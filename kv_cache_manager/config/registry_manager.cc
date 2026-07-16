@@ -142,6 +142,15 @@ bool RegistryManager::Init() {
 ErrorCode RegistryManager::AddStorage(RequestContext *request_context, const StorageConfig &storage_config) {
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
+    // Validate before persisting. Otherwise an invalid config (e.g.
+    // enable_inline_header=true, or enable_meta_checksum with algo=CA_UNSPECIFIED)
+    // lands in the registry and reappears on every restart via RecoverStorageUnsafe,
+    // and workers keep failing Init on a config the server said was OK.
+    std::string invalid_fields;
+    if (!storage_config.ValidateRequiredFields(invalid_fields)) {
+        PREFIX_LOG_S(WARN, "reject add storage: invalid config, fields[%s]", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     auto ec = LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and save storage failed");
     ec = data_storage_manager_->RegisterStorage(request_context, global_unique_name, storage_config);
@@ -186,6 +195,11 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
+    std::string invalid_fields;
+    if (!storage_config.ValidateRequiredFields(invalid_fields)) {
+        PREFIX_LOG_S(WARN, "update storage failed: invalid config, fields[%s]", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     // 重建期间短暂不可用
     auto ec = RemoveStorage(request_context, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");
@@ -520,6 +534,17 @@ size_t RegistryManager::RecoverStorageUnsafe() {
         StorageConfig storage_config;
         if (!storage_config.FromJsonString(val)) {
             KVCM_LOG_WARN("storage config from json string failed, skip. json string[%s]", val.c_str());
+            ++error_count;
+            continue;
+        }
+        // Same guard as AddStorage: a persisted config that violates the invariants
+        // (e.g. a partial-implementation upgrade left inline_header=true in the
+        // registry) must not be re-registered on recovery.
+        std::string invalid_fields;
+        if (!storage_config.ValidateRequiredFields(invalid_fields)) {
+            KVCM_LOG_WARN("skip recover storage: invalid config, fields[%s], json string[%s]",
+                          invalid_fields.c_str(),
+                          val.c_str());
             ++error_count;
             continue;
         }

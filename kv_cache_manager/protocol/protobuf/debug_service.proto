@@ -13,6 +13,8 @@ enum ErrorCode {
     INVALID_ARGUMENT = 5;
 
     IO_ERROR = 20;
+    CHECKSUM_MISMATCH = 21;      // checksum on the read buffer differs from what meta has
+    INLINE_HEADER_INVALID = 22;  // inline header check failed (Scheme B, reserved, disabled)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }

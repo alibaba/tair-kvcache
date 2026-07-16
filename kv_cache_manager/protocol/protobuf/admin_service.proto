@@ -19,6 +19,8 @@ enum ErrorCode {
     SERVER_NOT_LEADER = 9;
 
     IO_ERROR = 20;
+    CHECKSUM_MISMATCH = 21;      // checksum on the read buffer differs from what meta has
+    INLINE_HEADER_INVALID = 22;  // inline header check failed (Scheme B, reserved, disabled)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }
@@ -44,6 +46,21 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+}
+
+// Checksum algorithm. Same semantics as meta_service.proto. Re-declared per package
+// to keep proto files independent (no cross-package imports).
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. Same semantics as meta_service.proto.
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
 }
 
 message LocalStorageSpec {}
@@ -103,9 +120,11 @@ message NfsStorageSpec {
 }
 
 message VineyardStorageSpec {
-    int64 heartbeat_timeout_ms = 1;
-    int64 cleanup_grace_ms = 2;
-    int64 liveness_check_interval_ms = 3;
+    reserved 1; // historical cluster_name, removed from the API but tag must not be reused
+    reserved "cluster_name";
+    int64 heartbeat_timeout_ms = 2;
+    int64 cleanup_grace_ms = 3;
+    int64 liveness_check_interval_ms = 4;
 }
 
 message StorageConfig {
@@ -121,6 +140,7 @@ message StorageConfig {
         VineyardStorageSpec vineyard = 10;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -316,6 +336,9 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    // Per-block data checksum. Same semantics as meta_service.proto CacheLocation.checksum:
+    // 0 = unset (legacy data / legacy client; readers skip verification).
+    int64 checksum = 4;
 }
 
 message LocationSpecInfo {

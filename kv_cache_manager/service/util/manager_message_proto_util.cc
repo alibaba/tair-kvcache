@@ -5,11 +5,55 @@
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+// admin::ChecksumAlgo <-> C++ ChecksumAlgo. Values are numerically aligned, but use
+// an explicit switch so adding a new algorithm forces compile-time attention here.
+proto::admin::ChecksumAlgo ToAdminProtoChecksumAlgo(ChecksumAlgo algo) {
+    switch (algo) {
+    case ChecksumAlgo::CA_CRC32_XOR_INT64:
+        return proto::admin::CA_CRC32_XOR_INT64;
+    case ChecksumAlgo::CA_UNSPECIFIED:
+    default:
+        return proto::admin::CA_UNSPECIFIED;
+    }
+}
+
+ChecksumAlgo FromAdminProtoChecksumAlgo(proto::admin::ChecksumAlgo algo) {
+    switch (algo) {
+    case proto::admin::CA_CRC32_XOR_INT64:
+        return ChecksumAlgo::CA_CRC32_XOR_INT64;
+    case proto::admin::CA_UNSPECIFIED:
+    default:
+        return ChecksumAlgo::CA_UNSPECIFIED;
+    }
+}
+
+void DataIntegrityConfigToAdminProto(const DataIntegrityConfig &src, proto::admin::DataIntegrityConfig *dst) {
+    dst->set_enable_meta_checksum(src.enable_meta_checksum());
+    dst->set_enable_inline_header(src.enable_inline_header());
+    dst->set_inline_header_version(src.inline_header_version());
+    dst->set_algo(ToAdminProtoChecksumAlgo(src.algo()));
+}
+
+void DataIntegrityConfigFromAdminProto(const proto::admin::DataIntegrityConfig &src, DataIntegrityConfig &dst) {
+    dst.set_enable_meta_checksum(src.enable_meta_checksum());
+    dst.set_enable_inline_header(src.enable_inline_header());
+    dst.set_inline_header_version(src.inline_header_version());
+    dst.set_algo(FromAdminProtoChecksumAlgo(src.algo()));
+}
+
+} // namespace
+
 void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
                                         proto::admin::StorageConfig *proto_storage_config) {
     // 设置global_unique_name
     proto_storage_config->set_global_unique_name(storage_config.global_unique_name());
     proto_storage_config->set_check_storage_available_when_open(storage_config.check_storage_available_when_open());
+    // Round-trip integrity config so settings configured via admin API survive
+    // ListStorage and the Validate rejection of inline_header keeps working here.
+    DataIntegrityConfigToAdminProto(storage_config.integrity(), proto_storage_config->mutable_integrity());
     auto type = storage_config.type();
     // 根据实际存储类型设置global_unique_name
     if (type == DataStorageType::DATA_STORAGE_TYPE_HF3FS) {
@@ -73,6 +117,12 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     // 设置global_unique_name
     storage_config.set_global_unique_name(proto_storage_config->global_unique_name());
     storage_config.set_check_storage_available_when_open(proto_storage_config->check_storage_available_when_open());
+    // Read integrity from the admin request so AddStorage / UpdateStorage do not
+    // silently drop enable_meta_checksum, and so the inline_header rejection in
+    // StorageConfig::ValidateRequiredFields catches misconfigurations on this path.
+    if (proto_storage_config->has_integrity()) {
+        DataIntegrityConfigFromAdminProto(proto_storage_config->integrity(), storage_config.mutable_integrity());
+    }
     // 根据proto中的storage_type_case设置对应的存储类型
     switch (proto_storage_config->storage_spec_case()) {
     case proto::admin::StorageConfig::kThreefs: {

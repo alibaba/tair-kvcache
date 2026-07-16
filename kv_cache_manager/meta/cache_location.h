@@ -107,6 +107,7 @@ public:
         Put(writer, "spec_size", spec_size_);
         Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
+        Put(writer, "checksum", checksum_);
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
@@ -116,6 +117,9 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size_, size_t{0});
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
         KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
+        // checksum was added later; legacy entries deserialize to 0, which readers treat
+        // as "skip verification" to stay compatible with old clients that did not report it.
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "checksum", checksum_, int64_t{0});
         return true;
     }
 
@@ -126,6 +130,7 @@ public:
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
+    void set_checksum(int64_t checksum) { checksum_ = checksum; }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] const std::string &id() const { return id_; }
@@ -133,6 +138,7 @@ public:
     [[nodiscard]] DataStorageType type() const { return type_; }
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
     [[nodiscard]] int64_t create_time() const { return create_time_; }
+    [[nodiscard]] int64_t checksum() const { return checksum_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
         size_t usage = sizeof(CacheLocation) + id_.size();
         for (const auto &spec : location_specs_) {
@@ -148,6 +154,9 @@ private:
     size_t spec_size_ = 0;
     int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
+    // Per-block data checksum, identical across replicas. Reported by client in
+    // FinishWriteCache; 0 = unset (legacy data / legacy client), readers must skip.
+    int64_t checksum_ = 0;
 };
 
 using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;

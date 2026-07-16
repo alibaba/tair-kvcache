@@ -2,10 +2,228 @@
 #include <filesystem>
 #include <fstream>
 
+#include "kv_cache_manager/client/include/manager_client.h"
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
+
+class RecordingTransferClient : public TransferClient {
+public:
+    using TransferClient::LoadKvCaches;
+    using TransferClient::SaveKvCaches;
+
+    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
+                                 const BlockBuffers &block_buffers,
+                                 const LoadKvCachesOptions &options) override {
+        last_load_uri_count = uri_str_vec.size();
+        last_load_buffer_count = block_buffers.size();
+        last_load_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                const BlockBuffers &block_buffers,
+                                                                const SaveKvCachesOptions &options) override {
+        last_save_uri_count = uri_str_vec.size();
+        last_save_buffer_count = block_buffers.size();
+        last_save_options = options;
+        SaveKvCachesResult result;
+        result.uri_str_vec = uri_str_vec;
+        return {ER_OK, std::move(result)};
+    }
+
+    size_t last_load_uri_count{0};
+    size_t last_load_buffer_count{0};
+    LoadKvCachesOptions last_load_options;
+    size_t last_save_uri_count{0};
+    size_t last_save_buffer_count{0};
+    SaveKvCachesOptions last_save_options;
+
+protected:
+    ClientErrorCode Init(const std::string &, const InitParams &) override { return ER_OK; }
+};
+
+class RecordingManagerClient : public ManagerClient {
+public:
+    using ManagerClient::FinishWrite;
+    using ManagerClient::LoadKvCaches;
+    using ManagerClient::MatchLocation;
+    using ManagerClient::MatchMeta;
+    using ManagerClient::SaveKvCaches;
+
+    std::pair<ClientErrorCode, MatchLocationResult> MatchLocation(const std::string &,
+                                                                  QueryType,
+                                                                  const std::vector<int64_t> &,
+                                                                  const std::vector<int64_t> &,
+                                                                  const BlockMask &,
+                                                                  const std::vector<std::string> &,
+                                                                  const MatchLocationOptions &options) override {
+        last_match_location_options = options;
+        return {ER_OK, MatchLocationResult{}};
+    }
+
+    std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &,
+                                                         const std::vector<int64_t> &,
+                                                         const std::vector<int64_t> &,
+                                                         const std::vector<std::string> &,
+                                                         int64_t) override {
+        return {ER_OK, WriteLocation{}};
+    }
+
+    ClientErrorCode FinishWrite(const std::string &,
+                                const std::string &,
+                                const BlockMask &,
+                                const Locations &,
+                                const FinishWriteOptions &options) override {
+        last_finish_write_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &,
+                                                          const std::vector<int64_t> &,
+                                                          const std::vector<int64_t> &,
+                                                          const BlockMask &,
+                                                          const MatchMetaOptions &options) override {
+        last_match_meta_options = options;
+        return {ER_OK, MatchMetaResult{}};
+    }
+
+    ClientErrorCode RemoveCache(const std::string &,
+                                const std::vector<int64_t> &,
+                                const std::vector<int64_t> &,
+                                const BlockMask &) override {
+        return ER_OK;
+    }
+
+    ClientErrorCode LoadKvCaches(const UriStrVec &,
+                                 const BlockBuffers &,
+                                 const LoadKvCachesOptions &options) override {
+        last_load_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &,
+                                                                const BlockBuffers &,
+                                                                const SaveKvCachesOptions &options) override {
+        last_save_options = options;
+        return {ER_OK, SaveKvCachesResult{}};
+    }
+
+    MatchLocationOptions last_match_location_options;
+    FinishWriteOptions last_finish_write_options;
+    MatchMetaOptions last_match_meta_options;
+    LoadKvCachesOptions last_load_options;
+    SaveKvCachesOptions last_save_options;
+
+protected:
+    ClientErrorCode Init(const std::string &, InitParams &) override { return ER_OK; }
+    void Shutdown() override {}
+};
+
+TEST(ClientOptionsTest, TransferConvenienceOverloadsForwardOptions) {
+    RecordingTransferClient client;
+    UriStrVec uris = {"file://test_nfs/path?blkid=0&size=1"};
+    BlockBuffers buffers = {BlockBuffer{}};
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
+    EXPECT_EQ(uris.size(), client.last_load_uri_count);
+    EXPECT_EQ(buffers.size(), client.last_load_buffer_count);
+    EXPECT_EQ(nullptr, client.last_load_options.trace_info);
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
+
+    auto trace_info = std::make_shared<TransferTraceInfo>();
+    trace_info->need_print = true;
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, trace_info));
+    EXPECT_EQ(trace_info, client.last_load_options.trace_info);
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
+
+    std::vector<int64_t> expected_checksums = {0x11};
+    EXPECT_EQ(ER_OK,
+              client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(expected_checksums, trace_info)));
+    EXPECT_EQ(trace_info, client.last_load_options.trace_info);
+    EXPECT_EQ(expected_checksums, client.last_load_options.expected_checksums);
+
+    auto save_result = client.SaveKvCaches(uris, buffers);
+    EXPECT_EQ(ER_OK, save_result.first);
+    EXPECT_EQ(uris.size(), client.last_save_uri_count);
+    EXPECT_EQ(buffers.size(), client.last_save_buffer_count);
+    EXPECT_EQ(nullptr, client.last_save_options.trace_info);
+    EXPECT_FALSE(client.last_save_options.include_checksums);
+
+    auto save_with_checksum_result = client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::WithChecksums(trace_info));
+    EXPECT_EQ(ER_OK, save_with_checksum_result.first);
+    EXPECT_EQ(trace_info, client.last_save_options.trace_info);
+    EXPECT_TRUE(client.last_save_options.include_checksums);
+}
+
+TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
+    RecordingManagerClient client;
+    const std::string trace_id = "trace";
+    const std::vector<int64_t> keys = {1, 2};
+    const std::vector<int64_t> tokens = {3, 4};
+    const BlockMask block_mask = static_cast<BlockMaskOffset>(0);
+    const std::vector<std::string> spec_names = {"tp0"};
+    const Locations locations = {{{"tp0", "file://test"}}};
+    const UriStrVec uris = {"file://test"};
+    const BlockBuffers buffers = {BlockBuffer{}};
+
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(trace_id, QueryType::QT_PREFIX_MATCH, keys, tokens, block_mask, spec_names)
+                  .first);
+    EXPECT_EQ(-1, client.last_match_location_options.sw_size);
+    EXPECT_FALSE(client.last_match_location_options.include_checksums);
+
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(
+                        trace_id, QueryType::QT_REVERSE_ROLL_SW_MATCH, keys, tokens, block_mask, 7, spec_names)
+                  .first);
+    EXPECT_EQ(7, client.last_match_location_options.sw_size);
+    EXPECT_FALSE(client.last_match_location_options.include_checksums);
+
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(trace_id,
+                                   QueryType::QT_PREFIX_MATCH,
+                                   keys,
+                                   tokens,
+                                   block_mask,
+                                   spec_names,
+                                   MatchLocationOptions::WithChecksums(8))
+                  .first);
+    EXPECT_EQ(8, client.last_match_location_options.sw_size);
+    EXPECT_TRUE(client.last_match_location_options.include_checksums);
+
+    EXPECT_EQ(ER_OK, client.FinishWrite(trace_id, "session", block_mask, locations));
+    EXPECT_TRUE(client.last_finish_write_options.checksums.empty());
+
+    std::vector<int64_t> finish_checksums = {0x21, 0};
+    EXPECT_EQ(ER_OK,
+              client.FinishWrite(
+                  trace_id, "session", block_mask, locations, FinishWriteOptions::WithChecksums(finish_checksums)));
+    EXPECT_EQ(finish_checksums, client.last_finish_write_options.checksums);
+
+    EXPECT_EQ(ER_OK, client.MatchMeta(trace_id, keys, tokens, block_mask, 1).first);
+    EXPECT_EQ(1, client.last_match_meta_options.detail_level);
+    EXPECT_FALSE(client.last_match_meta_options.include_checksums);
+
+    EXPECT_EQ(ER_OK,
+              client.MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithChecksums(1))
+                  .first);
+    EXPECT_EQ(1, client.last_match_meta_options.detail_level);
+    EXPECT_TRUE(client.last_match_meta_options.include_checksums);
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(finish_checksums)));
+    EXPECT_EQ(finish_checksums, client.last_load_options.expected_checksums);
+
+    EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers).first);
+    EXPECT_FALSE(client.last_save_options.include_checksums);
+
+    EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::WithChecksums()).first);
+    EXPECT_TRUE(client.last_save_options.include_checksums);
+}
 
 class TransferClientTest : public TESTBASE {
 public:
@@ -226,4 +444,141 @@ TEST_F(TransferClientTest, TestBlockBufferUsage) {
     ASSERT_EQ(std::memcmp(buffer2.iovs[0].base, test_data2_, buffer2.iovs[0].size), 0);
 
     free(get_buffer);
+}
+
+// Inline headers are not supported yet, so Init must reject that configuration.
+TEST_F(TransferClientTest, TestCreateRejectsInlineHeader) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_inline_header": true
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// inline_header_version != 0 但开关没开 -> 同样被 Init 拒绝。
+TEST_F(TransferClientTest, TestCreateRejectsOrphanInlineHeaderVersion) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_inline_header": false,
+                "inline_header_version": 1
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// enable_meta_checksum=true 的 spec 能正常 Init (内部触发 hash pool 初始化或退化警告)。
+TEST_F(TransferClientTest, TestCreateAcceptsMetaChecksumSpec) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_meta_checksum": true,
+                "algo": "crc32_xor_int64"
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_NE(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+TEST_F(TransferClientTest, TestCreateRejectsUnsupportedChecksumAlgo) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_meta_checksum": true,
+                "algo": "unknown_algo"
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// expected_checksums 全 0 -> sentinel 跳过校验，行为 == 老路径，不会因 checksum 不匹配返回错误。
+TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesAllZeroSkipsCheck) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    BlockBuffer buffer1, buffer2;
+    BlockBuffers block_buffers = {buffer1, buffer2};
+    std::vector<int64_t> expected_checksums = {0, 0};
+    EXPECT_EQ(ER_OK,
+              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
+}
+
+// expected_checksums 长度与 block_buffers 不一致 -> ER_CHECKSUM_MISMATCH。
+TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    BlockBuffer buffer1, buffer2;
+    BlockBuffers block_buffers = {buffer1, buffer2};
+    std::vector<int64_t> expected_checksums = {0}; // 长度 1，但 buffers 长度 2
+    EXPECT_EQ(ER_CHECKSUM_MISMATCH,
+              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
+}
+
+// SaveKvCaches 失败时 result.checksums 必须保持空 —— 老实现把计算完的 checksum 直接
+// 返回给 caller，再让 caller 透传到 FinishWrite，就会给磁盘上不存在的数据落一条 hash。
+// 此处触发 sdk_wrapper->Put 前置校验错误 (empty inputs)，覆盖两种 build 下的行为。
+TEST_F(TransferClientTest, TestSaveKvCachesFailureLeavesChecksumsEmpty) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    UriStrVec empty_uris = {};
+    BlockBuffers empty_buffers = {};
+    auto result = client->SaveKvCaches(empty_uris, empty_buffers, SaveKvCachesOptions::WithChecksums());
+    EXPECT_EQ(ER_INVALID_PARAMS, result.first);
+    EXPECT_TRUE(result.second.checksums.empty()) << "checksums must stay empty on Save failure";
 }

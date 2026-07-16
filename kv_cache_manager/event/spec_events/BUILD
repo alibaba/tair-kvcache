@@ -12,4 +12,3 @@ cc_library(
         "//kv_cache_manager/meta:cache_location",
     ],
 )
-

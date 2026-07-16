@@ -3,6 +3,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -60,6 +61,10 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+
+    // data integrity
+    ER_CHECKSUM_MISMATCH = 118,     // checksum on the read buffer differs from what meta has
+    ER_INLINE_HEADER_INVALID = 119, // inline header check failed (Scheme B, reserved, disabled)
 };
 
 enum class QueryType : int {
@@ -186,6 +191,130 @@ struct ForwardContext {
 struct TransferTraceInfo {
     bool need_print = false;
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
+};
+
+// Optional operation controls keep rarely used knobs out of the hot-path
+// parameter list while leaving default calls concise.
+struct MatchLocationOptions {
+    // Slide-window size for QT_REVERSE_ROLL_SW_MATCH. The default keeps the
+    // existing non-window query behavior.
+    int32_t sw_size{-1};
+    bool include_checksums{false};
+
+    static MatchLocationOptions WithSlideWindowSize(int32_t sw_size) {
+        MatchLocationOptions options;
+        options.sw_size = sw_size;
+        return options;
+    }
+
+    static MatchLocationOptions WithChecksums(int32_t sw_size = -1) {
+        MatchLocationOptions options;
+        options.sw_size = sw_size;
+        options.include_checksums = true;
+        return options;
+    }
+};
+
+struct MatchLocationResult {
+    Locations locations;
+    std::vector<int64_t> checksums;
+};
+
+struct MatchLocationLenOptions {
+    int32_t sw_size{-1};
+
+    static MatchLocationLenOptions WithSlideWindowSize(int32_t sw_size) {
+        MatchLocationLenOptions options;
+        options.sw_size = sw_size;
+        return options;
+    }
+};
+
+struct MatchMetaOptions {
+    int32_t detail_level{0};
+    bool include_checksums{false};
+
+    static MatchMetaOptions WithDetailLevel(int32_t detail_level) {
+        MatchMetaOptions options;
+        options.detail_level = detail_level;
+        return options;
+    }
+
+    static MatchMetaOptions WithChecksums(int32_t detail_level = 0) {
+        MatchMetaOptions options;
+        options.detail_level = detail_level;
+        options.include_checksums = true;
+        return options;
+    }
+};
+
+struct MatchMetaResult {
+    Metas metas;
+    std::vector<int64_t> checksums;
+};
+
+struct FinishWriteOptions {
+    std::vector<int64_t> checksums;
+
+    static FinishWriteOptions WithChecksums(std::vector<int64_t> checksums) {
+        FinishWriteOptions options;
+        options.checksums = std::move(checksums);
+        return options;
+    }
+};
+
+struct LoadKvCachesOptions {
+    std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
+    std::vector<int64_t> expected_checksums;
+
+    static LoadKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
+        LoadKvCachesOptions options;
+        options.trace_info = trace_info;
+        return options;
+    }
+
+    static LoadKvCachesOptions VerifyWith(std::vector<int64_t> checksums) {
+        LoadKvCachesOptions options;
+        options.expected_checksums = std::move(checksums);
+        return options;
+    }
+
+    static LoadKvCachesOptions VerifyWith(std::vector<int64_t> checksums,
+                                          std::shared_ptr<TransferTraceInfo> trace_info) {
+        LoadKvCachesOptions options;
+        options.trace_info = trace_info;
+        options.expected_checksums = std::move(checksums);
+        return options;
+    }
+};
+
+struct SaveKvCachesOptions {
+    std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
+    bool include_checksums{false};
+
+    static SaveKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
+        SaveKvCachesOptions options;
+        options.trace_info = trace_info;
+        return options;
+    }
+
+    static SaveKvCachesOptions WithChecksums() {
+        SaveKvCachesOptions options;
+        options.include_checksums = true;
+        return options;
+    }
+
+    static SaveKvCachesOptions WithChecksums(std::shared_ptr<TransferTraceInfo> trace_info) {
+        SaveKvCachesOptions options;
+        options.trace_info = trace_info;
+        options.include_checksums = true;
+        return options;
+    }
+};
+
+struct SaveKvCachesResult {
+    UriStrVec uri_str_vec;
+    std::vector<int64_t> checksums;
 };
 
 } // namespace kv_cache_manager

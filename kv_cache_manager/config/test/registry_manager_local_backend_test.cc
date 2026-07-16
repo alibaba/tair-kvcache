@@ -687,4 +687,87 @@ TEST_F(RegistryManagerLocalBackendTest, TestRecoverRetryLoopLifecycle) {
     }
 }
 
+// AddStorage 必须先跑 StorageConfig::ValidateRequiredFields，否则包含 inline_header=true
+// 或未指定 checksum algo 的配置会静默进 registry，重启后 worker Init 才拒 —— 服务端和
+// 客户端说的不一样。
+TEST_F(RegistryManagerLocalBackendTest, TestAddStorageRejectsInvalidIntegrity) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_reject_integrity";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+
+    // 场景 1：enable_inline_header=true 直接被 ValidateRequiredFields 拒。
+    {
+        DataIntegrityConfig integrity;
+        integrity.set_enable_inline_header(true);
+        std::shared_ptr<NfsStorageSpec> spec = GetDefaultNfsStorageSpec();
+        StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "bad_inline_header", spec);
+        storage_config.set_integrity(integrity);
+        auto ec = registry_manager_->AddStorage(request_context_.get(), storage_config);
+        EXPECT_EQ(EC_BADARGS, ec);
+        // 不应写进 registry
+        EXPECT_FALSE(registry_manager_->data_storage_manager()->GetDataStorageBackend("bad_inline_header"));
+    }
+
+    // 场景 2：inline_header_version != 0 但开关未开 (orphan version) 也应被拒。
+    {
+        DataIntegrityConfig integrity;
+        integrity.set_inline_header_version(1);
+        std::shared_ptr<NfsStorageSpec> spec = GetDefaultNfsStorageSpec();
+        StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "orphan_version", spec);
+        storage_config.set_integrity(integrity);
+        auto ec = registry_manager_->AddStorage(request_context_.get(), storage_config);
+        EXPECT_EQ(EC_BADARGS, ec);
+        EXPECT_FALSE(registry_manager_->data_storage_manager()->GetDataStorageBackend("orphan_version"));
+    }
+
+    // 场景 3：enable_meta_checksum=true 但 algo=CA_UNSPECIFIED，同样应被拒。
+    {
+        DataIntegrityConfig integrity;
+        integrity.set_enable_meta_checksum(true);
+        integrity.set_algo(ChecksumAlgo::CA_UNSPECIFIED);
+        std::shared_ptr<NfsStorageSpec> spec = GetDefaultNfsStorageSpec();
+        StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "no_algo", spec);
+        storage_config.set_integrity(integrity);
+        auto ec = registry_manager_->AddStorage(request_context_.get(), storage_config);
+        EXPECT_EQ(EC_BADARGS, ec);
+        EXPECT_FALSE(registry_manager_->data_storage_manager()->GetDataStorageBackend("no_algo"));
+    }
+
+    // Sanity：不带 integrity 字段或全默认（关）的配置仍然应能成功注册。
+    {
+        std::shared_ptr<NfsStorageSpec> spec = GetDefaultNfsStorageSpec();
+        StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "default_integrity", spec);
+        auto ec = registry_manager_->AddStorage(request_context_.get(), storage_config);
+        EXPECT_EQ(EC_OK, ec);
+        EXPECT_TRUE(registry_manager_->data_storage_manager()->GetDataStorageBackend("default_integrity"));
+    }
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestUpdateStorageRejectsInvalidIntegrityBeforeRemovingExistingStorage) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_update_reject_integrity";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+
+    std::shared_ptr<NfsStorageSpec> original_spec = GetDefaultNfsStorageSpec();
+    original_spec->set_root_path(GetPrivateTestRuntimeDataPath() + "/original_nfs_root/");
+    StorageConfig original_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "storage1", original_spec);
+    ASSERT_EQ(EC_OK, registry_manager_->AddStorage(request_context_.get(), original_config));
+    ASSERT_TRUE(registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1"));
+
+    DataIntegrityConfig integrity;
+    integrity.set_enable_inline_header(true);
+    std::shared_ptr<NfsStorageSpec> invalid_spec = GetDefaultNfsStorageSpec();
+    invalid_spec->set_root_path(GetPrivateTestRuntimeDataPath() + "/invalid_nfs_root/");
+    StorageConfig invalid_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "storage1", invalid_spec);
+    invalid_config.set_integrity(integrity);
+
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), invalid_config, true));
+
+    auto storage = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(storage);
+    auto spec = std::dynamic_pointer_cast<NfsStorageSpec>(storage->GetStorageConfig().storage_spec());
+    ASSERT_TRUE(spec);
+    EXPECT_EQ(GetPrivateTestRuntimeDataPath() + "/original_nfs_root/", spec->root_path());
+}
+
 } // namespace kv_cache_manager

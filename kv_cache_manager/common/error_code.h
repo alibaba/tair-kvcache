@@ -26,6 +26,8 @@ enum [[nodiscard]] ErrorCode : int32_t{
     EC_NOSCRIPT = 17,
     EC_SERVICE_NOT_LEADER = 18,
     EC_NODE_NOT_REGISTERED = 19,
+    EC_CHECKSUM_MISMATCH = 20,     // checksum on the read buffer differs from what meta has
+    EC_INLINE_HEADER_INVALID = 21, // inline header check failed (Scheme B, reserved, disabled)
     EC_UNKNOWN = 127,
     EC_KVCM_MAX,
 };
@@ -42,6 +44,8 @@ inline PbErrorCode ToPbError(ErrorCode internal_error) {
         {EC_NOENT, PbErrorCode::INSTANCE_NOT_EXIST},
         {EC_SERVICE_NOT_LEADER, PbErrorCode::SERVER_NOT_LEADER},
         {EC_IO_ERROR, PbErrorCode::IO_ERROR},
+        {EC_CHECKSUM_MISMATCH, PbErrorCode::CHECKSUM_MISMATCH},
+        {EC_INLINE_HEADER_INVALID, PbErrorCode::INLINE_HEADER_INVALID},
         {EC_OUT_OF_LIMIT, PbErrorCode::REACH_MAX_ENTITY_CAPACITY},
         {EC_UNKNOWN, PbErrorCode::UNKNOWN_ERROR},
     };

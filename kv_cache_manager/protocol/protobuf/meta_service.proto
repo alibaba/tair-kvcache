@@ -18,6 +18,8 @@ enum ErrorCode {
     NODE_NOT_REGISTERED = 10;
 
     IO_ERROR = 20;
+    CHECKSUM_MISMATCH = 21;      // checksum on the read buffer differs from what meta has
+    INLINE_HEADER_INVALID = 22;  // inline header check failed (Scheme B, reserved, disabled)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }
@@ -44,6 +46,27 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+}
+
+// Checksum algorithm. CA_CRC32_XOR_INT64 mirrors SdkBufferCheckUtil::GetBlocksHash
+// (CRC32 per iov -> HashUtil::HashIntArray aggregated into an int64). Append new
+// algorithms here; never reuse retired values.
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. All fields default to disabled; specs without this field
+// behave exactly as legacy (verification path is skipped end-to-end).
+message DataIntegrityConfig {
+    // Scheme A: persist per-block checksum in KVCM meta and verify on read.
+    bool enable_meta_checksum = 1;
+    // Scheme B: embed a header (block_key + checksum + version) inside the stored
+    // data. Reserved; rejected by Validate / Init when true in this release.
+    bool enable_inline_header = 2;
+    // Layout version for Scheme B; 0 means no inline header (legacy data).
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
 }
 
 // ---- V6D event reporting ----
@@ -121,6 +144,11 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    // Per-block data checksum. Reported by client via FinishWriteCacheRequest.checksums
+    // and echoed back on GetCacheLocation / GetCacheMeta so readers can verify.
+    // 0 = unset (legacy data / legacy client); readers must skip verification when 0.
+    // All replicas of the same block must carry the same checksum.
+    int64 checksum = 4;
 }
 
 message LocationSpecInfo {
@@ -222,6 +250,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 message RegisterInstanceRequest {
@@ -378,7 +407,9 @@ message FinishWriteCacheRequest {
     string instance_id = 2;
     string write_session_id = 3;
     BlockMask success_blocks = 4;
-    repeated CacheLocation locations = 5;
+    // Full-batch checksum vector, parallel to the keys captured by StartWriteCache.
+    // Empty = not reported; 0 per entry = no checksum for that block.
+    repeated int64 checksums = 5;
 }
 
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况

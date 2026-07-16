@@ -31,30 +31,29 @@ public:
     virtual std::pair<ClientErrorCode, InstanceInfo> GetInstanceInfo(const std::string &trace_id,
                                                                      const std::string &instance_id) = 0;
 
-    // TODO : remove this
-    virtual std::pair<ClientErrorCode, Metas> GetCacheMeta(const std::string &trace_id,
-                                                           const std::string &instance_id,
-                                                           const KeyVector &keys,
-                                                           const TokenIdsVector &tokens,
-                                                           const BlockMask &block_mask,
-                                                           int32_t detail_level) = 0;
+    virtual std::pair<ClientErrorCode, MatchMetaResult> GetCacheMeta(const std::string &trace_id,
+                                                                     const std::string &instance_id,
+                                                                     const KeyVector &keys,
+                                                                     const TokenIdsVector &tokens,
+                                                                     const BlockMask &block_mask,
+                                                                     const MatchMetaOptions &options) = 0;
 
-    virtual std::pair<ClientErrorCode, Locations>
+    virtual std::pair<ClientErrorCode, MatchLocationResult>
     GetCacheLocation(const std::string &trace_id,
                      const std::string &instance_id,
                      QueryType query_type,
                      const KeyVector &keys,
                      const TokenIdsVector &tokens,
                      const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names) = 0;
+                     const std::vector<std::string> &location_spec_names,
+                     const MatchLocationOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                                     const std::string &instance_id,
                                                                     QueryType query_type,
                                                                     const KeyVector &keys,
                                                                     const TokenIdsVector &tokens,
-                                                                    int32_t sw_size) = 0;
+                                                                    const MatchLocationLenOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWriteCache(const std::string &trace_id,
@@ -67,7 +66,8 @@ public:
                                              const std::string &instance_id,
                                              const std::string write_session_id,
                                              const BlockMask &success_block,
-                                             const Locations &locations) = 0;
+                                             const Locations &locations,
+                                             const FinishWriteOptions &options = FinishWriteOptions{}) = 0;
 
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::string &instance_id,

@@ -10,13 +10,19 @@ public:
     ManagerClientImpl();
     ~ManagerClientImpl() override;
 
-    std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
-                                                        QueryType query_type,
-                                                        const std::vector<int64_t> &keys,
-                                                        const std::vector<int64_t> &tokens,
-                                                        const BlockMask &block_mask,
-                                                        int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+    using ManagerClient::FinishWrite;
+    using ManagerClient::LoadKvCaches;
+    using ManagerClient::MatchLocation;
+    using ManagerClient::MatchMeta;
+    using ManagerClient::SaveKvCaches;
+
+    std::pair<ClientErrorCode, MatchLocationResult> MatchLocation(const std::string &trace_id,
+                                                                  QueryType query_type,
+                                                                  const std::vector<int64_t> &keys,
+                                                                  const std::vector<int64_t> &tokens,
+                                                                  const BlockMask &block_mask,
+                                                                  const std::vector<std::string> &location_spec_names,
+                                                                  const MatchLocationOptions &options) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,
@@ -26,23 +32,27 @@ public:
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
-                                const Locations &locations) override;
+                                const Locations &locations,
+                                const FinishWriteOptions &options) override;
 
-    std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
-                                                const std::vector<int64_t> &keys,
-                                                const std::vector<int64_t> &tokens,
-                                                const BlockMask &block_mask,
-                                                int32_t detail_level) override;
+    std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &trace_id,
+                                                          const std::vector<int64_t> &keys,
+                                                          const std::vector<int64_t> &tokens,
+                                                          const BlockMask &block_mask,
+                                                          const MatchMetaOptions &options) override;
 
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::vector<int64_t> &keys,
                                 const std::vector<int64_t> &tokens,
                                 const BlockMask &block_mask) override;
 
-    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
+    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
+                                 const BlockBuffers &block_buffers,
+                                 const LoadKvCachesOptions &options) override;
 
-    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                       const BlockBuffers &block_buffers) override;
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                const BlockBuffers &block_buffers,
+                                                                const SaveKvCachesOptions &options) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;

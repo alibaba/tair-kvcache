@@ -35,6 +35,7 @@ public:
     inline DataStorageType type() const { return cache_location_.type(); }
     inline int32_t spec_size() const { return cache_location_.spec_size(); }
     inline const LocationSpecViewVec &location_specs() const { return location_specs_view_; }
+    inline int64_t checksum() const { return cache_location_.checksum(); }
 
 private:
     const CacheLocation &cache_location_;

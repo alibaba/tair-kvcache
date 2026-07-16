@@ -27,9 +27,12 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace {
+// StorageConfig::ToRapidWriter always emits the integrity block, even when all
+// fields are default values.
 static const std::string default_storage_configs(
     "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\",\"storage_spec\":{"
-    "\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
+    "\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8},\"integrity\":{\"enable_meta_checksum\":false,"
+    "\"enable_inline_header\":false,\"inline_header_version\":0,\"algo\":\"crc32_xor_int64\"}}]");
 } // namespace
 
 namespace kv_cache_manager {
@@ -1578,14 +1581,22 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
         instance_group.FromJsonString(instance_group_str);
         ASSERT_EQ(EC_OK, registry_manager->CreateInstanceGroup(request_context_.get(), instance_group));
     }
+    // StorageConfig::ToRapidWriter always emits the integrity block.
+    static constexpr const char *kDefaultIntegritySuffix =
+        ",\"integrity\":{\"enable_meta_checksum\":false,\"enable_inline_header\":false,"
+        "\"inline_header_version\":0,\"algo\":\"crc32_xor_int64\"}";
     auto expected = std::pair<ErrorCode, std::string>(
         EC_OK,
-        "[{\"type\":\"hf3fs\",\"is_available\":true,\"global_unique_name\":\"3fs_test_01\",\"storage_spec\":{\"cluster_"
-        "name\":\"test_cluster_name\",\"mountpoint\":\"/3fs/"
-        "test_mountpoint\",\"root_dir\":\"test_root_dir\",\"key_count_per_file\":2}},{\"type\":\"file\",\"is_"
-        "available\":true,\"global_unique_name\":\"nfs_test_01\",\"storage_spec\":{\"root_path\":\"/tmp/nfs_test_01/"
-        "\",\"key_count_per_file\":1}},{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_test_02\","
-        "\"storage_spec\":{\"root_path\":\"/tmp/nfs_test_01/\",\"key_count_per_file\":1}}]");
+        std::string("[{\"type\":\"hf3fs\",\"is_available\":true,\"global_unique_name\":\"3fs_test_01\","
+                    "\"storage_spec\":{\"cluster_name\":\"test_cluster_name\",\"mountpoint\":\"/3fs/"
+                    "test_mountpoint\",\"root_dir\":\"test_root_dir\",\"key_count_per_file\":2}") +
+            kDefaultIntegritySuffix +
+            "},{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_test_01\","
+            "\"storage_spec\":{\"root_path\":\"/tmp/nfs_test_01/\",\"key_count_per_file\":1}" +
+            kDefaultIntegritySuffix +
+            "},{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_test_02\","
+            "\"storage_spec\":{\"root_path\":\"/tmp/nfs_test_01/\",\"key_count_per_file\":1}" +
+            kDefaultIntegritySuffix + "}]");
     ASSERT_EQ(expected,
               cache_manager_->RegisterInstance(request_context_.get(),
                                                "test_group2",

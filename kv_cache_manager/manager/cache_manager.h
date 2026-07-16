@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -144,12 +145,34 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
+    struct FinishWriteCacheOptions {
+        std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
+        // checksums must be the same length as the keys captured at StartWriteCache
+        // (full batch, not just the success subset within success_block_mask). Pass
+        // an empty vector when the client does not report a checksum; existing
+        // CacheLocation checksums are then preserved.
+        std::vector<int64_t> checksums;
+
+        static FinishWriteCacheOptions WithWriteLocationInfo(
+            std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+            FinishWriteCacheOptions options;
+            options.write_location_info_internal = std::move(write_location_info_internal);
+            return options;
+        }
+
+        static FinishWriteCacheOptions WithChecksums(std::vector<int64_t> checksums) {
+            FinishWriteCacheOptions options;
+            options.checksums = std::move(checksums);
+            return options;
+        }
+    };
+
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
                      const std::string &write_session_id,
                      const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+                     FinishWriteCacheOptions options = FinishWriteCacheOptions{});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,

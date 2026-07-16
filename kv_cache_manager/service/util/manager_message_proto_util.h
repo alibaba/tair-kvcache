@@ -209,6 +209,10 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         DataStorageTypeToProto(cache_location_info.type(), &type);
         proto_cache_location->set_type(type);
     }
+    // Round-trip the checksum so readers can verify with the value persisted at write
+    // time. 0 means "no checksum" and is the legacy default; new readers skip the
+    // sentinel.
+    proto_cache_location->set_checksum(cache_location_info.checksum());
 
     for (const auto &location_spec : cache_location_info.location_specs()) {
         auto *proto_spec = proto_cache_location->add_location_specs();
@@ -520,6 +524,7 @@ ProtoConvert::CacheLocationToProto(const CacheLocation &cache_location_info, T *
         DataStorageTypeToProto(cache_location_info.type(), &type);
         proto_cache_location->set_type(type);
     }
+    proto_cache_location->set_checksum(cache_location_info.checksum());
     LocationSpecsToProto(cache_location_info.location_specs(), proto_cache_location->mutable_location_specs());
 }
 template <typename T>
@@ -535,6 +540,7 @@ ProtoConvert::CacheLocationFromProto(const T *proto_cache_location, CacheLocatio
         DataStorageTypeFromProto(proto_cache_location->type(), data_storage_type);
         cache_location_info.set_type(data_storage_type);
     }
+    cache_location_info.set_checksum(proto_cache_location->checksum());
     std::vector<LocationSpec> location_spec_infos;
     LocationSpecsFromProto(proto_cache_location->location_specs(), location_spec_infos);
     cache_location_info.set_location_specs(std::move(location_spec_infos));

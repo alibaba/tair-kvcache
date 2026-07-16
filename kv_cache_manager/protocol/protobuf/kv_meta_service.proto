@@ -15,6 +15,8 @@ enum ErrorCode {
     INSTANCE_NOT_EXIST = 8;
 
     IO_ERROR = 20;
+    CHECKSUM_MISMATCH = 21;      // checksum on the read buffer differs from what meta has
+    INLINE_HEADER_INVALID = 22;  // inline header check failed (Scheme B, reserved, disabled)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }
@@ -41,6 +43,21 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+}
+
+// Checksum algorithm. Same semantics as meta_service.proto. Re-declared per package
+// to keep proto files independent (no cross-package imports).
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. Same semantics as meta_service.proto.
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -128,6 +145,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 message RegisterInstanceRequest {

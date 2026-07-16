@@ -63,38 +63,31 @@
 
 namespace {
 
-kv_cache_manager::Locations GenLocations(
-    const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations) {
+struct ParsedLocations {
     kv_cache_manager::Locations locations;
-    locations.reserve(proto_locations.size());
+    std::vector<int64_t> checksums;
+};
+
+ParsedLocations
+GenLocations(const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations,
+             bool include_checksums = false) {
+    ParsedLocations result;
+    result.locations.reserve(proto_locations.size());
+    if (include_checksums) {
+        result.checksums.reserve(proto_locations.size());
+    }
     for (const auto &proto_location : proto_locations) {
         const auto &location_specs = proto_location.location_specs();
-        locations.push_back({});
-        locations.back().reserve(location_specs.size());
+        result.locations.push_back({});
+        result.locations.back().reserve(location_specs.size());
         for (const auto &location_spec : location_specs) {
-            locations.back().push_back({location_spec.name(), location_spec.uri()});
+            result.locations.back().push_back({location_spec.name(), location_spec.uri()});
+        }
+        if (include_checksums) {
+            result.checksums.push_back(proto_location.checksum());
         }
     }
-    return locations;
-}
-
-kv_cache_manager::ClientErrorCode
-GenCacheLocation(const kv_cache_manager::Locations &locations,
-                 google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> *proto_locations) {
-    if (locations.empty()) {
-        return kv_cache_manager::ClientErrorCode::ER_OK;
-    }
-    for (const auto &location : locations) {
-        auto *cache_location = proto_locations->Add();
-        cache_location->set_type(::kv_cache_manager::proto::meta::StorageType::ST_UNSPECIFIED);
-        cache_location->set_spec_size(-1);
-        for (const auto &location_spec : location) {
-            auto *spec = cache_location->add_location_specs();
-            spec->set_name(location_spec.spec_name);
-            spec->set_uri(location_spec.uri);
-        }
-    }
-    return kv_cache_manager::ClientErrorCode::ER_OK;
+    return result;
 }
 
 template <typename ProtoMessage>
@@ -127,7 +120,9 @@ kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::E
                   {proto::meta::INVALID_ARGUMENT, ER_SERVICE_INVALID_ARGUMENT},
                   {proto::meta::DUPLICATE_ENTITY, ER_SERVICE_DUPLICATE_ENTITY},
                   {proto::meta::INSTANCE_NOT_EXIST, ER_SERVICE_INSTANCE_NOT_EXIST},
-                  {proto::meta::SERVER_NOT_LEADER, ER_SERVICE_NOT_LEADER}};
+                  {proto::meta::SERVER_NOT_LEADER, ER_SERVICE_NOT_LEADER},
+                  {proto::meta::CHECKSUM_MISMATCH, ER_CHECKSUM_MISMATCH},
+                  {proto::meta::INLINE_HEADER_INVALID, ER_INLINE_HEADER_INVALID}};
     if (auto iter = error_map.find(service_error); iter != error_map.end()) {
         return iter->second;
     }
@@ -294,44 +289,48 @@ std::pair<ClientErrorCode, InstanceInfo> GrpcStub::GetInstanceInfo(const std::st
     return {ER_OK, instance_info};
 }
 
-std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trace_id,
-                                                         const std::string &instance_id,
-                                                         const KeyVector &keys,
-                                                         const TokenIdsVector &tokens,
-                                                         const BlockMask &block_mask,
-                                                         int32_t detail_level) {
+std::pair<ClientErrorCode, MatchMetaResult> GrpcStub::GetCacheMeta(const std::string &trace_id,
+                                                                   const std::string &instance_id,
+                                                                   const KeyVector &keys,
+                                                                   const TokenIdsVector &tokens,
+                                                                   const BlockMask &block_mask,
+                                                                   const MatchMetaOptions &options) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheMetaRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
     ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
-    request.set_detail_level(detail_level);
+    request.set_detail_level(options.detail_level);
     grpc::ClientContext context;
     proto::meta::GetCacheMetaResponse response;
     auto grpc_status = stub->GetCacheMeta(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    auto locations = GenLocations(response.locations());
+    MatchMetaResult result;
+    auto parsed_locations = GenLocations(response.locations(), options.include_checksums);
     std::vector<std::string> metas;
     std::for_each(
         response.metas().begin(), response.metas().end(), [&metas](const std::string &meta) { metas.push_back(meta); });
     KVCM_LOG_DEBUG("get cache meta success, locations: %s, metas: %s",
-                   DebugStringUtil::ToString(locations).c_str(),
+                   DebugStringUtil::ToString(parsed_locations.locations).c_str(),
                    DebugStringUtil::ToString(metas).c_str());
-    return {ER_OK, {locations, metas}};
+    result.metas = {std::move(parsed_locations.locations), std::move(metas)};
+    result.checksums = std::move(parsed_locations.checksums);
+    return {ER_OK, std::move(result)};
 }
 
-std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::string &trace_id,
-                                                                 const std::string &instance_id,
-                                                                 QueryType query_type,
-                                                                 const KeyVector &keys,
-                                                                 const TokenIdsVector &tokens,
-                                                                 const BlockMask &block_mask,
-                                                                 int32_t sw_size,
-                                                                 const std::vector<std::string> &location_spec_names) {
+std::pair<ClientErrorCode, MatchLocationResult>
+GrpcStub::GetCacheLocation(const std::string &trace_id,
+                           const std::string &instance_id,
+                           QueryType query_type,
+                           const KeyVector &keys,
+                           const TokenIdsVector &tokens,
+                           const BlockMask &block_mask,
+                           const std::vector<std::string> &location_spec_names,
+                           const MatchLocationOptions &options) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
-    request.set_sw_size(sw_size);
+    request.set_sw_size(options.sw_size);
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
     // 添加location_spec_names参数
     for (const auto &name : location_spec_names) {
@@ -344,9 +343,13 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     auto grpc_status = stub->GetCacheLocation(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    auto locations = GenLocations(response.locations());
-    KVCM_LOG_DEBUG("get cache location success, locations: %s", DebugStringUtil::ToString(locations).c_str());
-    return {ER_OK, locations};
+    MatchLocationResult result;
+    auto parsed_locations = GenLocations(response.locations(), options.include_checksums);
+    KVCM_LOG_DEBUG("get cache location success, locations: %s",
+                   DebugStringUtil::ToString(parsed_locations.locations).c_str());
+    result.locations = std::move(parsed_locations.locations);
+    result.checksums = std::move(parsed_locations.checksums);
+    return {ER_OK, std::move(result)};
 }
 
 std::pair<ClientErrorCode, int64_t> GrpcStub::GetCacheLocationLen(const std::string &trace_id,
@@ -354,11 +357,11 @@ std::pair<ClientErrorCode, int64_t> GrpcStub::GetCacheLocationLen(const std::str
                                                                   QueryType query_type,
                                                                   const KeyVector &keys,
                                                                   const TokenIdsVector &tokens,
-                                                                  int32_t sw_size) {
+                                                                  const MatchLocationLenOptions &options) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationLenRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
-    request.set_sw_size(sw_size);
+    request.set_sw_size(options.sw_size);
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
     grpc::ClientContext context;
     proto::meta::GetCacheLocationLenResponse response;
@@ -393,31 +396,26 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
     std::string write_session_id = response.write_session_id();
     BlockMask block_mask;
     ProtoConvert::BlockMaskFromProto(&response.block_mask(), block_mask);
-    auto locations = GenLocations(response.locations());
+    auto parsed_locations = GenLocations(response.locations());
     KVCM_LOG_DEBUG("start write cache success, write_session_id: %s, block_mask: %s, locations: %s",
                    write_session_id.c_str(),
                    DebugStringUtil::ToString(block_mask).c_str(),
-                   DebugStringUtil::ToString(locations).c_str());
-    return {ER_OK, {write_session_id, block_mask, locations}};
+                   DebugStringUtil::ToString(parsed_locations.locations).c_str());
+    return {ER_OK, {write_session_id, block_mask, std::move(parsed_locations.locations)}};
 }
 
 ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
                                            const std::string &instance_id,
                                            const std::string write_session_id,
                                            const BlockMask &success_block,
-                                           const Locations &locations) {
+                                           const Locations &locations,
+                                           const FinishWriteOptions &options) {
     auto stub = GET_AND_CHECK_STUB();
     proto::meta::FinishWriteCacheRequest request;
     SetCommonInfo(request, trace_id, instance_id);
     request.set_write_session_id(write_session_id);
-    auto proto_locations = request.mutable_locations();
-    auto ec = GenCacheLocation(locations, proto_locations);
-    if (ec != ER_OK) {
-        KVCM_LOG_DEBUG("finish write cache failed, write_session_id: %s, block_mask: %s, locations: %s",
-                       write_session_id.c_str(),
-                       DebugStringUtil::ToString(success_block).c_str(),
-                       DebugStringUtil::ToString(locations).c_str());
-        return ec;
+    for (auto checksum : options.checksums) {
+        request.add_checksums(checksum);
     }
     ProtoConvert::BlockMaskToProto(success_block, request.mutable_success_blocks());
     grpc::ClientContext context;
@@ -456,7 +454,7 @@ bool GrpcStub::TrimCache() {
 }
 
 std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::string &trace_id,
-                                                                  const std::string &instance_id) {
+                                                                 const std::string &instance_id) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetClusterInfoRequest request;
     SetCommonInfo(request, trace_id, instance_id);
@@ -476,9 +474,8 @@ std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::stri
         info.leader_endpoint.meta_http_port = ep.meta_http_port();
         info.leader_endpoint.custom_info = ep.custom_info();
     }
-    KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
-                   info.self_node_id.c_str(),
-                   info.leader_node_id.c_str());
+    KVCM_LOG_DEBUG(
+        "get cluster info success, self=%s, leader=%s", info.self_node_id.c_str(), info.leader_node_id.c_str());
     return {ER_OK, info};
 }
 

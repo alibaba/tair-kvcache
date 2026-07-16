@@ -86,6 +86,10 @@ public:
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        // Per-block data checksum to persist on CacheLocation; 0 means "do not touch
+        // existing checksum" so callers that do not care can leave it default. Currently
+        // only the FinishWriteCache path sets it.
+        int64_t checksum = 0;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,

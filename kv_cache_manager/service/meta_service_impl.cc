@@ -566,11 +566,21 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    // 调用Manager层完成写入缓存
     BlockMask success_blocks_req;
     ProtoConvert::BlockMaskFromProto(&request->success_blocks(), success_blocks_req);
-    ErrorCode ec_info = cache_manager_->FinishWriteCache(
-        request_context, request->instance_id(), request->write_session_id(), success_blocks_req);
+    std::vector<int64_t> checksums;
+    if (request->checksums_size() > 0) {
+        checksums.reserve(request->checksums_size());
+        for (auto checksum : request->checksums()) {
+            checksums.push_back(checksum);
+        }
+    }
+    ErrorCode ec_info = cache_manager_->FinishWriteCache(request_context,
+                                                         request->instance_id(),
+                                                         request->write_session_id(),
+                                                         success_blocks_req,
+                                                         CacheManager::FinishWriteCacheOptions::WithChecksums(
+                                                             std::move(checksums)));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

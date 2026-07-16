@@ -97,6 +97,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     }
     result->set_spec_size(specs.size());
     result->set_location_specs(std::move(specs));
+    // Same block replicated across specs shares one checksum by design (see
+    // data_integrity design doc); carry the winner's so the read path can verify.
+    result->set_checksum(winner->checksum());
     return result;
 }
 
@@ -521,6 +524,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 }
                 merged->set_spec_size(specs.size());
                 merged->set_location_specs(std::move(specs));
+                merged->set_checksum(winner->checksum());
                 out_locations[i].push_back(std::move(merged));
             }
         }
@@ -829,6 +833,11 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
             // COW: copy the location, modify the copy, replace the pointer
             auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
             new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
+            // Only overwrite the persisted checksum when the caller supplied one
+            // (non-zero); 0 means "keep whatever is already there".
+            if (batch_tasks[key_index][loc_index].checksum != 0) {
+                new_loc->set_checksum(batch_tasks[key_index][loc_index].checksum);
+            }
             locs[loc_index] = std::move(new_loc);
         }
         if (!updated) {
