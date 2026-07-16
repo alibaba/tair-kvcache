@@ -523,6 +523,70 @@ class TestGetClusterInfoPublicApi(unittest.TestCase):
             client.close()
 
 
+class TestReportingApis(unittest.TestCase):
+    """Tests for the event reporting and backend-aware query APIs."""
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_report_event_forwards_request(self, mock_make_api_request):
+        """report_event() should forward the request to reportEvent unchanged."""
+        mock_make_api_request.return_value = _ok_response_json()
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        request = {
+            "trace_id": "report-1",
+            "instance_id": "instance-1",
+            "host_ip_port": "10.0.0.2:9600",
+            "storage_type": "ST_VINEYARD",
+            "events": [
+                {
+                    "event_type": "EVENT_HEARTBEAT",
+                    "heartbeat": {"system_status": {"version": "v6d_1.0"}},
+                }
+            ],
+        }
+
+        try:
+            result = client.report_event(request, check_response=False)
+        finally:
+            client.close()
+
+        self.assertEqual(result["header"]["status"]["code"], "OK")
+        mock_make_api_request.assert_called_once_with(
+            "/api/reportEvent", request, False
+        )
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_get_cache_locations_by_backend_forwards_request(
+        self, mock_make_api_request
+    ):
+        """Backend-aware lookup should use getCacheLocationsByBackend."""
+        mock_make_api_request.return_value = _ok_response_json(
+            {"key_locations": []}
+        )
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        request = {
+            "trace_id": "lookup-1",
+            "instance_id": "instance-1",
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [123],
+            "backend_selectors": [
+                {
+                    "backend_type": "ST_VINEYARD",
+                    "strategy": "LSS_V6D_PREFIX",
+                }
+            ],
+        }
+
+        try:
+            result = client.get_cache_locations_by_backend(request)
+        finally:
+            client.close()
+
+        self.assertEqual(result["key_locations"], [])
+        mock_make_api_request.assert_called_once_with(
+            "/api/getCacheLocationsByBackend", request, True
+        )
+
+
 class TestNormalApiStillWorks(unittest.TestCase):
     """Regression tests: normal API calls should still work unchanged."""
 
