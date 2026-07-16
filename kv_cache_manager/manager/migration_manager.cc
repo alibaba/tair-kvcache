@@ -647,8 +647,9 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     // 异构 size 的 spec 分散在不同 create_group；某 group 使一个 block ineligible 后，
     // 之后处理的 group 里同 block 的 spec 可能已被 batch Create 成功分配 URI，却在下面
     // `!eligible` 分支被跳过、不进 preps[i].dst_uris，导致后续 rollback 删不到 → 永久 orphan
-    // （无 CacheLocation meta，reclaimer 也 GC 不到）。收集这些孤儿 URI，在 group 循环后统一删。
-    std::vector<DataStorageUri> skipped_created_uris;
+    // （无 CacheLocation meta，reclaimer 也 GC 不到）。Create 返回 shape 异常时，整组返回的
+    // 成功 URI 同样不能被采用。统一收集这些无 owner 的 URI，在 group 循环后删除。
+    std::vector<DataStorageUri> unowned_created_uris;
     for (auto &[size, entries] : create_groups) {
         std::vector<std::string> keys;
         keys.reserve(entries.size());
@@ -657,13 +658,35 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         }
         auto create_results =
             data_storage_manager_->Create(batch_ctx.get(), first_req.dst_storage_name, keys, size, nullptr);
-        for (std::size_t j = 0; j < entries.size() && j < create_results.size(); ++j) {
+        if (create_results.size() != entries.size()) {
+            KVCM_LOG_WARN(
+                "[%s] batch Create returned unexpected result count on storage %s for size %llu: expected %zu, got "
+                "%zu; rolling back the entire group",
+                trace_id.c_str(),
+                first_req.dst_storage_name.c_str(),
+                static_cast<unsigned long long>(size),
+                entries.size(),
+                create_results.size());
+            // 位置映射以 vector 下标为契约；shape 一旦异常，连前 min(N, M) 项也不能再可信地
+            // 绑定到 request。删除本组实际返回的全部成功 URI，并将本组 request 整体置失败。
+            for (const auto &[ec, uri] : create_results) {
+                if (ec == EC_OK) {
+                    unowned_created_uris.push_back(uri);
+                }
+            }
+            for (const auto &entry : entries) {
+                eligible[entry.req_idx] = false;
+                results[entry.req_idx] = EC_ERROR;
+            }
+            continue;
+        }
+        for (std::size_t j = 0; j < entries.size(); ++j) {
             const auto &e = entries[j];
             if (!eligible[e.req_idx]) {
                 // 该 block 已被其他 spec 的失败标记 ineligible；本 spec 若已成功分配，
                 // 需补删（否则永不进 dst_uris，rollback 漏删）。
                 if (create_results[j].first == EC_OK) {
-                    skipped_created_uris.push_back(create_results[j].second);
+                    unowned_created_uris.push_back(create_results[j].second);
                 }
                 continue;
             }
@@ -678,8 +701,8 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             }
         }
     }
-    if (!skipped_created_uris.empty()) {
-        data_storage_manager_->Delete(batch_ctx.get(), first_req.dst_storage_name, skipped_created_uris, nullptr);
+    if (!unowned_created_uris.empty()) {
+        data_storage_manager_->Delete(batch_ctx.get(), first_req.dst_storage_name, unowned_created_uris, nullptr);
     }
 
     // 回滚 Create 部分失败的 block 的已分配 URI

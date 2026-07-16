@@ -70,6 +70,59 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
 }
 } // namespace f10_orphan_stub
 
+// ---- R2-08 batch Create 返回 shape 测试存根 ----
+// DataStorageBackend::Create 的契约是 keys/results 按下标一一对应；这里分别制造短返回和长返回，
+// 并记录所有成功返回的 URI，验证 shape 异常时调用方不会采用任何结果且会全部回滚。
+namespace r2_08_create_shape_stub {
+enum class Shape {
+    kShort,
+    kLong,
+};
+
+Shape g_shape = Shape::kShort;
+std::vector<DataStorageUri> g_created_uris;
+std::vector<DataStorageUri> g_deleted_uris;
+
+void Reset(Shape shape) {
+    g_shape = shape;
+    g_created_uris.clear();
+    g_deleted_uris.clear();
+}
+
+std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
+                                                              RequestContext * /*rc*/,
+                                                              const std::string &name,
+                                                              const std::vector<std::string> &keys,
+                                                              size_t size,
+                                                              std::function<void()> /*cb*/) {
+    const std::size_t result_count = g_shape == Shape::kShort ? (keys.empty() ? 0 : keys.size() - 1) : keys.size() + 1;
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results;
+    results.reserve(result_count);
+    for (std::size_t i = 0; i < result_count; ++i) {
+        const std::string key = i < keys.size() ? keys[i] : "unexpected_extra_" + std::to_string(i);
+        DataStorageUri uri("dummy://" + name + "/" + key + "?size=" + std::to_string(size));
+        g_created_uris.push_back(uri);
+        results.emplace_back(EC_OK, std::move(uri));
+    }
+    return results;
+}
+
+std::vector<ErrorCode> Delete_stub(void * /*obj*/,
+                                   RequestContext * /*rc*/,
+                                   const std::string & /*name*/,
+                                   const std::vector<DataStorageUri> &uris,
+                                   std::function<void()> /*cb*/) {
+    g_deleted_uris.insert(g_deleted_uris.end(), uris.begin(), uris.end());
+    return std::vector<ErrorCode>(uris.size(), EC_OK);
+}
+
+bool WasDeleted(const DataStorageUri &created) {
+    return std::any_of(g_deleted_uris.begin(), g_deleted_uris.end(), [&](const DataStorageUri &deleted) {
+        return deleted.ToUriString() == created.ToUriString();
+    });
+}
+} // namespace r2_08_create_shape_stub
+
 namespace r2_04_mark_query_stub {
 ErrorCode g_aggregate_ec = EC_OK;
 std::vector<ErrorCode> g_per_key_ecs;
@@ -2063,6 +2116,94 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     }
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 700));
     ASSERT_EQ(0u, mgr.ActiveTaskCount()) << "failed batch item leaked its preparing reservation";
+}
+
+// R2-08: Batch Create 短返回时无法建立完整的位置映射。整组 request 都必须失败，且实际
+// 返回的成功 URI 必须全部删除，不能依赖后面的 per-block spec 数量检查间接兜底。
+TEST_F(MigrationManagerTest, TestBatchSubmitShortCreateResultRollsBackWholeGroup) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "shape_short_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "shape_short_cold/"));
+
+    std::vector<MigrationManager::MigrationRequest> requests;
+    for (int64_t block_key : {830, 831}) {
+        const std::string src_location_id = CreateSourceLocation(block_key, "hot_01", true, "same-size");
+        const auto src_location = GetLocation(block_key, src_location_id);
+        ASSERT_NE(nullptr, src_location);
+        MigrationManager::MigrationRequest request;
+        request.instance_id = kInstance;
+        request.block_key = block_key;
+        request.src_location_id = src_location_id;
+        request.src_storage_name = "hot_01";
+        request.dst_storage_name = "cold_01";
+        request.src_specs = src_location->location_specs();
+        requests.push_back(std::move(request));
+    }
+
+    r2_08_create_shape_stub::Reset(r2_08_create_shape_stub::Shape::kShort);
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_08_create_shape_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), r2_08_create_shape_stub::Delete_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("r2_08_short_create", std::move(requests));
+
+    ASSERT_EQ(2u, results.size());
+    ASSERT_EQ(EC_ERROR, results[0]);
+    ASSERT_EQ(EC_ERROR, results[1]);
+    ASSERT_EQ(1u, r2_08_create_shape_stub::g_created_uris.size());
+    ASSERT_EQ(r2_08_create_shape_stub::g_created_uris.size(), r2_08_create_shape_stub::g_deleted_uris.size());
+    for (const auto &created : r2_08_create_shape_stub::g_created_uris) {
+        ASSERT_TRUE(r2_08_create_shape_stub::WasDeleted(created));
+    }
+    ASSERT_EQ(1u, LocationCount(830));
+    ASSERT_EQ(1u, LocationCount(831));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+}
+
+// R2-08: Batch Create 长返回中的额外 URI 没有对应 CreateEntry。不能只采用前 N 个结果；
+// 本组全部成功返回（包括 extra）都必须删除，且不得发布任何 WRITING location。
+TEST_F(MigrationManagerTest, TestBatchSubmitLongCreateResultDeletesEveryReturnedUri) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "shape_long_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "shape_long_cold/"));
+
+    std::vector<MigrationManager::MigrationRequest> requests;
+    for (int64_t block_key : {832, 833}) {
+        const std::string src_location_id = CreateSourceLocation(block_key, "hot_01", true, "same-size");
+        const auto src_location = GetLocation(block_key, src_location_id);
+        ASSERT_NE(nullptr, src_location);
+        MigrationManager::MigrationRequest request;
+        request.instance_id = kInstance;
+        request.block_key = block_key;
+        request.src_location_id = src_location_id;
+        request.src_storage_name = "hot_01";
+        request.dst_storage_name = "cold_01";
+        request.src_specs = src_location->location_specs();
+        requests.push_back(std::move(request));
+    }
+
+    r2_08_create_shape_stub::Reset(r2_08_create_shape_stub::Shape::kLong);
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_08_create_shape_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), r2_08_create_shape_stub::Delete_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("r2_08_long_create", std::move(requests));
+
+    ASSERT_EQ(2u, results.size());
+    ASSERT_EQ(EC_ERROR, results[0]);
+    ASSERT_EQ(EC_ERROR, results[1]);
+    ASSERT_EQ(3u, r2_08_create_shape_stub::g_created_uris.size());
+    ASSERT_EQ(r2_08_create_shape_stub::g_created_uris.size(), r2_08_create_shape_stub::g_deleted_uris.size());
+    for (const auto &created : r2_08_create_shape_stub::g_created_uris) {
+        ASSERT_TRUE(r2_08_create_shape_stub::WasDeleted(created));
+    }
+    ASSERT_EQ(1u, LocationCount(832));
+    ASSERT_EQ(1u, LocationCount(833));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
 // F-03: ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。
