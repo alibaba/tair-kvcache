@@ -126,12 +126,22 @@ bool WasDeleted(const DataStorageUri &created) {
 // ---- prepared BatchSubmit 逐项 Create 失败测试存根 ----
 // 返回数量严格对齐，但第二项失败，验证普通 per-item failure 不会扩大成整组失败。
 namespace prepared_batch_partial_create_stub {
+int g_create_calls = 0;
+std::vector<std::size_t> g_create_key_counts;
+
+void Reset() {
+    g_create_calls = 0;
+    g_create_key_counts.clear();
+}
+
 std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               RequestContext * /*rc*/,
                                                               const std::string &name,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
                                                               std::function<void()> /*cb*/) {
+    ++g_create_calls;
+    g_create_key_counts.push_back(keys.size());
     std::vector<std::pair<ErrorCode, DataStorageUri>> results;
     results.reserve(keys.size());
     for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -177,6 +187,7 @@ bool g_all_block_scoped_targets_protected = true;
 bool g_cancel_first_reservation_on_create = false;
 std::optional<ErrorCode> g_cancel_result;
 int g_create_calls = 0;
+std::vector<std::size_t> g_create_key_counts;
 
 void Reset() {
     g_manager = nullptr;
@@ -186,6 +197,7 @@ void Reset() {
     g_cancel_first_reservation_on_create = false;
     g_cancel_result.reset();
     g_create_calls = 0;
+    g_create_key_counts.clear();
 }
 
 std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
@@ -195,6 +207,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               size_t size,
                                                               std::function<void()> /*cb*/) {
     ++g_create_calls;
+    g_create_key_counts.push_back(keys.size());
     for (const auto &[instance_id, block_key] : g_expected_reservations) {
         g_all_reserved_before_create =
             g_all_reserved_before_create && g_manager != nullptr && g_manager->HasMigrationTask(instance_id, block_key);
@@ -1629,6 +1642,8 @@ TEST_F(MigrationManagerTest, TestSubmitDuplicate) {
     ASSERT_EQ(1u, mgr.ActiveTaskCount());
 }
 
+// R2-14: success 用例必须显式证明走了真批量主路径。同尺寸的三个 prepared request 应合并为
+// 一次三 key Create，并一次发布三个 WRITING location；不能只凭最终 EC_OK 间接判断。
 TEST_F(MigrationManagerTest, TestBatchSubmit) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_hot/"));
@@ -1651,12 +1666,27 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     }
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
+
+    r2_reservation_stub::Reset();
+    r2_reservation_stub::g_manager = &mgr;
+    r2_reservation_stub::g_expected_reservations = {{kInstance, 800}, {kInstance, 801}, {kInstance, 802}};
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
     auto results = mgr.BatchSubmit("t", reqs);
     ASSERT_EQ(3u, results.size());
     for (auto ec : results) {
         ASSERT_EQ(ErrorCode::EC_OK, ec);
     }
+    ASSERT_EQ(1, r2_reservation_stub::g_create_calls);
+    ASSERT_EQ((std::vector<std::size_t>{3}), r2_reservation_stub::g_create_key_counts);
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
+    for (int64_t block_key = 800; block_key < 803; ++block_key) {
+        const std::string dst_location_id = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+        ASSERT_FALSE(dst_location_id.empty());
+        ASSERT_EQ(2u, LocationCount(block_key));
+        ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_location_id));
+    }
 }
 
 // R2-10: private prepared-request API 不再兼容空 src_specs fallback。违反 contract 时必须在
@@ -2094,6 +2124,65 @@ TEST_F(MigrationManagerTest, TestBatchSubmitSuccessDoesNotClearMarkForDifferentT
     ASSERT_EQ(0u, mgr.GetStats().marks_cleared);
 }
 
+// R2-14: prepared batch 中每个 item 必须绑定自己的 Mark 快照。三个相邻 item 分别携带
+// matching target、different target 和 no-mark，完成回调只能清除第一项，不能按平行下标串位。
+TEST_F(MigrationManagerTest, TestBatchSubmitMarkSnapshotsStayAlignedPerItem) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_mark_align_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_mark_align_cold_01/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_02", GetPrivateTestRuntimeDataPath() + "batch_mark_align_cold_02/"));
+
+    auto make_prepared_request = [&](int64_t block_key) {
+        const std::string src_location_id =
+            CreateSourceLocation(block_key, "hot_01", true, "batch-mark-align");
+        const auto src_location = GetLocation(block_key, src_location_id);
+        EXPECT_NE(nullptr, src_location);
+
+        MigrationManager::MigrationRequest request;
+        request.instance_id = kInstance;
+        request.block_key = block_key;
+        request.src_location_id = src_location_id;
+        request.src_storage_name = "hot_01";
+        request.dst_storage_name = "cold_01";
+        request.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+        if (src_location != nullptr) {
+            request.src_create_time = src_location->create_time();
+            request.src_specs = src_location->location_specs();
+        }
+        return request;
+    };
+
+    std::vector<MigrationManager::MigrationRequest> requests;
+    for (int64_t block_key : {851, 852, 853}) {
+        requests.push_back(make_prepared_request(block_key));
+    }
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {851}, "cold_01")); // 与 Copy 目标匹配。
+    ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {852}, "cold_02")); // 独立迁移意图。
+
+    const auto results = mgr.BatchSubmit("r2_14_mark_alignment", std::move(requests));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), results);
+
+    std::vector<std::string> dst_location_ids;
+    for (int64_t block_key : {851, 852, 853}) {
+        dst_location_ids.push_back(mgr.GetActiveTaskDstLocation(kInstance, block_key));
+        ASSERT_FALSE(dst_location_ids.back().empty());
+    }
+    for (int64_t block_key : {851, 852, 853}) {
+        mgr.OnTaskSuccess(kInstance, block_key);
+    }
+
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(851, dst_location_ids[0]));
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(852, dst_location_ids[1]));
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(853, dst_location_ids[2]));
+    ASSERT_EQ("", mgr.GetTieredWriteTarget(kInstance, 851));
+    ASSERT_EQ("cold_02", mgr.GetTieredWriteTarget(kInstance, 852));
+    ASSERT_EQ("", mgr.GetTieredWriteTarget(kInstance, 853));
+    ASSERT_EQ(1u, mgr.GetStats().marks_cleared);
+}
+
 // F-17/R2-10: prepared BatchSubmit 的 Create 逐项失败不影响其他 request，且测试必须进入
 // 真批量路径，不能再通过空 src_specs fallback 覆盖单条流程。
 TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
@@ -2119,6 +2208,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
+    prepared_batch_partial_create_stub::Reset();
     Stub stub;
     stub.set(ADDR(DataStorageManager, Create), prepared_batch_partial_create_stub::Create_stub);
     auto results = mgr.BatchSubmit("t", reqs);
@@ -2126,10 +2216,15 @@ TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     ASSERT_EQ(ErrorCode::EC_OK, results[0]);
     ASSERT_NE(ErrorCode::EC_OK, results[1]);
     ASSERT_EQ(ErrorCode::EC_OK, results[2]);
+    ASSERT_EQ(1, prepared_batch_partial_create_stub::g_create_calls);
+    ASSERT_EQ((std::vector<std::size_t>{3}), prepared_batch_partial_create_stub::g_create_key_counts);
     ASSERT_EQ(2u, mgr.ActiveTaskCount());
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 900));
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 901));
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 902));
+    ASSERT_EQ(2u, LocationCount(900));
+    ASSERT_EQ(1u, LocationCount(901));
+    ASSERT_EQ(2u, LocationCount(902));
 }
 
 // F-10 泄漏修复: 异构 size spec 分散到多个 create_group,某 group 的 Create 失败使 block
