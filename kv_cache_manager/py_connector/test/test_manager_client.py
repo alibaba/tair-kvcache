@@ -564,17 +564,24 @@ class TestConnectionErrorHandling(unittest.TestCase):
                 discovery = client._service_discovery
                 discovery.refresh = MagicMock(wraps=discovery.refresh)
                 client.session.post = MagicMock(side_effect=error)
+                route_refreshed = threading.Event()
+                original_refresh = client._refresh_manager_route
+
+                def refresh_and_signal(*args, **kwargs):
+                    try:
+                        return original_refresh(*args, **kwargs)
+                    finally:
+                        route_refreshed.set()
+
+                client._refresh_manager_route = refresh_and_signal
                 try:
                     with self.assertRaises(type(error)):
                         client.register_instance({"trace_id": "test"})
 
-                    deadline = time.time() + 1
-                    while (
-                        client.base_url != "http://10.0.0.2:8080"
-                        and time.time() < deadline
-                    ):
-                        time.sleep(0.01)
-
+                    self.assertTrue(
+                        route_refreshed.wait(timeout=5),
+                        "route refresh did not finish after the transport failure",
+                    )
                     self.assertEqual(client.base_url, "http://10.0.0.2:8080")
                     discovery.refresh.assert_called_once_with()
                     mock_discovery_post.assert_not_called()

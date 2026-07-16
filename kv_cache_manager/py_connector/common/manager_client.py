@@ -117,9 +117,8 @@ class KvCacheManagerClient:
                 logger.warning("Initial leader discovery failed, keeping original base_url %s: %s",
                                self.base_url, e)
 
-        # Leader discovery refreshes periodically. Service discovery without
-        # leader discovery is event-driven and only refreshes after transport
-        # failures, so it does not introduce a second refresh lifecycle.
+        # One route-refresh thread serves both modes. Leader discovery wakes
+        # periodically; service-discovery-only mode waits for transport failures.
         if self._auto_discover_leader or self._service_discovery is not None:
             self._refresh_thread = threading.Thread(
                 target=self._route_refresh_loop, daemon=True,
@@ -132,6 +131,7 @@ class KvCacheManagerClient:
 
     @staticmethod
     def _endpoint_url(endpoint: ServiceEndpoint):
+        """Build a Manager URL from the host:port-only HTTP endpoint contract."""
         return f"http://{endpoint.host}"
 
     def _close_service_discovery(self):
@@ -302,6 +302,10 @@ class KvCacheManagerClient:
             try:
                 response = self._make_request('POST', endpoint, data)
             except (requests.ConnectionError, requests.Timeout):
+                # Never retry the current request after a transport failure: without
+                # a response, the client cannot know whether Manager applied it, and
+                # the API set includes non-idempotent writes. Refresh only benefits
+                # subsequent calls.
                 if self._refresh_thread is not None:
                     logger.warning(
                         "Transport request to %s failed, notifying route refresh",
