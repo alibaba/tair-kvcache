@@ -434,9 +434,10 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
 
     // F-12: drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态
     // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
-    // 步骤：draining gate（阻止该 instance 所有新迁移提交，覆盖 reclaimer + admin 两路）
-    //       + PauseReclaimer（快速路径）→ cancel 活跃 copy → 有界等待完成 → 恢复。
-    // RAII guard 保证 EndDraining + ResumeReclaimer 在任何出口（含宏 return）都执行，避免 draining set 泄漏。
+    // 步骤：draining gate（阻止该 instance 所有新 Copy，覆盖 reclaimer + admin 两路）
+    //       → cancel 活跃 copy → 有界等待完成 → 删除并 trim。
+    // RAII guard 保证 EndDraining 在任何出口（含宏 return）都执行，避免 draining set 泄漏。
+    // 不暂停全局 Reclaimer：删除一个 instance 不应阻塞其他 instance，也不能覆盖 Server 生命周期的暂停状态。
     struct DrainGuard {
         CacheManager *mgr;
         std::string instance_id;
@@ -446,14 +447,12 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 if (auto mm = mgr->migration_manager()) {
                     mm->EndDrainingInstance(instance_id);
                 }
-                mgr->ResumeReclaimer();
             }
         }
     } drain_guard{this, instance_id, false};
 
     if (migration_manager_ != nullptr) {
         migration_manager_->BeginDrainingInstance(instance_id); // 契约保证：happens-before 所有后续提交
-        PauseReclaimer();                                       // 快速路径：减少 reclaimer 无效轮转
         drain_guard.active = true;
         const auto active_keys = migration_manager_->GetActiveBlockKeysForInstance(instance_id);
         if (!active_keys.empty()) {

@@ -58,6 +58,29 @@ ErrorCode ReadError_stub(void * /*obj*/,
 }
 } // namespace r2_04_mark_query_stub
 
+namespace r2_07_remove_instance_stub {
+CacheReclaimer *reclaimer = nullptr;
+bool called = false;
+bool observed_paused = false;
+
+void Reset(CacheReclaimer *value) {
+    reclaimer = value;
+    called = false;
+    observed_paused = false;
+}
+
+ErrorCode RemoveInstance_stub(void * /*obj*/,
+                              RequestContext * /*request_context*/,
+                              const std::string & /*instance_group*/,
+                              const std::string & /*instance_id*/) {
+    called = true;
+    if (reclaimer != nullptr) {
+        observed_paused = reclaimer->IsPaused();
+    }
+    return EC_ERROR;
+}
+} // namespace r2_07_remove_instance_stub
+
 class MockDataStorageBackend : public DataStorageBackend {
 public:
     explicit MockDataStorageBackend(std::shared_ptr<MetricsRegistry> mr) : DataStorageBackend(std::move(mr)) {}
@@ -405,6 +428,34 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
         ASSERT_TRUE(Jsonizable::FromJsonString(metas[i], meta));
         ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND), meta.at("status"));
     }
+}
+
+// R2-07: RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
+// Registry stub 在 drain 与删除的边界观察中间状态：false 场景验证删除 A 不会暂停
+// 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。
+TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseState) {
+    Stub stub;
+    stub.set(ADDR(RegistryManager, RemoveInstance), r2_07_remove_instance_stub::RemoveInstance_stub);
+
+    auto verify_pause_state = [&](bool initially_paused) {
+        if (initially_paused) {
+            cache_manager_->PauseReclaimer();
+        } else {
+            cache_manager_->ResumeReclaimer();
+        }
+        ASSERT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
+
+        r2_07_remove_instance_stub::Reset(cache_manager_->cache_reclaimer().get());
+        RequestContext ctx(initially_paused ? "r2_07_paused" : "r2_07_running");
+        EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
+        EXPECT_TRUE(r2_07_remove_instance_stub::called);
+        EXPECT_EQ(initially_paused, r2_07_remove_instance_stub::observed_paused);
+        EXPECT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
+    };
+
+    verify_pause_state(false);
+    verify_pause_state(true);
+    cache_manager_->ResumeReclaimer();
 }
 
 TEST_F(CacheManagerTest, TestRecover) {
