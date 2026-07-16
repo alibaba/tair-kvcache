@@ -71,7 +71,7 @@ class KvCacheManagerClient:
 
         self.base_url = resolved_url.rstrip('/')
 
-        # Leader discovery settings
+        # Manager route settings
         self._instance_id = instance_id
         # Immutable fallback address used when service discovery cannot return a fresh
         # endpoint. For a direct HTTP URL, this remains the stable discovery seed.
@@ -82,21 +82,26 @@ class KvCacheManagerClient:
         self._discovery_refresh_interval = discovery_refresh_interval_seconds
         self._min_discover_interval = min_discover_interval_seconds
 
-        self._leader_lock = threading.Lock()
+        self._route_lock = threading.Lock()
         self._refresh_event = threading.Event()
         self._closed = threading.Event()
-        self._last_discover_time = 0.0  # time.monotonic()
+        self._last_route_refresh_time = 0.0  # time.monotonic()
         self._refresh_thread = None
 
         if self._auto_discover_leader:
             try:
-                self._discover_leader()
+                self._refresh_manager_route()
             except Exception as e:
                 logger.warning("Initial leader discovery failed, keeping original base_url %s: %s",
                                self.base_url, e)
+
+        # Leader discovery refreshes periodically. Service discovery without
+        # leader discovery is event-driven and only refreshes after transport
+        # failures, so it does not introduce a second refresh lifecycle.
+        if self._auto_discover_leader or self._service_discovery is not None:
             self._refresh_thread = threading.Thread(
-                target=self._leader_refresh_loop, daemon=True,
-                name="kvcm-leader-refresh")
+                target=self._route_refresh_loop, daemon=True,
+                name="kvcm-route-refresh")
             self._refresh_thread.start()
 
     @staticmethod
@@ -118,67 +123,79 @@ class KvCacheManagerClient:
         """Extract status code from a standard API response."""
         return response_data.get('header', {}).get('status', {}).get('code')
 
-    def _discover_leader(self):
-        """Query getClusterInfo to discover and switch to the leader node.
-        Returns True if base_url is up-to-date, False on failure.
-        """
+    def _refresh_manager_route(self, force_service_refresh=False):
+        """Refresh the Manager route through service and optional leader discovery."""
         snapshot = self.base_url
-        with self._leader_lock:
+        with self._route_lock:
             # Another thread already updated base_url
             if self.base_url != snapshot:
                 return True
-            return self._do_discover_leader()
 
-    def _do_discover_leader(self):
-        """Actual discovery logic. Must be called under _leader_lock."""
-        url = self._resolve_discovery_url()
+            try:
+                route_url = self._resolve_discovery_url(force_service_refresh)
+                if not self._auto_discover_leader:
+                    if route_url != self.base_url:
+                        logger.info(
+                            "Service discovery refreshed manager route: %s -> %s",
+                            self.base_url,
+                            route_url,
+                        )
+                        self.base_url = route_url
+                    return True
+                return self._do_discover_leader(route_url)
+            finally:
+                self._last_route_refresh_time = time.monotonic()
+
+    def _do_discover_leader(self, url):
+        """Resolve and switch to the leader. Must be called under _route_lock."""
         try:
-            try:
-                resp = requests.post(
-                    url + '/api/getClusterInfo',
-                    json={
-                        "trace_id": f"leader_discovery_{time.monotonic()}",
-                        "instance_id": self._instance_id,
-                    },
-                    headers=self.headers,
-                    timeout=self._request_timeout_seconds,
-                )
-            except Exception as e:
-                logger.warning("Leader discovery request to %s failed: %s", url, e)
-                return False
+            resp = requests.post(
+                url + '/api/getClusterInfo',
+                json={
+                    "trace_id": f"leader_discovery_{time.monotonic()}",
+                    "instance_id": self._instance_id,
+                },
+                headers=self.headers,
+                timeout=self._request_timeout_seconds,
+            )
+        except Exception as e:
+            logger.warning("Leader discovery request to %s failed: %s", url, e)
+            return False
 
-            if resp.status_code != 200:
-                logger.warning("Leader discovery to %s returned status %d", url, resp.status_code)
-                return False
+        if resp.status_code != 200:
+            logger.warning("Leader discovery to %s returned status %d", url, resp.status_code)
+            return False
 
-            try:
-                data = resp.json()
-            except Exception as e:
-                logger.warning("Leader discovery response from %s is not valid JSON: %s", url, e)
-                return False
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.warning("Leader discovery response from %s is not valid JSON: %s", url, e)
+            return False
 
-            if self._get_status_code(data) != 'OK':
-                msg = data.get('header', {}).get('status', {}).get('message', 'unknown')
-                logger.warning("Leader discovery from %s returned error: %s", url, msg)
-                return False
+        if self._get_status_code(data) != 'OK':
+            msg = data.get('header', {}).get('status', {}).get('message', 'unknown')
+            logger.warning("Leader discovery from %s returned error: %s", url, msg)
+            return False
 
-            leader_ep = data.get('leader_endpoint')
-            if not leader_ep or not leader_ep.get('host') or not leader_ep.get('meta_http_port'):
-                logger.warning("Leader discovery from %s: leader_endpoint missing or incomplete", url)
-                return False
+        leader_ep = data.get('leader_endpoint')
+        if not leader_ep or not leader_ep.get('host') or not leader_ep.get('meta_http_port'):
+            logger.warning("Leader discovery from %s: leader_endpoint missing or incomplete", url)
+            return False
 
-            new_url = f"http://{leader_ep['host']}:{leader_ep['meta_http_port']}"
-            if new_url != self.base_url:
-                logger.info("Leader discovered: switching base_url from %s to %s", self.base_url, new_url)
-                self.base_url = new_url
-            return True
-        finally:
-            self._last_discover_time = time.monotonic()
+        new_url = f"http://{leader_ep['host']}:{leader_ep['meta_http_port']}"
+        if new_url != self.base_url:
+            logger.info("Leader discovered: switching base_url from %s to %s", self.base_url, new_url)
+            self.base_url = new_url
+        return True
 
-    def _resolve_discovery_url(self):
+    def _resolve_discovery_url(self, force_refresh=False):
         """Resolve a fresh leader-discovery seed, falling back to the initial one."""
         if self._service_discovery is not None:
             try:
+                if force_refresh and not self._service_discovery.refresh():
+                    logger.warning(
+                        "Failed to force-refresh manager service discovery; using cached endpoints"
+                    )
                 endpoint = self._service_discovery.get_one_endpoint()
             except Exception as e:
                 logger.warning(
@@ -194,22 +211,31 @@ class KvCacheManagerClient:
                 )
         return self._discovery_url
 
-    def _leader_refresh_loop(self):
-        """Background daemon: periodically refresh leader address, supports urgent wakeup."""
+    def _route_refresh_loop(self):
+        """Background daemon for periodic leader and event-driven route refresh."""
         while not self._closed.is_set():
-            self._refresh_event.wait(timeout=self._discovery_refresh_interval)
+            timeout = (
+                self._discovery_refresh_interval
+                if self._auto_discover_leader
+                else None
+            )
+            refresh_requested = self._refresh_event.wait(timeout=timeout)
             self._refresh_event.clear()
             if self._closed.is_set():
                 break
             # Min interval protection: wait remaining time instead of skipping
-            remaining = self._min_discover_interval - (time.monotonic() - self._last_discover_time)
+            remaining = self._min_discover_interval - (
+                time.monotonic() - self._last_route_refresh_time
+            )
             if remaining > 0:
                 if self._closed.wait(timeout=remaining):
                     break
             try:
-                self._discover_leader()
+                self._refresh_manager_route(
+                    force_service_refresh=refresh_requested,
+                )
             except Exception as e:
-                logger.warning("Background leader refresh failed: %s", e)
+                logger.warning("Background manager route refresh failed: %s", e)
 
     def _make_request(self, method, endpoint, data=None):
         """Helper method to make HTTP requests to the service"""
@@ -253,9 +279,12 @@ class KvCacheManagerClient:
         while True:
             try:
                 response = self._make_request('POST', endpoint, data)
-            except requests.ConnectionError:
-                if self._auto_discover_leader:
-                    logger.warning("Connection to %s failed, notifying background refresh", self.base_url)
+            except (requests.ConnectionError, requests.Timeout):
+                if self._refresh_thread is not None:
+                    logger.warning(
+                        "Transport request to %s failed, notifying route refresh",
+                        self.base_url,
+                    )
                     self._refresh_event.set()
                 raise
 
@@ -272,7 +301,7 @@ class KvCacheManagerClient:
                                    "retrying after %.3fs (retries left: %d)",
                                    endpoint, sleep_time, retries_left)
                     time.sleep(sleep_time)
-                    if self._discover_leader():
+                    if self._refresh_manager_route():
                         continue
                 if retries_left <= 0:
                     logger.error("All leader discovery retries exhausted for %s", endpoint)

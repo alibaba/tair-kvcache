@@ -132,7 +132,7 @@ class TestServiceDiscoveryInit(unittest.TestCase):
             mock_post.return_value = _make_mock_response(
                 _cluster_info_response("10.0.0.50", 7070)
             )
-            self.assertTrue(client._discover_leader())
+            self.assertTrue(client._refresh_manager_route())
             self.assertEqual(
                 mock_post.call_args[0][0],
                 "http://10.0.0.1:8080/api/getClusterInfo",
@@ -353,7 +353,7 @@ class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):
         mock_post.side_effect = capture_url
 
         try:
-            result = client._discover_leader()
+            result = client._refresh_manager_route()
             self.assertTrue(result)
             self.assertEqual(client.base_url, "http://10.0.0.50:7070")
             # Only the seed discovery_url should have been called
@@ -453,9 +453,31 @@ class TestServerNotLeaderRetry(unittest.TestCase):
         finally:
             client.close()
 
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_not_leader_does_not_rotate_service_endpoint_when_disabled(
+        self,
+        mock_discovery_post,
+    ):
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8080",
+            auto_discover_leader=False,
+            min_discover_interval_seconds=0,
+        )
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_not_leader_response())
+        )
+
+        try:
+            with self.assertRaises(AssertionError):
+                client.register_instance({"trace_id": "test"})
+            self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+            mock_discovery_post.assert_not_called()
+        finally:
+            client.close()
+
 
 class TestConnectionErrorHandling(unittest.TestCase):
-    """Tests for ConnectionError handling and background refresh wakeup."""
+    """Tests for transport error handling and route refresh wakeup."""
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_connection_error_wakes_background_refresh(self, mock_discovery_post):
@@ -503,6 +525,41 @@ class TestConnectionErrorHandling(unittest.TestCase):
         finally:
             client.close()
 
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_transport_error_refreshes_service_endpoint_without_leader_discovery(
+        self,
+        mock_discovery_post,
+    ):
+        for error in (
+            requests.ConnectionError("Connection refused"),
+            requests.Timeout("Request timed out"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                client = KvCacheManagerClient(
+                    "static://10.0.0.1:8080,10.0.0.2:8080",
+                    auto_discover_leader=False,
+                    min_discover_interval_seconds=0,
+                )
+                discovery = client._service_discovery
+                discovery.refresh = MagicMock(wraps=discovery.refresh)
+                client.session.post = MagicMock(side_effect=error)
+                try:
+                    with self.assertRaises(type(error)):
+                        client.register_instance({"trace_id": "test"})
+
+                    deadline = time.time() + 1
+                    while (
+                        client.base_url != "http://10.0.0.2:8080"
+                        and time.time() < deadline
+                    ):
+                        time.sleep(0.01)
+
+                    self.assertEqual(client.base_url, "http://10.0.0.2:8080")
+                    discovery.refresh.assert_called_once_with()
+                    mock_discovery_post.assert_not_called()
+                finally:
+                    client.close()
+
 
 class TestBackgroundRefresh(unittest.TestCase):
     """Tests for background leader refresh thread."""
@@ -528,7 +585,7 @@ class TestBackgroundRefresh(unittest.TestCase):
                 _cluster_info_response("10.0.0.2", 9090)
             )
             # Reset last discover time so min interval doesn't block
-            client._last_discover_time = 0
+            client._last_route_refresh_time = 0
 
             # Trigger urgent wakeup
             client._refresh_event.set()
@@ -596,11 +653,11 @@ class TestCloseLifecycle(unittest.TestCase):
 
 
 class TestThreadSafety(unittest.TestCase):
-    """Tests for thread-safe leader discovery dedup."""
+    """Tests for thread-safe Manager route refresh dedup."""
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_concurrent_discover_dedup(self, mock_post):
-        """Multiple threads calling _discover_leader should dedup via lock."""
+        """Concurrent Manager route refresh calls should dedup via lock."""
         actual_discover_count = [0]
         original_post = mock_post
 
@@ -622,13 +679,13 @@ class TestThreadSafety(unittest.TestCase):
             actual_discover_count[0] = 0
             client.base_url = "http://10.0.0.1:8080"  # reset to trigger discovery
 
-            # Launch many threads that all call _discover_leader
+            # Launch many threads that all refresh the Manager route.
             threads = []
             results = []
             lock = threading.Lock()
 
             def do_discover():
-                result = client._discover_leader()
+                result = client._refresh_manager_route()
                 with lock:
                     results.append(result)
 
@@ -644,7 +701,7 @@ class TestThreadSafety(unittest.TestCase):
             # All should have succeeded
             self.assertTrue(all(results))
             # But the actual HTTP call should only have happened once (or very few times)
-            # due to the snapshot-check dedup in _discover_leader
+            # due to the snapshot-check dedup in _refresh_manager_route
             self.assertLessEqual(actual_discover_count[0], 2)
         finally:
             client.close()
