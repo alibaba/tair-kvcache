@@ -160,12 +160,13 @@ def _make_single_spec(name, uri):
     return [{"name": name, "uri": uri}]
 
 
-def _ev_block_delete(block_key, medium):
+def _ev_block_delete(block_key, medium, spec_names):
     return {
         "event_type": "EVENT_BLOCK_DELETE",
         "block_delete": {
             "block_key": str(block_key),
             "medium": medium,
+            "spec_names": list(spec_names),
         },
     }
 
@@ -467,7 +468,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_delete(block_key, "mem")],
+                [_ev_block_delete(block_key, "mem", ["spec_4096"])],
                 trace_id="t06b",
             )
         )
@@ -479,7 +480,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_delete(99999, "mem")],
+                [_ev_block_delete(99999, "mem", ["spec_4096"])],
                 trace_id="t07",
             ),
             check_ok=False,
@@ -889,7 +890,7 @@ class EventReportBenchTest(unittest.TestCase):
             for i in range(ops_per_thread):
                 block_key = thread_id * ops_per_thread + i + 200000
                 events = [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(
-                    host, "mem"))), _ev_block_delete(block_key, "mem"), _ev_heartbeat({"thread": str(thread_id)}), ]
+                    host, "mem"))), _ev_block_delete(block_key, "mem", ["spec_4096"]), _ev_heartbeat({"thread": str(thread_id)}), ]
                 payload = _make_request(
                     self.instance_id, host, events,
                     trace_id=f"bench_mixed_{thread_id}_{i}",

@@ -924,7 +924,12 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                   request->instance_id().c_str(),
                   request->block_cache_keys_size());
 
-    auto [ec, host_matches] = cache_manager_->GetHostCacheState(request_context, request->instance_id(), keys, mediums);
+    auto query_type = static_cast<CacheManager::QueryType>(request->query_type());
+    if (query_type == CacheManager::QueryType::QT_UNSPECIFIED) {
+        query_type = CacheManager::QueryType::QT_PREFIX_MATCH;
+    }
+    auto [ec, host_matches] =
+        cache_manager_->GetHostCacheState(request_context, request->instance_id(), query_type, keys, mediums);
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());

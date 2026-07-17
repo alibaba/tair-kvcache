@@ -41,6 +41,7 @@ public:
         QT_BATCH_GET = 1,
         QT_PREFIX_MATCH = 2,
         QT_REVERSE_ROLL_SW_MATCH = 3,
+        QT_PREFIX_MATCH_WITH_MAMBA = 4,
     };
     std::string QueryTypeToString(QueryType query_type) const {
         switch (query_type) {
@@ -50,6 +51,8 @@ public:
             return "prefix_match";
         case QueryType::QT_REVERSE_ROLL_SW_MATCH:
             return "reverse_roll_sw_match";
+        case QueryType::QT_PREFIX_MATCH_WITH_MAMBA:
+            return "prefix_match_with_mamba";
         default:
             return "unspecified";
         }
@@ -169,6 +172,7 @@ public:
     std::pair<ErrorCode, std::vector<HostCacheMatch>>
     GetHostCacheState(RequestContext *request_context,
                       const std::string &instance_id,
+                      QueryType query_type,
                       const KeyVector &block_cache_keys,
                       const std::vector<std::string> &medium_filter = {});
     ErrorCode TrimCache(RequestContext *request_context,

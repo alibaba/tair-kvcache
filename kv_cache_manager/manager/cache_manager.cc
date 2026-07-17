@@ -2322,6 +2322,7 @@ SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_i
 std::pair<ErrorCode, std::vector<CacheManager::HostCacheMatch>>
 CacheManager::GetHostCacheState(RequestContext *request_context,
                                 const std::string &instance_id,
+                                QueryType query_type,
                                 const KeyVector &block_cache_keys,
                                 const std::vector<std::string> &medium_filter) {
     SPAN_TRACER(request_context);
@@ -2335,6 +2336,20 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                           std::vector<HostCacheMatch>,
                                           "meta searcher not found for instance: %s",
                                           instance_id.c_str());
+    }
+
+    if (block_cache_keys.empty()) {
+        return {EC_OK, {}};
+    }
+    if (query_type == QueryType::QT_UNSPECIFIED) {
+        query_type = QueryType::QT_PREFIX_MATCH;
+    }
+    if (query_type != QueryType::QT_PREFIX_MATCH && query_type != QueryType::QT_PREFIX_MATCH_WITH_MAMBA) {
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                          EC_BADARGS,
+                                          std::vector<HostCacheMatch>,
+                                          "unsupported query type for GetHostCacheState: %s",
+                                          QueryTypeToString(query_type).c_str());
     }
 
     // Build medium filter set (empty = match all mediums)
@@ -2351,15 +2366,10 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
         WARN, ec, std::vector<HostCacheMatch>, "BatchGetLocation failed for instance: %s", instance_id.c_str());
     assert(block_cache_keys.size() == location_maps.size());
 
-    // Parse locations and compute prefix match per host
-    // Extract host_ip_port and medium from URI instead of parsing location_id.
-    std::map<std::string, int64_t> host_prefix;
-    std::set<std::string> active_hosts;
+    std::vector<std::map<std::string, std::set<std::string>>> key_host_specs(block_cache_keys.size());
     const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
-
     for (size_t i = 0; i < block_cache_keys.size(); ++i) {
         const auto &locations = location_maps[i];
-        std::set<std::string> owners;
         for (const auto &kv : locations) {
             if (!kv.second || kv.second->location_specs().empty()) {
                 continue;
@@ -2367,42 +2377,55 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
             if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
                 continue;
             }
-            const std::string &uri_str = kv.second->location_specs().front().uri();
-            StandardUri parsed_uri(uri_str);
-            if (!parsed_uri.Valid()) {
-                continue;
-            }
-
-            std::string host = parsed_uri.GetHostPort();
-            if (host.empty()) {
-                continue;
-            }
-
-            // Medium filter: empty filter = match all
-            if (!medium_set.empty()) {
-                std::string medium = parsed_uri.GetPath();
-                // Path format: "/mem" -> "mem"
-                if (!medium.empty() && medium[0] == '/') {
-                    medium = medium.substr(1);
-                }
-                if (medium_set.find(medium) == medium_set.end()) {
+            for (const auto &spec : kv.second->location_specs()) {
+                StandardUri parsed_uri(spec.uri());
+                if (!parsed_uri.Valid()) {
                     continue;
                 }
-            }
 
-            owners.insert(host);
+                std::string host = parsed_uri.GetHostPort();
+                if (host.empty()) {
+                    continue;
+                }
+
+                // Medium filter: empty filter = match all
+                if (!medium_set.empty()) {
+                    std::string medium = parsed_uri.GetPath();
+                    // Path format: "/mem" -> "mem"
+                    if (!medium.empty() && medium[0] == '/') {
+                        medium = medium.substr(1);
+                    }
+                    if (medium_set.find(medium) == medium_set.end()) {
+                        continue;
+                    }
+                }
+
+                key_host_specs[i][host].insert(spec.name());
+            }
         }
+    }
 
-        if (i == 0) {
-            // First key: initialize active_hosts with all owners
-            for (const auto &h : owners) {
-                active_hosts.insert(h);
+    auto calc_prefix_match = [&block_cache_keys, &key_host_specs]() {
+        std::map<std::string, int64_t> host_prefix;
+        std::set<std::string> active_hosts;
+        for (size_t i = 0; i < block_cache_keys.size(); ++i) {
+            std::set<std::string> owners;
+            for (const auto &kv : key_host_specs[i]) {
+                owners.insert(kv.first);
             }
-            if (active_hosts.empty()) {
-                // No host owns the first key — no prefix match possible
-                break;
+
+            if (i == 0) {
+                // First key: initialize active_hosts with all owners
+                for (const auto &h : owners) {
+                    active_hosts.insert(h);
+                }
+                if (active_hosts.empty()) {
+                    // No host owns the first key — no prefix match possible
+                    break;
+                }
+                continue;
             }
-        } else {
+
             // Terminate hosts not in owners
             std::set<std::string> confirmed;
             for (const auto &h : active_hosts) {
@@ -2418,11 +2441,86 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                 break;
             }
         }
-    }
 
-    // Remaining active hosts matched all keys
-    for (const auto &h : active_hosts) {
-        host_prefix[h] = static_cast<int64_t>(block_cache_keys.size());
+        // Remaining active hosts matched all keys
+        for (const auto &h : active_hosts) {
+            host_prefix[h] = static_cast<int64_t>(block_cache_keys.size());
+        }
+        return host_prefix;
+    };
+
+    std::map<std::string, int64_t> host_prefix;
+    if (query_type == QueryType::QT_PREFIX_MATCH) {
+        host_prefix = calc_prefix_match();
+    } else {
+        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        if (!instance_info) {
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+                WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
+        }
+        std::vector<const LocationSpecGroup *> full_groups;
+        std::vector<const LocationSpecGroup *> gdn_groups;
+        for (const auto &group : instance_info->location_spec_groups()) {
+            if (group.name().rfind("full", 0) == 0) {
+                full_groups.push_back(&group);
+            } else {
+                gdn_groups.push_back(&group);
+            }
+        }
+        if (full_groups.empty()) {
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                              EC_BADARGS,
+                                              std::vector<HostCacheMatch>,
+                                              "no full location spec group for instance: %s",
+                                              instance_id.c_str());
+        }
+
+        auto has_all_groups = [](const std::set<std::string> &spec_names,
+                                 const std::vector<const LocationSpecGroup *> &groups) {
+            for (const auto *group : groups) {
+                for (const auto &spec_name : group->spec_names()) {
+                    if (spec_names.find(spec_name) == spec_names.end()) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        std::set<std::string> candidate_hosts;
+        for (const auto &kv : key_host_specs.front()) {
+            candidate_hosts.insert(kv.first);
+        }
+        for (const auto &host : candidate_hosts) {
+            size_t full_prefix_len = 0;
+            for (; full_prefix_len < key_host_specs.size(); ++full_prefix_len) {
+                auto host_it = key_host_specs[full_prefix_len].find(host);
+                if (host_it == key_host_specs[full_prefix_len].end()
+                    || !has_all_groups(host_it->second, full_groups)) {
+                    break;
+                }
+            }
+            if (full_prefix_len == 0) {
+                continue;
+            }
+
+            int64_t final_len = 0;
+            if (gdn_groups.empty()) {
+                final_len = static_cast<int64_t>(full_prefix_len);
+            } else {
+                for (size_t offset = full_prefix_len; offset > 0; --offset) {
+                    const size_t index = offset - 1;
+                    auto host_it = key_host_specs[index].find(host);
+                    if (host_it != key_host_specs[index].end() && has_all_groups(host_it->second, gdn_groups)) {
+                        final_len = static_cast<int64_t>(index + 1);
+                        break;
+                    }
+                }
+            }
+            if (final_len > 0) {
+                host_prefix[host] = final_len;
+            }
+        }
     }
 
     // Assemble result

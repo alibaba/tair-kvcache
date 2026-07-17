@@ -288,6 +288,7 @@ enum QueryType {
     QT_BATCH_GET = 1;
     QT_PREFIX_MATCH = 2;
     QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
 message GetCacheLocationRequest {
@@ -488,8 +489,9 @@ service MetaService {
 message GetHostCacheStateRequest {
     string trace_id = 1;
     string instance_id = 2;
-    repeated int64 block_cache_keys = 3;   // 请求 prompt 的有序 block cache keys
-    repeated string medium = 4;            // 要匹配的介质列表；为空时考虑所有介质
+    QueryType query_type = 3;
+    repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
+    repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
 }
 
 message HostCacheMatch {

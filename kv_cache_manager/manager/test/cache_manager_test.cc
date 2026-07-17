@@ -3657,7 +3657,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     //   host_C: prefix=1 (100; miss 200)
     {
         CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3, hosts.size());
 
@@ -3673,7 +3674,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     //   host_C: prefix=1 (miss 200)
     {
         CacheManager::KeyVector keys = {100, 200, 300, 400};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3, hosts.size());
 
@@ -3685,7 +3687,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     // --- Test 3: single key — all hosts have prefix=1 ---
     {
         CacheManager::KeyVector keys = {100};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3, hosts.size());
 
@@ -3698,7 +3701,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     // keys = {999, 100, 200}
     {
         CacheManager::KeyVector keys = {999, 100, 200};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         EXPECT_EQ(0, hosts.size());
     }
@@ -3707,7 +3711,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     // Note: MetaServiceImpl layer rejects empty keys; CacheManager returns empty directly.
     {
         CacheManager::KeyVector keys = {};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         EXPECT_EQ(0, hosts.size());
     }
@@ -3715,7 +3720,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     // --- Test 6: medium filter (only "mem") — should not change results ---
     {
         CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys, {"mem"});
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"mem"});
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3, hosts.size());
 
@@ -3727,7 +3733,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     // --- Test 7: medium filter (non-existent medium "ssd") → no hosts ---
     {
         CacheManager::KeyVector keys = {100, 200};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys, {"ssd"});
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"ssd"});
         ASSERT_EQ(EC_OK, ec);
         EXPECT_EQ(0, hosts.size());
     }
@@ -3736,7 +3743,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     {
         event_backend->SetNodeUnavailable("test_instance", "10.0.0.2:8080");
         CacheManager::KeyVector keys = {100, 200, 300, 400};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(2, hosts.size());
 
@@ -3746,5 +3754,111 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     }
 
     dsm->storage_map_.erase("event_backend_default");
+}
+
+TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_host_cache_state_mamba";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("full_0", 512),
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("full_0", {"full_0"}),
+        LocationSpecGroup("linear_0", {"linear_0"}),
+        LocationSpecGroup("linear_1", {"linear_1"}),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto event_backend = std::make_shared<EventReportBackend>(metrics_registry);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_mamba");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["event_backend_mamba"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates({"event_backend_mamba"});
+
+    auto report_specs = [&](const std::string &host, int64_t key, const std::vector<std::string> &spec_names) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium("mem");
+        for (const auto &spec_name : spec_names) {
+            auto *spec = ba->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/mem");
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    const std::string host_a = "10.0.1.1:8080";
+    const std::string host_b = "10.0.1.2:8080";
+    const std::string host_c = "10.0.1.3:8080";
+
+    report_specs(host_a, 100, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_a, 200, {"full_0"});
+    report_specs(host_a, 300, {"full_0"});
+    report_specs(host_a, 300, {"linear_0", "linear_1"});
+    report_specs(host_a, 400, {"full_0", "linear_0"});
+
+    report_specs(host_b, 100, {"full_0"});
+    report_specs(host_b, 200, {"full_0"});
+    report_specs(host_b, 300, {"full_0"});
+    report_specs(host_b, 400, {"full_0", "linear_0", "linear_1"});
+
+    report_specs(host_c, 100, {"full_0"});
+    report_specs(host_c, 200, {"full_0"});
+
+    auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
+        for (const auto &h : hosts) {
+            if (h.host_ip_port == host) {
+                return h.prefix_match_blocks;
+            }
+        }
+        return -1;
+    };
+
+    CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, keys);
+    ASSERT_EQ(EC_OK, ec);
+
+    EXPECT_EQ(3, find_prefix(hosts, host_a));
+    EXPECT_EQ(4, find_prefix(hosts, host_b));
+    EXPECT_EQ(-1, find_prefix(hosts, host_c));
+
+    auto [prefix_ec, prefix_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+    ASSERT_EQ(EC_OK, prefix_ec);
+    EXPECT_EQ(4, find_prefix(prefix_hosts, host_a));
+    EXPECT_EQ(4, find_prefix(prefix_hosts, host_b));
+    EXPECT_EQ(2, find_prefix(prefix_hosts, host_c));
+
+    dsm->storage_map_.erase("event_backend_mamba");
 }
 } // namespace kv_cache_manager
