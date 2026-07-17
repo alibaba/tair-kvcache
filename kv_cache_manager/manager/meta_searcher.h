@@ -73,16 +73,16 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<std::string> &out_location_ids);
-    struct UpsertLocation {
+    struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
-    ErrorCode BatchUpsertLocations(RequestContext *request_context,
-                                   const KeyVector &keys,
-                                   const std::vector<std::vector<UpsertLocation>> &new_locations_per_key,
-                                   std::vector<ErrorCode> &out_per_key_ec);
+    ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
+                                      const KeyVector &keys,
+                                      const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
+                                      std::vector<ErrorCode> &out_per_key_ec);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;

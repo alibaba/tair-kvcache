@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -31,6 +32,36 @@ void LogErrorCodes(const std::string &operation_name,
             KVCM_LOG_WARN("%s failed, keys[%lu](%lu) return %d", operation_name.c_str(), i, keys[i], error_codes[i]);
         }
     }
+}
+
+std::uint64_t GetLocationSpecsSize(const std::vector<LocationSpec> &specs) {
+    std::uint64_t total_size = 0;
+    for (const auto &loc_spec : specs) {
+        if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+            std::uint64_t spec_size = 0;
+            ds_uri.GetParamAs<std::uint64_t>("size", spec_size);
+            total_size += spec_size;
+        }
+    }
+    return total_size;
+}
+
+std::vector<LocationSpec> MergeLocationSpecsByName(const std::vector<LocationSpec> &old_specs,
+                                                   const std::vector<LocationSpec> &new_specs) {
+    std::map<std::string, LocationSpec> merged_specs;
+    for (const auto &spec : old_specs) {
+        merged_specs[spec.name()] = spec;
+    }
+    for (const auto &spec : new_specs) {
+        merged_specs[spec.name()] = spec;
+    }
+
+    std::vector<LocationSpec> specs;
+    specs.reserve(merged_specs.size());
+    for (auto &[name, spec] : merged_specs) {
+        specs.push_back(std::move(spec));
+    }
+    return specs;
 }
 
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
@@ -714,31 +745,41 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     return result.ec;
 }
 
-ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
-                                             const KeyVector &keys,
-                                             const std::vector<std::vector<UpsertLocation>> &new_locations_per_key,
-                                             std::vector<ErrorCode> &out_per_key_ec) {
-    if (keys.size() != new_locations_per_key.size()) {
+ErrorCode MetaSearcher::BatchMergeLocationSpecs(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
+    std::vector<ErrorCode> &out_per_key_ec) {
+    if (keys.size() != tasks_per_key.size()) {
         return EC_BADARGS;
     }
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
 
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
+    std::vector<std::vector<MergeLocationSpecsTask>> merge_tasks_per_key(keys.size());
 
-    auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](
-                        const LocationIdVector & /*existing_ids*/,
-                        ErrorCode get_ec,
-                        size_t index,
-                        PropertyMap & /*upsert_property_map*/,
-                        CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto create_modifier = [&tasks_per_key, &merge_tasks_per_key, &keys, &loc_sz, batch_create_time](
+                               const LocationIdVector &existing_ids,
+                               ErrorCode get_ec,
+                               size_t index,
+                               PropertyMap & /*upsert_property_map*/,
+                               CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
+            KVCM_LOG_WARN("load location ids failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
         }
+
+        const std::unordered_set<std::string> existing_id_set(existing_ids.begin(), existing_ids.end());
         std::uint64_t key_total_sz = 0;
         DataStorageType key_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        for (const auto &entry : new_locations_per_key[index]) {
+        bool created = false;
+        for (const auto &entry : tasks_per_key[index]) {
+            if (get_ec == ErrorCode::EC_OK && existing_id_set.count(entry.location_id) > 0) {
+                merge_tasks_per_key[index].push_back(entry);
+                continue;
+            }
+
             CacheLocation loc;
             loc.set_id(entry.location_id);
             loc.set_type(entry.type);
@@ -747,24 +788,24 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             loc.set_create_time(batch_create_time);
             for (const auto &ls : entry.specs) {
                 loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
-                if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {
-                    std::uint64_t spec_sz = 0;
-                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                    key_total_sz += spec_sz;
-                }
             }
             out_new_locations[entry.location_id] = std::make_shared<const CacheLocation>(std::move(loc));
+            key_total_sz += GetLocationSpecsSize(entry.specs);
             if (key_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
                 key_type = entry.type;
             }
+            created = true;
         }
         loc_sz[index] = std::make_pair(key_type, key_total_sz);
+        if (!created) {
+            return {ModifierAction::MA_SKIP, ErrorCode::EC_OK};
+        }
         return {ModifierAction::MA_OK, ErrorCode::EC_OK};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
-    auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, modifier);
+    auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, create_modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -777,8 +818,119 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
+        return result.ec;
     }
-    return result.ec;
+
+    KeyVector merge_keys;
+    std::vector<size_t> merge_key_indexs;
+    LocationIdsPerKey merge_location_ids;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (out_per_key_ec[i] != ErrorCode::EC_OK || merge_tasks_per_key[i].empty()) {
+            continue;
+        }
+        merge_keys.push_back(keys[i]);
+        merge_key_indexs.push_back(i);
+        auto &ids = merge_location_ids.emplace_back();
+        ids.reserve(merge_tasks_per_key[i].size());
+        for (const auto &task : merge_tasks_per_key[i]) {
+            ids.push_back(task.location_id);
+        }
+    }
+
+    if (merge_keys.empty()) {
+        return result.ec;
+    }
+
+    std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> merge_locs_sz(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        merge_locs_sz[i].resize(merge_tasks_per_key[i].size());
+    }
+    auto merge_modifier = [&merge_tasks_per_key, &merge_key_indexs, &merge_locs_sz, batch_create_time](
+                              const std::vector<ErrorCode> &get_ecs,
+                              const LocationIdVector &loc_ids,
+                              size_t key_index,
+                              CacheLocationVector &locs,
+                              PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        const size_t original_key_index = merge_key_indexs[key_index];
+        const auto &tasks = merge_tasks_per_key[original_key_index];
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+            const ErrorCode ec = get_ecs[loc_index];
+            if (loc_index >= tasks.size()) {
+                modifier_ecs[loc_index] = ErrorCode::EC_ERROR;
+                continue;
+            }
+            const auto &task = tasks[loc_index];
+            if (ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT) {
+                modifier_ecs[loc_index] = ec;
+                continue;
+            }
+
+            std::shared_ptr<CacheLocation> new_loc;
+            if (ec == ErrorCode::EC_OK && locs[loc_index]) {
+                new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
+                auto merged_specs = MergeLocationSpecsByName(new_loc->location_specs(), task.specs);
+                new_loc->set_location_specs(std::move(merged_specs));
+            } else {
+                new_loc = std::make_shared<CacheLocation>();
+                new_loc->set_id(task.location_id);
+                std::vector<LocationSpec> specs;
+                specs.reserve(task.specs.size());
+                for (const auto &spec : task.specs) {
+                    specs.emplace_back(spec.name(), spec.uri());
+                }
+                new_loc->set_location_specs(std::move(specs));
+            }
+            new_loc->set_type(task.type);
+            new_loc->set_status(task.status);
+            new_loc->set_create_time(batch_create_time);
+            new_loc->set_spec_size(new_loc->location_specs().size());
+            locs[loc_index] = std::move(new_loc);
+            merge_locs_sz[original_key_index][loc_index] =
+                std::make_pair(task.type, GetLocationSpecsSize(task.specs));
+            updated = true;
+        }
+        if (!updated) {
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
+        }
+        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
+    };
+
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto merge_result = meta_indexer_->ReadModifyWriteLocation(
+        request_context, merge_keys, merge_location_ids, merge_modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+
+    for (size_t i = 0; i < merge_key_indexs.size(); ++i) {
+        const size_t original_key_index = merge_key_indexs[i];
+        ErrorCode key_ec = ErrorCode::EC_OK;
+        if (i >= merge_result.per_location_error_codes.size()) {
+            key_ec = merge_result.ec == ErrorCode::EC_OK ? ErrorCode::EC_ERROR : merge_result.ec;
+        } else {
+            for (size_t loc_index = 0; loc_index < merge_result.per_location_error_codes[i].size(); ++loc_index) {
+                const auto loc_ec = merge_result.per_location_error_codes[i][loc_index];
+                if (loc_ec == ErrorCode::EC_OK) {
+                    const auto &sz = merge_locs_sz[original_key_index][loc_index];
+                    meta_indexer_->AddStorageUsageByType(sz.first, sz.second);
+                    continue;
+                }
+                if (key_ec == ErrorCode::EC_OK) {
+                    key_ec = loc_ec;
+                }
+            }
+        }
+        if (key_ec != ErrorCode::EC_OK) {
+            out_per_key_ec[original_key_index] = key_ec;
+        }
+    }
+
+    if (merge_result.ec != ErrorCode::EC_OK) {
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", merge_result.ec);
+        return merge_result.ec;
+    }
+    return ErrorCode::EC_OK;
 }
 
 ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_context,

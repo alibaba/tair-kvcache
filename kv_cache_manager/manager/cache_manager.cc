@@ -1531,6 +1531,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         std::vector<LocationSpec> specs;
         int event_index;
     };
+    struct BlockAddMergeEntry {
+        std::string location_id;
+        std::vector<LocationSpec> specs;
+        std::vector<int> event_indices;
+    };
     struct BlockDelEntry {
         std::string location_id;
         int event_index;
@@ -1679,20 +1684,45 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (!block_to_add.empty()) {
         KeyVector add_keys_aggr;
-        std::vector<const std::vector<BlockAddEntry> *> add_entries_aggr;
+        std::vector<std::vector<BlockAddMergeEntry>> add_merged_entries_aggr;
         add_keys_aggr.reserve(block_to_add.size());
-        add_entries_aggr.reserve(block_to_add.size());
+        add_merged_entries_aggr.reserve(block_to_add.size());
         for (const auto &kv : block_to_add) {
             add_keys_aggr.push_back(kv.first);
-            add_entries_aggr.push_back(&kv.second);
+
+            std::map<std::string, std::map<std::string, LocationSpec>> specs_by_location;
+            std::map<std::string, std::vector<int>> event_indices_by_location;
+            for (const auto &entry : kv.second) {
+                auto &specs_by_name = specs_by_location[entry.location_id];
+                for (const auto &spec : entry.specs) {
+                    specs_by_name[spec.name()] = spec;
+                }
+                event_indices_by_location[entry.location_id].push_back(entry.event_index);
+            }
+
+            auto &merged_entries = add_merged_entries_aggr.emplace_back();
+            merged_entries.reserve(specs_by_location.size());
+            for (auto &[location_id, specs_by_name] : specs_by_location) {
+                BlockAddMergeEntry merged_entry;
+                auto event_indices_it = event_indices_by_location.find(location_id);
+                if (event_indices_it != event_indices_by_location.end()) {
+                    merged_entry.event_indices = std::move(event_indices_it->second);
+                }
+                merged_entry.location_id = location_id;
+                merged_entry.specs.reserve(specs_by_name.size());
+                for (auto &[spec_name, spec] : specs_by_name) {
+                    merged_entry.specs.push_back(std::move(spec));
+                }
+                merged_entries.push_back(std::move(merged_entry));
+            }
         }
 
-        std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts(add_keys_aggr.size());
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks(add_keys_aggr.size());
         for (size_t i = 0; i < add_keys_aggr.size(); ++i) {
-            const auto &entries = *add_entries_aggr[i];
-            upserts[i].reserve(entries.size());
+            const auto &entries = add_merged_entries_aggr[i];
+            merge_tasks[i].reserve(entries.size());
             for (const auto &entry : entries) {
-                upserts[i].push_back(MetaSearcher::UpsertLocation{
+                merge_tasks[i].push_back(MetaSearcher::MergeLocationSpecsTask{
                     entry.location_id,
                     event_backend->GetStorageType(),
                     CacheLocationStatus::CLS_SERVING,
@@ -1702,16 +1732,18 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<ErrorCode> per_key_ec;
-        meta_searcher->BatchUpsertLocations(request_context, add_keys_aggr, upserts, per_key_ec);
+        meta_searcher->BatchMergeLocationSpecs(request_context, add_keys_aggr, merge_tasks, per_key_ec);
 
         for (size_t k = 0; k < add_keys_aggr.size(); ++k) {
             ErrorCode key_ec = (k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR;
             if (key_ec == EC_OK) {
                 continue;
             }
-            for (const auto &entry : *add_entries_aggr[k]) {
-                if (per_item_ec[entry.event_index] == EC_OK) {
-                    per_item_ec[entry.event_index] = key_ec;
+            for (const auto &entry : add_merged_entries_aggr[k]) {
+                for (int event_index : entry.event_indices) {
+                    if (per_item_ec[event_index] == EC_OK) {
+                        per_item_ec[event_index] = key_ec;
+                    }
                 }
             }
         }

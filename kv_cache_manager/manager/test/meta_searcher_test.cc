@@ -171,6 +171,86 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation2) {
     EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
 }
 
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
+    MetaSearcher::KeyVector keys = {10001};
+    const std::string location_id = "event_report#mem#127.0.0.1:8080";
+
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
+          LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    auto it = location_maps[0].find(location_id);
+    ASSERT_NE(location_maps[0].end(), it);
+    ASSERT_TRUE(it->second);
+    EXPECT_EQ(CacheLocationStatus::CLS_SERVING, it->second->status());
+    EXPECT_EQ(3u, it->second->spec_size());
+
+    std::map<std::string, std::string> spec_uris;
+    for (const auto &spec : it->second->location_specs()) {
+        spec_uris[spec.name()] = spec.uri();
+    }
+    ASSERT_EQ(3u, spec_uris.size());
+    EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_0"]);
+    EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_1"]);
+    EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["full_3"]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleSpecs) {
+    MetaSearcher::KeyVector keys = {10002};
+    const std::string location_id = "event_report#mem#127.0.0.1:8080";
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
+          LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    const auto &loc = location_maps[0].at(location_id);
+    ASSERT_TRUE(loc);
+    EXPECT_EQ(2u, loc->spec_size());
+    ASSERT_EQ(2u, loc->location_specs().size());
+}
+
 TEST_F(MetaSearcherTest, TestPrefixMatch) {
     // 首先添加一些测试数据
     MetaSearcher::KeyVector keys = {10, 20, 30};
@@ -1338,7 +1418,7 @@ protected:
         MetaSearcherTest::SetUp();
 
         // event report locations
-        std::vector<std::vector<MetaSearcher::UpsertLocation>> er_upserts = {
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> er_upserts = {
             // key 80000: peer_a + peer_b
             {
                 {"kvs#event_report#mem#peer_a:8080",
@@ -1381,7 +1461,7 @@ protected:
             },
         };
         std::vector<ErrorCode> per_key_ec;
-        ErrorCode ec = meta_searcher_->BatchUpsertLocations(
+        ErrorCode ec = meta_searcher_->BatchMergeLocationSpecs(
             request_context_.get(), {80000, 80001, 80002, 80003}, er_upserts, per_key_ec);
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 

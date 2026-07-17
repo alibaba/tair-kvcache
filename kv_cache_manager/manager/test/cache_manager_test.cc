@@ -2909,6 +2909,179 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     ASSERT_EQ(1, call_count);
 }
 
+TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_merge";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("full_3", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_default");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_default"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_default"});
+
+    const std::string host = "10.0.0.9:8080";
+    auto report_specs = [&](int64_t key,
+                            const std::string &medium,
+                            const std::vector<std::vector<LocationSpec>> &spec_groups) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+
+        for (const auto &specs : spec_groups) {
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *ba = ev->mutable_block_add();
+            ba->set_block_key(std::to_string(key));
+            ba->set_medium(medium);
+            for (const auto &input_spec : specs) {
+                auto *spec = ba->add_specs();
+                spec->set_name(input_spec.name());
+                spec->set_uri(input_spec.uri());
+            }
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+
+    auto get_location_map = [&](int64_t key) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+        return location_maps.empty() ? CacheLocationMap() : location_maps[0];
+    };
+    auto get_spec_uris = [](const CacheLocationConstPtr &location) {
+        std::map<std::string, std::string> spec_uris;
+        if (!location) {
+            return spec_uris;
+        }
+        for (const auto &spec : location->location_specs()) {
+            spec_uris[spec.name()] = spec.uri();
+        }
+        return spec_uris;
+    };
+
+    // Case 1: one BlockAdd can create one CacheLocation with multiple specs.
+    const int64_t multi_spec_key = 9001;
+    report_specs(multi_spec_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem"),
+                   LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(multi_spec_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(2u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+    }
+
+    // Case 2: later reports append new specs and overwrite same-name specs.
+    report_specs(multi_spec_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_spec_key,
+                 "mem",
+                 {{LocationSpec("full_3", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(multi_spec_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(3u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(3u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["full_3"]);
+    }
+
+    // Case 3: multiple BlockAdd events for the same key in one request are merged before writing meta.
+    const int64_t same_request_key = 9002;
+    report_specs(same_request_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")},
+                  {LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")},
+                  {LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(same_request_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(2u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+    }
+
+    // Case 4: same key with different medium uses different location_id and does not merge into one CacheLocation.
+    const int64_t multi_medium_key = 9003;
+    report_specs(multi_medium_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_medium_key,
+                 "disk",
+                 {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/disk")}});
+    {
+        auto location_map = get_location_map(multi_medium_key);
+        ASSERT_EQ(2u, location_map.size());
+
+        const std::string mem_location_id = event_backend->BuildLocationId("mem", host);
+        const std::string disk_location_id = event_backend->BuildLocationId("disk", host);
+        auto mem_it = location_map.find(mem_location_id);
+        auto disk_it = location_map.find(disk_location_id);
+        ASSERT_NE(location_map.end(), mem_it);
+        ASSERT_NE(location_map.end(), disk_it);
+        ASSERT_TRUE(mem_it->second);
+        ASSERT_TRUE(disk_it->second);
+
+        auto mem_specs = get_spec_uris(mem_it->second);
+        auto disk_specs = get_spec_uris(disk_it->second);
+        ASSERT_EQ(1u, mem_specs.size());
+        ASSERT_EQ(1u, disk_specs.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", mem_specs["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/disk", disk_specs["linear_1"]);
+    }
+}
+
 // =============================================================
 // GetCacheLocationsByBackend with backend_selectors
 // =============================================================
