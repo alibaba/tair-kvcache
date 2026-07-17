@@ -166,7 +166,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         logger.info(deployment)
 
         self._manager_client = KvCacheManagerClient.from_connector_config(
-            connector_extra_config
+            vars(self._extra_config)
         )
         self._manager_block_size = manager_block_size
 

@@ -65,7 +65,7 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 **元数据面到 KVCM 有两条等价通路**，最终都落到服务端同一套 `*ServiceImpl`（`grpc_service`/`http_service` 只是传输适配层）：
 
 1. **C++ `MetaClient`（gRPC）**：走 `internal/stub:grpc_stub`，供 C++ 侧与经 pybind 的引擎使用。
-2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖 MetaService 的全部 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`）。`manager_uri` 可直接使用 HTTP(S) 地址，也可使用通用服务发现 URL；启用 Leader 发现后，客户端以动态发现的 Manager 端点调用 `/api/getClusterInfo`，再根据 `leader_endpoint.meta_http_port` 直连 Leader，并处理 `SERVER_NOT_LEADER` 重试。Leader 查询和普通 API 请求共享可配置的 `request_timeout_seconds`。不同连接器按需选用其一。
+2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖 MetaService 的全部 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`）。`manager_uri` 可直接使用 HTTP(S) 地址，也可使用通用服务发现 URL；启用 Leader 发现后，客户端以动态发现的 Manager 端点调用 `/api/getClusterInfo`，再根据 `leader_endpoint.meta_http_port` 直连 Leader，并处理 `SERVER_NOT_LEADER` 重试。普通 API 请求使用可配置的 `request_timeout_seconds`（默认 1 秒），Leader 查询保留独立的 5 秒超时。不同连接器按需选用其一。
 
 数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
 

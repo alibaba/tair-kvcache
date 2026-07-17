@@ -211,7 +211,7 @@ class TestRequestTimeout(unittest.TestCase):
         self.assertEqual(client.session.post.call_args.kwargs["timeout"], 1.5)
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
-    def test_leader_discovery_uses_configured_timeout(self, mock_post):
+    def test_leader_discovery_uses_dedicated_timeout(self, mock_post):
         mock_post.return_value = _make_mock_response(_cluster_info_response())
         client = KvCacheManagerClient(
             "http://10.0.0.1:8080",
@@ -221,7 +221,7 @@ class TestRequestTimeout(unittest.TestCase):
         )
 
         try:
-            self.assertEqual(mock_post.call_args.kwargs["timeout"], 2.5)
+            self.assertEqual(mock_post.call_args.kwargs["timeout"], 5.0)
         finally:
             client.close()
 

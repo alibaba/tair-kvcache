@@ -14,6 +14,8 @@ from kv_cache_manager.py_connector.common.service_discovery_factory import (
     create_service_discovery,
 )
 
+_LEADER_DISCOVERY_TIMEOUT_SECONDS = 5.0
+
 
 class KvCacheManagerClient:
     @classmethod
@@ -48,7 +50,9 @@ class KvCacheManagerClient:
             base_url: Manager HTTP(S) address or a service-discovery URL. When
                 auto_discover_leader is enabled, leader discovery always starts from
                 this entry point instead of the current leader.
-            request_timeout_seconds: Timeout in seconds for Manager HTTP requests.
+            request_timeout_seconds: Timeout in seconds for regular Manager HTTP
+                requests. Defaults to 1 second. Leader discovery keeps its dedicated
+                5-second timeout.
         """
         self._request_timeout_seconds = float(request_timeout_seconds)
         if self._request_timeout_seconds <= 0:
@@ -178,7 +182,7 @@ class KvCacheManagerClient:
                     "instance_id": self._instance_id,
                 },
                 headers=self.headers,
-                timeout=self._request_timeout_seconds,
+                timeout=_LEADER_DISCOVERY_TIMEOUT_SECONDS,
             )
         except Exception as e:
             logger.warning("Leader discovery request to %s failed: %s", url, e)
