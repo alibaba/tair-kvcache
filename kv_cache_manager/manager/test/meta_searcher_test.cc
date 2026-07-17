@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <set>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -249,6 +250,63 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleS
     ASSERT_TRUE(loc);
     EXPECT_EQ(2u, loc->spec_size());
     ASSERT_EQ(2u, loc->location_specs().size());
+}
+
+TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
+    MetaSearcher::KeyVector keys = {10003};
+    const std::string location_id = "event_report#mem#127.0.0.1:8080";
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
+          LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem"),
+          LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
+        {location_id, {"linear_0"}},
+    }};
+    std::vector<std::vector<ErrorCode>> delete_results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(1u, delete_results.size());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    auto spec_names = std::set<std::string>();
+    for (const auto &spec : location_maps[0].at(location_id)->location_specs()) {
+        spec_names.insert(spec.name());
+    }
+    ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
+    EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
+
+    delete_tasks = {{
+        {location_id, {"linear_1", "full_3"}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(1u, delete_results.size());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+
+    delete_tasks = {{
+        {location_id, {}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(1u, delete_results.size());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), delete_results[0]);
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_FALSE(location_maps[0].empty());
 }
 
 TEST_F(MetaSearcherTest, TestPrefixMatch) {
@@ -604,136 +662,6 @@ TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     EXPECT_EQ(retrieved_location3.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     EXPECT_EQ(retrieved_location3.spec_size(), 3);
     EXPECT_EQ(retrieved_location3.location_specs().size(), 1);
-}
-
-TEST_F(MetaSearcherTest, TestBatchDeleteLocation) {
-    // 首先添加一些测试数据
-    MetaSearcher::KeyVector keys = {5000, 6000, 7000};
-
-    // 创建CacheLocation对象
-    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocationConstPtr location1 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocationConstPtr location2 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocationConstPtr location3 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
-
-    CacheLocationVector locations = {location1, location2, location3};
-
-    // 添加位置信息
-    std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(out_location_ids.size(), 3);
-
-    // 验证添加的位置信息可以被检索到
-    std::vector<CacheLocationMap> out_location_maps;
-    BlockMask mask; // 空mask，不跳过任何元素
-
-    ec = meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps);
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(out_location_maps.size(), 3);
-
-    for (const auto &location_map : out_location_maps) {
-        EXPECT_FALSE(location_map.empty());
-        // 每个map应该只有一个location（我们刚添加的）
-        EXPECT_EQ(location_map.size(), 1);
-    }
-
-    // 准备删除数据 - 删除前两个location
-    std::vector<std::string> delete_location_ids = {out_location_ids[0], out_location_ids[1], "non_existent_id"};
-    MetaSearcher::KeyVector delete_keys = {5000, 6000, 7000}; // 对应的keys
-
-    // 调用BatchDeleteLocation
-    std::vector<ErrorCode> delete_results;
-    ec = meta_searcher_->BatchDeleteLocation(request_context_.get(), delete_keys, delete_location_ids, delete_results);
-
-    // 验证结果
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(delete_results.size(), 3);
-    EXPECT_EQ(delete_results[0], ErrorCode::EC_OK);    // 成功删除第一个
-    EXPECT_EQ(delete_results[1], ErrorCode::EC_OK);    // 成功删除第二个
-    EXPECT_EQ(delete_results[2], ErrorCode::EC_NOENT); // 删除不存在的location应返回EC_NOENT
-
-    // 验证删除后的状态
-    out_location_maps.clear();
-    ec = meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps);
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(out_location_maps.size(), 3);
-
-    // 第一个key应该没有location了
-    EXPECT_TRUE(out_location_maps[0].empty());
-
-    // 第二个key应该没有location了
-    EXPECT_TRUE(out_location_maps[1].empty());
-
-    // 第三个key应该还有location
-    EXPECT_FALSE(out_location_maps[2].empty());
-    EXPECT_EQ(out_location_maps[2].size(), 1);
-
-    // 验证第三个location仍然存在且信息正确
-    auto it = out_location_maps[2].find(out_location_ids[2]);
-    EXPECT_NE(it, out_location_maps[2].end());
-
-    if (it != out_location_maps[2].end()) {
-        const auto &location = *it->second;
-        EXPECT_EQ(location.id(), out_location_ids[2]);
-        EXPECT_EQ(location.status(), CLS_WRITING);
-        EXPECT_EQ(location.type(), locations[2]->type());
-    }
-
-    // 测试错误情况：key和location_id数量不匹配
-    MetaSearcher::KeyVector mismatched_keys = {5000, 6000}; // 只有两个
-    std::vector<std::string> mismatched_location_ids = {
-        out_location_ids[0], out_location_ids[1], out_location_ids[2]}; // 三个
-
-    ec = meta_searcher_->BatchDeleteLocation(
-        request_context_.get(), mismatched_keys, mismatched_location_ids, delete_results);
-    EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
-}
-
-TEST_F(MetaSearcherTest, TestBatchDeleteLocation2) {
-    // 首先添加一些测试数据
-    MetaSearcher::KeyVector keys = {5000, 6000, 7000};
-
-    // 创建CacheLocation对象
-    std::vector<LocationSpec> specs1(
-        1, MetaSearcherTestHelper::CreateLocationSpec("nfs", "file:///tmp/test1/test.txt?offset=1&length=2&size=3"));
-    CacheLocationConstPtr location1 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs1);
-
-    std::vector<LocationSpec> specs2(
-        1, MetaSearcherTestHelper::CreateLocationSpec("hf3fs", "hf3fs:///tmp/test1/test.txt?offset=1&length=2&size=4"));
-    CacheLocationConstPtr location2 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, specs2);
-
-    std::vector<LocationSpec> specs3(2,
-                                     MetaSearcherTestHelper::CreateLocationSpec(
-                                         "mooncake", "mooncake:///tmp/test1/test.txt?offset=1&length=2&size=5"));
-    CacheLocationConstPtr location3 =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, specs3);
-
-    CacheLocationVector locations = {location1, location2, location3};
-
-    // 添加位置信息
-    std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(out_location_ids.size(), 3);
-
-    // 准备删除数据 - 删除前两个location
-    std::vector<std::string> delete_location_ids = {out_location_ids[0], out_location_ids[1], "non_existent_id"};
-    MetaSearcher::KeyVector delete_keys = {5000, 6000, 7000}; // 对应的keys
-
-    // 调用BatchDeleteLocation
-    std::vector<ErrorCode> delete_results;
-    ec = meta_searcher_->BatchDeleteLocation(request_context_.get(), delete_keys, delete_location_ids, delete_results);
-
-    // 验证结果
-    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
 }
 
 TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {

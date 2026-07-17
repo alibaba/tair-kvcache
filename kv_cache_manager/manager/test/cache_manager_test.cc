@@ -1,6 +1,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -3079,6 +3080,139 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         ASSERT_EQ(1u, disk_specs.size());
         EXPECT_EQ("event_report://10.0.0.9:8080/mem", mem_specs["linear_0"]);
         EXPECT_EQ("event_report://10.0.0.9:8080/disk", disk_specs["linear_1"]);
+    }
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_delete_specs";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("full_3", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_delete");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_delete"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_delete"});
+
+    const std::string host = "10.0.0.10:8080";
+    auto report_add = [&](int64_t key, const std::string &medium, const std::vector<LocationSpec> &specs) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums(medium);
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium(medium);
+        for (const auto &input_spec : specs) {
+            auto *spec = ba->add_specs();
+            spec->set_name(input_spec.name());
+            spec->set_uri(input_spec.uri());
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+    auto report_delete = [&](int64_t key,
+                             const std::string &medium,
+                             const std::vector<std::vector<std::string>> &spec_name_groups) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums(medium);
+        for (const auto &spec_names : spec_name_groups) {
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+            auto *bd = ev->mutable_block_delete();
+            bd->set_block_key(std::to_string(key));
+            bd->set_medium(medium);
+            for (const auto &spec_name : spec_names) {
+                bd->add_spec_names(spec_name);
+            }
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    auto get_location_map = [&](int64_t key) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+        return location_maps.empty() ? CacheLocationMap() : location_maps[0];
+    };
+    auto get_spec_names = [](const CacheLocationConstPtr &location) {
+        std::set<std::string> spec_names;
+        if (!location) {
+            return spec_names;
+        }
+        for (const auto &spec : location->location_specs()) {
+            spec_names.insert(spec.name());
+        }
+        return spec_names;
+    };
+
+    const int64_t partial_delete_key = 9101;
+    report_add(partial_delete_key,
+               "mem",
+               {LocationSpec("linear_0", "event_report://10.0.0.10:8080/mem"),
+                LocationSpec("linear_1", "event_report://10.0.0.10:8080/mem"),
+                LocationSpec("full_3", "event_report://10.0.0.10:8080/mem")});
+
+    report_delete(partial_delete_key, "mem", {{"linear_0"}});
+    {
+        auto location_map = get_location_map(partial_delete_key);
+        ASSERT_EQ(1u, location_map.size());
+        const auto location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        EXPECT_EQ((std::set<std::string>{"linear_1", "full_3"}), get_spec_names(loc_it->second));
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+    }
+
+    report_delete(partial_delete_key, "mem", {{"linear_1"}, {"full_3"}});
+    {
+        auto location_map = get_location_map(partial_delete_key);
+        EXPECT_TRUE(location_map.empty());
+    }
+
+    const int64_t multi_medium_key = 9103;
+    report_add(multi_medium_key, "mem", {LocationSpec("linear_0", "event_report://10.0.0.10:8080/mem")});
+    report_add(multi_medium_key, "disk", {LocationSpec("linear_1", "event_report://10.0.0.10:8080/disk")});
+    report_delete(multi_medium_key, "mem", {{"linear_0"}});
+    {
+        auto location_map = get_location_map(multi_medium_key);
+        ASSERT_EQ(1u, location_map.size());
+        const auto disk_location_id = event_backend->BuildLocationId("disk", host);
+        auto disk_it = location_map.find(disk_location_id);
+        ASSERT_NE(location_map.end(), disk_it);
+        EXPECT_EQ((std::set<std::string>{"linear_1"}), get_spec_names(disk_it->second));
     }
 }
 

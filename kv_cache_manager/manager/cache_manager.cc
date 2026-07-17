@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -1538,7 +1539,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     };
     struct BlockDelEntry {
         std::string location_id;
+        std::vector<std::string> spec_names;
         int event_index;
+    };
+    struct BlockDelMergeEntry {
+        std::string location_id;
+        std::vector<std::string> spec_names;
+        std::vector<int> event_indices;
     };
     std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
     std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
@@ -1626,8 +1633,20 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
+            if (p.spec_names_size() == 0) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: empty spec_names for block_key [%ld]",
+                              trace_id.c_str(),
+                              block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            std::vector<std::string> spec_names;
+            spec_names.reserve(p.spec_names_size());
+            for (const auto &spec_name : p.spec_names()) {
+                spec_names.push_back(spec_name);
+            }
             block_to_del[block_key].push_back(
-                BlockDelEntry{event_backend->BuildLocationId(p.medium(), host_ip_port), i});
+                BlockDelEntry{event_backend->BuildLocationId(p.medium(), host_ip_port), std::move(spec_names), i});
             break;
         }
         default:
@@ -1755,23 +1774,45 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (!block_to_del.empty()) {
         KeyVector del_keys_aggr;
-        std::vector<const std::vector<BlockDelEntry> *> del_entries_aggr;
+        std::vector<std::vector<BlockDelMergeEntry>> del_merged_entries_aggr;
         del_keys_aggr.reserve(block_to_del.size());
-        del_entries_aggr.reserve(block_to_del.size());
+        del_merged_entries_aggr.reserve(block_to_del.size());
         for (const auto &kv : block_to_del) {
             del_keys_aggr.push_back(kv.first);
-            del_entries_aggr.push_back(&kv.second);
-        }
 
-        LocationIdsPerKey del_location_ids(del_keys_aggr.size());
-        for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
-            for (const auto &entry : *del_entries_aggr[i]) {
-                del_location_ids[i].push_back(entry.location_id);
+            std::map<std::string, std::set<std::string>> spec_names_by_location;
+            std::map<std::string, std::vector<int>> event_indices_by_location;
+            for (const auto &entry : kv.second) {
+                event_indices_by_location[entry.location_id].push_back(entry.event_index);
+                auto &spec_names = spec_names_by_location[entry.location_id];
+                spec_names.insert(entry.spec_names.begin(), entry.spec_names.end());
+            }
+
+            auto &merged_entries = del_merged_entries_aggr.emplace_back();
+            merged_entries.reserve(event_indices_by_location.size());
+            for (auto &[location_id, event_indices] : event_indices_by_location) {
+                BlockDelMergeEntry merged_entry;
+                merged_entry.location_id = location_id;
+                merged_entry.event_indices = std::move(event_indices);
+                const auto &spec_names = spec_names_by_location[location_id];
+                merged_entry.spec_names.assign(spec_names.begin(), spec_names.end());
+                merged_entries.push_back(std::move(merged_entry));
             }
         }
 
         std::vector<std::vector<ErrorCode>> per_location_ec;
-        meta_searcher->BatchDeleteLocations(request_context, del_keys_aggr, del_location_ids, per_location_ec);
+        std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks(del_keys_aggr.size());
+        for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
+            const auto &entries = del_merged_entries_aggr[i];
+            delete_tasks[i].reserve(entries.size());
+            for (const auto &entry : entries) {
+                delete_tasks[i].push_back(MetaSearcher::DeleteLocationSpecsTask{
+                    entry.location_id,
+                    entry.spec_names,
+                });
+            }
+        }
+        meta_searcher->BatchDeleteLocationSpecs(request_context, del_keys_aggr, delete_tasks, per_location_ec);
 
         for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
             ErrorCode key_ec = EC_OK;
@@ -1788,9 +1829,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (key_ec == EC_OK) {
                 continue;
             }
-            for (const auto &entry : *del_entries_aggr[k]) {
-                if (per_item_ec[entry.event_index] == EC_OK) {
-                    per_item_ec[entry.event_index] = key_ec;
+            for (const auto &entry : del_merged_entries_aggr[k]) {
+                for (int event_index : entry.event_indices) {
+                    if (per_item_ec[event_index] == EC_OK) {
+                        per_item_ec[event_index] = key_ec;
+                    }
                 }
             }
         }

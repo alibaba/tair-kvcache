@@ -83,6 +83,14 @@ public:
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
                                       std::vector<ErrorCode> &out_per_key_ec);
+    struct DeleteLocationSpecsTask {
+        std::string location_id;
+        std::vector<std::string> spec_names;
+    };
+    ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
+                                       std::vector<std::vector<ErrorCode>> &out_batch_results);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
@@ -108,10 +116,6 @@ public:
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results);
-    ErrorCode BatchDeleteLocation(RequestContext *request_context,
-                                  const KeyVector &keys,
-                                  const std::vector<std::string> &location_ids,
-                                  std::vector<ErrorCode> &results);
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
