@@ -20,6 +20,11 @@ TEST_F(ServerConfigTest, TestSimple) {
         std::unordered_map<std::string, std::string> environ;
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
+        ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
+        ASSERT_EQ(100000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
+        ASSERT_EQ(64ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
+        ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
+        ASSERT_EQ(256ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimit());
     }
     // config_file not exist
     {
@@ -75,6 +80,28 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
     }
+}
+
+TEST_F(ServerConfigTest, TestCacheReclaimerAsyncDeleteConfig) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ{
+        {"kvcm.cache_reclaimer.inflight_delete_timeout_ms", "1234"},
+        {"kvcm.cache_reclaimer.pending_location_limit_per_group_type", "11"},
+        {"kvcm.cache_reclaimer.pending_bytes_limit_per_group_type", "22"},
+        {"kvcm.cache_reclaimer.pending_delete_handler_limit", "33"},
+        {"kvcm.cache_reclaimer.pending_bytes_limit", "44"},
+    };
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_TRUE(config.Check());
+    EXPECT_EQ(1234, config.GetCacheReclaimerInflightDeleteTimeoutMs());
+    EXPECT_EQ(11, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
+    EXPECT_EQ(22, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
+    EXPECT_EQ(33, config.GetCacheReclaimerPendingDeleteHandlerLimit());
+    EXPECT_EQ(44, config.GetCacheReclaimerPendingBytesLimit());
+
+    environ["kvcm.cache_reclaimer.pending_delete_handler_limit"] = "0";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
 }
 
 TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {

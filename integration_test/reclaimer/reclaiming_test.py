@@ -276,6 +276,454 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # new write should now be accepted
         self._write(16)
 
+    def test_no_over_eviction_with_delay(self):
+        """In-flight byte credit prevents repeated delayed batches."""
+        self._assert_no_over_eviction_with_delay(
+            group_capacity=1024 * 20,
+            type_capacity=1024 * 30,
+            max_key_count=30,
+        )
+
+    def test_no_over_eviction_with_delay_key_count(self):
+        """Predicted-key credit prevents repeated delayed batches."""
+        self._assert_no_over_eviction_with_delay(
+            group_capacity=1024 * 1024,
+            type_capacity=1024 * 1024,
+            max_key_count=20,
+        )
+
+    def test_no_over_eviction_same_group_multiple_instances(self):
+        """A Group-wide credit stops admission before the next instance."""
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(
+            self.worker_manager.start_worker(
+                0, **{"kvcm.cache_reclaimer.del_batch_size": 4}
+            )
+        )
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+
+        self._admin_client.add_storage({
+            "trace_id": self._trace_id,
+            "storage": self._make_dummy_storage(),
+        })
+        instance_group = self._make_dummy_instance_group()
+        instance_group["quota"]["capacity"] = 1024 * 20
+        instance_group["quota"]["quota_config"] = [
+            {"storage_type": 3, "capacity": 1024 * 30},
+            {"storage_type": 4, "capacity": 1024 * 30},
+        ]
+        instance_group[
+            "cache_config"
+        ][
+            "meta_indexer_config"
+        ][
+            "max_key_count"
+        ] = 16
+        instance_group[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "delay_before_delete_ms"
+        ] = 3000
+        self._admin_client.create_instance_group({
+            "trace_id": self._trace_id,
+            "instance_group": instance_group,
+        })
+
+        instance_ids = ["test_instance_01", "test_instance_02"]
+        for instance_id in instance_ids:
+            self._instance_id = instance_id
+            self._client.register_instance(self._make_dummy_ins_req())
+            for block_key in range(6):
+                self._write(block_key)
+
+        current_version = instance_group["version"]
+        instance_group["version"] = current_version + 1
+        instance_group[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "trigger_strategy"
+        ][
+            "used_percentage"
+        ] = 0.5
+        self._admin_client.update_instance_group({
+            "trace_id": self._trace_id + "_update_ig",
+            "instance_group": instance_group,
+            "current_version": current_version,
+        })
+
+        self._wait_metric_value(
+            "cache_reclaimer.pending_delete_handler_count", 1, timeout_s=5
+        )
+        self._wait_metric_value(
+            "cache_reclaimer.pending_delete_handler_count", 0, timeout_s=10
+        )
+        surviving_blocks = sum(
+            self._count_surviving_blocks(instance_id, range(6))
+            for instance_id in instance_ids
+        )
+        self.assertEqual(
+            self._metric_value("cache_reclaimer.delete_submit_count"),
+            1,
+            "Group credit should prevent admission from the next instance",
+        )
+        self.assertGreaterEqual(
+            surviving_blocks,
+            8,
+            "Group credit should limit delayed reclaim to one four-key batch",
+        )
+        self.assertLess(
+            surviving_blocks,
+            12,
+            "the delayed reclaim batch should still complete",
+        )
+
+    def test_no_progress_uses_polling_backoff(self):
+        """Active writers keep a hot water level from spinning the cron."""
+        self._admin_client.add_storage({
+            "trace_id": self._trace_id,
+            "storage": self._make_dummy_storage(),
+        })
+        instance_group = self._make_dummy_instance_group()
+        instance_group["quota"]["capacity"] = 1024 * 20
+        instance_group["quota"]["quota_config"] = [
+            {"storage_type": 3, "capacity": 1024 * 30},
+            {"storage_type": 4, "capacity": 1024 * 30},
+        ]
+        instance_group[
+            "cache_config"
+        ][
+            "meta_indexer_config"
+        ][
+            "max_key_count"
+        ] = 32
+        self._admin_client.create_instance_group({
+            "trace_id": self._trace_id,
+            "instance_group": instance_group,
+        })
+        self._client.register_instance(self._make_dummy_ins_req())
+
+        for block_key in range(12):
+            self._start_write(block_key)
+
+        current_version = instance_group["version"]
+        instance_group["version"] = current_version + 1
+        instance_group[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "trigger_strategy"
+        ][
+            "used_percentage"
+        ] = 0.1
+        self._admin_client.update_instance_group({
+            "trace_id": self._trace_id + "_update_ig",
+            "instance_group": instance_group,
+            "current_version": current_version,
+        })
+
+        time.sleep(0.8)
+        metrics = self._admin_client.get_metrics({
+            "trace_id": self._trace_id + "_metrics",
+        })["metrics"]
+        backoff_count = max(
+            (
+                int(metric["metric_value"].get("int_value", 0))
+                for metric in metrics
+                if metric["metric_name"] ==
+                "cache_reclaimer.reclaim_no_progress_backoff_count"
+            ),
+            default=0,
+        )
+        self.assertGreater(backoff_count, 0)
+        self.assertLess(
+            backoff_count,
+            20,
+            "no-progress rounds should follow the normal polling interval",
+        )
+
+    def _assert_no_over_eviction_with_delay(
+        self, group_capacity, type_capacity, max_key_count
+    ):
+        """Write 12 blocks, then trigger reclaim with a five-second delay.
+
+        A four-key batch is sufficient to move either configured water level
+        from 60% to 40%. The pending request must therefore credit the water
+        level immediately and prevent a second batch during the delay window.
+        The Future terminal state must release all temporary accounting.
+        """
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(
+            self.worker_manager.start_worker(
+                0, **{"kvcm.cache_reclaimer.del_batch_size": 4}
+            )
+        )
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+
+        self._admin_client.add_storage({
+            "trace_id": self._trace_id,
+            "storage": self._make_dummy_storage(),
+        })
+
+        instance_group = self._make_dummy_instance_group()
+        instance_group["quota"]["capacity"] = group_capacity
+        instance_group["quota"]["quota_config"] = [
+            {"storage_type": 3, "capacity": type_capacity},
+            {"storage_type": 4, "capacity": type_capacity},
+        ]
+        instance_group[
+            "cache_config"
+        ][
+            "meta_indexer_config"
+        ][
+            "max_key_count"
+        ] = max_key_count
+        instance_group[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "delay_before_delete_ms"
+        ] = 5000
+        self._admin_client.create_instance_group({
+            "trace_id": self._trace_id,
+            "instance_group": instance_group,
+        })
+        self._client.register_instance(self._make_dummy_ins_req())
+
+        for block_key in range(12):
+            self._write(block_key)
+
+        current_version = instance_group["version"]
+        instance_group["version"] = current_version + 1
+        instance_group[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "trigger_strategy"
+        ][
+            "used_percentage"
+        ] = 0.5
+        self._admin_client.update_instance_group({
+            "trace_id": self._trace_id + "_update_ig",
+            "instance_group": instance_group,
+            "current_version": current_version,
+        })
+
+        self._wait_metric_value(
+            "cache_reclaimer.pending_delete_handler_count", 1
+        )
+        expected_group_type_tags = {
+            "instance_group": self._instance_group_name,
+            "storage_type": "file",
+        }
+        expected_group_tags = {
+            "instance_group": self._instance_group_name,
+        }
+        inflight_metrics = {
+            "delete_submit_count": self._metric_value(
+                "cache_reclaimer.delete_submit_count"
+            ),
+            "pending_delete_handler_count": self._metric_value(
+                "cache_reclaimer.pending_delete_handler_count"
+            ),
+            "pending_location_count": self._metric_value(
+                "cache_reclaimer.pending_location_count"
+            ),
+            "pending_delete_bytes": self._metric_value(
+                "cache_reclaimer.pending_delete_bytes"
+            ),
+            "credited_delete_bytes": self._metric_value(
+                "cache_reclaimer.credited_delete_bytes"
+            ),
+            "predicted_deleted_key_count": self._metric_value(
+                "cache_reclaimer.predicted_deleted_key_count"
+            ),
+        }
+        logging.info("delayed reclaim in-flight metrics: %s", inflight_metrics)
+        self.assertEqual(inflight_metrics["delete_submit_count"], 1)
+        self.assertEqual(inflight_metrics["pending_delete_handler_count"], 1)
+        self.assertEqual(inflight_metrics["pending_location_count"], 4)
+        self.assertEqual(inflight_metrics["pending_delete_bytes"], 4 * 1024)
+        self.assertEqual(inflight_metrics["credited_delete_bytes"], 4 * 1024)
+        self.assertEqual(inflight_metrics["predicted_deleted_key_count"], 4)
+        self.assertEqual(
+            self._metric_value(
+                "cache_reclaimer.pending_location_count",
+                expected_group_type_tags,
+            ),
+            4,
+        )
+        self.assertEqual(
+            self._metric_value(
+                "cache_reclaimer.pending_delete_bytes",
+                expected_group_type_tags,
+            ),
+            4 * 1024,
+        )
+        self.assertEqual(
+            self._metric_value(
+                "cache_reclaimer.credited_delete_bytes",
+                expected_group_type_tags,
+            ),
+            4 * 1024,
+        )
+        self.assertEqual(
+            self._metric_value(
+                "cache_reclaimer.predicted_deleted_key_count",
+                expected_group_tags,
+            ),
+            4,
+        )
+
+        self.assertEqual(
+            self._metric_value("cache_reclaimer.delete_complete_count"),
+            0,
+            "the end-to-end Future must remain pending during the delay",
+        )
+        self.assertEqual(
+            self._count_surviving_blocks(self._instance_id, range(12)),
+            8,
+            "CAS should hide exactly one batch while its Future is pending",
+        )
+
+        self._wait_metric_value(
+            "cache_reclaimer.pending_delete_handler_count", 0, timeout_s=8
+        )
+
+        surviving_blocks = self._count_surviving_blocks(
+            self._instance_id, range(12)
+        )
+
+        logging.info(
+            "delayed reclaim survivors: %d/12 (capacity=%d, max_keys=%d)",
+            surviving_blocks,
+            group_capacity,
+            max_key_count,
+        )
+        self.assertGreaterEqual(
+            surviving_blocks,
+            8,
+            "in-flight credit should limit delayed reclaim to one batch",
+        )
+        self.assertLess(
+            surviving_blocks,
+            12,
+            "the delayed reclaim batch should still complete",
+        )
+        self.assertEqual(
+            self._metric_value("cache_reclaimer.delete_submit_count"),
+            1,
+            "fresh credit should prevent admission of a second batch",
+        )
+        self.assertEqual(
+            self._metric_value("cache_reclaimer.delete_complete_count"), 1
+        )
+        for metric_name in (
+            "pending_delete_handler_count",
+            "pending_location_count",
+            "pending_delete_bytes",
+            "credited_delete_bytes",
+            "predicted_deleted_key_count",
+        ):
+            self.assertEqual(
+                self._metric_value(f"cache_reclaimer.{metric_name}"),
+                0,
+                f"{metric_name} should be released at Future completion",
+            )
+        for metric_name in (
+            "pending_location_count",
+            "pending_delete_bytes",
+            "credited_delete_bytes",
+        ):
+            self.assertEqual(
+                self._metric_value(
+                    f"cache_reclaimer.{metric_name}",
+                    expected_group_type_tags,
+                ),
+                0,
+                f"tagged {metric_name} should be released at Future completion",
+            )
+        self.assertEqual(
+            self._metric_value(
+                "cache_reclaimer.predicted_deleted_key_count",
+                expected_group_tags,
+            ),
+            0,
+        )
+
+    def _wait_metric_value(
+        self, metric_name, expected_value, tags=None, timeout_s=2
+    ):
+        deadline = time.monotonic() + timeout_s
+        last_value = None
+        while time.monotonic() < deadline:
+            last_value = self._metric_value(metric_name, tags)
+            if last_value == expected_value:
+                return
+            time.sleep(0.05)
+        self.fail(
+            f"metric {metric_name} with tags {tags or {}} did not become "
+            f"{expected_value}; last value: {last_value}"
+        )
+
+    def _metric_value(self, metric_name, tags=None):
+        expected_tags = tags or {}
+        metrics = self._admin_client.get_metrics({
+            "trace_id": self._trace_id + "_metrics",
+        })["metrics"]
+        values = []
+        for metric in metrics:
+            if metric.get("metric_name") != metric_name:
+                continue
+            actual_tags = {
+                tag["tag_key"]: tag["tag_value"]
+                for tag in metric.get("metric_tags", [])
+            }
+            if actual_tags != expected_tags:
+                continue
+            metric_value = metric.get("metric_value", {})
+            for value_type in (
+                "int_value",
+                "float_value",
+                "double_value",
+            ):
+                if value_type in metric_value:
+                    values.append(float(metric_value[value_type]))
+                    break
+        self.assertEqual(
+            len(values),
+            1,
+            f"expected one {metric_name} metric with tags {expected_tags}, "
+            f"got {len(values)}",
+        )
+        return values[0]
+
+    def _count_surviving_blocks(self, instance_id, block_keys):
+        surviving_blocks = 0
+        for block_key in block_keys:
+            response = self._client.get_cache_location({
+                "trace_id": f"{self._trace_id}_check_{block_key}",
+                "query_type": "QT_PREFIX_MATCH",
+                "block_keys": [block_key],
+                "instance_id": instance_id,
+                "block_mask": {"offset": 0},
+            }, check_response=False)
+            if response.get("header", {}).get("status", {}).get("code") != "OK":
+                continue
+            if any(response.get("locations", [])):
+                surviving_blocks += 1
+        return surviving_blocks
+
     def test_persist_recover_00(self):
         """Test e2e persist/recover: cache locations and metadata
         survive a normal server restart.

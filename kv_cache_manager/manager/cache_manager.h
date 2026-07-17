@@ -11,6 +11,7 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
+#include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
@@ -70,7 +71,8 @@ public:
               uint64_t cache_reclaimer_key_sampling_size_per_task = 100,
               uint64_t cache_reclaimer_del_batch_size = 100,
               uint32_t cache_reclaimer_idle_interval_ms = 100,
-              uint32_t cache_reclaimer_worker_size = 16);
+              uint32_t cache_reclaimer_worker_size = 16,
+              CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();

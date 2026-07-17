@@ -38,6 +38,17 @@ public:
     uint64_t GetCacheReclaimerDelBatchSize() { return cache_reclaimer_del_batch_size_; }
     uint32_t GetCacheReclaimerIdleIntervalMs() { return cache_reclaimer_idle_interval_ms_; }
     uint32_t GetCacheReclaimerWorkerSize() { return cache_reclaimer_worker_size_; }
+    uint64_t GetCacheReclaimerInflightDeleteTimeoutMs() const { return cache_reclaimer_inflight_delete_timeout_ms_; }
+    uint64_t GetCacheReclaimerPendingLocationLimitPerGroupType() const {
+        return cache_reclaimer_pending_location_limit_per_group_type_;
+    }
+    uint64_t GetCacheReclaimerPendingBytesLimitPerGroupType() const {
+        return cache_reclaimer_pending_bytes_limit_per_group_type_;
+    }
+    uint64_t GetCacheReclaimerPendingDeleteHandlerLimit() const {
+        return cache_reclaimer_pending_delete_handler_limit_;
+    }
+    uint64_t GetCacheReclaimerPendingBytesLimit() const { return cache_reclaimer_pending_bytes_limit_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
@@ -83,6 +94,11 @@ private:
     uint64_t cache_reclaimer_del_batch_size_ = 0;
     uint32_t cache_reclaimer_idle_interval_ms_ = 0;
     uint32_t cache_reclaimer_worker_size_ = 0;
+    uint64_t cache_reclaimer_inflight_delete_timeout_ms_ = 0;
+    uint64_t cache_reclaimer_pending_location_limit_per_group_type_ = 0;
+    uint64_t cache_reclaimer_pending_bytes_limit_per_group_type_ = 0;
+    uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
+    uint64_t cache_reclaimer_pending_bytes_limit_ = 0;
     std::string metrics_reporter_type_;
     std::string metrics_reporter_config_;
     int64_t metrics_report_interval_ms_ = 0;

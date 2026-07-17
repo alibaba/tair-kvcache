@@ -41,6 +41,11 @@ struct PlanExecuteResult {
     std::string error_message;
 };
 
+struct AsyncDeleteSubmitResult {
+    bool accepted{false};
+    std::future<PlanExecuteResult> future;
+};
+
 struct CacheLocationDelRequest {
     std::string instance_id;
     std::vector<int64_t> block_keys;
@@ -50,6 +55,7 @@ struct CacheLocationDelRequest {
 
 struct ScheduledTask {
     std::function<void()> task;
+    std::function<void()> cancel_task;
     std::chrono::steady_clock::time_point execute_time;
     uint64_t sequence_id;
 
@@ -72,6 +78,8 @@ public:
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
+    AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
+    AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
 
     bool SubmitNonBlocking(const CacheMetaDelRequest &req);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req);
@@ -79,6 +87,13 @@ public:
     bool SubmitTask(std::function<void()> task, std::chrono::microseconds delay = std::chrono::microseconds(0));
 
 private:
+    struct PromiseCompletion;
+    struct LocationDelAdmissionResult {
+        PlanExecuteResult result{ErrorCode::EC_OK, ""};
+        CacheLocationDelRequest actual_task;
+        bool needs_physical_delete{false};
+    };
+
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -93,14 +108,26 @@ private:
     void WorkerRoutine();
 
     void Stop();
-    bool SubmitRaw(const std::function<void()> &task, std::chrono::microseconds delay);
+    bool SubmitRaw(const std::function<void()> &task,
+                   std::chrono::microseconds delay,
+                   const std::function<void()> &cancel_task = {});
     static bool FillActualTask(const std::vector<int64_t> &batch_cas_block_keys,
                                const std::vector<std::vector<MetaSearcher::LocationCASTask>> &batch_cas_tasks,
                                const std::vector<std::vector<ErrorCode>> &batch_results,
                                CacheLocationDelRequest &actual_task,
                                std::string &error_message);
-    void DoLocationDelTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
-                           const CacheLocationDelRequest &task);
+    LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task);
+    LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task);
+    LocationDelAdmissionResult PrepareDeleteTaskImpl(const std::string &instance_id,
+                                                     const std::vector<int64_t> &block_keys,
+                                                     const std::vector<std::vector<std::string>> *target_location_ids,
+                                                     std::chrono::microseconds delay);
+    void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
+                            std::chrono::microseconds delay,
+                            const std::function<LocationDelAdmissionResult()> &prepare);
+    AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
+                                                  std::function<LocationDelAdmissionResult()> prepare);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
 
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count)
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count)

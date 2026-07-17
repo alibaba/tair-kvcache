@@ -37,9 +37,11 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    linkstatic = True,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:schedule_plan_executor",
+        "@cpp_stub",
     ],
 )
 

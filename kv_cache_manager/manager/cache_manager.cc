@@ -157,7 +157,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint64_t cache_reclaimer_key_sampling_size_per_task,
                         uint64_t cache_reclaimer_del_batch_size,
                         uint32_t cache_reclaimer_idle_interval_ms,
-                        uint32_t cache_reclaimer_worker_size) {
+                        uint32_t cache_reclaimer_worker_size,
+                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config) {
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
@@ -181,7 +182,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         schedule_plan_executor_,
                                                         metrics_registry_,
                                                         event_manager_,
-                                                        write_location_manager_);
+                                                        write_location_manager_,
+                                                        std::move(cache_reclaimer_async_delete_config));
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;

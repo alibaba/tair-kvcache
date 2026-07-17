@@ -13,8 +13,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -45,6 +47,7 @@ private:                                                                        
 #endif
 
 class CacheReclaimStrategy;
+class CacheLocation;
 class EventManager;
 class InstanceGroup;
 class InstanceGroupQuota;
@@ -57,6 +60,14 @@ class SchedulePlanExecutor;
 class WriteLocationManager;
 struct CacheLocationDelRequest;
 struct PlanExecuteResult;
+
+struct CacheReclaimerAsyncDeleteConfig {
+    std::uint64_t inflight_delete_timeout_ms{60000};
+    std::uint64_t pending_location_limit_per_group_type{100000};
+    std::uint64_t pending_bytes_limit_per_group_type{64ULL * 1024 * 1024 * 1024};
+    std::uint64_t pending_delete_handler_limit{1024};
+    std::uint64_t pending_bytes_limit{256ULL * 1024 * 1024 * 1024};
+};
 
 /**
  * @brief Manages cache reclamation operations to free up memory by
@@ -83,6 +94,23 @@ struct PlanExecuteResult;
  */
 class CacheReclaimer {
 public:
+    using BytesByStorageType = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
+    using CountsByStorageType = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
+
+    struct PendingLocationKey {
+        std::string instance_id;
+        std::int64_t block_key;
+        std::string location_id;
+
+        bool operator<(const PendingLocationKey &other) const noexcept {
+            return std::tie(instance_id, block_key, location_id) <
+                   std::tie(other.instance_id, other.block_key, other.location_id);
+        }
+        bool operator==(const PendingLocationKey &other) const noexcept {
+            return instance_id == other.instance_id && block_key == other.block_key && location_id == other.location_id;
+        }
+    };
+
     struct AgeStats {
         int64_t min_us = INT64_MAX;
         int64_t max_us = 0;
@@ -130,7 +158,8 @@ public:
                    std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                    std::shared_ptr<MetricsRegistry> metrics_registry,
                    std::shared_ptr<EventManager> event_manager,
-                   std::shared_ptr<WriteLocationManager> write_location_manager);
+                   std::shared_ptr<WriteLocationManager> write_location_manager,
+                   CacheReclaimerAsyncDeleteConfig async_delete_config = {});
 
     /**
      * @brief Delete copy constructor
@@ -324,6 +353,8 @@ private:
     // default to kFutureTimeoutMs
     std::atomic<std::uint32_t> future_timeout_ms_;
 
+    const CacheReclaimerAsyncDeleteConfig async_delete_config_;
+
     std::mutex task_queue_mutex_;
     std::condition_variable cv_task_queue_;
     std::deque<std::function<void()>> task_queue_;
@@ -344,6 +375,14 @@ private:
         const std::string ins_gr_;
         const std::uint64_t blk_count_;
         const std::uint64_t loc_count_;
+        const std::vector<PendingLocationKey> pending_locations_;
+        const BytesByStorageType bytes_by_type_;
+        const CountsByStorageType location_counts_by_type_;
+        const std::uint64_t predicted_deleted_keys_;
+        const std::chrono::steady_clock::time_point submitted_at_;
+        const std::chrono::steady_clock::time_point credit_deadline_;
+        bool credit_enabled_;
+        bool outcome_unknown_reported_;
         std::future<PlanExecuteResult> fut_;
 
         DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
@@ -351,9 +390,38 @@ private:
                       std::string ins_gr,
                       std::uint64_t blk_count,
                       std::uint64_t loc_count,
+                      std::vector<PendingLocationKey> pending_locations,
+                      BytesByStorageType bytes_by_type,
+                      CountsByStorageType location_counts_by_type,
+                      std::uint64_t predicted_deleted_keys,
+                      std::chrono::steady_clock::time_point submitted_at,
+                      std::chrono::steady_clock::time_point credit_deadline,
                       std::future<PlanExecuteResult> fut);
     };
     std::forward_list<DeleteHandler> delete_handlers_;
+
+    struct GroupStorageTypeKey {
+        std::string instance_group;
+        DataStorageType storage_type;
+
+        bool operator<(const GroupStorageTypeKey &other) const noexcept {
+            return std::tie(instance_group, storage_type) < std::tie(other.instance_group, other.storage_type);
+        }
+    };
+
+    struct PendingQuota {
+        std::uint64_t location_count{0};
+        std::uint64_t bytes{0};
+    };
+
+    std::set<PendingLocationKey> pending_locations_;
+    std::map<std::string, BytesByStorageType> credited_delete_bytes_by_group_;
+    std::map<std::string, std::uint64_t> predicted_deleted_keys_by_group_;
+    std::map<GroupStorageTypeKey, PendingQuota> pending_quota_by_group_type_;
+    std::uint64_t pending_delete_handler_count_{0};
+    std::uint64_t pending_delete_bytes_{0};
+    std::set<GroupStorageTypeKey> reported_group_type_metric_keys_;
+    std::set<std::string> reported_group_metric_keys_;
 
     // record instance group water level exceed flags
     class WaterLevelExceed {
@@ -432,7 +500,7 @@ private:
      * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
-    void ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
+    bool ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
@@ -449,7 +517,7 @@ private:
      * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
-    void ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
+    bool ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
@@ -465,13 +533,18 @@ private:
      * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
-    void ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
+    bool ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
-    bool TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
-                           const std::shared_ptr<const InstanceGroup> &instance_group) noexcept;
+    struct ReclaimResult {
+        bool water_level_exceeded{false};
+        bool made_progress{false};
+    };
+
+    ReclaimResult TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                                    const std::shared_ptr<const InstanceGroup> &instance_group) noexcept;
 
     void HandleDelRes() noexcept;
 
@@ -504,11 +577,28 @@ private:
                      const std::vector<std::int64_t> &batch,
                      const WaterLevelExceed &water_level_exceed,
                      std::vector<std::vector<std::string>> &out_loc_ids,
-                     AgeStats &out_create_age_stats) const noexcept;
+                     BytesByStorageType &out_bytes_by_type,
+                     CountsByStorageType &out_location_counts_by_type,
+                     std::uint64_t &out_predicted_deleted_keys,
+                     AgeStats &out_create_age_stats) noexcept;
 
-    void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
+    bool SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const CacheLocationDelRequest &req) noexcept;
+                      const CacheLocationDelRequest &req,
+                      const BytesByStorageType &bytes_by_type,
+                      const CountsByStorageType &location_counts_by_type,
+                      std::uint64_t predicted_deleted_keys) noexcept;
+
+    static std::uint64_t SaturatingSub(std::uint64_t lhs, std::uint64_t rhs) noexcept;
+    static std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept;
+    static std::uint64_t GetLocationBytes(const CacheLocation &location) noexcept;
+    BytesByStorageType GetCreditedDeleteBytes(const std::string &instance_group) const noexcept;
+    std::uint64_t GetPredictedDeletedKeys(const std::string &instance_group) const noexcept;
+    void AddDeleteHandlerState(const DeleteHandler &handler) noexcept;
+    void DisableCredit(DeleteHandler &handler, const char *reason) noexcept;
+    void ReleaseDeleteHandlerState(DeleteHandler &handler) noexcept;
+    void RecordPendingLimitReject(const std::string &instance_group, const std::string &storage_type_scope) noexcept;
+    void UpdateAsyncDeleteMetrics() noexcept;
 
     struct GroupUsageData;
 
@@ -522,6 +612,13 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_submit_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_del_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_fail_count)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us)
@@ -531,6 +628,12 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_delete_handler_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_location_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_delete_bytes)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(credited_delete_bytes)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(predicted_deleted_key_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us)
