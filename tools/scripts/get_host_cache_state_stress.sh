@@ -26,6 +26,9 @@ MEDIUM="${MEDIUM:-mem}"
 SECONDARY_MEDIUM="${SECONDARY_MEDIUM:-disk}"
 FULL_SPEC_NAME="${FULL_SPEC_NAME:-full_attention}"
 MAMBA_SPEC_NAME="${MAMBA_SPEC_NAME:-mamba_state}"
+EVENT_HEARTBEAT_TIMEOUT_MS="${EVENT_HEARTBEAT_TIMEOUT_MS:-300000}"
+EVENT_CLEANUP_GRACE_MS="${EVENT_CLEANUP_GRACE_MS:-300000}"
+EVENT_LIVENESS_CHECK_INTERVAL_MS="${EVENT_LIVENESS_CHECK_INTERVAL_MS:-5000}"
 # Keep the default below 2^53 because jq 1.6 represents JSON numbers as doubles.
 KEY_BASE="${KEY_BASE:-$((2000000000000 + ($$ % 1000000) * 1000000))}"
 SKIP_REGISTER="${SKIP_REGISTER:-0}"
@@ -102,6 +105,15 @@ DATA MODEL
                            default: full_attention
   MAMBA_SPEC_NAME          Mamba/linear LocationSpec name
                            default: mamba_state
+  EVENT_HEARTBEAT_TIMEOUT_MS
+                           Synthetic event-report node heartbeat timeout.
+                           Increase this for long read stress runs.
+                           default: 300000
+  EVENT_CLEANUP_GRACE_MS   Synthetic event-report cleanup grace.
+                           default: 300000
+  EVENT_LIVENESS_CHECK_INTERVAL_MS
+                           Synthetic event-report liveness check interval.
+                           default: 5000
   KEY_BASE                 First synthetic int64 block key (unique by default)
 
 CASE SELECTION
@@ -359,7 +371,8 @@ build_report_payload() {
             event_type: "EVENT_BLOCK_DELETE",
             block_delete: {
                 block_key: ($key | tostring),
-                medium: $medium
+                medium: $medium,
+                spec_names: ["tp0"]
             }
         };
         {
@@ -499,15 +512,18 @@ build_query_payload() {
     local medium="$3"
     local output="$4"
     local trace="$5"
+    local query_type="${6:-QT_PREFIX_MATCH}"
     jq -nc \
         --arg trace "$trace" \
         --arg instance "$INSTANCE_ID" \
+        --arg query_type "$query_type" \
         --arg medium "$medium" \
         --argjson key_base "$key_base" \
         --argjson count "$count" '
         {
             trace_id: $trace,
             instance_id: $instance,
+            query_type: $query_type,
             block_cache_keys: [range(0; $count) | $key_base + .],
             medium: (if $medium == "" then [] else [$medium] end)
         }' >"$output"
@@ -518,15 +534,18 @@ query_custom_keys() {
     local medium="$2"
     local output="$3"
     local trace="$4"
+    local query_type="${5:-QT_PREFIX_MATCH}"
     local payload="${output}.payload.json"
     jq -nc \
         --arg trace "$trace" \
         --arg instance "$INSTANCE_ID" \
+        --arg query_type "$query_type" \
         --arg medium "$medium" \
         --argjson keys "$keys_json" '
         {
             trace_id: $trace,
             instance_id: $instance,
+            query_type: $query_type,
             block_cache_keys: $keys,
             medium: (if $medium == "" then [] else [$medium] end)
         }' >"$payload"
@@ -613,15 +632,18 @@ bootstrap_test_group() {
     response="$WORK_DIR/bootstrap_event.response.json"
     jq -nc \
         --arg trace "ghcs_add_event_$$" \
-        --arg storage "$EVENT_STORAGE_NAME" '
+        --arg storage "$EVENT_STORAGE_NAME" \
+        --argjson heartbeat_timeout_ms "$EVENT_HEARTBEAT_TIMEOUT_MS" \
+        --argjson cleanup_grace_ms "$EVENT_CLEANUP_GRACE_MS" \
+        --argjson liveness_check_interval_ms "$EVENT_LIVENESS_CHECK_INTERVAL_MS" '
         {
             trace_id: $trace,
             storage: {
                 global_unique_name: $storage,
                 event_report: {
-                    heartbeat_timeout_ms: 30000,
-                    cleanup_grace_ms: 300000,
-                    liveness_check_interval_ms: 5000
+                    heartbeat_timeout_ms: $heartbeat_timeout_ms,
+                    cleanup_grace_ms: $cleanup_grace_ms,
+                    liveness_check_interval_ms: $liveness_check_interval_ms
                 },
                 check_storage_available_when_open: false
             }
@@ -1031,7 +1053,8 @@ case_mamba() {
     parallel_post_dir /api/reportEvent "$WORK_DIR/mamba_only_add" "$WRITE_CONCURRENCY" \
         "mamba-only BLOCK_ADD"
     query="$WORK_DIR/mamba_query.json"
-    build_query_payload "$key_base" "$BLOCK_COUNT" "" "$query" "ghcs_mamba_query_$$"
+    build_query_payload "$key_base" "$BLOCK_COUNT" "" "$query" "ghcs_mamba_query_$$" \
+        QT_PREFIX_MATCH_WITH_MAMBA
     post_and_check /api/getHostCacheState "$query" "$WORK_DIR/mamba_only.response.json" mamba-only-query
     actual="$(prefix_for_host "$WORK_DIR/mamba_only.response.json" "$host")"
     if [[ "$actual" != 0 ]]; then
