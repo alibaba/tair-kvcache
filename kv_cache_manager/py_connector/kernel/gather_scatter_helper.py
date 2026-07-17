@@ -127,6 +127,9 @@ def scatter_kv_caches(
         total_token_in_kvcache: int,  # total token in kv cache
         src_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
         token_indices: List[int],  # List of token positions to update
+        kv_stride: int = 0,  # stride between K and V sections (in elements)
+        block_stride: int = 0,  # stride between blocks (in elements)
+        local_block_size: int = 0,  # tokens per block (0 = use total_token_in_kvcache)
 ):
     assert len(kv_caches_ptrs) == src_tensor.shape[0], "Number of layers mismatch"
     num_layers = len(kv_caches_ptrs)
@@ -140,6 +143,9 @@ def scatter_kv_caches(
     # Calculate grid size
     grid = (num_layers, num_tokens_in_block)
 
+    # Default local_block_size to total_token_in_kvcache if not provided
+    effective_local_block_size = local_block_size if local_block_size > 0 else total_token_in_kvcache
+
     # Launch kernel
     BLOCK_SIZE = 128  # Tunable parameter
     kv_cache_scatter_kernel[grid](
@@ -150,6 +156,9 @@ def scatter_kv_caches(
         hidden_size,
         total_token_in_kvcache,
         num_layers,
+        kv_stride,
+        block_stride,
+        effective_local_block_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -160,6 +169,9 @@ def gather_kv_caches(
         total_token_in_kvcache: int,  # total token in kv cache
         dst_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
         token_indices: List[int],  # List of token positions to update
+        kv_stride: int = 0,  # stride between K and V sections (in elements)
+        block_stride: int = 0,  # stride between blocks (in elements)
+        local_block_size: int = 0,  # tokens per block (0 = use total_token_in_kvcache)
 ):
     assert kv_caches_ptrs.shape[0] == dst_tensor.shape[0], "Number of layers mismatch"
     num_layers = kv_caches_ptrs.shape[0]
@@ -172,6 +184,9 @@ def gather_kv_caches(
     # Calculate grid size
     grid = (num_layers, num_tokens_in_block)
 
+    # Default local_block_size to total_token_in_kvcache if not provided
+    effective_local_block_size = local_block_size if local_block_size > 0 else total_token_in_kvcache
+
     # Launch kernel
     BLOCK_SIZE = 128  # Tunable parameter
     kv_cache_gather_kernel[grid](
@@ -182,6 +197,9 @@ def gather_kv_caches(
         hidden_size,
         total_token_in_kvcache,
         num_layers,
+        kv_stride,
+        block_stride,
+        effective_local_block_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

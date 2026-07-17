@@ -27,14 +27,13 @@ try:
     # vllm >= v0.11.1
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
     from vllm.utils.network_utils import get_ip
-    from vllm.v1.kv_cache_interface import MambaSpec, FullAttentionSpec
+    from vllm.v1.kv_cache_interface import MambaSpec
     _HAS_MAMBA_SPEC = True
 except ImportError:
     # vllm <= v0.11.0
     from vllm.utils import get_kv_cache_torch_dtype, get_ip
     _HAS_MAMBA_SPEC = False
     MambaSpec = None
-    FullAttentionSpec = None
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
