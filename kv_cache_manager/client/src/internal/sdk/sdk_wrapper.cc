@@ -262,6 +262,15 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
 
     // Wait with shared deadline
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    // Drain in-flight tasks with bounded wait to prevent background writes into caller's buffers
+    auto drain = [&](size_t from) {
+        stop->store(true);
+        for (size_t j = from; j < futures.size(); ++j) {
+            futures[j].wait_until(deadline);
+        }
+    };
+
     for (size_t i = 0; i < futures.size(); ++i) {
         auto remaining = deadline - std::chrono::steady_clock::now();
         if (remaining <= std::chrono::steady_clock::duration::zero()) {
@@ -274,22 +283,13 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                           timeout_ms,
                           i + 1,
                           futures.size());
-            stop->store(true);
-            // Drain all remaining in-flight tasks before returning
-            for (size_t j = i + 1; j < futures.size(); ++j) {
-                futures[j].wait();
-            }
+            drain(i + 1);
             return ER_SDK_TIMEOUT;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
-            // Fail-fast: signal remaining tasks to exit early, then drain in-flight
-            // tasks to prevent background writes into caller's buffers
-            stop->store(true);
-            for (size_t j = i + 1; j < futures.size(); ++j) {
-                futures[j].wait();
-            }
+            drain(i + 1);
             return ec;
         }
     }
