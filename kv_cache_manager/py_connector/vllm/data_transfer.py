@@ -157,6 +157,9 @@ class DataTransferManager:
                     copy_buffer_indices,
                     self._manager_block_size,
                     self._kvcache_info.per_token_per_layer_dim_size,
+                    kv_stride=self._kvcache_info.kv_stride,
+                    block_stride=self._kvcache_info.block_stride,
+                    local_block_size=self._kvcache_info.local_block_size,
                 )
 
                 copy_done_event = self._device_mod.Event()
@@ -171,26 +174,41 @@ class DataTransferManager:
         self._copy_buffer_allocator.free_buffer(copy_buffer_indices)
         multi_result.submit_result(task_idx, [transfer_result] * len(remote_uris))
 
-    def create_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids):
-        """创建加载完成回调函数
+    def create_load_done_callback(self, req_id, tp_rank, epoch, local_block_ids,
+                                  attn_block_count=0, hybrid_block_count=0):
+        """Create load done callback.
 
         Args:
-            req_id: 请求ID
+            req_id: Request ID
             tp_rank: TP rank
-            epoch
-            local_block_ids: 本地块ID列表
-
-        Returns:
-            回调函数
+            epoch: Current epoch
+            local_block_ids: Local block ID list (length = attn_block_count)
+            attn_block_count: Number of attention blocks (for AND-merge with hybrid)
+            hybrid_block_count: Number of hybrid blocks (0 for pure attention)
         """
         def generate_message(task_results):
-            failed_block_idxs = []
-            idx = 0
+            # Flatten all task results into a single list
+            all_successes = []
             for task_result in task_results:
                 for block_result in task_result:
-                    if block_result != kvcm_py_client.ClientErrorCode.ER_OK:
-                        failed_block_idxs.append(local_block_ids[idx])
-                    idx += 1
+                    all_successes.append(block_result == kvcm_py_client.ClientErrorCode.ER_OK)
+
+            if hybrid_block_count > 0 and attn_block_count > 0:
+                # AND-merge: block i is fully loaded only if both attention and hybrid succeed
+                attn_successes = all_successes[:attn_block_count]
+                hybrid_successes = all_successes[attn_block_count:]
+                assert len(hybrid_successes) == attn_block_count, \
+                    f"hybrid_block_count ({len(hybrid_successes)}) != attn_block_count ({attn_block_count})"
+                merged_successes = [
+                    attn_successes[i] and hybrid_successes[i]
+                    for i in range(attn_block_count)
+                ]
+            else:
+                merged_successes = all_successes
+
+            failed_block_idxs = [
+                local_block_ids[i] for i, ok in enumerate(merged_successes) if not ok
+            ]
 
             msg = CoordinateMessage(
                 time.time(),
@@ -224,6 +242,9 @@ class DataTransferManager:
                 copy_buffer_indices,
                 self._manager_block_size,
                 self._kvcache_info.per_token_per_layer_dim_size,
+                kv_stride=self._kvcache_info.kv_stride,
+                block_stride=self._kvcache_info.block_stride,
+                local_block_size=self._kvcache_info.local_block_size,
             )
             copy_done_event = self._device_mod.Event()
             copy_done_event.record(self._save_stream)
@@ -257,29 +278,40 @@ class DataTransferManager:
         # TODO: submit uri when enable local alloc
         multi_result.submit_result(task_idx, [transfer_result[0]] * len(remote_uris))
 
-    def create_save_done_callback(self, req_id, tp_rank, write_session_id):
+    def create_save_done_callback(self, req_id, tp_rank, write_session_id,
+                                  attn_block_count=0, hybrid_block_count=0):
         """创建保存完成回调函数
         
         Args:
             req_id: 请求ID
             tp_rank: TP rank
             write_session_id: 写入会话ID
+            attn_block_count: attention层的block数量（用于AND-merge hybrid结果）
+            hybrid_block_count: hybrid层的block数量（0表示纯attention模型）
             
         Returns:
             回调函数
         """
         def generate_message(task_results):
-            is_successes = []
-            # TODO: report uri when enable local alloc
-            # remote_uris = []
+            # Flatten all task results into a single list
+            all_successes = []
             for task_result in task_results:
                 for block_result in task_result:
-                    if block_result != kvcm_py_client.ClientErrorCode.ER_OK:
-                        is_successes.append(False)
-                        # remote_uris.append(None)
-                    else:
-                        is_successes.append(True)
-                        # remote_uris.extend(future_result[1])
+                    all_successes.append(block_result == kvcm_py_client.ClientErrorCode.ER_OK)
+
+            if hybrid_block_count > 0 and attn_block_count > 0:
+                # AND-merge: attention[i] AND hybrid[i] → block i is fully saved
+                attn_successes = all_successes[:attn_block_count]
+                hybrid_successes = all_successes[attn_block_count:]
+                assert len(hybrid_successes) == attn_block_count, \
+                    f"hybrid_block_count ({len(hybrid_successes)}) != attn_block_count ({attn_block_count})"
+                is_successes = [
+                    attn_successes[i] and hybrid_successes[i]
+                    for i in range(attn_block_count)
+                ]
+            else:
+                # Pure attention (or pure hybrid) — no merge needed
+                is_successes = all_successes
 
             msg = CoordinateMessage(
                 time.time(),
@@ -290,3 +322,119 @@ class DataTransferManager:
             self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
 
         return generate_message
+
+    # ==============================
+    # Hybrid (mamba/gdn/linear) layer transfer methods
+    # ==============================
+
+    def _get_hybrid_block_byte_size(self) -> int:
+        """Total bytes per block across all hybrid layers."""
+        info = self._kvcache_info.hybrid_info
+        return info.page_size_bytes * info.layer_num
+
+    def hybrid_load_task(self, multi_result: MultiResult, task_idx, remote_uris, block_indices):
+        """Load hybrid state for a batch of blocks (opaque byte-level memcpy).
+
+        Args:
+            multi_result: 多任务结果管理器
+            task_idx: 任务索引
+            remote_uris: 远程URI列表 (hybrid spec的URI)
+            block_indices: 每个block的local block id列表
+        """
+        info = self._kvcache_info.hybrid_info
+        per_block_bytes = self._get_hybrid_block_byte_size()
+        device = self._kvcache_info.device
+
+        # Allocate pinned CPU buffer for this batch (faster GPU↔CPU transfer)
+        cpu_buffer = torch.empty(len(remote_uris) * per_block_bytes, dtype=torch.uint8,
+                                 device="cpu", pin_memory=True)
+
+        buffers = []
+        for i in range(len(remote_uris)):
+            offset = i * per_block_bytes
+            buf = kvcm_py_client.BlockBuffer()
+            iov = kvcm_py_client.Iov()
+            iov.type = kvcm_py_client.MemoryType.CPU
+            iov.base = cpu_buffer.data_ptr() + offset
+            iov.size = per_block_bytes
+            iov.ignore = False
+            buf.iovs = [iov]
+            buffers.append(buf)
+
+        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
+
+        if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
+            # Scatter from CPU buffer to GPU hybrid state (block-level memcpy via tensor indexing)
+            with self._device_mod.stream(self._load_stream):
+                gpu_buffer = cpu_buffer.to(device, non_blocking=True)
+                for i, block_idx in enumerate(block_indices):
+                    for layer_idx in range(info.layer_num):
+                        src_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
+                        src_slice = gpu_buffer[src_offset:src_offset + info.page_size_bytes]
+                        info.block_view_tensors[layer_idx][block_idx].copy_(src_slice)
+
+                copy_done_event = self._device_mod.Event()
+                copy_done_event.record(self._load_stream)
+            copy_done_event.synchronize()
+        else:
+            logger.warning("hybrid load task failed, remote_uris:%s, transfer_result:%s",
+                           remote_uris, transfer_result)
+
+        multi_result.submit_result(task_idx, [transfer_result] * len(remote_uris))
+
+    def hybrid_save_task(self, multi_result: MultiResult, task_idx, remote_uris, block_indices,
+                         kvcache_ready_event):
+        """Save hybrid state for a batch of blocks (opaque byte-level memcpy).
+
+        Args:
+            multi_result: 多任务结果管理器
+            task_idx: 任务索引
+            remote_uris: 远程URI列表 (hybrid spec的URI)
+            block_indices: 每个block的local block id列表
+            kvcache_ready_event: KV缓存就绪事件
+        """
+        info = self._kvcache_info.hybrid_info
+        per_block_bytes = self._get_hybrid_block_byte_size()
+        device = self._kvcache_info.device
+
+        # Gather from GPU hybrid state to GPU buffer (block-level memcpy via tensor indexing)
+        with self._device_mod.stream(self._save_stream):
+            kvcache_ready_event.wait()
+
+            gpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8, device=device)
+            for i, block_idx in enumerate(block_indices):
+                for layer_idx in range(info.layer_num):
+                    src_slice = info.block_view_tensors[layer_idx][block_idx]
+                    dst_offset = (i * info.layer_num + layer_idx) * info.page_size_bytes
+                    gpu_buffer[dst_offset:dst_offset + info.page_size_bytes].copy_(src_slice)
+
+            copy_done_event = self._device_mod.Event()
+            copy_done_event.record(self._save_stream)
+
+        copy_done_event.synchronize()
+
+        # Use pinned memory for efficient D2H transfer
+        cpu_buffer = torch.empty(len(block_indices) * per_block_bytes, dtype=torch.uint8,
+                                 device="cpu", pin_memory=True)
+        cpu_buffer.copy_(gpu_buffer, non_blocking=True)
+        self._device_mod.current_stream().synchronize()
+
+        buffers = []
+        for i in range(len(remote_uris)):
+            offset = i * per_block_bytes
+            buf = kvcm_py_client.BlockBuffer()
+            iov = kvcm_py_client.Iov()
+            iov.type = kvcm_py_client.MemoryType.CPU
+            iov.base = cpu_buffer.data_ptr() + offset
+            iov.size = per_block_bytes
+            iov.ignore = False
+            buf.iovs = [iov]
+            buffers.append(buf)
+
+        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers)
+
+        if transfer_result[0] != kvcm_py_client.ClientErrorCode.ER_OK:
+            logger.warning("hybrid save task failed, remote_uris:%s, transfer_result:%s",
+                           remote_uris, transfer_result)
+
+        multi_result.submit_result(task_idx, [transfer_result[0]] * len(remote_uris))

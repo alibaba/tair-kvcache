@@ -42,8 +42,15 @@ def kv_cache_batch_gather_kernel(
         NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers * kv_count
         BLOCK_SIZE: tl.constexpr,  # 隐藏维度分块大小
         DTYPE: tl.constexpr = tl.float16,
+        kv_stride: tl.constexpr = 0,  # stride between K and V (for V pointers)
+        block_stride: tl.constexpr = 0,  # stride between blocks (0 = use flat indexing)
+        local_block_size: tl.constexpr = 0,  # actual block size in tensor (0 = use NUM_TOKENS_PER_BLOCK)
 ):
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
+    
+    # Determine if using strided layout
+    USE_STRIDED: tl.constexpr = (block_stride != 0)
+    EFFECTIVE_LOCAL_BLOCK_SIZE: tl.constexpr = local_block_size if local_block_size > 0 else NUM_TOKENS_PER_BLOCK
 
     pid = tl.program_id(0)
     grid_size = tl.num_programs(0)  # 实际grid大小 (如3)
@@ -65,6 +72,9 @@ def kv_cache_batch_gather_kernel(
         for ptr_idx in tl.range(NUM_KVCACHE_PTRS):
             # 3.1 加载当前层的KV缓存基地址
             kvcache_ptr = tl.load(kv_cache_ptrs_ptr + ptr_idx).to(tl.pointer_type(DTYPE))
+            
+            # Determine if this is a V pointer (odd index)
+            is_v_ptr = ptr_idx % 2
 
             # 3.2 计算当前层在dst中的基础偏移
             layer_offset = block_offset + ptr_idx * NUM_DIMS_PER_BLOCK
@@ -90,7 +100,17 @@ def kv_cache_batch_gather_kernel(
 
                 # 从HBM的KV缓存加载数据
                 # 计算源指针: [BLOCK_SIZE]
-                src_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
+                if USE_STRIDED:
+                    # Strided layout: convert flat token index to strided offset
+                    kv_block_idx = global_token_idx // EFFECTIVE_LOCAL_BLOCK_SIZE
+                    token_in_kv_block = global_token_idx % EFFECTIVE_LOCAL_BLOCK_SIZE
+                    strided_offset = kv_block_idx * block_stride + token_in_kv_block * NUM_DIMS_PER_TOKEN
+                    # Add kv_stride for V pointers
+                    strided_offset = strided_offset + is_v_ptr * kv_stride
+                    src_ptrs = kvcache_ptr + strided_offset + dim_idx_in_token
+                else:
+                    # Contiguous layout: flat indexing
+                    src_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
                 load_mask = mask & token_gather_mask
                 data = tl.load(src_ptrs, mask=load_mask, other=0.0)
                 # 大块连续写入 host memory (PCIe优化)
@@ -107,7 +127,10 @@ def batch_gather_kv_caches(
         dst_block_indices: List[int],  # List of dst block indices
         num_tokens_per_block: int,
         dim_size_per_token_per_layer: int,
-        sm_count: int = 3
+        sm_count: int = 3,
+        kv_stride: int = 0,  # stride between K and V (for V pointers)
+        block_stride: int = 0,  # stride between blocks (0 = use flat indexing)
+        local_block_size: int = 0,  # actual block size in tensor (0 = use num_tokens_per_block)
 ):
     # 配置参数
     total_blocks = len(dst_block_indices)
@@ -132,6 +155,9 @@ def batch_gather_kv_caches(
         BLOCK_SIZE=2048,
         DTYPE=pytorch_dtype_to_triton_dtype(dst_tensor.dtype),
         num_warps=32,
+        kv_stride=kv_stride,
+        block_stride=block_stride,
+        local_block_size=local_block_size if local_block_size > 0 else num_tokens_per_block,
     )
     # TODO autotune num_warps and BLOCK_SIZE
 
@@ -148,8 +174,15 @@ def kv_cache_batch_scatter_kernel(
         NUM_KVCACHE_PTRS: tl.constexpr,  # num_layers * kv_count
         BLOCK_SIZE: tl.constexpr,  # 隐藏维度分块大小
         DTYPE: tl.constexpr = tl.float16,
+        kv_stride: tl.constexpr = 0,  # stride between K and V (for V pointers)
+        block_stride: tl.constexpr = 0,  # stride between blocks (0 = use flat indexing)
+        local_block_size: tl.constexpr = 0,  # actual block size in tensor (0 = use NUM_TOKENS_PER_BLOCK)
 ):
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
+    
+    # Determine if using strided layout
+    USE_STRIDED: tl.constexpr = (block_stride != 0)
+    EFFECTIVE_LOCAL_BLOCK_SIZE: tl.constexpr = local_block_size if local_block_size > 0 else NUM_TOKENS_PER_BLOCK
 
     pid = tl.program_id(0)
     grid_size = tl.num_programs(0)  # 实际grid大小 (如3)
@@ -171,6 +204,9 @@ def kv_cache_batch_scatter_kernel(
         for ptr_idx in range(NUM_KVCACHE_PTRS):
             # 3.1 加载当前层的KV缓存基地址
             kvcache_ptr = tl.load(kv_cache_ptrs_ptr + ptr_idx).to(tl.pointer_type(DTYPE))
+            
+            # Determine if this is a V pointer (odd index)
+            is_v_ptr = ptr_idx % 2
 
             # 3.2 计算当前层在src中的基础偏移
             layer_offset = block_offset + ptr_idx * NUM_DIMS_PER_BLOCK
@@ -201,7 +237,17 @@ def kv_cache_batch_scatter_kernel(
 
                 # 向HBM的KV缓存写入数据
                 # 计算目的指针: [BLOCK_SIZE]
-                dst_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
+                if USE_STRIDED:
+                    # Strided layout: convert flat token index to strided offset
+                    kv_block_idx = global_token_idx // EFFECTIVE_LOCAL_BLOCK_SIZE
+                    token_in_kv_block = global_token_idx % EFFECTIVE_LOCAL_BLOCK_SIZE
+                    strided_offset = kv_block_idx * block_stride + token_in_kv_block * NUM_DIMS_PER_TOKEN
+                    # Add kv_stride for V pointers
+                    strided_offset = strided_offset + is_v_ptr * kv_stride
+                    dst_ptrs = kvcache_ptr + strided_offset + dim_idx_in_token
+                else:
+                    # Contiguous layout: flat indexing
+                    dst_ptrs = kvcache_ptr + global_token_idx * NUM_DIMS_PER_TOKEN + dim_idx_in_token
                 tl.store(dst_ptrs, data, mask=load_mask)
 
 
@@ -214,7 +260,10 @@ def batch_scatter_kv_caches(
         src_block_indices: List[int],  # List of src block indices
         num_tokens_per_block: int,
         dim_size_per_token_per_layer: int,
-        sm_count: int = 3
+        sm_count: int = 3,
+        kv_stride: int = 0,  # stride between K and V (for V pointers)
+        block_stride: int = 0,  # stride between blocks (0 = use flat indexing)
+        local_block_size: int = 0,  # actual block size in tensor (0 = use num_tokens_per_block)
 ):
     # 配置参数
     total_blocks = len(src_block_indices)
@@ -245,4 +294,7 @@ def batch_scatter_kv_caches(
         BLOCK_SIZE=2048,
         DTYPE=pytorch_dtype_to_triton_dtype(src_tensor.dtype),
         num_warps=32,
+        kv_stride=kv_stride,
+        block_stride=block_stride,
+        local_block_size=local_block_size if local_block_size > 0 else num_tokens_per_block,
     )

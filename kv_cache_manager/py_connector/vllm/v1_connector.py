@@ -20,15 +20,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 
 try:
     # vllm >= v0.11.1
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
     from vllm.utils.network_utils import get_ip
+    from vllm.v1.kv_cache_interface import MambaSpec, FullAttentionSpec
+    _HAS_MAMBA_SPEC = True
 except ImportError:
     # vllm <= v0.11.0
     from vllm.utils import get_kv_cache_torch_dtype, get_ip
+    _HAS_MAMBA_SPEC = False
+    MambaSpec = None
+    FullAttentionSpec = None
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -39,7 +45,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSer
 from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
 from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
-from kv_cache_manager.py_connector.common.types import KVCacheInfo
+from kv_cache_manager.py_connector.common.types import KVCacheInfo, HybridCacheInfo
 from kv_cache_manager.py_connector.kernel.gather_scatter_helper import CopyBufferAllocator
 from kv_cache_manager.py_connector.vllm.metadata import SaveRequest, LoadRequest, FinishRequest, ReqStateToWorker, \
     TairKvCacheConnectorMetadata
@@ -105,10 +111,70 @@ class TransferTaskArgs:
     remote_uris: List[str] = field(default_factory=list)
 
 
-class TairKvCacheConnector(KVConnectorBase_V1):
+class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called when a request has finished all kv cache groups.
+
+        For hybrid models, block_ids is a tuple where each element corresponds
+        to a kv_cache_group (e.g. block_ids[0] = attention blocks, block_ids[1] = hybrid blocks).
+        In mamba_cache_mode="all", all groups share the same block_ids.
+
+        We delegate to request_finished which handles saving progress tracking.
+        """
+        # For hybrid models with mamba_cache_mode="all", all groups share block_ids.
+        # We use block_ids[0] (attention group) since the saving logic is block-level.
+        if len(block_ids) == 0:
+            return False, None
+        delay_free, extra_info = self.request_finished(request, block_ids[0])
+        return delay_free, extra_info
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+        """
+        Specify the required KV cache layout for this connector.
+        
+        We don't enforce a specific KV cache layout. vLLM will use the default
+        layout determined by the attention backend (typically NHD for FlashAttention).
+        """
+        return None
+
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
         """Convert TP rank to location spec name."""
         return f"tp{tp_rank}"
+
+    def _tp_rank_to_hybrid_spec_name(self, tp_rank: int) -> str:
+        """Convert TP rank to hybrid (mamba/gdn) location spec name."""
+        return f"tp{tp_rank}_hybrid"
+
+    def _detect_hybrid_layers(self, kv_cache_config) -> tuple[bool, list, int]:
+        """Detect hybrid (non-attention) layer groups from kv_cache_config.
+
+        Returns:
+            (has_hybrid, hybrid_layer_names, hybrid_page_size_bytes)
+        """
+        if not _HAS_MAMBA_SPEC or kv_cache_config is None:
+            return False, [], 0
+
+        hybrid_layer_names = []
+        hybrid_page_size_bytes = 0
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                hybrid_layer_names.extend(group.layer_names)
+                if hybrid_page_size_bytes == 0:
+                    hybrid_page_size_bytes = spec.page_size_bytes
+                else:
+                    assert spec.page_size_bytes == hybrid_page_size_bytes, \
+                        f"All MambaSpec groups must have the same page_size_bytes, " \
+                        f"got {spec.page_size_bytes} vs {hybrid_page_size_bytes}"
+
+        has_hybrid = len(hybrid_layer_names) > 0
+        return has_hybrid, hybrid_layer_names, hybrid_page_size_bytes
 
     def __init__(self,
                  vllm_config: "VllmConfig",
@@ -132,6 +198,11 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         configure_log_level(self._extra_config.log_level)
 
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
+        # Scheduler's logical block size — used to index local_block_ids.
+        # Must NOT be overwritten by register_kv_caches.
+        self._vllm_block_size = vllm_config.cache_config.block_size
+        # Kernel's physical block size — may be overwritten by register_kv_caches
+        # to tensor.shape[2] for hybrid models where cache_config.block_size != kernel_block_size.
         self._local_block_size = vllm_config.cache_config.block_size
 
         model_config = vllm_config.model_config
@@ -152,6 +223,13 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         per_manager_location_spec_shape = [num_layer, 1 if self._use_mla else 2, manager_block_size,
                                            per_tp_rank_kv_head_num,
                                            head_size]
+
+        # Detect hybrid (mamba/gdn/linear) layers from kv_cache_config
+        self._has_hybrid, self._hybrid_layer_names, self._hybrid_page_size_bytes = \
+            self._detect_hybrid_layers(kv_cache_config)
+        if self._has_hybrid:
+            logger.warning("Hybrid model detected: %d hybrid layers, page_size_bytes=%d",
+                           len(self._hybrid_layer_names), self._hybrid_page_size_bytes)
 
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
         deployment = {
@@ -189,17 +267,44 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         self._host_ip = get_ip()
         port = self._extra_config.coordinator_base_port
 
-        register_response = self._manager_client.register_instance({
+        # Build location_spec_infos and location_spec_groups
+        location_spec_infos = [{
+            "name": self._tp_rank_to_spec_name(rank),
+            "size": math.prod(per_manager_location_spec_shape) * kv_dtype.itemsize
+        } for rank in range(self._tp_size)]
+
+        location_spec_groups = []
+
+        if self._has_hybrid:
+            # Add hybrid spec infos for each tp rank.
+            # Size must cover ALL hybrid layers packed into one buffer per block,
+            # matching what hybrid_save_task actually sends.
+            hybrid_total_bytes = self._hybrid_page_size_bytes * len(self._hybrid_layer_names)
+            for rank in range(self._tp_size):
+                location_spec_infos.append({
+                    "name": self._tp_rank_to_hybrid_spec_name(rank),
+                    "size": hybrid_total_bytes
+                })
+            # Define spec groups for hybrid attention
+            all_attn_specs = [self._tp_rank_to_spec_name(r) for r in range(self._tp_size)]
+            all_hybrid_specs = [self._tp_rank_to_hybrid_spec_name(r) for r in range(self._tp_size)]
+            location_spec_groups = [
+                {"name": "Full", "spec_names": all_attn_specs},
+                {"name": "FullAndHybrid", "spec_names": all_attn_specs + all_hybrid_specs},
+            ]
+
+        register_request = {
             "trace_id": "trace_trace",
             "instance_group": self._extra_config.instance_group,
             "instance_id": self._extra_config.instance_id,
             "model_deployment": deployment,
             "block_size": manager_block_size,
-            "location_spec_infos": [{
-                "name": self._tp_rank_to_spec_name(rank),
-                "size": math.prod(per_manager_location_spec_shape) * kv_dtype.itemsize
-            } for rank in range(self._tp_size)],
-        })
+            "location_spec_infos": location_spec_infos,
+        }
+        if location_spec_groups:
+            register_request["location_spec_groups"] = location_spec_groups
+
+        register_response = self._manager_client.register_instance(register_request)
         # TODO: check conflict and update
         self._iov_size = math.prod(
             per_manager_location_spec_shape) * kv_dtype.itemsize * self._extra_config.hf3fs_concurrent_io_block_count
@@ -265,6 +370,10 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                     self._location_spec_name: math.prod(per_manager_location_spec_shape) * kv_dtype.itemsize,
                 },
             }
+            if self._has_hybrid:
+                self._hybrid_location_spec_name = self._tp_rank_to_hybrid_spec_name(self._tp_rank)
+                transfer_client_json["location_spec_infos"][self._hybrid_location_spec_name] = \
+                    self._hybrid_page_size_bytes * len(self._hybrid_layer_names)
             self._transfer_client_config = json.dumps(transfer_client_json)
 
             self._init_params = kvcm_py_client.InitParams()
@@ -323,16 +432,41 @@ class TairKvCacheConnector(KVConnectorBase_V1):
     # ==============================
 
     def generate_blocks_idx(self, manager_block_idxes, local_block_ids):
+        """Map manager block indices to flat token indices in the KV cache tensor.
+
+        Three-tier block hierarchy:
+          Manager block  : _manager_block_size (e.g. 528) — KVCM server's unit
+          vLLM logical   : _vllm_block_size   (e.g. 528) — scheduler's allocation unit
+          Kernel physical: _local_block_size   (e.g. 16)  — tensor's storage unit
+
+        ratio = _vllm_block_size // _local_block_size (e.g. 33)
+        Each logical block occupies `ratio` consecutive physical blocks in the tensor.
+        """
+        ratio = self._vllm_block_size // self._local_block_size
         blocks_idx = []
         for manager_block_idx in manager_block_idxes:
-            # get kvcache index list
             block_idx = []
             for i in range(self._manager_block_size):
                 now_token_idx = manager_block_idx * self._manager_block_size + i
-                assert now_token_idx // self._local_block_size < len(local_block_ids)
-                local_block_id = local_block_ids[now_token_idx // self._local_block_size]
-                token_offset = now_token_idx % self._local_block_size
-                block_idx.append(local_block_id * self._local_block_size + token_offset)
+
+                # 1. Logical block index (into local_block_ids)
+                logical_block_idx = now_token_idx // self._vllm_block_size
+                assert logical_block_idx < len(local_block_ids), (
+                    f"logical_block_idx={logical_block_idx} out of range "
+                    f"(len={len(local_block_ids)}, ratio={ratio}, "
+                    f"vllm_bs={self._vllm_block_size}, local_bs={self._local_block_size})"
+                )
+                local_block_id = local_block_ids[logical_block_idx]
+
+                # 2. Token offset within the logical block
+                token_within_logical = now_token_idx % self._vllm_block_size
+
+                # 3. Physical block in tensor
+                physical_block = local_block_id * ratio + token_within_logical // self._local_block_size
+
+                # 4. Flat token index for gather/scatter kernel
+                token_within_physical = token_within_logical % self._local_block_size
+                block_idx.append(physical_block * self._local_block_size + token_within_physical)
             blocks_idx.append(block_idx)
         return blocks_idx
 
@@ -375,13 +509,74 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             logger.warning("finish_write_cache failed, write_session_id: %s, error: %s", write_session_id, e)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        _, first_layer_kvcache = next(iter(kv_caches.items()))
         self._kv_caches = kv_caches
+
+        # Separate attention layers (Tensor) from hybrid layers (list[Tensor])
+        attn_layer_names = []
+        hybrid_layer_names_in_kv = []
+        for name, cache in kv_caches.items():
+            if isinstance(cache, list):
+                hybrid_layer_names_in_kv.append(name)
+            else:
+                attn_layer_names.append(name)
+
+        # Find first attention layer as reference
+        first_attn_kvcache = None
+        for name in attn_layer_names:
+            first_attn_kvcache = kv_caches[name]
+            break
+
+        if first_attn_kvcache is not None:
+            self._register_attention_kv_caches(first_attn_kvcache, attn_layer_names)
+        else:
+            raise RuntimeError(
+                "Pure Mamba/GDN models are not supported; "
+                "at least one Attention layer is required in kv_caches")
+
+        # Register hybrid layers if present
+        if self._has_hybrid and hybrid_layer_names_in_kv:
+            self._register_hybrid_kv_caches(hybrid_layer_names_in_kv)
+        elif hybrid_layer_names_in_kv:
+            logger.warning("Hybrid layers found in kv_caches but _has_hybrid is False, "
+                           "hybrid layers will not be transferred")
+
+        # Safety: if _has_hybrid is True, hybrid_info must have been set
+        if self._has_hybrid:
+            assert getattr(self, '_hybrid_info', None) is not None, \
+                "_has_hybrid is True but hybrid_info was not set; " \
+                "kv_caches may not contain the expected hybrid layers"
+
+        # Finalize: build KVCacheInfo and DataTransferManager
+        self._finalize_kv_cache_registration()
+
+    def _register_attention_kv_caches(self, first_layer_kvcache, attn_layer_names):
+        """Register attention layer KV caches (existing logic)."""
         # TODO: support MLA
 
-        assert self._local_block_size == first_layer_kvcache.shape[2], "kv cache shape error"
-        for layer_name, kvcache in kv_caches.items():
-            assert kvcache.is_contiguous(), "kv cache must be contiguous"
+        # For hybrid models, the kernel block size (tensor shape[2]) may differ
+        # from the scheduler's block size (vllm config). Update _local_block_size
+        # to match the tensor's actual block size.
+        self._local_block_size = first_layer_kvcache.shape[2]
+        
+        # Compute stride parameters for strided memory layout
+        # For contiguous layout: kv_stride=0, block_stride=0 (use flat indexing)
+        # For strided layout: compute from tensor strides
+        if first_layer_kvcache.is_contiguous():
+            self._kv_stride = 0
+            self._block_stride = 0
+        else:
+            # Strided layout: [2, num_blocks, block_size, num_heads, head_dim]
+            # stride[0] = distance between K and V
+            # stride[1] = distance between blocks
+            self._kv_stride = first_layer_kvcache.stride(0)
+            self._block_stride = first_layer_kvcache.stride(1)
+            logger.info(f"Strided KV cache layout: kv_stride={self._kv_stride}, block_stride={self._block_stride}")
+        
+        for name in attn_layer_names:
+            kvcache = self._kv_caches[name]
+            # Hybrid models may have strided tensors; skip contiguous check for them
+            if not self._has_hybrid:
+                assert kvcache.is_contiguous(), "kv cache must be contiguous"
 
         # torch.Size([2, block_num, block_size, kv_head_num, kv_dim])
         # 2 -> key, value
@@ -405,25 +600,25 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                first_layer_kvcache[0][0][0].data_ptr(), "kv cache shape error"
         assert self._per_manager_location_spec_layer_byte_size == 2 * self._manager_block_size * self._per_layer_token_key_byte_size
 
-        self._per_manager_location_spec_shape = [len(self._kv_caches)] + self._per_manager_location_spec_layer_shape
+        self._per_manager_location_spec_shape = [len(attn_layer_names)] + self._per_manager_location_spec_layer_shape
         self._per_manager_location_spec_byte_size = math.prod(
             self._per_manager_location_spec_shape) * self._dtype.itemsize
 
         self._kvcache_ptr_tensor_cpu = torch.tensor(
-            [self._kv_caches[name].data_ptr() for name in self._kv_caches],
+            [self._kv_caches[name].data_ptr() for name in attn_layer_names],
             dtype=torch.int64,
             device="cpu"
         )
         self._kvcache_ptr_tensor_gpu = self._kvcache_ptr_tensor_cpu.to(self._device)
         if self._use_mla:
             self._all_kvcache_ptr_tensor_cpu = torch.tensor(
-                [self._kv_caches[name].data_ptr() for name in self._kv_caches],
+                [self._kv_caches[name].data_ptr() for name in attn_layer_names],
                 dtype=torch.int64,
                 device="cpu"
             )
         else:
             kvcache_ptrs = []
-            for name in self._kv_caches:
+            for name in attn_layer_names:
                 kvcache_ptrs.append(self._kv_caches[name][0].data_ptr())
                 kvcache_ptrs.append(self._kv_caches[name][1].data_ptr())
             self._all_kvcache_ptr_tensor_cpu = torch.tensor(
@@ -433,6 +628,62 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             )
         self._all_kvcache_ptr_tensor_gpu = self._all_kvcache_ptr_tensor_cpu.to(self._device)
 
+        self._copy_buffer_allocator = CopyBufferAllocator(torch.device("cpu"), self._dtype,
+                                                          self._per_manager_location_spec_shape, 1024)
+
+    def _register_hybrid_kv_caches(self, hybrid_layer_names):
+        """Register hybrid (mamba/gdn/linear) layer state caches.
+
+        For each hybrid layer, kv_caches[name] is a list[Tensor] (e.g. [conv_state, ssm_state]).
+        All state tensors share the same underlying untyped_storage (guaranteed by vllm).
+        We reconstruct a (num_blocks, page_size_bytes) byte view for opaque block transfer.
+        """
+        device = self._device
+        block_view_tensors = []
+        ptr_list = []
+
+        for name in hybrid_layer_names:
+            state_tensors = self._kv_caches[name]
+            assert isinstance(state_tensors, list) and len(state_tensors) > 0, \
+                f"Hybrid layer {name} should be a non-empty list of tensors"
+
+            # Assert all state tensors share the same untyped_storage (contiguity guarantee)
+            base_storage = state_tensors[0].untyped_storage()
+            for i, st in enumerate(state_tensors[1:], 1):
+                assert st.untyped_storage().data_ptr() == base_storage.data_ptr(), \
+                    f"Hybrid layer {name}: state tensor [{i}] does not share storage with [0]"
+
+            # Build (num_blocks, page_size_bytes) uint8 view from the shared storage
+            num_blocks = state_tensors[0].shape[0]
+            byte_view = torch.tensor([], dtype=torch.uint8, device=device).set_(base_storage)
+            total_bytes = base_storage.nbytes()
+            assert total_bytes >= num_blocks * self._hybrid_page_size_bytes, \
+                f"Hybrid layer {name}: storage size {total_bytes} < {num_blocks} * {self._hybrid_page_size_bytes}"
+            byte_view = byte_view[:num_blocks * self._hybrid_page_size_bytes].view(
+                num_blocks, self._hybrid_page_size_bytes)
+            block_view_tensors.append(byte_view)
+            ptr_list.append(base_storage.data_ptr())
+
+        ptr_tensor_cpu = torch.tensor(ptr_list, dtype=torch.int64, device="cpu")
+
+        self._hybrid_info = HybridCacheInfo(
+            layer_names=hybrid_layer_names,
+            ptr_tensor_cpu=ptr_tensor_cpu,
+            block_view_tensors=block_view_tensors,
+            page_size_bytes=self._hybrid_page_size_bytes,
+            layer_num=len(hybrid_layer_names),
+        )
+
+        logger.warning("Registered hybrid layers: %s, page_size_bytes=%d, layer_num=%d",
+                       hybrid_layer_names, self._hybrid_page_size_bytes, len(hybrid_layer_names))
+
+    def _finalize_kv_cache_registration(self):
+        """Finalize KV cache registration after both attention and hybrid layers are registered.
+
+        Called at the end of register_kv_caches to build KVCacheInfo and DataTransferManager.
+        """
+        hybrid_info = getattr(self, '_hybrid_info', None) if self._has_hybrid else None
+
         self._kvcache_info = KVCacheInfo(
             self._tp_rank,
             self._tp_size,
@@ -440,18 +691,20 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self._kvcache_ptr_tensor_cpu,
             self._kvcache_ptr_tensor_gpu,
             self._all_kvcache_ptr_tensor_gpu,
-            len(self._kv_caches),
+            len([n for n in self._kv_caches if isinstance(self._kv_caches[n], torch.Tensor)]),
             self._local_token_num,
             tuple(self._per_manager_location_spec_shape),
             self._per_manager_location_spec_byte_size,
             self._per_layer_token_key_dim_size,
             self._device,
-            self._dtype
+            self._dtype,
+            hybrid_info,
+            self._kv_stride,
+            self._block_stride,
+            self._local_block_size,
         )
-        self._copy_buffer_allocator = CopyBufferAllocator(torch.device("cpu"), self._dtype,
-                                                          self._per_manager_location_spec_shape, 1024)
 
-        # 初始化DataTransferManager实例
+        # Initialize DataTransferManager
         self._data_transfer = DataTransferManager(
             self._kvcache_info,
             self._manager_block_size,
@@ -461,8 +714,8 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self._extra_config,
         )
 
-        logger.warning("register_kv_caches, _per_manager_location_spec_layer_shape: %s",
-                       self._per_manager_location_spec_layer_shape)
+        logger.warning("register_kv_caches, _per_manager_location_spec_layer_shape: %s, has_hybrid: %s",
+                       self._per_manager_location_spec_layer_shape, self._has_hybrid)
 
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -472,19 +725,40 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             if len(load_req.need_load_locations) == 0:
                 continue
 
+            # --- Attention layer load (existing path) ---
             block_token_indices = self.generate_blocks_idx(load_req.manager_block_idxes, load_req.local_block_ids)
             all_remote_uris = self.get_self_uris(load_req.need_load_locations)
 
             per_task_size = self._extra_config.block_per_load_task
-            task_num = math.ceil(len(block_token_indices) / per_task_size)
+
+            # --- Hybrid layer load setup ---
+            hybrid_uris = []
+            hybrid_block_indices = []
+            if self._has_hybrid:
+                hybrid_uris = self.get_self_hybrid_uris(load_req.need_load_locations)
+                if len(hybrid_uris) > 0:
+                    hybrid_block_indices = self.generate_hybrid_block_indices(
+                        load_req.manager_block_idxes, load_req.local_block_ids)
+                    assert len(hybrid_uris) == len(hybrid_block_indices), \
+                        f"hybrid_uris ({len(hybrid_uris)}) != hybrid_block_indices ({len(hybrid_block_indices)}), " \
+                        f"locations may have mixed Full/FullAndHybrid groups"
+
+            # Total tasks = attention tasks + hybrid tasks (merged into one MultiResult)
+            attn_task_num = math.ceil(len(block_token_indices) / per_task_size)
+            hybrid_task_num = math.ceil(len(hybrid_uris) / per_task_size) if hybrid_uris else 0
+            total_task_num = attn_task_num + hybrid_task_num
+
             done_callback = self._data_transfer.create_load_done_callback(
                 load_req.req_id,
                 self._kvcache_info.tp_rank,
                 meta.epoch,
-                copy.copy(load_req.local_block_ids)
+                copy.copy(load_req.local_block_ids),
+                attn_block_count=len(block_token_indices),
+                hybrid_block_count=len(hybrid_uris)
             )
-            multi_result = MultiResult(task_num, done_callback)
+            multi_result = MultiResult(total_task_num, done_callback)
 
+            # Submit attention tasks
             task_idx = 0
             for i in range(0, len(block_token_indices), per_task_size):
                 end_idx = min(len(block_token_indices), i + per_task_size)
@@ -492,6 +766,16 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 task_block_token_indices = block_token_indices[i:end_idx]
                 self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
                                                 task_block_token_indices)
+                task_idx += 1
+
+            # Submit hybrid tasks (continuing with same multi_result)
+            for i in range(0, len(hybrid_uris), per_task_size):
+                end_idx = min(len(hybrid_uris), i + per_task_size)
+                h_task_uris = hybrid_uris[i:end_idx]
+                h_task_blocks = hybrid_block_indices[i:end_idx]
+                self._data_transfer.submit_task(
+                    self._data_transfer.hybrid_load_task,
+                    multi_result, task_idx, h_task_uris, h_task_blocks)
                 task_idx += 1
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -515,19 +799,40 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         for req_save in meta.to_save_requests:
             req = self._alive_requests[req_save.req_id]
 
+            # --- Attention layer save (existing path) ---
             # get idx
             blocks_idx = self.generate_blocks_idx(req_save.manager_block_idxes, req.local_block_ids)
             all_remote_uris = self.get_self_uris(req_save.target_locations)
 
             per_task_size = self._extra_config.block_per_save_task
-            task_num = math.ceil(len(blocks_idx) / per_task_size)
+
+            # --- Hybrid layer save setup ---
+            hybrid_uris = []
+            hybrid_block_indices = []
+            if self._has_hybrid:
+                hybrid_uris = self.get_self_hybrid_uris(req_save.target_locations)
+                if len(hybrid_uris) > 0:
+                    hybrid_block_indices = self.generate_hybrid_block_indices(
+                        req_save.manager_block_idxes, req.local_block_ids)
+                    assert len(hybrid_uris) == len(hybrid_block_indices), \
+                        f"hybrid_uris ({len(hybrid_uris)}) != hybrid_block_indices ({len(hybrid_block_indices)}), " \
+                        f"locations may have mixed Full/FullAndHybrid groups"
+
+            # Total tasks = attention tasks + hybrid tasks (merged into one MultiResult)
+            attn_task_num = math.ceil(len(blocks_idx) / per_task_size)
+            hybrid_task_num = math.ceil(len(hybrid_uris) / per_task_size) if hybrid_uris else 0
+            total_task_num = attn_task_num + hybrid_task_num
+
             done_callback = self._data_transfer.create_save_done_callback(
                 req.req_id,
                 self._kvcache_info.tp_rank,
-                req_save.write_session_id
+                req_save.write_session_id,
+                attn_block_count=len(blocks_idx),
+                hybrid_block_count=len(hybrid_uris)
             )
-            multi_result = MultiResult(task_num, done_callback)
+            multi_result = MultiResult(total_task_num, done_callback)
 
+            # Submit attention tasks
             task_idx = 0
             for i in range(0, len(blocks_idx), per_task_size):
                 end_idx = min(len(blocks_idx), i + per_task_size)
@@ -537,6 +842,18 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                                                 task_block_token_indices,
                                                 kvcache_ready_event)
                 task_idx += 1
+
+            # Submit hybrid tasks (continuing with same multi_result)
+            for i in range(0, len(hybrid_uris), per_task_size):
+                end_idx = min(len(hybrid_uris), i + per_task_size)
+                h_task_uris = hybrid_uris[i:end_idx]
+                h_task_blocks = hybrid_block_indices[i:end_idx]
+                self._data_transfer.submit_task(
+                    self._data_transfer.hybrid_save_task,
+                    multi_result, task_idx, h_task_uris, h_task_blocks,
+                    kvcache_ready_event)
+                task_idx += 1
+
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
 
@@ -548,6 +865,38 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 if self._tp_rank_to_spec_name(self._kvcache_info.tp_rank) == location_spec["name"]:
                     all_remote_uris.append(location_spec["uri"])
         return all_remote_uris
+
+    def get_self_hybrid_uris(self, locations):
+        """Extract hybrid spec URIs for this rank."""
+        if not self._has_hybrid:
+            return []
+        hybrid_spec_name = self._tp_rank_to_hybrid_spec_name(self._kvcache_info.tp_rank)
+        all_remote_uris = []
+        for location in locations:
+            for location_spec in location.get("location_specs", []):
+                if hybrid_spec_name == location_spec["name"]:
+                    all_remote_uris.append(location_spec["uri"])
+        return all_remote_uris
+
+    def generate_hybrid_block_indices(self, manager_block_idxes, local_block_ids):
+        """Generate local block IDs for hybrid (per-block) transfer.
+
+        Unlike attention's generate_blocks_idx which produces per-token indices,
+        hybrid state is per-block, so we only need one local block ID per manager block.
+
+        Hybrid state tensors are indexed by logical block IDs (scheduler's allocation unit),
+        so we use _vllm_block_size (not _local_block_size) for the lookup.
+        """
+        block_indices = []
+        for manager_block_idx in manager_block_idxes:
+            now_token_idx = manager_block_idx * self._manager_block_size
+            logical_block_idx = now_token_idx // self._vllm_block_size
+            assert logical_block_idx < len(local_block_ids), (
+                f"hybrid block index {logical_block_idx} out of range "
+                f"(len={len(local_block_ids)}, vllm_bs={self._vllm_block_size})"
+            )
+            block_indices.append(local_block_ids[logical_block_idx])
+        return block_indices
 
     def get_finished(
             self, finished_req_ids: set[str]
@@ -777,6 +1126,14 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             "token_ids": token_ids,
             "write_timeout_seconds": 30
         }
+        # Fill location_spec_group_names for hybrid attention models
+        if self._has_hybrid:
+            # In mamba_cache_mode="all", every block has both attention and hybrid state
+            request["location_spec_group_names"] = ["FullAndHybrid"] * target_save_num
+            # Keep block_keys=[] to let server generate hash-based keys from token_ids.
+            # This ensures write and query use the same hash function.
+            # NOTE: Server must apply key generation BEFORE validating keys.size() == group_names.size().
+            # See server-side fix in commit 71205d0 (CacheManager::StartWriteCache).
         logger.debug("start_write_cache req: %s", request)
         try:
             response = self._manager_client.start_write_cache(request)

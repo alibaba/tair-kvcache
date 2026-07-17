@@ -633,11 +633,6 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    if (!location_spec_group_names.empty()) {
-        auto check_ec =
-            CheckLocationSpecGroupNames(request_context, instance_id, keys.size(), location_spec_group_names);
-        RETURN_IF_EC_NOT_OK_WITH_TYPE(check_ec, StartWriteCacheInfo);
-    }
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     CacheLocationVector new_locations;
@@ -677,6 +672,17 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
+
+    // Validate location_spec_group_names size matches query_keys size (not keys size).
+    // This must happen AFTER key generation because:
+    // - If keys is empty, query_keys is generated from token_ids via GenKeyVector
+    // - location_spec_group_names.size() must match the ACTUAL number of keys used (query_keys.size())
+    // - Validating against keys.size() would fail when keys is empty (normal token_ids mode)
+    if (!location_spec_group_names.empty()) {
+        auto check_ec =
+            CheckLocationSpecGroupNames(request_context, instance_id, query_keys.size(), location_spec_group_names);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE(check_ec, StartWriteCacheInfo);
+    }
 
     std::vector<std::string> location_ids;
     std::string write_session_id = StringUtil::GenerateRandomString(32);
