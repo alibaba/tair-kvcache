@@ -31,6 +31,7 @@ class SubscriberConfig:
     data_parallel_size: int = 1
 
     # kvcm SDK
+    kvcm_base_url: str = ""
     kvcm_heartbeat_interval_s: float = 1.0
     kvcm_request_timeout_s: float = 5.0
     kv_event_queue_maxsize: int = 1024
@@ -106,6 +107,7 @@ class SubscriberConfig:
         parser.add_argument("--zmq-topic", default=default)
         parser.add_argument("--zmq-replay-timeout-s", type=float, default=default)
         parser.add_argument("--data-parallel-size", type=int, default=default)
+        parser.add_argument("--kvcm-base-url", default=default)
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
         parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)

@@ -108,6 +108,7 @@ def test_kvcm_report_batch_size_must_be_positive() -> None:
 
 def test_kvcm_runtime_config_defaults() -> None:
     config = SubscriberConfig()
+    assert config.kvcm_base_url == ""
     assert config.kvcm_heartbeat_interval_s == 1.0
 
 
@@ -121,6 +122,15 @@ def test_kvcm_runtime_config_cli_override() -> None:
     )
     config = SubscriberConfig.from_args(args)
     assert config.kvcm_heartbeat_interval_s == 2.5
+
+
+def test_kvcm_base_url_cli_override() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--kvcm-base-url", "http://127.0.0.1:6382"])
+
+    config = SubscriberConfig.from_args(args)
+
+    assert config.kvcm_base_url == "http://127.0.0.1:6382"
 
 
 def test_kvcm_runtime_config_yaml_loading(tmp_path: Path) -> None:

@@ -16,8 +16,10 @@ uv sync
 # With defaults
 uv run python -m subscriber
 
-# With CLI args
-uv run python -m subscriber --zmq-pub-endpoint tcp://localhost:5557 --kvcm-addr 10.0.0.1:50051
+# With CLI args and a directly addressed KVCM service
+uv run python -m subscriber \
+  --zmq-pub-endpoint tcp://localhost:5557 \
+  --kvcm-base-url http://10.0.0.1:6382
 
 # With config file
 uv run python -m subscriber --config config.yaml
@@ -39,6 +41,11 @@ until KVCM acknowledges it, confirms removals across consecutive snapshots,
 and periodically refreshes the full add set for reconciliation.
 The configured `block_size` must match every RTP endpoint because KVCM instance
 registration happens before the first snapshot is forwarded.
+
+By default the Subscriber discovers KVCM from `KVCM_VSERVICE_ID`. For local
+tests or deployments with a fixed manager address, set `kvcm_base_url` in YAML
+or pass `--kvcm-base-url`; the explicit address takes precedence over Spectrum
+service discovery.
 
 RTP-LLM can launch this process automatically by setting
 `KVCM_SUBSCRIBER_CONFIG` to the YAML path. RTP derives the default cache API

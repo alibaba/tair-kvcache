@@ -89,9 +89,12 @@ class KvcmClient:
         self._started = False
 
     def _base_url(self) -> str:
+        configured_base_url = self._config.kvcm_base_url.strip()
+        if configured_base_url:
+            return configured_base_url
         virtual_service_id = os.environ.get("KVCM_VSERVICE_ID", "")
         if not virtual_service_id:
-            raise ValueError("Please specify KVCM_VSERVICE_ID")
+            raise ValueError("Please specify kvcm_base_url or KVCM_VSERVICE_ID")
         return f"spectrum://{virtual_service_id}:6382"
 
     def _instance_group(self) -> str:

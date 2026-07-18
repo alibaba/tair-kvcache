@@ -435,6 +435,58 @@ async def test_start_uses_spectrum_address_from_vservice_id(
     assert [created.base_url for created in created_clients] == ["spectrum://vs-a:6382"]
 
 
+async def test_start_prefers_configured_kvcm_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-ignored")
+    created_clients: list[FakeSdkClient] = []
+
+    def create_http_client(
+        base_url: str, *, request_timeout_seconds: float
+    ) -> FakeSdkClient:
+        client = FakeSdkClient(base_url)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "subscriber.kvcm.client.HttpKvCacheManagerClient", create_http_client
+    )
+
+    client = KvcmClient(
+        SubscriberConfig(
+            kvcm_base_url="  http://127.0.0.1:6382  ",
+            kvcm_heartbeat_interval_s=60.0,
+        ),
+        medium_mapper=_vllm_medium_mapper,
+        storage_type="ST_EVENT_REPORT",
+        supported_mediums=["hbm", "mem"],
+    )
+
+    await client.start()
+    await client.close()
+
+    assert [created.base_url for created in created_clients] == [
+        "http://127.0.0.1:6382"
+    ]
+
+
+def test_client_requires_configured_or_discovered_kvcm_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVCM_VSERVICE_ID", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match="Please specify kvcm_base_url or KVCM_VSERVICE_ID",
+    ):
+        KvcmClient(
+            SubscriberConfig(),
+            medium_mapper=_vllm_medium_mapper,
+            storage_type="ST_EVENT_REPORT",
+            supported_mediums=["hbm", "mem"],
+        )
+
+
 async def test_start_resolves_host_ip_port_once_and_reuses_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
