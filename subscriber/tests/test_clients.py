@@ -334,7 +334,11 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
         },
         {
             "event_type": "EVENT_BLOCK_DELETE",
-            "block_delete": {"block_key": "13", "medium": "mem"},
+            "block_delete": {
+                "block_key": "13",
+                "medium": "mem",
+                "spec_names": ["vllm_1"],
+            },
         },
         {"event_type": "EVENT_HOST_DOWN", "host_down": {}},
     ]
@@ -348,7 +352,11 @@ def test_report_events_for_batches_maps_unknown_medium_to_empty_string() -> None
     assert _client()._report_events_for_batches([batch]) == [
         {
             "event_type": "EVENT_BLOCK_DELETE",
-            "block_delete": {"block_key": "13", "medium": ""},
+            "block_delete": {
+                "block_key": "13",
+                "medium": "",
+                "spec_names": ["vllm_1"],
+            },
         }
     ]
 
@@ -813,9 +821,28 @@ async def test_send_batch_reports_converted_events() -> None:
     assert request["events"] == [
         {
             "event_type": "EVENT_BLOCK_DELETE",
-            "block_delete": {"block_key": "13", "medium": "mem"},
+            "block_delete": {
+                "block_key": "13",
+                "medium": "mem",
+                "spec_names": ["vllm_1"],
+            },
         }
     ]
+
+
+def test_block_delete_uses_registered_engine_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DS_LLM_ENGINE_CONFIG", '{"block_size": 64}')
+    client = _client(SubscriberConfig(block_size=32))
+    batch = KVEventBatch(
+        ts=1.0,
+        events=[BlockRemoved(block_hashes=[13], medium="CPU")],
+    )
+
+    events = client._report_events_for_batches([batch])
+
+    assert events[0]["block_delete"]["spec_names"] == ["vllm_64"]
 
 
 async def test_send_batch_splits_large_snapshot_reports() -> None:

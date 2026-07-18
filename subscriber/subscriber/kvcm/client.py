@@ -198,17 +198,21 @@ class KvcmClient:
         }
 
     def _block_specs(self, medium: str) -> list[dict[str, str]]:
+        spec_names = self._block_spec_names()
+        return [
+            {
+                "name": spec_names[0],
+                "uri": self._location_uri_builder(self._host_ip_port(), medium),
+            }
+        ]
+
+    def _block_spec_names(self) -> list[str]:
         block_size = self._config_int(
             self._engine_config,
             "block_size",
             self._config.block_size,
         )
-        return [
-            {
-                "name": self._location_spec_name(block_size),
-                "uri": self._location_uri_builder(self._host_ip_port(), medium),
-            }
-        ]
+        return [self._location_spec_name(block_size)]
 
     def _report_events_for_batches(
         self, batches: list[KVEventBatch]
@@ -239,6 +243,7 @@ class KvcmClient:
                                 "block_delete": {
                                     "block_key": str(block_hash),
                                     "medium": medium,
+                                    "spec_names": self._block_spec_names(),
                                 },
                             }
                         )
