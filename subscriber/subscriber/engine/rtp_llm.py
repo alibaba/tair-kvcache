@@ -217,7 +217,7 @@ class RtpGrpcCacheStatusSource:
                     ("grpc.max_receive_message_length", _MAX_RECEIVE_MESSAGE_LENGTH)
                 ],
             )
-            call = channel.unary_unary(
+            call: Any = channel.unary_unary(
                 _GET_CACHE_STATUS_METHOD,
                 request_serializer=lambda request: request.SerializeToString(),
                 response_deserializer=CacheStatusPB.FromString,
