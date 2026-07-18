@@ -50,6 +50,25 @@ def test_cache_status_proto_subset_round_trips() -> None:
     assert dict(decoded_response.cache_keys) == {11: True, 12: False}
 
 
+def test_grpc_source_serializes_concrete_dynamic_request(mocker) -> None:
+    channel = mocker.Mock()
+    mocker.patch(
+        "subscriber.engine.rtp_llm.grpc.aio.insecure_channel",
+        return_value=channel,
+    )
+    source = RtpGrpcCacheStatusSource(("rank-0:1",), 1.0)
+
+    source._ensure_connections()
+
+    serializer = channel.unary_unary.call_args.kwargs["request_serializer"]
+    encoded = serializer(
+        CacheVersionPB(latest_cache_version=-1, need_cache_keys=True)
+    )
+    decoded = CacheVersionPB.FromString(encoded)
+    assert decoded.latest_cache_version == -1
+    assert decoded.need_cache_keys is True
+
+
 async def test_grpc_source_merges_only_present_keys_from_all_endpoints() -> None:
     first = CacheStatusPB(block_size=64, version=9)
     first.cache_keys[1] = True

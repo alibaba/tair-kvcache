@@ -219,7 +219,7 @@ class RtpGrpcCacheStatusSource:
             )
             call = channel.unary_unary(
                 _GET_CACHE_STATUS_METHOD,
-                request_serializer=Message.SerializeToString,
+                request_serializer=lambda request: request.SerializeToString(),
                 response_deserializer=CacheStatusPB.FromString,
             )
             self._channels.append(channel)
