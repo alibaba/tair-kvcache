@@ -53,14 +53,8 @@ class HiCacheKVCM(HiCacheStorage):
         self.instance_group = self.extra_config["instance_group"]
         self.instance_id = self.extra_config["instance_id"]
 
-        self._manager_client = KvCacheManagerClient(
-            self.extra_config["manager_uri"],
-            instance_id=self.instance_id,
-            auto_discover_leader=self.extra_config.get("auto_discover_leader", False),
-            leader_retry_count=self.extra_config.get("leader_retry_count", 1),
-            leader_retry_base_interval_seconds=self.extra_config.get("leader_retry_base_interval_seconds", 0.005),
-            discovery_refresh_interval_seconds=self.extra_config.get("discovery_refresh_interval_seconds", 30),
-            min_discover_interval_seconds=self.extra_config.get("min_discover_interval_seconds", 1),
+        self._manager_client = KvCacheManagerClient.from_connector_config(
+            self.extra_config
         )
 
         self.registered_pools = {}

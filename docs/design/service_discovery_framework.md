@@ -484,6 +484,29 @@ if discovery:
         endpoints = sd.get_all_endpoints()
 ```
 
+`KvCacheManagerClient` 也可以直接接收同一格式的服务发现 URL。客户端会先解析
+一个 Manager 端点；启用 Leader 发现后，每次刷新 Leader 都会重新获取一个发现
+端点作为查询入口，避免固定依赖某个 Manager 节点：
+
+```python
+from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+
+client = KvCacheManagerClient(
+    "static://127.0.0.1:6382,127.0.0.1:6383",
+    instance_id="example-instance",
+    auto_discover_leader=True,
+    request_timeout_seconds=2.0,
+)
+```
+
+随项目提供的 vLLM、SGLang 和 TensorRT-LLM connector 都会从各自原有的
+extra config 中透传这些 Manager Client 参数，包括
+`request_timeout_seconds`；未配置时普通 API 请求默认超时为 `1.0` 秒。
+Leader 查询使用独立的 5 秒超时，不受该参数影响。
+
+开源构建可直接使用 `static://`；需要内部实现的 scheme 仍由对应的
+`stub_source` 实现提供，通用 Client 不依赖具体服务发现类型。
+
 ### 配置集成示例
 
 在实际项目中，服务发现 URL 通常通过配置文件传入：
@@ -666,4 +689,3 @@ mytype://my-service?param1=value1
 - 非空时，直接把 URL 透传给 `pace_init`，由 `pace_mp` 自身识别 `vipserver://` / `spectrum://` / `static://` 等形式（pace_mp 是内部组件，已与 service_discovery_url 完全兼容）。
 - 为空时使用 `domain` 作为 `pace_init` 的目标。
 - 这样新 client 在面对老 server（`service_discovery_url` 为空）时，行为与历史版本一致。
-
