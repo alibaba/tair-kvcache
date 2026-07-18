@@ -59,12 +59,20 @@ class KvcmClient:
         medium_mapper: Callable[[str | None], str],
         storage_type: str,
         supported_mediums: list[str],
+        location_spec_namer: Callable[[int], str] | None = None,
+        location_uri_builder: Callable[[str, str], str] | None = None,
         manager_client: AbstractKvCacheManagerClient | None = None,
     ) -> None:
         self._config = config
         self._medium_mapper = medium_mapper
         self._storage_type = storage_type
         self._supported_mediums = supported_mediums
+        self._location_spec_namer = location_spec_namer or (
+            lambda block_size: f"vllm_{block_size}"
+        )
+        self._location_uri_builder = location_uri_builder or (
+            lambda host_ip_port, medium: f"vllm://{host_ip_port}/{medium}"
+        )
         self._manager_client: AbstractKvCacheManagerClient = (
             manager_client
             or HttpKvCacheManagerClient(
@@ -74,8 +82,10 @@ class KvcmClient:
         )
         self._host_ip_port_value: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._send_lock = asyncio.Lock()
         self._engine_config: dict[str, Any] = _get_engine_config_from_env()
         self._registered = False
+        self._engine_available = True
         self._started = False
 
     def _base_url(self) -> str:
@@ -106,17 +116,39 @@ class KvcmClient:
         return raw
 
     def _location_spec_name(self, block_size: int) -> str:
-        return f"vllm_{block_size}"
+        return self._location_spec_namer(block_size)
 
     def _register_instance_request(self) -> dict[str, object]:
         cfg = self._engine_config
-        block_size = self._config_int(cfg, "block_size")
+        block_size = self._config_int(cfg, "block_size", self._config.block_size)
         location_spec_name = self._location_spec_name(block_size)
         raw_dtype = cfg.get("dtype")
-        dtype = raw_dtype if isinstance(raw_dtype, str) else ""
-        tp_size = self._config_int(cfg, "tensor_parallel_size")
-        dp_size = self._config_int(cfg, "data_parallel_size")
-        pp_size = self._config_int(cfg, "pipeline_parallel_size")
+        dtype = (
+            raw_dtype
+            if isinstance(raw_dtype, str) and raw_dtype
+            else self._config.model_dtype
+        )
+        raw_model_name = cfg.get("model_name")
+        model_name = (
+            raw_model_name
+            if isinstance(raw_model_name, str) and raw_model_name
+            else self._config.model_name
+        )
+        tp_size = self._config_int(
+            cfg,
+            "tensor_parallel_size",
+            self._config.tensor_parallel_size,
+        )
+        dp_size = self._config_int(
+            cfg,
+            "data_parallel_size",
+            self._config.data_parallel_size,
+        )
+        pp_size = self._config_int(
+            cfg,
+            "pipeline_parallel_size",
+            self._config.pipeline_parallel_size,
+        )
         return {
             "trace_id": self._trace_id("register_instance"),
             "instance_group": self._instance_group(),
@@ -124,9 +156,9 @@ class KvcmClient:
             "block_size": block_size,
             "location_spec_infos": [{"name": location_spec_name, "size": block_size}],
             "model_deployment": {
-                "model_name": "default",
+                "model_name": model_name,
                 "dtype": dtype,
-                "use_mla": False,
+                "use_mla": bool(cfg.get("use_mla", self._config.use_mla)),
                 "tp_size": tp_size,
                 "dp_size": dp_size,
                 "lora_name": "",
@@ -163,11 +195,15 @@ class KvcmClient:
         }
 
     def _block_specs(self, medium: str) -> list[dict[str, str]]:
-        block_size = self._config_int(self._engine_config, "block_size")
+        block_size = self._config_int(
+            self._engine_config,
+            "block_size",
+            self._config.block_size,
+        )
         return [
             {
                 "name": self._location_spec_name(block_size),
-                "uri": f"vllm://{self._host_ip_port()}/{medium}",
+                "uri": self._location_uri_builder(self._host_ip_port(), medium),
             }
         ]
 
@@ -210,7 +246,9 @@ class KvcmClient:
         return events
 
     async def start(self) -> None:
-        self._host_ip_port_value = await resolve_host_ip_port()
+        self._host_ip_port_value = (
+            self._config.host_ip_port or await resolve_host_ip_port()
+        )
         await self._manager_client.start()
         self._started = True
         if await self._manager_is_ready():
@@ -232,10 +270,10 @@ class KvcmClient:
             raise RuntimeError("kvcm client has not been started")
         await self._manager_client.register_instance(self._register_instance_request())
 
-    async def _register_and_report_node(self) -> None:
+    async def _register_and_report_node(self) -> bool:
         """Perform the two-step kvcm registration: the register_instance RPC
         followed by the NODE_REGISTER event report. ``_registered`` is left
-        untouched; callers set it only after this method returns cleanly."""
+        false unless both operations complete successfully."""
 
         try:
             await self._register_instance()
@@ -248,7 +286,7 @@ class KvcmClient:
                 tags={"phase": "register_instance"},
                 exc_info=exc,
             )
-            return
+            return False
         try:
             await self._report_events([self._node_register_event()])
         except Exception as exc:
@@ -260,33 +298,56 @@ class KvcmClient:
                 tags={"phase": "node_register"},
                 exc_info=exc,
             )
-            return
+            return False
         self._registered = True
+        return True
+
+    async def set_engine_available(self, available: bool) -> None:
+        """Pause node heartbeats while the inference engine is down.
+
+        Recovery performs a fresh NODE_REGISTER before forwarding the next
+        cache generation. This prevents the heartbeat loop from making a dead
+        engine node available again immediately after HOST_DOWN.
+        """
+
+        async with self._send_lock:
+            self._engine_available = available
+            if not available:
+                return
+            if (
+                self._started
+                and not self._registered
+                and await self._manager_is_ready()
+            ):
+                await self._register_and_report_node()
 
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._config.kvcm_heartbeat_interval_s)
-            if not self._registered:
-                if not await self._manager_is_ready():
+            async with self._send_lock:
+                if not self._engine_available:
                     continue
-                await self._register_and_report_node()
-                if self._registered:
-                    logger.info(
-                        "kvcm registration recovered",
-                        step="kvcm_register",
-                    )
+                if not self._registered:
+                    if not await self._manager_is_ready():
+                        continue
+                    await self._register_and_report_node()
+                    if self._registered:
+                        logger.info(
+                            "kvcm registration recovered",
+                            step="kvcm_register",
+                        )
 
-            try:
-                await self._report_events([self._heartbeat_event()])
-            except Exception as exc:
-                self._registered = False
-                logger.warning(
-                    "kvcm heartbeat report failed (%s: %s)",
-                    type(exc).__name__,
-                    exc,
-                    step="kvcm_heartbeat",
-                    exc_info=exc,
-                )
+                try:
+                    await self._report_events([self._heartbeat_event()])
+                except Exception as exc:
+                    self._registered = False
+                    logger.warning(
+                        "kvcm heartbeat report failed (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                        step="kvcm_heartbeat",
+                        exc_info=exc,
+                    )
 
     async def _report_events(self, events: list[dict[str, object]]) -> dict[str, Any]:
         if not self._started or self._manager_client is None:
@@ -298,19 +359,8 @@ class KvcmClient:
     async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
         if not self._started or self._manager_client is None:
             raise RuntimeError("kvcm client has not been started")
-        if not self._registered:
-            raise RuntimeError("kvcm client is not ready")
         events = self._report_events_for_batches(batches)
-        try:
-            if not events:
-                response = None
-            else:
-                response = await self._manager_client.report_event(
-                    self._report_event_request(events), check_response=True
-                )
-        except Exception:
-            raise
-        if response is None:
+        if not events:
             if logger.is_debug_enabled():
                 logger.debug(
                     "kvcm send skipped because batch group has no reportable events",
@@ -318,15 +368,57 @@ class KvcmClient:
                     tags={"epoch": epoch},
                 )
             return
-        item_results = (
-            response.get("item_results") if isinstance(response, dict) else None
-        )
-        if item_results:
-            logger.warning(
-                "kvcm report_event returned partial item results",
-                step="kvcm_send",
-                tags={"epoch": epoch, "item_results": item_results},
+        async with self._send_lock:
+            if not self._registered:
+                raise RuntimeError("kvcm client is not ready")
+
+            host_down_events = [
+                event
+                for event in events
+                if event["event_type"] == KvcmReportEventType.HOST_DOWN
+            ]
+            mutation_events = [
+                event
+                for event in events
+                if event["event_type"] != KvcmReportEventType.HOST_DOWN
+            ]
+            if host_down_events:
+                # KVCM applies block mutations before HOST_DOWN within one
+                # request. Split the reset so the new generation cannot be
+                # removed by the asynchronous old-generation cleanup.
+                await self._send_report_events(host_down_events, epoch)
+                self._registered = False
+                if not mutation_events:
+                    return
+                if not self._engine_available:
+                    raise RuntimeError(
+                        "cannot report cache snapshot while engine is down"
+                    )
+                if not await self._register_and_report_node():
+                    raise RuntimeError("kvcm node registration failed after host reset")
+
+            await self._send_report_events(mutation_events, epoch)
+
+    async def _send_report_events(
+        self,
+        events: list[dict[str, object]],
+        epoch: int,
+    ) -> None:
+        batch_size = self._config.kvcm_report_batch_size
+        for offset in range(0, len(events), batch_size):
+            response = await self._manager_client.report_event(
+                self._report_event_request(events[offset : offset + batch_size]),
+                check_response=True,
             )
+            item_results = (
+                response.get("item_results") if isinstance(response, dict) else None
+            )
+            if item_results:
+                logger.warning(
+                    "kvcm report_event returned partial item results",
+                    step="kvcm_send",
+                    tags={"epoch": epoch, "item_results": item_results},
+                )
 
     async def close(self) -> None:
         if self._heartbeat_task is not None:

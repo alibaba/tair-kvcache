@@ -10,13 +10,14 @@
 
 ## 1. 系统概览
 
-仓库包含三个相对独立的部分：
+仓库包含四个相对独立的部分：
 
 | 部分 | 路径 | 说明 |
 |---|---|---|
 | **KVCache Manager** | `kv_cache_manager/` | 核心系统：全局 KVCache 元数据管理服务，以及配套的客户端 SDK 与推理框架连接器。本文档的主体。 |
 | **HiSim** | `hisim/` | 独立的 LLM 推理仿真系统，通过回放 trace 预测 TTFT/TPOT/吞吐等指标，不依赖 Manager 运行时。 |
 | **Optimizer** | `kv_cache_manager/optimizer/` | 缓存仿真与优化：回放 KVCache 访问 trace，模拟命中率与容量消耗，指导逐出策略与容量参数调优。在线化能力正在开发中，后续会与现有 optimizer 合并。 |
+| **Subscriber** | `subscriber/` | 与推理引擎同机部署的独立 Python 进程。vLLM adapter 消费 ZMQ KV events，RTP-LLM adapter 轮询完整 `GetCacheStatus` 快照并在本地做确认式 diff，随后统一调用 KVCM `ReportEvent`。 |
 
 KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理（查询、写入、容量管理），推理引擎通过 Client/Connector 接入。
 
@@ -52,6 +53,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 |---|---|---|
 | **client** | `client/` | C++/Python 客户端 SDK，是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。面向外部，不被服务端核心调用。 |
 | **py_connector** | `py_connector/` | 推理框架集成（Python）。将 client 接入 vLLM/SGLang/TRT-LLM，含 CUDA kernel 辅助，负责在引擎的推理流程中按正确顺序调用元数据面与数据面接口。此外自带一个纯 Python 的 HTTP 元数据面客户端 `KvCacheManagerClient`（`common/manager_client.py`），作为 C++ `MetaClient` 之外的另一条元数据面通路。位于 Python 侧栈顶。 |
+| **subscriber** | `subscriber/` | 推理引擎缓存事件适配。隔离各引擎的事件/快照协议，通过 HTTP `RegisterInstance` 与 `ReportEvent` 维护 KVCM 的事件上报型元数据；不参与 KVCache 数据搬运。 |
 
 > **三个面的界定**：本文档区分三个面——**元数据面**指 MetaService 的接口（`GetCacheLocation`/`StartWriteCache`/`FinishWriteCache`/`GetCacheMeta`/`RemoveCache`/`RegisterInstance` 等）及 client 侧调用这些接口的逻辑，是推理引擎读写 KVCache 的热路径；**数据面**指 KVCache 数据在引擎显存/内存与存储后端之间的实际搬运（`TransferClient`，不经过 KVCM）；**管控面**仅指 AdminService 的接口（Storage 增删改、Instance Group 管理、账号、配置快照、运维监控、Leader 运维等），供运维/管理工具使用，不在推理引擎的读写热路径上。
 
@@ -129,6 +131,7 @@ flowchart TD
     subgraph clientside["客户端侧（对外分支）"]
         client["client SDK"]
         py_connector["py_connector<br/>vLLM/SGLang/TRT-LLM"]
+        subscriber["subscriber<br/>vLLM ZMQ · RTP full snapshot"]
     end
 
     optimizer["optimizer（仿真与优化）"]
@@ -155,6 +158,7 @@ flowchart TD
 
     %% 客户端分支
     py_connector --> client
+    subscriber --> service
     client --> config
     client --> data_storage
     client --> protocol

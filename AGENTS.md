@@ -31,6 +31,7 @@ flowchart TD
 
     %% 对外分支与 optimizer
     py_connector["py_connector"] --> client["client SDK"]
+    subscriber["subscriber（vLLM / RTP-LLM 事件适配）"] --> service
     client -.-> config
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
 ```

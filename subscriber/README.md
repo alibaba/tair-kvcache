@@ -1,6 +1,8 @@
 # KVCacheEventSubscriber
 
-A process that subscribes to inference engine's KV cache events and forwards them to the kvcm service.
+A process that observes inference-engine KV cache state and forwards normalized
+events to the KVCM service. vLLM uses its ZMQ event stream; RTP-LLM uses full
+`GetCacheStatus` gRPC snapshots and an acknowledged local diff.
 
 ## Installation
 
@@ -19,7 +21,30 @@ uv run python -m subscriber --zmq-pub-endpoint tcp://localhost:5557 --kvcm-addr 
 
 # With config file
 uv run python -m subscriber --config config.yaml
+
+# RTP-LLM: point at the rank-0 GetCacheStatus gRPC endpoint
+uv run python -m subscriber \
+  --config config.yaml \
+  --engine-type rtp_llm \
+  --rtp-endpoints 127.0.0.1:8089 \
+  --block-size 64 \
+  --host-ip-port 10.0.0.8:8088
 ```
+
+For RTP-LLM, multiple comma-separated endpoints may be supplied when one
+subscriber must merge several DP cache snapshots. Every endpoint must return a
+complete snapshot; a failed endpoint rejects the whole poll so a transient DP
+failure is not interpreted as mass eviction. The subscriber retries a diff
+until KVCM acknowledges it, confirms removals across consecutive snapshots,
+and periodically refreshes the full add set for reconciliation.
+The configured `block_size` must match every RTP endpoint because KVCM instance
+registration happens before the first snapshot is forwarded.
+
+RTP-LLM can launch this process automatically by setting
+`KVCM_SUBSCRIBER_CONFIG` to the YAML path. RTP derives the default cache API
+endpoint from its resolved `START_PORT`: rank-0 gRPC is `START_PORT + 1`.
+Set `RTP_LLM_CACHE_SUBSCRIBER_ENDPOINTS` explicitly for multi-DP or multi-node
+deployments where remote advertised addresses cannot be inferred locally.
 
 ## Development
 

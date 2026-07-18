@@ -23,6 +23,49 @@ def test_engine_type_cli_override() -> None:
     assert config.engine_type == "sglang"
 
 
+def test_rtp_cli_overrides_and_endpoint_normalization() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--engine-type",
+            "rtp_llm",
+            "--rtp-endpoints",
+            "127.0.0.1:8089, 127.0.0.1:8097",
+            "--rtp-rpc-timeout-s",
+            "2.5",
+            "--rtp-poll-interval-s",
+            "0.5",
+            "--rtp-deletion-confirmations",
+            "3",
+            "--rtp-full-refresh-interval-s",
+            "60",
+            "--no-rtp-reset-on-start",
+        ]
+    )
+
+    config = SubscriberConfig.from_args(args)
+
+    assert config.rtp_endpoint_list == (
+        "127.0.0.1:8089",
+        "127.0.0.1:8097",
+    )
+    assert config.rtp_rpc_timeout_s == 2.5
+    assert config.rtp_poll_interval_s == 0.5
+    assert config.rtp_deletion_confirmations == 3
+    assert config.rtp_full_refresh_interval_s == 60
+    assert config.rtp_reset_on_start is False
+
+
+def test_rtp_requires_at_least_one_endpoint() -> None:
+    config = SubscriberConfig(engine_type="rtp_llm", rtp_endpoints=" , ")
+
+    with pytest.raises(
+        ValueError,
+        match="^rtp_endpoints must contain at least one endpoint$",
+    ):
+        config.validate()
+
+
 def test_kv_event_queue_maxsize_defaults_to_1024() -> None:
     config = SubscriberConfig()
 
@@ -53,6 +96,13 @@ def test_kv_event_queue_maxsize_must_be_positive() -> None:
     config = SubscriberConfig(kv_event_queue_maxsize=0)
 
     with pytest.raises(ValueError, match="kv_event_queue_maxsize must be >= 1"):
+        config.validate()
+
+
+def test_kvcm_report_batch_size_must_be_positive() -> None:
+    config = SubscriberConfig(kvcm_report_batch_size=0)
+
+    with pytest.raises(ValueError, match="kvcm_report_batch_size must be >= 1"):
         config.validate()
 
 

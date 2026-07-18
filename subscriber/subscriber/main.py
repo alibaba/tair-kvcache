@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -20,6 +21,30 @@ class QueuedKVEventBatch:
     batches: list[KVEventBatch]
     epoch_snapshot: int
     timer: StageTimer
+    on_delivery: Callable[[bool], Awaitable[None]] | None = None
+
+
+async def _notify_delivery(
+    callback: Callable[[bool], Awaitable[None]] | None,
+    delivered: bool,
+) -> None:
+    """Best-effort delivery feedback for snapshot adapters with acked baselines."""
+
+    if callback is None:
+        return
+    try:
+        await callback(delivered)
+    except Exception as exc:
+        logger.warning(
+            "engine adapter delivery callback failed",
+            step="kv_event_loop",
+            tags={
+                "delivered": delivered,
+                "error": exc.__class__.__name__,
+                "message": str(exc),
+            },
+            exc_info=True,
+        )
 
 
 async def consume_kv_events(
@@ -38,9 +63,15 @@ async def consume_kv_events(
                     "dropping kv event batch captured while engine is not ready",
                     step="kv_event_loop",
                 )
+                await _notify_delivery(event.on_delivery, False)
                 continue
             await queue.put(
-                QueuedKVEventBatch(event.batches, epoch_snapshot, event.timer)
+                QueuedKVEventBatch(
+                    event.batches,
+                    epoch_snapshot,
+                    event.timer,
+                    event.on_delivery,
+                )
             )
     finally:
         await events.aclose()
@@ -69,6 +100,7 @@ async def send_kv_events(
                         "current_epoch": epoch,
                     },
                 )
+                await _notify_delivery(queued.on_delivery, False)
                 continue
             try:
                 await kvcm.send_batch(queued.batches, epoch)
@@ -88,7 +120,9 @@ async def send_kv_events(
                     },
                     exc_info=True,
                 )
+                await _notify_delivery(queued.on_delivery, False)
                 continue
+            await _notify_delivery(queued.on_delivery, True)
             # Metrics stay outside the send try/except: reporting is best-effort
             # (report never raises) and must never be misread as a send failure.
             stored_block_hash_count = sum(
@@ -185,6 +219,8 @@ async def run(config: SubscriberConfig) -> None:
         medium_mapper=adapter.map_medium,
         storage_type=adapter.storage_type(),
         supported_mediums=adapter.supported_mediums(),
+        location_spec_namer=adapter.location_spec_name,
+        location_uri_builder=adapter.location_uri,
     )
     try:
         await kvcm.start()
@@ -203,6 +239,9 @@ async def run(config: SubscriberConfig) -> None:
                 "engine_health_timeout_s": config.engine_health_timeout_s,
                 "engine_health_failure_threshold": (
                     config.engine_health_failure_threshold
+                ),
+                "rtp_endpoints": (
+                    config.rtp_endpoints if config.engine_type == "rtp_llm" else ""
                 ),
             },
         )

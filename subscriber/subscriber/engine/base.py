@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
@@ -28,6 +28,7 @@ class EngineEventBatch:
 
     batches: list[KVEventBatch]
     timer: StageTimer
+    on_delivery: Callable[[bool], Awaitable[None]] | None = None
 
 
 class AbstractEngineAdapter(ABC):
@@ -111,6 +112,16 @@ class AbstractEngineAdapter(ABC):
 
         For example, the vLLM adapter returns ``"ST_EVENT_REPORT"``.
         """
+        ...
+
+    @abstractmethod
+    def location_spec_name(self, block_size: int) -> str:
+        """Return the KVCM location-spec name for one engine cache block."""
+        ...
+
+    @abstractmethod
+    def location_uri(self, host_ip_port: str, medium: str) -> str:
+        """Build the engine-specific cache location URI reported to KVCM."""
         ...
 
     async def reset_generation_state(self) -> None:

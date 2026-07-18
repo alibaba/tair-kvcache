@@ -170,6 +170,27 @@ def test_block_specs_use_registered_location_spec_name() -> None:
     assert {spec["name"] for spec in block_specs} <= registered_spec_names
 
 
+def test_engine_adapter_controls_location_spec_and_uri() -> None:
+    client = KvcmClient(
+        SubscriberConfig(engine_type="rtp_llm"),
+        medium_mapper=lambda medium: medium or "",
+        storage_type="ST_EVENT_REPORT",
+        supported_mediums=["hbm"],
+        location_spec_namer=lambda block_size: f"rtp_llm_{block_size}",
+        location_uri_builder=lambda host, medium: f"rtp-llm://{host}/{medium}",
+        manager_client=FakeSdkClient(),
+    )
+    client._host_ip_port_value = "10.0.0.8:9000"
+
+    assert client._location_spec_name(64) == "rtp_llm_64"
+    assert client._block_specs("hbm") == [
+        {
+            "name": "rtp_llm_1",
+            "uri": "rtp-llm://10.0.0.8:9000/hbm",
+        }
+    ]
+
+
 def test_register_and_block_specs_use_configured_block_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -743,6 +764,103 @@ async def test_send_batch_reports_converted_events() -> None:
             "block_delete": {"block_key": "13", "medium": "mem"},
         }
     ]
+
+
+async def test_send_batch_splits_large_snapshot_reports() -> None:
+    fake_sdk = FakeSdkClient()
+    client = _make_kvcm(
+        SubscriberConfig(
+            kvcm_heartbeat_interval_s=60.0,
+            kvcm_report_batch_size=2,
+        ),
+        fake_sdk,
+    )
+    batch = KVEventBatch(
+        ts=1.0,
+        events=[BlockRemoved(block_hashes=[11, 12, 13, 14, 15], medium="CPU")],
+    )
+
+    await client.start()
+    fake_sdk.report_event.reset_mock()
+    await client.send_batch([batch], epoch=7)
+    await client.close()
+
+    assert fake_sdk.report_event.await_count == 3
+    assert [
+        len(call.args[0]["events"])
+        for call in fake_sdk.report_event.await_args_list
+    ] == [2, 2, 1]
+
+
+async def test_snapshot_reset_reregisters_before_reporting_full_adds() -> None:
+    fake_sdk = FakeSdkClient()
+    client = _make_kvcm(
+        SubscriberConfig(kvcm_heartbeat_interval_s=60.0),
+        fake_sdk,
+    )
+    batch = KVEventBatch(
+        ts=1.0,
+        events=[
+            AllBlocksCleared(),
+            BlockStored(
+                block_hashes=[11, 12],
+                parent_block_hash=None,
+                token_ids=[],
+                block_size=1,
+                lora_id=None,
+                medium="GPU",
+                lora_name=None,
+            ),
+        ],
+    )
+
+    await client.start()
+    fake_sdk.register_instance.reset_mock()
+    fake_sdk.report_event.reset_mock()
+    await client.send_batch([batch], epoch=1)
+    await client.close()
+
+    fake_sdk.register_instance.assert_awaited_once()
+    assert [
+        [event["event_type"] for event in call.args[0]["events"]]
+        for call in fake_sdk.report_event.await_args_list
+    ] == [
+        ["EVENT_HOST_DOWN"],
+        ["EVENT_NODE_REGISTER"],
+        ["EVENT_BLOCK_ADD", "EVENT_BLOCK_ADD"],
+    ]
+
+
+async def test_engine_down_pauses_heartbeat_registration_until_recovery() -> None:
+    fake_sdk = FakeSdkClient()
+    client = _make_kvcm(
+        SubscriberConfig(kvcm_heartbeat_interval_s=0.01),
+        fake_sdk,
+    )
+
+    await client.start()
+    await client.set_engine_available(False)
+    await client.send_batch(
+        [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])],
+        epoch=1,
+    )
+    fake_sdk.register_instance.reset_mock()
+    fake_sdk.report_event.reset_mock()
+
+    await asyncio.sleep(0.03)
+
+    fake_sdk.register_instance.assert_not_awaited()
+    fake_sdk.report_event.assert_not_awaited()
+
+    await client.set_engine_available(True)
+    fake_sdk.register_instance.assert_awaited_once()
+    assert fake_sdk.report_event.await_args_list[0].args[0]["events"] == [
+        {
+            "event_type": "EVENT_NODE_REGISTER",
+            "node_register": {"mediums": ["hbm", "mem"]},
+        }
+    ]
+    await client.close()
 
 
 async def test_send_empty_batch_does_not_report_event() -> None:

@@ -35,5 +35,13 @@ class SGLangAdapter(AbstractEngineAdapter):
         pass
         return ""
 
+    def location_spec_name(self, block_size: int) -> str:
+        pass
+        return ""
+
+    def location_uri(self, host_ip_port: str, medium: str) -> str:
+        pass
+        return ""
+
     async def reset_generation_state(self) -> None:
         pass

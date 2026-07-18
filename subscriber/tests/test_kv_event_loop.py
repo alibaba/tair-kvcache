@@ -129,6 +129,23 @@ async def test_consume_kv_events_drops_batch_when_not_ready(
     assert queue.empty()
 
 
+async def test_consume_notifies_snapshot_adapter_when_gate_is_closed(
+    adapter: MagicMock, coordinator: MagicMock
+) -> None:
+    delivery = AsyncMock()
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue(maxsize=1)
+
+    async def _subscribe():
+        yield EngineEventBatch(_batch(), StageTimer(), delivery)
+
+    adapter.subscribe_kv_events = _subscribe
+    coordinator.capture_epoch.return_value = None
+
+    await consume_kv_events(adapter, coordinator, queue)
+
+    delivery.assert_awaited_once_with(False)
+
+
 async def test_send_kv_events_sends_batch_when_epoch_unchanged(
     kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
@@ -145,6 +162,23 @@ async def test_send_kv_events_sends_batch_when_epoch_unchanged(
 
     kvcm.send_batch.assert_awaited_once_with(batch, 1)
     assert queue.empty()
+
+
+async def test_send_notifies_snapshot_adapter_after_kvcm_ack(
+    kvcm: MagicMock, coordinator: MagicMock
+) -> None:
+    delivery = AsyncMock()
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(QueuedKVEventBatch(_batch(), 1, StageTimer(), delivery))
+
+    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, MagicMock()))
+    await asyncio.sleep(0)
+    sender.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    delivery.assert_awaited_once_with(True)
 
 
 async def test_send_kv_events_reports_successful_batch_latency(
@@ -195,6 +229,24 @@ async def test_send_kv_events_drops_batch_when_epoch_changed(
     kvcm.send_batch.assert_not_awaited()
     reporter.report.assert_not_called()
     assert queue.empty()
+
+
+async def test_send_notifies_snapshot_adapter_after_kvcm_failure(
+    kvcm: MagicMock, coordinator: MagicMock
+) -> None:
+    delivery = AsyncMock()
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(QueuedKVEventBatch(_batch(), 1, StageTimer(), delivery))
+    kvcm.send_batch.side_effect = RuntimeError("send failed")
+
+    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, MagicMock()))
+    await asyncio.sleep(0)
+    sender.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    delivery.assert_awaited_once_with(False)
 
 
 async def test_send_kv_events_logs_failure_and_continues_with_next_batch(

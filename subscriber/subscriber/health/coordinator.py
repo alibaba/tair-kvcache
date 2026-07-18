@@ -42,6 +42,7 @@ class EngineHealthCoordinator:
         self._state = EngineHealthState.STARTING
         self._epoch = 0
         self._failure_count = 0
+        self._reset_reported = False
         self._ready = asyncio.Event()
 
     @property
@@ -93,6 +94,15 @@ class EngineHealthCoordinator:
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         elif self._state is EngineHealthState.DEAD:
+            if not self._reset_reported:
+                # A previous HOST_DOWN may have failed because KVCM was
+                # unavailable. Re-register only to retry the authoritative
+                # reset, then pause again if it still cannot be delivered.
+                await self._kvcm.set_engine_available(True)
+                self._reset_reported = await self._send_all_blocks_cleared()
+                if not self._reset_reported:
+                    await self._kvcm.set_engine_available(False)
+                    return
             try:
                 await self._adapter.reset_generation_state()
             except Exception as exc:
@@ -107,8 +117,10 @@ class EngineHealthCoordinator:
                     exc_info=True,
                 )
                 return
+            await self._kvcm.set_engine_available(True)
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
+            self._reset_reported = False
         self._failure_count = 0
         self._ready.set()
 
@@ -131,9 +143,10 @@ class EngineHealthCoordinator:
         self._ready.clear()
         if self._failure_count >= self._threshold:
             self._state = EngineHealthState.DEAD
-            await self._send_all_blocks_cleared()
+            await self._kvcm.set_engine_available(False)
+            self._reset_reported = await self._send_all_blocks_cleared()
 
-    async def _send_all_blocks_cleared(self) -> None:
+    async def _send_all_blocks_cleared(self) -> bool:
         batch = KVEventBatch(ts=self._clock(), events=[AllBlocksCleared()])
         try:
             await self._kvcm.send_batch([batch], self._epoch)
@@ -148,3 +161,5 @@ class EngineHealthCoordinator:
                 },
                 exc_info=True,
             )
+            return False
+        return True

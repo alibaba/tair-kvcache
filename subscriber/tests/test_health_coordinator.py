@@ -37,13 +37,23 @@ class FakeAdapter(AbstractEngineAdapter):
     def storage_type(self) -> str:
         return "ST_UNSPECIFIED"
 
+    def location_spec_name(self, block_size: int) -> str:
+        return f"fake_{block_size}"
+
+    def location_uri(self, host_ip_port: str, medium: str) -> str:
+        return f"fake://{host_ip_port}/{medium}"
+
 
 class RecordingKvcmClient(KvcmClient):
     def __init__(self) -> None:
         self.sent: list[tuple[list[KVEventBatch], int]] = []
+        self.availability: list[bool] = []
 
     async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
         self.sent.append((batches, epoch))
+
+    async def set_engine_available(self, available: bool) -> None:
+        self.availability.append(available)
 
 
 def _config(threshold: int = 3) -> SubscriberConfig:
@@ -160,6 +170,7 @@ async def test_healthy_to_dead_sends_reset_once_with_current_epoch() -> None:
     batches, epoch = kvcm.sent[0]
     assert epoch == 1
     assert batches == [KVEventBatch(ts=123.0, events=[AllBlocksCleared()])]
+    assert kvcm.availability == [False]
 
     # Further UNHEALTHY events must NOT resend reset.
     await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
@@ -169,8 +180,15 @@ async def test_healthy_to_dead_sends_reset_once_with_current_epoch() -> None:
 
 async def test_reset_report_failure_is_logged_and_recovery_continues(mocker) -> None:
     class FailingResetKvcmClient(RecordingKvcmClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
         async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
-            raise RuntimeError("reset report failed")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("reset report failed")
+            await super().send_batch(batches, epoch)
 
     adapter = FakeAdapter()
     kvcm = FailingResetKvcmClient()
@@ -183,6 +201,8 @@ async def test_reset_report_failure_is_logged_and_recovery_continues(mocker) -> 
 
     assert coordinator.state is EngineHealthState.HEALTHY
     assert coordinator.epoch == 2
+    assert kvcm.availability == [False, True, True]
+    assert len(kvcm.sent) == 1
     warning.assert_called_once_with(
         "failed to report all blocks cleared to kvcm",
         step="engine_health",
@@ -193,6 +213,25 @@ async def test_reset_report_failure_is_logged_and_recovery_continues(mocker) -> 
         },
         exc_info=True,
     )
+
+
+async def test_recovery_stays_dead_while_host_reset_retry_keeps_failing() -> None:
+    class FailingResetKvcmClient(RecordingKvcmClient):
+        async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
+            raise RuntimeError("reset report failed")
+
+    adapter = FakeAdapter()
+    kvcm = FailingResetKvcmClient()
+    coordinator = EngineHealthCoordinator(adapter, kvcm, _config(threshold=1))
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+
+    assert coordinator.state is EngineHealthState.DEAD
+    assert coordinator.epoch == 1
+    assert adapter.reset_generation_calls == 0
+    assert kvcm.availability == [False, True, False]
 
 
 async def test_dead_recovery_resets_generation_and_bumps_epoch() -> None:
@@ -216,6 +255,7 @@ async def test_dead_recovery_resets_generation_and_bumps_epoch() -> None:
     assert coordinator.state is EngineHealthState.HEALTHY
     assert coordinator.epoch == 2
     assert adapter.reset_generation_calls == 1
+    assert kvcm.availability == [False, True]
     assert await asyncio.wait_for(waiter, timeout=1.0) == 2
 
 

@@ -470,3 +470,9 @@ class VllmAdapter(AbstractEngineAdapter):
 
     def storage_type(self) -> str:
         return "ST_EVENT_REPORT"
+
+    def location_spec_name(self, block_size: int) -> str:
+        return f"vllm_{block_size}"
+
+    def location_uri(self, host_ip_port: str, medium: str) -> str:
+        return f"vllm://{host_ip_port}/{medium}"

@@ -34,9 +34,27 @@ class SubscriberConfig:
     kvcm_heartbeat_interval_s: float = 1.0
     kvcm_request_timeout_s: float = 5.0
     kv_event_queue_maxsize: int = 1024
+    kvcm_report_batch_size: int = 1000
+    host_ip_port: str = ""
+
+    # Engine deployment metadata used for KVCM instance registration
+    block_size: int = 1
+    model_name: str = "default"
+    model_dtype: str = ""
+    use_mla: bool = False
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
 
     # Engine
     engine_type: str = "vllm"
+
+    # RTP-LLM full-snapshot polling
+    rtp_endpoints: str = "127.0.0.1:8089"
+    rtp_rpc_timeout_s: float = 1.0
+    rtp_poll_interval_s: float = 1.0
+    rtp_deletion_confirmations: int = 2
+    rtp_full_refresh_interval_s: float = 300.0
+    rtp_reset_on_start: bool = True
 
     # Engine liveness (HTTP /health polling)
     engine_health_url: str = "http://127.0.0.1:8000/health"
@@ -91,7 +109,33 @@ class SubscriberConfig:
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
         parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
+        parser.add_argument("--kvcm-report-batch-size", type=int, default=default)
+        parser.add_argument("--host-ip-port", default=default)
+        parser.add_argument("--block-size", type=int, default=default)
+        parser.add_argument("--model-name", default=default)
+        parser.add_argument("--model-dtype", default=default)
+        parser.add_argument(
+            "--use-mla",
+            action=argparse.BooleanOptionalAction,
+            default=default,
+        )
+        parser.add_argument("--tensor-parallel-size", type=int, default=default)
+        parser.add_argument("--pipeline-parallel-size", type=int, default=default)
         parser.add_argument("--engine-type", default=default)
+        parser.add_argument("--rtp-endpoints", default=default)
+        parser.add_argument("--rtp-rpc-timeout-s", type=float, default=default)
+        parser.add_argument("--rtp-poll-interval-s", type=float, default=default)
+        parser.add_argument(
+            "--rtp-deletion-confirmations", type=int, default=default
+        )
+        parser.add_argument(
+            "--rtp-full-refresh-interval-s", type=float, default=default
+        )
+        parser.add_argument(
+            "--rtp-reset-on-start",
+            action=argparse.BooleanOptionalAction,
+            default=default,
+        )
         parser.add_argument(
             "--log-level",
             choices=_LOG_LEVELS,
@@ -164,12 +208,41 @@ class SubscriberConfig:
                 )
         if self.kv_event_queue_maxsize < 1:
             raise ValueError("kv_event_queue_maxsize must be >= 1")
+        if self.kvcm_report_batch_size < 1:
+            raise ValueError("kvcm_report_batch_size must be >= 1")
+        if self.block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        if self.tensor_parallel_size < 1:
+            raise ValueError("tensor_parallel_size must be >= 1")
+        if self.pipeline_parallel_size < 1:
+            raise ValueError("pipeline_parallel_size must be >= 1")
         if self.kvcm_heartbeat_interval_s <= 0:
             raise ValueError("kvcm_heartbeat_interval_s must be > 0")
         if self.kvcm_request_timeout_s <= 0:
             raise ValueError("kvcm_request_timeout_s must be > 0")
         if self.zmq_replay_timeout_s <= 0:
             raise ValueError("zmq_replay_timeout_s must be > 0")
+        if self.engine_type == "rtp_llm":
+            if not self.rtp_endpoint_list:
+                raise ValueError("rtp_endpoints must contain at least one endpoint")
+            if self.rtp_rpc_timeout_s <= 0:
+                raise ValueError("rtp_rpc_timeout_s must be > 0")
+            if self.rtp_poll_interval_s <= 0:
+                raise ValueError("rtp_poll_interval_s must be > 0")
+            if self.rtp_deletion_confirmations < 1:
+                raise ValueError("rtp_deletion_confirmations must be >= 1")
+            if self.rtp_full_refresh_interval_s <= 0:
+                raise ValueError("rtp_full_refresh_interval_s must be > 0")
+
+    @property
+    def rtp_endpoint_list(self) -> tuple[str, ...]:
+        """Return normalized RTP rank gRPC endpoints from the CSV setting."""
+
+        return tuple(
+            endpoint.strip()
+            for endpoint in self.rtp_endpoints.split(",")
+            if endpoint.strip()
+        )
 
 
 def _parse_tcp_endpoint_for_multi_dp(
@@ -214,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the subscriber command-line parser."""
 
     parser = argparse.ArgumentParser(
-        description="tair-kvcache subscriber — vLLM KV event forwarder"
+        description="tair-kvcache subscriber — inference-engine KV event forwarder"
     )
     parser.add_argument(
         "--config", default=None, metavar="FILE", help="Path to YAML config file"
