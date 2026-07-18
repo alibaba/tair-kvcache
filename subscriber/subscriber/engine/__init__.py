@@ -6,6 +6,5 @@ from subscriber.engine.base import AbstractEngineAdapter
 
 __all__ = ["AbstractEngineAdapter"]
 
-# Reference the module so linters keep the side-effect import.
-_ = _vllm
-_ = _rtp_llm
+# Keep adapter modules referenced after their registration side effects.
+_REGISTERED_ADAPTER_MODULES = (_vllm, _rtp_llm)

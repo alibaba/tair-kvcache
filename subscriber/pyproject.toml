@@ -21,6 +21,8 @@ dev = [
     "ruff>=0.4",
     "pre-commit>=3.7",
     "types-pyyaml>=6.0",
+    "types-grpcio>=1.0",
+    "types-protobuf>=5.28",
 ]
 
 [project.scripts]
