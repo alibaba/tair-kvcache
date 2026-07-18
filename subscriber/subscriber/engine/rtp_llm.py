@@ -103,8 +103,10 @@ def _add_field(
     *,
     name: str,
     number: int,
-    field_type: int,
-    label: int = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    field_type: descriptor_pb2.FieldDescriptorProto.Type.ValueType,
+    label: descriptor_pb2.FieldDescriptorProto.Label.ValueType = (
+        descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+    ),
     type_name: str = "",
 ) -> None:
     field = message.field.add()
