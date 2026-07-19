@@ -65,6 +65,19 @@ class EngineHealthCoordinator:
             return self._epoch
         return None
 
+    def capture_event_epoch(self) -> int:
+        """Assign an engine event to its current or next healthy epoch.
+
+        Events may arrive before the first health probe or while the ready gate
+        is temporarily closed. Keeping their generation here lets the bounded
+        sender queue preserve them until the gate reopens. Events captured in a
+        DEAD generation retain the old epoch and are discarded after recovery.
+        """
+
+        if self._state is EngineHealthState.STARTING:
+            return self._epoch + 1
+        return self._epoch
+
     def is_epoch_current(self, snapshot: int) -> bool:
         """Return True if the snapshot still matches the active epoch."""
 

@@ -33,6 +33,7 @@ class SubscriberConfig:
     # kvcm SDK
     kvcm_base_url: str = ""
     kvcm_heartbeat_interval_s: float = 1.0
+    kvcm_send_retry_interval_s: float = 1.0
     kvcm_request_timeout_s: float = 5.0
     kv_event_queue_maxsize: int = 1024
     kvcm_report_batch_size: int = 1000
@@ -109,6 +110,9 @@ class SubscriberConfig:
         parser.add_argument("--data-parallel-size", type=int, default=default)
         parser.add_argument("--kvcm-base-url", default=default)
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
+        parser.add_argument(
+            "--kvcm-send-retry-interval-s", type=float, default=default
+        )
         parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
         parser.add_argument("--kvcm-report-batch-size", type=int, default=default)
@@ -218,6 +222,8 @@ class SubscriberConfig:
             raise ValueError("pipeline_parallel_size must be >= 1")
         if self.kvcm_heartbeat_interval_s <= 0:
             raise ValueError("kvcm_heartbeat_interval_s must be > 0")
+        if self.kvcm_send_retry_interval_s <= 0:
+            raise ValueError("kvcm_send_retry_interval_s must be > 0")
         if self.kvcm_request_timeout_s <= 0:
             raise ValueError("kvcm_request_timeout_s must be > 0")
         if self.zmq_replay_timeout_s <= 0:

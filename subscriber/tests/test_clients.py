@@ -739,7 +739,7 @@ async def test_start_resets_registered_when_node_register_report_fails(
     await client.close()
 
 
-async def test_start_without_endpoint_drops_batches_then_registers_after_recovery(
+async def test_start_without_endpoint_retries_batch_after_registration_recovers(
     mocker,
 ) -> None:
     fake_sdk = FakeSdkClient()
@@ -763,14 +763,27 @@ async def test_start_without_endpoint_drops_batches_then_registers_after_recover
 
     queue = asyncio.Queue()
     batches = [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
-    await queue.put(mocker.Mock(batches=batches, epoch_snapshot=1))
+    await queue.put(
+        mocker.Mock(
+            batches=batches,
+            epoch_snapshot=1,
+            timer=mocker.Mock(),
+            on_delivery=None,
+        )
+    )
     coordinator = mocker.Mock()
     coordinator.wait_ready_epoch = AsyncMock(return_value=1)
     coordinator.is_epoch_current.return_value = True
     sender = asyncio.create_task(
-        send_kv_events(client, coordinator, queue, mocker.Mock())
+        send_kv_events(
+            client,
+            coordinator,
+            queue,
+            mocker.Mock(),
+            retry_interval_s=0.001,
+        )
     )
-    await queue.join()
+    await asyncio.sleep(0.01)
 
     warning.assert_any_call(
         "kvcm has no available endpoint; starting in not-ready state",
@@ -779,17 +792,20 @@ async def test_start_without_endpoint_drops_batches_then_registers_after_recover
     send_warning = next(
         call
         for call in warning.call_args_list
-        if call.args == ("failed to send kv event batch to kvcm; dropping batch",)
+        if call.args
+        == ("failed to send kv event batch to kvcm; retrying in order",)
     )
     assert "kvcm client is not ready" in send_warning.kwargs["tags"]["message"]
 
     fake_sdk.ready = True
     await asyncio.wait_for(registered.wait(), timeout=0.2)
+    await asyncio.wait_for(queue.join(), timeout=0.2)
 
-    fake_sdk.report_event.reset_mock()
-    await client.send_batch(batches, epoch=1)
-
-    fake_sdk.report_event.assert_awaited_once()
+    assert any(
+        event["event_type"] == "EVENT_HOST_DOWN"
+        for call in fake_sdk.report_event.await_args_list
+        for event in call.args[0]["events"]
+    )
     sender.cancel()
     with pytest.raises(asyncio.CancelledError):
         await sender

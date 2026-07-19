@@ -52,19 +52,12 @@ async def consume_kv_events(
     coordinator: EngineHealthCoordinator,
     queue: asyncio.Queue[QueuedKVEventBatch],
 ) -> None:
-    """Enqueue only batches captured while the coordinator has a ready epoch."""
+    """Enqueue batches with their engine generation for ordered delivery."""
 
     events = adapter.subscribe_kv_events()
     try:
         async for event in events:
-            epoch_snapshot = coordinator.capture_epoch()
-            if epoch_snapshot is None:
-                logger.warning(
-                    "dropping kv event batch captured while engine is not ready",
-                    step="kv_event_loop",
-                )
-                await _notify_delivery(event.on_delivery, False)
-                continue
+            epoch_snapshot = coordinator.capture_event_epoch()
             await queue.put(
                 QueuedKVEventBatch(
                     event.batches,
@@ -82,45 +75,60 @@ async def send_kv_events(
     coordinator: EngineHealthCoordinator,
     queue: asyncio.Queue[QueuedKVEventBatch],
     latency_reporter: SpanMetricsReporter,
+    retry_interval_s: float = 1.0,
 ) -> None:
-    """Send queued batches only if their captured epoch is still current."""
+    """Send queued batches in order, retrying while their epoch stays current."""
+
+    if retry_interval_s <= 0:
+        raise ValueError("retry_interval_s must be > 0")
 
     while True:
         queued = await queue.get()
         try:
             queued.timer.mark("queue_wait")
-            epoch = await coordinator.wait_ready_epoch()
-            queued.timer.mark("gate_wait")
-            if not coordinator.is_epoch_current(queued.epoch_snapshot):
-                logger.warning(
-                    "dropping kv event batch because engine epoch changed before send",
-                    step="kv_event_loop",
-                    tags={
-                        "captured_epoch": queued.epoch_snapshot,
-                        "current_epoch": epoch,
-                    },
-                )
-                await _notify_delivery(queued.on_delivery, False)
-                continue
-            try:
-                await kvcm.send_batch(queued.batches, epoch)
-            except Exception as exc:
-                # TODO: Buffer or replay batches dropped while KVCM is unavailable.
-                logger.warning(
-                    "failed to send kv event batch to kvcm; dropping batch",
-                    step="kvcm_send",
-                    tags={
-                        "epoch": epoch,
-                        "batch_count": len(queued.batches),
-                        "event_count": sum(
-                            len(batch.events) for batch in queued.batches
-                        ),
-                        "error": exc.__class__.__name__,
-                        "message": str(exc),
-                    },
-                    exc_info=True,
-                )
-                await _notify_delivery(queued.on_delivery, False)
+            retry_attempt = 0
+            delivered = False
+            while True:
+                epoch = await coordinator.wait_ready_epoch()
+                if retry_attempt == 0:
+                    queued.timer.mark("gate_wait")
+                if not coordinator.is_epoch_current(queued.epoch_snapshot):
+                    logger.warning(
+                        "dropping kv event batch because engine epoch changed "
+                        "before send",
+                        step="kv_event_loop",
+                        tags={
+                            "captured_epoch": queued.epoch_snapshot,
+                            "current_epoch": epoch,
+                        },
+                    )
+                    await _notify_delivery(queued.on_delivery, False)
+                    break
+                try:
+                    await kvcm.send_batch(queued.batches, epoch)
+                except Exception as exc:
+                    retry_attempt += 1
+                    logger.warning(
+                        "failed to send kv event batch to kvcm; retrying in order",
+                        step="kvcm_send",
+                        tags={
+                            "epoch": epoch,
+                            "batch_count": len(queued.batches),
+                            "event_count": sum(
+                                len(batch.events) for batch in queued.batches
+                            ),
+                            "retry_attempt": retry_attempt,
+                            "retry_interval_s": retry_interval_s,
+                            "error": exc.__class__.__name__,
+                            "message": str(exc),
+                        },
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(retry_interval_s)
+                    continue
+                delivered = True
+                break
+            if not delivered:
                 continue
             await _notify_delivery(queued.on_delivery, True)
             # Metrics stay outside the send try/except: reporting is best-effort
@@ -156,18 +164,27 @@ async def kv_event_loop(
     kvcm: KvcmClient,
     coordinator: EngineHealthCoordinator,
     queue_maxsize: int = 1024,
+    retry_interval_s: float = 1.0,
 ) -> None:
     """Forward engine KV batches to kvcm through a bounded producer/sender queue."""
 
     if queue_maxsize < 1:
         raise ValueError("queue_maxsize must be >= 1")
+    if retry_interval_s <= 0:
+        raise ValueError("retry_interval_s must be > 0")
 
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue(maxsize=queue_maxsize)
     latency_reporter = SpanMetricsReporter()
     await latency_reporter.start()
     producer = asyncio.create_task(consume_kv_events(adapter, coordinator, queue))
     sender = asyncio.create_task(
-        send_kv_events(kvcm, coordinator, queue, latency_reporter)
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            latency_reporter,
+            retry_interval_s,
+        )
     )
     try:
         done, _ = await asyncio.wait(
@@ -234,6 +251,7 @@ async def run(config: SubscriberConfig) -> None:
                 "zmq_pub_endpoint": config.zmq_pub_endpoint,
                 "zmq_replay_endpoint": config.zmq_replay_endpoint,
                 "kvcm_heartbeat_interval_s": config.kvcm_heartbeat_interval_s,
+                "kvcm_send_retry_interval_s": config.kvcm_send_retry_interval_s,
                 "engine_health_url": config.engine_health_url,
                 "engine_health_interval_s": config.engine_health_interval_s,
                 "engine_health_timeout_s": config.engine_health_timeout_s,
@@ -246,9 +264,41 @@ async def run(config: SubscriberConfig) -> None:
             },
         )
 
-        await asyncio.gather(
-            kv_event_loop(adapter, kvcm, coordinator, config.kv_event_queue_maxsize),
-            coordinator.watch_loop(),
+        event_task = asyncio.create_task(
+            kv_event_loop(
+                adapter,
+                kvcm,
+                coordinator,
+                config.kv_event_queue_maxsize,
+                config.kvcm_send_retry_interval_s,
+            ),
+            name="kv-event-loop",
         )
+        health_task = asyncio.create_task(
+            coordinator.watch_loop(),
+            name="engine-health-loop",
+        )
+        tasks = {event_task, health_task}
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            failed = next(
+                (
+                    task
+                    for task in done
+                    if not task.cancelled() and task.exception() is not None
+                ),
+                None,
+            )
+            if failed is not None:
+                await failed
+            completed = next(iter(done))
+            raise RuntimeError(f"{completed.get_name()} ended unexpectedly")
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await kvcm.close()

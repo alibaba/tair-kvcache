@@ -111,6 +111,31 @@ async def test_first_healthy_opens_epoch_one_and_releases_waiters() -> None:
     assert adapter.reset_generation_calls == 0
 
 
+async def test_event_epoch_is_bufferable_across_closed_health_gates() -> None:
+    adapter = FakeAdapter()
+    kvcm = RecordingKvcmClient()
+    coordinator = EngineHealthCoordinator(adapter, kvcm, _config(threshold=2))
+
+    assert coordinator.capture_epoch() is None
+    assert coordinator.capture_event_epoch() == 1
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+    assert coordinator.capture_epoch() == 1
+    assert coordinator.capture_event_epoch() == 1
+
+    await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
+    assert coordinator.capture_epoch() is None
+    assert coordinator.capture_event_epoch() == 1
+
+    await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
+    assert coordinator.state is EngineHealthState.DEAD
+    assert coordinator.capture_event_epoch() == 1
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+    assert coordinator.capture_epoch() == 2
+    assert coordinator.capture_event_epoch() == 2
+
+
 async def test_rtp_first_healthy_releases_deferred_kvcm_registration() -> None:
     adapter = FakeAdapter()
     kvcm = RecordingKvcmClient()

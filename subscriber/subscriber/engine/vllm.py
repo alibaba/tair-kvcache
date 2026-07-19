@@ -113,6 +113,11 @@ class VllmAdapter(AbstractEngineAdapter):
     def __init__(self, config: SubscriberConfig) -> None:
         """Open the vLLM subscription and replay sockets from subscriber config."""
 
+        if config.data_parallel_size != 1:
+            raise ValueError(
+                "vLLM adapter currently supports exactly one DP endpoint; "
+                "multi-DP must not silently subscribe to rank 0 only"
+            )
         self._config = config
         self._endpoint = config.dp_endpoints[0]
         self._ctx = zmq.asyncio.Context.instance()
@@ -200,6 +205,14 @@ class VllmAdapter(AbstractEngineAdapter):
                     continue
                 seq, payload = received
                 generation = self._generation
+
+                if seq <= self._last_seq:
+                    logger.warning(
+                        "dropping stale or duplicate kv event sequence",
+                        step="zmq_subscribe",
+                        tags={"last_seq": self._last_seq, "current_seq": seq},
+                    )
+                    continue
 
                 if seq > self._last_seq + 1:
                     missed = seq - self._last_seq - 1
@@ -439,16 +452,16 @@ class VllmAdapter(AbstractEngineAdapter):
                                 },
                             )
                             event = LivenessEvent.UNHEALTHY
-                        await asyncio.sleep(self._config.engine_health_interval_s)
                         yield event
+                        await asyncio.sleep(self._config.engine_health_interval_s)
             except Exception as exc:
                 logger.warning(
                     "engine health watch loop failed unexpectedly",
                     step="engine_health",
                     tags={"error": exc.__class__.__name__, "message": str(exc)},
                 )
-                await asyncio.sleep(self._config.engine_health_interval_s)
                 yield LivenessEvent.UNHEALTHY
+                await asyncio.sleep(self._config.engine_health_interval_s)
 
     async def reset_generation_state(self) -> None:
         """Clear sequence state and recreate sockets after engine recovery."""

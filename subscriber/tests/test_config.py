@@ -127,6 +127,7 @@ def test_kvcm_runtime_config_defaults() -> None:
     config = SubscriberConfig()
     assert config.kvcm_base_url == ""
     assert config.kvcm_heartbeat_interval_s == 1.0
+    assert config.kvcm_send_retry_interval_s == 1.0
 
 
 def test_kvcm_runtime_config_cli_override() -> None:
@@ -135,10 +136,13 @@ def test_kvcm_runtime_config_cli_override() -> None:
         [
             "--kvcm-heartbeat-interval-s",
             "2.5",
+            "--kvcm-send-retry-interval-s",
+            "0.25",
         ]
     )
     config = SubscriberConfig.from_args(args)
     assert config.kvcm_heartbeat_interval_s == 2.5
+    assert config.kvcm_send_retry_interval_s == 0.25
 
 
 def test_kvcm_base_url_cli_override() -> None:
@@ -156,6 +160,7 @@ def test_kvcm_runtime_config_yaml_loading(tmp_path: Path) -> None:
         textwrap.dedent(
             """\
             kvcm_heartbeat_interval_s: 3.0
+            kvcm_send_retry_interval_s: 0.5
             """
         )
     )
@@ -163,6 +168,7 @@ def test_kvcm_runtime_config_yaml_loading(tmp_path: Path) -> None:
     args = parser.parse_args(["--config", str(yaml_file)])
     config = SubscriberConfig.from_args(args)
     assert config.kvcm_heartbeat_interval_s == 3.0
+    assert config.kvcm_send_retry_interval_s == 0.5
 
 
 def test_non_positive_kvcm_heartbeat_interval_raises() -> None:
@@ -170,6 +176,17 @@ def test_non_positive_kvcm_heartbeat_interval_raises() -> None:
     args = parser.parse_args(["--kvcm-heartbeat-interval-s", "0"])
 
     with pytest.raises(ValueError, match="^kvcm_heartbeat_interval_s must be > 0$"):
+        SubscriberConfig.from_args(args)
+
+
+def test_non_positive_kvcm_send_retry_interval_raises() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--kvcm-send-retry-interval-s", "0"])
+
+    with pytest.raises(
+        ValueError,
+        match="^kvcm_send_retry_interval_s must be > 0$",
+    ):
         SubscriberConfig.from_args(args)
 
 

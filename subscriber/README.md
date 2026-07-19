@@ -51,6 +51,15 @@ tests or deployments with a fixed manager address, set `kvcm_base_url` in YAML
 or pass `--kvcm-base-url`; the explicit address takes precedence over Spectrum
 service discovery.
 
+KVCM send failures are retried in event order with bounded-queue backpressure;
+`kvcm_send_retry_interval_s` controls the retry interval. A queued batch is
+discarded only after engine recovery advances the epoch, so events from an old
+engine generation cannot leak into the new one.
+
+The vLLM adapter currently accepts exactly one DP event endpoint. Multi-DP vLLM
+configuration fails at startup instead of silently subscribing to DP rank 0.
+RTP-LLM multi-DP snapshot aggregation is supported as described above.
+
 RTP-LLM can launch this process automatically by setting
 `KVCM_SUBSCRIBER_CONFIG` to the YAML path. RTP derives the default cache API
 endpoint from its resolved `START_PORT`: rank-0 gRPC is `START_PORT + 1`.
