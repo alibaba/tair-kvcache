@@ -326,6 +326,38 @@ async def test_send_kv_events_retries_in_order_before_next_batch(
     )
 
 
+async def test_send_kv_events_throttles_repeated_failure_logs(
+    kvcm: MagicMock, coordinator: MagicMock, mocker
+) -> None:
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(QueuedKVEventBatch(_batch(), 1, StageTimer()))
+    kvcm.send_batch.side_effect = [RuntimeError("still down")] * 30 + [None]
+    warning = mocker.patch("subscriber.main.logger.warning")
+
+    sender = asyncio.create_task(
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            MagicMock(),
+            retry_interval_s=0.001,
+        )
+    )
+    await asyncio.wait_for(queue.join(), timeout=1)
+    sender.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    assert kvcm.send_batch.await_count == 31
+    assert warning.call_count == 2
+    retry_attempts = [
+        call.kwargs["tags"]["retry_attempt"] for call in warning.call_args_list
+    ]
+    exc_info_values = [call.kwargs["exc_info"] for call in warning.call_args_list]
+    assert retry_attempts == [1, 30]
+    assert exc_info_values == [True, False]
+
+
 async def test_kv_event_loop_sends_batch_when_epoch_unchanged(
     adapter: MagicMock, kvcm: MagicMock, coordinator: MagicMock
 ) -> None:

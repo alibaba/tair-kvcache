@@ -13,6 +13,8 @@ from subscriber.kvcm.client import KvcmClient
 from subscriber.metrics import MetricSample, SpanMetricsReporter, StageTimer
 from subscriber.types import BlockRemoved, BlockStored, KVEventBatch
 
+_KVCM_SEND_RETRY_LOG_EVERY = 30
+
 
 @dataclass(frozen=True)
 class QueuedKVEventBatch:
@@ -108,22 +110,27 @@ async def send_kv_events(
                     await kvcm.send_batch(queued.batches, epoch)
                 except Exception as exc:
                     retry_attempt += 1
-                    logger.warning(
-                        "failed to send kv event batch to kvcm; retrying in order",
-                        step="kvcm_send",
-                        tags={
-                            "epoch": epoch,
-                            "batch_count": len(queued.batches),
-                            "event_count": sum(
-                                len(batch.events) for batch in queued.batches
-                            ),
-                            "retry_attempt": retry_attempt,
-                            "retry_interval_s": retry_interval_s,
-                            "error": exc.__class__.__name__,
-                            "message": str(exc),
-                        },
-                        exc_info=True,
-                    )
+                    if (
+                        retry_attempt == 1
+                        or retry_attempt % _KVCM_SEND_RETRY_LOG_EVERY == 0
+                    ):
+                        logger.warning(
+                            "failed to send kv event batch to kvcm; "
+                            "retrying in order",
+                            step="kvcm_send",
+                            tags={
+                                "epoch": epoch,
+                                "batch_count": len(queued.batches),
+                                "event_count": sum(
+                                    len(batch.events) for batch in queued.batches
+                                ),
+                                "retry_attempt": retry_attempt,
+                                "retry_interval_s": retry_interval_s,
+                                "error": exc.__class__.__name__,
+                                "message": str(exc),
+                            },
+                            exc_info=retry_attempt == 1,
+                        )
                     await asyncio.sleep(retry_interval_s)
                     continue
                 delivered = True
