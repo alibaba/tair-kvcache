@@ -31,6 +31,8 @@ def test_rtp_cli_overrides_and_endpoint_normalization() -> None:
             "rtp_llm",
             "--rtp-endpoints",
             "127.0.0.1:8089, 127.0.0.1:8097",
+            "--data-parallel-size",
+            "2",
             "--rtp-rpc-timeout-s",
             "2.5",
             "--rtp-poll-interval-s",
@@ -63,6 +65,21 @@ def test_rtp_requires_at_least_one_endpoint() -> None:
         ValueError,
         match="^rtp_endpoints must contain at least one endpoint$",
     ):
+        config.validate()
+
+
+def test_rtp_requires_exactly_one_unique_endpoint_per_dp_rank() -> None:
+    config = SubscriberConfig(
+        engine_type="rtp_llm",
+        data_parallel_size=2,
+        rtp_endpoints="rank-0:8089",
+    )
+
+    with pytest.raises(ValueError, match="expected 2, got 1"):
+        config.validate()
+
+    config.rtp_endpoints = "rank-0:8089,rank-0:8089"
+    with pytest.raises(ValueError, match="duplicate endpoints"):
         config.validate()
 
 

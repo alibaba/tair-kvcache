@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from subscriber.config import SubscriberConfig
@@ -11,6 +12,7 @@ from subscriber.engine.rtp_llm import (
     RtpGrpcCacheStatusSource,
     RtpLlmAdapter,
 )
+from subscriber.health.events import LivenessEvent
 from subscriber.metrics import StageTimer
 from subscriber.types import AllBlocksCleared, BlockRemoved, BlockStored
 
@@ -98,6 +100,35 @@ async def test_grpc_source_merges_only_present_keys_from_all_endpoints() -> None
 
     assert snapshot == CacheSnapshot(frozenset({1, 2, 3}), 64, 8)
     assert requests == [(-1, True, 2.5), (-1, True, 2.5)]
+
+
+async def test_grpc_source_waits_for_every_endpoint_before_rejecting_poll() -> None:
+    release_second_endpoint = asyncio.Event()
+
+    async def failed_call(_request: Any, *, timeout: float) -> Any:
+        assert timeout == 1.0
+        raise RuntimeError("rank unavailable")
+
+    async def pending_call(_request: Any, *, timeout: float) -> Any:
+        assert timeout == 1.0
+        await release_second_endpoint.wait()
+        return CacheStatusPB(block_size=64, version=1)
+
+    source = RtpGrpcCacheStatusSource(("rank-0:1", "rank-1:2"), 1.0)
+    source._calls = [failed_call, pending_call]
+
+    fetch = asyncio.create_task(source.fetch_snapshot())
+    await asyncio.sleep(0)
+    assert not fetch.done()
+
+    release_second_endpoint.set()
+    try:
+        await fetch
+    except RuntimeError as exc:
+        assert "rank-0:1" in str(exc)
+        assert "rank unavailable" in str(exc)
+    else:
+        raise AssertionError("expected one failed DP endpoint to reject the poll")
 
 
 async def test_grpc_source_rejects_uninitialized_cache_block_size() -> None:
@@ -213,6 +244,29 @@ def test_snapshot_block_size_must_match_kvcm_registration() -> None:
         assert "does not match KVCM registration" in str(exc)
     else:
         raise AssertionError("expected block-size mismatch to reject the snapshot")
+
+
+async def test_invalid_snapshot_metadata_never_reports_engine_healthy() -> None:
+    class InvalidSnapshotSource:
+        async def fetch_snapshot(self) -> CacheSnapshot:
+            return CacheSnapshot(frozenset({1}), 32, 1)
+
+        async def close(self) -> None:
+            return None
+
+    adapter = RtpLlmAdapter(
+        _config(block_size=64, rtp_poll_interval_s=0.001),
+        source=InvalidSnapshotSource(),
+    )
+    events = adapter.watch_liveness()
+    try:
+        first = await asyncio.wait_for(events.__anext__(), timeout=1)
+        second = await asyncio.wait_for(events.__anext__(), timeout=1)
+    finally:
+        await events.aclose()
+
+    assert first is LivenessEvent.UNHEALTHY
+    assert second is LivenessEvent.UNHEALTHY
 
 
 def test_rtp_kvcm_location_metadata() -> None:

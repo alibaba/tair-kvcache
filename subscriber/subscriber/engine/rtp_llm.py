@@ -234,9 +234,26 @@ class RtpGrpcCacheStatusSource:
 
     async def fetch_snapshot(self) -> CacheSnapshot:
         self._ensure_connections()
-        responses = await asyncio.gather(
-            *(self._fetch_one(call) for call in self._calls)
+        results = await asyncio.gather(
+            *(self._fetch_one(call) for call in self._calls),
+            return_exceptions=True,
         )
+        failures = [
+            (endpoint, result)
+            for endpoint, result in zip(self._endpoints, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            details = ", ".join(
+                f"{endpoint}: {failure.__class__.__name__}: {failure}"
+                for endpoint, failure in failures
+            )
+            raise RuntimeError(
+                f"RTP GetCacheStatus failed for configured endpoint(s): {details}"
+            ) from failures[0][1]
+        responses = [
+            result for result in results if not isinstance(result, BaseException)
+        ]
         block_sizes = {int(response.block_size) for response in responses}
         if len(block_sizes) != 1:
             raise RuntimeError(
@@ -343,16 +360,14 @@ class RtpLlmAdapter(AbstractEngineAdapter):
                 continue
 
             timer.mark("rtp_snapshot_fetch")
-            self._healthy_streak += 1
-            await self._liveness_queue.put(LivenessEvent.HEALTHY)
-            if self._healthy_streak == 1:
-                # Let the health coordinator open or recover the send epoch
-                # before an authoritative snapshot reaches the forwarding gate.
-                await asyncio.sleep(self._config.rtp_poll_interval_s)
-                continue
-
             try:
-                event = self._event_for_snapshot(snapshot, timer)
+                self._validate_snapshot(snapshot)
+                self._healthy_streak += 1
+                event = (
+                    self._event_for_snapshot(snapshot, timer)
+                    if self._healthy_streak > 1
+                    else None
+                )
             except Exception as exc:
                 self._healthy_streak = 0
                 await self._liveness_queue.put(LivenessEvent.UNHEALTHY)
@@ -366,6 +381,13 @@ class RtpLlmAdapter(AbstractEngineAdapter):
                 )
                 await asyncio.sleep(self._config.rtp_poll_interval_s)
                 continue
+
+            await self._liveness_queue.put(LivenessEvent.HEALTHY)
+            if self._healthy_streak == 1:
+                # Let the health coordinator open or recover the send epoch
+                # before an authoritative snapshot reaches the forwarding gate.
+                await asyncio.sleep(self._config.rtp_poll_interval_s)
+                continue
             if event is not None:
                 await self._event_queue.put(event)
                 delivery_done = self._delivery_done
@@ -375,11 +397,9 @@ class RtpLlmAdapter(AbstractEngineAdapter):
                         self._delivery_done = None
             await asyncio.sleep(self._config.rtp_poll_interval_s)
 
-    def _event_for_snapshot(
-        self,
-        snapshot: CacheSnapshot,
-        timer: StageTimer,
-    ) -> EngineEventBatch | None:
+    def _validate_snapshot(self, snapshot: CacheSnapshot) -> None:
+        """Reject inconsistent cache metadata before reporting engine health."""
+
         if snapshot.block_size != self._config.block_size:
             raise RuntimeError(
                 "RTP cache block size does not match KVCM registration: "
@@ -393,6 +413,13 @@ class RtpLlmAdapter(AbstractEngineAdapter):
                 "RTP cache block size changed while subscriber was running: "
                 f"{self._block_size} -> {snapshot.block_size}"
             )
+
+    def _event_for_snapshot(
+        self,
+        snapshot: CacheSnapshot,
+        timer: StageTimer,
+    ) -> EngineEventBatch | None:
+        self._validate_snapshot(snapshot)
 
         now = self._clock()
         force_full_add = self._force_full_add or now >= self._next_full_refresh_at

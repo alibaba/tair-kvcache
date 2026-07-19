@@ -225,8 +225,16 @@ class SubscriberConfig:
         if self.zmq_replay_timeout_s <= 0:
             raise ValueError("zmq_replay_timeout_s must be > 0")
         if self.engine_type == "rtp_llm":
-            if not self.rtp_endpoint_list:
+            endpoints = self.rtp_endpoint_list
+            if not endpoints:
                 raise ValueError("rtp_endpoints must contain at least one endpoint")
+            if len(endpoints) != self.data_parallel_size:
+                raise ValueError(
+                    "rtp_endpoints must contain exactly one endpoint per DP rank; "
+                    f"expected {self.data_parallel_size}, got {len(endpoints)}"
+                )
+            if len(set(endpoints)) != len(endpoints):
+                raise ValueError("rtp_endpoints must not contain duplicate endpoints")
             if self.rtp_rpc_timeout_s <= 0:
                 raise ValueError("rtp_rpc_timeout_s must be > 0")
             if self.rtp_poll_interval_s <= 0:
