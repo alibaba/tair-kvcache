@@ -1015,8 +1015,7 @@ async def test_send_batch_splits_large_snapshot_reports() -> None:
 
     assert fake_sdk.report_event.await_count == 3
     assert [
-        len(call.args[0]["events"])
-        for call in fake_sdk.report_event.await_args_list
+        len(call.args[0]["events"]) for call in fake_sdk.report_event.await_args_list
     ] == [2, 2, 1]
 
 
