@@ -110,9 +110,7 @@ class SubscriberConfig:
         parser.add_argument("--data-parallel-size", type=int, default=default)
         parser.add_argument("--kvcm-base-url", default=default)
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
-        parser.add_argument(
-            "--kvcm-send-retry-interval-s", type=float, default=default
-        )
+        parser.add_argument("--kvcm-send-retry-interval-s", type=float, default=default)
         parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
         parser.add_argument("--kvcm-report-batch-size", type=int, default=default)

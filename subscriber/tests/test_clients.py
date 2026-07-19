@@ -792,8 +792,7 @@ async def test_start_without_endpoint_retries_batch_after_registration_recovers(
     send_warning = next(
         call
         for call in warning.call_args_list
-        if call.args
-        == ("failed to send kv event batch to kvcm; retrying in order",)
+        if call.args == ("failed to send kv event batch to kvcm; retrying in order",)
     )
     assert "kvcm client is not ready" in send_warning.kwargs["tags"]["message"]
 
