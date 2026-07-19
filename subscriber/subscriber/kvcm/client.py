@@ -345,7 +345,7 @@ class KvcmClient:
         while True:
             await asyncio.sleep(self._config.kvcm_heartbeat_interval_s)
             async with self._send_lock:
-                if not self._engine_available:
+                if not self._engine_available or self._initial_reset_pending:
                     continue
                 if not self._registered:
                     if not await self._manager_is_ready():
@@ -401,7 +401,7 @@ class KvcmClient:
             ]
             initial_reset = self._initial_reset_pending and bool(host_down_events)
             if not self._registered:
-                if not host_down_events or not self._engine_available:
+                if not initial_reset or not self._engine_available:
                     raise RuntimeError("kvcm client is not ready")
                 # HOST_DOWN identifies the node by instance/host and does not
                 # require NODE_REGISTER. Register only the instance first so
