@@ -38,6 +38,7 @@ class EngineHealthCoordinator:
         self._adapter = adapter
         self._kvcm = kvcm
         self._threshold = config.engine_health_failure_threshold
+        self._defer_initial_availability = config.engine_type == "rtp_llm"
         self._clock = clock or time.time
         self._state = EngineHealthState.STARTING
         self._epoch = 0
@@ -91,6 +92,8 @@ class EngineHealthCoordinator:
 
     async def _on_healthy(self) -> None:
         if self._state is EngineHealthState.STARTING:
+            if self._defer_initial_availability:
+                await self._kvcm.set_engine_available(True)
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         elif self._state is EngineHealthState.DEAD:

@@ -45,7 +45,7 @@ uv run python -m subscriber --config config.yaml
 - **asyncio 全异步**：所有 IO 必须使用 `zmq.asyncio.Socket`，禁止在 async 函数中调用同步 ZMQ socket 方法。
 - **引擎适配器隔离**：ZMQ 订阅和 replay 逻辑封装在 `AbstractEngineAdapter` 子类中，`kv_event_loop` 不感知具体引擎实现。
 - **引擎存活探测隔离**：底层连接状态（如 ZMQ socket monitor）由 `AbstractEngineAdapter.watch_liveness()` 暴露为引擎无关事件，判死、epoch、reset 策略集中在 health coordinator。
-- **冷启动 reset 语义**：事件流 adapter（vLLM）首次连接前不发送 `AllBlocksCleared`；RTP 全量 adapter 默认在首个稳定快照前执行一次 `HOST_DOWN → NODE_REGISTER`，用于清除 Subscriber 重启期间遗留的旧 key，再上报完整 add 集合。
+- **冷启动 reset 语义**：事件流 adapter（vLLM）首次连接前不发送 `AllBlocksCleared`；RTP 在首个有效快照前不得注册节点或发送心跳，全量 adapter 默认在首个稳定快照执行一次 `RegisterInstance → HOST_DOWN → NODE_REGISTER`，用于清除 Subscriber 重启期间遗留的旧 key，再上报完整 add 集合。
 - **发送门控**：向 kvcm 转发实时或 replay batch 前必须通过 `EngineHealthCoordinator.wait_ready_epoch()` 获取当前可发送 epoch。
 - **Replay 语义**：检测到 seq gap 时，先聚合所有 replay batch 一次性 yield，再 yield 当前实时消息。replay 使用 DEALER socket（非 REQ），避免 async 下严格一问一答的阻塞问题。
 - **RTP 全量语义**：RTP adapter 只接受所有配置 endpoint 都成功返回的完整快照；diff baseline 仅在 KVCM 确认发送成功后推进，删除需连续快照确认。

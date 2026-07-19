@@ -85,7 +85,10 @@ class KvcmClient:
         self._send_lock = asyncio.Lock()
         self._engine_config: dict[str, Any] = _get_engine_config_from_env()
         self._registered = False
-        self._engine_available = True
+        self._engine_available = config.engine_type != "rtp_llm"
+        self._initial_reset_pending = (
+            config.engine_type == "rtp_llm" and config.rtp_reset_on_start
+        )
         self._started = False
 
     def _base_url(self) -> str:
@@ -259,7 +262,12 @@ class KvcmClient:
         )
         await self._manager_client.start()
         self._started = True
-        if await self._manager_is_ready():
+        if not self._engine_available:
+            logger.info(
+                "waiting for RTP cache snapshot before registering with kvcm",
+                step="kvcm_register",
+            )
+        elif await self._manager_is_ready():
             await self._register_and_report_node()
         else:
             logger.warning(
@@ -322,6 +330,10 @@ class KvcmClient:
             self._engine_available = available
             if not available:
                 return
+            if self._initial_reset_pending:
+                # The first authoritative RTP snapshot must clear an old host
+                # generation before NODE_REGISTER makes it available again.
+                return
             if (
                 self._started
                 and not self._registered
@@ -377,9 +389,6 @@ class KvcmClient:
                 )
             return
         async with self._send_lock:
-            if not self._registered:
-                raise RuntimeError("kvcm client is not ready")
-
             host_down_events = [
                 event
                 for event in events
@@ -390,13 +399,27 @@ class KvcmClient:
                 for event in events
                 if event["event_type"] != KvcmReportEventType.HOST_DOWN
             ]
+            initial_reset = self._initial_reset_pending and bool(host_down_events)
+            if not self._registered:
+                if not host_down_events or not self._engine_available:
+                    raise RuntimeError("kvcm client is not ready")
+                # HOST_DOWN identifies the node by instance/host and does not
+                # require NODE_REGISTER. Register only the instance first so
+                # stale block state is never made available during cold start.
+                await self._register_instance()
             if host_down_events:
                 # KVCM applies block mutations before HOST_DOWN within one
                 # request. Split the reset so the new generation cannot be
                 # removed by the asynchronous old-generation cleanup.
                 await self._send_report_events(host_down_events, epoch)
                 self._registered = False
+                if initial_reset:
+                    self._initial_reset_pending = False
                 if not mutation_events:
+                    if initial_reset and not await self._register_and_report_node():
+                        raise RuntimeError(
+                            "kvcm node registration failed after host reset"
+                        )
                     return
                 if not self._engine_available:
                     raise RuntimeError(

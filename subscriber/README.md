@@ -41,6 +41,10 @@ until KVCM acknowledges it, confirms removals across consecutive snapshots,
 and periodically refreshes the full add set for reconciliation.
 The configured `block_size` must match every RTP endpoint because KVCM instance
 registration happens before the first snapshot is forwarded.
+For RTP-LLM, node registration and heartbeat are deferred until the cache API
+returns a valid snapshot. With the default startup reset enabled, the
+Subscriber clears any old host generation before registering the node and
+reporting the first full add set.
 
 By default the Subscriber discovers KVCM from `KVCM_VSERVICE_ID`. For local
 tests or deployments with a fixed manager address, set `kvcm_base_url` in YAML

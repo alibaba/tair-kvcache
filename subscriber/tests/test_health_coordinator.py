@@ -111,6 +111,22 @@ async def test_first_healthy_opens_epoch_one_and_releases_waiters() -> None:
     assert adapter.reset_generation_calls == 0
 
 
+async def test_rtp_first_healthy_releases_deferred_kvcm_registration() -> None:
+    adapter = FakeAdapter()
+    kvcm = RecordingKvcmClient()
+    coordinator = EngineHealthCoordinator(
+        adapter,
+        kvcm,
+        SubscriberConfig(engine_type="rtp_llm"),
+    )
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+
+    assert coordinator.state is EngineHealthState.HEALTHY
+    assert coordinator.epoch == 1
+    assert kvcm.availability == [True]
+
+
 async def test_healthy_healthy_resets_failure_and_keeps_gate_open() -> None:
     adapter = FakeAdapter()
     kvcm = RecordingKvcmClient()
