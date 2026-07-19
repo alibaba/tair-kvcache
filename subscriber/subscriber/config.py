@@ -127,9 +127,7 @@ class SubscriberConfig:
         parser.add_argument("--rtp-endpoints", default=default)
         parser.add_argument("--rtp-rpc-timeout-s", type=float, default=default)
         parser.add_argument("--rtp-poll-interval-s", type=float, default=default)
-        parser.add_argument(
-            "--rtp-deletion-confirmations", type=int, default=default
-        )
+        parser.add_argument("--rtp-deletion-confirmations", type=int, default=default)
         parser.add_argument(
             "--rtp-full-refresh-interval-s", type=float, default=default
         )

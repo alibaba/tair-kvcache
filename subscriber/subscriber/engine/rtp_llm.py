@@ -257,8 +257,7 @@ class RtpGrpcCacheStatusSource:
         block_sizes = {int(response.block_size) for response in responses}
         if len(block_sizes) != 1:
             raise RuntimeError(
-                "RTP workers returned inconsistent block sizes: "
-                f"{sorted(block_sizes)}"
+                f"RTP workers returned inconsistent block sizes: {sorted(block_sizes)}"
             )
         block_size = block_sizes.pop()
         if block_size <= 0:

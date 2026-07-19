@@ -63,9 +63,7 @@ def test_grpc_source_serializes_concrete_dynamic_request(mocker) -> None:
     source._ensure_connections()
 
     serializer = channel.unary_unary.call_args.kwargs["request_serializer"]
-    encoded = serializer(
-        CacheVersionPB(latest_cache_version=-1, need_cache_keys=True)
-    )
+    encoded = serializer(CacheVersionPB(latest_cache_version=-1, need_cache_keys=True))
     decoded = CacheVersionPB.FromString(encoded)
     assert decoded.latest_cache_version == -1
     assert decoded.need_cache_keys is True
