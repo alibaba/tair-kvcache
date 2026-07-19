@@ -115,8 +115,7 @@ async def send_kv_events(
                         or retry_attempt % _KVCM_SEND_RETRY_LOG_EVERY == 0
                     ):
                         logger.warning(
-                            "failed to send kv event batch to kvcm; "
-                            "retrying in order",
+                            "failed to send kv event batch to kvcm; retrying in order",
                             step="kvcm_send",
                             tags={
                                 "epoch": epoch,
