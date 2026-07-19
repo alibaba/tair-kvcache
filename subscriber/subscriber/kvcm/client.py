@@ -351,11 +351,14 @@ class KvcmClient:
                     if not await self._manager_is_ready():
                         continue
                     await self._register_and_report_node()
-                    if self._registered:
-                        logger.info(
-                            "kvcm registration recovered",
-                            step="kvcm_register",
-                        )
+                    if not self._registered:
+                        # A heartbeat must never make a node visible before
+                        # both RegisterInstance and NODE_REGISTER succeed.
+                        continue
+                    logger.info(
+                        "kvcm registration recovered",
+                        step="kvcm_register",
+                    )
 
                 try:
                     await self._report_events([self._heartbeat_event()])

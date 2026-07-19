@@ -850,6 +850,22 @@ async def test_heartbeat_reports_periodically() -> None:
     fake_sdk.close.assert_awaited_once()
 
 
+async def test_heartbeat_is_skipped_while_registration_retry_fails() -> None:
+    fake_sdk = FakeSdkClient()
+    fake_sdk.register_instance.side_effect = RuntimeError("register failed")
+    client = _make_kvcm(
+        SubscriberConfig(kvcm_heartbeat_interval_s=0.01),
+        fake_sdk,
+    )
+
+    await client.start()
+    await asyncio.sleep(0.03)
+    await client.close()
+
+    assert fake_sdk.register_instance.await_count >= 2
+    fake_sdk.report_event.assert_not_awaited()
+
+
 async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
     fake_sdk = FakeSdkClient()
     heartbeat_error = RuntimeError("heartbeat failed")
