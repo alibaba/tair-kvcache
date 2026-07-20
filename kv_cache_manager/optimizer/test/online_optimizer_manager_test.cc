@@ -107,6 +107,12 @@ protected:
 
     std::shared_ptr<OptimizerRegistryManager> registry_;
     std::shared_ptr<OnlineOptimizerManager> mgr_;
+
+    static double FullCapacityGb(int64_t capacity_blocks) {
+        constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+        constexpr double kFullBlockChargeBytes = 16384.0;
+        return static_cast<double>(capacity_blocks) * kFullBlockChargeBytes / kBytesPerGb;
+    }
 };
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceBasic) {
@@ -245,6 +251,93 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
     // Large capacity (index 1) should hit all 100 keys
     ASSERT_EQ(2, result.hit_count_per_capacity.size());
     EXPECT_EQ(100, result.hit_count_per_capacity[1]);
+}
+
+TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2), FullCapacityGb(3)}, "lru", true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+    EXPECT_EQ((std::vector<int64_t>{2, 3}), reg_result.estimated_capacity_blocks);
+
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, first));
+    EXPECT_EQ((std::vector<int64_t>{0, 0}), first.hit_count_per_capacity);
+
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {2, 1, 3}, 13, second));
+    EXPECT_EQ((std::vector<int64_t>{1, 3}), second.hit_count_per_capacity);
+    ASSERT_EQ(2, second.hit_rate_per_capacity.size());
+    EXPECT_DOUBLE_EQ(4.0 / 13.0, second.hit_rate_per_capacity[0]);
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.hit_rate_per_capacity[1]);
+    EXPECT_EQ(3, second.max_hit_count);
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.max_hit_rate);
+
+    bool checked_state = false;
+    ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
+        checked_state = true;
+        EXPECT_NE(nullptr, state.lite_hit);
+        EXPECT_EQ(nullptr, state.indexer);
+        EXPECT_EQ(2, state.lite_hit->request_count());
+    }));
+    EXPECT_TRUE(checked_state);
+
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(2, summaries[0].total_queries);
+    EXPECT_EQ(26, summaries[0].total_input_tokens);
+    ASSERT_EQ(2, summaries[0].per_capacity_hit_rates.size());
+    EXPECT_EQ(1, summaries[0].per_capacity_hit_rates[0].total_hits);
+    EXPECT_DOUBLE_EQ(4.0 / 26.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
+    EXPECT_EQ(3, summaries[0].per_capacity_hit_rates[1].total_hits);
+    EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].per_capacity_hit_rates[1].hit_rate);
+    EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);
+}
+
+TEST_F(OnlineOptimizerManagerTest, FullAttentionRequiresConsistentInputTokenLength) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)});
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    EXPECT_EQ(EC_BADARGS, mgr_->TraceQuery("i1", {1}, 3, result));
+    EXPECT_EQ(EC_BADARGS, mgr_->TraceQuery("i1", {}, 4, result));
+    EXPECT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 7, result));
+
+    std::vector<InstanceSummary> summaries;
+    mgr_->ListInstances("g1", summaries);
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(1, summaries[0].total_queries);
+    EXPECT_EQ(7, summaries[0].total_input_tokens);
+}
+
+TEST_F(OnlineOptimizerManagerTest, FullAttentionRejectsTtlInLiteHitPhase) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)}, "lru", false, 60);
+    RegisterInstanceResult reg_result;
+    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, reg_result));
+}
+
+TEST_F(OnlineOptimizerManagerTest, ResetStatsResetsFullAttentionLiteHit) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)});
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    mgr_->TraceQuery("i1", {1, 2}, 9, result);
+    mgr_->TraceQuery("i1", {1, 2}, 8, result);
+    ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
+
+    std::vector<InstanceSummary> summaries;
+    mgr_->ListInstances("g1", summaries);
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(0, summaries[0].total_queries);
+    EXPECT_EQ(0, summaries[0].total_input_tokens);
+    EXPECT_EQ(0, summaries[0].total_blocks_queried);
+    EXPECT_EQ(0, summaries[0].unique_keys);
 }
 
 TEST_F(OnlineOptimizerManagerTest, ListInstances) {

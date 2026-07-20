@@ -393,7 +393,9 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         const auto &instance_id = p->instance_id();
 
         for (const auto &info : per_cap) {
-            double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
+            double hit_rate = info.hit_rate >= 0.0
+                                  ? info.hit_rate
+                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
             MetricsTags prom_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
@@ -443,7 +445,9 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         const auto &instance_id = p->instance_id();
 
         for (const auto &info : per_cap) {
-            double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
+            double hit_rate = info.hit_rate >= 0.0
+                                  ? info.hit_rate
+                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
             MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};

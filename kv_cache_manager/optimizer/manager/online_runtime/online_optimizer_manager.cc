@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -22,6 +24,39 @@ const LocationSpecGroup *FindLocationSpecGroup(const std::vector<LocationSpecGro
         }
     }
     return nullptr;
+}
+
+constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
+
+bool ConvertCapacitiesToBlocks(const std::vector<double> &capacity_gb,
+                               int64_t block_charge_bytes,
+                               std::vector<int64_t> &capacity_blocks) {
+    capacity_blocks.clear();
+    capacity_blocks.reserve(capacity_gb.size());
+    for (double capacity : capacity_gb) {
+        if (!std::isfinite(capacity) || capacity < 0.0) {
+            return false;
+        }
+        const long double blocks = static_cast<long double>(capacity) * kBytesPerGb / block_charge_bytes;
+        if (blocks >= static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+            capacity_blocks.push_back(std::numeric_limits<int64_t>::max());
+        } else {
+            capacity_blocks.push_back(static_cast<int64_t>(blocks));
+        }
+    }
+    return true;
+}
+
+int64_t ClampToInt64(uint64_t value) {
+    return value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ? std::numeric_limits<int64_t>::max()
+                                                                              : static_cast<int64_t>(value);
+}
+
+int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
+    if (lhs != 0 && rhs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / lhs) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return static_cast<int64_t>(lhs * rhs);
 }
 
 } // namespace
@@ -218,6 +253,25 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         return EC_BADARGS;
     }
     int32_t linear_step = instance_info.linear_step();
+    if (instance_info.block_size() <= 0) {
+        KVCM_LOG_ERROR("RegisterInstance failed: non-positive token block_size for instance[%s]", instance_id.c_str());
+        return EC_BADARGS;
+    }
+    if (instance_group.eviction_policy() != "lru") {
+        KVCM_LOG_ERROR("RegisterInstance failed: unsupported eviction_policy[%s] for instance[%s]",
+                       instance_group.eviction_policy().c_str(),
+                       instance_id.c_str());
+        return EC_BADARGS;
+    }
+    if (instance_group.ttl_seconds() < 0) {
+        KVCM_LOG_ERROR("RegisterInstance failed: negative TTL for instance[%s]", instance_id.c_str());
+        return EC_BADARGS;
+    }
+    if (linear_step == 0 && instance_group.ttl_seconds() > 0) {
+        KVCM_LOG_ERROR("RegisterInstance failed: LiteHit full-attention mode does not support TTL for instance[%s]",
+                       instance_id.c_str());
+        return EC_BADARGS;
+    }
 
     const auto &optimizer_state_info = instance_info.optimizer_state_info();
     if (optimizer_state_info.full_location_spec_group_name().empty()) {
@@ -286,10 +340,10 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     }
 
     const auto &capacity_gb = instance_group.capacity_gb();
-    std::vector<int64_t> estimated_capacity_blocks(capacity_gb.size());
-    for (size_t i = 0; i < capacity_gb.size(); i++) {
-        int64_t bytes = static_cast<int64_t>(capacity_gb[i] * 1024.0 * 1024.0 * 1024.0);
-        estimated_capacity_blocks[i] = bytes / estimated_bytes_per_block;
+    std::vector<int64_t> estimated_capacity_blocks;
+    if (!ConvertCapacitiesToBlocks(capacity_gb, estimated_bytes_per_block, estimated_capacity_blocks)) {
+        KVCM_LOG_ERROR("RegisterInstance failed: invalid capacity for instance[%s]", instance_id.c_str());
+        return EC_BADARGS;
     }
 
     auto state = std::make_shared<InstanceState>();
@@ -301,20 +355,33 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     state->linear_step = linear_step;
     state->total_hits_per_capacity.resize(capacity_gb.size(), 0);
 
-    auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
-                                                           instance_group.enable_theoretical_max_cache(),
-                                                           capacity_gb,
-                                                           size_full_only,
-                                                           size_full_linear,
-                                                           linear_step,
-                                                           instance_group.ttl_seconds());
-    if (!indexer) {
-        KVCM_LOG_ERROR("RegisterInstance failed: unsupported eviction_policy[%s] for instance[%s]",
-                       instance_group.eviction_policy().c_str(),
-                       instance_id.c_str());
-        return EC_BADARGS;
+    if (linear_step == 0) {
+        state->lite_hit_capacity_blocks = estimated_capacity_blocks;
+        std::vector<int64_t> lite_hit_capacities = estimated_capacity_blocks;
+        if (instance_group.enable_theoretical_max_cache()) {
+            lite_hit_capacities.push_back(LiteHit::kInfiniteCapacity);
+        }
+        try {
+            state->lite_hit = std::make_unique<LiteHit>(std::move(lite_hit_capacities), instance_info.block_size());
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR(
+                "RegisterInstance failed: initialize LiteHit for instance[%s]: %s", instance_id.c_str(), e.what());
+            return EC_BADARGS;
+        }
+    } else {
+        auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
+                                                               instance_group.enable_theoretical_max_cache(),
+                                                               capacity_gb,
+                                                               size_full_only,
+                                                               size_full_linear,
+                                                               linear_step,
+                                                               instance_group.ttl_seconds());
+        if (!indexer) {
+            KVCM_LOG_ERROR("RegisterInstance failed: initialize linear indexer for instance[%s]", instance_id.c_str());
+            return EC_BADARGS;
+        }
+        state->indexer = std::move(indexer);
     }
-    state->indexer = std::move(indexer);
 
     {
         std::unique_lock lock(instances_mutex_);
@@ -372,13 +439,90 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         state = it->second;
     }
 
+    const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+    if (!block_keys.empty() &&
+        block_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / block_keys.size()) {
+        return EC_BADARGS;
+    }
+    const int64_t input_token_len = static_cast<int64_t>(block_keys.size() * block_size);
+    return TraceQuery(instance_id, block_keys, input_token_len, result);
+}
+
+ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
+                                             const std::vector<int64_t> &block_keys,
+                                             int64_t input_token_len,
+                                             TraceQueryResult &result) {
+    std::shared_ptr<InstanceState> state;
+    {
+        std::shared_lock lock(instances_mutex_);
+        auto it = instances_.find(instance_id);
+        if (it == instances_.end()) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        state = it->second;
+    }
+
     std::lock_guard<std::mutex> guard(state->mutex);
+    result = TraceQueryResult{};
 
     const int64_t total_blocks = static_cast<int64_t>(block_keys.size());
     const size_t num_caps = state->total_hits_per_capacity.size();
+    result.total_blocks = total_blocks;
+    result.input_token_len = input_token_len;
+    result.capacity_gb = state->instance_group->capacity_gb();
+
+    if (state->linear_step == 0) {
+        if (input_token_len < 0 || !state->lite_hit) {
+            return input_token_len < 0 ? EC_BADARGS : EC_ERROR;
+        }
+
+        LiteHit::RequestResult request_result;
+        try {
+            request_result = state->lite_hit->ProcessRequest(block_keys, static_cast<uint64_t>(input_token_len));
+        } catch (const std::invalid_argument &e) {
+            KVCM_LOG_ERROR(
+                "TraceQuery failed: invalid LiteHit request for instance[%s]: %s", instance_id.c_str(), e.what());
+            return EC_BADARGS;
+        }
+
+        result.hit_count_per_capacity.reserve(num_caps);
+        result.hit_rate_per_capacity.reserve(num_caps);
+        for (std::size_t i = 0; i < num_caps; ++i) {
+            const auto &capacity_result = request_result.capacity_results[i];
+            result.hit_count_per_capacity.push_back(ClampToInt64(capacity_result.hit_count));
+            result.hit_rate_per_capacity.push_back(capacity_result.hit_rate);
+        }
+        result.cache_hit_count = result.hit_count_per_capacity.empty() ? 0 : result.hit_count_per_capacity.front();
+
+        const uint64_t unique_blocks = state->lite_hit->current_unique_blocks();
+        result.unique_keys_per_capacity.reserve(state->lite_hit_capacity_blocks.size());
+        for (int64_t capacity : state->lite_hit_capacity_blocks) {
+            result.unique_keys_per_capacity.push_back(
+                ClampToInt64(std::min(unique_blocks, static_cast<uint64_t>(capacity))));
+        }
+        result.current_unique_keys =
+            result.unique_keys_per_capacity.empty() ? 0 : result.unique_keys_per_capacity.front();
+
+        if (state->instance_group->enable_theoretical_max_cache()) {
+            const auto &max_result = request_result.capacity_results.back();
+            result.max_hit_count = ClampToInt64(max_result.hit_count);
+            result.max_hit_rate = max_result.hit_rate;
+            result.theoretical_unique_keys = ClampToInt64(unique_blocks);
+        } else {
+            result.theoretical_unique_keys = -1;
+        }
+
+        // Kept only for the existing debug field. All full-attention hit
+        // counts, token denominators, and rates live in LiteHit itself.
+        state->total_blocks_queried += total_blocks;
+        return EC_OK;
+    }
 
     std::vector<int64_t> hit_count;
     int64_t max_hit_count;
+    if (!state->indexer) {
+        return EC_ERROR;
+    }
     state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
 
     state->indexer->PostQueryMaintenance();
@@ -393,14 +537,19 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     }
 
     result.cache_hit_count = hit_count.empty() ? 0 : hit_count[0];
-    result.total_blocks = total_blocks;
     hit_count.resize(num_caps);
     result.hit_count_per_capacity = std::move(hit_count);
-    result.capacity_gb = state->instance_group->capacity_gb();
+    result.hit_rate_per_capacity.reserve(num_caps);
+    for (int64_t hits : result.hit_count_per_capacity) {
+        result.hit_rate_per_capacity.push_back(total_blocks > 0 ? static_cast<double>(hits) / total_blocks : 0.0);
+    }
     result.unique_keys_per_capacity = state->indexer->capacity_unique_counts();
     result.current_unique_keys = state->indexer->unique_count();
     result.theoretical_unique_keys = max_hit_count >= 0 ? state->indexer->unique_count() : -1;
     result.max_hit_count = max_hit_count;
+    result.max_hit_rate = total_blocks > 0 && max_hit_count >= 0
+                              ? static_cast<double>(max_hit_count) / static_cast<double>(total_blocks)
+                              : 0.0;
 
     return EC_OK;
 }
@@ -421,18 +570,7 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.instance_id = id;
         s.instance_group = state->instance_info->instance_group_name();
         s.block_size = state->instance_info->block_size();
-        s.total_queries = state->total_queries;
         s.total_blocks_queried = state->total_blocks_queried;
-
-        s.total_max_hits = state->total_max_hits;
-        s.max_hit_rate = state->total_blocks_queried > 0
-                             ? static_cast<double>(s.total_max_hits) / static_cast<double>(state->total_blocks_queried)
-                             : 0.0;
-        s.unique_keys = state->indexer->unique_count();
-        s.eviction_count = state->indexer->eviction_count();
-        s.memory_usage_bytes = state->indexer->memory_usage_bytes();
-        s.kv_cache_usage_bytes = state->indexer->kv_cache_usage_bytes();
-        s.ttl_eviction_count = state->indexer->ttl_eviction_count();
         s.avg_bytes_per_block =
             (state->linear_step == 0)
                 ? state->size_full_only
@@ -440,31 +578,80 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.linear_step = state->linear_step;
 
         const auto &caps = state->instance_group->capacity_gb();
-        for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); i++) {
-            PerCapacityHitRateInfo info;
-            info.capacity_gb = caps[i];
-            info.total_hits = state->total_hits_per_capacity[i];
-            info.hit_rate = state->total_blocks_queried > 0 ? static_cast<double>(info.total_hits) /
-                                                                  static_cast<double>(state->total_blocks_queried)
-                                                            : 0.0;
-            s.per_capacity_hit_rates.push_back(info);
-        }
+        if (state->linear_step == 0) {
+            if (!state->lite_hit) {
+                continue;
+            }
+            const LiteHit::AnalysisResult analysis = state->lite_hit->GetResult();
+            s.total_queries = ClampToInt64(analysis.request_count);
+            s.total_input_tokens = ClampToInt64(analysis.total_input_tokens);
+            s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
+            s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
-        // Collect hit age bucket distribution
-        auto age_buckets = state->indexer->GetHitAgeBuckets();
-        int64_t bucket_total = 0;
-        for (const auto &bucket : age_buckets) {
-            bucket_total += bucket.hit_count;
-        }
-        // Use bucket_total as denominator when total_max_hits is unavailable (bounded indexer).
-        int64_t age_denom = s.total_max_hits > 0 ? s.total_max_hits : bucket_total;
-        for (const auto &bucket : age_buckets) {
-            HitAgeBucketRatio ratio_info;
-            ratio_info.threshold_seconds = bucket.threshold_seconds;
-            ratio_info.hit_count = bucket.hit_count;
-            ratio_info.ratio =
-                age_denom > 0 ? static_cast<double>(bucket.hit_count) / static_cast<double>(age_denom) : 0.0;
-            s.hit_age_bucket_ratios.push_back(ratio_info);
+            uint64_t largest_resident_blocks = 0;
+            for (int64_t capacity : state->lite_hit_capacity_blocks) {
+                largest_resident_blocks =
+                    std::max(largest_resident_blocks,
+                             std::min(state->lite_hit->current_unique_blocks(), static_cast<uint64_t>(capacity)));
+            }
+            s.kv_cache_usage_bytes =
+                SaturatingMultiplyToInt64(largest_resident_blocks, static_cast<uint64_t>(state->size_full_only));
+
+            for (size_t i = 0; i < caps.size() && i < analysis.capacity_results.size(); ++i) {
+                const auto &capacity_result = analysis.capacity_results[i];
+                PerCapacityHitRateInfo info;
+                info.capacity_gb = caps[i];
+                info.total_hits = ClampToInt64(capacity_result.hit_count);
+                info.hit_rate = capacity_result.hit_rate;
+                s.per_capacity_hit_rates.push_back(info);
+            }
+
+            if (state->instance_group->enable_theoretical_max_cache()) {
+                const auto &max_result = analysis.capacity_results.back();
+                s.total_max_hits = ClampToInt64(max_result.hit_count);
+                s.max_hit_rate = max_result.hit_rate;
+            }
+        } else {
+            if (!state->indexer) {
+                continue;
+            }
+            s.total_queries = state->total_queries;
+            s.total_max_hits = state->total_max_hits;
+            s.max_hit_rate = state->total_blocks_queried > 0 ? static_cast<double>(s.total_max_hits) /
+                                                                   static_cast<double>(state->total_blocks_queried)
+                                                             : 0.0;
+            s.unique_keys = state->indexer->unique_count();
+            s.eviction_count = state->indexer->eviction_count();
+            s.memory_usage_bytes = state->indexer->memory_usage_bytes();
+            s.kv_cache_usage_bytes = state->indexer->kv_cache_usage_bytes();
+            s.ttl_eviction_count = state->indexer->ttl_eviction_count();
+
+            for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); i++) {
+                PerCapacityHitRateInfo info;
+                info.capacity_gb = caps[i];
+                info.total_hits = state->total_hits_per_capacity[i];
+                info.hit_rate = state->total_blocks_queried > 0 ? static_cast<double>(info.total_hits) /
+                                                                      static_cast<double>(state->total_blocks_queried)
+                                                                : 0.0;
+                s.per_capacity_hit_rates.push_back(info);
+            }
+
+            // Hit-age is a legacy indexer statistic and is intentionally not
+            // part of LiteHit's full-attention state.
+            auto age_buckets = state->indexer->GetHitAgeBuckets();
+            int64_t bucket_total = 0;
+            for (const auto &bucket : age_buckets) {
+                bucket_total += bucket.hit_count;
+            }
+            int64_t age_denom = s.total_max_hits > 0 ? s.total_max_hits : bucket_total;
+            for (const auto &bucket : age_buckets) {
+                HitAgeBucketRatio ratio_info;
+                ratio_info.threshold_seconds = bucket.threshold_seconds;
+                ratio_info.hit_count = bucket.hit_count;
+                ratio_info.ratio =
+                    age_denom > 0 ? static_cast<double>(bucket.hit_count) / static_cast<double>(age_denom) : 0.0;
+                s.hit_age_bucket_ratios.push_back(ratio_info);
+            }
         }
 
         summaries.push_back(std::move(s));
@@ -484,20 +671,28 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     }
 
     std::lock_guard<std::mutex> guard(state->mutex);
-    auto new_indexer = CacheIndexerFactory::CreateCacheIndexer(state->instance_group->eviction_policy(),
-                                                               state->instance_group->enable_theoretical_max_cache(),
-                                                               state->instance_group->capacity_gb(),
-                                                               state->size_full_only,
-                                                               state->size_full_linear,
-                                                               state->linear_step,
-                                                               state->instance_group->ttl_seconds());
-    if (!new_indexer) {
-        KVCM_LOG_ERROR("ResetStats failed: unsupported eviction_policy[%s] for instance[%s]",
-                       state->instance_group->eviction_policy().c_str(),
-                       instance_id.c_str());
-        return EC_ERROR;
+    if (state->linear_step == 0) {
+        if (!state->lite_hit) {
+            return EC_ERROR;
+        }
+        state->lite_hit->Reset();
+    } else {
+        auto new_indexer =
+            CacheIndexerFactory::CreateCacheIndexer(state->instance_group->eviction_policy(),
+                                                    state->instance_group->enable_theoretical_max_cache(),
+                                                    state->instance_group->capacity_gb(),
+                                                    state->size_full_only,
+                                                    state->size_full_linear,
+                                                    state->linear_step,
+                                                    state->instance_group->ttl_seconds());
+        if (!new_indexer) {
+            KVCM_LOG_ERROR("ResetStats failed: unsupported eviction_policy[%s] for instance[%s]",
+                           state->instance_group->eviction_policy().c_str(),
+                           instance_id.c_str());
+            return EC_ERROR;
+        }
+        state->indexer = std::move(new_indexer);
     }
-    state->indexer = std::move(new_indexer);
     state->total_queries = 0;
     state->total_blocks_queried = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);

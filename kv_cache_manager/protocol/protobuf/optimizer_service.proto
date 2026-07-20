@@ -145,32 +145,35 @@ message OptimizerGetInstanceResponse {
     int32 linear_step = 8;
 }
 
-// TraceQuery：模拟 block 级缓存命中
+// TraceQuery：按完整 block 回放缓存状态，full-attention 命中率按 input token 计算
 
 message TraceQueryRequest {
     string trace_id = 1;
     string instance_id = 2;
-    repeated int64 block_keys = 3;  // 本次请求的 block key 序列（有序，前缀匹配）
-    repeated int64 token_ids = 4;   // 预留：token 粒度追踪
+    repeated int64 block_keys = 3; // 本次请求所有完整 block 的 key 序列（有序，前缀匹配）
+    repeated int64 token_ids = 4;  // 兼容输入；未设置 input_token_len 时可由其长度推导
+    int64 input_token_len = 5;     // 原始输入 token 数
 }
 
 message TraceQueryResponse {
     CommonResponseHeader header = 1;
     int64 total_blocks = 2;    // 本次请求的总 block 数
-    repeated TraceQueryCapacityResult capacity_results = 3;
-    TraceQueryTheoreticalResult theoretical_result = 4;
+    int64 input_token_len = 3;
+    repeated TraceQueryCapacityResult capacity_results = 4;
+    TraceQueryTheoreticalResult theoretical_result = 5;
 }
 
 message TraceQueryCapacityResult {
     double capacity_gb = 1;
-    int64 cache_hit_count = 2;      // 该容量下的前缀连续命中长度
-    double hit_rate = 3;            // cache_hit_count / total_blocks
+    int64 cache_hit_count = 2;      // 该容量下的前缀连续命中长度（block 数）
+    double hit_rate = 3;            // full-attention: cache_hit_count * block_size / input_token_len
     int64 current_unique_keys = 4;  // 该容量下当前 resident unique key 数
 }
 
 message TraceQueryTheoreticalResult {
-    int64 max_hit_count = 1;        // theoretical/max cache 前缀连续命中长度，未启用时为 -1
+    int64 max_hit_count = 1;        // theoretical/max cache 前缀连续命中长度（block 数），未启用时为 -1
     int64 current_unique_keys = 2;  // theoretical/max cache 当前 resident unique key 数
+    double hit_rate = 3;
 }
 
 // Instance 列表/统计重置
@@ -209,6 +212,7 @@ message OptimizerInstanceSummary {
     repeated OptimizerCapacitySummary capacity_summaries = 5; // 各容量档位的累积命中率
     OptimizerTheoreticalSummary theoretical_summary = 6;
     OptimizerInstanceDebugInfo debug_info = 7;
+    int64 total_input_tokens = 8;
 }
 
 message OptimizerListInstancesResponse {

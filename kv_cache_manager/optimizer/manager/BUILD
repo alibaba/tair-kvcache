@@ -59,5 +59,6 @@ cc_library(
         "//kv_cache_manager/optimizer/index:cache_indexer",
         "//kv_cache_manager/optimizer/index:cache_indexer_factory",
         "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
     ],
 )
