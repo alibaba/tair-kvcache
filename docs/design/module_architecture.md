@@ -16,7 +16,7 @@
 |---|---|---|
 | **KVCache Manager** | `kv_cache_manager/` | 核心系统：全局 KVCache 元数据管理服务，以及配套的客户端 SDK 与推理框架连接器。本文档的主体。 |
 | **HiSim** | `hisim/` | 独立的 LLM 推理仿真系统，通过回放 trace 预测 TTFT/TPOT/吞吐等指标，不依赖 Manager 运行时。 |
-| **Optimizer** | `kv_cache_manager/optimizer/` | 缓存仿真与优化：回放 KVCache 访问 trace，模拟命中率与容量消耗，指导逐出策略与容量参数调优。在线化能力正在开发中，后续会与现有 optimizer 合并。 |
+| **Optimizer** | `kv_cache_manager/optimizer/` | 缓存仿真与优化：既支持离线回放 KVCache 访问 trace，也提供在线 TraceQuery 服务。完整 optimizer 用于策略/容量分析；LiteHit 用最小状态精确计算多容量 full-attention LRU 命中率。 |
 
 KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理（查询、写入、容量管理），推理引擎通过 Client/Connector 接入。
 
@@ -97,7 +97,7 @@ service → manager → meta → config → data_storage → common
 ### 3.3 客户端与 Optimizer
 
 - **client** 是独立的对外分支，仅共享 `common`、`config`、`data_storage`、`protocol` 以及 `service/util:manager_message_proto_util`；**py_connector** 通过 pybind 位于 client 之上。核心服务端不依赖 client。运行时，元数据面经 gRPC（C++ `MetaClient`）或 HTTP（py_connector 的 Python `KvCacheManagerClient`）调用 KVCM 服务，数据面经 C++ `TransferClient` 直接读写存储后端——这几条链路是理解端到端流程的关键（见第 4 节）。
-- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优）。目前通过 `meta:cache_location` 类型与 `event` 的 optimizer 事件与核心关联；在线化能力正在开发中，后续会与现有 optimizer 合并。
+- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优），并通过独立 online runtime/service 提供实时 TraceQuery。full-attention LRU 的在线多容量统计复用 LiteHit；它通过 `meta:cache_location` 类型与 `event` 的 optimizer 事件与核心关联。
 
 ### 3.4 模块关系图
 

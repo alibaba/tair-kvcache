@@ -30,6 +30,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 - **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
 - **可视化分析**：支持 Radix Tree 可视化、命中率图表和 Trade-off 曲线分析
 - **在线优化服务**：支持通过服务接口注册在线实例、实时 TraceQuery 统计命中率和容量使用
+- **轻量多容量分析**：LiteHit 用 reuse distance 一次精确计算多个 full-attention LRU 容量（含无限容量）的命中率，同时支持离线请求序列和在线流式请求
 
 ---
 
@@ -40,7 +41,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 Optimizer 当前包含离线 trace 回放和在线优化服务两条运行路径：
 
 - 离线回放路径使用 `OptimizerManager`、`OptIndexerManager`、`OptEvictionManager` 和 `RadixTreeIndex`，依赖 replay 配置、trace loader/converter 和 data storage 类型。
-- 在线服务路径使用 `OnlineOptimizerManager`、`CacheIndexerFactory`、`LruCacheIndexer`/`TtlCacheIndexerWrapper` 和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。
+- 在线服务路径使用 `OnlineOptimizerManager`、LiteHit、`CacheIndexerFactory`、`LruCacheIndexer`/`TtlCacheIndexerWrapper` 和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。full-attention 多容量 LRU 由 `InstanceState` 直接持有 LiteHit；linear attention 仍由通用 `CacheIndexer` 模拟。
 
 两条路径共享 optimizer 模块内的命中率建模代码，但运行时、配置 target 和服务边界保持独立，避免在线服务引入离线 replay/data storage 依赖。
 
@@ -75,9 +76,9 @@ OnlineOptimizerManager (在线运行时协调器)
     ├── OptimizerRegistryManager (实例组/实例持久化)
     └── InstanceState (instance_id 隔离的运行状态)
         ↓
-    CacheIndexerFactory
-        ├── LruCacheIndexer (容量命中率模拟)
-        └── TtlCacheIndexerWrapper (TTL 淘汰和 hit-age 统计)
+    ├── LiteHit (full-attention 多容量 LRU)
+    └── CacheIndexerFactory (linear attention)
+        └── LruCacheIndexer / TtlCacheIndexerWrapper
 ```
 
 ### 目录结构
@@ -89,10 +90,16 @@ kv_cache_manager/optimizer/
 │   ├── optimizer_runner.h/cc        # Trace 执行器
 │   ├── eviction_manager.h/cc        # 驱逐管理器
 │   ├── indexer_manager.h/cc         # 索引管理器
-│   └── optimizer_loader.h/cc        # Trace 加载器
+│   ├── optimizer_loader.h/cc        # Trace 加载器
+│   ├── lite_hit_offline_runner.h/cc # 离线 LiteHit runner：进程内驱动 OnlineOptimizerManager
+│   └── online_runtime/              # 在线运行时
+│       └── online_optimizer_manager.h/cc # 在线实例注册、TraceQuery 和统计
 ├── index/                # 索引层
 │   ├── radix_tree_index.h/cc        # 离线 Radix 树索引
-│   └── online/                    # 在线容量/TTL 命中率索引器
+│   └── online/                    # linear attention 在线容量/TTL 索引器
+├── liteHit/              # 轻量多容量 full-attention LRU 命中率核心
+│   ├── lite_hit.h/cc                # 多容量 LRU 命中率分析器
+│   └── dynamic_fenwick_tree.h/cc    # reuse-distance 用的 order-statistics Fenwick
 ├── eviction_policy/      # 驱逐策略层
 │   ├── base.h                   # 策略基类
 │   ├── common_structure.h       # 通用数据结构
@@ -117,8 +124,6 @@ kv_cache_manager/optimizer/
 │   ├── tier_config.h/cc          # 存储层配置
 │   ├── eviction_config.h         # 驱逐策略参数
 │   └── types.h                   # 类型定义
-├── online_runtime/       # 在线优化运行时
-│   └── online_optimizer_manager.h/cc # 在线实例注册、TraceQuery 和统计
 ├── service/              # 在线服务实现
 │   ├── optimizer_service_impl.h/cc    # 服务接口适配层
 │   └── metrics/                   # 在线指标上报
@@ -142,11 +147,14 @@ kv_cache_manager/optimizer/
 │           └── plot_utils.py             # Pareto/per-tier 绘图工具
 ├── pybind/               # Python 绑定
 │   └── py_optimizer_binding.cc   # Python 接口
-├── main.cc               # 程序入口
+├── main.cc               # 离线回放程序入口（optimizer_main）
+├── lite_hit_main.cc      # 离线 LiteHit 多容量分析入口（lite_hit_main）
 └── optimizer_startup_config_load.json  # 配置示例
 ```
 
 在线服务协议定义在 `kv_cache_manager/protocol/protobuf/optimizer_service.proto`，由 service 层转换为 optimizer online config/runtime 对象。
+
+full-attention TraceQuery 只把完整 block 放入 `block_keys`，并用 `input_token_len` 传入包含尾部 token 的原始输入长度。Online Manager 用 full location spec group 的固定字节 charge 将 `capacity_gb` 向下取整为 block 容量，再把同一请求交给 LiteHit；请求级与累计命中率均为 `prefix_hit_blocks * block_size_tokens / input_tokens`。旧客户端缺少长度时兼容假设没有尾部 token。第一阶段 full-attention + TTL 不支持；linear attention 的统计口径和 TTL 行为保持 legacy 路径不变。
 
 ---
 
@@ -633,6 +641,33 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 ```bash
 bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 ```
+
+### 离线 LiteHit 多容量分析
+
+独立入口 `lite_hit_main`，与上面的 replay 回放并行、互不干扰。它在进程内构造一个内存态的 `OnlineOptimizerManager`（空 `registry_uri`，无外部依赖），注册配置里的实例组/实例，按时间戳回放 trace 的读请求走 `TraceQuery`，**逐请求**导出「每个请求在各容量下的 prefix 命中结果」CSV。full-attention 实例（linear_step=0）与在线一样走 LiteHit，命中率口径完全一致。
+
+trace 复用共享的 `StandardTraceLoader`：同一份标准格式 trace 既能喂给 liteHit 离线分析，也能直接给 replay 回放用。liteHit 只关心读请求的 `instance_id` / `timestamp_ns` / `keys` / `input_len`，trace 里的 `query_type` / `block_mask` 等在线字段对 liteHit 无副作用。
+
+回放支持两种模式，由 `assume_time_sorted` 控制（默认 `true`）：`true` 时假设 trace 已按 `timestamp_ns` 有序，走 `StandardTraceLoader::StreamFromFile` 逐行流式回放（内存 O(1)，不整份加载）；`false` 时先 `LoadFromFile` 全量读入并按时间戳排序再回放（因为 `TraceQuery` 的 LRU recency 依赖请求顺序）。`TraceQuery`/LiteHit 本身是增量的、不保留 trace 历史，所以流式是天然可行的，唯一被批量化逼出来的就是全局排序。
+
+```bash
+bazel build //kv_cache_manager/optimizer:lite_hit_main
+bazel run //kv_cache_manager/optimizer:lite_hit_main -- /path/to/lite_hit_config.json
+```
+
+配置 `OptimizerLiteHitConfig` 是一个独立的外层包装，但内部**复用在线的配置对象**：容量写在 `OptimizerInstanceGroup.capacity_gb`（GB），block_size / 每 block 字节数由 `OptimizerInstanceInfo` 给定，GB→block 换算与在线共用同一套逻辑。
+
+| 字段 | 含义 |
+|------|------|
+| trace_file_path | 标准格式 trace 文件路径（与 replay 共用同一份 trace） |
+| output_result_path | 结果 CSV 输出路径 |
+| instance_groups | 在线 `OptimizerInstanceGroup` 列表（含 capacity_gb / eviction_policy / enable_theoretical_max_cache 等） |
+| instances | 在线 `OptimizerInstanceInfo` 列表（含 block_size / linear_step / location spec 等） |
+| assume_time_sorted | 是否假设 trace 已按 timestamp_ns 有序（默认 true）：true=流式回放；false=全量加载后排序 |
+
+输出 CSV 为**逐请求长表**，列：`trace_id,instance_id,timestamp_ns,capacity_gb,hit_count,hit_rate,input_tokens`。每个请求在每个容量下输出一行；开启 `enable_theoretical_max_cache` 时该请求额外输出一行 `capacity_gb=inf` 的命中上界。流式回放时逐请求写出，内存 O(1)。
+
+per-instance 聚合无需单独产出——按 `(instance_id, capacity_gb)` 分组即可推导：`total_hits = sum(hit_count)`，`total_queries` = 任一容量下的行数，`total_input_tokens = sum(input_tokens)`（取任一容量的那批行），聚合 `hit_rate = sum(hit_rate * input_tokens) / sum(input_tokens)`（按 input_tokens 加权的逐请求 hit_rate，而非简单平均）。`trace_id` 优先取自 trace 记录；若该条 trace 未提供，则用 `DefaultTraceId` 兜底生成 `trace_<instance_id>_<timestamp_ns>`，保证每行请求都可标识。block_size 不再单独记录——需要时可由任一 `hit_count>0` 的行反推（`block_size = hit_rate * input_tokens / hit_count`）。
 
 ### Python 接口
 
