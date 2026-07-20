@@ -43,3 +43,21 @@ cc_library(
         "//kv_cache_manager/optimizer/index",
     ],
 )
+
+cc_library(
+    name = "online_optimizer_manager",
+    srcs = [
+        "online_runtime/online_optimizer_manager.cc",
+    ],
+    hdrs = [
+        "online_runtime/online_optimizer_manager.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/optimizer/config:online_optimizer_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/index:cache_indexer",
+        "//kv_cache_manager/optimizer/index:cache_indexer_factory",
+        "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
+    ],
+)

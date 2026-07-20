@@ -6,7 +6,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"

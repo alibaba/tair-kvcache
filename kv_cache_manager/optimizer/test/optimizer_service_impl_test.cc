@@ -1,7 +1,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 

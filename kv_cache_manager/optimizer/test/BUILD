@@ -190,7 +190,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
     ],
@@ -216,7 +216,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer:optimizer_service_impl",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
@@ -233,7 +233,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_registry",
-        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer:optimizer_metrics_collector",
         "//kv_cache_manager/optimizer:optimizer_metrics_reporter",
         "//kv_cache_manager/optimizer/config",
