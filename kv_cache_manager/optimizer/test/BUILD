@@ -157,6 +157,18 @@ cc_test(
 )
 
 cc_test(
+    name = "LiteHitTest",
+    srcs = [
+        "lite_hit_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+    ],
+)
+
+cc_test(
     name = "TtlCacheIndexerWrapperTest",
     srcs = [
         "ttl_cache_indexer_wrapper_test.cc",
