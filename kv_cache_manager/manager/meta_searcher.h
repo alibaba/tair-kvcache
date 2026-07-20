@@ -18,6 +18,7 @@ using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk
                                             const std::vector<std::vector<std::string>> &loc_ids)>;
 
 class MetaIndexer;
+class LocationSpecGroup;
 
 enum class LocationSelectStrategy : int32_t {
     LSS_UNSPECIFIED = 0,
@@ -37,6 +38,11 @@ public:
     using KeyVector = std::vector<KeyType>;
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
+
+    struct HostCacheMatch {
+        std::string host_ip_port;
+        int64_t prefix_match_blocks;
+    };
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -65,6 +71,15 @@ public:
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy) const;
+    ErrorCode PrefixMatchByHost(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const std::vector<std::string> &medium_filter,
+                                std::vector<HostCacheMatch> &out_matches) const;
+    ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
+                                         const KeyVector &keys,
+                                         const std::vector<std::string> &medium_filter,
+                                         const std::vector<LocationSpecGroup> &location_spec_groups,
+                                         std::vector<HostCacheMatch> &out_matches) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,

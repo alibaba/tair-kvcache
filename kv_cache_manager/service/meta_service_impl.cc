@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "google/protobuf/message.h"
-#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/env_util.h"
+#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -924,12 +924,12 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                   request->instance_id().c_str(),
                   request->block_cache_keys_size());
 
-    auto query_type = static_cast<CacheManager::QueryType>(request->query_type());
-    if (query_type == CacheManager::QueryType::QT_UNSPECIFIED) {
-        query_type = CacheManager::QueryType::QT_PREFIX_MATCH;
-    }
     auto [ec, host_matches] =
-        cache_manager_->GetHostCacheState(request_context, request->instance_id(), query_type, keys, mediums);
+        cache_manager_->GetHostCacheState(request_context,
+                                          request->instance_id(),
+                                          static_cast<CacheManager::QueryType>(request->query_type()),
+                                          keys,
+                                          mediums);
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());
@@ -943,13 +943,11 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
+        status->set_message("Host cache state retrieved successfully");
         KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
                       request->trace_id().c_str(),
                       response->hosts_size());
     }
-    auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);
-    request_context->set_status_code(header->status().code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

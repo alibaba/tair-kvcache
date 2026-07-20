@@ -2940,34 +2940,33 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         {"event_backend_default"});
 
     const std::string host = "10.0.0.9:8080";
-    auto report_specs = [&](int64_t key,
-                            const std::string &medium,
-                            const std::vector<std::vector<LocationSpec>> &spec_groups) {
-        proto::meta::ReportEventRequest req;
-        req.set_instance_id(instance_id);
-        req.set_host_ip_port(host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto report_specs =
+        [&](int64_t key, const std::string &medium, const std::vector<std::vector<LocationSpec>> &spec_groups) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT);
 
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums("mem");
+            auto *reg = req.add_events();
+            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            reg->mutable_node_register()->add_mediums("mem");
 
-        for (const auto &specs : spec_groups) {
-            auto *ev = req.add_events();
-            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-            auto *ba = ev->mutable_block_add();
-            ba->set_block_key(std::to_string(key));
-            ba->set_medium(medium);
-            for (const auto &input_spec : specs) {
-                auto *spec = ba->add_specs();
-                spec->set_name(input_spec.name());
-                spec->set_uri(input_spec.uri());
+            for (const auto &specs : spec_groups) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *ba = ev->mutable_block_add();
+                ba->set_block_key(std::to_string(key));
+                ba->set_medium(medium);
+                for (const auto &input_spec : specs) {
+                    auto *spec = ba->add_specs();
+                    spec->set_name(input_spec.name());
+                    spec->set_uri(input_spec.uri());
+                }
             }
-        }
 
-        proto::meta::ReportEventResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-    };
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
 
     auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
     ASSERT_NE(nullptr, meta_searcher);
@@ -3011,12 +3010,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
     }
 
     // Case 2: later reports append new specs and overwrite same-name specs.
-    report_specs(multi_spec_key,
-                 "mem",
-                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
-    report_specs(multi_spec_key,
-                 "mem",
-                 {{LocationSpec("full_3", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_spec_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_spec_key, "mem", {{LocationSpec("full_3", "event_report://10.0.0.9:8080/mem")}});
     {
         auto location_map = get_location_map(multi_spec_key);
         ASSERT_EQ(1u, location_map.size());
@@ -3055,12 +3050,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
 
     // Case 4: same key with different medium uses different location_id and does not merge into one CacheLocation.
     const int64_t multi_medium_key = 9003;
-    report_specs(multi_medium_key,
-                 "mem",
-                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
-    report_specs(multi_medium_key,
-                 "disk",
-                 {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/disk")}});
+    report_specs(multi_medium_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_medium_key, "disk", {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/disk")}});
     {
         auto location_map = get_location_map(multi_medium_key);
         ASSERT_EQ(2u, location_map.size());
@@ -3134,29 +3125,28 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
         proto::meta::ReportEventResponse resp;
         ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
     };
-    auto report_delete = [&](int64_t key,
-                             const std::string &medium,
-                             const std::vector<std::vector<std::string>> &spec_name_groups) {
-        proto::meta::ReportEventRequest req;
-        req.set_instance_id(instance_id);
-        req.set_host_ip_port(host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums(medium);
-        for (const auto &spec_names : spec_name_groups) {
-            auto *ev = req.add_events();
-            ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
-            auto *bd = ev->mutable_block_delete();
-            bd->set_block_key(std::to_string(key));
-            bd->set_medium(medium);
-            for (const auto &spec_name : spec_names) {
-                bd->add_spec_names(spec_name);
+    auto report_delete =
+        [&](int64_t key, const std::string &medium, const std::vector<std::vector<std::string>> &spec_name_groups) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+            auto *reg = req.add_events();
+            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            reg->mutable_node_register()->add_mediums(medium);
+            for (const auto &spec_names : spec_name_groups) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+                auto *bd = ev->mutable_block_delete();
+                bd->set_block_key(std::to_string(key));
+                bd->set_medium(medium);
+                for (const auto &spec_name : spec_names) {
+                    bd->add_spec_names(spec_name);
+                }
             }
-        }
-        proto::meta::ReportEventResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-    };
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
 
     auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
     ASSERT_NE(nullptr, meta_searcher);
@@ -3614,6 +3604,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         {"10.0.0.1:8080", {100, 200, 400}},
         {"10.0.0.2:8080", {100, 200, 300, 400}},
         {"10.0.0.3:8080", {100}},
+        {"10.0.0.4:8080", {200, 300}},
     };
     for (const auto &hd : host_data) {
         proto::meta::ReportEventRequest req;
@@ -3739,7 +3730,35 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(0, hosts.size());
     }
 
-    // --- Test 8: unavailable host is filtered even before metadata cleanup ---
+    // --- Test 8: middle miss stops prefix; later hits do not extend any host ---
+    {
+        CacheManager::KeyVector keys = {100, 500, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
+    }
+
+    // --- Test 9: hosts absent from the first key are not returned with prefix=0 ---
+    {
+        CacheManager::KeyVector keys = {100, 200, 300};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(3, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
+    }
+
+    // --- Test 10: unavailable host is filtered even before metadata cleanup ---
     {
         event_backend->SetNodeUnavailable("test_instance", "10.0.0.2:8080");
         CacheManager::KeyVector keys = {100, 200, 300, 400};
@@ -3834,6 +3853,10 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     report_specs(host_c, 100, {"full_0"});
     report_specs(host_c, 200, {"full_0"});
 
+    const std::string host_d = "10.0.1.4:8080";
+    report_specs(host_d, 200, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_d, 300, {"full_0", "linear_0", "linear_1"});
+
     auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
         for (const auto &h : hosts) {
             if (h.host_ip_port == host) {
@@ -3851,6 +3874,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     EXPECT_EQ(3, find_prefix(hosts, host_a));
     EXPECT_EQ(4, find_prefix(hosts, host_b));
     EXPECT_EQ(-1, find_prefix(hosts, host_c));
+    EXPECT_EQ(-1, find_prefix(hosts, host_d));
 
     auto [prefix_ec, prefix_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
@@ -3858,6 +3882,32 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     EXPECT_EQ(4, find_prefix(prefix_hosts, host_a));
     EXPECT_EQ(4, find_prefix(prefix_hosts, host_b));
     EXPECT_EQ(2, find_prefix(prefix_hosts, host_c));
+    EXPECT_EQ(-1, find_prefix(prefix_hosts, host_d));
+
+    {
+        CacheManager::KeyVector break_keys = {100, 500, 400};
+        auto [break_ec, break_hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, break_keys);
+        ASSERT_EQ(EC_OK, break_ec);
+        EXPECT_EQ(1, find_prefix(break_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_b));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_d));
+    }
+
+    {
+        CacheManager::KeyVector keys_without_host_d_first = {100, 200, 300};
+        auto [absent_ec, absent_hosts] =
+            cache_manager_->GetHostCacheState(request_context_.get(),
+                                              instance_id,
+                                              CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                              keys_without_host_d_first);
+        ASSERT_EQ(EC_OK, absent_ec);
+        EXPECT_EQ(3, find_prefix(absent_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_b));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_d));
+    }
 
     dsm->storage_map_.erase("event_backend_mamba");
 }
