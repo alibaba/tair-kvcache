@@ -1000,6 +1000,7 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
     auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, create_modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
+    ErrorCode final_ec = result.ec;
 
     for (size_t i = 0; i < keys.size(); ++i) {
         ErrorCode key_ec = (i < result.error_codes.size()) ? result.error_codes[i] : result.ec;
@@ -1011,18 +1012,17 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
-        return result.ec;
     }
 
     KeyVector merge_keys;
-    std::vector<size_t> merge_key_indexs;
+    std::vector<size_t> merge_key_indices;
     LocationIdsPerKey merge_location_ids;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (out_per_key_ec[i] != ErrorCode::EC_OK || merge_tasks_per_key[i].empty()) {
             continue;
         }
         merge_keys.push_back(keys[i]);
-        merge_key_indexs.push_back(i);
+        merge_key_indices.push_back(i);
         auto &ids = merge_location_ids.emplace_back();
         ids.reserve(merge_tasks_per_key[i].size());
         for (const auto &task : merge_tasks_per_key[i]) {
@@ -1031,21 +1031,21 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
     }
 
     if (merge_keys.empty()) {
-        return result.ec;
+        return final_ec;
     }
 
     std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> merge_locs_sz(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         merge_locs_sz[i].resize(merge_tasks_per_key[i].size());
     }
-    auto merge_modifier = [&merge_tasks_per_key, &merge_key_indexs, &merge_locs_sz, batch_create_time](
+    auto merge_modifier = [&keys, &merge_tasks_per_key, &merge_key_indices, &merge_locs_sz, batch_create_time](
                               const std::vector<ErrorCode> &get_ecs,
                               const LocationIdVector &loc_ids,
                               size_t key_index,
                               CacheLocationVector &locs,
                               PropertyMap &upsert_property_map) -> LocationModifierResult {
         (void)upsert_property_map;
-        const size_t original_key_index = merge_key_indexs[key_index];
+        const size_t original_key_index = merge_key_indices[key_index];
         const auto &tasks = merge_tasks_per_key[original_key_index];
         std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
@@ -1058,6 +1058,11 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
             const auto &task = tasks[loc_index];
             if (ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT) {
                 modifier_ecs[loc_index] = ec;
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              original_key_index,
+                              keys[original_key_index],
+                              task.location_id.c_str(),
+                              ec);
                 continue;
             }
 
@@ -1095,8 +1100,8 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         meta_indexer_->ReadModifyWriteLocation(request_context, merge_keys, merge_location_ids, merge_modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
-    for (size_t i = 0; i < merge_key_indexs.size(); ++i) {
-        const size_t original_key_index = merge_key_indexs[i];
+    for (size_t i = 0; i < merge_key_indices.size(); ++i) {
+        const size_t original_key_index = merge_key_indices[i];
         ErrorCode key_ec = ErrorCode::EC_OK;
         if (i >= merge_result.per_location_error_codes.size()) {
             key_ec = merge_result.ec == ErrorCode::EC_OK ? ErrorCode::EC_ERROR : merge_result.ec;
@@ -1120,9 +1125,13 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
 
     if (merge_result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", merge_result.ec);
-        return merge_result.ec;
+        if (final_ec == ErrorCode::EC_OK) {
+            final_ec = merge_result.ec;
+        } else if (merge_result.ec != final_ec) {
+            final_ec = ErrorCode::EC_PARTIAL_OK;
+        }
     }
-    return ErrorCode::EC_OK;
+    return final_ec;
 }
 
 ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context,
@@ -1135,24 +1144,28 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
+    // 每个 DeleteLocationSpecsTask 需要独立返回结果；同一个 key 下多个 task
+    // 也可能删除同一个 location 的不同 specs，因此先展开成 task 维度执行。
     KeyVector flat_keys;
     LocationIdsPerKey flat_location_ids;
-    std::vector<std::pair<size_t, size_t>> flat_to_original_index;
-    std::vector<std::pair<DataStorageType, std::uint64_t>> flat_locs_sz;
+    std::vector<std::pair<size_t, size_t>> flat_to_original_task_indices;
+    std::vector<std::pair<DataStorageType, std::uint64_t>> flat_deleted_specs_size;
     for (size_t i = 0; i < keys.size(); ++i) {
         out_batch_results[i].assign(tasks_per_key[i].size(), ErrorCode::EC_OK);
         for (size_t task_index = 0; task_index < tasks_per_key[i].size(); ++task_index) {
             flat_keys.push_back(keys[i]);
             flat_location_ids.push_back({tasks_per_key[i][task_index].location_id});
-            flat_to_original_index.push_back({i, task_index});
-            flat_locs_sz.emplace_back(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0);
+            flat_to_original_task_indices.push_back({i, task_index});
+            flat_deleted_specs_size.emplace_back(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0);
         }
     }
     if (flat_keys.empty()) {
         return EC_OK;
     }
 
-    auto modifier = [&keys, &tasks_per_key, &flat_to_original_index, &flat_locs_sz](
+    // 每条 flat task 独立处理：NOENT 视为幂等成功；spec_names 为空返回 BADARGS；
+    // 删除后无剩余 specs 则删除整个 location，否则 COW 更新 location_specs。
+    auto modifier = [&keys, &tasks_per_key, &flat_to_original_task_indices, &flat_deleted_specs_size](
                         const std::vector<ErrorCode> &get_ecs,
                         const LocationIdVector &loc_ids,
                         size_t key_index,
@@ -1160,15 +1173,16 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
                         PropertyMap &upsert_property_map) -> LocationModifierResult {
         (void)upsert_property_map;
         std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
-        if (loc_ids.size() != 1 || key_index >= flat_to_original_index.size()) {
+        if (loc_ids.size() != 1 || key_index >= flat_to_original_task_indices.size()) {
             modifier_ecs.assign(loc_ids.size(), ErrorCode::EC_ERROR);
             return {ModifierAction::MA_FAIL, std::move(modifier_ecs)};
         }
 
-        const auto [original_key_index, original_task_index] = flat_to_original_index[key_index];
+        const auto [original_key_index, original_task_index] = flat_to_original_task_indices[key_index];
         const auto &task = tasks_per_key[original_key_index][original_task_index];
         const ErrorCode ec = get_ecs.empty() ? ErrorCode::EC_ERROR : get_ecs[0];
         const std::string &loc_id = loc_ids[0];
+
         if (ec != ErrorCode::EC_OK) {
             modifier_ecs[0] = ec == ErrorCode::EC_NOENT ? ErrorCode::EC_OK : ec;
             if (ec != ErrorCode::EC_NOENT) {
@@ -1180,10 +1194,12 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
             }
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
+
         if (locs.empty() || !locs[0]) {
             modifier_ecs[0] = ErrorCode::EC_OK;
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
+
         if (task.spec_names.empty()) {
             modifier_ecs[0] = ErrorCode::EC_BADARGS;
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
@@ -1204,7 +1220,8 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         if (kept_specs.size() == locs[0]->location_specs().size()) {
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        flat_locs_sz[key_index] = std::make_pair(locs[0]->type(), GetLocationSpecsSize(deleted_specs));
+
+        flat_deleted_specs_size[key_index] = std::make_pair(locs[0]->type(), GetLocationSpecsSize(deleted_specs));
         if (kept_specs.empty()) {
             return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
         }
@@ -1220,8 +1237,10 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     auto result = meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    for (size_t i = 0; i < flat_to_original_index.size(); ++i) {
-        const auto [original_key_index, original_task_index] = flat_to_original_index[i];
+
+    // ReadModifyWriteLocation 返回 flat 维度结果，这里映射回原始 key/task 维度。
+    for (size_t i = 0; i < flat_to_original_task_indices.size(); ++i) {
+        const auto [original_key_index, original_task_index] = flat_to_original_task_indices[i];
         ErrorCode ec = result.ec;
         if (i < result.per_location_error_codes.size() && !result.per_location_error_codes[i].empty()) {
             ec = result.per_location_error_codes[i][0];
@@ -1229,11 +1248,12 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         out_batch_results[original_key_index][original_task_index] = ec;
     }
 
-    for (size_t i = 0; i < flat_to_original_index.size(); ++i) {
-        const auto [original_key_index, original_task_index] = flat_to_original_index[i];
+    // 只有实际删除了 specs 且 RMW 成功时，才扣减 storage usage。
+    for (size_t i = 0; i < flat_to_original_task_indices.size(); ++i) {
+        const auto [original_key_index, original_task_index] = flat_to_original_task_indices[i];
         if (out_batch_results[original_key_index][original_task_index] == ErrorCode::EC_OK &&
-            flat_locs_sz[i].first != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
-            meta_indexer_->SubStorageUsageByType(flat_locs_sz[i].first, flat_locs_sz[i].second);
+            flat_deleted_specs_size[i].first != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+            meta_indexer_->SubStorageUsageByType(flat_deleted_specs_size[i].first, flat_deleted_specs_size[i].second);
         }
     }
 

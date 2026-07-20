@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <set>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -7,6 +9,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 
 using namespace kv_cache_manager;
 
@@ -34,6 +37,30 @@ public:
 CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
 SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &) -> void {};
+
+class FaultyGetLocationIdsBackend : public MetaLocalBackend {
+public:
+    void SetFailedKey(KeyType key) { failed_key_ = key; }
+
+    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          LocationIdsPerKey &out_location_ids) noexcept override {
+        auto results = MetaLocalBackend::GetLocationIds(request_context, keys, out_location_ids);
+        if (!failed_key_.has_value()) {
+            return results;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == failed_key_.value()) {
+                results[i] = EC_ERROR;
+                out_location_ids[i].clear();
+            }
+        }
+        return results;
+    }
+
+private:
+    std::optional<KeyType> failed_key_;
+};
 } // namespace
 
 class MetaSearcherTest : public TESTBASE {
@@ -76,6 +103,18 @@ public:
             return nullptr;
         }
         return indexer;
+    }
+
+    FaultyGetLocationIdsBackend *ReplaceWithFaultyBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto faulty_backend = std::make_unique<FaultyGetLocationIdsBackend>();
+        EXPECT_EQ(EC_OK, faulty_backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, faulty_backend->Open());
+        auto backend_raw = faulty_backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(faulty_backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
     }
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
@@ -252,6 +291,56 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleS
     ASSERT_EQ(2u, loc->location_specs().size());
 }
 
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBlockFailure) {
+    auto faulty_backend = ReplaceWithFaultyBackend();
+    ASSERT_NE(nullptr, faulty_backend);
+
+    const int64_t merge_key = 10004;
+    const int64_t failed_key = 10005;
+    const std::string location_id = "event_report#mem#127.0.0.1:8080";
+    const std::string failed_location_id = "event_report#mem#127.0.0.2:8080";
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> seed_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {merge_key}, seed_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    faulty_backend->SetFailedKey(failed_key);
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}}},
+        {{failed_location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("linear_0", "event_report://127.0.0.2:8080/mem")}}},
+    };
+
+    EXPECT_EQ(EC_PARTIAL_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {merge_key, failed_key}, merge_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_ERROR}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {merge_key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+
+    std::set<std::string> spec_names;
+    for (const auto &spec : location_maps[0].at(location_id)->location_specs()) {
+        spec_names.insert(spec.name());
+    }
+    ASSERT_EQ((std::set<std::string>{"linear_0", "full_3"}), spec_names);
+}
+
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     MetaSearcher::KeyVector keys = {10003};
     const std::string location_id = "event_report#mem#127.0.0.1:8080";
@@ -271,7 +360,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
         {location_id, {"linear_0"}},
     }};
     std::vector<std::vector<ErrorCode>> delete_results;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
     ASSERT_EQ(1u, delete_results.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
 
@@ -290,7 +380,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     delete_tasks = {{
         {location_id, {"linear_1", "full_3"}},
     }};
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
     ASSERT_EQ(1u, delete_results.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -301,7 +392,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
         {location_id, {}},
     }};
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
     ASSERT_EQ(1u, delete_results.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), delete_results[0]);
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
