@@ -134,13 +134,21 @@ async def test_consume_buffers_snapshot_batch_when_gate_is_closed(
 
 
 async def test_send_kv_events_sends_batch_when_epoch_unchanged(
-    kvcm: MagicMock, coordinator: MagicMock
+    kvcm: MagicMock,
+    coordinator: MagicMock,
 ) -> None:
     batch = _batch()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
     await queue.put(QueuedKVEventBatch(batch, 1, StageTimer()))
 
-    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, MagicMock()))
+    sender = asyncio.create_task(
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            MagicMock(),
+        )
+    )
     await asyncio.sleep(0)
     sender.cancel()
 
@@ -169,7 +177,8 @@ async def test_send_notifies_snapshot_adapter_after_kvcm_ack(
 
 
 async def test_send_kv_events_reports_successful_batch_latency(
-    kvcm: MagicMock, coordinator: MagicMock
+    kvcm: MagicMock,
+    coordinator: MagicMock,
 ) -> None:
     batch = _batch_with_block_hashes()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
@@ -177,7 +186,12 @@ async def test_send_kv_events_reports_successful_batch_latency(
     await queue.put(QueuedKVEventBatch(batch, 1, StageTimer()))
 
     sender = asyncio.create_task(
-        send_kv_events(kvcm, coordinator, queue, latency_reporter=reporter)
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            latency_reporter=reporter,
+        )
     )
     await asyncio.sleep(0)
     sender.cancel()
@@ -188,7 +202,13 @@ async def test_send_kv_events_reports_successful_batch_latency(
     reporter.report.assert_called_once()
     sample = reporter.report.call_args.args[0]
     spans = sample.spans
-    assert [span.name for span in spans] == ["queue_wait", "gate_wait", "kvcm_send"]
+    assert [span.name for span in spans] == [
+        "queue_wait",
+        "gate_wait",
+        "block_filter",
+        "metadata_learn",
+        "kvcm_send",
+    ]
     assert all(span.duration_s >= 0 for span in spans)
     assert sample.counters == {
         "stored_block_hash_count": 3,
@@ -196,8 +216,71 @@ async def test_send_kv_events_reports_successful_batch_latency(
     }
 
 
+async def test_send_kv_events_suppresses_removal_with_remaining_copies(
+    kvcm: MagicMock,
+    coordinator: MagicMock,
+) -> None:
+    store = BlockStored(
+        block_hashes=[1],
+        parent_block_hash=None,
+        token_ids=[10],
+        block_size=16,
+        lora_id=None,
+        medium="GPU",
+        lora_name=None,
+    )
+    suppressed_removal = BlockRemoved(
+        block_hashes=[1], medium="GPU", remaining_copy_counts=[1]
+    )
+    final_removal = BlockRemoved(
+        block_hashes=[1], medium="GPU", remaining_copy_counts=[0]
+    )
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(
+        QueuedKVEventBatch(
+            [KVEventBatch(ts=1.0, events=[store, suppressed_removal])],
+            1,
+            StageTimer(),
+        )
+    )
+    await queue.put(
+        QueuedKVEventBatch(
+            [KVEventBatch(ts=2.0, events=[final_removal])],
+            1,
+            StageTimer(),
+        )
+    )
+
+    sender = asyncio.create_task(
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            MagicMock(),
+        )
+    )
+    await queue.join()
+    sender.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    first_sent = [
+        event
+        for batch in kvcm.send_batch.await_args_list[0].args[0]
+        for event in batch.events
+    ]
+    second_sent = [
+        event
+        for batch in kvcm.send_batch.await_args_list[1].args[0]
+        for event in batch.events
+    ]
+    assert first_sent == [store]
+    assert second_sent == [final_removal]
+
+
 async def test_send_kv_events_drops_batch_when_epoch_changed(
-    kvcm: MagicMock, coordinator: MagicMock
+    kvcm: MagicMock,
+    coordinator: MagicMock,
 ) -> None:
     batch = _batch_with_block_hashes()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
@@ -206,7 +289,14 @@ async def test_send_kv_events_drops_batch_when_epoch_changed(
     coordinator.wait_ready_epoch.return_value = 2
     coordinator.is_epoch_current.return_value = False
 
-    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, reporter))
+    sender = asyncio.create_task(
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            reporter,
+        )
+    )
     await asyncio.sleep(0)
     sender.cancel()
 
@@ -274,8 +364,10 @@ async def test_send_stops_retrying_when_engine_epoch_changes(
     delivery.assert_awaited_once_with(False)
 
 
-async def test_send_kv_events_retries_in_order_before_next_batch(
-    kvcm: MagicMock, coordinator: MagicMock, mocker
+async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
+    kvcm: MagicMock,
+    coordinator: MagicMock,
+    mocker,
 ) -> None:
     first_batch = _batch_with_block_hashes()
     second_batch = _batch()
@@ -356,6 +448,61 @@ async def test_send_kv_events_throttles_repeated_failure_logs(
     exc_info_values = [call.kwargs["exc_info"] for call in warning.call_args_list]
     assert retry_attempts == [1, 30]
     assert exc_info_values == [True, False]
+
+
+async def test_send_kv_events_filters_correctly_after_kvcm_failure(
+    kvcm: MagicMock,
+    coordinator: MagicMock,
+) -> None:
+    store = BlockStored(
+        block_hashes=[1],
+        parent_block_hash=None,
+        token_ids=[10],
+        block_size=16,
+        lora_id=None,
+        medium="GPU",
+        lora_name=None,
+    )
+    suppressed = BlockRemoved(block_hashes=[1], medium="GPU", remaining_copy_counts=[1])
+    final_removal = BlockRemoved(
+        block_hashes=[1], medium="GPU", remaining_copy_counts=[0]
+    )
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(QueuedKVEventBatch([KVEventBatch(1.0, [store])], 1, StageTimer()))
+    await queue.put(
+        QueuedKVEventBatch([KVEventBatch(2.0, [suppressed])], 1, StageTimer())
+    )
+    await queue.put(
+        QueuedKVEventBatch([KVEventBatch(3.0, [store, final_removal])], 1, StageTimer())
+    )
+    # Second send fails — filter state should not matter (stateless).
+    kvcm.send_batch.side_effect = [None, RuntimeError("delete failed"), None]
+
+    sender = asyncio.create_task(
+        send_kv_events(
+            kvcm,
+            coordinator,
+            queue,
+            MagicMock(),
+            retry_interval_s=0.001,
+        )
+    )
+    await asyncio.wait_for(queue.join(), timeout=1)
+    sender.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    # Suppressed removal batch is never sent to kvcm (empty after filtering).
+    # send_batch is called for batch 1 (store), then skips batch 2 (suppressed,
+    # no events left), then sends batch 3 (store + final_removal) which fails
+    # once and retries successfully.
+    assert kvcm.send_batch.await_count == 3
+    third_sent_events = [
+        event
+        for batch in kvcm.send_batch.await_args_list[2].args[0]
+        for event in batch.events
+    ]
+    assert third_sent_events == [store, final_removal]
 
 
 async def test_kv_event_loop_sends_batch_when_epoch_unchanged(
@@ -484,11 +631,20 @@ async def test_run_uses_configured_kv_event_queue_maxsize(
 ) -> None:
     config = SubscriberConfig(kv_event_queue_maxsize=7)
     adapter = MagicMock()
+    adapter.fetch_kv_cache_group_metadata = AsyncMock(return_value=None)
+    adapter.close = AsyncMock()
     kvcm = MagicMock()
     kvcm.start = AsyncMock()
     kvcm.close = AsyncMock()
     coordinator = MagicMock()
-    coordinator.watch_loop = AsyncMock()
+
+    async def _wait_ready_epoch() -> int:
+        await asyncio.sleep(0)
+        return 1
+
+    coordinator.wait_ready_epoch = _wait_ready_epoch
+    coordinator.attach_kvcm_client = MagicMock()
+    coordinator_factory = MagicMock(return_value=coordinator)
     event_loop_called = asyncio.Event()
     watch_loop_started = asyncio.Event()
 
@@ -498,6 +654,7 @@ async def test_run_uses_configured_kv_event_queue_maxsize(
         _coordinator: MagicMock,
         queue_maxsize: int = 1024,
         retry_interval_s: float = 1.0,
+        learner: object = None,
     ) -> None:
         assert _adapter is adapter
         assert _kvcm is kvcm
@@ -517,9 +674,7 @@ async def test_run_uses_configured_kv_event_queue_maxsize(
         "subscriber.main.AbstractEngineAdapter.create", MagicMock(return_value=adapter)
     )
     monkeypatch.setattr("subscriber.main.KvcmClient", MagicMock(return_value=kvcm))
-    monkeypatch.setattr(
-        "subscriber.main.EngineHealthCoordinator", MagicMock(return_value=coordinator)
-    )
+    monkeypatch.setattr("subscriber.main.EngineHealthCoordinator", coordinator_factory)
     monkeypatch.setattr("subscriber.main.kv_event_loop", _kv_event_loop)
 
     from subscriber.main import run
@@ -532,6 +687,8 @@ async def test_run_uses_configured_kv_event_queue_maxsize(
     with pytest.raises(asyncio.CancelledError):
         await run_task
 
+    coordinator_factory.assert_called_once_with(adapter, None, config)
+    coordinator.attach_kvcm_client.assert_called_once_with(kvcm)
     kvcm.close.assert_awaited_once()
 
 
@@ -539,9 +696,11 @@ async def test_run_cancels_event_loop_when_health_loop_ends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = SubscriberConfig()
-    adapter = MagicMock()
+    adapter = MagicMock(close=AsyncMock())
+    adapter.fetch_kv_cache_group_metadata = AsyncMock(return_value=[])
     kvcm = MagicMock(start=AsyncMock(), close=AsyncMock())
     coordinator = MagicMock()
+    coordinator.wait_ready_epoch = AsyncMock(return_value=1)
     event_started = asyncio.Event()
     event_cancelled = asyncio.Event()
 
@@ -578,9 +737,11 @@ async def test_run_cancels_health_loop_when_event_loop_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = SubscriberConfig()
-    adapter = MagicMock()
+    adapter = MagicMock(close=AsyncMock())
+    adapter.fetch_kv_cache_group_metadata = AsyncMock(return_value=[])
     kvcm = MagicMock(start=AsyncMock(), close=AsyncMock())
     coordinator = MagicMock()
+    coordinator.wait_ready_epoch = AsyncMock(return_value=1)
     health_started = asyncio.Event()
     health_cancelled = asyncio.Event()
 
@@ -619,10 +780,23 @@ async def test_run_awaits_kvcm_close_when_start_raises(
 ) -> None:
     config = SubscriberConfig()
     adapter = MagicMock()
+    adapter.fetch_kv_cache_group_metadata = AsyncMock(return_value=None)
+    adapter.close = AsyncMock()
     kvcm = MagicMock()
     kvcm.start = AsyncMock(side_effect=RuntimeError("start failed"))
     kvcm.close = AsyncMock()
     coordinator = MagicMock()
+
+    async def _wait_ready_epoch() -> int:
+        await asyncio.sleep(0)
+        return 1
+
+    coordinator.wait_ready_epoch = _wait_ready_epoch
+
+    async def _watch_loop() -> None:
+        await asyncio.Event().wait()
+
+    coordinator.watch_loop = _watch_loop
 
     monkeypatch.setattr(
         "subscriber.main.AbstractEngineAdapter.create", MagicMock(return_value=adapter)
@@ -638,6 +812,7 @@ async def test_run_awaits_kvcm_close_when_start_raises(
         await run(config)
 
     kvcm.close.assert_awaited_once()
+    adapter.close.assert_awaited_once()
 
 
 async def test_kv_event_loop_survives_sender_exception_until_cancelled(
@@ -693,3 +868,87 @@ async def test_kv_event_loop_rejects_invalid_retry_interval(
 ) -> None:
     with pytest.raises(ValueError, match="retry_interval_s must be > 0"):
         await kv_event_loop(adapter, kvcm, coordinator, retry_interval_s=0)
+
+
+async def test_run_starts_watch_loop_before_metadata_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """watch_loop must start before fetch_kv_cache_group_metadata is called."""
+    config = SubscriberConfig()
+    call_order: list[str] = []
+
+    adapter = MagicMock()
+
+    async def _fetch_metadata():
+        call_order.append("fetch_metadata")
+        return None
+
+    adapter.fetch_kv_cache_group_metadata = _fetch_metadata
+    adapter.close = AsyncMock()
+
+    kvcm = MagicMock()
+    kvcm.start = AsyncMock()
+    kvcm.close = AsyncMock()
+
+    coordinator = MagicMock()
+
+    async def _watch_loop():
+        call_order.append("watch_loop_started")
+        await asyncio.Event().wait()
+
+    coordinator.watch_loop = _watch_loop
+
+    async def _wait_ready_epoch():
+        await asyncio.sleep(0)
+        call_order.append("wait_ready_epoch")
+        return 1
+
+    coordinator.wait_ready_epoch = _wait_ready_epoch
+
+    attach_called = False
+
+    def _attach_kvcm_client(kvcm_ref):
+        nonlocal attach_called
+        attach_called = True
+
+    coordinator.attach_kvcm_client = _attach_kvcm_client
+
+    event_loop_called = asyncio.Event()
+
+    async def _kv_event_loop(
+        _a, _k, _c, queue_maxsize=1024, retry_interval_s=1.0, learner=None
+    ):
+        event_loop_called.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "subscriber.main.AbstractEngineAdapter.create",
+        MagicMock(return_value=adapter),
+    )
+    kvcm_factory = MagicMock(return_value=kvcm)
+    monkeypatch.setattr("subscriber.main.KvcmClient", kvcm_factory)
+    monkeypatch.setattr(
+        "subscriber.main.EngineHealthCoordinator", MagicMock(return_value=coordinator)
+    )
+    monkeypatch.setattr("subscriber.main.kv_event_loop", _kv_event_loop)
+
+    from subscriber.main import run
+
+    run_task = asyncio.create_task(run(config))
+    await asyncio.wait_for(event_loop_called.wait(), timeout=1.0)
+
+    assert call_order == [
+        "watch_loop_started",
+        "wait_ready_epoch",
+        "fetch_metadata",
+    ]
+    assert attach_called
+    assert kvcm_factory.call_args.kwargs["group_metadata"] is None
+    assert kvcm_factory.call_args.kwargs["learn_mode"] is True
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    kvcm.close.assert_awaited_once()
+    adapter.close.assert_awaited_once()

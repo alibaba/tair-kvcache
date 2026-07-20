@@ -40,6 +40,19 @@ uv run python -m subscriber \
 uv run python -m subscriber --config config.yaml
 ```
 
+## Protobuf 代码生成
+
+`subscriber/proto/` 下的 gRPC stub 由 `subscriber/proto/kv_cache_group_metadata.proto` 生成。
+修改 `.proto` 文件后，需手动重新生成并提交：
+
+```bash
+uv run python -m grpc_tools.protoc \
+  -I. --python_out=. --grpc_python_out=. --pyi_out=. \
+  subscriber/proto/kv_cache_group_metadata.proto
+```
+
+生成文件（`_pb2.py`、`_pb2_grpc.py`、`_pb2.pyi`）已提交到仓库，构建时**不会**自动重新生成。
+
 ## 约束
 
 - **asyncio 全异步**：所有 IO 必须使用 `zmq.asyncio.Socket`，禁止在 async 函数中调用同步 ZMQ socket 方法。
@@ -47,6 +60,7 @@ uv run python -m subscriber --config config.yaml
 - **引擎存活探测隔离**：底层连接状态（如 ZMQ socket monitor）由 `AbstractEngineAdapter.watch_liveness()` 暴露为引擎无关事件，判死、epoch、reset 策略集中在 health coordinator。
 - **冷启动 reset 语义**：事件流 adapter（vLLM）首次连接前不发送 `AllBlocksCleared`；RTP 在首个有效快照前不得注册节点或发送心跳，全量 adapter 默认在首个稳定快照执行一次 `RegisterInstance → HOST_DOWN → NODE_REGISTER`，用于清除 Subscriber 重启期间遗留的旧 key，再上报完整 add 集合。
 - **发送门控**：向 kvcm 转发实时或 replay batch 前必须通过 `EngineHealthCoordinator.wait_ready_epoch()` 获取当前可发送 epoch。
+- **分阶段 span 计时**：从 event 到手到发送 kvcm 的每个阶段用 span 埋点，可拓展。载体 `EngineEventBatch(batches, timer)` 由 adapter yield：timer 起源于 adapter 开始处理该 event，adapter 标记自身阶段（live=`decode`、replay=`replay_fetch`），`send_kv_events` 在同一 timer 上续标 `queue_wait`/`gate_wait`/`kvcm_send`。`SpanMetricsReporter` 按阶段各自计数求平均（异构 live/replay 时间线也正确），总耗时超阈值时告警并附各阶段 breakdown。加新阶段只需在相应位置多一次 `timer.mark("stage")`。span 上报是 best-effort，`StageTimer.mark/spans` 与 `report()` 契约永不抛异常，绝不阻断转发主路径。
 - **Replay 语义**：检测到 seq gap 时，先聚合所有 replay batch 一次性 yield，再 yield 当前实时消息。replay 使用 DEALER socket（非 REQ），避免 async 下严格一问一答的阻塞问题。
 - **RTP 全量语义**：RTP adapter 只接受所有配置 endpoint 都成功返回的完整快照；diff baseline 仅在 KVCM 确认发送成功后推进，删除需连续快照确认。
 - **端口语义**：RTP `GetCacheStatus` 走 rank gRPC 端口（默认 `START_PORT + 1`），不是前端 HTTP 推理端口；多 DP/多机地址由启动器显式传入。

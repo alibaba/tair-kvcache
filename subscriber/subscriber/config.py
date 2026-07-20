@@ -32,7 +32,7 @@ class SubscriberConfig:
 
     # kvcm SDK
     kvcm_base_url: str = ""
-    kvcm_heartbeat_interval_s: float = 1.0
+    kvcm_heartbeat_interval_s: float = 5.0
     kvcm_send_retry_interval_s: float = 1.0
     kvcm_request_timeout_s: float = 5.0
     kv_event_queue_maxsize: int = 1024
@@ -58,11 +58,15 @@ class SubscriberConfig:
     rtp_full_refresh_interval_s: float = 300.0
     rtp_reset_on_start: bool = True
 
-    # Engine liveness (HTTP /health polling)
-    engine_health_url: str = "http://127.0.0.1:8000/health"
-    engine_health_interval_s: float = 1.0
+    # Engine liveness (HTTP /health polling).
+    engine_health_url: str = "http://127.0.0.1:8601/readiness"
+    engine_health_interval_s: float = 5.0
     engine_health_timeout_s: float = 1.0
     engine_health_failure_threshold: int = 3
+
+    # KV cache group metadata gRPC fetch (after engine is confirmed healthy).
+    engine_grpc_endpoint: str = "127.0.0.1:18002"
+    engine_kv_group_metadata_max_retries: int = 5
 
     # ZMQ SUB socket transport
     zmq_reconnect_ivl_ms: int = 100
@@ -149,6 +153,10 @@ class SubscriberConfig:
         parser.add_argument(
             "--engine-health-failure-threshold", type=int, default=default
         )
+        parser.add_argument("--engine-grpc-endpoint", default=default)
+        parser.add_argument(
+            "--engine-kv-group-metadata-max-retries", type=int, default=default
+        )
         parser.add_argument("--zmq-reconnect-ivl-ms", type=int, default=default)
         parser.add_argument("--zmq-reconnect-ivl-max-ms", type=int, default=default)
         parser.add_argument(
@@ -195,6 +203,8 @@ class SubscriberConfig:
             )
         if self.engine_health_failure_threshold < 1:
             raise ValueError("engine_health_failure_threshold must be >= 1")
+        if self.engine_kv_group_metadata_max_retries < 1:
+            raise ValueError("engine_kv_group_metadata_max_retries must be >= 1")
         if self.data_parallel_size < 1:
             raise ValueError("data_parallel_size must be >= 1")
         if self.data_parallel_size > 1:

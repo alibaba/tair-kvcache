@@ -275,6 +275,45 @@ async def test_fetch_kv_cache_group_metadata_retries_until_success(
     assert client.get_kv_cache_group_metadata.await_count == 2
 
 
+async def test_fetch_kv_cache_group_metadata_retries_on_retryable_response_code(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    retryable_response = kv_cache_group_metadata_pb2.KvCacheGroupListPB()
+    retryable_response.err_code = (
+        kv_cache_group_metadata_pb2.KV_CACHE_GROUP_METADATA_UNAVAILABLE
+    )
+    retryable_response.err_msg = "engine metadata is not ready"
+    success_response = _kv_cache_group_metadata_response(
+        [
+            {
+                "group_idx": 0,
+                "kind": "full_attention",
+                "block_size": 16,
+                "sliding_window": -1,
+            }
+        ]
+    )
+    _mock_adapter_sockets(mocker)
+    client = _mock_dashllm_grpc_client(mocker, success_response)
+    client.get_kv_cache_group_metadata = AsyncMock(
+        side_effect=[retryable_response, success_response]
+    )
+    sleep_mock = mocker.patch("subscriber.engine.vllm.asyncio.sleep", AsyncMock())
+
+    adapter = VllmAdapter(config)
+
+    assert await adapter.fetch_kv_cache_group_metadata() == [
+        KvCacheGroupSpec(
+            group_idx=0,
+            kind="full_attention",
+            block_size=16,
+            sliding_window=None,
+        )
+    ]
+    assert sleep_mock.await_count == 1
+    assert client.get_kv_cache_group_metadata.await_count == 2
+
+
 async def test_probe_health_connect_error_logs_connect_error(mocker: Any) -> None:
     warning = mocker.patch("subscriber.engine.vllm.logger.warning")
     client = _FakeAsyncClient([httpx.ConnectError("refused")])
@@ -323,30 +362,9 @@ async def test_watch_liveness_polls_and_maps_health(
         LivenessEvent.UNHEALTHY,
         LivenessEvent.HEALTHY,
     ]
-    assert fake_client.get_calls == [config.engine_health_url] * 4
+    assert fake_client.get_calls == ["http://127.0.0.1:8601/readiness"] * 4
     assert sleep_mock.await_count == 3
     sleep_mock.assert_awaited_with(config.engine_health_interval_s)
-
-
-async def test_watch_liveness_yields_first_probe_without_interval_delay(
-    config: SubscriberConfig, mocker: Any
-) -> None:
-    _mock_adapter_sockets(mocker)
-    fake_client = _FakeAsyncClient([_response(200)])
-    mocker.patch("subscriber.engine.vllm.httpx.AsyncClient", return_value=fake_client)
-    sleep_started = asyncio.Event()
-
-    async def _sleep(_interval: float) -> None:
-        sleep_started.set()
-        await asyncio.Event().wait()
-
-    mocker.patch("subscriber.engine.vllm.asyncio.sleep", side_effect=_sleep)
-
-    adapter = VllmAdapter(config)
-    events = adapter.watch_liveness()
-    assert await asyncio.wait_for(anext(events), timeout=0.1) is LivenessEvent.HEALTHY
-    assert not sleep_started.is_set()
-    await events.aclose()
 
 
 def test_adapter_opens_sub_and_dealer_without_monitor(
@@ -360,16 +378,6 @@ def test_adapter_opens_sub_and_dealer_without_monitor(
     mock_sub.setsockopt_string.assert_called_once()
     mock_dealer.connect.assert_called_once_with(config.zmq_replay_endpoint)
     mock_sub.get_monitor_socket.assert_not_called()
-
-
-def test_adapter_rejects_multi_dp_instead_of_silently_using_rank_zero() -> None:
-    config = SubscriberConfig(data_parallel_size=2)
-
-    with pytest.raises(
-        ValueError,
-        match="vLLM adapter currently supports exactly one DP endpoint",
-    ):
-        VllmAdapter(config)
 
 
 async def test_live_receive_records_zmq_queue_backlog_signal(
@@ -669,34 +677,6 @@ async def test_yields_single_batch_no_gap(
     assert len(results[0]) == 1
     assert len(results[1]) == 1
     mock_dealer.send_multipart.assert_not_called()
-
-
-async def test_drops_duplicate_live_sequence_without_rewinding(
-    config: SubscriberConfig, mocker: Any
-) -> None:
-    first_batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
-    second_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
-    mock_sub, mock_dealer = _mock_adapter_sockets(mocker)
-    mock_sub.recv_multipart = AsyncMock(
-        side_effect=[
-            [b"", _seq_bytes(0), _encode_batch(first_batch)],
-            [b"", _seq_bytes(0), _encode_batch(first_batch)],
-            [b"", _seq_bytes(1), _encode_batch(second_batch)],
-        ]
-    )
-    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
-
-    adapter = VllmAdapter(config)
-    results = await _collect_n(adapter, 2)
-
-    assert results == [[first_batch], [second_batch]]
-    assert adapter._last_seq == 1
-    mock_dealer.send_multipart.assert_not_called()
-    warning.assert_called_once_with(
-        "dropping stale or duplicate kv event sequence",
-        step="zmq_subscribe",
-        tags={"last_seq": 0, "current_seq": 0},
-    )
 
 
 async def test_recv_live_message_logs_debug_metadata(

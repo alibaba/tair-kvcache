@@ -1,10 +1,29 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, TypeAlias
 
 import msgspec
 
-ExternalBlockHash = int
+# ExternalBlockHash is used for reproducible prefix-cache block hashing.
+# It's a union of `bytes` and `int` to keep backward compatibility
+# after we default block hashing to use sha256 bytes.
+ExternalBlockHash: TypeAlias = bytes | int
+
+
+@dataclass(frozen=True)
+class KvCacheGroupSpec:
+    """Per-group KV cache metadata fetched from the engine.
+
+    ``group_idx`` and ``block_size`` are provided explicitly by the engine's
+    metadata endpoint (do not infer ``group_idx`` from list position).
+    ``sliding_window`` is ``None`` for non-windowed kinds.
+    """
+
+    group_idx: int
+    kind: str
+    block_size: int
+    sliding_window: int | None = None
 
 
 class EventBatch(
@@ -45,6 +64,7 @@ class BlockRemoved(KVCacheEvent):
     block_hashes: list[ExternalBlockHash]
     medium: str | None
     group_idx: int | None = None
+    remaining_copy_counts: list[int] | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):

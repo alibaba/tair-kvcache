@@ -3,11 +3,11 @@ name = "tair-kvcache-subscriber"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "grpcio>=1.66",
+    "grpcio>=1.68.1",
+    "protobuf>=5.28.1",
     "pyzmq>=26",
     "msgspec>=0.18",
     "httpx>=0.27",
-    "protobuf>=5.28",
     "pyyaml>=6.0",
 ]
 
@@ -23,6 +23,7 @@ dev = [
     "types-pyyaml>=6.0",
     "types-grpcio>=1.0",
     "types-protobuf>=5.28",
+    "grpcio-tools==1.68.1",
 ]
 
 [project.scripts]
@@ -38,13 +39,33 @@ packages = ["subscriber"]
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+exclude = [
+    "subscriber/proto/*_pb2*.py",
+    "subscriber/proto/*_pb2*.pyi",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+"subscriber/proto/*_pb2*.py" = ["ALL"]
+"subscriber/proto/*_pb2*.pyi" = ["ALL"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["dashlog"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["subscriber.proto.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["subscriber.engine.dashllm_grpc"]
+disable_error_code = ["no-untyped-call"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

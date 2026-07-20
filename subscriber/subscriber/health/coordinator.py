@@ -31,12 +31,12 @@ class EngineHealthCoordinator:
     def __init__(
         self,
         adapter: AbstractEngineAdapter,
-        kvcm: KvcmClient,
+        kvcm_client: KvcmClient | None,
         config: SubscriberConfig,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._adapter = adapter
-        self._kvcm = kvcm
+        self._kvcm_client = kvcm_client
         self._threshold = config.engine_health_failure_threshold
         self._defer_initial_availability = config.engine_type == "rtp_llm"
         self._clock = clock or time.time
@@ -45,6 +45,14 @@ class EngineHealthCoordinator:
         self._failure_count = 0
         self._reset_reported = False
         self._ready = asyncio.Event()
+
+    def attach_kvcm_client(self, kvcm_client: KvcmClient) -> None:
+        """Attach the KVCM client after construction.
+
+        Must be called before the coordinator can send reset events
+        (i.e. before the first HEALTHY -> DEAD transition).
+        """
+        self._kvcm_client = kvcm_client
 
     @property
     def state(self) -> EngineHealthState:
@@ -105,8 +113,8 @@ class EngineHealthCoordinator:
 
     async def _on_healthy(self) -> None:
         if self._state is EngineHealthState.STARTING:
-            if self._defer_initial_availability:
-                await self._kvcm.set_engine_available(True)
+            if self._defer_initial_availability and self._kvcm_client is not None:
+                await self._kvcm_client.set_engine_available(True)
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         elif self._state is EngineHealthState.DEAD:
@@ -114,10 +122,12 @@ class EngineHealthCoordinator:
                 # A previous HOST_DOWN may have failed because KVCM was
                 # unavailable. Re-register only to retry the authoritative
                 # reset, then pause again if it still cannot be delivered.
-                await self._kvcm.set_engine_available(True)
+                if self._kvcm_client is not None:
+                    await self._kvcm_client.set_engine_available(True)
                 self._reset_reported = await self._send_all_blocks_cleared()
                 if not self._reset_reported:
-                    await self._kvcm.set_engine_available(False)
+                    if self._kvcm_client is not None:
+                        await self._kvcm_client.set_engine_available(False)
                     return
             try:
                 await self._adapter.reset_generation_state()
@@ -133,7 +143,8 @@ class EngineHealthCoordinator:
                     exc_info=True,
                 )
                 return
-            await self._kvcm.set_engine_available(True)
+            if self._kvcm_client is not None:
+                await self._kvcm_client.set_engine_available(True)
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
             self._reset_reported = False
@@ -159,13 +170,21 @@ class EngineHealthCoordinator:
         self._ready.clear()
         if self._failure_count >= self._threshold:
             self._state = EngineHealthState.DEAD
-            await self._kvcm.set_engine_available(False)
+            if self._kvcm_client is not None:
+                await self._kvcm_client.set_engine_available(False)
             self._reset_reported = await self._send_all_blocks_cleared()
 
     async def _send_all_blocks_cleared(self) -> bool:
+        if self._kvcm_client is None:
+            logger.warning(
+                "cannot send all blocks cleared; kvcm client not attached",
+                step="engine_health",
+                tags={"epoch": self._epoch},
+            )
+            return False
         batch = KVEventBatch(ts=self._clock(), events=[AllBlocksCleared()])
         try:
-            await self._kvcm.send_batch([batch], self._epoch)
+            await self._kvcm_client.send_batch([batch], self._epoch)
         except Exception as exc:
             logger.warning(
                 "failed to report all blocks cleared to kvcm",

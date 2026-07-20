@@ -192,3 +192,131 @@ class SpanMetricsReporter:
             step="kv_event_metrics",
             tags=tags,
         )
+
+
+class ZmqQueueMetricsReporter:
+    """Best-effort periodic summary of observable vLLM SUB queue signals.
+
+    Stable libzmq exposes only ``POLLIN`` readiness, not a numeric inbound
+    queue depth. The reporter records how often a message remains ready after
+    each receive, which proves at least one message was queued behind it.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_reader: Callable[[], Mapping[str, object]],
+        summary_interval_s: float = 60.0,
+    ) -> None:
+        self._state_reader = state_reader
+        self._summary_interval_s = summary_interval_s
+        self._received_message_count = 0
+        self._received_message_bytes = 0
+        self._queue_nonempty_observation_count = 0
+        self._sequence_gap_count = 0
+        self._missed_message_count = 0
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        """Start the periodic logger without affecting event forwarding."""
+
+        try:
+            if self._task is not None and not self._task.done():
+                return
+            self._task = asyncio.create_task(
+                self._run(),
+                name="zmq-queue-metrics",
+            )
+        except Exception:
+            pass
+
+    async def stop(self) -> None:
+        """Stop periodic logging without propagating reporter failures."""
+
+        try:
+            task = self._task
+            if task is None:
+                return
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if self._task is task:
+                    self._task = None
+        except Exception:
+            pass
+
+    def record_message(
+        self,
+        *,
+        message_bytes: int,
+        queue_nonempty_after_receive: bool,
+    ) -> None:
+        """Record one live ZMQ message. Never blocks or raises."""
+
+        try:
+            self._received_message_count += 1
+            self._received_message_bytes += message_bytes
+            if queue_nonempty_after_receive:
+                self._queue_nonempty_observation_count += 1
+        except Exception:
+            pass
+
+    def record_sequence_gap(self, *, missed_message_count: int) -> None:
+        """Record a live-sequence gap. Never blocks or raises."""
+
+        try:
+            if missed_message_count > 0:
+                self._sequence_gap_count += 1
+                self._missed_message_count += missed_message_count
+        except Exception:
+            pass
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._summary_interval_s)
+                try:
+                    await self._log_summary()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _log_summary(self) -> None:
+        tags: dict[str, object] = {}
+        try:
+            tags.update(self._state_reader())
+        except Exception as exc:
+            tags["zmq_queue_state_error"] = type(exc).__name__
+        tags.update(
+            {
+                "zmq_received_message_count": self._received_message_count,
+                "zmq_received_message_bytes": self._received_message_bytes,
+                "zmq_queue_nonempty_observation_count": (
+                    self._queue_nonempty_observation_count
+                ),
+                "zmq_sequence_gap_count": self._sequence_gap_count,
+                "zmq_missed_message_count": self._missed_message_count,
+            }
+        )
+        self._reset_window()
+        await asyncio.to_thread(
+            logger.info,
+            "vLLM ZMQ queue metrics",
+            step="zmq_queue_metrics",
+            tags=tags,
+        )
+
+    def _reset_window(self) -> None:
+        self._received_message_count = 0
+        self._received_message_bytes = 0
+        self._queue_nonempty_observation_count = 0
+        self._sequence_gap_count = 0
+        self._missed_message_count = 0

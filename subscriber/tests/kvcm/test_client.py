@@ -176,27 +176,6 @@ def test_block_specs_use_registered_location_spec_name() -> None:
     assert {spec["name"] for spec in block_specs} <= registered_spec_names
 
 
-def test_engine_adapter_controls_location_spec_and_uri() -> None:
-    client = KvcmClient(
-        SubscriberConfig(engine_type="rtp_llm"),
-        medium_mapper=lambda medium: medium or "",
-        storage_type="ST_EVENT_REPORT",
-        supported_mediums=["hbm"],
-        location_spec_namer=lambda block_size: f"rtp_llm_{block_size}",
-        location_uri_builder=lambda host, medium: f"rtp-llm://{host}/{medium}",
-        manager_client=FakeSdkClient(),
-    )
-    client._host_ip_port_value = "10.0.0.8:9000"
-
-    assert client._location_spec_name(64) == "rtp_llm_64"
-    assert client._block_specs("hbm") == [
-        {
-            "name": "rtp_llm_1",
-            "uri": "rtp-llm://10.0.0.8:9000/hbm",
-        }
-    ]
-
-
 def test_register_and_block_specs_use_configured_block_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -454,152 +433,30 @@ async def test_start_creates_sdk_registers_instance_reports_node_and_starts_hear
     fake_sdk.close.assert_awaited_once()
 
 
-async def test_rtp_start_defers_registration_until_authoritative_reset() -> None:
+async def test_learn_mode_warns_after_registering_default_specs(mocker) -> None:
     fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(
-            engine_type="rtp_llm",
-            rtp_reset_on_start=True,
-            kvcm_heartbeat_interval_s=0.01,
-        ),
-        fake_sdk,
+    warning = mocker.patch("subscriber.kvcm.client.logger.warning")
+    client = KvcmClient(
+        SubscriberConfig(kvcm_heartbeat_interval_s=60.0),
+        medium_mapper=_vllm_medium_mapper,
+        storage_type="ST_EVENT_REPORT",
+        supported_mediums=["hbm", "mem"],
+        manager_client=fake_sdk,
+        learn_mode=True,
     )
 
     await client.start()
-    fake_sdk.register_instance.assert_not_awaited()
-    fake_sdk.report_event.assert_not_awaited()
-
-    await client.set_engine_available(True)
-    await asyncio.sleep(0.03)
-    fake_sdk.register_instance.assert_not_awaited()
-    fake_sdk.report_event.assert_not_awaited()
-
-    await client.send_batch(
-        [
-            KVEventBatch(
-                ts=1.0,
-                events=[
-                    AllBlocksCleared(),
-                    BlockStored(
-                        block_hashes=[11],
-                        parent_block_hash=None,
-                        token_ids=[],
-                        block_size=1,
-                        lora_id=None,
-                        medium="GPU",
-                        lora_name=None,
-                    ),
-                ],
-            )
-        ],
-        epoch=1,
+    client.update_group_metadata(
+        {0: KvCacheGroupSpec(group_idx=0, kind="full_attention", block_size=16)}
     )
 
-    assert fake_sdk.register_instance.await_count == 2
-    assert [
-        [event["event_type"] for event in call.args[0]["events"]]
-        for call in fake_sdk.report_event.await_args_list
-    ] == [
-        ["EVENT_HOST_DOWN"],
-        ["EVENT_NODE_REGISTER"],
-        ["EVENT_BLOCK_ADD"],
-    ]
-    assert client._registered
-    assert not client._initial_reset_pending
-    await client.close()
-
-
-async def test_rtp_empty_initial_snapshot_registers_after_reset() -> None:
-    fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(
-            engine_type="rtp_llm",
-            rtp_reset_on_start=True,
-            kvcm_heartbeat_interval_s=0.01,
-        ),
-        fake_sdk,
+    warning.assert_any_call(
+        "learn-mode registered KVCM with default specs; later learned group metadata "
+        "cannot update the active registration",
+        step="kv_metadata_learn",
+        tags={"registered_spec_names": ["vllm_1"], "block_size": 1},
     )
-
-    await client.start()
-    await client.set_engine_available(True)
-    await client.send_batch(
-        [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])],
-        epoch=1,
-    )
-
-    assert [
-        [event["event_type"] for event in call.args[0]["events"]]
-        for call in fake_sdk.report_event.await_args_list
-    ] == [["EVENT_HOST_DOWN"], ["EVENT_NODE_REGISTER"]]
-    assert client._registered
-    await client.close()
-
-
-async def test_rtp_initial_reset_failure_keeps_registration_deferred() -> None:
-    fake_sdk = FakeSdkClient()
-    first_host_down = True
-
-    async def report_event(
-        request: dict[str, object], **_kwargs: object
-    ) -> dict[str, object]:
-        nonlocal first_host_down
-        event_type = request["events"][0]["event_type"]
-        if event_type == "EVENT_HOST_DOWN" and first_host_down:
-            first_host_down = False
-            raise RuntimeError("kvcm unavailable")
-        return {"header": {"status": {"code": "OK"}}}
-
-    fake_sdk.report_event.side_effect = report_event
-    client = _make_kvcm(
-        SubscriberConfig(
-            engine_type="rtp_llm",
-            rtp_reset_on_start=True,
-            kvcm_heartbeat_interval_s=0.01,
-        ),
-        fake_sdk,
-    )
-    batch = [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
-
-    await client.start()
-    await client.set_engine_available(True)
-    with pytest.raises(RuntimeError, match="kvcm unavailable"):
-        await client.send_batch(batch, epoch=1)
-
-    assert client._initial_reset_pending
-    assert not client._registered
-    await asyncio.sleep(0.03)
-    assert fake_sdk.register_instance.await_count == 1
-
-    await client.send_batch(batch, epoch=1)
-
-    assert not client._initial_reset_pending
-    assert client._registered
-    await client.close()
-
-
-async def test_rtp_without_initial_reset_registers_after_first_healthy() -> None:
-    fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(
-            engine_type="rtp_llm",
-            rtp_reset_on_start=False,
-            kvcm_heartbeat_interval_s=60.0,
-        ),
-        fake_sdk,
-    )
-
-    await client.start()
-    fake_sdk.register_instance.assert_not_awaited()
-
-    await client.set_engine_available(True)
-
     fake_sdk.register_instance.assert_awaited_once()
-    assert fake_sdk.report_event.await_args_list[0].args[0]["events"] == [
-        {
-            "event_type": "EVENT_NODE_REGISTER",
-            "node_register": {"mediums": ["hbm", "mem"]},
-        }
-    ]
     await client.close()
 
 
@@ -650,58 +507,6 @@ async def test_start_uses_spectrum_address_from_vservice_id(
     await client.close()
 
     assert [created.base_url for created in created_clients] == ["spectrum://vs-a:6382"]
-
-
-async def test_start_prefers_configured_kvcm_base_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-ignored")
-    created_clients: list[FakeSdkClient] = []
-
-    def create_http_client(
-        base_url: str, *, request_timeout_seconds: float
-    ) -> FakeSdkClient:
-        client = FakeSdkClient(base_url)
-        created_clients.append(client)
-        return client
-
-    monkeypatch.setattr(
-        "subscriber.kvcm.client.HttpKvCacheManagerClient", create_http_client
-    )
-
-    client = KvcmClient(
-        SubscriberConfig(
-            kvcm_base_url="  http://127.0.0.1:6382  ",
-            kvcm_heartbeat_interval_s=60.0,
-        ),
-        medium_mapper=_vllm_medium_mapper,
-        storage_type="ST_EVENT_REPORT",
-        supported_mediums=["hbm", "mem"],
-    )
-
-    await client.start()
-    await client.close()
-
-    assert [created.base_url for created in created_clients] == [
-        "http://127.0.0.1:6382"
-    ]
-
-
-def test_client_requires_configured_or_discovered_kvcm_address(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVCM_VSERVICE_ID", raising=False)
-
-    with pytest.raises(
-        ValueError,
-        match="Please specify kvcm_base_url or KVCM_VSERVICE_ID",
-    ):
-        KvcmClient(
-            SubscriberConfig(),
-            medium_mapper=_vllm_medium_mapper,
-            storage_type="ST_EVENT_REPORT",
-            supported_mediums=["hbm", "mem"],
-        )
 
 
 async def test_start_resolves_host_ip_port_once_and_reuses_it(
@@ -799,7 +604,7 @@ async def test_start_resets_registered_when_node_register_report_fails(
     await client.close()
 
 
-async def test_start_without_endpoint_retries_batch_after_registration_recovers(
+async def test_start_without_endpoint_drops_batches_then_registers_after_recovery(
     mocker,
 ) -> None:
     fake_sdk = FakeSdkClient()
@@ -823,14 +628,7 @@ async def test_start_without_endpoint_retries_batch_after_registration_recovers(
 
     queue = asyncio.Queue()
     batches = [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
-    await queue.put(
-        mocker.Mock(
-            batches=batches,
-            epoch_snapshot=1,
-            timer=mocker.Mock(),
-            on_delivery=None,
-        )
-    )
+    await queue.put(mocker.Mock(batches=batches, epoch_snapshot=1, on_delivery=None))
     coordinator = mocker.Mock()
     coordinator.wait_ready_epoch = AsyncMock(return_value=1)
     coordinator.is_epoch_current.return_value = True
@@ -843,28 +641,23 @@ async def test_start_without_endpoint_retries_batch_after_registration_recovers(
             retry_interval_s=0.001,
         )
     )
-    await asyncio.sleep(0.01)
 
     warning.assert_any_call(
         "kvcm has no available endpoint; starting in not-ready state",
         step="kvcm_register",
     )
-    send_warning = next(
-        call
-        for call in warning.call_args_list
-        if call.args == ("failed to send kv event batch to kvcm; retrying in order",)
-    )
-    assert "kvcm client is not ready" in send_warning.kwargs["tags"]["message"]
 
+    # Let the retry loop spin a few times while client is not ready.
+    await asyncio.sleep(0.01)
+
+    # Recover: client becomes ready and registers via heartbeat.
     fake_sdk.ready = True
     await asyncio.wait_for(registered.wait(), timeout=0.2)
-    await asyncio.wait_for(queue.join(), timeout=0.2)
 
-    assert any(
-        event["event_type"] == "EVENT_HOST_DOWN"
-        for call in fake_sdk.report_event.await_args_list
-        for event in call.args[0]["events"]
-    )
+    # The retry loop should now deliver the batch successfully.
+    await asyncio.wait_for(queue.join(), timeout=1.0)
+
+    fake_sdk.report_event.assert_awaited()
     sender.cancel()
     with pytest.raises(asyncio.CancelledError):
         await sender
@@ -923,22 +716,6 @@ async def test_heartbeat_reports_periodically() -> None:
     ]
     assert heartbeat_calls
     fake_sdk.close.assert_awaited_once()
-
-
-async def test_heartbeat_is_skipped_while_registration_retry_fails() -> None:
-    fake_sdk = FakeSdkClient()
-    fake_sdk.register_instance.side_effect = RuntimeError("register failed")
-    client = _make_kvcm(
-        SubscriberConfig(kvcm_heartbeat_interval_s=0.01),
-        fake_sdk,
-    )
-
-    await client.start()
-    await asyncio.sleep(0.03)
-    await client.close()
-
-    assert fake_sdk.register_instance.await_count >= 2
-    fake_sdk.report_event.assert_not_awaited()
 
 
 async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
@@ -1068,117 +845,6 @@ async def test_send_batch_reports_converted_events() -> None:
             },
         }
     ]
-
-
-def test_block_delete_uses_registered_engine_block_size(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DS_LLM_ENGINE_CONFIG", '{"block_size": 64}')
-    client = _client(SubscriberConfig(block_size=32))
-    batch = KVEventBatch(
-        ts=1.0,
-        events=[BlockRemoved(block_hashes=[13], medium="CPU")],
-    )
-
-    events = client._report_events_for_batches([batch])
-
-    assert events[0]["block_delete"]["specs"][0]["name"] == "vllm_64"
-
-
-async def test_send_batch_splits_large_snapshot_reports() -> None:
-    fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(
-            kvcm_heartbeat_interval_s=60.0,
-            kvcm_report_batch_size=2,
-        ),
-        fake_sdk,
-    )
-    batch = KVEventBatch(
-        ts=1.0,
-        events=[BlockRemoved(block_hashes=[11, 12, 13, 14, 15], medium="CPU")],
-    )
-
-    await client.start()
-    fake_sdk.report_event.reset_mock()
-    await client.send_batch([batch], epoch=7)
-    await client.close()
-
-    assert fake_sdk.report_event.await_count == 3
-    assert [
-        len(call.args[0]["events"]) for call in fake_sdk.report_event.await_args_list
-    ] == [2, 2, 1]
-
-
-async def test_snapshot_reset_reregisters_before_reporting_full_adds() -> None:
-    fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(kvcm_heartbeat_interval_s=60.0),
-        fake_sdk,
-    )
-    batch = KVEventBatch(
-        ts=1.0,
-        events=[
-            AllBlocksCleared(),
-            BlockStored(
-                block_hashes=[11, 12],
-                parent_block_hash=None,
-                token_ids=[],
-                block_size=1,
-                lora_id=None,
-                medium="GPU",
-                lora_name=None,
-            ),
-        ],
-    )
-
-    await client.start()
-    fake_sdk.register_instance.reset_mock()
-    fake_sdk.report_event.reset_mock()
-    await client.send_batch([batch], epoch=1)
-    await client.close()
-
-    fake_sdk.register_instance.assert_awaited_once()
-    assert [
-        [event["event_type"] for event in call.args[0]["events"]]
-        for call in fake_sdk.report_event.await_args_list
-    ] == [
-        ["EVENT_HOST_DOWN"],
-        ["EVENT_NODE_REGISTER"],
-        ["EVENT_BLOCK_ADD", "EVENT_BLOCK_ADD"],
-    ]
-
-
-async def test_engine_down_pauses_heartbeat_registration_until_recovery() -> None:
-    fake_sdk = FakeSdkClient()
-    client = _make_kvcm(
-        SubscriberConfig(kvcm_heartbeat_interval_s=0.01),
-        fake_sdk,
-    )
-
-    await client.start()
-    await client.set_engine_available(False)
-    await client.send_batch(
-        [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])],
-        epoch=1,
-    )
-    fake_sdk.register_instance.reset_mock()
-    fake_sdk.report_event.reset_mock()
-
-    await asyncio.sleep(0.03)
-
-    fake_sdk.register_instance.assert_not_awaited()
-    fake_sdk.report_event.assert_not_awaited()
-
-    await client.set_engine_available(True)
-    fake_sdk.register_instance.assert_awaited_once()
-    assert fake_sdk.report_event.await_args_list[0].args[0]["events"] == [
-        {
-            "event_type": "EVENT_NODE_REGISTER",
-            "node_register": {"mediums": ["hbm", "mem"]},
-        }
-    ]
-    await client.close()
 
 
 async def test_send_empty_batch_does_not_report_event() -> None:

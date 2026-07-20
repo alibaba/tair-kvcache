@@ -126,7 +126,7 @@ def test_kvcm_report_batch_size_must_be_positive() -> None:
 def test_kvcm_runtime_config_defaults() -> None:
     config = SubscriberConfig()
     assert config.kvcm_base_url == ""
-    assert config.kvcm_heartbeat_interval_s == 1.0
+    assert config.kvcm_heartbeat_interval_s == 5.0
     assert config.kvcm_send_retry_interval_s == 1.0
 
 
@@ -215,8 +215,7 @@ def test_cli_overrides_yaml(tmp_path: Path) -> None:
 
 def test_health_config_defaults() -> None:
     config = SubscriberConfig()
-    assert config.engine_health_url == "http://127.0.0.1:8000/health"
-    assert config.engine_health_interval_s == 1.0
+    assert config.engine_health_interval_s == 5.0
     assert config.engine_health_timeout_s == 1.0
     assert config.engine_health_failure_threshold == 3
 
@@ -225,8 +224,6 @@ def test_health_config_cli_override() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
-            "--engine-health-url",
-            "http://10.0.0.1:9000/health",
             "--engine-health-interval-s",
             "0.25",
             "--engine-health-timeout-s",
@@ -236,7 +233,6 @@ def test_health_config_cli_override() -> None:
         ]
     )
     config = SubscriberConfig.from_args(args)
-    assert config.engine_health_url == "http://10.0.0.1:9000/health"
     assert config.engine_health_interval_s == 0.25
     assert config.engine_health_timeout_s == 0.1
     assert config.engine_health_failure_threshold == 5
@@ -247,7 +243,6 @@ def test_health_config_yaml_loading(tmp_path: Path) -> None:
     yaml_file.write_text(
         textwrap.dedent(
             """\
-            engine_health_url: "http://10.0.0.2:9001/health"
             engine_health_interval_s: 2.5
             engine_health_timeout_s: 0.75
             engine_health_failure_threshold: 7
@@ -257,7 +252,6 @@ def test_health_config_yaml_loading(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(["--config", str(yaml_file)])
     config = SubscriberConfig.from_args(args)
-    assert config.engine_health_url == "http://10.0.0.2:9001/health"
     assert config.engine_health_interval_s == 2.5
     assert config.engine_health_timeout_s == 0.75
     assert config.engine_health_failure_threshold == 7

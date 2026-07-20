@@ -11,6 +11,8 @@ from subscriber.engine.base import AbstractEngineAdapter
 from subscriber.health.coordinator import EngineHealthCoordinator
 from subscriber.kvcm.client import KvcmClient
 from subscriber.metrics import MetricSample, SpanMetricsReporter, StageTimer
+from subscriber.pipeline.block_filter import filter_block_removals
+from subscriber.pipeline.learn import GroupMetadataLearner
 from subscriber.types import BlockRemoved, BlockStored, KVEventBatch
 
 _KVCM_SEND_RETRY_LOG_EVERY = 30
@@ -78,6 +80,7 @@ async def send_kv_events(
     queue: asyncio.Queue[QueuedKVEventBatch],
     latency_reporter: SpanMetricsReporter,
     retry_interval_s: float = 1.0,
+    learner: GroupMetadataLearner | None = None,
 ) -> None:
     """Send queued batches in order, retrying while their epoch stays current."""
 
@@ -88,13 +91,41 @@ async def send_kv_events(
         queued = await queue.get()
         try:
             queued.timer.mark("queue_wait")
+            epoch = await coordinator.wait_ready_epoch()
+            queued.timer.mark("gate_wait")
+            if not coordinator.is_epoch_current(queued.epoch_snapshot):
+                logger.warning(
+                    "dropping kv event batch because engine epoch changed before send",
+                    step="kv_event_loop",
+                    tags={
+                        "captured_epoch": queued.epoch_snapshot,
+                        "current_epoch": epoch,
+                    },
+                )
+                await _notify_delivery(queued.on_delivery, False)
+                continue
+            batches = filter_block_removals(queued.batches)
+            queued.timer.mark("block_filter")
+            if not batches:
+                await _notify_delivery(queued.on_delivery, True)
+                continue
+            if learner is not None and learner.observe_batch(batches):
+                kvcm.update_group_metadata(learner.snapshot())
+                learner.consume_new_groups()
+                logger.info(
+                    "learned kv cache group metadata from live events",
+                    step="kv_metadata_learn",
+                    tags={
+                        "group_count": len(learner.snapshot()),
+                    },
+                )
+            queued.timer.mark("metadata_learn")
             retry_attempt = 0
             delivered = False
             while True:
-                epoch = await coordinator.wait_ready_epoch()
-                if retry_attempt == 0:
-                    queued.timer.mark("gate_wait")
-                if not coordinator.is_epoch_current(queued.epoch_snapshot):
+                if retry_attempt > 0 and not coordinator.is_epoch_current(
+                    queued.epoch_snapshot
+                ):
                     logger.warning(
                         "dropping kv event batch because engine epoch changed "
                         "before send",
@@ -107,7 +138,7 @@ async def send_kv_events(
                     await _notify_delivery(queued.on_delivery, False)
                     break
                 try:
-                    await kvcm.send_batch(queued.batches, epoch)
+                    await kvcm.send_batch(batches, epoch)
                 except Exception as exc:
                     retry_attempt += 1
                     if (
@@ -119,9 +150,9 @@ async def send_kv_events(
                             step="kvcm_send",
                             tags={
                                 "epoch": epoch,
-                                "batch_count": len(queued.batches),
+                                "batch_count": len(batches),
                                 "event_count": sum(
-                                    len(batch.events) for batch in queued.batches
+                                    len(batch.events) for batch in batches
                                 ),
                                 "retry_attempt": retry_attempt,
                                 "retry_interval_s": retry_interval_s,
@@ -141,13 +172,13 @@ async def send_kv_events(
             # (report never raises) and must never be misread as a send failure.
             stored_block_hash_count = sum(
                 len(event.block_hashes)
-                for batch in queued.batches
+                for batch in batches
                 for event in batch.events
                 if isinstance(event, BlockStored)
             )
             removed_block_hash_count = sum(
                 len(event.block_hashes)
-                for batch in queued.batches
+                for batch in batches
                 for event in batch.events
                 if isinstance(event, BlockRemoved)
             )
@@ -171,6 +202,7 @@ async def kv_event_loop(
     coordinator: EngineHealthCoordinator,
     queue_maxsize: int = 1024,
     retry_interval_s: float = 1.0,
+    learner: GroupMetadataLearner | None = None,
 ) -> None:
     """Forward engine KV batches to kvcm through a bounded producer/sender queue."""
 
@@ -190,6 +222,7 @@ async def kv_event_loop(
             queue,
             latency_reporter,
             retry_interval_s,
+            learner,
         )
     )
     try:
@@ -237,17 +270,36 @@ async def run(config: SubscriberConfig) -> None:
     """Run the subscriber event and liveness loops until cancellation or error."""
 
     adapter = AbstractEngineAdapter.create(config.engine_type, config)
-    kvcm = KvcmClient(
-        config,
-        medium_mapper=adapter.map_medium,
-        storage_type=adapter.storage_type(),
-        supported_mediums=adapter.supported_mediums(),
-        location_spec_namer=adapter.location_spec_name,
-        location_uri_builder=adapter.location_uri,
-    )
+    kvcm_client: KvcmClient | None = None
+    watch_task: asyncio.Task[None] | None = None
     try:
-        await kvcm.start()
-        coordinator = EngineHealthCoordinator(adapter, kvcm, config)
+        coordinator = EngineHealthCoordinator(adapter, None, config)
+        watch_task = asyncio.create_task(
+            coordinator.watch_loop(), name="engine-health-loop"
+        )
+
+        await coordinator.wait_ready_epoch()
+
+        group_metadata = await adapter.fetch_kv_cache_group_metadata()
+        learner: GroupMetadataLearner | None = None
+        if group_metadata is None:
+            learner = GroupMetadataLearner()
+            logger.warning(
+                "kv cache group metadata unavailable; starting in learn-mode",
+                step="startup",
+            )
+        kvcm_client = KvcmClient(
+            config,
+            medium_mapper=adapter.map_medium,
+            storage_type=adapter.storage_type(),
+            supported_mediums=adapter.supported_mediums(),
+            location_spec_namer=adapter.location_spec_name,
+            location_uri_builder=adapter.location_uri,
+            group_metadata=group_metadata,
+            learn_mode=learner is not None,
+        )
+        await kvcm_client.start()
+        coordinator.attach_kvcm_client(kvcm_client)
 
         logger.info(
             "subscriber started",
@@ -259,6 +311,7 @@ async def run(config: SubscriberConfig) -> None:
                 "kvcm_heartbeat_interval_s": config.kvcm_heartbeat_interval_s,
                 "kvcm_send_retry_interval_s": config.kvcm_send_retry_interval_s,
                 "engine_health_url": config.engine_health_url,
+                "learn_mode": learner is not None,
                 "engine_health_interval_s": config.engine_health_interval_s,
                 "engine_health_timeout_s": config.engine_health_timeout_s,
                 "engine_health_failure_threshold": (
@@ -273,18 +326,15 @@ async def run(config: SubscriberConfig) -> None:
         event_task = asyncio.create_task(
             kv_event_loop(
                 adapter,
-                kvcm,
+                kvcm_client,
                 coordinator,
                 config.kv_event_queue_maxsize,
                 config.kvcm_send_retry_interval_s,
+                learner,
             ),
             name="kv-event-loop",
         )
-        health_task = asyncio.create_task(
-            coordinator.watch_loop(),
-            name="engine-health-loop",
-        )
-        tasks = {event_task, health_task}
+        tasks = {event_task, watch_task}
         try:
             done, _ = await asyncio.wait(
                 tasks,
@@ -307,4 +357,10 @@ async def run(config: SubscriberConfig) -> None:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        await kvcm.close()
+        if watch_task is not None:
+            watch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await watch_task
+        if kvcm_client is not None:
+            await kvcm_client.close()
+        await adapter.close()

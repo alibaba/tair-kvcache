@@ -6,6 +6,7 @@ from subscriber.config import SubscriberConfig
 from subscriber.engine.base import AbstractEngineAdapter, EngineEventBatch
 from subscriber.health.events import LivenessEvent
 from subscriber.metrics import StageTimer
+from subscriber.types import KvCacheGroupSpec
 
 
 @AbstractEngineAdapter.register("sglang")
@@ -45,3 +46,9 @@ class SGLangAdapter(AbstractEngineAdapter):
 
     async def reset_generation_state(self) -> None:
         pass
+
+    async def fetch_kv_cache_group_metadata(self) -> list[KvCacheGroupSpec] | None:
+        return await super().fetch_kv_cache_group_metadata()
+
+    async def close(self) -> None:
+        return await super().close()

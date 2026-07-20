@@ -5,19 +5,33 @@ from collections import Counter
 from collections.abc import AsyncGenerator
 
 import httpx
+import msgspec
 import zmq
 import zmq.asyncio
 
 from subscriber import logger
 from subscriber.config import SubscriberConfig
 from subscriber.engine.base import AbstractEngineAdapter, EngineEventBatch
+from subscriber.engine.dashllm_grpc import DashllmGrpcClient
 from subscriber.health.events import LivenessEvent
-from subscriber.metrics import StageTimer
-from subscriber.types import BlockRemoved, BlockStored, KVEventBatch
+from subscriber.metrics import StageTimer, ZmqQueueMetricsReporter
+from subscriber.proto import kv_cache_group_metadata_pb2
+from subscriber.types import (
+    BlockRemoved,
+    BlockStored,
+    ExternalBlockHash,
+    KvCacheGroupSpec,
+    KVEventBatch,
+)
 from subscriber.utils.msgpack_helper import KVEventBatchMsgpackHelper
 
 _END_SEQ = (-1).to_bytes(8, "big", signed=True)
 _MAX_DEBUG_BLOCK_HASHES = 32
+
+# The subscriber is co-located with the engine, so control endpoints default to
+# localhost addresses. URLs are configurable via SubscriberConfig.
+_METADATA_RETRY_BASE_S = 0.5
+_METADATA_RETRY_MAX_S = 30.0
 
 MEDIUM_VLLM_GPU = "GPU"
 MEDIUM_VLLM_CPU = "CPU"
@@ -28,38 +42,113 @@ _KVCM_MEDIUM_MAP = {
 }
 
 
+class _RetryableMetadataResponseError(RuntimeError):
+    """A DashLLM response that asks the subscriber to retry metadata fetch."""
+
+    def __init__(self, err_code: int, err_msg: str) -> None:
+        self.err_code = err_code
+        super().__init__(f"DashLLM metadata error {err_code}: {err_msg}")
+
+
+def _metadata_response_error(payload: object) -> tuple[int, str] | None:
+    """Return an explicit metadata response error, if present."""
+
+    err_code = getattr(payload, "err_code", 0)
+    if not isinstance(err_code, int) or err_code == (
+        kv_cache_group_metadata_pb2.KV_CACHE_GROUP_METADATA_OK
+    ):
+        return None
+    err_msg = getattr(payload, "err_msg", "")
+    return err_code, err_msg if isinstance(err_msg, str) else ""
+
+
+def _format_block_hash(block_hash: ExternalBlockHash) -> str:
+    """Render a block hash safely for dashlog's structured JSON output."""
+
+    if isinstance(block_hash, bytes):
+        return block_hash.hex()
+    return str(block_hash)
+
+
+def _event_for_debug(event: BlockStored | BlockRemoved) -> dict[str, object]:
+    """Copy an event for logging without token IDs or mutating forwarding data."""
+
+    event_data = msgspec.structs.asdict(event)
+    event_data.pop("token_ids", None)
+    event_data["block_hashes"] = [
+        _format_block_hash(block_hash) for block_hash in event.block_hashes
+    ]
+    if isinstance(event, BlockStored) and event.parent_block_hash is not None:
+        event_data["parent_block_hash"] = _format_block_hash(event.parent_block_hash)
+    return event_data
+
+
 def _summarize_batch(batch: KVEventBatch) -> dict[str, object]:
     event_type_counts = Counter(type(event).__name__ for event in batch.events)
-    stored_block_hash_count = 0
-    removed_block_hash_count = 0
-    stored_block_hashes: list[int] = []
-    removed_block_hashes: list[int] = []
+    stored_blocks: list[dict[str, object]] = []
+    removed_blocks: list[dict[str, object]] = []
     for event in batch.events:
         if isinstance(event, BlockStored):
-            for block_hash in event.block_hashes:
-                stored_block_hash_count += 1
-                if len(stored_block_hashes) < _MAX_DEBUG_BLOCK_HASHES:
-                    stored_block_hashes.append(block_hash)
+            if len(stored_blocks) < _MAX_DEBUG_BLOCK_HASHES:
+                stored_blocks.append(_event_for_debug(event))
         elif isinstance(event, BlockRemoved):
-            for block_hash in event.block_hashes:
-                removed_block_hash_count += 1
-                if len(removed_block_hashes) < _MAX_DEBUG_BLOCK_HASHES:
-                    removed_block_hashes.append(block_hash)
+            if len(removed_blocks) < _MAX_DEBUG_BLOCK_HASHES:
+                removed_blocks.append(_event_for_debug(event))
     return {
         "event_count": len(batch.events),
         "event_types": ",".join(
             f"{name}:{count}" for name, count in sorted(event_type_counts.items())
         ),
         "data_parallel_rank": batch.data_parallel_rank,
-        "stored_block_hash_count": stored_block_hash_count,
-        "stored_block_hashes": stored_block_hashes,
-        "stored_block_hashes_truncated": stored_block_hash_count
-        > len(stored_block_hashes),
-        "removed_block_hash_count": removed_block_hash_count,
-        "removed_block_hashes": removed_block_hashes,
-        "removed_block_hashes_truncated": removed_block_hash_count
-        > len(removed_block_hashes),
+        "stored_block_count": len(stored_blocks),
+        "stored_blocks": stored_blocks,
+        "stored_blocks_truncated": sum(
+            1 for e in batch.events if isinstance(e, BlockStored)
+        )
+        > len(stored_blocks),
+        "removed_block_count": len(removed_blocks),
+        "removed_blocks": removed_blocks,
+        "removed_blocks_truncated": sum(
+            1 for e in batch.events if isinstance(e, BlockRemoved)
+        )
+        > len(removed_blocks),
     }
+
+
+def _parse_kv_cache_group_metadata(payload: object) -> list[KvCacheGroupSpec] | None:
+    """Parse gRPC metadata into per-group specs.
+
+    ``GetKvCacheGroupsMetadata`` returns repeated entries with ``group_idx``,
+    ``kind``, ``block_size``, and ``sliding_window``. ``-1`` encodes no sliding
+    window. Returns ``None`` when the response has no group topology.
+    """
+
+    raw = getattr(payload, "items", None)
+    if raw is None:
+        return None
+    specs: list[KvCacheGroupSpec] = []
+    for entry in raw:
+        group_idx = getattr(entry, "group_idx", None)
+        kind = getattr(entry, "kind", None)
+        block_size = getattr(entry, "block_size", None)
+        if (
+            not isinstance(group_idx, int)
+            or not isinstance(kind, str)
+            or not isinstance(block_size, int)
+        ):
+            return None
+        sliding_window = getattr(entry, "sliding_window", None)
+        specs.append(
+            KvCacheGroupSpec(
+                group_idx=group_idx,
+                kind=kind,
+                block_size=block_size,
+                sliding_window=sliding_window
+                if isinstance(sliding_window, int) and sliding_window != -1
+                else None,
+            )
+        )
+    return specs or None
 
 
 async def _probe_health(client: httpx.AsyncClient, url: str) -> LivenessEvent:
@@ -107,7 +196,8 @@ class VllmAdapter(AbstractEngineAdapter):
     """Engine adapter for vLLM.
 
     Uses ZMQ SUB + DEALER for KV event subscription and replay. Liveness is
-    reported through an HTTP /health polling loop.
+    reported through an HTTP /health polling loop. DashLLM control-plane RPCs
+    use the adapter-owned gRPC client.
     """
 
     def __init__(self, config: SubscriberConfig) -> None:
@@ -124,6 +214,8 @@ class VllmAdapter(AbstractEngineAdapter):
         self._msgpack_helper = KVEventBatchMsgpackHelper()
         self._last_seq = -1
         self._generation = 0
+        self._closed = False
+        self._dashllm_grpc_client = DashllmGrpcClient(self._config.engine_grpc_endpoint)
         if logger.is_debug_enabled():
             logger.debug(
                 "connecting vLLM ZMQ sockets",
@@ -138,6 +230,9 @@ class VllmAdapter(AbstractEngineAdapter):
             )
         self._sub = self._open_sub_socket()
         self._dealer = self._open_dealer_socket()
+        self._zmq_queue_metrics = ZmqQueueMetricsReporter(
+            state_reader=self._zmq_queue_state,
+        )
 
     def _open_sub_socket(self) -> zmq.asyncio.Socket:
         sub = self._ctx.socket(zmq.SUB)
@@ -198,6 +293,7 @@ class VllmAdapter(AbstractEngineAdapter):
         (DEALER round-trip plus batch decode).
         """
 
+        await self._zmq_queue_metrics.start()
         try:
             while True:
                 received = await self._recv_live_message()
@@ -216,6 +312,9 @@ class VllmAdapter(AbstractEngineAdapter):
 
                 if seq > self._last_seq + 1:
                     missed = seq - self._last_seq - 1
+                    self._zmq_queue_metrics.record_sequence_gap(
+                        missed_message_count=missed
+                    )
                     logger.warning(
                         "kv event sequence gap detected, triggering replay",
                         step="zmq_replay",
@@ -260,6 +359,7 @@ class VllmAdapter(AbstractEngineAdapter):
                 self._last_seq = seq
                 yield EngineEventBatch([batch], timer)
         finally:
+            await self._zmq_queue_metrics.stop()
             self._sub.close(linger=0)
             self._dealer.close(linger=0)
 
@@ -277,6 +377,10 @@ class VllmAdapter(AbstractEngineAdapter):
             return None
         if generation != self._generation:
             return None
+        self._zmq_queue_metrics.record_message(
+            message_bytes=sum(len(frame) for frame in frames),
+            queue_nonempty_after_receive=self._sub_queue_is_readable(sub),
+        )
         if len(frames) != 3:
             logger.warning(
                 "dropping malformed kv event message frames",
@@ -304,6 +408,28 @@ class VllmAdapter(AbstractEngineAdapter):
                 },
             )
         return seq, payload
+
+    def _zmq_queue_state(self) -> dict[str, bool | int]:
+        """Return the stable libzmq queue signals available for the SUB socket."""
+
+        receive_high_water_mark = self._sub.getsockopt(zmq.RCVHWM)
+        if not isinstance(receive_high_water_mark, int):
+            raise TypeError("ZMQ RCVHWM must be an integer")
+        return {
+            "zmq_sub_readable": self._sub_queue_is_readable(self._sub),
+            "zmq_sub_rcvhwm": receive_high_water_mark,
+            "zmq_exact_queue_depth_available": False,
+        }
+
+    @staticmethod
+    def _sub_queue_is_readable(sub: zmq.asyncio.Socket) -> bool:
+        """Whether libzmq currently has at least one message ready to receive."""
+
+        try:
+            events = sub.getsockopt(zmq.EVENTS)
+            return isinstance(events, int) and bool(events & zmq.POLLIN)
+        except Exception:
+            return False
 
     async def _replay_missing_batches(
         self, current_seq: int, generation: int
@@ -463,9 +589,109 @@ class VllmAdapter(AbstractEngineAdapter):
                 yield LivenessEvent.UNHEALTHY
                 await asyncio.sleep(self._config.engine_health_interval_s)
 
+    async def fetch_kv_cache_group_metadata(self) -> list[KvCacheGroupSpec] | None:
+        """Fetch per-group metadata from the engine's gRPC endpoint.
+
+        Retries with exponential backoff up to ``engine_kv_group_metadata_max_retries``
+        attempts. The engine is already confirmed healthy by the coordinator
+        before this method is called, so failures are transient transport
+        errors rather than engine unavailability.
+        """
+
+        max_retries = self._config.engine_kv_group_metadata_max_retries
+        delay = _METADATA_RETRY_BASE_S
+        for attempt in range(1, max_retries + 1):
+            try:
+                payload = await self._dashllm_grpc_client.get_kv_cache_group_metadata(
+                    self._config.engine_health_timeout_s
+                )
+                response_error = _metadata_response_error(payload)
+                if response_error is not None:
+                    err_code, err_msg = response_error
+                    if err_code == (
+                        kv_cache_group_metadata_pb2.KV_CACHE_GROUP_METADATA_UNAVAILABLE
+                    ):
+                        raise _RetryableMetadataResponseError(err_code, err_msg)
+                    logger.warning(
+                        "received non-retryable kv cache group metadata error; "
+                        "falling back to learn-mode",
+                        step="kv_metadata",
+                        tags={
+                            "err_code": err_code,
+                            "err_msg": err_msg,
+                            "target": self._config.engine_grpc_endpoint,
+                        },
+                    )
+                    return None
+            # TODO: Retry only _RetryableMetadataResponseError and explicitly
+            # retryable gRPC transport statuses instead of every Exception.
+            except Exception as exc:
+                if attempt >= max_retries:
+                    logger.warning(
+                        "failed to fetch kv cache group metadata; "
+                        "max retries exhausted, falling back to learn-mode",
+                        step="kv_metadata",
+                        tags={
+                            "error": type(exc).__name__,
+                            "message": str(exc),
+                            "target": self._config.engine_grpc_endpoint,
+                            "attempts": attempt,
+                            "max_retries": max_retries,
+                            "err_code": getattr(exc, "err_code", None),
+                        },
+                    )
+                    return None
+                logger.warning(
+                    "failed to fetch kv cache group metadata; retrying",
+                    step="kv_metadata",
+                    tags={
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "target": self._config.engine_grpc_endpoint,
+                        "retry_in_s": delay,
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                        "err_code": getattr(exc, "err_code", None),
+                    },
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _METADATA_RETRY_MAX_S)
+                continue
+            metadata = _parse_kv_cache_group_metadata(payload)
+            if logger.is_debug_enabled():
+                logger.debug(
+                    "fetched kv cache group metadata",
+                    step="kv_metadata",
+                    tags={
+                        "group_count": len(metadata) if metadata else 0,
+                        "groups": [
+                            {
+                                "kind": spec.kind,
+                                "sliding_window": spec.sliding_window,
+                            }
+                            for spec in metadata
+                        ]
+                        if metadata
+                        else None,
+                    },
+                )
+            return metadata
+        raise AssertionError("unreachable")
+
+    async def close(self) -> None:
+        """Release the DashLLM gRPC client and vLLM ZMQ sockets."""
+
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._dashllm_grpc_client.close()
+        finally:
+            self._sub.close(linger=0)
+            self._dealer.close(linger=0)
+
     async def reset_generation_state(self) -> None:
         """Clear sequence state and recreate sockets after engine recovery."""
-
         self._generation += 1
         self._last_seq = -1
         self._sub.close(linger=0)

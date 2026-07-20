@@ -12,7 +12,13 @@ from subscriber import logger
 from subscriber.config import SubscriberConfig
 from subscriber.kvcm.base import AbstractKvCacheManagerClient
 from subscriber.kvcm.manager_client import HttpKvCacheManagerClient
-from subscriber.types import AllBlocksCleared, BlockRemoved, BlockStored, KVEventBatch
+from subscriber.types import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KvCacheGroupSpec,
+    KVEventBatch,
+)
 from subscriber.utils.network import resolve_host_ip_port
 
 
@@ -24,6 +30,14 @@ class KvcmReportEventType(StrEnum):
     BLOCK_ADD = "EVENT_BLOCK_ADD"
     BLOCK_DELETE = "EVENT_BLOCK_DELETE"
     HOST_DOWN = "EVENT_HOST_DOWN"
+
+
+# Map vLLM ``KVCacheSpecKind`` values to the short kvcm spec-name prefix.
+# Unmapped kinds fall back to their raw kind string.
+_KIND_DISPLAY_NAMES = {
+    "full_attention": "full",
+    "mamba": "linear",
+}
 
 
 def _get_engine_config_from_env() -> dict[str, Any]:
@@ -62,6 +76,8 @@ class KvcmClient:
         location_spec_namer: Callable[[int], str] | None = None,
         location_uri_builder: Callable[[str, str], str] | None = None,
         manager_client: AbstractKvCacheManagerClient | None = None,
+        group_metadata: list[KvCacheGroupSpec] | None = None,
+        learn_mode: bool = False,
     ) -> None:
         self._config = config
         self._medium_mapper = medium_mapper
@@ -73,6 +89,13 @@ class KvcmClient:
         self._location_uri_builder = location_uri_builder or (
             lambda host_ip_port, medium: f"vllm://{host_ip_port}/{medium}"
         )
+        self._group_by_idx: dict[int, KvCacheGroupSpec] | None = (
+            {spec.group_idx: spec for spec in group_metadata}
+            if group_metadata is not None
+            else None
+        )
+        self._learn_mode = learn_mode
+        self._learn_mode_registration_warning_emitted = False
         self._manager_client: AbstractKvCacheManagerClient = (
             manager_client
             or HttpKvCacheManagerClient(
@@ -90,6 +113,14 @@ class KvcmClient:
             config.engine_type == "rtp_llm" and config.rtp_reset_on_start
         )
         self._started = False
+
+    def update_group_metadata(self, group_by_idx: dict[int, KvCacheGroupSpec]) -> None:
+        """Replace the group metadata used for spec name generation.
+
+        Called by the learn-mode pipeline when the ``GroupMetadataLearner``
+        discovers new groups from live events.
+        """
+        self._group_by_idx = dict(group_by_idx)
 
     def _base_url(self) -> str:
         configured_base_url = self._config.kvcm_base_url.strip()
@@ -121,13 +152,60 @@ class KvcmClient:
             return default
         return raw
 
-    def _location_spec_name(self, block_size: int) -> str:
-        return self._location_spec_namer(block_size)
+    def _location_spec_name(self, block_size: int, group_idx: int | None = None) -> str:
+        if self._group_by_idx is None:
+            return self._location_spec_namer(block_size)
+        if group_idx is None:
+            logger.warning(
+                "event missing group_idx in multi-group engine; "
+                "using fallback spec name",
+                step="kvcm_send",
+                tags={"block_size": block_size},
+            )
+            return self._location_spec_namer(block_size)
+        spec = self._group_by_idx.get(group_idx)
+        if spec is None:
+            logger.warning(
+                "group_idx not present in kv cache metadata; using fallback spec name",
+                step="kvcm_send",
+                tags={"group_idx": group_idx},
+            )
+            return self._location_spec_namer(block_size)
+        display = _KIND_DISPLAY_NAMES.get(spec.kind, spec.kind)
+        return f"{display}_{group_idx}"
+
+    def _location_specs(
+        self, block_size: int
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        """Build ``location_spec_infos`` and ``location_spec_groups``.
+
+        With group metadata, each group becomes its own location spec named
+        ``{display_kind}_{group_idx}`` sized by that group's own ``block_size``,
+        and each spec gets its own single-member location spec group of the same
+        name. Without metadata a single ``default`` group is used, matching
+        pre-hybrid engines.
+        """
+
+        if self._group_by_idx is None:
+            name = self._location_spec_name(block_size)
+            infos: list[dict[str, object]] = [{"name": name, "size": block_size}]
+            groups: list[dict[str, object]] = [
+                {"name": "default", "spec_names": [name]}
+            ]
+            return infos, groups
+
+        infos = []
+        groups = []
+        for spec in self._group_by_idx.values():
+            name = self._location_spec_name(spec.block_size, spec.group_idx)
+            infos.append({"name": name, "size": spec.block_size})
+            groups.append({"name": name, "spec_names": [name]})
+        return infos, groups
 
     def _register_instance_request(self) -> dict[str, object]:
         cfg = self._engine_config
-        block_size = self._config_int(cfg, "block_size", self._config.block_size)
-        location_spec_name = self._location_spec_name(block_size)
+        block_size = self._config_int(cfg, "block_size")
+        location_spec_infos, location_spec_groups = self._location_specs(block_size)
         raw_dtype = cfg.get("dtype")
         dtype = (
             raw_dtype
@@ -160,7 +238,7 @@ class KvcmClient:
             "instance_group": self._instance_group(),
             "instance_id": self._instance_id(),
             "block_size": block_size,
-            "location_spec_infos": [{"name": location_spec_name, "size": block_size}],
+            "location_spec_infos": location_spec_infos,
             "model_deployment": {
                 "model_name": model_name,
                 "dtype": dtype,
@@ -172,9 +250,7 @@ class KvcmClient:
                 "extra": "",
                 "user_data": "",
             },
-            "location_spec_groups": [
-                {"name": "default", "spec_names": [location_spec_name]}
-            ],
+            "location_spec_groups": location_spec_groups,
         }
 
     def _node_register_event(self) -> dict[str, object]:
@@ -200,11 +276,13 @@ class KvcmClient:
             "storage_type": self._storage_type,
         }
 
-    def _block_specs(self, medium: str) -> list[dict[str, str]]:
-        spec_names = self._block_spec_names()
+    def _block_specs(
+        self, medium: str, group_idx: int | None = None
+    ) -> list[dict[str, str]]:
+        block_size = self._config_int(self._engine_config, "block_size")
         return [
             {
-                "name": spec_names[0],
+                "name": self._location_spec_name(block_size, group_idx),
                 "uri": self._location_uri_builder(self._host_ip_port(), medium),
             }
         ]
@@ -225,7 +303,7 @@ class KvcmClient:
             for event in batch.events:
                 if isinstance(event, BlockStored):
                     medium = self._medium_mapper(event.medium)
-                    specs = self._block_specs(medium)
+                    specs = self._block_specs(medium, event.group_idx)
                     for block_hash in event.block_hashes:
                         events.append(
                             {
@@ -239,6 +317,7 @@ class KvcmClient:
                         )
                 elif isinstance(event, BlockRemoved):
                     medium = self._medium_mapper(event.medium)
+                    specs = self._block_specs(medium, event.group_idx)
                     for block_hash in event.block_hashes:
                         events.append(
                             {
@@ -246,7 +325,7 @@ class KvcmClient:
                                 "block_delete": {
                                     "block_key": str(block_hash),
                                     "medium": medium,
-                                    "spec_names": self._block_spec_names(),
+                                    "specs": specs,
                                 },
                             }
                         )
@@ -281,10 +360,12 @@ class KvcmClient:
             return False
         return await self._manager_client.is_ready()
 
-    async def _register_instance(self) -> None:
+    async def _register_instance(self) -> dict[str, object]:
         if not self._started or self._manager_client is None:
             raise RuntimeError("kvcm client has not been started")
-        await self._manager_client.register_instance(self._register_instance_request())
+        request = self._register_instance_request()
+        await self._manager_client.register_instance(request)
+        return request
 
     async def _register_and_report_node(self) -> bool:
         """Perform the two-step kvcm registration: the register_instance RPC
@@ -292,7 +373,7 @@ class KvcmClient:
         false unless both operations complete successfully."""
 
         try:
-            await self._register_instance()
+            registration_request = await self._register_instance()
         except Exception as exc:
             logger.warning(
                 "kvcm register_instance failed (%s: %s)",
@@ -316,6 +397,28 @@ class KvcmClient:
             )
             return False
         self._registered = True
+        if self._learn_mode and not self._learn_mode_registration_warning_emitted:
+            self._learn_mode_registration_warning_emitted = True
+            location_spec_infos = registration_request.get("location_spec_infos")
+            registered_spec_names = (
+                [
+                    name
+                    for spec in location_spec_infos
+                    if isinstance(spec, dict)
+                    and isinstance((name := spec.get("name")), str)
+                ]
+                if isinstance(location_spec_infos, list)
+                else []
+            )
+            logger.warning(
+                "learn-mode registered KVCM with default specs; later learned "
+                "group metadata cannot update the active registration",
+                step="kv_metadata_learn",
+                tags={
+                    "registered_spec_names": registered_spec_names,
+                    "block_size": registration_request["block_size"],
+                },
+            )
         return True
 
     async def set_engine_available(self, available: bool) -> None:

@@ -280,3 +280,112 @@ def test_reporter_swallows_report_errors(mocker) -> None:
     reporter._queue.put_nowait.side_effect = RuntimeError("queue failure")
 
     reporter.report(_sample(metrics, ("kvcm_send", 0.01)))
+
+
+async def test_zmq_queue_reporter_logs_traffic_and_backlog_signals(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    summary_logged = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _record_info(*args, **kwargs) -> None:
+        if kwargs.get("tags", {}).get("zmq_received_message_count") == 2:
+            loop.call_soon_threadsafe(summary_logged.set)
+
+    info = mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
+    reporter = metrics.ZmqQueueMetricsReporter(
+        state_reader=lambda: {
+            "zmq_sub_readable": True,
+            "zmq_sub_rcvhwm": 1000,
+            "zmq_exact_queue_depth_available": False,
+        },
+        summary_interval_s=0.01,
+    )
+
+    await reporter.start()
+    reporter.record_message(message_bytes=11, queue_nonempty_after_receive=True)
+    reporter.record_message(message_bytes=13, queue_nonempty_after_receive=False)
+    reporter.record_sequence_gap(missed_message_count=3)
+    try:
+        await asyncio.wait_for(summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+
+    info.assert_called_with(
+        "vLLM ZMQ queue metrics",
+        step="zmq_queue_metrics",
+        tags={
+            "zmq_sub_readable": True,
+            "zmq_sub_rcvhwm": 1000,
+            "zmq_exact_queue_depth_available": False,
+            "zmq_received_message_count": 2,
+            "zmq_received_message_bytes": 24,
+            "zmq_queue_nonempty_observation_count": 1,
+            "zmq_sequence_gap_count": 1,
+            "zmq_missed_message_count": 3,
+        },
+    )
+
+
+async def test_zmq_queue_reporter_logs_idle_socket_state(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    summary_logged = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _record_info(*args, **kwargs) -> None:
+        if kwargs.get("tags", {}).get("zmq_received_message_count") == 0:
+            loop.call_soon_threadsafe(summary_logged.set)
+
+    info = mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
+    reporter = metrics.ZmqQueueMetricsReporter(
+        state_reader=lambda: {"zmq_sub_readable": False, "zmq_sub_rcvhwm": 1000},
+        summary_interval_s=0.01,
+    )
+
+    await reporter.start()
+    try:
+        await asyncio.wait_for(summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+
+    info.assert_called_with(
+        "vLLM ZMQ queue metrics",
+        step="zmq_queue_metrics",
+        tags={
+            "zmq_sub_readable": False,
+            "zmq_sub_rcvhwm": 1000,
+            "zmq_received_message_count": 0,
+            "zmq_received_message_bytes": 0,
+            "zmq_queue_nonempty_observation_count": 0,
+            "zmq_sequence_gap_count": 0,
+            "zmq_missed_message_count": 0,
+        },
+    )
+
+
+async def test_zmq_queue_reporter_continues_after_log_failure(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    second_summary_logged = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    calls = 0
+
+    def _record_info(*args, **kwargs) -> None:
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("logger failed")
+        loop.call_soon_threadsafe(second_summary_logged.set)
+
+    mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
+    reporter = metrics.ZmqQueueMetricsReporter(
+        state_reader=lambda: {},
+        summary_interval_s=0.01,
+    )
+
+    await reporter.start()
+    try:
+        await asyncio.wait_for(second_summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+
+    assert calls >= 2

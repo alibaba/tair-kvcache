@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from subscriber.health.events import LivenessEvent
 from subscriber.metrics import StageTimer
-from subscriber.types import KVEventBatch
+from subscriber.types import KvCacheGroupSpec, KVEventBatch
 
 if TYPE_CHECKING:
     from subscriber.config import SubscriberConfig
@@ -124,6 +124,14 @@ class AbstractEngineAdapter(ABC):
         """Build the engine-specific cache location URI reported to KVCM."""
         ...
 
+    async def close(self) -> None:
+        """Release adapter-owned asynchronous resources.
+
+        The subscriber calls this once during shutdown. Adapters without
+        external resources may keep the default no-op implementation.
+        """
+        return None
+
     async def reset_generation_state(self) -> None:
         """Reset adapter-local generation state after an engine restart.
 
@@ -149,5 +157,17 @@ class AbstractEngineAdapter(ABC):
         Closing the old sockets with ``linger=0`` inside this method provides
         a second line of defense by turning parked awaits into exceptions that
         the helpers already translate into ``None``.
+        """
+        return None
+
+    async def fetch_kv_cache_group_metadata(self) -> list[KvCacheGroupSpec] | None:
+        """Return per-group KV cache metadata indexed by ``group_idx``.
+
+        The list position is the ``group_idx`` carried by KV cache events.
+        Returns ``None`` when the engine exposes no group topology (e.g. a
+        single-group / attention-free model, or an adapter with no metadata
+        source). Implementations that fetch over the network should keep
+        retrying until they get a definitive answer, since callers register with
+        kvcm only after this resolves.
         """
         return None
