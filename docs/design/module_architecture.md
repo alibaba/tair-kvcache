@@ -4,7 +4,7 @@
 
 > **维护提示**：当模块的职责、依赖方向或调用关系发生变化，或新增/删除模块时，请同步更新本文档与文末的 Mermaid 图，并同步更新 [AGENTS.md](../../AGENTS.md) 中的缩略图。
 
-相关文档：[基本概念](basic_concepts.md)、[高可用与选主机制](ha_leader_elector.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
+相关文档：[基本概念](basic_concepts.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
 
 ---
 
@@ -245,7 +245,7 @@ sequenceDiagram
 
 ### 4.5 容量回收（后台异步）
 
-`CacheReclaimer` 依据 Quota 与存储水位选出待逐出的 key，通过 `SchedulePlanExecutor`（后台线程池）异步删除 `data_storage` 中的数据并更新 `meta` 索引；删除不阻塞前台请求。回收动作通过 `event` 上报回收事件。
+`CacheReclaimer` 依据 Quota 与存储水位选出待逐出的 key，并把 Location 删除作为端到端异步任务提交给 `SchedulePlanExecutor`。Executor worker 完成元数据 Get/CAS/Sync；Sync 成功后通过定时队列等待删除 delay（等待不占 worker），随后删除 `data_storage` 数据并 CAD `meta` 索引。Reclaimer 在任务终态前按 Instance Group 与 BaseStorageType 维护 pending Location、删除 bytes credit 和硬配额，用于去重、避免过度逐出及提供有界反压；回收动作通过 `event` 上报。完整生命周期和异常语义见 [CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)。
 
 ### 4.6 HA 故障转移
 

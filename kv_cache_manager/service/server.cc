@@ -60,12 +60,20 @@ bool Server::Init(const ServerConfig &config) {
     }
 
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
+    CacheReclaimerAsyncDeleteConfig async_delete_config;
+    async_delete_config.inflight_delete_timeout_ms = config_.GetCacheReclaimerInflightDeleteTimeoutMs();
+    async_delete_config.pending_location_limit_per_group_type =
+        config_.GetCacheReclaimerPendingLocationLimitPerGroupType();
+    async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
+    async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
+    async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                          config_.GetCacheReclaimerKeySamplingSizeTotal(),
                          config_.GetCacheReclaimerKeySamplingSizePerTask(),
                          config_.GetCacheReclaimerDelBatchSize(),
                          config_.GetCacheReclaimerIdleIntervalMs(),
-                         config_.GetCacheReclaimerWorkerSize());
+                         config_.GetCacheReclaimerWorkerSize(),
+                         async_delete_config);
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
 
     // Set revisit interval histogram configuration

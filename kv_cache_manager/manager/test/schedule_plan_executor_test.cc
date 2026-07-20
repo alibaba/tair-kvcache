@@ -1,4 +1,7 @@
+#include <atomic>
 #include <filesystem>
+#include <stdexcept>
+#include <thread>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -11,8 +14,34 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "stub.h"
 using namespace kv_cache_manager;
 namespace {
+std::atomic<bool> sync_entered{false};
+std::atomic<bool> sync_completed{false};
+std::atomic<bool> release_sync{true};
+std::atomic<std::int64_t> sync_delay_ms{0};
+std::atomic<std::size_t> sync_thread_hash{0};
+
+bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
+    (void)obj;
+    (void)keys;
+    sync_thread_hash.store(std::hash<std::thread::id>{}(std::this_thread::get_id()), std::memory_order_relaxed);
+    sync_entered.store(true, std::memory_order_release);
+    while (!release_sync.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sync_delay_ms.load(std::memory_order_relaxed)));
+    sync_completed.store(true, std::memory_order_release);
+    return true;
+}
+
+std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_throw_stub(void *obj, const std::string &instance_id) {
+    (void)obj;
+    (void)instance_id;
+    throw std::runtime_error("injected GetMetaIndexer exception");
+}
+
 class SchedulePlanExecutorTestHelper {
 public:
     static LocationSpec CreateLocationSpec(const std::string &name = "", const std::string &uri = "") {
@@ -55,7 +84,7 @@ public:
         return meta_storage_backend_config;
     }
 
-    bool CreateMetaIndexer(const std::string &instance_id, const std::string &storage_type) {
+    ErrorCode CreateMetaIndexer(const std::string &instance_id, const std::string &storage_type) {
         auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
         auto backend_config = ConstructMetaStorageBackendConfig();
         meta_indexer_config->meta_storage_backend_config_ = backend_config;
@@ -64,7 +93,7 @@ public:
         return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
     }
 
-    bool CreateDataStorage() {
+    ErrorCode CreateDataStorage() {
         auto nfs_storage_spec = std::make_shared<NfsStorageSpec>();
         nfs_storage_spec->set_root_path("/mnt/nfs");
         nfs_storage_spec->set_key_count_per_file(5);
@@ -723,4 +752,334 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequestWithDelay) {
     ASSERT_GE(execution_duration.count(), delay.count() / 1000 - 100)
         << "Task executed too early, expected delay: " << delay.count() / 1000 - 100
         << "ms, actual execution time: " << execution_duration.count() << "ms";
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncAdmissionRunsOnWorkerAndReturnsQuickly) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("async_admission_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/async_admission?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {900}, {location}, location_ids));
+    ASSERT_EQ(1, location_ids.size());
+    std::vector<CacheLocationMap> initial_location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {900}, empty_mask, initial_location_maps));
+    ASSERT_EQ(1, initial_location_maps.size());
+    const auto initial_status = initial_location_maps.front().at(location_ids.front())->status();
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    auto release_blocker_future = release_blocker.get_future().share();
+    ASSERT_TRUE(executor.SubmitTask([&blocker_started, release_blocker_future] {
+        blocker_started.set_value();
+        release_blocker_future.wait();
+    }));
+    ASSERT_EQ(std::future_status::ready, blocker_started.get_future().wait_for(std::chrono::seconds(1)));
+
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {900},
+        .location_ids = {{location_ids.front()}},
+    };
+    const auto begin = std::chrono::steady_clock::now();
+    auto submit_result = executor.SubmitAsync(request);
+    const auto submit_cost = std::chrono::steady_clock::now() - begin;
+    ASSERT_TRUE(submit_result.accepted);
+    ASSERT_TRUE(submit_result.future.valid());
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(submit_cost).count(), 100);
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {900}, empty_mask, location_maps));
+    ASSERT_EQ(initial_status, location_maps.front().at(location_ids.front())->status());
+
+    release_blocker.set_value();
+    const auto result = submit_result.future.get();
+    EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncMetaSelectsAllLocationsAndSkipsDeleting) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("async_meta_selection_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    std::vector<std::string> location_ids;
+    for (int location_idx = 0; location_idx < 2; ++location_idx) {
+        auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS,
+            1,
+            {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc_" + std::to_string(location_idx),
+                                                                "nfs://nfs_01/async_meta_selection_" +
+                                                                    std::to_string(location_idx) + "?size=1")});
+        std::vector<std::string> added_location_ids;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher.BatchAddLocation(request_context.get(), {903}, {location}, added_location_ids));
+        ASSERT_EQ(1, added_location_ids.size());
+        location_ids.push_back(added_location_ids.front());
+    }
+
+    Stub stub;
+    sync_entered.store(false);
+    sync_completed.store(false);
+    release_sync.store(true);
+    sync_delay_ms.store(0);
+    sync_thread_hash.store(0);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_stub);
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheMetaDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {903},
+        .delay = std::chrono::seconds(10),
+    };
+    const auto caller_thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    auto first_submit_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(first_submit_result.accepted);
+
+    const auto sync_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!sync_completed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < sync_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(sync_completed.load(std::memory_order_acquire));
+    EXPECT_NE(caller_thread_hash, sync_thread_hash.load(std::memory_order_relaxed));
+    EXPECT_EQ(std::future_status::timeout, first_submit_result.future.wait_for(std::chrono::milliseconds(10)));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {903}, empty_mask, location_maps));
+    ASSERT_EQ(1, location_maps.size());
+    ASSERT_EQ(2, location_maps.front().size());
+    for (const auto &location_id : location_ids) {
+        ASSERT_EQ(CacheLocationStatus::CLS_DELETING, location_maps.front().at(location_id)->status());
+    }
+
+    sync_entered.store(false, std::memory_order_release);
+    auto second_submit_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(second_submit_result.accepted);
+    ASSERT_EQ(std::future_status::ready, second_submit_result.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(ErrorCode::EC_OK, second_submit_result.future.get().status);
+    EXPECT_FALSE(sync_entered.load(std::memory_order_acquire));
+
+    executor.Stop();
+    ASSERT_EQ(std::future_status::ready, first_submit_result.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(ErrorCode::EC_ERROR, first_submit_result.future.get().status);
+    stub.reset(ADDR(MetaIndexer, Sync));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncMetaAdmissionCancelledOnStop) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    auto release_blocker_future = release_blocker.get_future().share();
+    ASSERT_TRUE(executor.SubmitTask([&blocker_started, release_blocker_future] {
+        blocker_started.set_value();
+        release_blocker_future.wait();
+    }));
+    ASSERT_EQ(std::future_status::ready, blocker_started.get_future().wait_for(std::chrono::seconds(1)));
+
+    const auto submit_begin = std::chrono::steady_clock::now();
+    auto submit_result = executor.SubmitAsync(CacheMetaDelRequest{
+        .instance_id = kTestInstanceName,
+        .block_keys = {904},
+    });
+    const auto submit_cost = std::chrono::steady_clock::now() - submit_begin;
+    ASSERT_TRUE(submit_result.accepted);
+    ASSERT_TRUE(submit_result.future.valid());
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(submit_cost).count(), 100);
+
+    std::thread stop_thread([&executor]() { executor.Stop(); });
+    const auto future_status = submit_result.future.wait_for(std::chrono::seconds(1));
+    release_blocker.set_value();
+    stop_thread.join();
+
+    ASSERT_EQ(std::future_status::ready, future_status);
+    const auto result = submit_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("before delete admission"));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncDelayStartsAfterSyncAndDoesNotOccupyWorker) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("async_delay_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/async_delay?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {901}, {location}, location_ids));
+
+    Stub stub;
+    sync_entered.store(false);
+    sync_completed.store(false);
+    release_sync.store(true);
+    sync_delay_ms.store(150);
+    sync_thread_hash.store(0);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_stub);
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {901},
+        .location_ids = {{location_ids.front()}},
+        .delay = std::chrono::milliseconds(250),
+    };
+    const auto caller_thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto begin = std::chrono::steady_clock::now();
+    auto submit_result = executor.SubmitAsync(request);
+    const auto submit_cost = std::chrono::steady_clock::now() - begin;
+    ASSERT_TRUE(submit_result.accepted);
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(submit_cost).count(), 100);
+
+    const auto sync_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!sync_entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < sync_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(sync_entered.load(std::memory_order_acquire));
+    EXPECT_NE(caller_thread_hash, sync_thread_hash.load(std::memory_order_relaxed));
+
+    const auto deleting_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    bool deleting = false;
+    while (std::chrono::steady_clock::now() < deleting_deadline) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask empty_mask;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher.BatchGetLocation(request_context.get(), {901}, empty_mask, location_maps));
+        deleting = !location_maps.empty() && !location_maps.front().empty() &&
+                   location_maps.front().at(location_ids.front())->status() == CacheLocationStatus::CLS_DELETING;
+        if (deleting) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(deleting);
+
+    const auto sync_completed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!sync_completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < sync_completed_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(sync_completed.load(std::memory_order_acquire));
+
+    std::promise<void> immediate_task_done;
+    auto immediate_task_future = immediate_task_done.get_future();
+    ASSERT_TRUE(executor.SubmitTask([&immediate_task_done] { immediate_task_done.set_value(); }));
+    EXPECT_EQ(std::future_status::ready, immediate_task_future.wait_for(std::chrono::milliseconds(100)));
+
+    const auto result = submit_result.future.get();
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+    EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 380);
+    stub.reset(ADDR(MetaIndexer, Sync));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncCompletesFailureAndExceptionPaths) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = "missing_instance",
+        .block_keys = {1},
+        .location_ids = {{"location"}},
+    };
+
+    auto missing_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(missing_result.accepted);
+    ASSERT_EQ(std::future_status::ready, missing_result.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(ErrorCode::EC_NOENT, missing_result.future.get().status);
+
+    auto missing_meta_result = executor.SubmitAsync(CacheMetaDelRequest{
+        .instance_id = "missing_instance",
+        .block_keys = {1},
+    });
+    ASSERT_TRUE(missing_meta_result.accepted);
+    ASSERT_EQ(std::future_status::ready, missing_meta_result.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(ErrorCode::EC_NOENT, missing_meta_result.future.get().status);
+
+    Stub stub;
+    stub.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_throw_stub);
+    auto exception_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(exception_result.accepted);
+    ASSERT_EQ(std::future_status::ready, exception_result.future.wait_for(std::chrono::seconds(1)));
+    const auto result = exception_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("injected GetMetaIndexer exception"));
+
+    auto meta_exception_result = executor.SubmitAsync(CacheMetaDelRequest{
+        .instance_id = "missing_instance",
+        .block_keys = {1},
+    });
+    ASSERT_TRUE(meta_exception_result.accepted);
+    ASSERT_EQ(std::future_status::ready, meta_exception_result.future.wait_for(std::chrono::seconds(1)));
+    const auto meta_result = meta_exception_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, meta_result.status);
+    EXPECT_NE(std::string::npos, meta_result.error_message.find("injected GetMetaIndexer exception"));
+    stub.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncSecondEnqueueFailureCompletesFuture) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("async_second_enqueue_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/second_enqueue?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {902}, {location}, location_ids));
+
+    Stub stub;
+    sync_entered.store(false);
+    release_sync.store(false);
+    sync_delay_ms.store(0);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_stub);
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {902},
+        .location_ids = {{location_ids.front()}},
+        .delay = std::chrono::milliseconds(10),
+    };
+    auto submit_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(submit_result.accepted);
+
+    const auto sync_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!sync_entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < sync_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(sync_entered.load(std::memory_order_acquire));
+    executor.stop_.store(true);
+    executor.condition_.notify_all();
+    release_sync.store(true, std::memory_order_release);
+
+    ASSERT_EQ(std::future_status::ready, submit_result.future.wait_for(std::chrono::seconds(1)));
+    const auto result = submit_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("physical delete task"));
+    executor.Stop();
+    stub.reset(ADDR(MetaIndexer, Sync));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncRejectedHasNoFuture) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    executor.Stop();
+    const auto location_submit_result = executor.SubmitAsync(CacheLocationDelRequest{});
+    EXPECT_FALSE(location_submit_result.accepted);
+    EXPECT_FALSE(location_submit_result.future.valid());
+    const auto meta_submit_result = executor.SubmitAsync(CacheMetaDelRequest{});
+    EXPECT_FALSE(meta_submit_result.accepted);
+    EXPECT_FALSE(meta_submit_result.future.valid());
 }

@@ -128,7 +128,32 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->cache_reclaimer_worker_size_ = std::stol(value);
          return true;
-    }},
+     }},
+    {"kvcm.cache_reclaimer.inflight_delete_timeout_ms",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_inflight_delete_timeout_ms_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_location_limit_per_group_type",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_location_limit_per_group_type_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_bytes_limit_per_group_type",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_bytes_limit_per_group_type_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_delete_handler_limit",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_delete_handler_limit_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_bytes_limit",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_bytes_limit_ = std::stoull(value);
+         return true;
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -200,6 +225,11 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_del_batch_size_ = 100;
     cache_reclaimer_idle_interval_ms_ = 100;
     cache_reclaimer_worker_size_ = 16;
+    cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
+    cache_reclaimer_pending_location_limit_per_group_type_ = 100000;
+    cache_reclaimer_pending_bytes_limit_per_group_type_ = 64ULL * 1024 * 1024 * 1024;
+    cache_reclaimer_pending_delete_handler_limit_ = 1024;
+    cache_reclaimer_pending_bytes_limit_ = 256ULL * 1024 * 1024 * 1024;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {
@@ -308,6 +338,14 @@ bool ServerConfig::Check() {
         if (boundaries.empty()) {
             return false; // ParseRevisitIntervalBuckets already printed the error
         }
+    }
+
+    if (cache_reclaimer_inflight_delete_timeout_ms_ == 0 ||
+        cache_reclaimer_pending_location_limit_per_group_type_ == 0 ||
+        cache_reclaimer_pending_bytes_limit_per_group_type_ == 0 ||
+        cache_reclaimer_pending_delete_handler_limit_ == 0 || cache_reclaimer_pending_bytes_limit_ == 0) {
+        fprintf(stderr, "CacheReclaimer async delete limits and timeout must be greater than zero\n");
+        return false;
     }
 
     return true;

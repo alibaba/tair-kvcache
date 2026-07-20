@@ -24,7 +24,9 @@ Example:
 
 ## KVCacheManager Server Config
 
-KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置：
+KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置。
+CacheReclaimer 异步删除相关参数的生命周期语义见
+[CacheReclaimer 异步删除与过度逐出优化设计](design/cache_reclaimer_async_delete.md)。
 
 ```TEXT
 ## 参数配置方式有3种，相同配置按照从前往后的覆盖关系（后覆盖前）
@@ -76,6 +78,18 @@ kvcm.service.enable_debug_service=false
 
 # 指定KVCache Manager初始配置JSON文件路径
 kvcm.startup_config=package/etc/default_startup_config.json
+
+# CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
+# 不取消底层删除。默认 60000ms。
+kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
+
+# 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
+kvcm.cache_reclaimer.pending_location_limit_per_group_type=100000
+kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
+
+# 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
+kvcm.cache_reclaimer.pending_delete_handler_limit=1024
+kvcm.cache_reclaimer.pending_bytes_limit=274877906944
 
 # 可选值有dummy，local，logging，kmonitor；若不配置，默认启用logging
 kvcm.metrics.reporter_type

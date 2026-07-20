@@ -47,6 +47,32 @@ bool VecContains(const std::vector<std::int64_t> &vec, const std::int64_t v) {
     return std::any_of(vec.cbegin(), vec.cend(), [v](const std::int64_t &e) { return e == v; });
 }
 
+std::vector<CacheLocationMap>
+MakeServingLocationMaps(const std::size_t count, const DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS) {
+    std::vector<CacheLocationMap> maps;
+    maps.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string location_id = "serving_location_" + std::to_string(i);
+        maps.push_back(CacheLocationMap{
+            {location_id,
+             std::make_shared<CacheLocation>(
+                 location_id, CacheLocationStatus::CLS_SERVING, type, 0, std::vector<LocationSpec>{})},
+        });
+    }
+    return maps;
+}
+
+CacheLocationConstPtr MakeCacheLocation(const std::string &location_id,
+                                        const CacheLocationStatus status,
+                                        const DataStorageType type,
+                                        const std::string &uri) {
+    std::vector<LocationSpec> specs;
+    if (!uri.empty()) {
+        specs.emplace_back("test_spec", uri);
+    }
+    return std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
+}
+
 /* ---------------- RegistryManager_ListInstanceGroup_stub ---------------- */
 
 using ins_group_ptr_vec = std::vector<std::shared_ptr<const InstanceGroup>>;
@@ -167,26 +193,39 @@ RegistryManager_ListInstanceInfo_stub(void *obj, RequestContext *rc, const std::
     return std::make_pair(list_ins_info_result, iv);
 }
 
-/* ---------------- SchedulePlanExecutor_Submit_stub ---------------- */
+/* ---------------- SchedulePlanExecutor_SubmitAsync_stub ---------------- */
 
 std::chrono::milliseconds spe_submit_delay{0};
 PlanExecuteResult del_result;
+bool spe_submit_accepted;
+bool spe_submit_auto_complete;
+bool spe_submit_invalid_future;
 std::vector<CacheLocationDelRequest> submitted_del_requests;
+std::vector<std::shared_ptr<std::promise<PlanExecuteResult>>> submitted_del_promises;
 std::mutex submitted_del_requests_mutex;
-// spe_submit_loc is used to help casting the func addr in the stub def below
-// the using declarations is the same as
-// typedef std::future<PlanExecuteResult> (SchedulePlanExecutor::*spe_submit_loc)(const CacheLocationDelRequest &);
-using spe_submit_loc = std::future<PlanExecuteResult> (SchedulePlanExecutor::*)(const CacheLocationDelRequest &);
+using spe_submit_async_loc = AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const CacheLocationDelRequest &);
 
-std::future<PlanExecuteResult> SchedulePlanExecutor_Submit_stub(void *obj, const CacheLocationDelRequest &request) {
+AsyncDeleteSubmitResult SchedulePlanExecutor_SubmitAsync_stub(void *obj, const CacheLocationDelRequest &request) {
     const auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
     {
         std::lock_guard<std::mutex> lock(submitted_del_requests_mutex);
         submitted_del_requests.emplace_back(request);
+        if (!spe_submit_auto_complete) {
+            submitted_del_promises.emplace_back(promise);
+        }
     }
     std::this_thread::sleep_for(spe_submit_delay);
-    promise->set_value(del_result);
-    return promise->get_future();
+    if (!spe_submit_accepted) {
+        return {};
+    }
+    if (spe_submit_invalid_future) {
+        return AsyncDeleteSubmitResult{true, {}};
+    }
+    auto future = promise->get_future();
+    if (spe_submit_auto_complete) {
+        promise->set_value(del_result);
+    }
+    return AsyncDeleteSubmitResult{true, std::move(future)};
 }
 
 /* ---------------- MetaIndexerManager_GetMetaIndexer_stub ---------------- */
@@ -308,7 +347,8 @@ public:
         // set up stubs
         stub_.set(ADDR(RegistryManager, ListInstanceGroup), RegistryManager_ListInstanceGroup_stub);
         stub_.set(ADDR(RegistryManager, ListInstanceInfo), RegistryManager_ListInstanceInfo_stub);
-        stub_.set(static_cast<spe_submit_loc>(ADDR(SchedulePlanExecutor, Submit)), SchedulePlanExecutor_Submit_stub);
+        stub_.set(static_cast<spe_submit_async_loc>(ADDR(SchedulePlanExecutor, SubmitAsync)),
+                  SchedulePlanExecutor_SubmitAsync_stub);
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
@@ -331,6 +371,9 @@ public:
         dummy_meta_searcher = std::make_shared<MetaSearcher>(nullptr);
 
         del_result = {ErrorCode::EC_OK, ""};
+        spe_submit_accepted = true;
+        spe_submit_auto_complete = true;
+        spe_submit_invalid_future = false;
         get_result = ErrorCode::EC_OK;
         random_sample_result = ErrorCode::EC_OK;
         sample_reclaim_result = ErrorCode::EC_OK;
@@ -373,6 +416,20 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, block_del_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, location_del_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, location_del_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, credit_timeout_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, credit_timeout_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, pending_limit_reject_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_limit_reject_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) = mr_->GetCounter(
+            SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, duplicate_pending_location_filtered_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_no_progress_backoff_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_no_progress_backoff_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, delete_submit_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, delete_submit_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, delete_complete_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, delete_complete_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, delete_fail_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, delete_fail_count));
 
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_duration_us));
@@ -386,6 +443,18 @@ public:
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_filter_duration_us));
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_submit_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, pending_delete_handler_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_delete_handler_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, pending_location_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_location_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, pending_delete_bytes) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_delete_bytes));
+        cache_reclaimer_->METRICS_(cache_reclaimer, credited_delete_bytes) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, credited_delete_bytes));
+        cache_reclaimer_->METRICS_(cache_reclaimer, predicted_deleted_key_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, predicted_deleted_key_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, oldest_pending_request_age_ms) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, oldest_pending_request_age_ms));
     }
 
     void TearDown() override {
@@ -400,6 +469,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(submitted_del_requests_mutex);
             submitted_del_requests.clear();
+            submitted_del_promises.clear();
         }
 
         get_out_properties.clear();
@@ -409,7 +479,7 @@ public:
 
         stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
         stub_.reset(ADDR(RegistryManager, ListInstanceInfo));
-        stub_.reset(static_cast<spe_submit_loc>(ADDR(SchedulePlanExecutor, Submit)));
+        stub_.reset(static_cast<spe_submit_async_loc>(ADDR(SchedulePlanExecutor, SubmitAsync)));
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
@@ -462,6 +532,22 @@ public:
         return WaitUntil([this] { return HasSubmittedDelRequests(); }, timeout);
     }
 
+    void CompleteSubmittedDelete(const std::size_t index, const PlanExecuteResult &result) {
+        std::shared_ptr<std::promise<PlanExecuteResult>> promise;
+        {
+            std::lock_guard<std::mutex> lock(submitted_del_requests_mutex);
+            ASSERT_LT(index, submitted_del_promises.size());
+            promise = submitted_del_promises[index];
+        }
+        promise->set_value(result);
+    }
+
+    void ReplaceReclaimer(const CacheReclaimerAsyncDeleteConfig &config) {
+        cache_reclaimer_->Stop();
+        cache_reclaimer_ =
+            std::make_unique<CacheReclaimer>(10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr, config);
+    }
+
     int ListInstanceGroupCallCount() {
         std::lock_guard<std::mutex> lock(list_ins_group_mut);
         return list_ins_group_call_counter;
@@ -482,7 +568,7 @@ public:
 TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
     stub_.reset(ADDR(RegistryManager, ListInstanceInfo));
-    stub_.reset(static_cast<spe_submit_loc>(ADDR(SchedulePlanExecutor, Submit)));
+    stub_.reset(static_cast<spe_submit_async_loc>(ADDR(SchedulePlanExecutor, SubmitAsync)));
     stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
@@ -675,8 +761,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
 
     {
         cache_reclaimer_->Pause();
@@ -1382,10 +1467,11 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
     }
 
     {
-        // instance 0 block byte size = 1024, key count = 0, max key count = 32
-        // instance 1 block byte size = 1024, key count = 0, max key count = 32
+        // instance 0 storage usage = 1024, key count = 0, max key count = 32
+        // instance 1 storage usage = 1024, key count = 0, max key count = 32
         // group quota capacity set to zero
-        // should *not* trigger reclaiming when group_used_byte_size = 0
+        // Byte and key-count water levels are independent, so positive official
+        // storage usage still triggers reclaiming when the key count is zero.
 
         key_count = 0;
         max_key_count = 32;
@@ -1398,7 +1484,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
     }
 
     {
@@ -1431,10 +1518,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
     }
 
     {
-        // instance 0 block byte size = 1024, key count = 0, max key count = 32
-        // instance 1 block byte size = 1024, key count = 0, max key count = 32
+        // instance 0 storage usage = 1024, key count = 0, max key count = 32
+        // instance 1 storage usage = 1024, key count = 0, max key count = 32
         // group quota capacity set to -1
-        // should *not* trigger reclaiming when group_used_byte_size = 0
+        // A negative capacity has the same zero-capacity semantics.
 
         key_count = 0;
         max_key_count = 32;
@@ -1447,7 +1534,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
     }
 }
 
@@ -1611,7 +1699,7 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     // batching_size default to 100 which is larger than the size of sampled keys (10)
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(sample_reclaim_keys.size());
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     // main thread sleeps for 10ms to ensure the worker thread do
@@ -1684,8 +1772,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -1753,8 +1840,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -1824,8 +1910,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -1958,8 +2043,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -2171,6 +2255,7 @@ TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     del_result = {ErrorCode::EC_ERROR, "unknown"};
 
     // update the trigger strategy to trigger the reclaiming
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -2183,10 +2268,10 @@ TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    ASSERT_TRUE(WaitUntilSubmittedDelRequests());
     ASSERT_TRUE(cache_reclaimer_->IsRunning()); // the worker thread should still be running
 
     cache_reclaimer_->Stop();
@@ -2377,8 +2462,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 5));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), 0);
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
@@ -2467,7 +2551,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.01); // 1%
         instance_groups.emplace_back(ins_group);
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = MakeServingLocationMaps(sample_reclaim_keys.size());
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2493,7 +2577,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         // clear requests from previous test
         ClearSubmittedDelRequests();
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = MakeServingLocationMaps(sample_reclaim_keys.size());
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -2519,7 +2603,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         // clear requests from previous test
         ClearSubmittedDelRequests();
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = MakeServingLocationMaps(sample_reclaim_keys.size());
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         ASSERT_TRUE(WaitUntilSubmittedDelRequests());
@@ -2584,8 +2668,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     const auto initial_sleep_interval = std::chrono::milliseconds(100);
     cache_reclaimer_->SetSleepIntervalMs(request_context_.get(),
                                          static_cast<std::uint32_t>(initial_sleep_interval.count()));
@@ -2660,8 +2743,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
 
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
-    batch_get_loc_out_maps =
-        std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
+    batch_get_loc_out_maps = MakeServingLocationMaps(cache_reclaimer_->GetBatchingSize(request_context_.get()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     // worker thread should first sleep for 10ms then do the reclaiming
@@ -2737,8 +2819,19 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes01) {
     auto fut = promise->get_future();
 
     cache_reclaimer_->delete_handlers_.clear();
-    cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 2, 3, std::move(fut));
+    const auto now = std::chrono::steady_clock::now();
+    cache_reclaimer_->delete_handlers_.emplace_front(request_context_,
+                                                     "test_instance",
+                                                     "test_instance_group",
+                                                     2,
+                                                     3,
+                                                     std::vector<CacheReclaimer::PendingLocationKey>{},
+                                                     CacheReclaimer::BytesByStorageType{},
+                                                     CacheReclaimer::CountsByStorageType{},
+                                                     0,
+                                                     now,
+                                                     now + std::chrono::hours(1),
+                                                     std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -2762,11 +2855,18 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes02) {
         promises.emplace_back(promise);
 
         auto fut = promise->get_future();
+        const auto now = std::chrono::steady_clock::now();
         cache_reclaimer_->delete_handlers_.emplace_front(request_context_,
                                                          "test_instance" + std::to_string(i),
                                                          "test_instance_group" + std::to_string(i),
                                                          0,
                                                          0,
+                                                         std::vector<CacheReclaimer::PendingLocationKey>{},
+                                                         CacheReclaimer::BytesByStorageType{},
+                                                         CacheReclaimer::CountsByStorageType{},
+                                                         0,
+                                                         now,
+                                                         now + std::chrono::hours(1),
                                                          std::move(fut));
     }
 
@@ -2806,15 +2906,27 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
     auto fut = promise->get_future();
 
     cache_reclaimer_->delete_handlers_.clear();
-    cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 0, 0, std::move(fut));
+    const auto now = std::chrono::steady_clock::now();
+    cache_reclaimer_->delete_handlers_.emplace_front(request_context_,
+                                                     "test_instance",
+                                                     "test_instance_group",
+                                                     0,
+                                                     0,
+                                                     std::vector<CacheReclaimer::PendingLocationKey>{},
+                                                     CacheReclaimer::BytesByStorageType{},
+                                                     CacheReclaimer::CountsByStorageType{},
+                                                     0,
+                                                     now,
+                                                     now + std::chrono::hours(1),
+                                                     std::move(fut));
 
     try {
         throw std::runtime_error("test exception");
     } catch (...) { promise->set_exception(std::current_exception()); }
 
     cache_reclaimer_->HandleDelRes();
-    ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.front().credit_enabled_);
 }
 
 TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
@@ -2826,11 +2938,652 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
     fut.get(); // fut is not valid anymore
 
     cache_reclaimer_->delete_handlers_.clear();
-    cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 0, 0, std::move(fut));
+    const auto now = std::chrono::steady_clock::now();
+    cache_reclaimer_->delete_handlers_.emplace_front(request_context_,
+                                                     "test_instance",
+                                                     "test_instance_group",
+                                                     0,
+                                                     0,
+                                                     std::vector<CacheReclaimer::PendingLocationKey>{},
+                                                     CacheReclaimer::BytesByStorageType{},
+                                                     CacheReclaimer::CountsByStorageType{},
+                                                     0,
+                                                     now,
+                                                     now + std::chrono::hours(1),
+                                                     std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
-    ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.front().credit_enabled_);
+}
+
+TEST_F(CacheReclaimerTest, TestAsyncDeleteStateIsInstanceIsolatedAndReleasedOnTerminalFuture) {
+    spe_submit_auto_complete = false;
+    cache_reclaimer_->job_state_flag_ = true;
+
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    const auto nfs_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    bytes_by_type[nfs_idx] = 100;
+    counts_by_type[nfs_idx] = 1;
+    CacheLocationDelRequest request{
+        .instance_id = "ignored_by_reclaimer",
+        .block_keys = {7},
+        .location_ids = {{"same_location"}},
+    };
+
+    const auto instance_1 = InstanceInfoFactory();
+    ASSERT_TRUE(
+        cache_reclaimer_->SubmitDelReq(request_context_, instance_1, request, bytes_by_type, counts_by_type, 1));
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    ASSERT_EQ(1, cache_reclaimer_->pending_locations_.size());
+    ASSERT_EQ(100, cache_reclaimer_->credited_delete_bytes_by_group_.at(instance_1->instance_group_name())[nfs_idx]);
+    ASSERT_EQ(1, cache_reclaimer_->predicted_deleted_keys_by_group_.at(instance_1->instance_group_name()));
+    ASSERT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    ASSERT_EQ(100, cache_reclaimer_->pending_delete_bytes_);
+
+    // The same instance/block/location is pending before Executor CAS and must not be submitted again.
+    ASSERT_FALSE(
+        cache_reclaimer_->SubmitDelReq(request_context_, instance_1, request, bytes_by_type, counts_by_type, 1));
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+
+    // The same block/location in another instance remains independent.
+    const auto instance_2 = InstanceInfoFactory();
+    instance_2->set_instance_id("second_instance");
+    ASSERT_TRUE(
+        cache_reclaimer_->SubmitDelReq(request_context_, instance_2, request, bytes_by_type, counts_by_type, 1));
+    ASSERT_EQ(2, SubmittedDelRequestCount());
+    ASSERT_EQ(2, cache_reclaimer_->pending_locations_.size());
+    ASSERT_EQ(200, cache_reclaimer_->credited_delete_bytes_by_group_.at(instance_1->instance_group_name())[nfs_idx]);
+    ASSERT_EQ(2, cache_reclaimer_->pending_delete_handler_count_);
+    // Direct submissions bypass the cron's end-of-batch metrics refresh.
+    cache_reclaimer_->UpdateAsyncDeleteMetrics();
+    const MetricsTags credit_tags{{"instance_group", instance_1->instance_group_name()},
+                                  {"storage_type", ToString(DataStorageType::DATA_STORAGE_TYPE_NFS)}};
+    EXPECT_EQ(
+        200,
+        mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, credited_delete_bytes), credit_tags).Get());
+
+    CompleteSubmittedDelete(0, PlanExecuteResult{ErrorCode::EC_PARTIAL_OK, "partial"});
+    CompleteSubmittedDelete(1, PlanExecuteResult{ErrorCode::EC_ERROR, "failed"});
+    cache_reclaimer_->HandleDelRes();
+
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_locations_.empty());
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_TRUE(cache_reclaimer_->predicted_deleted_keys_by_group_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_quota_by_group_type_.empty());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_bytes_);
+    EXPECT_EQ(
+        0,
+        mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, credited_delete_bytes), credit_tags).Get());
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocationCreditsNormalizeTypeAndPredictKeysConservatively) {
+    const auto instance = InstanceInfoFactory();
+    batch_get_loc_out_maps = {
+        CacheLocationMap{
+            {"hf3fs",
+             MakeCacheLocation("hf3fs",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+                               "nfs://store/hf3fs?size=10")},
+            {"vcns",
+             MakeCacheLocation("vcns",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS,
+                               "nfs://store/vcns?size=20")},
+        },
+        CacheLocationMap{
+            {"unknown_size",
+             MakeCacheLocation("unknown_size",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store/unknown?size=not-a-number")},
+            {"active_writer",
+             MakeCacheLocation("active_writer",
+                               CacheLocationStatus::CLS_WRITING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store/writing?size=40")},
+        },
+    };
+
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {10, 11},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+
+    const auto hf3fs_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+    const auto vcns_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+    const auto nfs_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(2, location_ids.size());
+    EXPECT_EQ(2, location_ids[0].size());
+    EXPECT_EQ(1, location_ids[1].size());
+    EXPECT_EQ(30, bytes_by_type[hf3fs_idx]);
+    EXPECT_EQ(2, counts_by_type[hf3fs_idx]);
+    EXPECT_EQ(0, bytes_by_type[vcns_idx]);
+    EXPECT_EQ(0, counts_by_type[vcns_idx]);
+    EXPECT_EQ(0, bytes_by_type[nfs_idx]);
+    EXPECT_EQ(1, counts_by_type[nfs_idx]);
+    EXPECT_EQ(1, predicted_keys);
+
+    // Pending is scoped by instance_id: it is filtered in the same instance but not another one.
+    batch_get_loc_out_maps = {batch_get_loc_out_maps.front()};
+    cache_reclaimer_->pending_locations_.insert({instance->instance_id(), 10, "hf3fs"});
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {10},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    EXPECT_EQ(1, location_ids.front().size());
+    EXPECT_EQ("vcns", location_ids.front().front());
+    EXPECT_EQ(0, predicted_keys);
+
+    const auto other_instance = InstanceInfoFactory();
+    other_instance->set_instance_id("other_instance");
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              other_instance,
+                                              {10},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    EXPECT_EQ(2, location_ids.front().size());
+    EXPECT_EQ(1, predicted_keys);
+}
+
+TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHardQuota) {
+    CacheReclaimerAsyncDeleteConfig config;
+    config.inflight_delete_timeout_ms = 1;
+    config.pending_delete_handler_limit = 1;
+    ReplaceReclaimer(config);
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    const auto type_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    bytes_by_type[type_idx] = 64;
+    counts_by_type[type_idx] = 1;
+    const auto instance = InstanceInfoFactory();
+    CacheLocationDelRequest request{
+        .block_keys = {1},
+        .location_ids = {{"deadline_location"}},
+    };
+    ASSERT_TRUE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 1));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_FALSE(cache_reclaimer_->delete_handlers_.front().credit_enabled_);
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_TRUE(cache_reclaimer_->predicted_deleted_keys_by_group_.empty());
+    EXPECT_EQ(1, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(64, cache_reclaimer_->pending_delete_bytes_);
+    EXPECT_EQ(1,
+              cache_reclaimer_->pending_quota_by_group_type_
+                  .at({instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_NFS})
+                  .location_count);
+
+    CacheLocationDelRequest second_request{
+        .block_keys = {2},
+        .location_ids = {{"second_location"}},
+    };
+    EXPECT_FALSE(
+        cache_reclaimer_->SubmitDelReq(request_context_, instance, second_request, bytes_by_type, counts_by_type, 1));
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+
+    CompleteSubmittedDelete(0, PlanExecuteResult{ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_locations_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_quota_by_group_type_.empty());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_bytes_);
+}
+
+TEST_F(CacheReclaimerTest, TestInvalidFutureDisablesCreditButKeepsPendingAndQuota) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_invalid_future = true;
+
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    const auto type_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    bytes_by_type[type_idx] = 32;
+    counts_by_type[type_idx] = 1;
+    const auto instance = InstanceInfoFactory();
+    CacheLocationDelRequest request{
+        .block_keys = {2},
+        .location_ids = {{"invalid_future_location"}},
+    };
+    ASSERT_TRUE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 1));
+    cache_reclaimer_->HandleDelRes();
+
+    ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_FALSE(cache_reclaimer_->delete_handlers_.front().credit_enabled_);
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_EQ(1, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(32, cache_reclaimer_->pending_delete_bytes_);
+}
+
+TEST_F(CacheReclaimerTest, TestBackpressureCropsOnlySaturatedGroupTypeAndProcessLimitStopsAll) {
+    CacheReclaimerAsyncDeleteConfig config;
+    config.pending_location_limit_per_group_type = 1;
+    config.pending_bytes_limit_per_group_type = 1024;
+    ReplaceReclaimer(config);
+
+    const auto instance = InstanceInfoFactory();
+    cache_reclaimer_->pending_quota_by_group_type_[{instance->instance_group_name(),
+                                                    DataStorageType::DATA_STORAGE_TYPE_HF3FS}] = {1, 1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"hf3fs",
+         MakeCacheLocation("hf3fs",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+                           "nfs://store/hf3fs?size=10")},
+        {"nfs",
+         MakeCacheLocation("nfs",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/nfs?size=20")},
+    }};
+
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    ASSERT_EQ(1, location_ids.front().size());
+    EXPECT_EQ("nfs", location_ids.front().front());
+    EXPECT_EQ(0, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_HF3FS)]);
+    EXPECT_EQ(20, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(0, predicted_keys);
+    const MetricsTags hf3fs_limit_tags{{"instance_group", instance->instance_group_name()},
+                                       {"storage_type", ToString(DataStorageType::DATA_STORAGE_TYPE_HF3FS)}};
+    EXPECT_GT(mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_limit_reject_count),
+                              hf3fs_limit_tags)
+                  .Get(),
+              0);
+
+    cache_reclaimer_
+        ->pending_quota_by_group_type_[{instance->instance_group_name(), DataStorageType::DATA_STORAGE_TYPE_HF3FS}] = {
+        0, config.pending_bytes_limit_per_group_type};
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.front().size());
+    EXPECT_EQ("nfs", location_ids.front().front());
+
+    cache_reclaimer_->pending_delete_handler_count_ = config.pending_delete_handler_limit;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    EXPECT_TRUE(location_ids.front().empty());
+    EXPECT_EQ(0, create_age_stats.min_us);
+    EXPECT_EQ(0, create_age_stats.max_us);
+    EXPECT_EQ(0, create_age_stats.avg_us);
+
+    cache_reclaimer_->pending_delete_handler_count_ = 0;
+    cache_reclaimer_->pending_delete_bytes_ = config.pending_bytes_limit;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    EXPECT_TRUE(location_ids.front().empty());
+}
+
+TEST_F(CacheReclaimerTest, TestEmptyAndRejectedRequestsLeaveNoAsyncDeleteState) {
+    cache_reclaimer_->job_state_flag_ = true;
+    const auto instance = InstanceInfoFactory();
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+
+    EXPECT_FALSE(cache_reclaimer_->SubmitDelReq(
+        request_context_, instance, CacheLocationDelRequest{}, bytes_by_type, counts_by_type, 0));
+    EXPECT_EQ(0, SubmittedDelRequestCount());
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_locations_.empty());
+
+    spe_submit_accepted = false;
+    CacheLocationDelRequest request{
+        .block_keys = {1},
+        .location_ids = {{"rejected_location"}},
+    };
+    counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = 1;
+    EXPECT_FALSE(cache_reclaimer_->SubmitDelReq(request_context_, instance, request, bytes_by_type, counts_by_type, 0));
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_locations_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_quota_by_group_type_.empty());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+}
+
+TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
+    EXPECT_EQ(0, CacheReclaimer::SaturatingSub(1, 2));
+    EXPECT_EQ(0, CacheReclaimer::SaturatingSub(0, std::numeric_limits<std::uint64_t>::max()));
+    EXPECT_EQ(3, CacheReclaimer::SaturatingSub(5, 2));
+
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(100);
+    instance_group->quota_.quota_config_.clear();
+    QuotaConfig nfs_quota;
+    nfs_quota.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    nfs_quota.set_capacity(100);
+    instance_group->quota_.quota_config_.push_back(nfs_quota);
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 90);
+    key_count = 79;
+    max_key_count = 100;
+
+    CacheReclaimer::BytesByStorageType credit{};
+    credit[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = 20;
+    cache_reclaimer_->credited_delete_bytes_by_group_[instance_group->name()] = credit;
+    cache_reclaimer_->predicted_deleted_keys_by_group_[instance_group->name()] =
+        std::numeric_limits<std::uint64_t>::max();
+    cache_reclaimer_->job_state_flag_ = true;
+    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                   instance_group->name(),
+                                                                   instance_group->quota(),
+                                                                   instance_group->cache_config()->reclaim_strategy(),
+                                                                   instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_FALSE(water_level->CheckGroupWaterLevelExceed());
+
+    // A byte credit that saturates effective bytes at zero must not
+    // suppress an independently exceeded key-count water level.
+    credit[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = std::numeric_limits<std::uint64_t>::max();
+    cache_reclaimer_->credited_delete_bytes_by_group_[instance_group->name()] = credit;
+    cache_reclaimer_->predicted_deleted_keys_by_group_[instance_group->name()] = 0;
+    key_count = 90;
+    const auto key_water_level =
+        cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                              instance_group->name(),
+                                              instance_group->quota(),
+                                              instance_group->cache_config()->reclaim_strategy(),
+                                              instance_infos);
+    ASSERT_NE(nullptr, key_water_level);
+    EXPECT_TRUE(key_water_level->GetGeneralWaterLevelExceed());
+
+    // The symmetric case must still evaluate byte usage when predicted
+    // key credit saturates the effective key count at zero.
+    credit.fill(0);
+    cache_reclaimer_->credited_delete_bytes_by_group_[instance_group->name()] = credit;
+    cache_reclaimer_->predicted_deleted_keys_by_group_[instance_group->name()] =
+        std::numeric_limits<std::uint64_t>::max();
+    const auto byte_water_level =
+        cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                              instance_group->name(),
+                                              instance_group->quota(),
+                                              instance_group->cache_config()->reclaim_strategy(),
+                                              instance_infos);
+    ASSERT_NE(nullptr, byte_water_level);
+    EXPECT_TRUE(byte_water_level->GetGeneralWaterLevelExceed());
+
+    // A zero-capacity storage type is satisfied once its effective usage
+    // has saturated to zero; otherwise credit could never stop eviction.
+    instance_group->quota_.quota_config_.front().set_capacity(0);
+    credit[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = std::numeric_limits<std::uint64_t>::max();
+    cache_reclaimer_->credited_delete_bytes_by_group_[instance_group->name()] = credit;
+    const auto zero_effective_usage =
+        cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                              instance_group->name(),
+                                              instance_group->quota(),
+                                              instance_group->cache_config()->reclaim_strategy(),
+                                              instance_infos);
+    ASSERT_NE(nullptr, zero_effective_usage);
+    EXPECT_FALSE(zero_effective_usage->CheckGroupWaterLevelExceed());
+}
+
+TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstance) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"fifty_bytes",
+         MakeCacheLocation("fifty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=50")},
+    }};
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 60);
+
+    const auto instance_1 = InstanceInfoFactory();
+    const auto instance_2 = InstanceInfoFactory();
+    instance_2->set_instance_id("same_group_second_instance");
+    instance_infos = {instance_1, instance_2};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    group->cache_config_->reclaim_strategy_->set_delay_before_delete_ms(1000);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestReclaimCronHandlesReadyFutureBeforeReadingOfficialUsage) {
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    batch_get_loc_out_maps = MakeServingLocationMaps(1);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+    cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), 1);
+
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    instance_groups = {group};
+
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = 30;
+    counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)] = 1;
+    std::promise<PlanExecuteResult> completed_promise;
+    auto completed_future = completed_promise.get_future();
+    completed_promise.set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+    const auto now = std::chrono::steady_clock::now();
+    cache_reclaimer_->delete_handlers_.emplace_front(
+        request_context_,
+        instance_infos.front()->instance_id(),
+        group->name(),
+        1,
+        1,
+        std::vector<CacheReclaimer::PendingLocationKey>{{instance_infos.front()->instance_id(), 999, "old"}},
+        bytes_by_type,
+        counts_by_type,
+        0,
+        now,
+        now + std::chrono::hours(1),
+        std::move(completed_future));
+    cache_reclaimer_->AddDeleteHandlerState(cache_reclaimer_->delete_handlers_.front());
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
+    ASSERT_TRUE(WaitUntilSubmittedDelRequests());
+    cache_reclaimer_->Stop();
+    EXPECT_EQ(0, cache_reclaimer_->pending_locations_.count({instance_infos.front()->instance_id(), 999, "old"}));
+    EXPECT_GT(SubmittedDelRequestCount(), 0);
+}
+
+TEST_F(CacheReclaimerTest, TestPausedCronStillReleasesTerminalFutureState) {
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    const auto nfs_idx = ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    bytes_by_type[nfs_idx] = 16;
+    counts_by_type[nfs_idx] = 1;
+
+    std::promise<PlanExecuteResult> promise;
+    auto future = promise.get_future();
+    promise.set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+    const auto now = std::chrono::steady_clock::now();
+    cache_reclaimer_->delete_handlers_.emplace_front(
+        request_context_,
+        instance_infos.front()->instance_id(),
+        instance_groups.front()->name(),
+        1,
+        1,
+        std::vector<CacheReclaimer::PendingLocationKey>{{instance_infos.front()->instance_id(), 1, "paused"}},
+        bytes_by_type,
+        counts_by_type,
+        1,
+        now,
+        now + std::chrono::hours(1),
+        std::move(future));
+    cache_reclaimer_->AddDeleteHandlerState(cache_reclaimer_->delete_handlers_.front());
+    // Direct state setup bypasses the cron's end-of-batch metrics refresh.
+    cache_reclaimer_->UpdateAsyncDeleteMetrics();
+    ASSERT_EQ(1, cache_reclaimer_->get_cache_reclaimer_pending_delete_handler_count_metrics());
+    cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), 1);
+    cache_reclaimer_->Pause();
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
+    ASSERT_TRUE(WaitUntil(
+        [this] { return cache_reclaimer_->get_cache_reclaimer_pending_delete_handler_count_metrics() == 0; }));
+    cache_reclaimer_->Stop();
+
+    EXPECT_TRUE(cache_reclaimer_->pending_locations_.empty());
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_TRUE(cache_reclaimer_->pending_quota_by_group_type_.empty());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_bytes_);
+}
+
+TEST_F(CacheReclaimerTest, TestReclaimCronBacksOffWhenExecutorRejects) {
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    batch_get_loc_out_maps = MakeServingLocationMaps(1);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    instance_groups = {group};
+    spe_submit_accepted = false;
+    const auto polling_interval = std::chrono::milliseconds(80);
+    cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), static_cast<std::uint32_t>(polling_interval.count()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
+    ASSERT_TRUE(WaitUntilSubmittedDelRequests(std::chrono::seconds(1)));
+    const auto submit_count_after_first_round = SubmittedDelRequestCount();
+    const auto list_count_after_first_round = ListInstanceGroupCallCount();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(submit_count_after_first_round, SubmittedDelRequestCount());
+    EXPECT_EQ(list_count_after_first_round, ListInstanceGroupCallCount());
+    cache_reclaimer_->Stop();
+    EXPECT_GT(cache_reclaimer_->get_cache_reclaimer_reclaim_no_progress_backoff_count_metrics(), 0);
+}
+
+TEST_F(CacheReclaimerTest, TestReclaimCronKeepsPositiveBackoffWhenPollingIntervalIsZero) {
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    batch_get_loc_out_maps = MakeServingLocationMaps(1);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    instance_groups = {group};
+    spe_submit_accepted = false;
+    cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), 0);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
+    ASSERT_TRUE(WaitUntilSubmittedDelRequests(std::chrono::seconds(1)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    cache_reclaimer_->Stop();
+
+    EXPECT_LT(ListInstanceGroupCallCount(), 100);
+    EXPECT_GT(cache_reclaimer_->get_cache_reclaimer_reclaim_no_progress_backoff_count_metrics(), 0);
+}
+
+TEST_F(CacheReclaimerTest, TestTryReclaimReportsNoProgressForPendingOrMissingVictim) {
+    cache_reclaimer_->job_state_flag_ = true;
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"pending",
+         MakeCacheLocation("pending",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/pending?size=1")},
+    }};
+    cache_reclaimer_->pending_locations_.insert({instance_infos.front()->instance_id(), 1, "pending"});
+    auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(0, SubmittedDelRequestCount());
+
+    cache_reclaimer_->pending_locations_.clear();
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"deleting",
+         MakeCacheLocation("deleting",
+                           CacheLocationStatus::CLS_DELETING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/deleting?size=1")},
+    }};
+    result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(0, SubmittedDelRequestCount());
 }
 
 TEST_F(CacheReclaimerTest, TestDoKeySampling) {
