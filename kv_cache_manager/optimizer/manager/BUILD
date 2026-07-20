@@ -62,3 +62,20 @@ cc_library(
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
     ],
 )
+
+cc_library(
+    name = "lite_hit_offline_runner",
+    srcs = [
+        "lite_hit_offline_runner.cc",
+    ],
+    hdrs = [
+        "lite_hit_offline_runner.h",
+    ],
+    deps = [
+        ":online_optimizer_manager",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/trace_loader",
+    ],
+)

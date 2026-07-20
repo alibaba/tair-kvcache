@@ -14,6 +14,18 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "lite_hit_main",
+    srcs = [
+        "lite_hit_main.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/optimizer/manager:lite_hit_offline_runner",
+        "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
 cc_library(
     name = "config",
     hdrs = [
