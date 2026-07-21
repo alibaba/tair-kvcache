@@ -58,7 +58,9 @@ KVCacheManager 支持多节点高可用（HA）部署模式。多个 KVCM 实例
 |---|---|---|
 | CoordinationMemoryBackend | `memory://` | 单进程测试 |
 | CoordinationFileBackend | `file:///path/to/dir` | 单机开发/测试 |
-| CoordinationRedisBackend | `redis://[password@]host:port[?params]` | 生产环境 |
+| CoordinationRedisBackend | `redis://[auth_token@]host:port/?db=<index>[&params]` | 生产环境 |
+
+Redis DB 只能通过 query 参数 `db` 指定，未配置时使用 DB 0；URI path（例如 `/1`）不会选择 DB。`db > 0` 要求 Redis 服务端支持 `SELECT`，因此不适用于 Redis Cluster。
 
 ### 3.2 LeaderElector
 
@@ -251,7 +253,7 @@ kvcm.leader_elector.loop_interval_ms=100
 **多节点 HA（Redis，生产）：**
 
 ```
-kvcm.coordination.uri=redis://your_password@redis-host:6379?timeout_ms=5000&retry_count=3&cluster_name=kvcm_app_0
+kvcm.coordination.uri=redis://your_auth_token@redis-host:6379/?db=2&timeout_ms=5000&retry_count=3&cluster_name=kvcm_app_0
 kvcm.leader_elector.lease_ms=10000
 kvcm.leader_elector.loop_interval_ms=100
 kvcm.service.advertised_host=10.0.0.1

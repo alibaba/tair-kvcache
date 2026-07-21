@@ -300,4 +300,48 @@ TEST_F(CoordinationRedisDiffClusterNameTest, TestLeaderElectionKeyIsolation) {
     ASSERT_EQ(EC_OK, backend_cluster_b_->Unlock(leader_lock_key, "node_b"));
 }
 
+TEST(CoordinationRedisDbIsolationTest, SameKeysAreIsolatedByDb) {
+    const std::string uri_prefix = "redis://test_redis_user:test_redis_password@localhost:6379/"
+                                   "?timeout_ms=1000&retry_count=3&client_min_pool_size=1&client_max_pool_size=2";
+    const std::string cluster_name = "coordination_db_isolation_test";
+    const std::string uri_db0 = uri_prefix + "&db=0&cluster_name=" + cluster_name;
+    const std::string uri_db1 = uri_prefix + "&db=1&cluster_name=" + cluster_name;
+    const std::string key = "same_key";
+    const std::string lock_key = "same_lock";
+
+    RedisClientExt cleanup_db0(StandardUri::FromUri(uri_db0));
+    RedisClientExt cleanup_db1(StandardUri::FromUri(uri_db1));
+    ASSERT_TRUE(cleanup_db0.Open());
+    ASSERT_TRUE(cleanup_db1.Open());
+    const std::string redis_key = "kvcm_" + cluster_name + "_kv:" + key;
+    const std::string redis_lock_key = "kvcm_" + cluster_name + "_lock:" + lock_key;
+    cleanup_db0.Del(redis_key);
+    cleanup_db1.Del(redis_key);
+    cleanup_db0.Del(redis_lock_key);
+    cleanup_db1.Del(redis_lock_key);
+
+    auto backend_db0 = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri_db0);
+    auto backend_db1 = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri_db1);
+    ASSERT_NE(nullptr, backend_db0);
+    ASSERT_NE(nullptr, backend_db1);
+
+    ASSERT_EQ(EC_OK, backend_db1->SetValue(key, "db1"));
+    std::string value;
+    EXPECT_EQ(EC_NOENT, backend_db0->GetValue(key, value));
+    ASSERT_EQ(EC_OK, backend_db0->SetValue(key, "db0"));
+    ASSERT_EQ(EC_OK, backend_db0->GetValue(key, value));
+    EXPECT_EQ("db0", value);
+    ASSERT_EQ(EC_OK, backend_db1->GetValue(key, value));
+    EXPECT_EQ("db1", value);
+
+    // Locks use the same selected connection DB as coordination KV data.
+    ASSERT_EQ(EC_OK, backend_db0->TryLock(lock_key, "holder_db0", 5000));
+    ASSERT_EQ(EC_OK, backend_db1->TryLock(lock_key, "holder_db1", 5000));
+    ASSERT_EQ(EC_OK, backend_db0->Unlock(lock_key, "holder_db0"));
+    ASSERT_EQ(EC_OK, backend_db1->Unlock(lock_key, "holder_db1"));
+
+    cleanup_db0.Del(redis_key);
+    cleanup_db1.Del(redis_key);
+}
+
 } // namespace kv_cache_manager

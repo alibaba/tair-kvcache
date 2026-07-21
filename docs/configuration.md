@@ -19,8 +19,20 @@ Example:
 /home/admin/kv_cache_manager/bin/kv_cache_manager_bin \
     -c '/home/admin/kv_cache_manager/etc/default_server_config.conf' \
     -l '/home/admin/kv_cache_manager/etc/default_logger_config.conf' \
-    -e 'kvcm.registry_storage.uri=redis://:foo@bar:6379?cluster_name=placeholder'
+    -e 'kvcm.registry_storage.uri=redis://your_auth_token@redis-host:6379/?db=1&cluster_name=placeholder'
 ```
+
+### Redis URI
+
+Registry、Meta 和 Coordination Redis 后端共用以下 URI 格式：
+
+```TEXT
+redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
+```
+
+- `auth_token` 会作为 Redis `AUTH` 命令的单个参数传入；`auth=...` query 参数不会用于认证。
+- `db` 必须放在 query 参数中；未配置时使用 DB 0。`redis://host:port/1` 中的 `/1` 是 path，不能用于选择 DB。
+- `db > 0` 依赖 Redis 服务端支持 `SELECT`。Redis Cluster 不支持多逻辑 DB，此时应使用 DB 0，并通过 `cluster_name` 和 key 前缀隔离，或使用独立 Redis 实例。
 
 ## KVCacheManager Server Config
 
@@ -35,10 +47,11 @@ CacheReclaimer 异步删除相关参数的生命周期语义见
 ## 3. 通过环境变量配置，set_env(kvcm.service.rpc_port, 6381)
 
 # 指定系统Registry自身数据存储位置
-# kvcm.registry_storage.uri=redis://127.0.0.1:6379?auth=123456
+# cluster_name必填；db必须通过query参数指定
+# kvcm.registry_storage.uri=redis://your_auth_token@127.0.0.1:6379/?db=1&cluster_name=kvcm_cluster
 
 # 指定协调后端服务的URI（用于多节点选主、节点信息存储等）。Redis选主key按cluster_name隔离。
-# kvcm.coordination.uri=redis://127.0.0.1:6379?auth=123456&cluster_name=kvcm_app_0
+# kvcm.coordination.uri=redis://your_auth_token@127.0.0.1:6379/?db=2&cluster_name=kvcm_app_0
 # 旧配置 kvcm.distributed_lock.uri 仍可使用（向后兼容），但新配置优先
 
 # 指定选主时当前节点使用的node_id（如果不指定会自动生成）
@@ -172,6 +185,9 @@ kvcm.event.event_publishers_configs
                 "mutex_shard_num": 16,
                 "batch_key_size": 16,
                 "meta_storage_backend_config": { # 控制meta indexer的storage backend，可选local本地文件或者redis
+                    # Redis示例：
+                    # "storage_type": "redis",
+                    # "storage_uri": "redis://your_auth_token@redis-host:6379/?db=3&client_max_pool_size=16"
                     "storage_type": "local",
                     "storage_uri": ""
                 },
