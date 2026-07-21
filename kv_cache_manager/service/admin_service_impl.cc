@@ -576,7 +576,8 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
                                                          request->block_size(),
                                                          location_spec_infos,
                                                          model_deployment_req,
-                                                         location_spec_groups);
+                                                         location_spec_groups,
+                                                         static_cast<CacheManager::QueryType>(request->query_type()));
     if (ec_info != EC_OK) {
         status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());

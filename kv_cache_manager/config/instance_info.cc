@@ -13,6 +13,7 @@ bool InstanceInfo::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "model_deployment", model_deployment_);
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "location_spec_groups", location_spec_groups_, std::vector<LocationSpecGroup>());
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "query_type", query_type_, static_cast<int32_t>(0));
     SortLocationSpecGroups();
     return true;
 }
@@ -25,6 +26,7 @@ void InstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "location_spec_infos", location_spec_infos_);
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
+    Put(writer, "query_type", query_type_);
 }
 
 std::string InstanceInfo::ToString() const {

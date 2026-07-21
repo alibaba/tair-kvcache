@@ -46,6 +46,14 @@ enum StorageType {
     ST_EVENT_REPORT = 7;
 }
 
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+    QT_PREFIX_MATCH = 2;
+    QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
+}
+
 message LocalStorageSpec {}
 
 message DummyStorageSpec {
@@ -365,6 +373,7 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;                            
 }
 
 message RegisterInstanceRequest {
@@ -375,6 +384,7 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;                           
 }
 
 message RemoveInstanceRequest {

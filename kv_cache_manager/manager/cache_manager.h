@@ -103,7 +103,8 @@ public:
                                                        int32_t block_size,
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
-                                                       const std::vector<LocationSpecGroup> &location_spec_groups);
+                                                       const std::vector<LocationSpecGroup> &location_spec_groups,
+                                                       QueryType query_type = QueryType::QT_UNSPECIFIED);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);

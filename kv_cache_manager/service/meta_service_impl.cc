@@ -321,13 +321,15 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
     }
     std::vector<LocationSpecGroup> location_spec_groups;
     ProtoConvert::LocationSpecGroupsFromProto(request->location_spec_groups(), location_spec_groups);
-    auto [ec_info, storage_configs] = cache_manager_->RegisterInstance(request_context,
-                                                                       request->instance_group(),
-                                                                       request->instance_id(),
-                                                                       request->block_size(),
-                                                                       location_spec_infos,
-                                                                       model_deployment_req,
-                                                                       location_spec_groups);
+    auto [ec_info, storage_configs] =
+        cache_manager_->RegisterInstance(request_context,
+                                         request->instance_group(),
+                                         request->instance_id(),
+                                         request->block_size(),
+                                         location_spec_infos,
+                                         model_deployment_req,
+                                         location_spec_groups,
+                                         static_cast<CacheManager::QueryType>(request->query_type()));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

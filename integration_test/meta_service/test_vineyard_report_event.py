@@ -725,6 +725,26 @@ class EventReportFunctionalTest(unittest.TestCase):
 
     # 16. GetHostCacheState — per-host prefix match verification
     def test_16_get_host_cache_state(self):
+        instance_id = f"{self.instance_id}_host_cache_state"
+        self.client.register_instance({
+            "trace_id": "t16_register",
+            "instance_group": self.INSTANCE_GROUP_NAME,
+            "instance_id": instance_id,
+            "block_size": 128,
+            "query_type": "QT_PREFIX_MATCH",
+            "model_deployment": {
+                "model_name": "test_er_model",
+                "dtype": "FP8",
+                "use_mla": False,
+                "tp_size": 1,
+                "dp_size": 1,
+                "pp_size": 1,
+            },
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ],
+        })
+
         # Data layout (3 hosts, different key subsets):
         #   key 10000: host_A, host_B, host_C
         #   key 10001: host_A, host_B
@@ -752,7 +772,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 )
             self.client.report_event(
                 _make_request(
-                    self.instance_id, host, events,
+                    instance_id, host, events,
                     trace_id=f"t16_setup_{host}",
                 )
             )
@@ -760,7 +780,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         # 2. Query GetHostCacheState
         resp = self.client.get_host_cache_state({
             "trace_id": "t16_query",
-            "instance_id": self.instance_id,
+            "instance_id": instance_id,
             "block_cache_keys": [10000, 10001, 10002, 10003, 10004],
         })
 

@@ -121,4 +121,34 @@ TEST_F(InstanceInfoTest, TestMismatchFieldsIgnoresLocationSpecGroupOrder) {
     EXPECT_EQ("location_spec_groups", mismatched[0]);
 }
 
+TEST_F(InstanceInfoTest, TestQueryTypeSerializeAndMismatch) {
+    constexpr int32_t kBlockSize = 64;
+    constexpr int32_t kQueryType = 4;
+    InstanceInfo instance_info("quota_group", "instance_group", "instance_id", kBlockSize, {}, {}, {}, kQueryType);
+
+    EXPECT_EQ(kQueryType, instance_info.query_type());
+    EXPECT_TRUE(instance_info.MismatchFields(kBlockSize, {}, {}, {}, kQueryType).empty());
+
+    auto mismatched = instance_info.MismatchFields(kBlockSize, {}, {}, {}, 2);
+    ASSERT_EQ(1, mismatched.size());
+    EXPECT_EQ("query_type", mismatched[0]);
+
+    InstanceInfo parsed;
+    ASSERT_TRUE(parsed.FromJsonString(instance_info.ToJsonString()));
+    EXPECT_EQ(kQueryType, parsed.query_type());
+}
+
+TEST_F(InstanceInfoTest, TestQueryTypeDefaultsToUnspecifiedForOldJson) {
+    InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
+    std::string json = instance_info.ToJsonString();
+    const std::string query_type_field = ",\"query_type\":4";
+    const auto pos = json.find(query_type_field);
+    ASSERT_NE(std::string::npos, pos);
+    json.erase(pos, query_type_field.size());
+
+    InstanceInfo parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(0, parsed.query_type());
+}
+
 } // namespace kv_cache_manager
