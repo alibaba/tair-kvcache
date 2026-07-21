@@ -1,6 +1,5 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
-#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -18,11 +17,8 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
-#include "kv_cache_manager/meta/cache_location.h"
-#include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"

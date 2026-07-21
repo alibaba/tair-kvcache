@@ -1,11 +1,7 @@
 #pragma once
 
-#include <cstdint>
 #include <memory>
-#include <utility>
-#include <vector>
 
-#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/service_impl_base.h"
 
@@ -15,7 +11,6 @@ class LeaderElector;
 class CacheManager;
 class MetricsReporter;
 class MetricsRegistry;
-class MetaIndexer;
 class RegistryManager;
 class RequestContext;
 
