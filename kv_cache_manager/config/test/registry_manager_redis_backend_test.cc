@@ -8,6 +8,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -97,6 +98,33 @@ TEST_F(RegistryManagerRedisBackendTest, TestInit) {
     uri = "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3";
     registry_manager_ = std::make_shared<RegistryManager>(uri, metrics_registry_);
     ASSERT_FALSE(registry_manager_->Init());
+}
+
+TEST_F(RegistryManagerRedisBackendTest, TestRedisDbIsolation) {
+    const std::string uri_prefix =
+        "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3";
+    const std::string cluster_name = "registry_db_isolation_test";
+    const std::string key = "same_key";
+
+    auto backend_db0 =
+        RegistryStorageBackendFactory::CreateAndInitStorageBackend(uri_prefix + "&db=0&cluster_name=" + cluster_name);
+    auto backend_db1 =
+        RegistryStorageBackendFactory::CreateAndInitStorageBackend(uri_prefix + "&db=1&cluster_name=" + cluster_name);
+    ASSERT_NE(nullptr, backend_db0);
+    ASSERT_NE(nullptr, backend_db1);
+
+    // Use the same cluster name and key so Redis DB is the only isolation boundary.
+    backend_db0->Delete(key);
+    backend_db1->Delete(key);
+    const std::map<std::string, std::string> expected{{"field", "db1"}};
+    ASSERT_EQ(EC_OK, backend_db1->Save(key, expected));
+
+    std::map<std::string, std::string> actual;
+    EXPECT_EQ(EC_NOENT, backend_db0->Load(key, actual));
+    ASSERT_EQ(EC_OK, backend_db1->Load(key, actual));
+    EXPECT_EQ(expected, actual);
+
+    EXPECT_EQ(EC_OK, backend_db1->Delete(key));
 }
 
 TEST_F(RegistryManagerRedisBackendTest, TestRecover) {
