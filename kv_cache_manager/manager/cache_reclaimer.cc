@@ -1403,17 +1403,24 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         const DataStorageUri uri(loc.location_specs().front().uri());
         return cold_storages.count(uri.GetHostName()) > 0;
     };
-    const auto cold_locations_cover_specs = [&loc_on_cold_storage](const CacheLocationMap &loc_map,
-                                                                   const CacheLocation &source_loc) -> bool {
+    const auto is_pending_location = [this, &ins_id](const std::int64_t block_key,
+                                                     const std::string &location_id) -> bool {
+        return pending_locations_.find(PendingLocationKey{ins_id, block_key, location_id}) != pending_locations_.end();
+    };
+    const auto cold_locations_cover_specs = [&is_pending_location, &loc_on_cold_storage](
+                                                 const std::int64_t block_key,
+                                                 const CacheLocationMap &loc_map,
+                                                 const CacheLocation &source_loc) -> bool {
         if (source_loc.location_specs().empty()) {
             return false;
         }
         for (const auto &source_spec : source_loc.location_specs()) {
-            const bool covered =
-                std::any_of(loc_map.begin(), loc_map.end(), [&source_spec, &loc_on_cold_storage](const auto &entry) {
+            const bool covered = std::any_of(
+                loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](
+                                                    const auto &entry) {
                     const auto &loc_ptr = entry.second;
                     if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
-                        !loc_on_cold_storage(*loc_ptr)) {
+                        is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
                         return false;
                     }
                     return std::any_of(
@@ -1448,6 +1455,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     continue;
                 }
                 const auto &loc = *loc_ptr;
+                if (is_pending_location(block_key, loc.id())) {
+                    continue;
+                }
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                     migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
@@ -1472,6 +1482,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             }
             ++valid_location_count;
             const auto &loc = *loc_ptr;
+            if (is_pending_location(block_key, loc.id())) {
+                METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
+                continue;
+            }
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
@@ -1496,7 +1510,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                            loc_on_cold_storage(loc)) {
                     // 多副本 keep_both：保留冷层副本，不淘汰（优先腾出热层空间）。
                 } else if (keep_cold_evict_hot && loc.status() == CacheLocationStatus::CLS_SERVING &&
-                           !cold_locations_cover_specs(loc_map, loc)) {
+                           !cold_locations_cover_specs(block_key, loc_map, loc)) {
                     // spec group 场景下，只有当该热 location 的 specs 已被冷层 SERVING location 覆盖时才删热。
                 } else {
                     // there's no storage type water level exceeded
@@ -1506,12 +1520,6 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     selected_by_water_level = true;
                 }
                 if (!selected_by_water_level) {
-                    continue;
-                }
-
-                const PendingLocationKey pending_key{ins_id, batch[block_idx], loc.id()};
-                if (pending_locations_.find(pending_key) != pending_locations_.end()) {
-                    METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
                     continue;
                 }
 
@@ -1802,8 +1810,23 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     params.retention = strategy.retention();
     params.mark_timeout_ms = strategy.methods().mark().timeout_ms();
     params.dedup_marks = true; // reclaimer 跳过已打标的 block（10a: 内部用 BatchGetTieredWriteTargets 批量查）
+    // Async deletion records accepted locations before its worker publishes CLS_DELETING.
+    // Remove those locations from the migration snapshot so a still-SERVING source or
+    // target that is already pending deletion cannot drive Copy/Mark admission.
+    auto available_loc_maps = loc_maps;
+    for (std::size_t block_idx = 0; block_idx < available_loc_maps.size(); ++block_idx) {
+        auto &loc_map = available_loc_maps[block_idx];
+        for (auto it = loc_map.begin(); it != loc_map.end();) {
+            const PendingLocationKey pending_key{ins_id, batch[block_idx], it->first};
+            if (pending_locations_.find(pending_key) != pending_locations_.end()) {
+                it = loc_map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     const auto dispatch = migration_manager_->DispatchMigrationBatch(
-        request_context->trace_id(), ins_id, src_name, dst_name, batch, loc_maps, params);
+        request_context->trace_id(), ins_id, src_name, dst_name, batch, available_loc_maps, params);
 
     if (dispatch.copy_submitted > 0) {
         METRICS_(cache_reclaimer, migration_copy_submitted_total) += dispatch.copy_submitted;

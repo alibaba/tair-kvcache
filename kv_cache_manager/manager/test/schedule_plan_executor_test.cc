@@ -1232,3 +1232,24 @@ TEST_F(SchedulePlanExecutorTest, TestCopyTaskStopped) {
     auto result = executor.Submit(req).get();
     ASSERT_EQ(ErrorCode::EC_ERROR, result.status);
 }
+
+TEST_F(SchedulePlanExecutorTest, TestQueuedCopyTaskCompletesOnStop) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1006,
+        .exec_storage_name = "unused_storage",
+        .src_uris = {MakeUri("unused_src")},
+        .dst_uris = {MakeUri("unused_dst")},
+        .delay = std::chrono::hours(1),
+    };
+
+    auto future = executor.Submit(req);
+    ASSERT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(10)));
+    executor.Stop();
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    const auto result = future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("before copy task execution"));
+}

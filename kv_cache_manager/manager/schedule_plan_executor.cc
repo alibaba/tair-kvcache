@@ -782,8 +782,11 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationC
     }
 
     // copy 任务是 URI 级（URI 已由 MigrationManager 解析/预分配），无需 meta 解析，直接异步执行。
-    bool submit_result =
-        this->SubmitRaw([this, promise, task]() { DoCopyTask(promise, task); }, task.delay);
+    auto execute_task = [this, promise, task]() { DoCopyTask(promise, task); };
+    auto cancel_task = [promise]() {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before copy task execution.");
+    };
+    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task);
     if (!submit_result) {
         HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit copy task failed");
         return future;

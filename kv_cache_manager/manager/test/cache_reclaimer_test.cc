@@ -638,6 +638,25 @@ public:
             std::make_unique<CacheReclaimer>(10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr, config);
     }
 
+    bool FilterLocations(const std::shared_ptr<const InstanceInfo> &instance_info,
+                         const std::vector<std::int64_t> &batch,
+                         const CacheReclaimer::WaterLevelExceed &water_level_exceed,
+                         std::vector<std::vector<std::string>> &location_ids,
+                         CacheReclaimer::AgeStats &create_age_stats) {
+        CacheReclaimer::BytesByStorageType bytes_by_type{};
+        CacheReclaimer::CountsByStorageType location_counts_by_type{};
+        std::uint64_t predicted_deleted_keys = 0;
+        return cache_reclaimer_->FilterLocID(request_context_.get(),
+                                             instance_info,
+                                             batch,
+                                             water_level_exceed,
+                                             location_ids,
+                                             bytes_by_type,
+                                             location_counts_by_type,
+                                             predicted_deleted_keys,
+                                             create_age_stats);
+    }
+
     int ListInstanceGroupCallCount() {
         std::lock_guard<std::mutex> lock(list_ins_group_mut);
         return list_ins_group_call_counter;
@@ -4122,7 +4141,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
         std::vector<std::vector<std::string>> out;
         CacheReclaimer::AgeStats age_stats;
-        ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43}, wl, out, age_stats));
+        ASSERT_TRUE(FilterLocations(ins_info, {42, 43}, wl, out, age_stats));
         ASSERT_EQ(2u, out.size());
         ASSERT_EQ(1u, out[0].size()) << "active migration task should not suppress eviction";
         ASSERT_EQ("loc_a", out[0][0]);
@@ -4141,7 +4160,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
         std::vector<std::vector<std::string>> out;
         CacheReclaimer::AgeStats age_stats;
-        ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43}, wl, out, age_stats));
+        ASSERT_TRUE(FilterLocations(ins_info, {42, 43}, wl, out, age_stats));
         ASSERT_EQ(2u, out.size());
         ASSERT_EQ(1u, out[0].size()) << "migrating block not protected in storage-type eviction zone";
         ASSERT_EQ("loc_a", out[0][0]);
@@ -4153,7 +4172,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
     cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, write_location_manager, mm_);
+        10,
+        100,
+        1,
+        10,
+        16,
+        rm_,
+        mim_,
+        msm_,
+        spe_,
+        mr_,
+        em_,
+        write_location_manager,
+        CacheReclaimerAsyncDeleteConfig{},
+        mm_);
 
     const auto ins_info = InstanceInfoFactory();
     mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
@@ -4192,7 +4224,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43, 44, 45}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {42, 43, 44, 45}, wl, out, age_stats));
     ASSERT_EQ(4u, out.size());
     EXPECT_TRUE(out[0].empty()) << "active copy target should not be treated as orphan";
     ASSERT_EQ(1u, out[1].size());
@@ -4251,7 +4283,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDKeepColdEvictHot) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0, 1}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0, 1}, wl, out, age_stats));
     ASSERT_EQ(2u, out.size());
     // block 0 多副本 -> 只淘汰热副本 hot_a，保留 cold_a
     ASSERT_EQ(1u, out[0].size()) << "multi-replica block should evict only the hot copy";
@@ -4259,6 +4291,61 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDKeepColdEvictHot) {
     // block 1 仅热副本 -> 正常淘汰
     ASSERT_EQ(1u, out[1].size());
     ASSERT_EQ("hot_b", out[1][0]);
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDPendingColdDoesNotCompleteCoverage) {
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+    constexpr std::int64_t block_key = 0;
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
+    auto pending_cold = std::make_shared<CacheLocation>(
+        "cold_pending",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_pending/tp0")});
+    auto available_cold = std::make_shared<CacheLocation>(
+        "cold_available",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_available/tp1")});
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"hot_full", hot_loc},
+        {"cold_pending", pending_cold},
+        {"cold_available", available_cold},
+    }};
+    cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), block_key, "cold_pending"});
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGeneralWaterLevelExceed(true);
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(FilterLocations(ins_info, {block_key}, water_level, location_ids, age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    EXPECT_TRUE(location_ids.front().empty())
+        << "a cold location pending deletion must not complete coverage for hot eviction";
 
     stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
     g_cold_ig.reset();
@@ -4304,7 +4391,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0}, wl, out, age_stats));
     ASSERT_EQ(1u, out.size());
     EXPECT_TRUE(out[0].empty()) << "hot location should stay until cold tier covers all of its specs";
 
@@ -4315,7 +4402,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
 TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
     cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, write_location_manager, mm_);
+        10,
+        100,
+        1,
+        10,
+        16,
+        rm_,
+        mim_,
+        msm_,
+        spe_,
+        mr_,
+        em_,
+        write_location_manager,
+        CacheReclaimerAsyncDeleteConfig{},
+        mm_);
 
     auto ig = InstanceGroupFactory();
     {
@@ -4350,7 +4450,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0}, wl, out, age_stats));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(2u, out[0].size());
     std::sort(out[0].begin(), out[0].end());
@@ -4497,6 +4597,24 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         ASSERT_EQ("src_10", captured_copy_reqs[0].src_location_id);
         ASSERT_EQ("hot_01", captured_copy_reqs[0].src_storage_name);
         ASSERT_EQ("cold_01", captured_copy_reqs[0].dst_storage_name);
+    }
+
+    // A source already accepted by async deletion is excluded even while its
+    // metadata still reports SERVING before the delete worker publishes DELETING.
+    {
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        const std::vector<std::int64_t> batch = {10};
+        const auto loc_maps = make_loc_maps(batch);
+        cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), 10, "src_10"});
+
+        const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+            request_context_, ins_info, strategy, /*available_copy_slots*/ 1, batch, loc_maps);
+
+        EXPECT_EQ(0, submitted);
+        EXPECT_TRUE(captured_copy_reqs.empty());
+        cache_reclaimer_->pending_locations_.erase({ins_info->instance_id(), 10, "src_10"});
     }
 
     // ---- 场景 B：并发预算上限 ----
@@ -4906,7 +5024,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0}, wl, out, age_stats));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(1u, out[0].size()) << "hot should be evicted when cold union covers all specs";
     ASSERT_EQ("hot_full", out[0][0]);
@@ -4950,7 +5068,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDStorageTypeEvictionIgnoresCold) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0}, wl, out, age_stats));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(2u, out[0].size()) << "storage-type eviction should not preserve cold";
 
@@ -4998,7 +5116,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_TRUE(FilterLocations(ins_info, {0}, wl, out, age_stats));
     ASSERT_EQ(1u, out.size());
     // WRITING cold 不算覆盖 → has_cold=false → keep_cold_evict_hot=false → hot 正常被选
     ASSERT_EQ(1u, out[0].size());
