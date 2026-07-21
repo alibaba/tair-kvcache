@@ -141,7 +141,9 @@ public:
 
     // 在 meta 中为 block_key 直接添加一个位于指定 storage 的 CacheLocation。
     // status=CLS_SERVING 时 CAS WRITING->SERVING；status=CLS_WRITING 则保持。
-    void SeedLocationOnStorage(int64_t block_key, const std::string &storage_name, CacheLocationStatus status) {
+    void SeedLocationOnStorage(int64_t block_key,
+                               const std::string &storage_name,
+                               CacheLocationStatus status) {
         auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);

@@ -1415,19 +1415,18 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             return false;
         }
         for (const auto &source_spec : source_loc.location_specs()) {
-            const bool covered = std::any_of(
-                loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](
-                                                    const auto &entry) {
-                    const auto &loc_ptr = entry.second;
-                    if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
-                        is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
-                        return false;
-                    }
-                    return std::any_of(
-                        loc_ptr->location_specs().begin(),
-                        loc_ptr->location_specs().end(),
-                        [&source_spec](const auto &cold_spec) { return cold_spec.name() == source_spec.name(); });
-                });
+            const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
+                const auto &loc_ptr = entry.second;
+                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
+                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
+                    return false;
+                }
+                return std::any_of(loc_ptr->location_specs().begin(),
+                                   loc_ptr->location_specs().end(),
+                                   [&source_spec](const auto &cold_spec) {
+                                       return cold_spec.name() == source_spec.name();
+                                   });
+            });
             if (!covered) {
                 return false;
             }
@@ -1461,9 +1460,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                     migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-                const bool is_orphaned_writing =
-                    loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
-                    !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
+                const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
+                                                 write_location_manager_ != nullptr &&
+                                                 !write_location_manager_->HasLocationId(loc.id()) &&
+                                                 !is_active_copy_target;
                 if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
                     continue;
                 }
@@ -1494,9 +1494,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             const bool is_active_copy_target =
                 loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                 migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-            const bool is_orphaned_writing =
-                loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
-                !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
+            const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
+                                             write_location_manager_ != nullptr &&
+                                             !write_location_manager_->HasLocationId(loc.id()) &&
+                                             !is_active_copy_target;
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 bool selected_by_water_level = false;
                 if (in_storage_type_eviction_zone) {
@@ -1593,10 +1594,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     return true;
 }
 
-void CacheReclaimer::TryMigrateOnGroup(
-    const std::shared_ptr<RequestContext> &request_context,
-    const std::shared_ptr<const InstanceGroup> &instance_group,
-    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
+void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                                       const std::shared_ptr<const InstanceGroup> &instance_group,
+                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         return;
     }

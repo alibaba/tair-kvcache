@@ -191,10 +191,10 @@ public:
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
     enum class CopyAdmissionStatus {
         kAccept,
-        kAlreadyMigrating,      // 该 block_key 已有活跃 Copy 任务
-        kTargetServingExists,   // 目标 storage 上已存在 SERVING 副本
-        kTargetWritingExists,   // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
-        kSourceServingNotFound, // 源 storage 上没有 SERVING 副本，无可复制源
+        kAlreadyMigrating,       // 该 block_key 已有活跃 Copy 任务
+        kTargetServingExists,    // 目标 storage 上已存在 SERVING 副本
+        kTargetWritingExists,    // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
+        kSourceServingNotFound,  // 源 storage 上没有 SERVING 副本，无可复制源
     };
 
     struct CopyAdmission {
@@ -277,12 +277,12 @@ public:
     std::size_t PendingAsyncMigrationPrepareCountForGroup(const std::string &instance_group_name) const;
 
     DispatchBatchResult DispatchMigrationBatch(const std::string &trace_id,
-                                               const std::string &instance_id,
-                                               const std::string &src_name,
-                                               const std::string &dst_name,
-                                               const std::vector<int64_t> &batch,
-                                               const std::vector<CacheLocationMap> &loc_maps,
-                                               const DispatchBatchParams &params);
+                                              const std::string &instance_id,
+                                              const std::string &src_name,
+                                              const std::string &dst_name,
+                                              const std::vector<int64_t> &batch,
+                                              const std::vector<CacheLocationMap> &loc_maps,
+                                              const DispatchBatchParams &params);
 
     // ---- 统计 ----
     MigrationStats GetStats() const;
@@ -299,8 +299,7 @@ private:
 
     // ---- 仅供测试/诊断（BUILD 通过 -fno-access-control 访问）----
     std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
-    void
-    DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
+    void DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
     void DebugEnableCopySubmissionsForTest();
     std::size_t PendingAsyncMigrationPrepareCountForTest() const;
 
@@ -311,13 +310,7 @@ private:
     //   kRunning    —— copy 已进入提交阶段、future 未完成，正常态；
     //   kCompleting —— monitor 已认领完成（promote/失败清理进行中），此后 Cancel 太晚；
     //   kCancelling —— 外部已请求取消，收尾推迟到 future 完成时由 monitor 执行（删 WRITING 目标、不 promote）。
-    enum class CopyTaskState {
-        kPreparing,
-        kPrepareCancelling,
-        kRunning,
-        kCompleting,
-        kCancelling
-    };
+    enum class CopyTaskState { kPreparing, kPrepareCancelling, kRunning, kCompleting, kCancelling };
 
     // 单个活跃 Copy 任务的上下文。
     struct CopyTaskContext {
@@ -331,9 +324,9 @@ private:
         std::string dst_location_id;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         std::chrono::steady_clock::time_point submit_time;
-        uint64_t total_bytes = 0;     // 源端各 spec 字节数之和（取自 uri size 参数）
-        std::string mark_target;      // 提交时 mark 的 target（空=无 mark，用于 match-clear）
-        int64_t mark_deadline_ms = 0; // 提交时 mark 的 deadline（用于 match-clear）
+        uint64_t total_bytes = 0;              // 源端各 spec 字节数之和（取自 uri size 参数）
+        std::string mark_target;               // 提交时 mark 的 target（空=无 mark，用于 match-clear）
+        int64_t mark_deadline_ms = 0;          // 提交时 mark 的 deadline（用于 match-clear）
         CopyTaskState state = CopyTaskState::kRunning; // 收尾认领状态
     };
 
@@ -394,7 +387,7 @@ private:
                            const std::string &target_storage,
                            int64_t deadline_ms);
     void ProcessExpiredMarks();
-    size_t ActiveTaskCountUnsafe() const;                                               // 调用方持有 task_mutex_
+    size_t ActiveTaskCountUnsafe() const; // 调用方持有 task_mutex_
     size_t ActiveTaskCountForGroupUnsafe(const std::string &instance_group_name) const; // 调用方持有 task_mutex_
 
     // ---- 活跃任务表操作收口（均要求调用方持有 task_mutex_）----
@@ -419,23 +412,11 @@ private:
     bool HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const;
 
     // ---- 收尾认领（均要求调用方持有 task_mutex_）----
-    enum class ClaimResult {
-        kClaimedRunning,
-        kWasCancelling,
-        kBusyPreparing,
-        kBusyCompleting,
-        kNotFound
-    };
+    enum class ClaimResult { kClaimedRunning, kWasCancelling, kBusyPreparing, kBusyCompleting, kNotFound };
     // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
     // kCancelling→拷 ctx 返回 kWasCancelling（不改状态，交由 CompleteCancelledTask 收尾）。
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
-    enum class CancelResult {
-        kMarked,
-        kMarkedPreparing,
-        kAlreadyCancelling,
-        kBusyCompleting,
-        kNotFound
-    };
+    enum class CancelResult { kMarked, kMarkedPreparing, kAlreadyCancelling, kBusyCompleting, kNotFound };
     // 外部 Cancel 认领：kPreparing→kPrepareCancelling（由提交线程清理）；
     // kRunning→kCancelling（future 完成后清理）；两个 cancelling 状态均幂等；kCompleting→太晚。
     CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
