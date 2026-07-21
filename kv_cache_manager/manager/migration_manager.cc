@@ -13,6 +13,9 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/event/event_manager.h"
@@ -118,12 +121,14 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
                                    std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
                                    std::shared_ptr<DataStorageManager> data_storage_manager,
                                    std::shared_ptr<MetricsRegistry> metrics_registry,
-                                   std::shared_ptr<EventManager> event_manager)
+                                   std::shared_ptr<EventManager> event_manager,
+                                   std::shared_ptr<RegistryManager> registry_manager)
     : schedule_plan_executor_(std::move(schedule_plan_executor))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , data_storage_manager_(std::move(data_storage_manager))
     , metrics_registry_(std::move(metrics_registry))
-    , event_manager_(std::move(event_manager)) {
+    , event_manager_(std::move(event_manager))
+    , registry_manager_(std::move(registry_manager)) {
     if (metrics_registry_ != nullptr) {
         metrics_enabled_ = true;
         m_tasks_submitted_total_ = metrics_registry_->GetCounter("migration.tasks_submitted_total");
@@ -166,6 +171,7 @@ void MigrationManager::Start() {
     if (!running_.compare_exchange_strong(expected, true)) {
         return; // already running
     }
+    async_prepare_generation_.fetch_add(1, std::memory_order_acq_rel);
     accepting_copy_submissions_.store(true, std::memory_order_release);
     monitor_thread_ = std::thread([this]() { MonitorLoop(); });
     KVCM_LOG_INFO("MigrationManager started");
@@ -176,6 +182,11 @@ void MigrationManager::Stop() {
     // 等待已经持有 shared lock 的提交函数完整返回。该 barrier 只等待 prepare/enqueue，不等待
     // executor 中已异步运行的数据 Copy。
     accepting_copy_submissions_.store(false, std::memory_order_release);
+    async_prepare_generation_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(async_prepare_mutex_);
+        pending_async_prepare_jobs_.clear();
+    }
     std::unique_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
 
     bool expected = true;
@@ -502,7 +513,8 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
 
 std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id,
                                                      std::vector<MigrationRequest> requests,
-                                                     CopyConcurrencyLimit copy_limit) {
+                                                     CopyConcurrencyLimit copy_limit,
+                                                     bool lifecycle_lock_held) {
     if (requests.empty()) {
         return {};
     }
@@ -571,7 +583,13 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
         return collect_results();
     }
-    std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
+    std::shared_lock<std::shared_mutex> lifecycle_lock;
+    if (!lifecycle_lock_held) {
+        lifecycle_lock = std::shared_lock<std::shared_mutex>(copy_submission_lifecycle_mutex_);
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+            return collect_results();
+        }
+    }
 
     // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + draining gate + preparing reservation ----
     // 所有 eligible item 必须在释放短准入锁、执行任何 batch Create/AddLocation 前进入
@@ -1120,7 +1138,7 @@ void MigrationManager::SubmitTargetLocationDelete(const CopyTaskContext &ctx) {
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.dst_location_id}};
-    schedule_plan_executor_->SubmitNonBlocking(del_req);
+    schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation);
 }
 
 void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
@@ -1131,7 +1149,7 @@ void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.src_location_id}};
-    schedule_plan_executor_->SubmitNonBlocking(del_req);
+    schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation);
 }
 
 void MigrationManager::MonitorLoop() {
@@ -1914,6 +1932,203 @@ MigrationManager::SelectMigrationCandidateKeys(RequestContext *request_context,
     return {EC_OK, std::move(candidate_keys)};
 }
 
+std::size_t MigrationManager::AsyncMigrationPrepareKeyHash::operator()(const AsyncMigrationPrepareKey &key) const {
+    std::size_t seed = std::hash<std::uint64_t>{}(key.generation);
+    const auto combine = [&seed](std::size_t value) {
+        seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    };
+    combine(std::hash<std::string>{}(key.instance_group_name));
+    combine(std::hash<std::string>{}(key.instance_id));
+    combine(std::hash<std::string>{}(key.source_storage_name));
+    combine(std::hash<std::string>{}(key.target_storage_name));
+    return seed;
+}
+
+std::size_t MigrationManager::PendingAsyncMigrationPrepareCountForTest() const {
+    std::lock_guard<std::mutex> lock(async_prepare_mutex_);
+    return pending_async_prepare_jobs_.size();
+}
+
+std::size_t
+MigrationManager::PendingAsyncMigrationPrepareCountForGroup(const std::string &instance_group_name) const {
+    std::lock_guard<std::mutex> lock(async_prepare_mutex_);
+    return static_cast<std::size_t>(
+        std::count_if(pending_async_prepare_jobs_.begin(),
+                      pending_async_prepare_jobs_.end(),
+                      [&instance_group_name](const AsyncMigrationPrepareKey &key) {
+                          return key.instance_group_name == instance_group_name;
+                      }));
+}
+
+void MigrationManager::FinishAsyncMigrationPrepare(const AsyncMigrationPrepareKey &key) {
+    std::lock_guard<std::mutex> lock(async_prepare_mutex_);
+    pending_async_prepare_jobs_.erase(key);
+}
+
+bool MigrationManager::SubmitAsyncMigrationPrepare(AsyncMigrationPrepareJob job) {
+    if (!schedule_plan_executor_ || !accepting_copy_submissions_.load(std::memory_order_acquire) ||
+        job.instance_group_name.empty() || job.instance_id.empty() || job.source_storage_name.empty() ||
+        job.target_storage_name.empty() || job.block_keys.empty() ||
+        job.pending_location_ids_by_block.size() != job.block_keys.size()) {
+        return false;
+    }
+
+    const auto generation = async_prepare_generation_.load(std::memory_order_acquire);
+    AsyncMigrationPrepareKey key{generation,
+                                 job.instance_group_name,
+                                 job.instance_id,
+                                 job.source_storage_name,
+                                 job.target_storage_name};
+    {
+        std::lock_guard<std::mutex> lock(async_prepare_mutex_);
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire) ||
+            async_prepare_generation_.load(std::memory_order_acquire) != generation ||
+            pending_async_prepare_jobs_.size() >= kMaxPendingAsyncMigrationPrepareJobs ||
+            !pending_async_prepare_jobs_.insert(key).second) {
+            return false;
+        }
+    }
+
+    auto weak_self = weak_from_this();
+    if (weak_self.expired()) {
+        FinishAsyncMigrationPrepare(key);
+        return false;
+    }
+    auto execute_task = [weak_self, key, job = std::move(job)]() mutable {
+        auto self = weak_self.lock();
+        if (!self) {
+            return;
+        }
+        try {
+            self->RunAsyncMigrationPrepare(std::move(job), key.generation);
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("async migration prepare threw exception: %s", e.what());
+        } catch (...) { KVCM_LOG_ERROR("async migration prepare threw unknown exception"); }
+        self->FinishAsyncMigrationPrepare(key);
+    };
+    auto cancel_task = [weak_self, key]() {
+        if (auto self = weak_self.lock()) {
+            self->FinishAsyncMigrationPrepare(key);
+        }
+    };
+    if (!schedule_plan_executor_->SubmitTask(ScheduleTaskClass::kMigrationPrepare,
+                                             std::move(execute_task),
+                                             std::chrono::microseconds::zero(),
+                                             std::move(cancel_task))) {
+        FinishAsyncMigrationPrepare(key);
+        return false;
+    }
+    return true;
+}
+
+void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, std::uint64_t generation) {
+    const auto prepare_and_dispatch = [&]() -> DispatchBatchResult {
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire) ||
+            async_prepare_generation_.load(std::memory_order_acquire) != generation || !registry_manager_ ||
+            !meta_indexer_manager_ || !data_storage_manager_) {
+            return {};
+        }
+
+        // Prepare 会读取 Registry/Meta/DataStorage，必须与 leader cleanup 使用同一个 lifecycle
+        // barrier。Stop 先关闭 gate，再取 unique lock：已运行 Job 收口后才能清理依赖；排队 Job
+        // 随后取得 shared lock 时会因 generation/gate 变化直接退出，不再访问已清理资源。
+        std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire) ||
+            async_prepare_generation_.load(std::memory_order_acquire) != generation) {
+            return {};
+        }
+
+        auto request_context = std::make_shared<RequestContext>(job.trace_id);
+        const auto instance_info = registry_manager_->GetInstanceInfo(request_context.get(), job.instance_id);
+        if (!instance_info || instance_info->instance_group_name() != job.instance_group_name) {
+            return {};
+        }
+        const auto cache_config = registry_manager_->GetCacheConfig(job.instance_group_name);
+        if (!cache_config) {
+            return {};
+        }
+
+        std::shared_ptr<MigrationStrategy> current_strategy;
+        for (const auto &strategy : cache_config->migration_strategies()) {
+            if (strategy && strategy->source_storage_name() == job.source_storage_name &&
+                strategy->target_storage_name() == job.target_storage_name) {
+                current_strategy = strategy;
+                break;
+            }
+        }
+        if (!current_strategy) {
+            return {};
+        }
+        const bool copy_enabled = current_strategy->methods().copy().enabled();
+        const bool mark_enabled = current_strategy->methods().mark().enabled();
+        if ((!copy_enabled && !mark_enabled) ||
+            data_storage_manager_->GetDataStorageBackend(job.source_storage_name) == nullptr ||
+            data_storage_manager_->GetDataStorageBackend(job.target_storage_name) == nullptr) {
+            return {};
+        }
+
+        const auto indexer = meta_indexer_manager_->GetMetaIndexer(job.instance_id);
+        if (!indexer) {
+            return {};
+        }
+        MetaSearcher meta_searcher(indexer);
+        std::vector<CacheLocationMap> loc_maps;
+        BlockMask empty_mask;
+        if (meta_searcher.BatchGetLocation(request_context.get(), job.block_keys, empty_mask, loc_maps) != EC_OK ||
+            loc_maps.size() != job.block_keys.size()) {
+            return {};
+        }
+
+        for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
+            if (job.pending_location_ids_by_block[block_idx].empty()) {
+                continue;
+            }
+            const std::unordered_set<std::string> pending_ids(job.pending_location_ids_by_block[block_idx].begin(),
+                                                              job.pending_location_ids_by_block[block_idx].end());
+            auto &loc_map = loc_maps[block_idx];
+            for (auto it = loc_map.begin(); it != loc_map.end();) {
+                if (pending_ids.count(it->first) > 0) {
+                    it = loc_map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+        const std::size_t max_concurrent_copy =
+            configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+        DispatchBatchParams params;
+        params.do_copy = copy_enabled;
+        params.do_mark = mark_enabled;
+        params.copy_limit = CopyConcurrencyLimit{job.instance_group_name, max_concurrent_copy};
+        const auto active_copy_count = ActiveTaskCountForGroup(job.instance_group_name);
+        params.max_copy_slots = max_concurrent_copy > active_copy_count ? max_concurrent_copy - active_copy_count : 0;
+        params.retention = current_strategy->retention();
+        params.mark_timeout_ms = current_strategy->methods().mark().timeout_ms();
+        params.dedup_marks = true;
+        return DispatchMigrationBatchWithLifecycleLockHeld(job.trace_id,
+                                                            job.instance_id,
+                                                            job.source_storage_name,
+                                                            job.target_storage_name,
+                                                            job.block_keys,
+                                                            loc_maps,
+                                                            params);
+    };
+
+    const auto dispatch = prepare_and_dispatch();
+    // Callback is deliberately outside the lifecycle shared lock; it must not extend Stop latency
+    // or create a shared-to-exclusive lock upgrade path.
+    if (!job.on_dispatched) {
+        return;
+    }
+    try {
+        job.on_dispatched(dispatch);
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("async migration dispatch callback threw exception: %s", e.what());
+    } catch (...) { KVCM_LOG_ERROR("async migration dispatch callback threw unknown exception"); }
+}
+
 MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *request_context,
                                                                const std::string &trace_id,
                                                                const std::string &instance_group_name,
@@ -1993,6 +2208,31 @@ MigrationManager::DispatchMigrationBatch(const std::string &trace_id,
     if (batch.empty() || loc_maps.size() != batch.size()) {
         return result;
     }
+    if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+        return result;
+    }
+    // Copy 与 Mark 必须位于同一个 leader-lifecycle barrier 内。否则 Stop 可能在异步 Job
+    // 完成 fresh read 后关闭 Copy gate，但 Job 仍继续写入 Mark。
+    std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
+    if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+        return result;
+    }
+    return DispatchMigrationBatchWithLifecycleLockHeld(
+        trace_id, instance_id, src_name, dst_name, batch, loc_maps, params);
+}
+
+MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatchWithLifecycleLockHeld(
+    const std::string &trace_id,
+    const std::string &instance_id,
+    const std::string &src_name,
+    const std::string &dst_name,
+    const std::vector<int64_t> &batch,
+    const std::vector<CacheLocationMap> &loc_maps,
+    const DispatchBatchParams &params) {
+    DispatchBatchResult result;
+    if (batch.empty() || loc_maps.size() != batch.size()) {
+        return result;
+    }
 
     // 10a: mark 去重用 batch 查询替代逐 block IsMarkedForTieredWrite（N 次 meta 往返 → 1 次）。
     std::unordered_set<int64_t> already_marked;
@@ -2048,7 +2288,7 @@ MigrationManager::DispatchMigrationBatch(const std::string &trace_id,
 
     // 分发
     if (!copy_reqs.empty()) {
-        const auto results = BatchSubmit(trace_id, std::move(copy_reqs), params.copy_limit);
+        const auto results = BatchSubmit(trace_id, std::move(copy_reqs), params.copy_limit, true);
         for (std::size_t i = 0; i < results.size(); ++i) {
             if (results[i] == EC_OK) {
                 ++result.copy_submitted;

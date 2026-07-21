@@ -315,11 +315,20 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint64_t cache_reclaimer_del_batch_size,
                         uint32_t cache_reclaimer_idle_interval_ms,
                         uint32_t cache_reclaimer_worker_size,
-                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config) {
+                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config,
+                        uint32_t schedule_plan_migration_worker_budget) {
+    if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
+        schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
+        KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
+                       schedule_plan_executor_thread_count,
+                       schedule_plan_migration_worker_budget);
+        return false;
+    }
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
-                                                                     metrics_registry_);
+                                                                     metrics_registry_,
+                                                                     schedule_plan_migration_worker_budget);
     event_manager_ = std::make_shared<EventManager>();
     if (!event_manager_) {
         KVCM_LOG_WARN("create EventManager failed");
@@ -332,7 +341,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                             meta_indexer_manager_,
                                                             registry_manager_->data_storage_manager(),
                                                             metrics_registry_,
-                                                            event_manager_);
+                                                            event_manager_,
+                                                            registry_manager_);
     // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
     // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
     assert(migration_manager_ != nullptr);

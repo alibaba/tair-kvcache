@@ -1629,15 +1629,20 @@ void CacheReclaimer::TryMigrateOnGroup(
         bool built = false;
         bool ok = false;
         std::vector<std::int64_t> batch;
-        std::vector<CacheLocationMap> loc_maps;
     };
     std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
-    // 按任务记录的 group 统计活跃 Copy。这里只用于提前剪枝，最终硬限制在 BatchSubmit 内原子执行。
+    // active Copy 与已排队/运行的异步 Prepare 一起用于提前剪枝，避免慢 Create 期间每轮 cron
+    // 都继续给同一 group 堆积新 Job；最终硬限制仍在 BatchSubmit 内原子执行。
     const std::size_t active_copy = migration_manager_->ActiveTaskCountForGroup(ins_gr);
-    std::size_t available_copy_slots = max_concurrent_copy > active_copy ? max_concurrent_copy - active_copy : 0;
+    const std::size_t pending_prepare = migration_manager_->PendingAsyncMigrationPrepareCountForGroup(ins_gr);
+    constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
+    const std::size_t estimated_inflight =
+        active_copy > kMaxSize - pending_prepare ? kMaxSize : active_copy + pending_prepare;
+    std::size_t available_copy_slots =
+        max_concurrent_copy > estimated_inflight ? max_concurrent_copy - estimated_inflight : 0;
 
     for (const auto &strategy : strategies) {
         if (strategy == nullptr) {
@@ -1683,45 +1688,50 @@ void CacheReclaimer::TryMigrateOnGroup(
 
         LOG_WITH_GR(DEBUG,
                     "migration triggered: src_storage [%s] type [%d] wl [%f] migration_thr [%f] "
-                    "group_copy_concurrency [%zu] active_copy [%zu] available_copy_slots [%zu]",
+                    "group_copy_concurrency [%zu] active_copy [%zu] pending_prepare [%zu] "
+                    "available_copy_slots [%zu]",
                     src_name.c_str(),
                     static_cast<std::int32_t>(src_type),
                     water_level,
                     migration_threshold,
                     max_concurrent_copy,
                     active_copy,
+                    pending_prepare,
                     available_copy_slots);
 
         for (const auto &instance_info : instance_infos) {
             if (instance_info == nullptr) {
                 continue;
             }
+            // Copy-only route 没有 fallback Mark 可做。异步化后无法在本线程获知每个 Job
+            // 实际提交了几个 Copy，因此按剩余 block slot 至多放行同样数量的 Prepare Job，
+            // 防止 group limit 很小时仍为大量 instance 排队做无效的 fresh meta read。
+            if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
+                break;
+            }
             auto &cached = migration_batch_cache[instance_info->instance_id()];
             if (!cached.built) {
                 cached.built = true;
-                cached.ok = BuildMigrationBatch(request_context, instance_info, cached.batch, cached.loc_maps);
+                cached.ok = BuildMigrationCandidateBatch(request_context, instance_info, cached.batch);
             }
             if (!cached.ok || cached.batch.empty()) {
                 continue;
             }
-            const std::size_t submitted = MigrateByStrategyOnBatch(
-                request_context, instance_info, *strategy, available_copy_slots, cached.batch, cached.loc_maps);
-            available_copy_slots = available_copy_slots > submitted ? available_copy_slots - submitted : 0;
+            const bool submitted = SubmitMigrationPrepareJob(request_context, instance_info, *strategy, cached.batch);
+            if (submitted && copy_enabled && !mark_enabled) {
+                --available_copy_slots;
+            }
         }
     }
 }
 
-bool CacheReclaimer::BuildMigrationBatch(const std::shared_ptr<RequestContext> &request_context,
-                                         const std::shared_ptr<const InstanceInfo> &instance_info,
-                                         std::vector<std::int64_t> &out_batch,
-                                         std::vector<CacheLocationMap> &out_loc_maps) noexcept {
+bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
+                                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  std::vector<std::int64_t> &out_batch) noexcept {
     out_batch.clear();
-    out_loc_maps.clear();
     if (instance_info == nullptr) {
         return false;
     }
-    const std::string &ins_id = instance_info->instance_id();
-    const std::string &ins_gr = instance_info->instance_group_name();
 
     // 采样 + LRU 取最冷 batch（复用回收侧的采样与排序）。
     std::vector<std::int64_t> keys;
@@ -1733,115 +1743,78 @@ bool CacheReclaimer::BuildMigrationBatch(const std::shared_ptr<RequestContext> &
     if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats)) {
         return false;
     }
-    if (out_batch.empty()) {
-        return true;
-    }
-
-    // 取各 block 的 location map。多条 migration strategy 复用这一批结果，再按各自 source storage 过滤。
-    if (meta_searcher_manager_ == nullptr) {
-        LOG_WITH_ID(WARN, "meta searcher manager is nullptr");
-        out_batch.clear();
-        return false;
-    }
-    const auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(ins_id);
-    if (meta_searcher == nullptr) {
-        LOG_WITH_ID(WARN, "meta searcher is nullptr");
-        out_batch.clear();
-        return false;
-    }
-    const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, out_batch.size(), false);
-    if (const auto ec = meta_searcher->BatchGetLocation(request_context.get(), out_batch, blk_mask, out_loc_maps);
-        ec != ErrorCode::EC_OK) {
-        LOG_WITH_ID(WARN, "get cache location maps failed, error code: [%d]", static_cast<std::int32_t>(ec));
-        out_batch.clear();
-        out_loc_maps.clear();
-        return false;
-    }
-    if (out_loc_maps.size() != out_batch.size()) {
-        out_batch.clear();
-        out_loc_maps.clear();
-        return false;
-    }
     return true;
 }
 
-std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<RequestContext> &request_context,
-                                                     const std::shared_ptr<const InstanceInfo> &instance_info,
-                                                     const MigrationStrategy &strategy,
-                                                     const std::size_t available_copy_slots,
-                                                     const std::vector<std::int64_t> &batch,
-                                                     const std::vector<CacheLocationMap> &loc_maps) noexcept {
+std::vector<std::vector<std::string>>
+CacheReclaimer::SnapshotPendingLocations(const std::string &instance_id,
+                                         const std::vector<std::int64_t> &batch) const {
+    std::vector<std::vector<std::string>> snapshot(batch.size());
+    for (std::size_t block_idx = 0; block_idx < batch.size(); ++block_idx) {
+        const auto block_key = batch[block_idx];
+        auto it = pending_locations_.lower_bound(PendingLocationKey{instance_id, block_key, ""});
+        while (it != pending_locations_.end() && it->instance_id == instance_id && it->block_key == block_key) {
+            snapshot[block_idx].push_back(it->location_id);
+            ++it;
+        }
+    }
+    return snapshot;
+}
+
+bool CacheReclaimer::SubmitMigrationPrepareJob(const std::shared_ptr<RequestContext> &request_context,
+                                               const std::shared_ptr<const InstanceInfo> &instance_info,
+                                               const MigrationStrategy &strategy,
+                                               const std::vector<std::int64_t> &batch) noexcept {
     if (!IsRunning() || IsPaused()) {
-        return 0;
+        return false;
     }
     if (instance_info == nullptr || migration_manager_ == nullptr) {
-        return 0;
+        return false;
     }
-    if (batch.empty() || loc_maps.size() != batch.size()) {
-        return 0;
+    if (batch.empty()) {
+        return false;
     }
 
     const bool copy_enabled = strategy.methods().copy().enabled();
     const bool mark_enabled = strategy.methods().mark().enabled();
     if (!copy_enabled && !mark_enabled) {
-        return 0;
-    }
-    // 仅 Copy 启用且本轮无可用提交槽位 -> 无事可做
-    if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
-        return 0;
+        return false;
     }
 
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
     const std::string &src_name = strategy.source_storage_name();
     const std::string &dst_name = strategy.target_storage_name();
-    const auto cache_config = registry_manager_->GetCacheConfig(ins_gr);
-    const auto configured_copy_concurrency =
-        cache_config == nullptr ? 0 : cache_config->migration_copy_max_concurrency();
-    const std::size_t max_concurrent_copy =
-        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
 
-    // 准入、分发和 fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
-    MigrationManager::DispatchBatchParams params;
-    params.do_copy = copy_enabled;
-    params.do_mark = mark_enabled;
-    params.max_copy_slots = available_copy_slots;
-    params.copy_limit = MigrationManager::CopyConcurrencyLimit{ins_gr, max_concurrent_copy};
-    params.retention = strategy.retention();
-    params.mark_timeout_ms = strategy.methods().mark().timeout_ms();
-    params.dedup_marks = true; // reclaimer 跳过已打标的 block（10a: 内部用 BatchGetTieredWriteTargets 批量查）
-    // Async deletion records accepted locations before its worker publishes CLS_DELETING.
-    // Remove those locations from the migration snapshot so a still-SERVING source or
-    // target that is already pending deletion cannot drive Copy/Mark admission.
-    auto available_loc_maps = loc_maps;
-    for (std::size_t block_idx = 0; block_idx < available_loc_maps.size(); ++block_idx) {
-        auto &loc_map = available_loc_maps[block_idx];
-        for (auto it = loc_map.begin(); it != loc_map.end();) {
-            const PendingLocationKey pending_key{ins_id, batch[block_idx], it->first};
-            if (pending_locations_.find(pending_key) != pending_locations_.end()) {
-                it = loc_map.erase(it);
-            } else {
-                ++it;
-            }
+    auto copy_counter = METRICS_(cache_reclaimer, migration_copy_submitted_total);
+    auto mark_counter = METRICS_(cache_reclaimer, migration_mark_submitted_total);
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context->trace_id();
+    job.instance_group_name = ins_gr;
+    job.instance_id = ins_id;
+    job.source_storage_name = src_name;
+    job.target_storage_name = dst_name;
+    job.block_keys = batch;
+    // pending_locations_ 由 Reclaimer cron 单线程维护。这里只复制与本 batch 相关的前缀范围；
+    // executor worker 不得读取 CacheReclaimer 的任何可变状态。
+    job.pending_location_ids_by_block = SnapshotPendingLocations(ins_id, batch);
+    job.on_dispatched = [copy_counter, mark_counter, ins_id, src_name, dst_name](
+                            const MigrationManager::DispatchBatchResult &dispatch) mutable {
+        if (dispatch.copy_submitted > 0) {
+            copy_counter += dispatch.copy_submitted;
         }
-    }
-    const auto dispatch = migration_manager_->DispatchMigrationBatch(
-        request_context->trace_id(), ins_id, src_name, dst_name, batch, available_loc_maps, params);
-
-    if (dispatch.copy_submitted > 0) {
-        METRICS_(cache_reclaimer, migration_copy_submitted_total) += dispatch.copy_submitted;
-    }
-    if (dispatch.mark_submitted > 0) {
-        METRICS_(cache_reclaimer, migration_mark_submitted_total) += dispatch.mark_submitted;
-    }
-
-    LOG_WITH_ID(DEBUG,
-                "migrate by strategy: src [%s] dst [%s] copy_submitted [%lld] mark_submitted [%lld]",
-                src_name.c_str(),
-                dst_name.c_str(),
-                static_cast<long long>(dispatch.copy_submitted),
-                static_cast<long long>(dispatch.mark_submitted));
-    return dispatch.copy_submitted;
+        if (dispatch.mark_submitted > 0) {
+            mark_counter += dispatch.mark_submitted;
+        }
+        KVCM_LOG_DEBUG("async migration dispatched: instance [%s] src [%s] dst [%s] "
+                       "copy_submitted [%lld] mark_submitted [%lld]",
+                       ins_id.c_str(),
+                       src_name.c_str(),
+                       dst_name.c_str(),
+                       static_cast<long long>(dispatch.copy_submitted),
+                       static_cast<long long>(dispatch.mark_submitted));
+    };
+    return migration_manager_->SubmitAsyncMigrationPrepare(std::move(job));
 }
 
 bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,

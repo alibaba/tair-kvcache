@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -66,6 +69,17 @@ struct CacheLocationCopyRequest {
     std::chrono::microseconds delay{std::chrono::seconds(0)};
 };
 
+// 任务类别同时定义 ready task 的调度优先级。Migration continuation 已经持有活跃
+// reservation/WRITING 目标，必须先于新的 Prepare 收敛；所有 migration 类别共同受
+// 进程级 worker budget 约束。
+enum class ScheduleTaskClass : std::uint8_t {
+    kReclaim = 0,
+    kSystem = 1,
+    kMigrationContinuation = 2,
+    kMigrationPrepare = 3,
+    kCount = 4,
+};
+
 struct ScheduledTask {
     std::function<void()> task;
     std::function<void()> cancel_task;
@@ -86,7 +100,8 @@ public:
     explicit SchedulePlanExecutor(unsigned int thread_count,
                                   const std::shared_ptr<MetaIndexerManager> &meta_manager,
                                   const std::shared_ptr<DataStorageManager> &storage_manager,
-                                  const std::shared_ptr<MetricsRegistry> &metrics_registry);
+                                  const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                                  unsigned int migration_worker_budget = std::numeric_limits<unsigned int>::max());
     ~SchedulePlanExecutor();
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
@@ -95,10 +110,16 @@ public:
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
 
-    bool SubmitNonBlocking(const CacheMetaDelRequest &req);
-    bool SubmitNonBlocking(const CacheLocationDelRequest &req);
+    bool SubmitNonBlocking(const CacheMetaDelRequest &req,
+                           ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
+    bool SubmitNonBlocking(const CacheLocationDelRequest &req,
+                           ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
 
     bool SubmitTask(std::function<void()> task, std::chrono::microseconds delay = std::chrono::microseconds(0));
+    bool SubmitTask(ScheduleTaskClass task_class,
+                    std::function<void()> task,
+                    std::chrono::microseconds delay = std::chrono::microseconds(0),
+                    std::function<void()> cancel_task = {});
 
 private:
     struct PromiseCompletion;
@@ -114,7 +135,10 @@ private:
     std::vector<std::thread> workers_;
     std::atomic<bool> stop_;
 
-    std::multiset<ScheduledTask> tasks_;
+    static constexpr std::size_t kTaskClassCount = static_cast<std::size_t>(ScheduleTaskClass::kCount);
+    std::array<std::multiset<ScheduledTask>, kTaskClassCount> task_queues_;
+    std::size_t migration_worker_budget_{0};
+    std::size_t running_migration_tasks_{0};
     std::mutex queue_mutex_;
     std::condition_variable condition_;
     std::atomic<uint64_t> sequence_counter_{0};
@@ -122,9 +146,13 @@ private:
     void WorkerRoutine();
 
     void Stop();
-    bool SubmitRaw(const std::function<void()> &task,
+    bool SubmitRaw(std::function<void()> task,
                    std::chrono::microseconds delay,
-                   const std::function<void()> &cancel_task = {});
+                   std::function<void()> cancel_task = {},
+                   ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
+    static bool IsMigrationTaskClass(ScheduleTaskClass task_class);
+    static std::size_t TaskClassIndex(ScheduleTaskClass task_class);
+    std::size_t WaitingTaskCountLocked() const;
     static bool FillActualTask(const std::vector<int64_t> &batch_cas_block_keys,
                                const std::vector<std::vector<MetaSearcher::LocationCASTask>> &batch_cas_tasks,
                                const std::vector<std::vector<ErrorCode>> &batch_results,
@@ -138,15 +166,21 @@ private:
                                                      std::chrono::microseconds delay);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
-                            const std::function<LocationDelAdmissionResult()> &prepare);
+                            const std::function<LocationDelAdmissionResult()> &prepare,
+                            ScheduleTaskClass task_class);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
+    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
+    std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
+                                                        ScheduleTaskClass task_class);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);
 
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count)
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count)
+    KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_migration_task_count)
+    KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_migration_task_count)
 };
 
 #undef KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <future>
@@ -475,7 +476,7 @@ public:
         msm_ = std::make_shared<MetaSearcherManager>(rm_, mim_);
         dsm_ = std::make_shared<DataStorageManager>(mr_);
         spe_ = std::make_shared<SchedulePlanExecutor>(0, mim_, dsm_, mr_);
-        mm_ = std::make_shared<MigrationManager>(spe_, mim_, dsm_);
+        mm_ = std::make_shared<MigrationManager>(spe_, mim_, dsm_, mr_, em_, rm_);
 
         cache_reclaimer_ = std::make_unique<CacheReclaimer>(
             10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr, CacheReclaimerAsyncDeleteConfig{}, mm_);
@@ -541,6 +542,7 @@ public:
 
     void TearDown() override {
         cache_reclaimer_->Stop();
+        mm_->Stop();
 
         instance_groups.clear();
         instance_infos.clear();
@@ -591,6 +593,34 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return predicate();
+    }
+
+    void EnableAsyncMigration(const std::shared_ptr<InstanceGroup> &instance_group,
+                              const std::shared_ptr<InstanceInfo> &instance_info) {
+        ASSERT_NE(nullptr, instance_group);
+        ASSERT_NE(nullptr, instance_info);
+        ASSERT_NE(nullptr, instance_group->cache_config());
+        rm_->data_storage_manager_ = dsm_;
+        rm_->instance_group_configs_[instance_group->name()] = instance_group;
+        rm_->instance_infos_[instance_info->instance_id()] = instance_info;
+        for (const auto &strategy : instance_group->cache_config()->migration_strategies()) {
+            if (!strategy) {
+                continue;
+            }
+            if (dsm_->storage_map_.count(strategy->source_storage_name()) == 0) {
+                dsm_->storage_map_[strategy->source_storage_name()] =
+                    std::make_shared<TypedTestBackend>(mr_, DataStorageType::DATA_STORAGE_TYPE_NFS);
+            }
+            if (dsm_->storage_map_.count(strategy->target_storage_name()) == 0) {
+                dsm_->storage_map_[strategy->target_storage_name()] =
+                    std::make_shared<TypedTestBackend>(mr_, DataStorageType::DATA_STORAGE_TYPE_NFS);
+            }
+        }
+        mm_->Start();
+    }
+
+    bool WaitForAsyncMigrationIdle(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+        return WaitUntil([this]() { return mm_->PendingAsyncMigrationPrepareCountForTest() == 0; }, timeout);
     }
 
     std::vector<CacheLocationDelRequest> SubmittedDelRequestsSnapshot() {
@@ -4508,6 +4538,16 @@ ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
         case 50:
             m.emplace("src_50", MakeServingLoc("src_50", "hot_vcns"));
             break;
+        case 60:
+        case 61:
+            // Location ids are scoped by block key. Reusing one here lets the
+            // pending-snapshot test detect an incorrect cross-block flattened set.
+            m.emplace("shared_src", MakeServingLoc("shared_src", "hot_01"));
+            break;
+        case 62:
+            m.emplace("src_62", MakeServingLoc("src_62", "hot_01"));
+            m.emplace("dst_62", MakeServingLoc("dst_62", "cold_01"));
+            break;
         case 11:
             m.emplace("src_11", MakeServingLoc("src_11", "hot_01"));
             m.emplace("dst_11", MakeServingLoc("dst_11", "cold_01"));
@@ -4527,10 +4567,34 @@ ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
     return ErrorCode::EC_OK;
 }
 
+namespace {
+std::mutex async_prepare_read_mutex;
+std::condition_variable async_prepare_read_cv;
+bool async_prepare_read_started = false;
+bool release_async_prepare_read = false;
+
+ErrorCode BlockingMigrateTest_BatchGetLocation_stub(void *obj,
+                                                    RequestContext *rc,
+                                                    const std::vector<std::int64_t> &kv,
+                                                    const BlockMask &bm,
+                                                    std::vector<CacheLocationMap> &out_loc_maps) {
+    {
+        std::unique_lock<std::mutex> lock(async_prepare_read_mutex);
+        async_prepare_read_started = true;
+        async_prepare_read_cv.notify_all();
+        async_prepare_read_cv.wait(lock, []() { return release_async_prepare_read; });
+    }
+    return MigrateTest_BatchGetLocation_stub(obj, rc, kv, bm, out_loc_maps);
+}
+} // namespace
+
 std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
                                                          const std::string &trace_id,
                                                          std::vector<MigrationManager::MigrationRequest> requests,
-                                                         MigrationManager::CopyConcurrencyLimit copy_limit) {
+                                                         MigrationManager::CopyConcurrencyLimit copy_limit,
+                                                         bool lifecycle_lock_held) {
+    static_cast<void>(obj);
+    static_cast<void>(lifecycle_lock_held);
     captured_copy_trace = trace_id;
     captured_copy_reqs = requests;
     captured_copy_req_batches.emplace_back(requests);
@@ -4541,9 +4605,11 @@ std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
 ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
                                                    const std::string &instance_id,
                                                    const std::vector<std::int64_t> &block_keys,
-                                                   const std::string &dst_storage_name) {
+                                                   const std::string &dst_storage_name,
+                                                   int64_t timeout_ms) {
     static_cast<void>(obj);
     static_cast<void>(instance_id);
+    static_cast<void>(timeout_ms);
     captured_mark_keys = block_keys;
     captured_mark_target = dst_storage_name;
     return ErrorCode::EC_OK;
@@ -4563,20 +4629,23 @@ MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, 
     return strategy;
 }
 
-TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
+TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
     stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
 
     cache_reclaimer_->job_state_flag_ = true; // 让 IsRunning() 为真，无需启动 cron 线程
 
     const auto ins_info = InstanceInfoFactory();
-    auto make_loc_maps = [&](const std::vector<std::int64_t> &batch) {
-        std::vector<CacheLocationMap> loc_maps;
-        const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
-        const auto ec = MigrateTest_BatchGetLocation_stub(nullptr, request_context_.get(), batch, blk_mask, loc_maps);
-        EXPECT_EQ(ErrorCode::EC_OK, ec);
-        EXPECT_EQ(batch.size(), loc_maps.size());
-        return loc_maps;
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    const auto configure_strategy = [&](const MigrationStrategy &strategy, const std::size_t copy_limit) {
+        auto instance_group = InstanceGroupFactory();
+        auto config = std::make_shared<CacheConfig>();
+        config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+        config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+        config->set_migration_copy_max_concurrency(static_cast<int64_t>(copy_limit));
+        config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+        instance_group->set_cache_config(config);
+        EnableAsyncMigration(instance_group, ins_info);
     };
 
     // ---- 场景 A：准入过滤（仅 copy）----
@@ -4584,14 +4653,13 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
         const std::vector<std::int64_t> batch = {10, 11, 12, 13};
-        const auto loc_maps = make_loc_maps(batch);
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
-        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-            request_context_, ins_info, strategy, /*available_copy_slots*/ 5, batch, loc_maps);
+        configure_strategy(strategy, 5);
+        ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+        ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
         // 仅 block 10 合格：11 目标已有 SERVING 副本，12 不在源 storage 上，13 目标已有 WRITING location
-        ASSERT_EQ(1u, submitted);
         ASSERT_EQ(1u, captured_copy_reqs.size());
         ASSERT_EQ(10, captured_copy_reqs[0].block_key);
         ASSERT_EQ("src_10", captured_copy_reqs[0].src_location_id);
@@ -4605,14 +4673,13 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
         const std::vector<std::int64_t> batch = {10};
-        const auto loc_maps = make_loc_maps(batch);
         cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), 10, "src_10"});
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
-        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-            request_context_, ins_info, strategy, /*available_copy_slots*/ 1, batch, loc_maps);
+        configure_strategy(strategy, 1);
+        ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+        ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        EXPECT_EQ(0, submitted);
         EXPECT_TRUE(captured_copy_reqs.empty());
         cache_reclaimer_->pending_locations_.erase({ins_info->instance_id(), 10, "src_10"});
     }
@@ -4622,14 +4689,13 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
         const std::vector<std::int64_t> batch = {20, 21, 22};
-        const auto loc_maps = make_loc_maps(batch);
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
-        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-            request_context_, ins_info, strategy, /*available_copy_slots*/ 2, batch, loc_maps);
+        configure_strategy(strategy, 2);
+        ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+        ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
         // 3 个合格候选，预算 2 -> 只提交 2 个
-        ASSERT_EQ(2u, submitted);
         ASSERT_EQ(2u, captured_copy_reqs.size());
         for (const auto &req : captured_copy_reqs) {
             ASSERT_TRUE(req.block_key == 20 || req.block_key == 21 || req.block_key == 22);
@@ -4643,13 +4709,12 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         captured_copy_req_batches.clear();
         captured_mark_keys.clear();
         const std::vector<std::int64_t> batch = {30};
-        const auto loc_maps = make_loc_maps(batch);
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ false, /*mark*/ true);
-        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-            request_context_, ins_info, strategy, /*available_copy_slots*/ 0, batch, loc_maps);
+        configure_strategy(strategy, 1);
+        ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+        ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        ASSERT_EQ(0u, submitted); // 无 copy
         ASSERT_TRUE(captured_copy_reqs.empty());
         ASSERT_EQ(1u, captured_mark_keys.size());
         ASSERT_EQ(30, captured_mark_keys[0]);
@@ -4663,13 +4728,12 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         captured_mark_keys.clear();
         captured_mark_target.clear();
         const std::vector<std::int64_t> batch = {20, 21, 22};
-        const auto loc_maps = make_loc_maps(batch);
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true);
-        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-            request_context_, ins_info, strategy, /*available_copy_slots*/ 2, batch, loc_maps);
+        configure_strategy(strategy, 2);
+        ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+        ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
-        ASSERT_EQ(2u, submitted);
         ASSERT_EQ(2u, captured_copy_reqs.size());
         ASSERT_EQ(1u, captured_mark_keys.size());
         std::vector<std::int64_t> copied_keys;
@@ -4683,8 +4747,389 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         ASSERT_EQ("cold_01", captured_mark_target);
     }
 
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
     stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+TEST_F(CacheReclaimerTest, TestAsyncMigrationPendingSnapshotRemainsBlockScoped) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    cache_reclaimer_->job_state_flag_ = true;
+
+    const auto ins_info = InstanceInfoFactory();
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(3);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    // block 60 and 61 deliberately reuse the same location id. Only block 60 is pending,
+    // so flattening pending ids across blocks would incorrectly remove block 61's source.
+    cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), 60, "shared_src"});
+    // A pending target must also be removed from the fresh snapshot so block 62 can be copied again.
+    cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), 62, "dst_62"});
+
+    captured_copy_reqs.clear();
+    ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, {60, 61, 62}));
+    ASSERT_TRUE(WaitForAsyncMigrationIdle());
+
+    ASSERT_EQ(2u, captured_copy_reqs.size());
+    EXPECT_EQ(61, captured_copy_reqs[0].block_key);
+    EXPECT_EQ(62, captured_copy_reqs[1].block_key);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+}
+
+TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareCoalescesAndRevalidatesStrategy) {
+    const auto ins_info = InstanceInfoFactory();
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(2);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_started = false;
+    bool release_blocker = false;
+    ASSERT_TRUE(spe_->SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocker_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_blocker; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
+    }
+
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context_->trace_id();
+    job.instance_group_name = instance_group->name();
+    job.instance_id = ins_info->instance_id();
+    job.source_storage_name = strategy.source_storage_name();
+    job.target_storage_name = strategy.target_storage_name();
+    job.block_keys = {10};
+    job.pending_location_ids_by_block = {{}};
+    const bool first_accepted = mm_->SubmitAsyncMigrationPrepare(job);
+    const bool duplicate_accepted = mm_->SubmitAsyncMigrationPrepare(job);
+    const auto pending_for_group = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+
+    // Job 只保存 route identity；排队期间 route 被删除后，worker 必须使用最新配置并放弃分发。
+    config->set_migration_strategies({});
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_blocker = true;
+    }
+    cv.notify_all();
+    const bool became_idle = WaitForAsyncMigrationIdle();
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(first_accepted);
+    EXPECT_FALSE(duplicate_accepted);
+    EXPECT_EQ(1u, pending_for_group);
+    EXPECT_TRUE(became_idle);
+    EXPECT_TRUE(captured_copy_reqs.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) {
+    const auto ins_info = InstanceInfoFactory();
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    {
+        std::lock_guard<std::mutex> lock(async_prepare_read_mutex);
+        async_prepare_read_started = false;
+        release_async_prepare_read = false;
+    }
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), BlockingMigrateTest_BatchGetLocation_stub);
+
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context_->trace_id();
+    job.instance_group_name = instance_group->name();
+    job.instance_id = ins_info->instance_id();
+    job.source_storage_name = strategy.source_storage_name();
+    job.target_storage_name = strategy.target_storage_name();
+    job.block_keys = {10};
+    job.pending_location_ids_by_block = {{}};
+    const bool accepted = mm_->SubmitAsyncMigrationPrepare(std::move(job));
+
+    bool read_started = false;
+    {
+        std::unique_lock<std::mutex> lock(async_prepare_read_mutex);
+        read_started = async_prepare_read_cv.wait_for(
+            lock, std::chrono::seconds(3), []() { return async_prepare_read_started; });
+    }
+
+    std::future<void> stop_future;
+    bool stop_waited_for_prepare = false;
+    if (read_started) {
+        stop_future = std::async(std::launch::async, [this]() { mm_->Stop(); });
+        stop_waited_for_prepare = stop_future.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    }
+
+    // Always release the injected I/O wait before making fatal assertions or leaving the test.
+    {
+        std::lock_guard<std::mutex> lock(async_prepare_read_mutex);
+        release_async_prepare_read = true;
+    }
+    async_prepare_read_cv.notify_all();
+
+    bool stop_completed = false;
+    if (stop_future.valid()) {
+        stop_completed = stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    }
+
+    EXPECT_TRUE(accepted);
+    EXPECT_TRUE(read_started);
+    EXPECT_TRUE(stop_waited_for_prepare);
+    EXPECT_TRUE(stop_completed);
+}
+
+TEST_F(CacheReclaimerTest, TestQueuedAsyncMigrationFromPreviousGenerationIsDiscarded) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_started = false;
+    bool release_blocker = false;
+    ASSERT_TRUE(spe_->SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocker_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_blocker; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
+    }
+
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context_->trace_id();
+    job.instance_group_name = instance_group->name();
+    job.instance_id = ins_info->instance_id();
+    job.source_storage_name = strategy.source_storage_name();
+    job.target_storage_name = strategy.target_storage_name();
+    job.block_keys = {10};
+    job.pending_location_ids_by_block = {{}};
+
+    const bool old_job_accepted = mm_->SubmitAsyncMigrationPrepare(job);
+    mm_->Stop();
+    const bool post_stop_accepted = mm_->SubmitAsyncMigrationPrepare(job);
+    mm_->Start();
+    const bool new_job_accepted = mm_->SubmitAsyncMigrationPrepare(job);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_blocker = true;
+    }
+    cv.notify_all();
+    const bool became_idle = WaitForAsyncMigrationIdle();
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(old_job_accepted);
+    EXPECT_FALSE(post_stop_accepted);
+    EXPECT_TRUE(new_job_accepted);
+    EXPECT_TRUE(became_idle);
+    ASSERT_EQ(1u, captured_copy_req_batches.size())
+        << "only the job submitted in the current manager generation may dispatch";
+    ASSERT_EQ(1u, captured_copy_req_batches[0].size());
+    EXPECT_EQ(10, captured_copy_req_batches[0][0].block_key);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+}
+
+TEST_F(CacheReclaimerTest, TestExecutorStopCancelsQueuedAsyncMigrationPrepare) {
+    const auto ins_info = InstanceInfoFactory();
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_started = false;
+    bool release_blocker = false;
+    ASSERT_TRUE(spe_->SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocker_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_blocker; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
+    }
+
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context_->trace_id();
+    job.instance_group_name = instance_group->name();
+    job.instance_id = ins_info->instance_id();
+    job.source_storage_name = strategy.source_storage_name();
+    job.target_storage_name = strategy.target_storage_name();
+    job.block_keys = {10};
+    job.pending_location_ids_by_block = {{}};
+    const bool accepted = mm_->SubmitAsyncMigrationPrepare(std::move(job));
+
+    auto stop_future = std::async(std::launch::async, [this]() { spe_->Stop(); });
+    const bool pending_released = WaitForAsyncMigrationIdle();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_blocker = true;
+    }
+    cv.notify_all();
+    const bool stop_completed =
+        stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(accepted);
+    EXPECT_TRUE(pending_released);
+    EXPECT_TRUE(stop_completed);
+    EXPECT_TRUE(captured_copy_reqs.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestPendingLocationSnapshotIsScopedByInstanceAndBlock) {
+    cache_reclaimer_->pending_locations_.insert({"instance_a", 9, "before"});
+    cache_reclaimer_->pending_locations_.insert({"instance_a", 10, "location_b"});
+    cache_reclaimer_->pending_locations_.insert({"instance_a", 10, "location_a"});
+    cache_reclaimer_->pending_locations_.insert({"instance_a", 11, "location_c"});
+    cache_reclaimer_->pending_locations_.insert({"instance_b", 10, "other_instance"});
+
+    const auto snapshot = cache_reclaimer_->SnapshotPendingLocations("instance_a", {10, 12, 11});
+
+    ASSERT_EQ(3u, snapshot.size());
+    EXPECT_EQ((std::vector<std::string>{"location_a", "location_b"}), snapshot[0]);
+    EXPECT_TRUE(snapshot[1].empty());
+    EXPECT_EQ((std::vector<std::string>{"location_c"}), snapshot[2]);
+}
+
+TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossTicks) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    cache_reclaimer_->job_state_flag_ = true;
+    rm_->data_storage_manager_ = dsm_;
+
+    auto instance_group = InstanceGroupFactory();
+    QuotaConfig quota_config;
+    quota_config.set_capacity(1000);
+    quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    InstanceGroupQuota quota;
+    quota.set_capacity(1000);
+    quota.set_quota_config({quota_config});
+    instance_group->set_quota(quota);
+
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(2);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+
+    auto make_instance = [&](const std::string &id) {
+        auto info = InstanceInfoFactory();
+        info->set_instance_id(id);
+        info->set_instance_group_name(instance_group->name());
+        EnableAsyncMigration(instance_group, info);
+        return info;
+    };
+    const auto first_instance = make_instance("pending_tick_first");
+    const auto second_instance = make_instance("pending_tick_second");
+    const auto third_instance = make_instance("pending_tick_third");
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 800);
+    sample_reclaim_keys = {10};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocker_started = false;
+    bool release_blocker = false;
+    ASSERT_TRUE(spe_->SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        blocker_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_blocker; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return blocker_started; });
+    }
+
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {first_instance});
+    const auto pending_after_first_tick =
+        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+
+    sample_reclaim_call_counter = 0;
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {second_instance, third_instance});
+    const auto pending_after_second_tick =
+        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto sampled_on_second_tick = sample_reclaim_call_counter;
+
+    sample_reclaim_call_counter = 0;
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {third_instance});
+    const auto pending_after_full_tick =
+        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto sampled_when_full = sample_reclaim_call_counter;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_blocker = true;
+    }
+    cv.notify_all();
+    const bool became_idle = WaitForAsyncMigrationIdle();
+
+    EXPECT_TRUE(started);
+    EXPECT_EQ(1u, pending_after_first_tick);
+    EXPECT_EQ(2u, pending_after_second_tick);
+    EXPECT_EQ(1, sampled_on_second_tick)
+        << "only one remaining copy slot may enqueue one instance prepare job";
+    EXPECT_EQ(2u, pending_after_full_tick);
+    EXPECT_EQ(0, sampled_when_full) << "a full pending budget must prune before candidate sampling";
+    EXPECT_TRUE(became_idle);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategies) {
@@ -4723,9 +5168,10 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
             std::make_shared<MigrationStrategy>(MakeStrategy("hot_02", "cold_02", /*copy*/ true, /*mark*/ false)),
         });
         ins_group->set_cache_config(cfg);
-        // MigrateByStrategyOnBatch 从 RegistryManager 读取同一份 group 并发配置。
         rm_->instance_group_configs_[ins_group->name()] = ins_group;
     }
+    const auto ins_info = InstanceInfoFactory();
+    EnableAsyncMigration(ins_group, ins_info);
 
     dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 800);
     key_count = 2;
@@ -4737,10 +5183,11 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
     captured_copy_limits.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
-    ASSERT_EQ(1, batch_get_loc_call_counter);
+    ASSERT_EQ(2, batch_get_loc_call_counter); // 每条 route 在 worker 中 fresh read；采样批次只构建一次
     ASSERT_EQ(2u, captured_copy_req_batches.size());
     ASSERT_EQ(1u, captured_copy_req_batches[0].size());
     ASSERT_EQ(10, captured_copy_req_batches[0][0].block_key);
@@ -4896,6 +5343,8 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
         });
         ins_group->set_cache_config(cfg);
     }
+    const auto ins_info = InstanceInfoFactory();
+    EnableAsyncMigration(ins_group, ins_info);
 
     dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 800);
     sample_reclaim_keys = {50};
@@ -4904,7 +5353,8 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
 
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
-    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {ins_info});
+    ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
     ASSERT_EQ(1, batch_get_loc_call_counter);
@@ -4922,7 +5372,8 @@ namespace {
 std::vector<ErrorCode> BatchSubmit_PartialFail_stub(void * /*obj*/,
                                                     const std::string &trace_id,
                                                     std::vector<MigrationManager::MigrationRequest> requests,
-                                                    MigrationManager::CopyConcurrencyLimit /*copy_limit*/) {
+                                                    MigrationManager::CopyConcurrencyLimit /*copy_limit*/,
+                                                    bool /*lifecycle_lock_held*/) {
     captured_copy_trace = trace_id;
     captured_copy_reqs = requests;
     captured_copy_req_batches.emplace_back(requests);
@@ -4935,7 +5386,7 @@ std::vector<ErrorCode> BatchSubmit_PartialFail_stub(void * /*obj*/,
 }
 } // namespace
 
-TEST_F(CacheReclaimerTest, TestMigrateByStrategyBothCopyFailFallbackMark) {
+TEST_F(CacheReclaimerTest, TestAsyncMigrationCopyFailureFallsBackToMark) {
     cache_reclaimer_->job_state_flag_ = true;
     const auto ins_info = InstanceInfoFactory();
     captured_copy_reqs.clear();
@@ -4948,24 +5399,23 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyBothCopyFailFallbackMark) {
     stub_.set(ADDR(MigrationManager, BatchSubmit), BatchSubmit_PartialFail_stub);
     stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
 
-    // batch = {20, 21, 22}：全部合格(loc_maps 里有源)；slots 足够(5)
+    // batch = {20, 21, 22}：全部合格，group copy slots 足够。
     const std::vector<std::int64_t> batch = {20, 21, 22};
-    std::vector<CacheLocationMap> loc_maps;
-    {
-        const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
-        ASSERT_EQ(ErrorCode::EC_OK,
-                  MigrateTest_BatchGetLocation_stub(nullptr, request_context_.get(), batch, blk_mask, loc_maps));
-        ASSERT_EQ(batch.size(), loc_maps.size());
-    }
-
     const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true);
-    const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
-        request_context_, ins_info, strategy, /*available_copy_slots*/ 5, batch, loc_maps);
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(5);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
+    ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
     // 3 个都进 copy；BatchSubmit 返回 [OK, ERROR, OK]
     ASSERT_EQ(3u, captured_copy_reqs.size());
-    // submitted_copy = 2 (index 0 和 2 成功)
-    ASSERT_EQ(2u, submitted);
     // 失败的 index 1 (block_key=21) 应回落到 mark
     ASSERT_EQ(1u, captured_mark_keys.size());
     ASSERT_EQ(21, captured_mark_keys[0]);

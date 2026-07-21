@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <initializer_list>
 #include <memory>
@@ -28,6 +29,7 @@ namespace kv_cache_manager {
 class MetaIndexerManager;
 class DataStorageManager;
 class EventManager;
+class RegistryManager;
 class RequestContext;
 
 /**
@@ -45,10 +47,10 @@ class RequestContext;
  * 不引入新状态机（复用 CLS_WRITING）；crash 恢复交给 Reclaimer 孤儿检测。
  * MigrationManager 维护一个活跃任务集合（instance_id + block_key）用于防重复迁移与并发预算统计。
  *
- * 线程模型（一期）：copy 任务在 SchedulePlanExecutor 内同步执行；MigrationManager 起一个监控线程
- * 轮询 copy future，就绪后驱动状态流转。
+ * 线程模型：Reclaimer 的 Prepare 与所有 Copy/迁移 cleanup 在共享 SchedulePlanExecutor 中执行，
+ * Admin Prepare 保持调用线程同步语义；MigrationManager 监控线程轮询 copy future 并驱动状态流转。
  */
-class MigrationManager {
+class MigrationManager : public std::enable_shared_from_this<MigrationManager> {
 public:
     // 一条 Copy 迁移请求：把 instance/block 下 src_location 的数据复制到 dst_storage。
     struct MigrationRequest {
@@ -93,7 +95,8 @@ public:
                      std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
                      std::shared_ptr<DataStorageManager> data_storage_manager,
                      std::shared_ptr<MetricsRegistry> metrics_registry = nullptr,
-                     std::shared_ptr<EventManager> event_manager = nullptr);
+                     std::shared_ptr<EventManager> event_manager = nullptr,
+                     std::shared_ptr<RegistryManager> registry_manager = nullptr);
     ~MigrationManager();
 
     MigrationManager(const MigrationManager &) = delete;
@@ -253,6 +256,26 @@ public:
         int64_t copy_failed = 0;
         int64_t mark_submitted = 0;
     };
+
+    // Reclaimer 只在其单线程中选择候选并生成 pending-delete 快照；Job 跨异步边界后完全
+    // own 输入。worker 会重新读取当前 instance/config/strategy/location，再进入统一分发。
+    struct AsyncMigrationPrepareJob {
+        std::string trace_id;
+        std::string instance_group_name;
+        std::string instance_id;
+        std::string source_storage_name;
+        std::string target_storage_name;
+        std::vector<int64_t> block_keys;
+        std::vector<std::vector<std::string>> pending_location_ids_by_block;
+        std::function<void(const DispatchBatchResult &)> on_dispatched;
+    };
+
+    // 同一路由最多保留一个 queued/running Prepare。返回 true 仅表示 Job 已入队；实际
+    // Copy/Mark 准入结果通过 on_dispatched 和 MigrationManager 指标观察。
+    bool SubmitAsyncMigrationPrepare(AsyncMigrationPrepareJob job);
+    // 用于 Reclaimer 的轻量 backpressure；包含 queued 与正在执行的 Prepare，不替代 Copy 硬准入。
+    std::size_t PendingAsyncMigrationPrepareCountForGroup(const std::string &instance_group_name) const;
+
     DispatchBatchResult DispatchMigrationBatch(const std::string &trace_id,
                                                const std::string &instance_id,
                                                const std::string &src_name,
@@ -271,13 +294,15 @@ private:
     // shape 校验，违反 contract 时整批返回 EC_BADARGS，不进入 reservation/backend/meta I/O。
     std::vector<ErrorCode> BatchSubmit(const std::string &trace_id,
                                        std::vector<MigrationRequest> requests,
-                                       CopyConcurrencyLimit copy_limit = CopyConcurrencyLimit());
+                                       CopyConcurrencyLimit copy_limit = CopyConcurrencyLimit(),
+                                       bool lifecycle_lock_held = false);
 
     // ---- 仅供测试/诊断（BUILD 通过 -fno-access-control 访问）----
     std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
     void
     DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
     void DebugEnableCopySubmissionsForTest();
+    std::size_t PendingAsyncMigrationPrepareCountForTest() const;
 
     // 活跃 Copy 任务的收尾状态机。用于让外部 Cancel 线程与单一 monitor 完成线程在
     // task_mutex_ 内原子认领"谁负责收尾"，避免 cancel 与 promote 并发误删刚提升的目标。
@@ -418,11 +443,39 @@ private:
     // + cancelled 终态 metric/event/log。仅由 OnTaskSuccess/OnTaskFailed 在认领到 kWasCancelling 时调用。
     void CompleteCancelledTask(const CopyTaskContext &ctx);
 
+    struct AsyncMigrationPrepareKey {
+        std::uint64_t generation = 0;
+        std::string instance_group_name;
+        std::string instance_id;
+        std::string source_storage_name;
+        std::string target_storage_name;
+
+        bool operator==(const AsyncMigrationPrepareKey &other) const {
+            return generation == other.generation && instance_group_name == other.instance_group_name &&
+                   instance_id == other.instance_id && source_storage_name == other.source_storage_name &&
+                   target_storage_name == other.target_storage_name;
+        }
+    };
+    struct AsyncMigrationPrepareKeyHash {
+        std::size_t operator()(const AsyncMigrationPrepareKey &key) const;
+    };
+
+    void RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, std::uint64_t generation);
+    void FinishAsyncMigrationPrepare(const AsyncMigrationPrepareKey &key);
+    DispatchBatchResult DispatchMigrationBatchWithLifecycleLockHeld(const std::string &trace_id,
+                                                                    const std::string &instance_id,
+                                                                    const std::string &src_name,
+                                                                    const std::string &dst_name,
+                                                                    const std::vector<int64_t> &batch,
+                                                                    const std::vector<CacheLocationMap> &loc_maps,
+                                                                    const DispatchBatchParams &params);
+
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<EventManager> event_manager_;
+    std::shared_ptr<RegistryManager> registry_manager_;
     bool metrics_enabled_ = false;
 
     // 活跃 Copy 任务表。
@@ -449,6 +502,13 @@ private:
     std::mutex copy_submission_mutex_;
     // draining 中的 instance（copy_submission_mutex_ 保护）。非空即拒绝该 instance 的新提交。
     std::unordered_set<std::string> draining_instances_;
+
+    // 异步 Prepare 仅记录轻量 route key；不持有 Reclaimer 指针。Stop 递增 generation 使
+    // 已排队的旧 leader Job 自动失效，避免切主后执行陈旧策略。
+    static constexpr std::size_t kMaxPendingAsyncMigrationPrepareJobs = 1024;
+    mutable std::mutex async_prepare_mutex_;
+    std::unordered_set<AsyncMigrationPrepareKey, AsyncMigrationPrepareKeyHash> pending_async_prepare_jobs_;
+    std::atomic<std::uint64_t> async_prepare_generation_{0};
 
     // 统计计数（原子，GetStats 汇总）。
     std::atomic<uint64_t> stat_copy_submitted_{0};

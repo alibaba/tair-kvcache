@@ -33,6 +33,7 @@ class CacheManagerMetricsRecorder;
 struct MetricsLifecycle;
 class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
+constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
 
 class CacheManager {
     // TODO should not public
@@ -73,7 +74,8 @@ public:
               uint64_t cache_reclaimer_del_batch_size = 100,
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
-              CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {});
+              CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();

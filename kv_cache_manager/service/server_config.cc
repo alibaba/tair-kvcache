@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdio.h>
 
@@ -103,6 +104,20 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->schedule_plan_executor_thread_count_ = std::stoi(value);
          return true;
+     }},
+    {"kvcm.schedule_plan_migration_worker_budget",
+     [](const std::string &value, ServerConfig *config) {
+         try {
+             std::size_t parsed_length = 0;
+             const auto parsed = std::stoull(value, &parsed_length);
+             if (parsed_length != value.size() || parsed > std::numeric_limits<uint32_t>::max()) {
+                 return false;
+             }
+             config->schedule_plan_migration_worker_budget_ = static_cast<uint32_t>(parsed);
+             return true;
+         } catch (...) {
+             return false;
+         }
      }},
     {"kvcm.cache_reclaimer.key_sampling_size_total",
      [](const std::string &value, ServerConfig *config) {
@@ -220,6 +235,8 @@ void ServerConfig::UpdateDefaultConfig() {
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
+    schedule_plan_executor_thread_count_ = 2;
+    schedule_plan_migration_worker_budget_ = 1;
     cache_reclaimer_key_sampling_size_total_ = 1000;
     cache_reclaimer_key_sampling_size_per_task_ = 100;
     cache_reclaimer_del_batch_size_ = 100;
@@ -345,6 +362,13 @@ bool ServerConfig::Check() {
         cache_reclaimer_pending_bytes_limit_per_group_type_ == 0 ||
         cache_reclaimer_pending_delete_handler_limit_ == 0 || cache_reclaimer_pending_bytes_limit_ == 0) {
         fprintf(stderr, "CacheReclaimer async delete limits and timeout must be greater than zero\n");
+        return false;
+    }
+
+    if (schedule_plan_executor_thread_count_ <= 1 || schedule_plan_migration_worker_budget_ == 0 ||
+        schedule_plan_migration_worker_budget_ >= static_cast<uint32_t>(schedule_plan_executor_thread_count_)) {
+        fprintf(stderr,
+                "SchedulePlanExecutor requires thread_count > 1 and 0 < migration_worker_budget < thread_count\n");
         return false;
     }
 

@@ -67,13 +67,17 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
-    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
-                         config_.GetCacheReclaimerKeySamplingSizeTotal(),
-                         config_.GetCacheReclaimerKeySamplingSizePerTask(),
-                         config_.GetCacheReclaimerDelBatchSize(),
-                         config_.GetCacheReclaimerIdleIntervalMs(),
-                         config_.GetCacheReclaimerWorkerSize(),
-                         async_delete_config);
+    if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
+                              config_.GetCacheReclaimerKeySamplingSizeTotal(),
+                              config_.GetCacheReclaimerKeySamplingSizePerTask(),
+                              config_.GetCacheReclaimerDelBatchSize(),
+                              config_.GetCacheReclaimerIdleIntervalMs(),
+                              config_.GetCacheReclaimerWorkerSize(),
+                              async_delete_config,
+                              config_.GetSchedulePlanMigrationWorkerBudget())) {
+        KVCM_LOG_ERROR("cache manager init failed");
+        return false;
+    }
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
 
     // Set revisit interval histogram configuration

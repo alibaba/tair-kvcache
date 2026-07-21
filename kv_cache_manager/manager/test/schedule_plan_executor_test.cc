@@ -1,6 +1,10 @@
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -1252,4 +1256,197 @@ TEST_F(SchedulePlanExecutorTest, TestQueuedCopyTaskCompletesOnStop) {
     const auto result = future.get();
     EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
     EXPECT_NE(std::string::npos, result.error_message.find("before copy task execution"));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetLeavesWorkerForReclaim) {
+    SchedulePlanExecutor executor(4, meta_manager_, data_storage_manager_, metrics_registry_, 2);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release_migrations = false;
+    int running_migrations = 0;
+    int completed_migrations = 0;
+    int max_running_migrations = 0;
+
+    bool all_migrations_accepted = true;
+    for (int i = 0; i < 4; ++i) {
+        all_migrations_accepted &= executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++running_migrations;
+            max_running_migrations = std::max(max_running_migrations, running_migrations);
+            cv.notify_all();
+            cv.wait(lock, [&]() { return release_migrations; });
+            --running_migrations;
+            ++completed_migrations;
+            cv.notify_all();
+        });
+    }
+
+    bool budget_filled = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        budget_filled = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return running_migrations == 2; });
+    }
+
+    std::promise<void> reclaim_ran;
+    auto reclaim_future = reclaim_ran.get_future();
+    const bool reclaim_accepted = executor.SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
+    const bool reclaim_completed = reclaim_accepted &&
+                                   reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_migrations = true;
+    }
+    cv.notify_all();
+    bool all_migrations_completed = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        all_migrations_completed =
+            cv.wait_for(lock, std::chrono::seconds(3), [&]() { return completed_migrations == 4; });
+    }
+
+    EXPECT_TRUE(budget_filled);
+    EXPECT_TRUE(all_migrations_accepted);
+    EXPECT_TRUE(reclaim_accepted);
+    EXPECT_TRUE(reclaim_completed);
+    EXPECT_TRUE(all_migrations_completed);
+    EXPECT_EQ(2, max_running_migrations);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetClampAppliesAcrossPrepareAndContinuation) {
+    auto run_case = [&](unsigned int requested_budget, int expected_running) {
+        auto executor = std::make_unique<SchedulePlanExecutor>(
+            2, meta_manager_, data_storage_manager_, metrics_registry_, requested_budget);
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool release_migrations = false;
+        int running_migrations = 0;
+        int completed_migrations = 0;
+        int max_running_migrations = 0;
+        auto migration_task = [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++running_migrations;
+            max_running_migrations = std::max(max_running_migrations, running_migrations);
+            cv.notify_all();
+            cv.wait(lock, [&]() { return release_migrations; });
+            --running_migrations;
+            ++completed_migrations;
+            cv.notify_all();
+        };
+
+        const bool prepare_accepted =
+            executor->SubmitTask(ScheduleTaskClass::kMigrationPrepare, migration_task);
+        const bool continuation_accepted =
+            executor->SubmitTask(ScheduleTaskClass::kMigrationContinuation, migration_task);
+
+        bool expected_concurrency_reached = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            expected_concurrency_reached = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
+                return running_migrations == expected_running;
+            });
+        }
+
+        // With a clamped budget of one, the second worker must remain available for reclaim
+        // even though one Prepare and one Continuation are both ready.
+        bool reclaim_completed = true;
+        if (expected_running == 1) {
+            std::promise<void> reclaim_ran;
+            auto reclaim_future = reclaim_ran.get_future();
+            const bool reclaim_accepted =
+                executor->SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
+            reclaim_completed = reclaim_accepted &&
+                                reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            release_migrations = true;
+        }
+        cv.notify_all();
+        bool all_completed = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            all_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
+                return completed_migrations == 2;
+            });
+        }
+
+        EXPECT_TRUE(prepare_accepted);
+        EXPECT_TRUE(continuation_accepted);
+        EXPECT_TRUE(expected_concurrency_reached);
+        EXPECT_TRUE(reclaim_completed);
+        EXPECT_TRUE(all_completed);
+        EXPECT_EQ(expected_running, max_running_migrations);
+    };
+
+    run_case(/*requested_budget*/ 0, /*expected_running*/ 1);
+    run_case(/*requested_budget*/ 99, /*expected_running*/ 2);
+    run_case(std::numeric_limits<unsigned int>::max(), /*expected_running*/ 2);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationContinuationPrecedesNewPrepare) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_, 1);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool system_started = false;
+    bool release_system = false;
+    std::vector<std::string> execution_order;
+
+    ASSERT_TRUE(executor.SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        system_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_system; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return system_started; });
+    }
+
+    const bool prepare_accepted = executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() {
+        std::lock_guard<std::mutex> lock(mutex);
+        execution_order.emplace_back("prepare");
+        cv.notify_all();
+    });
+    const bool continuation_accepted = executor.SubmitTask(ScheduleTaskClass::kMigrationContinuation, [&]() {
+        std::lock_guard<std::mutex> lock(mutex);
+        execution_order.emplace_back("continuation");
+        cv.notify_all();
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_system = true;
+    }
+    cv.notify_all();
+
+    bool both_completed = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        both_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return execution_order.size() == 2; });
+    }
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(prepare_accepted);
+    EXPECT_TRUE(continuation_accepted);
+    ASSERT_TRUE(both_completed);
+    ASSERT_EQ(2u, execution_order.size());
+    EXPECT_EQ("continuation", execution_order[0]);
+    EXPECT_EQ("prepare", execution_order[1]);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationExceptionReleasesBudget) {
+    SchedulePlanExecutor executor(2, meta_manager_, data_storage_manager_, metrics_registry_, 1);
+
+    std::promise<void> second_ran;
+    auto second_future = second_ran.get_future();
+    ASSERT_TRUE(executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare,
+                                    []() { throw std::runtime_error("injected migration task failure"); }));
+    ASSERT_TRUE(executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() { second_ran.set_value(); }));
+
+    EXPECT_EQ(std::future_status::ready, second_future.wait_for(std::chrono::seconds(3)));
 }

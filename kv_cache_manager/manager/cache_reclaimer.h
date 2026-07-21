@@ -578,17 +578,17 @@ private:
                         std::vector<std::int64_t> &out_batch,
                         AgeStats &out_lru_age_stats) const noexcept;
 
-    bool BuildMigrationBatch(const std::shared_ptr<RequestContext> &request_context,
-                             const std::shared_ptr<const InstanceInfo> &instance_info,
-                             std::vector<std::int64_t> &out_batch,
-                             std::vector<CacheLocationMap> &out_loc_maps) noexcept;
+    bool BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
+                                      const std::shared_ptr<const InstanceInfo> &instance_info,
+                                      std::vector<std::int64_t> &out_batch) noexcept;
 
-    std::size_t MigrateByStrategyOnBatch(const std::shared_ptr<RequestContext> &request_context,
-                                         const std::shared_ptr<const InstanceInfo> &instance_info,
-                                         const MigrationStrategy &strategy,
-                                         std::size_t available_copy_slots,
-                                         const std::vector<std::int64_t> &batch,
-                                         const std::vector<CacheLocationMap> &loc_maps) noexcept;
+    std::vector<std::vector<std::string>>
+    SnapshotPendingLocations(const std::string &instance_id, const std::vector<std::int64_t> &batch) const;
+
+    bool SubmitMigrationPrepareJob(const std::shared_ptr<RequestContext> &request_context,
+                                   const std::shared_ptr<const InstanceInfo> &instance_info,
+                                   const MigrationStrategy &strategy,
+                                   const std::vector<std::int64_t> &batch) noexcept;
 
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,

@@ -33,6 +33,7 @@ public:
     uint32_t GetLogLevel() const { return log_level_; }
     const std::string &startup_config() { return startup_config_; }
     int32_t GetSchedulePlanExecutorThreadCount() { return schedule_plan_executor_thread_count_; }
+    uint32_t GetSchedulePlanMigrationWorkerBudget() const { return schedule_plan_migration_worker_budget_; }
     uint64_t GetCacheReclaimerKeySamplingSizeTotal() { return cache_reclaimer_key_sampling_size_total_; }
     uint64_t GetCacheReclaimerKeySamplingSizePerTask() { return cache_reclaimer_key_sampling_size_per_task_; }
     uint64_t GetCacheReclaimerDelBatchSize() { return cache_reclaimer_del_batch_size_; }
@@ -89,6 +90,7 @@ private:
     uint32_t log_level_ = 0;
     std::string startup_config_;
     int32_t schedule_plan_executor_thread_count_ = 0;
+    uint32_t schedule_plan_migration_worker_budget_ = 0;
     uint64_t cache_reclaimer_key_sampling_size_total_ = 0;
     uint64_t cache_reclaimer_key_sampling_size_per_task_ = 0;
     uint64_t cache_reclaimer_del_batch_size_ = 0;

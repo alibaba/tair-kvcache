@@ -2496,6 +2496,7 @@ TEST_F(MigrationManagerTest, TestDispatchSkipsMarkWhenDedupQueryFails) {
     params.dedup_marks = true;
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    mgr.DebugEnableCopySubmissionsForTest();
     const auto result =
         mgr.DispatchMigrationBatch("mark_query_error", kInstance, "hot_01", "cold_01", {1}, {loc_map}, params);
 

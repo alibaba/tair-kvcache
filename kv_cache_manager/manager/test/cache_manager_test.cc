@@ -285,6 +285,27 @@ public:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
+TEST_F(CacheManagerTest, TestInitRejectsInvalidMigrationWorkerBudget) {
+    const std::vector<std::pair<int32_t, uint32_t>> invalid_configs{
+        {1, 1}, // at least one worker must remain available outside migration
+        {2, 0},
+        {2, 2},
+        {2, 3},
+    };
+    for (const auto &[worker_count, migration_budget] : invalid_configs) {
+        auto manager = std::make_unique<CacheManager>(metrics_registry_, registry_manager_);
+        EXPECT_FALSE(manager->Init(worker_count,
+                                   /*cache_reclaimer_key_sampling_size_total*/ 1000,
+                                   /*cache_reclaimer_key_sampling_size_per_task*/ 100,
+                                   /*cache_reclaimer_del_batch_size*/ 100,
+                                   /*cache_reclaimer_idle_interval_ms*/ 100,
+                                   /*cache_reclaimer_worker_size*/ 16,
+                                   CacheReclaimerAsyncDeleteConfig{},
+                                   migration_budget))
+            << "worker_count=" << worker_count << " migration_budget=" << migration_budget;
+    }
+}
+
 TEST_F(CacheManagerTest, TestRegisterInstance) {
     // register same instance in each round
     {
@@ -2294,7 +2315,9 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
@@ -2302,20 +2325,22 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     // submit a second request and verify count increases
     func({300}, {{"loc_c"}});
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(2u, executor->tasks_.size());
+        ASSERT_EQ(2u, executor->WaitingTaskCountLocked());
     }
 
     // clean up: clear tasks so executor destructor is clean
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 }
 
@@ -2483,7 +2508,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: key 1 exists, key 2 stale, key 3 exists
@@ -2520,13 +2547,15 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
     // location
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     // clean up
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -2570,7 +2599,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: all stale
@@ -2594,12 +2625,14 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
     // deletion request submitted for the 2 stale keys
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -2643,7 +2676,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: key 1 valid, key 2 stale, key 3 stale
@@ -2675,12 +2710,14 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
     // deletion request submitted for stale keys 2,3
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -4131,6 +4168,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
 TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
     constexpr int64_t kTimeoutMs = 3000;
     EnableTieredMigrationStrategy("default", "hot_01", "cold_01", kTimeoutMs);
+    cache_manager_->StartMigrationManager();
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
                                      "admin_mark_timeout_instance",
@@ -4187,6 +4225,7 @@ TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
 
 TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
     EnableTieredMigrationStrategy("default", "hot_01", "cold_01", 3000);
+    cache_manager_->StartMigrationManager();
     ASSERT_TRUE(RegisterDummyStorage("cold_02"));
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
