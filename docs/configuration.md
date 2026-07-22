@@ -92,6 +92,13 @@ kvcm.service.enable_debug_service=false
 # 指定KVCache Manager初始配置JSON文件路径
 kvcm.startup_config=package/etc/default_startup_config.json
 
+# 删除、系统任务与分层迁移共享的后台线程池总大小，必须大于 1
+kvcm.schedule_plan_executor_thread_count=8
+
+# 分层迁移 Prepare/Copy/cleanup 最多同时占用的共享线程池 worker 数；必须满足
+# 0 < migration_worker_budget < executor_thread_count
+kvcm.schedule_plan_migration_worker_budget=3
+
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
@@ -122,6 +129,29 @@ kvcm.metrics.prometheus_prefix=kvcm
 # log event publisher的初始化配置值，暂未启用
 kvcm.event.event_publishers_configs
 ```
+
+### SchedulePlanExecutor 线程与迁移预算
+
+`kvcm.schedule_plan_executor_thread_count` 是删除、系统任务和分层迁移共同使用的进程级线程池总大小；
+`kvcm.schedule_plan_migration_worker_budget` 是该线程池内同时运行的 Migration Prepare、Copy 和 cleanup
+任务上限，并不是额外创建的迁移线程数。随包提供的 `default_server_config.conf` 使用 `8/3`，未提供配置文件时
+代码级默认值为 `2/1`。
+
+两个参数必须满足：
+
+```TEXT
+executor_thread_count > 1
+0 < migration_worker_budget < executor_thread_count
+```
+
+迁移任务可能在 Backend Create、Copy 等存储操作中长时间占用 worker。任务优先级只能决定尚未运行任务的
+出队顺序，无法抢占已经运行的迁移任务，因此 Migration budget 必须小于线程池总大小，确保至少有一个 worker
+不会被迁移任务占用，可以继续处理水位回收和系统任务。这里不是把线程池静态切分为两部分：没有迁移任务时，
+回收和系统任务仍可使用全部 worker。
+
+该约束是进程级 Executor 的启动条件，与启动时是否已经配置 migration strategy 无关；instance group 可在运行期
+新增迁移策略，因此不能根据启动时的策略状态放宽校验。`2/1`、`8/3` 是合法配置，`1/1`、`8/8` 和 `8/0`
+会导致 `ServerConfig::Check` 或 `CacheManager::Init` 失败。已有单线程自定义配置需要至少调整为 `2/1`。
 
 ## CacheManager Initial Config
 
