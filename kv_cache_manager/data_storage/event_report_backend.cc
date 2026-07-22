@@ -44,6 +44,12 @@ ErrorCode EventReportBackend::DoOpen(const StorageConfig &config, const std::str
                       config.ToString().c_str());
         return EC_ERROR;
     }
+    if (!IsEventReportStorageType(config.type())) {
+        KVCM_LOG_WARN("trace_id [%s] | EventReportBackend::DoOpen: unexpected storage type, storage config: [%s]",
+                      trace_id.c_str(),
+                      config.ToString().c_str());
+        return EC_ERROR;
+    }
     spec_ = *spec;
     heartbeat_timeout_ms_ = spec_.heartbeat_timeout_ms();
     cleanup_grace_ms_ = spec_.cleanup_grace_ms();
@@ -113,7 +119,7 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
         info.available.store(true, std::memory_order_relaxed);
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
         info.instance_id = instance_id;
-        info.metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
+        info.metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}, {"type", ToString(config_.type())}};
         KVCM_LOG_INFO("EventReportBackend: node [%s] already registered for instance [%s], "
                       "mediums=%zu (refreshed heartbeat, gen=%lu)",
                       host_ip_port.c_str(),
@@ -129,7 +135,7 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
     info->mediums = mediums;
     info->instance_id = instance_id;
-    info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
+    info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}, {"type", ToString(config_.type())}};
     host_map[host_ip_port] = std::move(info);
 
     KVCM_LOG_INFO("EventReportBackend: node [%s] registered in storage [%s] for instance [%s], mediums=%zu, gen=%lu",
@@ -424,10 +430,11 @@ std::vector<ErrorCode> EventReportBackend::UnLock(const std::vector<DataStorageU
 }
 
 std::string EventReportBackend::BuildLocationId(const std::string &medium, const std::string &host_ip_port) const {
+    const std::string type_token = ToString(config_.type());
     std::string result;
-    result.reserve(4 + 16 + 1 + medium.size() + 1 + host_ip_port.size());
+    result.reserve(4 + type_token.size() + 1 + medium.size() + 1 + host_ip_port.size());
     result.append("kvs#");
-    result.append("event_report");
+    result.append(type_token);
     result.push_back('#');
     result.append(medium);
     result.push_back('#');

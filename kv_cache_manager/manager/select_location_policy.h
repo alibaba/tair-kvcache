@@ -93,6 +93,7 @@ protected:
         StorageTypeWeights::VCNS_HF3FS,
         StorageTypeWeights::DEFAULT,
         StorageTypeWeights::EVENT_REPORT,
+        StorageTypeWeights::EVENT_REPORT,
     };
 
     WeightArray &storage_weights_ = default_storage_weights_;

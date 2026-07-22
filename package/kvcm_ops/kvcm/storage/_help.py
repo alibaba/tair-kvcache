@@ -9,7 +9,6 @@ storage module:
         python3 -m kvcm_ops add_storage nfs --help
         python3 -m kvcm_ops add_storage pace --help
         python3 -m kvcm_ops add_storage 3fs --help
-        python3 -m kvcm_ops add_storage event_report --help
 
         # add nfs storage, given "global_unique_name, root_path, key_kount_per_file"
         python3 -m kvcm_ops add_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 16
@@ -22,13 +21,13 @@ storage module:
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16 --not_touch_file_when_create
 
         # add event_report storage
-        python3 -m kvcm_ops add_storage -u test_event_report_1 event_report --heartbeat_timeout_ms 30000
+        python3 -m kvcm_ops add_storage -u test_vllm_1 event_report_l1p5 --heartbeat_timeout_ms 30000
+        python3 -m kvcm_ops add_storage -u test_vinyard_1 event_report_l2 --heartbeat_timeout_ms 30000
     update storage:
         python3 -m kvcm_ops update_storage --help
         python3 -m kvcm_ops update_storage nfs --help
         python3 -m kvcm_ops update_storage pace --help
         python3 -m kvcm_ops update_storage 3fs --help
-        python3 -m kvcm_ops update_storage event_report --help
         python3 -m kvcm_ops update_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 64
     enable/disable storage:
         python3 -m kvcm_ops enable_storage --help

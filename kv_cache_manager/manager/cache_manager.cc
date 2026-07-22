@@ -1409,8 +1409,12 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 namespace {
 
 std::shared_ptr<DataStorageBackend> LookupEventReportBackend(const std::shared_ptr<RegistryManager> &registry_manager,
-                                                             const std::string &instance_id) {
+                                                             const std::string &instance_id,
+                                                             DataStorageType requested_type) {
     if (!registry_manager || !registry_manager->data_storage_manager()) {
+        return nullptr;
+    }
+    if (!IsEventReportStorageType(requested_type)) {
         return nullptr;
     }
     std::string group_name = registry_manager->GetInstanceGroupName(instance_id);
@@ -1422,12 +1426,14 @@ std::shared_ptr<DataStorageBackend> LookupEventReportBackend(const std::shared_p
         return nullptr;
     }
     auto dsm = registry_manager->data_storage_manager();
-    const auto &candidate_name = ig->event_report_storage_candidates().front();
-    auto backend = dsm->GetDataStorageBackend(candidate_name);
-    if (!backend || !dynamic_cast<EventReportBackend *>(backend.get())) {
-        return nullptr;
+    for (const auto &candidate_name : ig->event_report_storage_candidates()) {
+        auto backend = dsm->GetDataStorageBackend(candidate_name);
+        auto *event_backend = dynamic_cast<EventReportBackend *>(backend.get());
+        if (event_backend && event_backend->GetStorageType() == requested_type) {
+            return backend;
+        }
     }
-    return backend;
+    return nullptr;
 }
 
 bool ParseInt64(const std::string &s, int64_t &out) {
@@ -1475,8 +1481,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         response_status->set_message("storage_type is required");
         return EC_BADARGS;
     }
+    if (!IsEventReportStorageType(requested_type)) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: unsupported event-report storage_type [%d]",
+                      trace_id.c_str(),
+                      static_cast<int>(requested_type));
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("unsupported event-report storage_type: " + ToString(requested_type));
+        return EC_BADARGS;
+    }
 
-    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id);
+    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id, requested_type);
     auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
     if (!event_backend) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportBackend not found for instance [%s] type [%d]",
@@ -1484,7 +1498,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                       instance_id.c_str(),
                       static_cast<int>(requested_type));
         response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        response_status->set_message("EventReportBackend not found for instance: " + instance_id);
+        response_status->set_message("EventReportBackend not found for instance: " + instance_id +
+                                     ", type: " + ToString(requested_type));
         return EC_INSTANCE_NOT_EXIST;
     }
 
@@ -1892,7 +1907,7 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
                                         const std::string &host_ip_port,
                                         uint64_t cleanup_generation,
                                         DataStorageType storage_type) {
-    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id);
+    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id, storage_type);
     auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
 
     if (event_backend) {
@@ -2291,12 +2306,18 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         }
 
         std::string storage_unique_name = storage_uris.front().GetHostName();
-        auto erb_holder = LookupEventReportBackend(registry_manager_, instance_id);
+        auto erb_holder = LookupEventReportBackend(registry_manager_, instance_id, loc.type());
         auto *erb = dynamic_cast<EventReportBackend *>(erb_holder.get());
         if (erb && loc.type() == erb->GetStorageType()) {
             auto ig = registry_manager_->GetInstanceGroupConfig(registry_manager_->GetInstanceGroupName(instance_id));
-            if (ig && !ig->event_report_storage_candidates().empty()) {
-                storage_unique_name = ig->event_report_storage_candidates().front();
+            if (ig) {
+                for (const auto &candidate_name : ig->event_report_storage_candidates()) {
+                    auto backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(candidate_name);
+                    if (backend && backend->GetType() == loc.type()) {
+                        storage_unique_name = candidate_name;
+                        break;
+                    }
+                }
             }
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
@@ -2341,12 +2362,10 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                           instance_id.c_str());
     }
 
-    if (block_cache_keys.empty()) {
-        return {EC_OK, {}};
-    }
     if (query_type == QueryType::QT_UNSPECIFIED) {
         auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
         if (!instance_info) {
+            request_context->error_tracer()->AddErrorMsg("instance not found");
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
                 WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
         }
@@ -2362,6 +2381,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                           "unsupported query type for GetHostCacheState: %s",
                                           QueryTypeToString(query_type).c_str());
     }
+
+    PREFIX_LOG(INFO, "GetHostCacheState query_type [%s]", QueryTypeToString(query_type).c_str());
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);

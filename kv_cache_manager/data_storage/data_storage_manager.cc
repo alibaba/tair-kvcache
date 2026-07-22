@@ -173,7 +173,8 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
         return std::make_shared<NfsBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
         return std::make_shared<DummyBackend>(metrics_registry_);
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
         return std::make_shared<EventReportBackend>(metrics_registry_);
     default:
         return nullptr;

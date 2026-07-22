@@ -19,9 +19,16 @@ class StorageQuota(JsonData):
 
     def check(self) -> bool:
         _type = self._type.upper()
-        if _type not in ["ST_3FS", "ST_TAIRMEMPOOL", "ST_NFS", "ST_EVENT_REPORT"]:
+        supported_types = [
+            "ST_3FS",
+            "ST_TAIRMEMPOOL",
+            "ST_NFS",
+            "ST_EVENT_REPORT_L1P5",
+            "ST_EVENT_REPORT_L2",
+        ]
+        if _type not in supported_types:
             raise RuntimeError(
-                f"storage type {self._type} invalid, support ST_3FS|ST_TAIRMEMPOOL|ST_NFS|ST_EVENT_REPORT")
+                f"storage type {self._type} invalid, support {'|'.join(supported_types)}")
         self._type = _type
         if self._capacity <= 0:
             raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")

@@ -21,13 +21,16 @@ curl -g -vvv -X POST http://localhost:56040/api/addStorage \
 
 
 def create_add_storage_data(args, storage_type: str, storage_spec: dict):
+    storage = {
+        "global_unique_name": args.unique_name,
+        storage_type: storage_spec,
+        "check_storage_available_when_open": True
+    }
+    if storage_type == "event_report":
+        storage["storage_type"] = args.event_report_storage_type
     return {
         "trace_id": args.trace_id,
-        "storage": {
-            "global_unique_name": args.unique_name,
-            storage_type: storage_spec,
-            "check_storage_available_when_open": True
-        }
+        "storage": storage
     }
 
 

@@ -379,7 +379,7 @@ build_report_payload() {
             trace_id: $trace,
             instance_id: $instance,
             host_ip_port: $host,
-            storage_type: "ST_EVENT_REPORT",
+            storage_type: "ST_EVENT_REPORT_L1P5",
             events: [range($start; $end) as $i |
                 if $event_type == "add" then add_event($key_base + $i)
                 else delete_event($key_base + $i)
@@ -400,7 +400,7 @@ build_node_register_payload() {
             trace_id: $trace,
             instance_id: $instance,
             host_ip_port: $host,
-            storage_type: "ST_EVENT_REPORT",
+            storage_type: "ST_EVENT_REPORT_L1P5",
             events: [{
                 event_type: "EVENT_NODE_REGISTER",
                 node_register: {mediums: [$medium, $secondary]}
@@ -428,7 +428,7 @@ build_hybrid_add_payload() {
             trace_id: $trace,
             instance_id: $instance,
             host_ip_port: $host,
-            storage_type: "ST_EVENT_REPORT",
+            storage_type: "ST_EVENT_REPORT_L1P5",
             events: [range($start; $end) as $i | {
                 event_type: "EVENT_BLOCK_ADD",
                 block_add: {
@@ -463,7 +463,7 @@ build_single_spec_add_payload() {
             trace_id: $trace,
             instance_id: $instance,
             host_ip_port: $host,
-            storage_type: "ST_EVENT_REPORT",
+            storage_type: "ST_EVENT_REPORT_L1P5",
             events: [range($start; $end) as $i | {
                 event_type: "EVENT_BLOCK_ADD",
                 block_add: {
@@ -494,7 +494,7 @@ build_component_delete_payload() {
             trace_id: $trace,
             instance_id: $instance,
             host_ip_port: $host,
-            storage_type: "ST_EVENT_REPORT",
+            storage_type: "ST_EVENT_REPORT_L1P5",
             events: [{
                 event_type: "EVENT_BLOCK_DELETE",
                 block_delete: {
@@ -640,6 +640,7 @@ bootstrap_test_group() {
             trace_id: $trace,
             storage: {
                 global_unique_name: $storage,
+                storage_type: "ST_EVENT_REPORT_L1P5",
                 event_report: {
                     heartbeat_timeout_ms: $heartbeat_timeout_ms,
                     cleanup_grace_ms: $cleanup_grace_ms,

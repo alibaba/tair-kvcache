@@ -9,7 +9,7 @@
 
 using namespace kv_cache_manager;
 
-#define D_EVENT_REPORT DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT
+#define D_EVENT_REPORT DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5
 #define D_3FS DataStorageType::DATA_STORAGE_TYPE_HF3FS
 #define D_NFS DataStorageType::DATA_STORAGE_TYPE_NFS
 #define D_UNKNOWN DataStorageType::DATA_STORAGE_TYPE_UNKNOWN

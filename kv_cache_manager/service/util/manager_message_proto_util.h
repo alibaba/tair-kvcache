@@ -298,8 +298,12 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_DUMMY;
         break;
     }
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT: {
-        *proto_data_storage_type = T::ST_EVENT_REPORT;
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5: {
+        *proto_data_storage_type = T::ST_EVENT_REPORT_L1P5;
+        break;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2: {
+        *proto_data_storage_type = T::ST_EVENT_REPORT_L2;
         break;
     }
     default: {
@@ -342,8 +346,12 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
         break;
     }
-    case T::ST_EVENT_REPORT: {
-        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT;
+    case T::ST_EVENT_REPORT_L1P5: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        break;
+    }
+    case T::ST_EVENT_REPORT_L2: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
         break;
     }
     default: {

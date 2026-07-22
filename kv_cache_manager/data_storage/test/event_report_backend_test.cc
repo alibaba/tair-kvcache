@@ -18,13 +18,15 @@ class EventReportBackendTest : public TESTBASE {
 public:
     void SetUp() override { metrics_registry_ = std::make_shared<MetricsRegistry>(); }
 
-    static StorageConfig
-    MakeConfig(int64_t hb_timeout_ms = 200, int64_t cleanup_grace_ms = 400, int64_t check_interval_ms = 50) {
+    static StorageConfig MakeConfig(int64_t hb_timeout_ms = 200,
+                                    int64_t cleanup_grace_ms = 400,
+                                    int64_t check_interval_ms = 50,
+                                    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5) {
         auto spec = std::make_shared<EventReportStorageSpec>();
         spec->set_heartbeat_timeout_ms(hb_timeout_ms);
         spec->set_cleanup_grace_ms(cleanup_grace_ms);
         spec->set_liveness_check_interval_ms(check_interval_ms);
-        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test_group", spec);
+        return StorageConfig(type, "event_report_test_group", spec);
     }
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -51,16 +53,27 @@ TEST_F(EventReportBackendTest, BasicAccessors) {
 
     // After Open(), GetType() returns the configured type
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
-    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     ASSERT_TRUE(backend.Available());
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, BuildLocationIdIncludesEventReportType) {
+    EventReportBackend l1p5_backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, l1p5_backend.Open(MakeConfig(), "trace"));
+    EXPECT_EQ("kvs#event_report_l1p5#mem#10.0.0.1:8080", l1p5_backend.BuildLocationId("mem", "10.0.0.1:8080"));
+
+    EventReportBackend l2_backend(metrics_registry_);
+    ASSERT_EQ(EC_OK,
+              l2_backend.Open(MakeConfig(200, 400, 50, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2), "trace"));
+    EXPECT_EQ("kvs#event_report_l2#mem#10.0.0.1:8080", l2_backend.BuildLocationId("mem", "10.0.0.1:8080"));
 }
 
 TEST_F(EventReportBackendTest, OpenWithWrongSpecTypeFails) {
     EventReportBackend backend(metrics_registry_);
     auto spec = std::make_shared<NfsStorageSpec>();
     spec->set_root_path("/tmp");
-    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test", spec);
+    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "event_report_test", spec);
     ASSERT_NE(EC_OK, backend.Open(cfg, "trace"));
     ASSERT_FALSE(backend.Available());
 }
@@ -308,7 +321,8 @@ TEST_F(EventReportBackendTest, OnHeartbeatPublishesMetricsGauges) {
 
     auto hit_rate_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hit_rate_data, nullptr);
-    MetricsTags expected_tags = {{"instance_id", "test_inst"}, {"host", "10.0.0.10:9600"}};
+    MetricsTags expected_tags = {
+        {"instance_id", "test_inst"}, {"host", "10.0.0.10:9600"}, {"type", "event_report_l1p5"}};
     auto gauge = hit_rate_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(0.85, gauge.Get());
 
@@ -336,6 +350,44 @@ TEST_F(EventReportBackendTest, OnHeartbeatPublishesMetricsGauges) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
+TEST_F(EventReportBackendTest, MetricsGaugesAreIsolatedByEventReportType) {
+    EventReportBackend l1p5_backend(metrics_registry_);
+    EventReportBackend l2_backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, l1p5_backend.Open(MakeConfig(), "trace"));
+    ASSERT_EQ(
+        EC_OK,
+        l2_backend.Open(MakeConfig(5000, 10000, 50, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2), "trace"));
+
+    const std::string instance_id = "test_inst";
+    const std::string host = "10.0.0.10:9600";
+    ASSERT_EQ(EC_OK, l1p5_backend.RegisterNode(instance_id, host, {"mem"}));
+    ASSERT_EQ(EC_OK, l2_backend.RegisterNode(instance_id, host, {"mem"}));
+
+    ASSERT_EQ(EC_OK, l1p5_backend.OnHeartbeat(instance_id, host, {{"used_bytes", "100"}}));
+    ASSERT_EQ(EC_OK, l2_backend.OnHeartbeat(instance_id, host, {{"used_bytes", "200"}}));
+
+    auto data = metrics_registry_->GetMetricsData("event_report.used_bytes");
+    ASSERT_NE(data, nullptr);
+    MetricsTags l1p5_tags = {{"instance_id", instance_id}, {"host", host}, {"type", "event_report_l1p5"}};
+    MetricsTags l2_tags = {{"instance_id", instance_id}, {"host", host}, {"type", "event_report_l2"}};
+    ASSERT_DOUBLE_EQ(100.0, data->GetOrCreateGauge(l1p5_tags).Get());
+    ASSERT_DOUBLE_EQ(200.0, data->GetOrCreateGauge(l2_tags).Get());
+
+    l1p5_backend.SetNodeUnavailable(instance_id, host);
+    ASSERT_DOUBLE_EQ(0.0, data->GetOrCreateGauge(l1p5_tags).Get());
+    ASSERT_DOUBLE_EQ(200.0, data->GetOrCreateGauge(l2_tags).Get());
+
+    ASSERT_EQ(EC_OK, l2_backend.UnregisterNode(instance_id, host));
+    auto values = data->GetMetricsValues();
+    for (const auto &[tags, val] : values) {
+        ASSERT_NE(tags, l2_tags) << "l2 gauge should have been removed";
+    }
+    ASSERT_DOUBLE_EQ(0.0, data->GetOrCreateGauge(l1p5_tags).Get());
+
+    ASSERT_EQ(EC_OK, l1p5_backend.Close());
+    ASSERT_EQ(EC_OK, l2_backend.Close());
+}
+
 TEST_F(EventReportBackendTest, SetNodeUnavailableZerosGauges) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
@@ -346,8 +398,8 @@ TEST_F(EventReportBackendTest, SetNodeUnavailableZerosGauges) {
     backend.OnHeartbeat("test_inst", "10.0.0.30:9600", {{"hit_rate", "0.90"}, {"mem_used", "8192"}});
     backend.OnHeartbeat("test_inst", "10.0.0.31:9600", {{"hit_rate", "0.80"}, {"mem_used", "4096"}});
 
-    MetricsTags tags_30 = {{"instance_id", "test_inst"}, {"host", "10.0.0.30:9600"}};
-    MetricsTags tags_31 = {{"instance_id", "test_inst"}, {"host", "10.0.0.31:9600"}};
+    MetricsTags tags_30 = {{"instance_id", "test_inst"}, {"host", "10.0.0.30:9600"}, {"type", "event_report_l1p5"}};
+    MetricsTags tags_31 = {{"instance_id", "test_inst"}, {"host", "10.0.0.31:9600"}, {"type", "event_report_l1p5"}};
 
     auto hr_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hr_data, nullptr);
@@ -379,8 +431,8 @@ TEST_F(EventReportBackendTest, UnregisterNodeCleansUpGauges) {
     backend.OnHeartbeat("test_inst", "10.0.0.20:9600", {{"hit_rate", "0.75"}, {"mem_used", "4096"}});
     backend.OnHeartbeat("test_inst", "10.0.0.21:9600", {{"hit_rate", "0.60"}, {"mem_used", "2048"}});
 
-    MetricsTags tags_20 = {{"instance_id", "test_inst"}, {"host", "10.0.0.20:9600"}};
-    MetricsTags tags_21 = {{"instance_id", "test_inst"}, {"host", "10.0.0.21:9600"}};
+    MetricsTags tags_20 = {{"instance_id", "test_inst"}, {"host", "10.0.0.20:9600"}, {"type", "event_report_l1p5"}};
+    MetricsTags tags_21 = {{"instance_id", "test_inst"}, {"host", "10.0.0.21:9600"}, {"type", "event_report_l1p5"}};
 
     auto hr_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hr_data, nullptr);

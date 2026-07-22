@@ -80,7 +80,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
-            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+            if (!IsEventReportStorageType(loc_ptr->type())) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -211,6 +211,7 @@ SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
 CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
                                       CheckLocDataExistFunc check_loc_data_exist,
                                       std::vector<std::string> &out_prune_loc_ids) {
+    out_prune_loc_ids.clear();
     CacheLocationMap valid;
     for (const auto &[id, loc] : location_map) {
         if (!loc)
@@ -218,7 +219,7 @@ CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
         if (loc->status() != CacheLocationStatus::CLS_SERVING)
             continue;
         if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
-            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+            if (!IsEventReportStorageType(loc->type())) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -502,7 +503,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     for (const auto &selector : selectors) {
         DataStorageType target_type = selector.backend_type;
 
-        if (target_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT &&
+        if (target_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
             (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
              selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
             // --- event report cross-key selection ---
@@ -523,7 +524,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)
+                    if (loc->type() != target_type)
                         continue;
                     std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())

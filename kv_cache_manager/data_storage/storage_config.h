@@ -16,7 +16,8 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
-    DATA_STORAGE_TYPE_EVENT_REPORT = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L2 = 8,
     COUNT, // as sentinel, must be last
 };
 
@@ -25,6 +26,11 @@ std::string ToString(const DataStorageType &type);
 DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
+
+constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
+           type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+}
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)

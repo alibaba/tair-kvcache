@@ -536,7 +536,7 @@ class TestMetaServiceApiWrappers(unittest.TestCase):
             "trace_id": "report-1",
             "instance_id": "instance-1",
             "host_ip_port": "10.0.0.2:9600",
-            "storage_type": "ST_VINEYARD",
+            "storage_type": "ST_EVENT_REPORT_L2",
             "events": [
                 {
                     "event_type": "EVENT_HEARTBEAT",
@@ -568,7 +568,7 @@ class TestMetaServiceApiWrappers(unittest.TestCase):
             "block_keys": [123],
             "backend_selectors": [
                 {
-                    "backend_type": "ST_VINEYARD",
+                    "backend_type": "ST_EVENT_REPORT_L2",
                     "strategy": "LSS_V6D_PREFIX",
                 }
             ],

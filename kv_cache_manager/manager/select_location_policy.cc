@@ -23,7 +23,7 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING) {
             if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
-                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+                if (!IsEventReportStorageType(kv.second->type())) {
                     out_prune_loc_ids.emplace_back(kv.first);
                 }
                 continue;
@@ -53,7 +53,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         if (kv.second->status() != CacheLocationStatus::CLS_NOT_FOUND) {
             if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
                 !check_loc_data_exist(*kv.second)) {
-                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+                if (!IsEventReportStorageType(kv.second->type())) {
                     out_prune_loc_ids.emplace_back(kv.first);
                 }
                 continue;
@@ -88,7 +88,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
             !check_loc_data_exist(*kv.second)) {
-            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+            if (!IsEventReportStorageType(kv.second->type())) {
                 out_prune_loc_ids.emplace_back(kv.first);
             }
             continue;
@@ -128,7 +128,7 @@ bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location
         }
         if (check_loc_data_exist && kv.second->status() == CacheLocationStatus::CLS_SERVING &&
             !check_loc_data_exist(*kv.second)) {
-            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+            if (!IsEventReportStorageType(kv.second->type())) {
                 out_prune_loc_ids.emplace_back(kv.first);
             }
             continue;

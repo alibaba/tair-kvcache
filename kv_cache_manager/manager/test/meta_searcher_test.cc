@@ -218,7 +218,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
     std::vector<ErrorCode> per_key_ec;
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
     }};
@@ -227,7 +227,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
 
     tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem")}},
     }};
@@ -236,7 +236,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
 
     tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
           LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
@@ -271,7 +271,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleS
 
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
           LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem")}},
@@ -302,7 +302,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBl
 
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> seed_tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
     }};
@@ -314,11 +314,11 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBl
     faulty_backend->SetFailedKey(failed_key);
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {
         {{location_id,
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
           CacheLocationStatus::CLS_SERVING,
           {LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}}},
         {{failed_location_id,
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
           CacheLocationStatus::CLS_SERVING,
           {LocationSpec("linear_0", "event_report://127.0.0.2:8080/mem")}}},
     };
@@ -347,7 +347,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
 
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem"),
           LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem"),
@@ -1442,40 +1442,40 @@ protected:
             // key 80000: peer_a + peer_b
             {
                 {"kvs#event_report#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
                 {"kvs#event_report#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80001: peer_a + peer_b
             {
                 {"kvs#event_report#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
                 {"kvs#event_report#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80002: peer_b only
             {
                 {"kvs#event_report#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80003: peer_a + peer_b
             {
                 {"kvs#event_report#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
                 {"kvs#event_report#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
@@ -1505,7 +1505,7 @@ protected:
 TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixStrategy) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1518,7 +1518,7 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixStrategy) {
     // peer_a only covers 80000-80001 (2 keys, breaks at 80002).
     for (size_t i = 0; i < 4; ++i) {
         ASSERT_EQ(out[i].size(), 1) << "key index " << i << " should have 1 event report location";
-        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
         // URI should contain peer_b
         EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos)
             << "key index " << i << " should be served by peer_b";
@@ -1530,7 +1530,7 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixStrategy) {
 TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
     };
 
     LocationsPerKey out;
@@ -1554,7 +1554,7 @@ TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {
     //   peer_b: covers 80000, 80002, 80003 → prefix = 3  → winner = peer_b
     MetaSearcher::KeyVector keys = {80000, 80002, 80003};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1572,7 +1572,7 @@ TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsWhenNoEventReport) {
     // key 80004 has no event report. If it's the first key, PREFIX should stop immediately.
     MetaSearcher::KeyVector keys = {80004, 80000, 80001};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1590,7 +1590,7 @@ TEST_F(BatchGetBestLocationByBackendTest, CoverageSkipsGap) {
     // COVERAGE skips keys with no event report and picks from the rest.
     MetaSearcher::KeyVector keys = {80004, 80000, 80001};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
     };
 
     LocationsPerKey out;
@@ -1624,7 +1624,7 @@ TEST_F(BatchGetBestLocationByBackendTest, WeightedRandomTair) {
 TEST_F(BatchGetBestLocationByBackendTest, MixedEventReportAndTair) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
     };
 
@@ -1639,7 +1639,7 @@ TEST_F(BatchGetBestLocationByBackendTest, MixedEventReportAndTair) {
         ASSERT_EQ(out[i].size(), 2) << "key index " << i;
         int er_count = 0, tair_count = 0;
         for (const auto &loc : out[i]) {
-            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)
+            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)
                 er_count++;
             if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)
                 tair_count++;
@@ -1668,7 +1668,7 @@ TEST_F(BatchGetBestLocationByBackendTest, EmptySelectorsBackwardCompat) {
 TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
     MetaSearcher::KeyVector keys = {99999}; // nonexistent key
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
     };
 

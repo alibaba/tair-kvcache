@@ -94,7 +94,7 @@ def add_3fs_sub_parser(subparsers):
     return parser_3fs
 
 
-def add_event_report_sub_parser(subparsers, name, help_text):
+def add_event_report_sub_parser(subparsers, name, help_text, event_report_storage_type):
     parser = subparsers.add_parser(name, help=help_text)
     parser.add_argument(
         '--heartbeat_timeout_ms',
@@ -111,6 +111,7 @@ def add_event_report_sub_parser(subparsers, name, help_text):
         type=int,
         default=None,
         help='liveness check interval in ms (server default: 5000)')
+    parser.set_defaults(event_report_storage_type=event_report_storage_type)
     return parser
 
 
@@ -141,12 +142,22 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
     parser_nfs = add_nfs_sub_parser(subparsers)
     parser_pace = add_pace_sub_parser(subparsers)
     parser_3fs = add_3fs_sub_parser(subparsers)
-    parser_event_report = add_event_report_sub_parser(subparsers, 'event_report', 'Event report storage options')
+    parser_event_report_l1p5 = add_event_report_sub_parser(
+        subparsers,
+        'event_report_l1p5',
+        'L1.5 event report storage options',
+        'ST_EVENT_REPORT_L1P5')
+    parser_event_report_l2 = add_event_report_sub_parser(
+        subparsers,
+        'event_report_l2',
+        'L2 event report storage options',
+        'ST_EVENT_REPORT_L2')
 
     parser_nfs.set_defaults(func=handle_nfs)
     parser_pace.set_defaults(func=handle_pace)
     parser_3fs.set_defaults(func=handle_3fs)
-    parser_event_report.set_defaults(func=handle_event_report)
+    parser_event_report_l1p5.set_defaults(func=handle_event_report)
+    parser_event_report_l2.set_defaults(func=handle_event_report)
 
     args = parser.parse_args()
 

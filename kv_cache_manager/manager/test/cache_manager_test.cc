@@ -1974,7 +1974,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup)
 
     StorageConfig config;
     config.set_global_unique_name(event_report_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
     event_report_backend->Open(config, "test_trace");
@@ -1988,7 +1988,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup)
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.100:8080/mem?gpu=A100")});
     ASSERT_EQ(func(loc), true);
 
@@ -2024,7 +2024,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnavailable
 
     StorageConfig config;
     config.set_global_unique_name(event_report_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
     event_report_backend->Open(config, "test_trace");
@@ -2039,7 +2039,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnavailable
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
@@ -2075,7 +2075,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnregistere
 
     StorageConfig config;
     config.set_global_unique_name(event_report_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
     event_report_backend->Open(config, "test_trace");
@@ -2087,7 +2087,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnregistere
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
@@ -2950,7 +2950,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
     {
         StorageConfig cfg;
         cfg.set_global_unique_name("event_backend_default");
-        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
         event_backend->Open(cfg, "test_trace");
     }
@@ -2964,7 +2964,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
             proto::meta::ReportEventRequest req;
             req.set_instance_id(instance_id);
             req.set_host_ip_port(host);
-            req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
 
             auto *reg = req.add_events();
             reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
@@ -3093,6 +3093,96 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
     }
 }
 
+TEST_F(CacheManagerTest, TestReportEventL1P5L2BlockAddAreIsolated) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_l1p5_l2";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto make_backend = [&](const std::string &name, DataStorageType type) {
+        auto backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+        StorageConfig cfg;
+        cfg.set_global_unique_name(name);
+        cfg.set_type(type);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        return std::make_pair(backend, backend->Open(cfg, "test_trace"));
+    };
+
+    auto l1p5_backend_result = make_backend("event_backend_l1p5", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    ASSERT_EQ(EC_OK, l1p5_backend_result.second);
+    auto l2_backend_result = make_backend("event_backend_l2", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    ASSERT_EQ(EC_OK, l2_backend_result.second);
+    auto l1p5_backend = l1p5_backend_result.first;
+    auto l2_backend = l2_backend_result.first;
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_l1p5"] = l1p5_backend;
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_l2"] = l2_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_l1p5", "event_backend_l2"});
+
+    const std::string host = "10.0.0.11:8080";
+    const int64_t key = 9201;
+    auto report_one = [&](proto::meta::StorageType storage_type, const std::string &spec_name, const std::string &uri) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(storage_type);
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium("mem");
+        auto *spec = ba->add_specs();
+        spec->set_name(spec_name);
+        spec->set_uri(uri);
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    report_one(proto::meta::ST_EVENT_REPORT_L1P5, "linear_0", "event_report://10.0.0.11:8080/l1p5");
+    report_one(proto::meta::ST_EVENT_REPORT_L2, "linear_1", "event_report://10.0.0.11:8080/l2");
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask = static_cast<size_t>(0);
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto &location_map = location_maps[0];
+    ASSERT_EQ(2u, location_map.size());
+
+    const std::string l1p5_location_id = l1p5_backend->BuildLocationId("mem", host);
+    const std::string l2_location_id = l2_backend->BuildLocationId("mem", host);
+    ASSERT_NE(l1p5_location_id, l2_location_id);
+    auto l1p5_it = location_map.find(l1p5_location_id);
+    auto l2_it = location_map.find(l2_location_id);
+    ASSERT_NE(location_map.end(), l1p5_it);
+    ASSERT_NE(location_map.end(), l2_it);
+    ASSERT_TRUE(l1p5_it->second);
+    ASSERT_TRUE(l2_it->second);
+
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, l1p5_it->second->type());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, l2_it->second->type());
+    ASSERT_EQ(1u, l1p5_it->second->location_specs().size());
+    ASSERT_EQ(1u, l2_it->second->location_specs().size());
+    EXPECT_EQ("linear_0", l1p5_it->second->location_specs()[0].name());
+    EXPECT_EQ("event_report://10.0.0.11:8080/l1p5", l1p5_it->second->location_specs()[0].uri());
+    EXPECT_EQ("linear_1", l2_it->second->location_specs()[0].name());
+    EXPECT_EQ("event_report://10.0.0.11:8080/l2", l2_it->second->location_specs()[0].uri());
+}
+
 TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_report_event_delete_specs";
@@ -3114,7 +3204,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
     {
         StorageConfig cfg;
         cfg.set_global_unique_name("event_backend_delete");
-        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
         event_backend->Open(cfg, "test_trace");
     }
@@ -3127,7 +3217,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
         reg->mutable_node_register()->add_mediums(medium);
@@ -3149,7 +3239,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
             proto::meta::ReportEventRequest req;
             req.set_instance_id(instance_id);
             req.set_host_ip_port(host);
-            req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
             auto *reg = req.add_events();
             reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
             reg->mutable_node_register()->add_mediums(medium);
@@ -3279,7 +3369,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     {
         StorageConfig er_config;
         er_config.set_global_unique_name("event_report_default");
-        er_config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        er_config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
         er_config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
         event_report_backend->Open(er_config, "test_trace");
     }
@@ -3304,7 +3394,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id("test_instance");
         req.set_host_ip_port(pd.host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
 
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
@@ -3343,7 +3433,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     // --- Test 2: EVENT_REPORT PREFIX + NFS (NFS on 300,500,700 should not affect event report peer selection) ---
     {
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3370,7 +3460,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         {
             const auto &kl = locs[1].cache_locations_view();
             ASSERT_EQ(1u, kl.size());
-            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, kl[0].type());
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, kl[0].type());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 500 (index 2): event report + NFS = 2
@@ -3383,7 +3473,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         {
             const auto &kl = locs[3].cache_locations_view();
             ASSERT_EQ(1u, kl.size());
-            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, kl[0].type());
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, kl[0].type());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 700 (index 4): NFS only = 1 (no event report peer has this key)
@@ -3397,7 +3487,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     // --- Test 3: EVENT_REPORT COVERAGE + NFS (NFS presence does not affect event report coverage selection) ---
     {
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3419,12 +3509,12 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.2"));
         // key 400 (index 1): event report only = 1
         ASSERT_EQ(1u, locs[1].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, locs[1].cache_locations_view()[0].type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[0].type());
         // key 500 (index 2): event report + NFS = 2
         ASSERT_EQ(2u, locs[2].cache_locations_view().size());
         // key 600 (index 3): event report only = 1
         ASSERT_EQ(1u, locs[3].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, locs[3].cache_locations_view()[0].type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[3].cache_locations_view()[0].type());
         // key 700 (index 4): NFS only = 1
         ASSERT_EQ(1u, locs[4].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[4].cache_locations_view()[0].type());
@@ -3467,7 +3557,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     {
         std::vector<int64_t> keys_no_er_first = {700, 300, 400};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3498,7 +3588,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     {
         std::vector<int64_t> keys_gap = {700, 300, 400};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3520,14 +3610,14 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(2u, locs[1].cache_locations_view().size());
         // key 400 (index 2): event report only = 1 (no NFS for 400)
         ASSERT_EQ(1u, locs[2].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, locs[2].cache_locations_view()[0].type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[2].cache_locations_view()[0].type());
     }
 
     // --- Test 7: nonexistent keys → all empty ---
     {
         std::vector<int64_t> bad_keys = {99998, 99999};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3607,7 +3697,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     {
         StorageConfig cfg;
         cfg.set_global_unique_name("event_backend_default");
-        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
         event_backend->Open(cfg, "test_trace");
     }
@@ -3631,7 +3721,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(hd.host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
 
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
@@ -3732,17 +3822,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(0, hosts.size());
     }
 
-    // --- Test 5: empty block_cache_keys → OK, empty response ---
-    // Note: MetaServiceImpl layer rejects empty keys; CacheManager returns empty directly.
-    {
-        CacheManager::KeyVector keys = {};
-        auto [ec, hosts] = cache_manager_->GetHostCacheState(
-            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
-        ASSERT_EQ(EC_OK, ec);
-        EXPECT_EQ(0, hosts.size());
-    }
-
-    // --- Test 6: medium filter (only "mem") — should not change results ---
+    // --- Test 5: medium filter (only "mem") — should not change results ---
     {
         CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
         auto [ec, hosts] = cache_manager_->GetHostCacheState(
@@ -3755,7 +3835,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
-    // --- Test 7: medium filter (non-existent medium "ssd") → no hosts ---
+    // --- Test 6: medium filter (non-existent medium "ssd") → no hosts ---
     {
         CacheManager::KeyVector keys = {100, 200};
         auto [ec, hosts] = cache_manager_->GetHostCacheState(
@@ -3764,7 +3844,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(0, hosts.size());
     }
 
-    // --- Test 8: middle miss stops prefix; later hits do not extend any host ---
+    // --- Test 7: middle miss stops prefix; later hits do not extend any host ---
     {
         CacheManager::KeyVector keys = {100, 500, 400};
         auto [ec, hosts] = cache_manager_->GetHostCacheState(
@@ -3778,7 +3858,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
     }
 
-    // --- Test 9: hosts absent from the first key are not returned with prefix=0 ---
+    // --- Test 8: hosts absent from the first key are not returned with prefix=0 ---
     {
         CacheManager::KeyVector keys = {100, 200, 300};
         auto [ec, hosts] = cache_manager_->GetHostCacheState(
@@ -3792,7 +3872,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
     }
 
-    // --- Test 10: unavailable host is filtered even before metadata cleanup ---
+    // --- Test 9: unavailable host is filtered even before metadata cleanup ---
     {
         event_backend->SetNodeUnavailable(instance_id, "10.0.0.2:8080");
         CacheManager::KeyVector keys = {100, 200, 300, 400};
@@ -3856,7 +3936,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     {
         StorageConfig cfg;
         cfg.set_global_unique_name("event_backend_mamba");
-        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
         event_backend->Open(cfg, "test_trace");
     }
@@ -3868,7 +3948,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
 
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
