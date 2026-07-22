@@ -40,6 +40,8 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
     # Two spec groups that partition the location_spec_infos
     GROUP_A = "GroupA"  # contains spec "tp0"
     GROUP_B = "GroupB"  # contains spec "tp1"
+    POLL_ATTEMPTS = 10
+    POLL_INTERVAL_SECONDS = 1
 
     def setUp(self):
         self.init_default()
@@ -128,58 +130,32 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
         # Delete all GroupA location files
         self._delete_cache_locations(locs_a, list(range(len(locs_a))))
 
-        # Poll until tp0 is fully pruned (query triggers lazy detection).
-        # Each query submits async prune requests; retry to wait for them
-        # to take effect in the meta indexer.
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            resp = self._prefix_query(block_keys)
-            if len(resp["locations"]) != 3:
-                if attempt < max_attempts - 1:
-                    time.sleep(2)
-                    continue
-                self.fail(
-                    f"blocks should still be queryable via GroupB location, "
-                    f"got {len(resp['locations'])} after {max_attempts} attempts")
+        # Query performs lazy stale-location detection and then submits async
+        # metadata pruning.  Wait for the read path to stop exposing tp0.
+        self._wait_for_prefix_specs(block_keys,
+                                    expected_location_count=3,
+                                    required_specs={"tp1"},
+                                    absent_specs={"tp0"})
 
-            all_specs = set()
-            for loc in resp["locations"]:
-                for s in loc["location_specs"]:
-                    all_specs.add(s["name"])
+        # Dummy storage uses deterministic paths for the same key/spec.  Put
+        # marker files back on the old GroupA paths: if stale metadata still
+        # exists, StartWriteCache treats it as covered until the queued prune
+        # deletes the markers and removes the old metadata; if prune already
+        # finished, these markers simply become the rewritten data files.
+        self._touch_cache_locations(locs_a)
 
-            if "tp0" not in all_specs:
-                # tp0 fully pruned — success
-                break
-
-            if attempt < max_attempts - 1:
-                logging.info(
-                    "attempt %d: tp0 still present, waiting for async "
-                    "prune to complete...", attempt + 1)
-                time.sleep(2)
-            else:
-                self.fail(
-                    f"tp0 specs still present after {max_attempts} attempts; "
-                    f"async prune did not complete in time")
-
-        # Verify only tp1 specs remain (tp0 was pruned)
-        for loc in resp["locations"]:
-            spec_names = [s["name"] for s in loc["location_specs"]]
-            self.assertIn("tp1", spec_names,
-                          "tp1 should survive since GroupB data is intact")
-
-        # Rewrite with GroupA → should allocate new locations
-        new_locs_a = self._write_blocks_with_group(block_keys, token_ids,
-                                                   self.GROUP_A)
-        self.assertEqual(len(new_locs_a), 3,
-                         "all blocks need new GroupA locations")
+        # Rewrite with GroupA.  StartWriteCache may still observe async
+        # deleting metadata, so retry until write filtering allocates all
+        # missing GroupA locations.  Failed attempts are explicitly aborted.
+        new_locs_a = self._write_blocks_with_group_retry(
+            block_keys, token_ids, self.GROUP_A, expected_location_count=3)
+        self._verify_block_keys(new_locs_a, block_keys)
 
         # Query: full coverage restored
         resp = self._prefix_query(block_keys)
         self.assertEqual(len(resp["locations"]), 3)
-        for loc in resp["locations"]:
-            spec_names = [s["name"] for s in loc["location_specs"]]
-            self.assertIn("tp0", spec_names)
-            self.assertIn("tp1", spec_names)
+        self._assert_locations_have_specs(resp["locations"],
+                                          required_specs={"tp0", "tp1"})
 
     def test_all_locations_lost_breaks_prefix(self):
         """When all locations' data is lost, prefix match breaks.
@@ -229,15 +205,57 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             MetaServiceHttpClient(self._http_url),
         )
 
-    def _write_blocks_with_group(self, block_keys, token_ids, group_name):
+    def _write_blocks_with_group(self, block_keys, token_ids, group_name,
+                                 expected_location_count=None):
         """Write blocks with a specific LocationSpecGroup."""
         resp = self._start_write_blocks(block_keys, token_ids,
                                         group_name=group_name)
         write_session_id = resp["write_session_id"]
         locations = resp["locations"]
+        if expected_location_count is not None:
+            self.assertEqual(
+                len(locations),
+                expected_location_count,
+                self._format_start_write_mismatch(resp, locations,
+                                                  expected_location_count))
         self._touch_cache_locations(locations)
         self._finish_write_blocks(write_session_id, len(locations))
         return locations
+
+    def _write_blocks_with_group_retry(self, block_keys, token_ids, group_name,
+                                       expected_location_count):
+        last_resp = None
+        for attempt in range(1, self.POLL_ATTEMPTS + 1):
+            resp = self._start_write_blocks(block_keys, token_ids,
+                                            group_name=group_name)
+            last_resp = resp
+            write_session_id = resp["write_session_id"]
+            locations = resp["locations"]
+            if len(locations) == expected_location_count:
+                self._touch_cache_locations(locations)
+                self._finish_write_blocks(write_session_id, len(locations))
+                return locations
+
+            self._touch_cache_locations(locations)
+            self._finish_write_blocks(write_session_id, len(locations),
+                                      success=False)
+            self._wait_for_locations_absent(locations)
+            mismatch = self._format_start_write_mismatch(
+                resp, locations, expected_location_count)
+            logging.info(
+                "attempt %d/%d: rewrite did not allocate all locations, "
+                "aborted session and will retry: %s",
+                attempt,
+                self.POLL_ATTEMPTS,
+                mismatch)
+            if attempt < self.POLL_ATTEMPTS:
+                time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        mismatch = self._format_start_write_mismatch(
+            last_resp, last_resp["locations"], expected_location_count)
+        self.fail(
+            "rewrite did not allocate expected locations after retries: "
+            f"{mismatch}")
 
     def _start_write_blocks(self, block_keys, token_ids, group_name=None):
         req = {
@@ -251,13 +269,13 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             req["location_spec_group_names"] = [group_name] * len(block_keys)
         return self._client.start_write_cache(req)
 
-    def _finish_write_blocks(self, write_session_id, loc_sz):
+    def _finish_write_blocks(self, write_session_id, loc_sz, success=True):
         return self._client.finish_write_cache({
             "trace_id": self._trace_id,
             "instance_id": self._instance_id,
             "write_session_id": write_session_id,
             "success_blocks": {
-                "bool_masks": {"values": [True] * loc_sz},
+                "bool_masks": {"values": [success] * loc_sz},
             },
         })
 
@@ -270,18 +288,110 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             "block_mask": {"offset": 0},
         })
 
+    def _wait_for_prefix_specs(self, block_keys, expected_location_count,
+                               required_specs=None, absent_specs=None):
+        required_specs = required_specs or set()
+        absent_specs = absent_specs or set()
+        last_resp = None
+        for attempt in range(1, self.POLL_ATTEMPTS + 1):
+            last_resp = self._prefix_query(block_keys)
+            locations = last_resp["locations"]
+            if (len(locations) == expected_location_count
+                    and self._locations_match_specs(locations,
+                                                    required_specs,
+                                                    absent_specs)):
+                return last_resp
+
+            logging.info(
+                "attempt %d/%d: waiting for prefix specs, locations=%s",
+                attempt,
+                self.POLL_ATTEMPTS,
+                self._summarize_locations(locations))
+            time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        self.fail(
+            "prefix query did not reach expected specs: "
+            f"expected_location_count={expected_location_count}, "
+            f"required_specs={sorted(required_specs)}, "
+            f"absent_specs={sorted(absent_specs)}, "
+            f"last_locations={self._summarize_locations(last_resp['locations'])}")
+
+    def _assert_locations_have_specs(self, locations, required_specs=None,
+                                     absent_specs=None):
+        required_specs = required_specs or set()
+        absent_specs = absent_specs or set()
+        self.assertTrue(
+            self._locations_match_specs(locations, required_specs,
+                                        absent_specs),
+            f"locations specs mismatch: "
+            f"required_specs={sorted(required_specs)}, "
+            f"absent_specs={sorted(absent_specs)}, "
+            f"locations={self._summarize_locations(locations)}")
+
+    @staticmethod
+    def _locations_match_specs(locations, required_specs, absent_specs):
+        for loc in locations:
+            spec_names = {s["name"] for s in loc.get("location_specs", [])}
+            if not required_specs.issubset(spec_names):
+                return False
+            if absent_specs.intersection(spec_names):
+                return False
+        return True
+
+    @staticmethod
+    def _summarize_locations(locations):
+        return [
+            [s.get("name") for s in loc.get("location_specs", [])]
+            for loc in locations
+        ]
+
+    @staticmethod
+    def _format_start_write_mismatch(resp, locations, expected_count):
+        uris = [
+            spec.get("uri")
+            for loc in locations
+            for spec in loc.get("location_specs", [])
+        ]
+        return (
+            f"start_write_cache returned {len(locations)} locations, "
+            f"expected {expected_count}; "
+            f"block_mask={resp.get('block_mask')}, uris={uris}")
+
+    def _wait_for_locations_absent(self, locations):
+        paths = self._location_paths(locations)
+        for attempt in range(1, self.POLL_ATTEMPTS + 1):
+            remaining = [path for path in paths if os.path.exists(path)]
+            if not remaining:
+                return
+            logging.info(
+                "attempt %d/%d: waiting for aborted write cleanup, "
+                "remaining_paths=%s",
+                attempt,
+                self.POLL_ATTEMPTS,
+                remaining)
+            if attempt < self.POLL_ATTEMPTS:
+                time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        self.fail(f"aborted write cleanup did not delete paths: {remaining}")
+
+    @staticmethod
+    def _location_paths(locations):
+        return [
+            urlparse(spec["uri"]).path
+            for loc in locations
+            for spec in loc.get("location_specs", [])
+        ]
+
     @staticmethod
     def _touch_cache_locations(locations):
         """Simulate the cache data write by creating data files."""
-        for loc in locations:
-            for spec in loc.get("location_specs", []):
-                file_path = urlparse(spec["uri"]).path
-                try:
-                    os.utime(file_path)
-                except FileNotFoundError:
-                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                    with open(file_path, 'x') as _:
-                        pass
+        for file_path in MultiLocationTest._location_paths(locations):
+            try:
+                os.utime(file_path)
+            except FileNotFoundError:
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, 'x') as _:
+                    pass
 
     @staticmethod
     def _delete_cache_locations(locations, indices):
@@ -292,6 +402,14 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
                 file_path = urlparse(spec["uri"]).path
                 if os.path.exists(file_path):
                     os.remove(file_path)
+
+    def _verify_block_keys(self, locations, block_keys):
+        self.assertEqual(len(locations), len(block_keys))
+        for loc, key in zip(locations, block_keys):
+            for spec in loc.get("location_specs", []):
+                file_path = urlparse(spec["uri"]).path
+                self.assertEqual(int(os.path.basename(file_path), base=16),
+                                 key)
 
     def _make_dummy_storage(self):
         dummy_root_path = f"{self.get_workdir()}/{self._storage_name}/data/"
