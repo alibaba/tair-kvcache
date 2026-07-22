@@ -18,20 +18,24 @@ public:
         : capacity_blocks_(capacity_blocks), block_size_tokens_(block_size_tokens) {}
 
     uint64_t Process(const LiteHit::TraceRequest &request) {
-        bool prefix_can_hit = true;
+        // Prefix hits are evaluated against the request-start content. Hits
+        // never change membership, so this matches sequential evaluation.
         uint64_t prefix_hits = 0;
         for (int64_t key : request.block_keys) {
-            auto it = positions_.find(key);
-            const bool hit = it != positions_.end();
-            if (prefix_can_hit && hit) {
-                ++prefix_hits;
-            } else if (!hit) {
-                prefix_can_hit = false;
+            if (positions_.find(key) == positions_.end()) {
+                break;
             }
+            ++prefix_hits;
+        }
 
-            if (hit) {
-                lru_.erase(it->second);
-                positions_.erase(it);
+        // State commits tail-to-head, mirroring LiteHit's reverse-order
+        // touches: the chain head ends up most recent.
+        for (auto it = request.block_keys.rbegin(); it != request.block_keys.rend(); ++it) {
+            const int64_t key = *it;
+            auto pos = positions_.find(key);
+            if (pos != positions_.end()) {
+                lru_.erase(pos->second);
+                positions_.erase(pos);
             }
             if (capacity_blocks_ != 0) {
                 lru_.push_back(key);
@@ -116,14 +120,15 @@ TEST(LiteHitTest, EmptyAndTailOnlyRequestsUseTokenDenominator) {
 TEST(LiteHitTest, RequestStartSnapshotProducesPrefixCapacityThresholds) {
     LiteHit lite_hit({1, 2, 3, LiteHit::kInfiniteCapacity}, 4);
 
-    // Final request-start LRU is [A, B, C] from LRU to MRU.
+    // Reverse-order commit makes the chain head most recent: the request-start
+    // LRU is [3, 2, 1] from LRU to MRU.
     lite_hit.ProcessRequest({1, 2, 3}, 12);
-    // Snapshot required capacities are [B:2, A:3, C:1], therefore prefix
-    // thresholds are [2, 3, 3].
+    // Snapshot required capacities are [2:2, 1:1, 3:3], therefore prefix
+    // thresholds are [2, 2, 3].
     const auto result = lite_hit.ProcessRequest({2, 1, 3}, 13);
 
-    EXPECT_EQ((std::vector<uint64_t>{0, 1, 3, 3}), HitCounts(result.capacity_results));
-    EXPECT_EQ((std::vector<uint64_t>{0, 4, 12, 12}), HitTokens(result.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{0, 2, 3, 3}), HitCounts(result.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{0, 8, 12, 12}), HitTokens(result.capacity_results));
     EXPECT_DOUBLE_EQ(12.0 / 13.0, result.capacity_results[2].hit_rate);
 }
 
@@ -132,20 +137,35 @@ TEST(LiteHitTest, BlocksAfterFirstMissStillUpdateGlobalLru) {
 
     lite_hit.ProcessRequest({1, 2}, 8);
     const auto mixed = lite_hit.ProcessRequest({1, 3, 2}, 12);
-    EXPECT_EQ((std::vector<uint64_t>{0, 1, 1}), HitCounts(mixed.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{1, 1, 1}), HitCounts(mixed.capacity_results));
 
-    // The previous request committed all of [1, 3, 2], so key 2 is MRU even
-    // though it was located after that request's first miss.
+    // The previous request committed all of [1, 3, 2] tail-to-head, so key 2
+    // was committed even though it was located after that request's first
+    // miss. It is the oldest of the three, hence resident only for infinity.
     const auto next = lite_hit.ProcessRequest({2}, 5);
-    EXPECT_EQ((std::vector<uint64_t>{1, 1, 1}), HitCounts(next.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{0, 0, 1}), HitCounts(next.capacity_results));
+}
+
+TEST(LiteHitTest, ReverseCommitKeepsChainHeadMostRecent) {
+    LiteHit lite_hit({1, LiteHit::kInfiniteCapacity}, 4);
+    lite_hit.ProcessRequest({1, 2, 3}, 12);
+
+    // The chain head is MRU after the commit, so it hits even at capacity 1;
+    // the chain leaf is the eviction victim side and only infinity hits it.
+    const auto head = lite_hit.ProcessRequest({1}, 4);
+    EXPECT_EQ((std::vector<uint64_t>{1, 1}), HitCounts(head.capacity_results));
+    const auto leaf = lite_hit.ProcessRequest({3}, 4);
+    EXPECT_EQ((std::vector<uint64_t>{0, 1}), HitCounts(leaf.capacity_results));
 }
 
 TEST(LiteHitTest, RepeatedKeysUseOneSnapshotAndSequentialFinalState) {
     LiteHit lite_hit({1, 2, LiteHit::kInfiniteCapacity}, 4);
     lite_hit.ProcessRequest({1, 2}, 8);
 
+    // Snapshot LRU is [2, 1] from LRU to MRU, so the leading key 2 pins the
+    // prefix threshold at 2 for the whole request.
     const auto repeated = lite_hit.ProcessRequest({2, 2, 1, 2}, 16);
-    EXPECT_EQ((std::vector<uint64_t>{2, 4, 4}), HitCounts(repeated.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{0, 4, 4}), HitCounts(repeated.capacity_results));
 
     const auto next = lite_hit.ProcessRequest({2, 1}, 8);
     EXPECT_EQ((std::vector<uint64_t>{1, 2, 2}), HitCounts(next.capacity_results));
@@ -156,7 +176,7 @@ TEST(LiteHitTest, PreservesInputCapacityOrderAndDuplicates) {
     lite_hit.ProcessRequest({1, 2, 3}, 12);
     const auto result = lite_hit.ProcessRequest({1, 2, 3}, 15);
 
-    EXPECT_EQ((std::vector<uint64_t>{3, 0, 3, 3, 0}), HitCounts(result.capacity_results));
+    EXPECT_EQ((std::vector<uint64_t>{3, 1, 3, 3, 0}), HitCounts(result.capacity_results));
     EXPECT_EQ(3, result.capacity_results[0].capacity_blocks);
     EXPECT_EQ(1, result.capacity_results[1].capacity_blocks);
     EXPECT_EQ(LiteHit::kInfiniteCapacity, result.capacity_results[3].capacity_blocks);

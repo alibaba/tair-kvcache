@@ -245,8 +245,10 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", init_keys, result);
-    // cache_hit_count uses index 0 (smallest capacity ~6 blocks), prefix match starts at key 0
-    // whose stack distance (99) exceeds the small capacity, so prefix hit = 0
+    // This legacy (non-full-attention) path replays with the eviction-policy
+    // simulator: cache_hit_count uses index 0 (smallest capacity ~6 blocks),
+    // prefix match starts at key 0 whose stack distance (99) exceeds the small
+    // capacity, so prefix hit = 0.
     EXPECT_EQ(0, result.cache_hit_count);
     // Large capacity (index 1) should hit all 100 keys
     ASSERT_EQ(2, result.hit_count_per_capacity.size());
@@ -266,9 +268,9 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
 
     TraceQueryResult second;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {2, 1, 3}, 13, second));
-    EXPECT_EQ((std::vector<int64_t>{1, 3}), second.hit_count_per_capacity);
+    EXPECT_EQ((std::vector<int64_t>{2, 3}), second.hit_count_per_capacity);
     ASSERT_EQ(2, second.hit_rate_per_capacity.size());
-    EXPECT_DOUBLE_EQ(4.0 / 13.0, second.hit_rate_per_capacity[0]);
+    EXPECT_DOUBLE_EQ(8.0 / 13.0, second.hit_rate_per_capacity[0]);
     EXPECT_DOUBLE_EQ(12.0 / 13.0, second.hit_rate_per_capacity[1]);
     EXPECT_EQ(3, second.max_hit_count);
     EXPECT_DOUBLE_EQ(12.0 / 13.0, second.max_hit_rate);
@@ -288,8 +290,8 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_EQ(2, summaries[0].total_queries);
     EXPECT_EQ(26, summaries[0].total_input_tokens);
     ASSERT_EQ(2, summaries[0].per_capacity_hit_rates.size());
-    EXPECT_EQ(1, summaries[0].per_capacity_hit_rates[0].total_hits);
-    EXPECT_DOUBLE_EQ(4.0 / 26.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
+    EXPECT_EQ(2, summaries[0].per_capacity_hit_rates[0].total_hits);
+    EXPECT_DOUBLE_EQ(8.0 / 26.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
     EXPECT_EQ(3, summaries[0].per_capacity_hit_rates[1].total_hits);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].per_capacity_hit_rates[1].hit_rate);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);

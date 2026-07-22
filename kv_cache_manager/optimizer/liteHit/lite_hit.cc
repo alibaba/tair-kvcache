@@ -148,16 +148,19 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys) {
         return;
     }
 
-    // Sequentially touching a request produces a final LRU order determined
-    // only by each distinct key's last occurrence. Remove old markers once,
-    // then append those last occurrences in their original order.
-    std::unordered_map<int64_t, std::size_t> last_occurrence;
-    last_occurrence.reserve(block_keys.size());
-    for (std::size_t i = 0; i < block_keys.size(); ++i) {
-        last_occurrence[block_keys[i]] = i;
+    // State commits tail-to-head: sequentially touching the request in
+    // reverse order produces a final LRU order determined only by each
+    // distinct key's last touch, which is its first occurrence visited
+    // back-to-front. The chain head therefore ends up most recent and the
+    // eviction victim is always a chain leaf. Remove old markers once, then
+    // append those touches in reverse request order.
+    std::unordered_map<int64_t, std::size_t> first_occurrence;
+    first_occurrence.reserve(block_keys.size());
+    for (std::size_t i = block_keys.size(); i > 0; --i) {
+        first_occurrence[block_keys[i - 1]] = i - 1;
     }
 
-    for (const auto &[block_key, _] : last_occurrence) {
+    for (const auto &[block_key, _] : first_occurrence) {
         const auto previous = last_positions_.find(block_key);
         if (previous != last_positions_.end()) {
             fenwick_.Add(previous->second, -1);
@@ -165,9 +168,9 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys) {
         }
     }
 
-    for (std::size_t i = 0; i < block_keys.size(); ++i) {
-        const int64_t block_key = block_keys[i];
-        if (last_occurrence.at(block_key) != i) {
+    for (std::size_t i = block_keys.size(); i > 0; --i) {
+        const int64_t block_key = block_keys[i - 1];
+        if (first_occurrence.at(block_key) != i - 1) {
             continue;
         }
         fenwick_.AppendZero();

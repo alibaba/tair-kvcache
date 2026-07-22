@@ -58,8 +58,12 @@ public:
     // complete blocks of the request:
     //   block_keys.size() == floor(input_token_len / block_size_tokens).
     // Prefix hits are evaluated against the request-start LRU snapshot; every
-    // complete block is then committed to the shared LRU state in request
-    // order, including blocks after the first miss.
+    // complete block is then committed to the shared LRU state tail-to-head
+    // (reverse request order), including blocks after the first miss. With
+    // prefix-chained keys a chain head is therefore always newer than its
+    // resident descendants, so the global LRU victim is always a leaf,
+    // matching leaf-first eviction used by production prefix caches
+    // (vLLM free-queue order, SGLang radix cache).
     RequestResult ProcessRequest(const std::vector<int64_t> &block_keys, uint64_t input_token_len);
 
     // Offline convenience API. It resets existing state, scans the requests

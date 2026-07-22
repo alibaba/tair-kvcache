@@ -37,6 +37,8 @@ online optimizer 按请求持续向 LiteHit 输入有序 block key。LiteHit 累
 
 - 一个访问对象对应一个 full-attention cache block，以 block key 唯一标识。
 - 同一个 block key 的所有访问视为同一个缓存对象。
+- block key 必须由输入层按前缀链式 hash 生成：请求第 j 个 key 是前 j 个完整 block 全部 token 的 hash，key 相等当且仅当整个 token 前缀相同。若只 hash 本 block 内容，跨请求复用语义不成立。LiteHit 只做 key 相等判断，不校验该契约。
+- 由该契约可知同一请求内 key 互不相同；核心对请求内重复 key 的处理属于防御行为。
 - 第一阶段假定所有 full-attention block 的 cache charge 相同。
 
 ### 4.2 请求
@@ -66,6 +68,7 @@ online optimizer 按请求持续向 LiteHit 输入有序 block key。LiteHit 累
 - block 第一次出现时为 cold miss。
 - 对于非 cold 访问，若 reuse distance 为 `d`，则容量 `C` 下命中的条件为 `d < C`。
 - 每个访问都必须更新全局 LRU 状态，包括请求已经发生 prefix miss 后的后续 block。
+- 状态提交按请求内倒序 touch（尾先、头后）：链头永远比链上后块新，全局驱逐牺牲者恒为链叶子，对齐生产 prefix cache 的尾先驱逐行为（vLLM 逆序释放 block、SGLang radix cache 叶子 LRU）。命中评估不受提交顺序影响，仍按请求正序基于请求前快照计算。
 
 ### 5.2 Full-attention prefix hit
 
@@ -158,6 +161,7 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
    `CacheIndexer` adapter。linear attention 继续走 legacy indexer。
 7. 第一阶段 full-attention + TTL 明确不支持，注册时返回参数错误。
 8. 新 TraceQuery 调用显式传 `input_token_len`；旧调用缺省时先从 `token_ids` 推导，仍缺省则兼容假设请求没有不完整尾部，并由 `block_keys.size() * block_size_tokens` 推导。
+9. LRU 状态更新固定为请求内倒序提交（见 5.1），不提供提交顺序开关。
 
 ## 12. 相关文档
 
