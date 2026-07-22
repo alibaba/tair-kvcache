@@ -267,6 +267,50 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCacheBackfill) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_scan";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({777});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr, batch.batch_keys, batch.batch_locations, batch.batch_properties));
+
+    std::vector<bool> cache_exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
+    ASSERT_EQ((std::vector<bool>{false}), cache_exists);
+
+    MaintenanceScanBatch scan_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForMaintenance(nullptr, SCAN_BASE_CURSOR, 10, scan_batch));
+    ASSERT_EQ((KeyVector{777}), scan_batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), scan_batch.location_results);
+    ASSERT_EQ(1, scan_batch.locations.size());
+    ASSERT_TRUE(scan_batch.locations[0].count("loc_777") > 0);
+
+    cache_exists.clear();
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
+    EXPECT_EQ((std::vector<bool>{false}), cache_exists);
+
+    CacheLocationMapVector authoritative_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetLocationsFromPersistent(nullptr, {777}, authoritative_locations));
+    ASSERT_EQ(1u, authoritative_locations.size());
+    ASSERT_TRUE(authoritative_locations.front().count("loc_777") > 0);
+
+    // An authoritative read remains side-effect free. Maintenance admission
+    // explicitly refreshes only accepted candidate keys before its RMW.
+    cache_exists.clear();
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
+    EXPECT_EQ((std::vector<bool>{false}), cache_exists);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.RefreshCacheFromPersistent(nullptr, {777}));
+    cache_exists.clear();
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
+    EXPECT_EQ((std::vector<bool>{true}), cache_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
 // --- PutMetaData / GetMetaData always routed to persistent --------------------
 
 TEST_F(MetaStorageBackendManagerTest, TestPutGetMetaData) {

@@ -860,6 +860,30 @@ TEST_F(CacheManagerTest, TestCleanup) {
     ASSERT_EQ("test_instance", meta_indexer->instance_id_);
 }
 
+TEST_F(CacheManagerTest, TestCleanupStopsActiveCacheGarbageCollector) {
+    CacheGarbageCollector::Config config;
+    config.enabled = true;
+    config.scan_interval_ms = 60000;
+    config.round_pause_ms = 60000;
+    config.scan_batch_size = 1;
+    config.orphan_writing_grace_period_ms = kMinCacheGcOrphanWritingGracePeriodMs;
+
+    auto collector = std::make_shared<CacheGarbageCollector>(config,
+                                                             cache_manager_->registry_manager_,
+                                                             cache_manager_->meta_indexer_manager_,
+                                                             cache_manager_->registry_manager_->data_storage_manager(),
+                                                             cache_manager_->schedule_plan_executor_,
+                                                             cache_manager_->metrics_registry_,
+                                                             cache_manager_->migration_manager_);
+    cache_manager_->cache_garbage_collector_ = collector;
+    ASSERT_EQ(EC_OK, cache_manager_->StartCacheGarbageCollector());
+    ASSERT_TRUE(collector->IsRunning());
+
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_FALSE(collector->IsRunning());
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
+}
+
 TEST_F(CacheManagerTest, TestStartWriteCache) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,

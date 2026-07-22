@@ -159,7 +159,8 @@ public:
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
-                                     std::vector<std::vector<ErrorCode>> &out_batch_results);
+                                     std::vector<std::vector<ErrorCode>> &out_batch_results,
+                                     bool refresh_cache_from_persistent = false);
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;

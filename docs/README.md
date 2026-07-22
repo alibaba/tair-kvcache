@@ -6,6 +6,7 @@
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
+- [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置

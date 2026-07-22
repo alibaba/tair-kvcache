@@ -48,6 +48,23 @@ using LocationIdVector = std::vector<LocationId>;
 using LocationIdsPerKey = std::vector<LocationIdVector>;
 using LocationsPerKey = std::vector<CacheLocationVector>;
 
+// A maintenance scan reads keys and their locations from the authoritative
+// backend without updating online access/LRU state. The three vectors are
+// always index-aligned when the scan succeeds.
+struct MaintenanceScanBatch {
+    std::string next_cursor;
+    KeyVector keys;
+    CacheLocationMapVector locations;
+    std::vector<ErrorCode> location_results;
+
+    void Clear() {
+        next_cursor.clear();
+        keys.clear();
+        locations.clear();
+        location_results.clear();
+    }
+};
+
 // ---------- Read-Modify-Write helpers ----------
 // Action codes shared by both block-level and location-level RMW modifiers.
 enum ModifierAction {

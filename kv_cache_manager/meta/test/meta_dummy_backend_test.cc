@@ -280,6 +280,38 @@ TEST_F(MetaDummyBackendTest, TestListKeys) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestMaintenanceScanReturnsLocationsWithoutTouchingLru) {
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_maintenance_scan", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc_1");
+    location->set_status(CacheLocationStatus::CLS_WRITING);
+    CacheLocationMapVector locations(1);
+    locations[0].emplace(location->id(), location);
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1}, locations, PropertyMapVector(1)));
+
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    int64_t lru_before = 0;
+    ASSERT_TRUE(backend->table_.FindAndApply(
+        1, [&lru_before](const DummyItem &item) { lru_before = std::stoll(item.properties.at(PROPERTY_LRU_TIME)); }));
+
+    MaintenanceScanBatch batch;
+    ASSERT_EQ(ErrorCode::EC_OK, backend->ScanLocationsForMaintenance(nullptr, SCAN_BASE_CURSOR, /*limit*/ 1, batch));
+    ASSERT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    ASSERT_EQ((KeyVector{1}), batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}), batch.location_results);
+    ASSERT_EQ(1, batch.locations.size());
+    ASSERT_TRUE(batch.locations[0].count("loc_1") > 0);
+
+    int64_t lru_after = 0;
+    ASSERT_TRUE(backend->table_.FindAndApply(
+        1, [&lru_after](const DummyItem &item) { lru_after = std::stoll(item.properties.at(PROPERTY_LRU_TIME)); }));
+    EXPECT_EQ(lru_before, lru_after);
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestRandomSample) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());

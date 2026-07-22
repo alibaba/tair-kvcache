@@ -14,6 +14,7 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
+#include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
@@ -88,7 +89,8 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
               CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
-              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET,
+              CacheGarbageCollector::Config cache_gc_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -213,6 +215,9 @@ public:
 
     void PauseReclaimer();
     void ResumeReclaimer();
+    ErrorCode StartCacheGarbageCollector();
+    void RequestStopCacheGarbageCollector();
+    void JoinCacheGarbageCollector();
 
     // 多层存储迁移控制面随 leader 生命周期启停（OnBecomeLeader/OnNoLongerLeader）。
     void StartMigrationManager();
@@ -221,6 +226,7 @@ public:
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager() { return meta_indexer_manager_; }
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor() { return schedule_plan_executor_; }
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
+    std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
@@ -370,6 +376,8 @@ private:
     std::shared_ptr<RegistryManager> registry_manager_;
     // 无需清理 - 让遗留的Plan自行跑完
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
+    // leader demotion 和析构时先停止 GC 线程；已接受的删除任务由 Executor best effort 继续执行
+    std::shared_ptr<CacheGarbageCollector> cache_garbage_collector_;
     // 无需清理 - 仅需要暂停
     std::shared_ptr<CacheReclaimer> cache_reclaimer_;
     // 无需清理 - 随 leader 生命周期 Start/Stop；活跃任务在切主时由 Reclaimer 孤儿检测兜底

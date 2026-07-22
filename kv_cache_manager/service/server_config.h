@@ -50,6 +50,12 @@ public:
         return cache_reclaimer_pending_delete_handler_limit_;
     }
     uint64_t GetCacheReclaimerPendingBytesLimit() const { return cache_reclaimer_pending_bytes_limit_; }
+    bool IsCacheGcEnabled() const { return cache_gc_enabled_; }
+    int64_t GetCacheGcScanIntervalMs() const { return cache_gc_scan_interval_ms_; }
+    int64_t GetCacheGcRoundPauseMs() const { return cache_gc_round_pause_ms_; }
+    uint64_t GetCacheGcScanBatchSize() const { return cache_gc_scan_batch_size_; }
+    int64_t GetCacheGcOrphanWritingGracePeriodMs() const { return cache_gc_orphan_writing_grace_period_ms_; }
+    uint64_t GetCacheGcMaxInflightDeleteRequests() const { return cache_gc_max_inflight_delete_requests_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
@@ -101,6 +107,12 @@ private:
     uint64_t cache_reclaimer_pending_bytes_limit_per_group_type_ = 0;
     uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
     uint64_t cache_reclaimer_pending_bytes_limit_ = 0;
+    bool cache_gc_enabled_ = false;
+    int64_t cache_gc_scan_interval_ms_ = 0;
+    int64_t cache_gc_round_pause_ms_ = 0;
+    uint64_t cache_gc_scan_batch_size_ = 0;
+    int64_t cache_gc_orphan_writing_grace_period_ms_ = 0;
+    uint64_t cache_gc_max_inflight_delete_requests_ = 0;
     std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;
     int64_t metrics_report_interval_ms_ = 0;

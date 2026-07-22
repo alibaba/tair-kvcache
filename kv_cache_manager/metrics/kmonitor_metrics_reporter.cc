@@ -160,6 +160,17 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us);
 
+    // cache garbage collector metrics
+    DECLARE_METRICS(cache_gc, scan_round_count);
+    DECLARE_METRICS(cache_gc, scan_key_count);
+    DECLARE_METRICS(cache_gc, candidate_count);
+    DECLARE_METRICS(cache_gc, delete_target_count);
+    DECLARE_METRICS(cache_gc, delete_result_count);
+    DECLARE_METRICS(cache_gc, operation_error_count);
+    DECLARE_METRICS(cache_gc, inflight_delete_count);
+    DECLARE_METRICS(cache_gc, inflight_delete_age_ms);
+    DECLARE_METRICS(cache_gc, round_duration_ms);
+
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
@@ -420,6 +431,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_min_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_max_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
+    // Cache GC counters are registered as gauges, matching the existing
+    // cumulative counter convention used for CacheReclaimer. Tagged series
+    // share one KMonitor metric and are distinguished at report time.
+    REGISTER_GAUGE_METRIC(cache_gc, scan_round_count);
+    REGISTER_GAUGE_METRIC(cache_gc, scan_key_count);
+    REGISTER_GAUGE_METRIC(cache_gc, candidate_count);
+    REGISTER_GAUGE_METRIC(cache_gc, delete_target_count);
+    REGISTER_GAUGE_METRIC(cache_gc, delete_result_count);
+    REGISTER_GAUGE_METRIC(cache_gc, operation_error_count);
+    REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_count);
+    REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_age_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, round_duration_ms);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -757,6 +781,45 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
+    } while (false);
+
+    do {
+        // Cache GC owns both untagged metrics and bounded tagged families
+        // (candidate reason, delete status and error stage). Read the registry
+        // snapshot so KMonitor preserves the same labels as Prometheus/local
+        // reporting instead of maintaining a second hard-coded tag list.
+        if (!metrics_registry_) {
+            break;
+        }
+        const auto report_registry_metric = [this](kmonitor::MutableMetric *metric, const std::string &name) {
+            const auto data = metrics_registry_->GetMetricsData(name);
+            if (!metric || !data) {
+                return;
+            }
+            for (const auto &[base_tags, value] : data->GetMetricsValues()) {
+                if (!value || !value->touched.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                double sample = 0.0;
+                if (std::holds_alternative<CounterValue>(value->value)) {
+                    sample = static_cast<double>(std::get<CounterValue>(value->value).load(std::memory_order_relaxed));
+                } else {
+                    sample = std::get<GaugeValue>(value->value).load(std::memory_order_relaxed);
+                }
+                const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(base_tags);
+                metric->Report(&tags, sample);
+            }
+        };
+
+        report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
+        report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");
+        report_registry_metric(ctx_->cache_gc_candidate_count_metrics.get(), "cache_gc.candidate_count");
+        report_registry_metric(ctx_->cache_gc_delete_target_count_metrics.get(), "cache_gc.delete_target_count");
+        report_registry_metric(ctx_->cache_gc_delete_result_count_metrics.get(), "cache_gc.delete_result_count");
+        report_registry_metric(ctx_->cache_gc_operation_error_count_metrics.get(), "cache_gc.operation_error_count");
+        report_registry_metric(ctx_->cache_gc_inflight_delete_count_metrics.get(), "cache_gc.inflight_delete_count");
+        report_registry_metric(ctx_->cache_gc_inflight_delete_age_ms_metrics.get(), "cache_gc.inflight_delete_age_ms");
+        report_registry_metric(ctx_->cache_gc_round_duration_ms_metrics.get(), "cache_gc.round_duration_ms");
     } while (false);
 
     do {

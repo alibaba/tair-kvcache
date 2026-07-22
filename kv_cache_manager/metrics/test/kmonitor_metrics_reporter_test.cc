@@ -104,6 +104,15 @@ TEST_F(KmonitorMetricsReporterTest, TestReportPerQuery) {
 
 TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
     {
+        metrics_registry_->GetCounter("cache_gc.scan_round_count") += 1;
+        metrics_registry_->GetCounter("cache_gc.candidate_count", {{"reason", "storage_missing"}}) += 2;
+        metrics_registry_->GetCounter("cache_gc.delete_result_count", {{"status", "0"}}) += 1;
+        metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "scan"}}) += 1;
+        metrics_registry_->GetGauge("cache_gc.inflight_delete_count") = 2;
+        EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
+    }
+
+    {
         // simulate the uninitialised case 1
         reporter_->cache_manager_ = nullptr;
         reporter_->metrics_registry_ = std::make_shared<MetricsRegistry>();

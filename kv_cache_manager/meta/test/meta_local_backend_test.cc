@@ -308,6 +308,43 @@ TEST_F(MetaLocalBackendTest, TestListKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestMaintenanceScanReturnsLocationsWithoutTouchingLru) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_maintenance_scan", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc_1");
+    location->set_status(CacheLocationStatus::CLS_WRITING);
+    CacheLocationMapVector locations(1);
+    locations[0].emplace(location->id(), location);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1}, locations, PropertyMapVector(1)));
+
+    auto *backend = GetLocalBackend();
+    auto get_last_access_time = [backend]() {
+        int64_t last_access_time = -1;
+        backend->cache_->ApplyToSingleShard(
+            0, [&last_access_time](std::string_view, Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) {
+                last_access_time = static_cast<MetaMemCacheItem *>(value)->GetLastAccessTime();
+            });
+        return last_access_time;
+    };
+    const int64_t lru_before = get_last_access_time();
+    ASSERT_GT(lru_before, 0);
+
+    MaintenanceScanBatch batch;
+    ASSERT_EQ(EC_OK, backend->ScanLocationsForMaintenance(nullptr, SCAN_BASE_CURSOR, /*limit*/ 1, batch));
+    ASSERT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    ASSERT_EQ((KeyVector{1}), batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), batch.location_results);
+    ASSERT_EQ(1, batch.locations.size());
+    ASSERT_TRUE(batch.locations[0].count("loc_1") > 0);
+    EXPECT_EQ(lru_before, get_last_access_time());
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());

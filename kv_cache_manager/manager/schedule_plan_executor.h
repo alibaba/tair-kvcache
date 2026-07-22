@@ -61,6 +61,9 @@ struct CacheLocationDelRequest {
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
+    // Maintenance scans observe the persistent source of truth. Revalidate
+    // admission there and refresh candidate keys into the hot cache before CAS.
+    bool authoritative_read{false};
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -116,8 +119,7 @@ public:
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
 
-    bool SubmitNonBlocking(const CacheMetaDelRequest &req,
-                           ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
+    bool SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req,
                            ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
 
@@ -166,12 +168,13 @@ private:
                                std::string &error_message);
     LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task);
     LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task);
-    LocationDelAdmissionResult PrepareDeleteTaskImpl(const std::string &instance_id,
-                                                     const std::vector<int64_t> &block_keys,
-                                                     const std::vector<std::vector<std::string>> *target_location_ids,
-                                                     const std::vector<std::vector<std::string>>
-                                                         *expected_location_values,
-                                                     std::chrono::microseconds delay);
+    LocationDelAdmissionResult
+    PrepareDeleteTaskImpl(const std::string &instance_id,
+                          const std::vector<int64_t> &block_keys,
+                          const std::vector<std::vector<std::string>> *target_location_ids,
+                          const std::vector<std::vector<std::string>> *expected_location_values,
+                          std::chrono::microseconds delay,
+                          bool authoritative_read = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
