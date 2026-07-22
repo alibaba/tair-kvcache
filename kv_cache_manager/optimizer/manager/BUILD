@@ -59,7 +59,9 @@ cc_library(
         "//kv_cache_manager/optimizer/index:cache_indexer",
         "//kv_cache_manager/optimizer/index:cache_indexer_factory",
         "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:request_preprocess",
     ],
 )
 
@@ -76,6 +78,9 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/liteHit:facts_csv",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:request_preprocess",
         "//kv_cache_manager/optimizer/trace_loader",
     ],
 )

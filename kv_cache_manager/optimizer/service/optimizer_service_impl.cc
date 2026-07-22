@@ -79,7 +79,8 @@ OptimizerInstanceInfo ConvertProtoToInstanceInfo(const proto::optimizer::Optimiz
                                  specs,
                                  groups,
                                  request.linear_step(),
-                                 optimizer_state_info);
+                                 optimizer_state_info,
+                                 request.enable_prefix_hash());
 }
 
 void SetErrorOnCollector(RequestContext *request_context, ErrorCode ec) {

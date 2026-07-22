@@ -267,7 +267,7 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_EQ((std::vector<int64_t>{0, 0}), first.hit_count_per_capacity);
 
     TraceQueryResult second;
-    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {2, 1, 3}, 13, second));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, second));
     EXPECT_EQ((std::vector<int64_t>{2, 3}), second.hit_count_per_capacity);
     ASSERT_EQ(2, second.hit_rate_per_capacity.size());
     EXPECT_DOUBLE_EQ(8.0 / 13.0, second.hit_rate_per_capacity[0]);
@@ -280,7 +280,8 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
         checked_state = true;
         EXPECT_NE(nullptr, state.lite_hit);
         EXPECT_EQ(nullptr, state.indexer);
-        EXPECT_EQ(2, state.lite_hit->request_count());
+        EXPECT_EQ(2, state.total_queries);
+        EXPECT_EQ(26, state.total_input_tokens);
     }));
     EXPECT_TRUE(checked_state);
 

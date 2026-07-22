@@ -164,7 +164,26 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:request_preprocess",
+    ],
+)
+
+cc_test(
+    name = "LiteHitOfflineRunnerTest",
+    srcs = [
+        "lite_hit_offline_runner_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/liteHit:facts_csv",
+        "//kv_cache_manager/optimizer/liteHit:facts_query",
+        "//kv_cache_manager/optimizer/manager:lite_hit_offline_runner",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
     ],
 )
 

@@ -27,6 +27,8 @@ struct InstanceState {
     // linear attention remains on the legacy CacheIndexer path.
     std::unique_ptr<LiteHit> lite_hit;
     std::unique_ptr<CacheIndexer> indexer;
+    // Static byte->block estimation of the configured capacities, kept for
+    // the existing response contract and used as projection slots.
     std::vector<int64_t> lite_hit_capacity_blocks;
 
     int64_t size_full_only = 0;
@@ -34,8 +36,12 @@ struct InstanceState {
     int32_t linear_step = 0;
     std::mutex mutex;
 
+    // Minimal cumulative integers per the existing contract. LiteHit itself
+    // no longer accumulates anything; the full-attention path updates these
+    // from projected facts. Rates are derived on read.
     int64_t total_queries = 0;
     int64_t total_blocks_queried = 0;
+    int64_t total_input_tokens = 0;
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
 };

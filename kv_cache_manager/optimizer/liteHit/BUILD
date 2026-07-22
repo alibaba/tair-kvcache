@@ -39,5 +39,8 @@ cc_library(
     name = "lite_hit",
     srcs = ["lite_hit.cc"],
     hdrs = ["lite_hit.h"],
-    deps = [":dynamic_fenwick_tree"],
+    deps = [
+        ":dynamic_fenwick_tree",
+        ":hit_curve",
+    ],
 )

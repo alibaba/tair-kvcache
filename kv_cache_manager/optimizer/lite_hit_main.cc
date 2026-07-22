@@ -14,14 +14,14 @@ int main(int argc, char *argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <lite_hit_config.json>" << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Runs offline LiteHit multi-capacity prefix hit-rate analysis on a" << std::endl;
-        std::cerr << "standard-format trace and writes a per-request CSV (one row per" << std::endl;
-        std::cerr << "request per capacity)." << std::endl;
+        std::cerr << "Replays a standard-format trace through per-instance LiteHit lanes and" << std::endl;
+        std::cerr << "atomically publishes one capacity-independent facts CSV:" << std::endl;
+        std::cerr << "  <output_result_path>/litehit_facts.csv" << std::endl;
+        std::cerr << "Apply capacities afterwards with lite_hit_facts_query_main." << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Config fields: trace_file_path, output_result_path, instance_groups (online" << std::endl;
-        std::cerr << "OptimizerInstanceGroup list, capacity_gb here), instances (OptimizerInstanceInfo list),"
-                  << std::endl;
-        std::cerr << "assume_time_sorted (default true: stream; false: load+sort)." << std::endl;
+        std::cerr << "Config fields: trace_file_path, output_result_path (directory)," << std::endl;
+        std::cerr << "instance_groups (online OptimizerInstanceGroup list), instances" << std::endl;
+        std::cerr << "(OptimizerInstanceInfo list), override_instance_id, pipeline_worker_count." << std::endl;
         kv_cache_manager::LoggerBroker::DestroyLogger();
         return 1;
     }

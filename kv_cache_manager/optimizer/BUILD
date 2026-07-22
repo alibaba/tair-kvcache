@@ -26,6 +26,17 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "lite_hit_facts_query_main",
+    srcs = [
+        "lite_hit_facts_query_main.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/optimizer/liteHit:facts_query",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
 cc_library(
     name = "config",
     hdrs = [

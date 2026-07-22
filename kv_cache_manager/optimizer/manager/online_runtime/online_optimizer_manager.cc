@@ -9,6 +9,8 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer_factory.h"
+#include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
+#include "kv_cache_manager/optimizer/liteHit/request_preprocess.h"
 
 namespace kv_cache_manager {
 
@@ -357,17 +359,7 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
 
     if (linear_step == 0) {
         state->lite_hit_capacity_blocks = estimated_capacity_blocks;
-        std::vector<int64_t> lite_hit_capacities = estimated_capacity_blocks;
-        if (instance_group.enable_theoretical_max_cache()) {
-            lite_hit_capacities.push_back(LiteHit::kInfiniteCapacity);
-        }
-        try {
-            state->lite_hit = std::make_unique<LiteHit>(std::move(lite_hit_capacities), instance_info.block_size());
-        } catch (const std::exception &e) {
-            KVCM_LOG_ERROR(
-                "RegisterInstance failed: initialize LiteHit for instance[%s]: %s", instance_id.c_str(), e.what());
-            return EC_BADARGS;
-        }
+        state->lite_hit = std::make_unique<LiteHit>();
     } else {
         auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
                                                                instance_group.enable_theoretical_max_cache(),
@@ -472,25 +464,39 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     result.capacity_gb = state->instance_group->capacity_gb();
 
     if (state->linear_step == 0) {
-        if (input_token_len < 0 || !state->lite_hit) {
-            return input_token_len < 0 ? EC_BADARGS : EC_ERROR;
+        if (!state->lite_hit) {
+            return EC_ERROR;
+        }
+        if (input_token_len < 0) {
+            return EC_BADARGS;
         }
 
-        LiteHit::RequestResult request_result;
+        NormalizedRequest normalized;
         try {
-            request_result = state->lite_hit->ProcessRequest(block_keys, static_cast<uint64_t>(input_token_len));
+            normalized = NormalizeRequest(block_keys,
+                                          input_token_len,
+                                          static_cast<uint64_t>(state->instance_info->block_size()),
+                                          state->instance_info->enable_prefix_hash());
         } catch (const std::invalid_argument &e) {
             KVCM_LOG_ERROR(
                 "TraceQuery failed: invalid LiteHit request for instance[%s]: %s", instance_id.c_str(), e.what());
             return EC_BADARGS;
         }
 
+        const RequestFact fact = state->lite_hit->ProcessRequest(normalized.block_keys);
+        result.input_token_len = ClampToInt64(normalized.input_token_len);
+
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        const double token_denominator = static_cast<double>(normalized.input_token_len);
         result.hit_count_per_capacity.reserve(num_caps);
         result.hit_rate_per_capacity.reserve(num_caps);
         for (std::size_t i = 0; i < num_caps; ++i) {
-            const auto &capacity_result = request_result.capacity_results[i];
-            result.hit_count_per_capacity.push_back(ClampToInt64(capacity_result.hit_count));
-            result.hit_rate_per_capacity.push_back(capacity_result.hit_rate);
+            const uint64_t hits =
+                HitCurveProjector::ProjectBlocks(fact, static_cast<uint64_t>(state->lite_hit_capacity_blocks[i]));
+            result.hit_count_per_capacity.push_back(ClampToInt64(hits));
+            result.hit_rate_per_capacity.push_back(
+                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(hits * block_size) / token_denominator);
+            state->total_hits_per_capacity[i] += static_cast<int64_t>(hits);
         }
         result.cache_hit_count = result.hit_count_per_capacity.empty() ? 0 : result.hit_count_per_capacity.front();
 
@@ -504,17 +510,19 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             result.unique_keys_per_capacity.empty() ? 0 : result.unique_keys_per_capacity.front();
 
         if (state->instance_group->enable_theoretical_max_cache()) {
-            const auto &max_result = request_result.capacity_results.back();
-            result.max_hit_count = ClampToInt64(max_result.hit_count);
-            result.max_hit_rate = max_result.hit_rate;
+            const uint64_t max_hits = HitCurveProjector::ProjectInfinite(fact);
+            result.max_hit_count = ClampToInt64(max_hits);
+            result.max_hit_rate =
+                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
             result.theoretical_unique_keys = ClampToInt64(unique_blocks);
+            state->total_max_hits += static_cast<int64_t>(max_hits);
         } else {
             result.theoretical_unique_keys = -1;
         }
 
-        // Kept only for the existing debug field. All full-attention hit
-        // counts, token denominators, and rates live in LiteHit itself.
+        state->total_queries++;
         state->total_blocks_queried += total_blocks;
+        state->total_input_tokens += ClampToInt64(normalized.input_token_len);
         return EC_OK;
     }
 
@@ -523,7 +531,13 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     if (!state->indexer) {
         return EC_ERROR;
     }
-    state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
+    // Legacy analyzers keep their algorithm but share the same prefix-hash
+    // preprocessing switch.
+    if (state->instance_info->enable_prefix_hash()) {
+        state->indexer->ProcessKeys(ApplyPrefixHash(block_keys), hit_count, max_hit_count);
+    } else {
+        state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
+    }
 
     state->indexer->PostQueryMaintenance();
 
@@ -582,9 +596,8 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             if (!state->lite_hit) {
                 continue;
             }
-            const LiteHit::AnalysisResult analysis = state->lite_hit->GetResult();
-            s.total_queries = ClampToInt64(analysis.request_count);
-            s.total_input_tokens = ClampToInt64(analysis.total_input_tokens);
+            s.total_queries = state->total_queries;
+            s.total_input_tokens = state->total_input_tokens;
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
@@ -597,19 +610,26 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             s.kv_cache_usage_bytes =
                 SaturatingMultiplyToInt64(largest_resident_blocks, static_cast<uint64_t>(state->size_full_only));
 
-            for (size_t i = 0; i < caps.size() && i < analysis.capacity_results.size(); ++i) {
-                const auto &capacity_result = analysis.capacity_results[i];
+            // Full-attention rates are token based: cumulative hit blocks are
+            // converted to tokens with the fixed block size and divided by the
+            // cumulative input tokens.
+            const double token_denominator = static_cast<double>(state->total_input_tokens);
+            const int64_t block_size_tokens = state->instance_info->block_size();
+            for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); ++i) {
                 PerCapacityHitRateInfo info;
                 info.capacity_gb = caps[i];
-                info.total_hits = ClampToInt64(capacity_result.hit_count);
-                info.hit_rate = capacity_result.hit_rate;
+                info.total_hits = state->total_hits_per_capacity[i];
+                info.hit_rate = state->total_input_tokens > 0
+                                    ? static_cast<double>(info.total_hits * block_size_tokens) / token_denominator
+                                    : 0.0;
                 s.per_capacity_hit_rates.push_back(info);
             }
 
             if (state->instance_group->enable_theoretical_max_cache()) {
-                const auto &max_result = analysis.capacity_results.back();
-                s.total_max_hits = ClampToInt64(max_result.hit_count);
-                s.max_hit_rate = max_result.hit_rate;
+                s.total_max_hits = state->total_max_hits;
+                s.max_hit_rate = state->total_input_tokens > 0
+                                     ? static_cast<double>(s.total_max_hits * block_size_tokens) / token_denominator
+                                     : 0.0;
             }
         } else {
             if (!state->indexer) {
@@ -695,6 +715,7 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     }
     state->total_queries = 0;
     state->total_blocks_queried = 0;
+    state->total_input_tokens = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);
     state->total_max_hits = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
