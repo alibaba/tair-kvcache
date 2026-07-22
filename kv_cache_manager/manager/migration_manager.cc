@@ -2063,8 +2063,16 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
         for (const auto &strategy : cache_config->migration_strategies()) {
             if (strategy && strategy->source_storage_name() == job.source_storage_name &&
                 strategy->target_storage_name() == job.target_storage_name) {
+                if (current_strategy) {
+                    // Config validation rejects duplicate routes. Fail closed here as well because recovered
+                    // legacy data or direct in-process mutation may bypass the normal validation entrypoint.
+                    KVCM_LOG_ERROR("duplicate migration route in instance group [%s]: [%s] -> [%s]",
+                                   job.instance_group_name.c_str(),
+                                   job.source_storage_name.c_str(),
+                                   job.target_storage_name.c_str());
+                    return {};
+                }
                 current_strategy = strategy;
-                break;
             }
         }
         if (!current_strategy) {

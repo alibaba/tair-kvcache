@@ -127,6 +127,7 @@ public:
     MigrationConfig() = default;
     ~MigrationConfig() override;
 
+    // A source/target pair identifies one migration route and must be unique within this config.
     const std::vector<std::shared_ptr<MigrationStrategy>> &strategies() const { return strategies_; }
     int64_t copy_max_concurrency() const { return copy_max_concurrency_; }
     MigrationMarkClearPolicy mark_clear_policy() const { return mark_clear_policy_; }

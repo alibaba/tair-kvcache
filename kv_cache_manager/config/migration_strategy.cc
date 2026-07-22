@@ -1,6 +1,7 @@
 #include "kv_cache_manager/config/migration_strategy.h"
 
 #include <cmath>
+#include <set>
 
 namespace kv_cache_manager {
 
@@ -138,6 +139,7 @@ void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &
 bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
+    std::set<std::pair<std::string, std::string>> migration_routes;
     if (copy_max_concurrency_ <= 0) {
         valid = false;
         local_invalid_fields += "{copy_max_concurrency}";
@@ -151,8 +153,17 @@ bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const 
         if (strategy == nullptr) {
             valid = false;
             local_invalid_fields += "{strategies:null_entry}";
-        } else if (!strategy->ValidateRequiredFields(local_invalid_fields)) {
+            continue;
+        }
+        if (!strategy->ValidateRequiredFields(local_invalid_fields)) {
             valid = false;
+        }
+        if (!strategy->source_storage_name().empty() && !strategy->target_storage_name().empty() &&
+            !migration_routes.emplace(strategy->source_storage_name(), strategy->target_storage_name()).second) {
+            // Async Prepare uses the route as its stable identity. Allowing two rules for the same route
+            // would make threshold/method/retention selection depend on vector order.
+            valid = false;
+            local_invalid_fields += "{strategies:duplicate_route}";
         }
     }
     if (!valid) {

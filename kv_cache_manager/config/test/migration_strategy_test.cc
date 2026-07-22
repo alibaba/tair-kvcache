@@ -256,3 +256,36 @@ TEST_F(MigrationStrategyTest, TestCacheConfigRejectsInvalidMigrationMarkClearPol
     ASSERT_FALSE(cache_config.ValidateRequiredFields(invalid_fields));
     ASSERT_NE(std::string::npos, invalid_fields.find("mark_clear_policy"));
 }
+
+TEST_F(MigrationStrategyTest, TestMigrationConfigRequiresUniqueRoutes) {
+    const auto make_strategy = [](const std::string &source,
+                                  const std::string &target,
+                                  double threshold,
+                                  bool copy,
+                                  bool mark) {
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name(source);
+        strategy->set_target_storage_name(target);
+        strategy->set_trigger_threshold(threshold);
+        strategy->mutable_methods().mutable_copy().set_enabled(copy);
+        strategy->mutable_methods().mutable_mark().set_enabled(mark);
+        if (copy) {
+            strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
+        }
+        return strategy;
+    };
+
+    MigrationConfig config;
+    config.set_strategies({make_strategy("hot", "cold", 0.9, true, false),
+                           make_strategy("hot", "cold", 0.5, false, true)});
+    std::string invalid_fields;
+    EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("duplicate_route"));
+
+    // Only an identical source/target pair is forbidden. Fan-out, fan-in and tier chains remain valid.
+    config.set_strategies({make_strategy("hot", "warm", 0.5, true, false),
+                           make_strategy("hot", "cold", 0.7, true, false),
+                           make_strategy("warm", "cold", 0.8, true, false)});
+    invalid_fields.clear();
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}

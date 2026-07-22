@@ -4848,6 +4848,48 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareCoalescesAndRevalidatesStrat
     EXPECT_TRUE(captured_copy_reqs.empty());
 }
 
+TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareRejectsAmbiguousRoute) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+    const auto copy_strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    auto mark_strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ false, /*mark*/ true);
+    mark_strategy.set_trigger_threshold(0.7);
+
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    // Direct mutation deliberately bypasses config validation to cover recovered legacy data.
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(copy_strategy),
+                                      std::make_shared<MigrationStrategy>(mark_strategy)});
+    instance_group->set_cache_config(config);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context_->trace_id();
+    job.instance_group_name = instance_group->name();
+    job.instance_id = ins_info->instance_id();
+    job.source_storage_name = mark_strategy.source_storage_name();
+    job.target_storage_name = mark_strategy.target_storage_name();
+    job.block_keys = {10};
+    job.pending_location_ids_by_block = {{}};
+
+    captured_copy_reqs.clear();
+    captured_mark_keys.clear();
+    ASSERT_TRUE(mm_->SubmitAsyncMigrationPrepare(std::move(job)));
+    ASSERT_TRUE(WaitForAsyncMigrationIdle());
+    EXPECT_TRUE(captured_copy_reqs.empty());
+    EXPECT_TRUE(captured_mark_keys.empty());
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
 TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) {
     const auto ins_info = InstanceInfoFactory();
     const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
