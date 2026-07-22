@@ -1073,10 +1073,17 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, GenWriteLocation);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
-        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, location_ids);
+        std::vector<MetaSearcher::AddLocationResult> add_results;
+        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, add_results);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchAddLocation);
-        // FIXME(rui): PartialOK and return will cause storage leak (not possible to reclaim)
-        //             example case -- indexer reach max key count after partial write
+        if (ec != EC_OK) {
+            RollbackAddLocations(request_context, instance_id, new_keys, new_locations, add_results);
+        } else {
+            location_ids.reserve(add_results.size());
+            for (const auto &add_result : add_results) {
+                location_ids.push_back(add_result.location_id);
+            }
+        }
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, PutWriteLocationManager);
@@ -1106,6 +1113,144 @@ CacheManager::StartWriteCache(RequestContext *request_context,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
                                 CacheLocationViewVecWrapper(std::move(new_locations)))};
+}
+
+void CacheManager::RollbackAddLocations(RequestContext *request_context,
+                                        const std::string &instance_id,
+                                        const KeyVector &keys,
+                                        const CacheLocationVector &locations,
+                                        const std::vector<MetaSearcher::AddLocationResult> &add_results) {
+    const std::string &trace_id = request_context->trace_id();
+    if (keys.size() != locations.size() || keys.size() != add_results.size()) {
+        PREFIX_LOG(ERROR,
+                   "rollback add locations size mismatch, keys[%lu], locations[%lu], results[%lu]",
+                   keys.size(),
+                   locations.size(),
+                   add_results.size());
+        return;
+    }
+
+    CacheLocationDelRequest metadata_rollback{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
+    std::map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
+    KeyVector uncertain_keys;
+    std::vector<std::string> uncertain_location_ids;
+    std::vector<size_t> uncertain_indices;
+
+    auto queue_uri_delete = [&](size_t index) {
+        if (!locations[index]) {
+            PREFIX_LOG(WARN, "rollback add location has null location, key[%lu](%lu)", index, keys[index]);
+            return;
+        }
+        for (const auto &spec : locations[index]->location_specs()) {
+            DataStorageUri uri(spec.uri());
+            if (!uri.Valid()) {
+                PREFIX_LOG(WARN,
+                           "rollback add location has invalid uri, key[%lu](%lu), uri[%s]",
+                           index,
+                           keys[index],
+                           spec.uri().c_str());
+                continue;
+            }
+            direct_delete_uris[uri.GetHostName()].push_back(std::move(uri));
+        }
+    };
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &add_result = add_results[i];
+        if (add_result.ec == EC_OK && !add_result.location_id.empty()) {
+            metadata_rollback.block_keys.push_back(keys[i]);
+            metadata_rollback.location_ids.push_back({add_result.location_id});
+            continue;
+        }
+        if (!add_result.location_id.empty()) {
+            // location id 已生成但写结果失败/未知：先做幂等元数据删除，确认无引用后才能删 URI。
+            uncertain_keys.push_back(keys[i]);
+            uncertain_location_ids.push_back(add_result.location_id);
+            uncertain_indices.push_back(i);
+            continue;
+        }
+        queue_uri_delete(i);
+    }
+
+    // 已成功写入元数据的 location 复用标准删除流水线：标记 DELETING、Sync、删 URI、删元数据。
+    if (!metadata_rollback.block_keys.empty()) {
+        reclaimer_task_supervisor_->Submit(trace_id, std::move(metadata_rollback));
+    }
+
+    if (!uncertain_keys.empty()) {
+        MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+        if (!meta_searcher) {
+            PREFIX_LOG(ERROR, "rollback uncertain add locations failed: meta searcher not found");
+        } else {
+            LocationIdsPerKey location_ids_per_key;
+            location_ids_per_key.reserve(uncertain_location_ids.size());
+            for (const auto &location_id : uncertain_location_ids) {
+                location_ids_per_key.push_back({location_id});
+            }
+            std::vector<std::vector<ErrorCode>> delete_results;
+            meta_searcher->BatchDeleteLocations(request_context,
+                                                uncertain_keys,
+                                                location_ids_per_key,
+                                                delete_results,
+                                                {},
+                                                false /* these failed adds were never included in usage */,
+                                                false /* failed adds were never counted as new keys */);
+            KeyVector deleted_metadata_keys;
+            for (size_t i = 0; i < uncertain_indices.size(); ++i) {
+                if (i < delete_results.size() && delete_results[i].size() == 1 &&
+                    delete_results[i].front() == EC_OK) {
+                    deleted_metadata_keys.push_back(uncertain_keys[i]);
+                }
+            }
+
+            bool metadata_synced = true;
+            if (!deleted_metadata_keys.empty()) {
+                auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+                metadata_synced = meta_indexer && meta_indexer->Sync(deleted_metadata_keys);
+                if (!metadata_synced) {
+                    PREFIX_LOG(WARN,
+                               "rollback uncertain add locations failed to sync deleted metadata, key_count[%zu]",
+                               deleted_metadata_keys.size());
+                }
+            }
+            for (size_t i = 0; i < uncertain_indices.size(); ++i) {
+                if (i >= delete_results.size() || delete_results[i].size() != 1) {
+                    continue;
+                }
+                const ErrorCode delete_ec = delete_results[i].front();
+                if (delete_ec == EC_NOENT || (delete_ec == EC_OK && metadata_synced)) {
+                    queue_uri_delete(uncertain_indices[i]);
+                }
+            }
+        }
+    }
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager) {
+        PREFIX_LOG(ERROR, "rollback add locations failed: data storage manager not found");
+        return;
+    }
+    // 明确未写入元数据的项没有 location 可交给删除流水线，直接释放其已分配 URI。
+    for (const auto &[storage_name, uris] : direct_delete_uris) {
+        const auto delete_results = data_storage_manager->Delete(request_context, storage_name, uris, nullptr);
+        if (delete_results.size() != uris.size()) {
+            PREFIX_LOG(WARN,
+                       "rollback data uri result size mismatch, storage[%s], expect[%lu], actual[%lu]",
+                       storage_name.c_str(),
+                       uris.size(),
+                       delete_results.size());
+        }
+        const size_t result_count = std::min(delete_results.size(), uris.size());
+        for (size_t i = 0; i < result_count; ++i) {
+            if (delete_results[i] != EC_OK && delete_results[i] != EC_NOENT) {
+                PREFIX_LOG(WARN,
+                           "rollback data uri failed, storage[%s], uri[%s], ec[%d]",
+                           storage_name.c_str(),
+                           uris[i].ToUriString().c_str(),
+                           delete_results[i]);
+            }
+        }
+    }
 }
 
 ErrorCode

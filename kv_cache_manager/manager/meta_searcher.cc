@@ -944,16 +944,18 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,
-                                         std::vector<std::string> &out_location_ids) {
+                                         std::vector<AddLocationResult> &out_results) {
+    out_results.assign(keys.size(), AddLocationResult{});
     if (keys.size() != locations.size()) {
+        for (auto &result : out_results) {
+            result.ec = EC_BADARGS;
+        }
         return EC_BADARGS;
     }
-    out_location_ids.clear();
-    out_location_ids.resize(keys.size());
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](
+    auto modifier = [&locations, &out_results, &keys, &loc_sz, batch_create_time](
                         const LocationIdVector &existing_location_ids,
                         ErrorCode get_ec,
                         size_t index,
@@ -996,7 +998,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         }
         loc_sz[index] = std::make_pair(locations[index]->type(), sz);
 
-        out_location_ids[index] = std::move(location_id);
+        out_results[index].location_id = std::move(location_id);
         return {ModifierAction::MA_OK, ErrorCode::EC_OK};
     };
 
@@ -1005,17 +1007,41 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
 
+    ErrorCode aggregate_ec = result.ec;
+    if (result.error_codes.size() != keys.size()) {
+        KVCM_LOG_ERROR(
+            "BatchAddLocation result size mismatch, expect: %lu, actual: %lu", keys.size(), result.error_codes.size());
+        for (auto &add_result : out_results) {
+            add_result.ec = ErrorCode::EC_MISMATCH;
+        }
+        aggregate_ec = ErrorCode::EC_MISMATCH;
+    } else {
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            out_results[i].ec = result.error_codes[i];
+            if (out_results[i].ec == ErrorCode::EC_OK && out_results[i].location_id.empty()) {
+                KVCM_LOG_ERROR("BatchAddLocation returned EC_OK with empty location id, key[%lu](%lu)", i, keys[i]);
+                out_results[i].ec = ErrorCode::EC_MISMATCH;
+                aggregate_ec = ErrorCode::EC_MISMATCH;
+            }
+        }
+    }
+
     // update the usage of each storage type
     for (std::size_t i = 0; i < keys.size(); i++) {
-        if (result.error_codes[i] == ErrorCode::EC_OK) {
+        if (out_results[i].ec == ErrorCode::EC_OK) {
             meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
 
-    if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
+    if (aggregate_ec != ErrorCode::EC_OK) {
+        std::vector<ErrorCode> per_key_ec;
+        per_key_ec.reserve(out_results.size());
+        for (const auto &add_result : out_results) {
+            per_key_ec.push_back(add_result.ec);
+        }
+        LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", per_key_ec, keys);
     }
-    return result.ec;
+    return aggregate_ec;
 }
 
 ErrorCode
@@ -1801,7 +1827,9 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
                                              const KeyVector &keys,
                                              const LocationIdsPerKey &location_ids_per_key,
                                              std::vector<std::vector<ErrorCode>> &out_per_location_ec,
-                                             const std::vector<std::vector<std::string>> &expected_location_values) {
+                                             const std::vector<std::vector<std::string>> &expected_location_values,
+                                             bool adjust_storage_usage,
+                                             bool adjust_reclaimed_key_count) {
     if (keys.size() != location_ids_per_key.size()) {
         return EC_BADARGS;
     }
@@ -1873,20 +1901,23 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    auto result = meta_indexer_->ReadModifyWriteLocation(
+        request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_per_location_ec = std::move(result.per_location_error_codes);
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i >= out_per_location_ec.size()) {
-            continue;
-        }
-        for (size_t k = 0; k < location_ids_per_key[i].size(); ++k) {
-            if (k >= out_per_location_ec[i].size()) {
+    if (adjust_storage_usage) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i >= out_per_location_ec.size()) {
                 continue;
             }
-            if (out_per_location_ec[i][k] == ErrorCode::EC_OK && !location_ids_per_key[i][k].empty()) {
-                meta_indexer_->SubStorageUsageByType(locs_sz[i][k].first, locs_sz[i][k].second);
+            for (size_t k = 0; k < location_ids_per_key[i].size(); ++k) {
+                if (k >= out_per_location_ec[i].size()) {
+                    continue;
+                }
+                if (out_per_location_ec[i][k] == ErrorCode::EC_OK && !location_ids_per_key[i][k].empty()) {
+                    meta_indexer_->SubStorageUsageByType(locs_sz[i][k].first, locs_sz[i][k].second);
+                }
             }
         }
     }

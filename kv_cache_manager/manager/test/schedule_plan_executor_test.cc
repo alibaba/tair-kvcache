@@ -66,6 +66,21 @@ public:
         return {spec};
     }
 };
+
+ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+                                  RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const CacheLocationVector &locations,
+                                  std::vector<std::string> &out_location_ids) {
+    std::vector<MetaSearcher::AddLocationResult> results;
+    const ErrorCode ec = meta_searcher->BatchAddLocation(request_context, keys, locations, results);
+    out_location_ids.clear();
+    out_location_ids.reserve(results.size());
+    for (const auto &result : results) {
+        out_location_ids.push_back(result.location_id);
+    }
+    return ec;
+}
 } // namespace
 class SchedulePlanExecutorTest : public TESTBASE {
 public:
@@ -160,9 +175,10 @@ TEST_F(SchedulePlanExecutorTest, TestSubmit) {
         // 添加location
         std::vector<std::string> location_ids1, location_ids2;
         ASSERT_EQ(ErrorCode::EC_OK,
-                  meta_searcher.BatchAddLocation(request_context.get(), {i * 2}, {location1}, location_ids1));
-        ASSERT_EQ(ErrorCode::EC_OK,
-                  meta_searcher.BatchAddLocation(request_context.get(), {i * 2 + 1}, {location2}, location_ids2));
+                  BatchAddLocationForTest(&meta_searcher, request_context.get(), {i * 2}, {location1}, location_ids1));
+        ASSERT_EQ(
+            ErrorCode::EC_OK,
+            BatchAddLocationForTest(&meta_searcher, request_context.get(), {i * 2 + 1}, {location2}, location_ids2));
 
         // 验证数据已添加
         std::vector<CacheLocationMap> location_maps;
@@ -260,7 +276,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     // 添加location
     std::vector<std::string> location_ids;
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {200}, {new_location}, location_ids));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {200}, {new_location}, location_ids));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -325,11 +341,11 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     // 分别添加location到同一个block_key
     std::vector<std::string> location_ids1, location_ids2, location_ids3;
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {400}, {location1}, location_ids1));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {400}, {location1}, location_ids1));
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {400}, {location2}, location_ids2));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {400}, {location2}, location_ids2));
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {400}, {location3}, location_ids3));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {400}, {location3}, location_ids3));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -396,7 +412,8 @@ TEST_F(SchedulePlanExecutorTest, TestStorageDelete) {
 
     // 添加location
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {300}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {300}, {location}, location_ids));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -449,7 +466,8 @@ TEST_F(SchedulePlanExecutorTest, TestDelayExecution) {
 
     // 添加location
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {500}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {500}, {location}, location_ids));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -521,7 +539,7 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleDelayedTasksExecutionOrder) {
         // 添加location
         std::vector<std::string> location_ids;
         ASSERT_EQ(ErrorCode::EC_OK,
-                  meta_searcher.BatchAddLocation(request_context.get(), {600 + i}, {location}, location_ids));
+                  BatchAddLocationForTest(&meta_searcher, request_context.get(), {600 + i}, {location}, location_ids));
 
         // 验证数据已添加
         std::vector<CacheLocationMap> location_maps;
@@ -609,11 +627,11 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     // 分别添加location到同一个block_key
     std::vector<std::string> location_ids1, location_ids2, location_ids3;
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {700}, {location1}, location_ids1));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {700}, {location1}, location_ids1));
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {700}, {location2}, location_ids2));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {700}, {location2}, location_ids2));
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {700}, {location3}, location_ids3));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {700}, {location3}, location_ids3));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -764,7 +782,7 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
             "tp0", "event_report://external_cache/cache/block701?s_version=11111111111111111111111111111111")});
     std::vector<std::string> location_ids;
     ASSERT_EQ(EC_OK,
-              meta_searcher.BatchAddLocation(request_context.get(), {block_key}, {location}, location_ids));
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
     ASSERT_EQ(1u, location_ids.size());
 
     SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
@@ -789,8 +807,8 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
     std::vector<std::string> control_location_ids;
     ASSERT_EQ(
         EC_OK,
-        meta_searcher.BatchAddLocation(
-            request_context.get(), {control_block_key}, {location}, control_location_ids));
+        BatchAddLocationForTest(
+            &meta_searcher, request_context.get(), {control_block_key}, {location}, control_location_ids));
     ASSERT_EQ(1u, control_location_ids.size());
     CacheLocationDelRequest control_request{
         .instance_id = kTestInstanceName,
@@ -843,7 +861,8 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequestWithDelay) {
 
     // 添加location
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {800}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {800}, {location}, location_ids));
 
     // 验证数据已添加
     std::vector<CacheLocationMap> location_maps;
@@ -904,7 +923,8 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncAdmissionRunsOnWorkerAndReturnsQ
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/async_admission?size=1")});
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {900}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {900}, {location}, location_ids));
     ASSERT_EQ(1, location_ids.size());
     std::vector<CacheLocationMap> initial_location_maps;
     BlockMask empty_mask;
@@ -960,8 +980,9 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncMetaSelectsAllLocationsAndSkipsD
                                                                 "nfs://nfs_01/async_meta_selection_" +
                                                                     std::to_string(location_idx) + "?size=1")});
         std::vector<std::string> added_location_ids;
-        ASSERT_EQ(ErrorCode::EC_OK,
-                  meta_searcher.BatchAddLocation(request_context.get(), {903}, {location}, added_location_ids));
+        ASSERT_EQ(
+            ErrorCode::EC_OK,
+            BatchAddLocationForTest(&meta_searcher, request_context.get(), {903}, {location}, added_location_ids));
         ASSERT_EQ(1, added_location_ids.size());
         location_ids.push_back(added_location_ids.front());
     }
@@ -1058,7 +1079,8 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncDelayStartsAfterSyncAndDoesNotOc
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/async_delay?size=1")});
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {901}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {901}, {location}, location_ids));
 
     Stub stub;
     sync_entered.store(false);
@@ -1177,7 +1199,8 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncSecondEnqueueFailureCompletesFut
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/second_enqueue?size=1")});
     std::vector<std::string> location_ids;
-    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {902}, {location}, location_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {902}, {location}, location_ids));
 
     Stub stub;
     sync_entered.store(false);
