@@ -32,7 +32,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
 | **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。 |
-| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`SchedulePlanExecutor` 等子组件。 |
+| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 管理 `MetaIndexer`，维护 cache key → `CacheLocation` 的索引；元数据后端可插拔；`meta_search_cache` 做查询缓存。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义各类配置对象；`RegistryManager` 持久化实例注册信息；`CoordinationBackend` + `LeaderElector` 提供一主多备的分布式选主。 |
 | **data_storage** | `data_storage/` | 可插拔的 KVCache 数据存储后端。`DataStorageManager` 管理后端集合，`DataStorageBackend` 抽象存储介质，`DataStorageUri` 统一位置描述。 |
@@ -247,7 +247,58 @@ sequenceDiagram
 
 `CacheReclaimer` 依据 Quota 与存储水位选出待逐出的 key，并把 Location 删除作为端到端异步任务提交给 `SchedulePlanExecutor`。Executor worker 完成元数据 Get/CAS/Sync；Sync 成功后通过定时队列等待删除 delay（等待不占 worker），随后删除 `data_storage` 数据并 CAD `meta` 索引。Reclaimer 在任务终态前按 Instance Group 与 BaseStorageType 维护 pending Location、删除 bytes credit 和硬配额，用于去重、避免过度逐出及提供有界反压；回收动作通过 `event` 上报。完整生命周期和异常语义见 [CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)。
 
-### 4.6 HA 故障转移
+### 4.6 分层存储迁移（异步 Prepare 与回收协同）
+
+分层迁移由 `CacheReclaimer` 根据 migration strategy 的 source storage 类型水位触发。Reclaimer cron 线程只完成 LRU 候选采样、同轮回收准入和异步 Job 构造，不在 cron 线程执行可能较慢的 Backend Create、最新 Location 查询或 Copy：
+
+1. 同一轮先执行 Reclaim 准入。删除请求被 Executor 接受后，Reclaimer 会同步把精确的 `(instance_id, block_key, location_id)` 记入 `pending_locations_`。
+2. 再构造 Migration Prepare Job。Job 携带候选 block 以及按 block 组织的 pending Location 快照，并完全持有跨异步边界所需的输入；Executor worker 不直接访问 Reclaimer 的可变状态。
+3. `MigrationManager` worker 重新读取当前 Instance、配置、strategy 和 Location，排除快照中的待删除 Location，再执行 Backend Create 以及统一的 Copy/Mark 准入与分发。配置已删除、Leader generation 已变化或 lifecycle gate 已关闭时，旧 Job 直接失效。
+4. Copy 完成后再次校验精确 source Location 仍为 `SERVING` 且 create time 未变化；若跨轮回收已经删除或替换 source，则不提升目标 Location，并清理本次生成的目标。
+
+上述顺序只保证“同轮先做 Reclaim 准入”，不等待物理删除完成；当水位只达到 migration threshold 而未达到 reclaim threshold 时，迁移仍可独立触发。Admin 发起的迁移保持同步 Prepare 语义，但与 Reclaimer 路径复用 `MigrationManager` 的统一分发、活跃任务表和 Instance Group Copy 并发硬限制。
+
+Reclaim、系统任务和 Migration 共用进程级 `SchedulePlanExecutor`。ready task 按 `Reclaim → System → Migration Continuation → Migration Prepare` 的顺序选择；Prepare、Copy 和迁移 cleanup 共同受 migration worker budget 约束。budget 必须小于线程池总大小，以保证长时间 Backend Create/Copy 不能占满所有 worker，至少有一个 worker 不会被 Migration 占用。任务优先级只影响尚未运行的任务，不能抢占已经执行的任务。参数约束和默认值见[配置指南](../configuration.md#scheduleplanexecutor-线程与迁移预算)。
+
+Migration 的背压分两层：活跃 Copy 数与 queued/running Prepare 数用于 Reclaimer 的跨轮提前剪枝，`MigrationManager::BatchSubmit` 再对 Instance Group Copy 并发做原子硬准入。同一 `generation + instance group + instance + source + target` 最多存在一个 queued/running Prepare，避免 Backend Create 变慢时 cron 重复堆积同一路由。Copy 路径还会在目标 `CLS_WRITING` 对 Reclaimer 可见前写入 active-task reservation，防止孤儿清理误删正在准备或执行的目标。
+
+```mermaid
+flowchart LR
+    subgraph cron["CacheReclaimer cron（单线程状态）"]
+        sample["采样 / LRU 候选"]
+        reclaim["Reclaim 准入"]
+        pending["pending_locations_"]
+        snapshot["按 block 复制 pending 快照"]
+
+        sample --> reclaim
+        reclaim --> pending
+        sample --> snapshot
+        pending --> snapshot
+    end
+
+    subgraph executor["共享 SchedulePlanExecutor"]
+        reclaim_task["kReclaim<br/>Get / CAS / Sync / Delete"]
+        prepare["kMigrationPrepare<br/>fresh 校验 / Backend Create / 分发"]
+        continuation["kMigrationContinuation<br/>Copy / cleanup"]
+    end
+
+    migration["MigrationManager<br/>统一 Copy / Mark 准入与活跃任务表"]
+    monitor["MigrationManager monitor<br/>完成校验 / promote / cleanup"]
+
+    reclaim -->|优先入队| reclaim_task
+    snapshot -->|Async Prepare Job| prepare
+    prepare --> migration
+    migration --> continuation
+    continuation --> monitor
+    migration -->|Mark| meta["MetaIndexer"]
+    migration -->|Create target| storage["DataStorageBackend"]
+    monitor --> meta
+    monitor --> storage
+    reclaim_task --> meta
+    reclaim_task --> storage
+```
+
+### 4.7 HA 故障转移
 
 `LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，降级时调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
 
