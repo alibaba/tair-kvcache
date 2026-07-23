@@ -78,8 +78,9 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/config",
-        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/config:config_types",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/protocol/protobuf:service_message_cc_proto",
         "//kv_cache_manager/service/util:manager_message_proto_util",
     ],
 )

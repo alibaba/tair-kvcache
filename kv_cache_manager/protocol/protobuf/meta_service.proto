@@ -44,17 +44,22 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+    ST_EVENT_REPORT = 8;
 }
 
-// ---- V6D event reporting ----
+// ---- Cache event reporting ----
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
-    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
-    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
-    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
-    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+    EVENT_NODE_REGISTER = 1; // A cache-owning node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // The node stored a new block locally
+    EVENT_BLOCK_DELETE = 3;  // The node deleted a local block
+    EVENT_HOST_DOWN = 4;     // The node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Node liveness heartbeat
+    // Authoritative replacement of every cache block reported by one host.
+    // A subscriber uses this after startup or when its incremental cursor is
+    // no longer recoverable.
+    EVENT_BLOCK_SNAPSHOT = 6;
 }
 
 message NodeRegisterParams {
@@ -81,6 +86,18 @@ message HeartbeatParams {
     map<string, string> system_status = 1;
 }
 
+message BlockSnapshotItem {
+    string block_key = 1;
+    string medium = 2;
+    repeated LocationSpec specs = 3;
+}
+
+message BlockSnapshotParams {
+    // The complete block set for host_ip_port across all reported mediums.
+    // An empty list authoritatively clears the host.
+    repeated BlockSnapshotItem blocks = 1;
+}
+
 message EventItem {
     ReportEventType event_type = 1;
     oneof event_params {
@@ -89,6 +106,7 @@ message EventItem {
         BlockDeleteParams block_delete = 4;
         HostDownParams host_down = 5;
         HeartbeatParams heartbeat = 6;
+        BlockSnapshotParams block_snapshot = 7;
     }
 }
 

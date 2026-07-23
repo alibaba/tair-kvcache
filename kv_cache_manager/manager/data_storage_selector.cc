@@ -52,6 +52,8 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS exceed availability flag
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY availability flag (testing only)
+    // slots 7-8: event-reporting backends are metadata-only and deliberately
+    // remain false so they can never be selected for cache writes.
     array_t_ storage_quota_avail_by_type_;
 };
 

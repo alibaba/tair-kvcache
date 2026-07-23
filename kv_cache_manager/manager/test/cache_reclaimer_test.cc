@@ -2680,9 +2680,8 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     // on absolute scheduler timing, while still requiring the second round to
     // arrive before the original sleep interval would have elapsed again.
     ASSERT_TRUE(WaitUntilSubmittedDelRequests(initial_sleep_interval + std::chrono::milliseconds(1000)));
-    ASSERT_TRUE(WaitUntil(
-        [this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
-        initial_sleep_interval / 2));
+    ASSERT_TRUE(WaitUntil([this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
+                          initial_sleep_interval / 2));
     cache_reclaimer_->Stop(); // join the worker thread
 
     ASSERT_LT(1, ListInstanceGroupCallCount());
@@ -3107,6 +3106,56 @@ TEST_F(CacheReclaimerTest, TestFilterLocationCreditsNormalizeTypeAndPredictKeysC
                                               create_age_stats));
     EXPECT_EQ(2, location_ids.front().size());
     EXPECT_EQ(1, predicted_keys);
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocationNeverReclaimsEventReportedStorage) {
+    const auto instance = InstanceInfoFactory();
+    batch_get_loc_out_maps = {
+        CacheLocationMap{
+            {"event_report",
+             MakeCacheLocation("event_report",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                               "event-report://engine-0/gpu?size=64")},
+        },
+        CacheLocationMap{
+            {"event_report",
+             MakeCacheLocation("event_report",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                               "event-report://engine-0/gpu?size=64")},
+            {"nfs",
+             MakeCacheLocation("nfs",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store?size=32")},
+        },
+    };
+
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {10, 11},
+                                              CacheReclaimer::WaterLevelExceed{},
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+
+    ASSERT_EQ(2, location_ids.size());
+    EXPECT_TRUE(location_ids[0].empty());
+    ASSERT_EQ(1, location_ids[1].size());
+    EXPECT_EQ("nfs", location_ids[1][0]);
+    EXPECT_EQ(32, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(1, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(0, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)]);
+    EXPECT_EQ(0, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)]);
+    EXPECT_EQ(0, predicted_keys);
 }
 
 TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHardQuota) {
@@ -3962,8 +4011,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
         // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
@@ -4018,8 +4067,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -4071,8 +4120,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1

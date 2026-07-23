@@ -1407,7 +1407,9 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 namespace {
 
 std::shared_ptr<DataStorageBackend>
-LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_manager, const std::string &instance_id) {
+LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_manager,
+                            const std::string &instance_id,
+                            DataStorageType requested_type) {
     if (!registry_manager || !registry_manager->data_storage_manager()) {
         return nullptr;
     }
@@ -1420,12 +1422,14 @@ LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_man
         return nullptr;
     }
     auto dsm = registry_manager->data_storage_manager();
-    const auto &candidate_name = ig->event_reporting_storage_candidates().front();
-    auto backend = dsm->GetDataStorageBackend(candidate_name);
-    if (!backend || !dynamic_cast<EventReportingBackend *>(backend.get())) {
-        return nullptr;
+    for (const auto &candidate_name : ig->event_reporting_storage_candidates()) {
+        auto backend = dsm->GetDataStorageBackend(candidate_name);
+        auto *event_backend = dynamic_cast<EventReportingBackend *>(backend.get());
+        if (event_backend && event_backend->GetStorageType() == requested_type) {
+            return backend;
+        }
     }
-    return backend;
+    return nullptr;
 }
 
 bool ParseInt64(const std::string &s, int64_t &out) {
@@ -1462,6 +1466,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         return EC_OK;
     }
 
+    // Snapshot replacement, incremental mutations and asynchronous cleanup
+    // must not interleave for the same engine node. Hash striping keeps the
+    // lock set bounded while allowing unrelated hosts to progress in parallel.
+    std::unique_lock<std::mutex> event_lock(GetEventReportMutex(instance_id, host_ip_port));
+
     DataStorageType requested_type = static_cast<DataStorageType>(request->storage_type());
     if (requested_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: storage_type is required but not specified", trace_id.c_str());
@@ -1469,8 +1478,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         response_status->set_message("storage_type is required");
         return EC_BADARGS;
     }
+    if (!IsEventReportingStorageType(requested_type)) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: storage_type [%d] is not event-reporting storage",
+                      trace_id.c_str(),
+                      static_cast<int>(requested_type));
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("storage_type is not event-reporting storage");
+        return EC_BADARGS;
+    }
 
-    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id, requested_type);
     auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
     if (!event_backend) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportingBackend not found for instance [%s] type [%d]",
@@ -1534,6 +1551,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     };
     std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
     std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
+    std::map<int64_t, std::vector<BlockAddEntry>> snapshot_to_add;
+    int snapshot_event_index = -1;
 
     for (int i = 0; i < events_size; ++i) {
         const auto &item = request->events(i);
@@ -1592,7 +1611,17 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             std::vector<LocationSpec> entry_specs;
             entry_specs.reserve(p.specs_size());
             for (const auto &s : p.specs()) {
+                if (s.name().empty() || s.uri().empty()) {
+                    entry_specs.clear();
+                    break;
+                }
                 entry_specs.emplace_back(s.name(), s.uri());
+            }
+            if (entry_specs.empty()) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: invalid specs for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
             }
             block_to_add[block_key].push_back(BlockAddEntry{std::move(location_id), std::move(entry_specs), i});
             break;
@@ -1622,6 +1651,45 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 BlockDelEntry{event_backend->BuildLocationId(p.medium(), host_ip_port), i});
             break;
         }
+        case proto::meta::EVENT_BLOCK_SNAPSHOT: {
+            if (snapshot_event_index >= 0 || !item.has_block_snapshot()) {
+                per_item_ec[i] = EC_BADARGS;
+                if (snapshot_event_index >= 0) {
+                    per_item_ec[snapshot_event_index] = EC_BADARGS;
+                }
+                break;
+            }
+            snapshot_event_index = i;
+            std::map<int64_t, std::vector<BlockAddEntry>> parsed_snapshot;
+            bool valid_snapshot = true;
+            for (const auto &block : item.block_snapshot().blocks()) {
+                int64_t block_key = 0;
+                if (!ParseInt64(block.block_key(), block_key) || block.medium().empty() || block.specs_size() == 0) {
+                    valid_snapshot = false;
+                    break;
+                }
+                std::vector<LocationSpec> entry_specs;
+                entry_specs.reserve(block.specs_size());
+                for (const auto &spec : block.specs()) {
+                    if (spec.name().empty() || spec.uri().empty()) {
+                        valid_snapshot = false;
+                        break;
+                    }
+                    entry_specs.emplace_back(spec.name(), spec.uri());
+                }
+                if (!valid_snapshot) {
+                    break;
+                }
+                parsed_snapshot[block_key].push_back(BlockAddEntry{
+                    event_backend->BuildLocationId(block.medium(), host_ip_port), std::move(entry_specs), i});
+            }
+            if (!valid_snapshot) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            snapshot_to_add = std::move(parsed_snapshot);
+            break;
+        }
         default:
             KVCM_LOG_WARN("trace_id [%s] | ReportEvent: unknown event_type %d at index %d (ignored)",
                           trace_id.c_str(),
@@ -1630,6 +1698,23 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             per_item_ec[i] = EC_BADARGS;
             break;
         }
+    }
+
+    if (snapshot_event_index >= 0 && (has_host_down || !block_to_add.empty() || !block_to_del.empty())) {
+        KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT cannot be mixed with block mutations or HOST_DOWN",
+                      trace_id.c_str());
+        for (int i = 0; i < events_size; ++i) {
+            const auto event_type = request->events(i).event_type();
+            if (event_type == proto::meta::EVENT_BLOCK_SNAPSHOT || event_type == proto::meta::EVENT_BLOCK_ADD ||
+                event_type == proto::meta::EVENT_BLOCK_DELETE || event_type == proto::meta::EVENT_HOST_DOWN) {
+                per_item_ec[i] = EC_BADARGS;
+            }
+        }
+        // Validation happens before any cache mutation. Do not partially apply
+        // the non-snapshot half of an invalid mixed request.
+        block_to_add.clear();
+        block_to_del.clear();
+        has_host_down = false;
     }
 
     if (has_register) {
@@ -1657,6 +1742,45 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     per_item_ec[i] = hb_ec;
                 }
             }
+        }
+    }
+
+    if ((!block_to_add.empty() || !block_to_del.empty() || snapshot_event_index >= 0) &&
+        !event_backend->IsNodeAvailable(instance_id, host_ip_port)) {
+        KVCM_LOG_WARN("trace_id [%s] | cache mutation from unregistered or unavailable host [%s]",
+                      trace_id.c_str(),
+                      host_ip_port.c_str());
+        for (int i = 0; i < events_size; ++i) {
+            const auto event_type = request->events(i).event_type();
+            if (event_type == proto::meta::EVENT_BLOCK_SNAPSHOT || event_type == proto::meta::EVENT_BLOCK_ADD ||
+                event_type == proto::meta::EVENT_BLOCK_DELETE) {
+                if (per_item_ec[i] != EC_OK) {
+                    continue;
+                }
+                per_item_ec[i] = EC_NODE_NOT_REGISTERED;
+            }
+        }
+        block_to_add.clear();
+        block_to_del.clear();
+    }
+
+    if (snapshot_event_index >= 0 && per_item_ec[snapshot_event_index] == EC_OK) {
+        const uint64_t snapshot_generation = event_backend->GetNodeGeneration(instance_id, host_ip_port);
+        const std::string host_suffix = event_backend->HostSuffix(host_ip_port);
+        auto abort_if_reregistered = [event_backend_holder, instance_id, host_ip_port, snapshot_generation]() -> bool {
+            auto *backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+            return backend && backend->GetNodeGeneration(instance_id, host_ip_port) != snapshot_generation;
+        };
+        auto snapshot_ec = meta_searcher->CleanupLocationsByHost(
+            request_context, host_suffix, requested_type, /*scan_batch_size=*/1000, abort_if_reregistered);
+        if (snapshot_ec != EC_OK) {
+            KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT cleanup failed for host [%s], ec=%d",
+                          trace_id.c_str(),
+                          host_ip_port.c_str(),
+                          snapshot_ec);
+            per_item_ec[snapshot_event_index] = snapshot_ec;
+        } else {
+            block_to_add = std::move(snapshot_to_add);
         }
     }
 
@@ -1795,6 +1919,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 mapped = proto::meta::INVALID_ARGUMENT;
             } else if (ec == EC_INSTANCE_NOT_EXIST) {
                 mapped = proto::meta::INSTANCE_NOT_EXIST;
+            } else if (ec == EC_NODE_NOT_REGISTERED) {
+                mapped = proto::meta::NODE_NOT_REGISTERED;
             } else {
                 mapped = proto::meta::INTERNAL_ERROR;
             }
@@ -1812,7 +1938,8 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
                                         const std::string &host_ip_port,
                                         uint64_t cleanup_generation,
                                         DataStorageType storage_type) {
-    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+    std::unique_lock<std::mutex> event_lock(GetEventReportMutex(instance_id, host_ip_port));
+    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id, storage_type);
     auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
 
     if (event_backend) {
@@ -1824,6 +1951,12 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
                           instance_id.c_str(),
                           cleanup_generation,
                           current_gen);
+            return;
+        }
+        if (event_backend->IsNodeAvailable(instance_id, host_ip_port)) {
+            KVCM_LOG_INFO("CleanupHostLocations: skipping cleanup for recovered host [%s] instance [%s]",
+                          host_ip_port.c_str(),
+                          instance_id.c_str());
             return;
         }
     }
@@ -1857,6 +1990,14 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
                       host_ip_port.c_str(),
                       instance_id.c_str());
     }
+}
+
+std::mutex &CacheManager::GetEventReportMutex(const std::string &instance_id, const std::string &host_ip_port) {
+    const size_t instance_hash = std::hash<std::string>{}(instance_id);
+    const size_t host_hash = std::hash<std::string>{}(host_ip_port);
+    const size_t shard = (instance_hash ^ (host_hash + 0x9e3779b9U + (instance_hash << 6U) + (instance_hash >> 2U))) %
+                         event_report_mutexes_.size();
+    return event_report_mutexes_[shard];
 }
 
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {
@@ -2210,13 +2351,25 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         }
 
         std::string storage_unique_name = storage_uris.front().GetHostName();
-        auto erb_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+        auto erb_holder = LookupEventReportingBackend(registry_manager_, instance_id, loc.type());
         auto *erb = dynamic_cast<EventReportingBackend *>(erb_holder.get());
-        if (erb && loc.type() == erb->GetStorageType()) {
-            auto ig = registry_manager_->GetInstanceGroupConfig(registry_manager_->GetInstanceGroupName(instance_id));
-            if (ig && !ig->event_reporting_storage_candidates().empty()) {
-                storage_unique_name = ig->event_reporting_storage_candidates().front();
+        if (erb && loc.type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+            if (storage_uris.size() != loc.location_specs().size()) {
+                return false;
             }
+            return std::all_of(storage_uris.cbegin(), storage_uris.cend(), [&](const DataStorageUri &uri) {
+                if (uri.GetHostName().empty()) {
+                    return false;
+                }
+                std::string host_ip_port = uri.GetHostName();
+                if (uri.GetPort() > 0) {
+                    host_ip_port += ":" + std::to_string(uri.GetPort());
+                }
+                return erb->IsNodeAvailable(instance_id, host_ip_port);
+            });
+        }
+        if (erb && loc.type() == erb->GetStorageType()) {
+            storage_unique_name = erb_holder->GetStorageConfig().global_unique_name();
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
         return std::all_of(result.cbegin(), result.cend(), [](bool v) { return v; });

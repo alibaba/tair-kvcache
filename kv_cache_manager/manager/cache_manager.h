@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -246,6 +248,7 @@ private:
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
+    std::mutex &GetEventReportMutex(const std::string &instance_id, const std::string &host_ip_port);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -310,6 +313,8 @@ private:
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理
     OnInstanceRemovedFn on_instance_removed_;
+    // 无需清理 - 仅用于串行化同一 instance + host 的快照、增量和清理操作。
+    std::array<std::mutex, 64> event_report_mutexes_;
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};

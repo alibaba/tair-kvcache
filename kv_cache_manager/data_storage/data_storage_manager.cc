@@ -6,6 +6,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/dummy_backend.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
 #include "kv_cache_manager/data_storage/mooncake_backend.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
@@ -175,6 +176,8 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
         return std::make_shared<DummyBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
         return std::make_shared<VineyardBackend>(metrics_registry_);
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT:
+        return std::make_shared<EventReportBackend>(metrics_registry_);
     default:
         return nullptr;
     }

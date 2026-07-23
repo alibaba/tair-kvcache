@@ -15,8 +15,9 @@ namespace kv_cache_manager {
 std::uint64_t StorageUsageData::GetStorageUsage() const noexcept {
     std::uint64_t storage_usage = 0;
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
-        if (i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) ||
-            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+        const auto type = static_cast<DataStorageType>(i);
+        if (type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||
+            type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || IsEventReportingStorageType(type)) {
             continue;
         }
         storage_usage += storage_usage_by_type_.at(i).load();

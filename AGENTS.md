@@ -30,6 +30,7 @@ flowchart TD
     metrics -. metrics_reporter .-> manager
 
     %% 对外分支与 optimizer
+    cache_event_subscriber["cache_event_subscriber"] --> py_connector
     py_connector["py_connector"] --> client["client SDK"]
     client -.-> config
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta

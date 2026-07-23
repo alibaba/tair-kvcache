@@ -25,6 +25,7 @@ public:
                                   const std::string &host_ip_port,
                                   const std::map<std::string, std::string> &system_status) = 0;
     virtual void SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) = 0;
+    virtual bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const = 0;
     virtual uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const = 0;
 
     virtual void SetCleanupCallback(CleanupCallback cb) = 0;

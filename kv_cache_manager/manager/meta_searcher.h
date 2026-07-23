@@ -120,6 +120,8 @@ public:
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,
                                      size_t scan_batch_size = 1000,
+                                     // Returns EC_MISMATCH when this predicate
+                                     // interrupts an incomplete cleanup.
                                      std::function<bool()> should_abort = nullptr);
 
 private:

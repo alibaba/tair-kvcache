@@ -47,7 +47,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
-            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (!IsEventReportingStorageType(loc_ptr->type())) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -185,7 +185,7 @@ CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
         if (loc->status() != CacheLocationStatus::CLS_SERVING)
             continue;
         if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
-            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (!IsEventReportingStorageType(loc->type())) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -415,7 +415,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     for (const auto &selector : selectors) {
         DataStorageType target_type = selector.backend_type;
 
-        if (target_type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD &&
+        if (IsEventReportingStorageType(target_type) &&
             (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
              selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
             // --- V6D cross-key selection ---
@@ -436,7 +436,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD)
+                    if (loc->type() != target_type)
                         continue;
                     std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())
@@ -1200,7 +1200,11 @@ ErrorCode MetaSearcher::CleanupLocationsByHost(RequestContext *request_context,
     do {
         if (should_abort && should_abort()) {
             KVCM_LOG_INFO("CleanupLocationsByHost: aborted by caller (host_suffix=%s)", host_suffix.c_str());
-            return EC_OK;
+            // The caller must not treat an incomplete cleanup as an
+            // authoritative replacement. EC_MISMATCH is retryable by the
+            // cache-event subscriber and also distinguishes this path from a
+            // fully completed no-op cleanup.
+            return EC_MISMATCH;
         }
         std::string next_cursor;
         KeyVector keys;

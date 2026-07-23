@@ -21,14 +21,13 @@ cc_library(
     srcs = ["manager_message_proto_util.cc"],
     hdrs = ["manager_message_proto_util.h"],
     deps = [
-        ":grpc_wrapper",
         "//kv_cache_manager/common",
-        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:config_types",
         "//kv_cache_manager/config:meta_cache_policy_config",
-        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/manager:cache_location_view",
-        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/protocol/protobuf:service_message_cc_proto",
     ],
 )
 

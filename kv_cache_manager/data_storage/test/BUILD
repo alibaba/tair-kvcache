@@ -61,7 +61,7 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/data_storage:common_define",
     ],
 )
 
@@ -78,3 +78,15 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "EventReportBackendTest",
+    srcs = [
+        "event_report_backend_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:event_reporting",
+    ],
+)

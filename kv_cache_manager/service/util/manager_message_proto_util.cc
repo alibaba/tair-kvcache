@@ -65,6 +65,13 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         vineyard->set_heartbeat_timeout_ms(vineyard_storage.heartbeat_timeout_ms());
         vineyard->set_cleanup_grace_ms(vineyard_storage.cleanup_grace_ms());
         vineyard->set_liveness_check_interval_ms(vineyard_storage.liveness_check_interval_ms());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+        const auto &event_storage =
+            *std::dynamic_pointer_cast<EventReportingStorageSpec>(storage_config.storage_spec());
+        auto *event_report = proto_storage_config->mutable_event_report();
+        event_report->set_heartbeat_timeout_ms(event_storage.heartbeat_timeout_ms());
+        event_report->set_cleanup_grace_ms(event_storage.cleanup_grace_ms());
+        event_report->set_liveness_check_interval_ms(event_storage.liveness_check_interval_ms());
     }
 }
 
@@ -147,6 +154,19 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
             spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
         storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+        break;
+    }
+    case proto::admin::StorageConfig::kEventReport: {
+        EventReportingStorageSpec spec;
+        const auto &event_report = proto_storage_config->event_report();
+        if (event_report.heartbeat_timeout_ms() > 0)
+            spec.set_heartbeat_timeout_ms(event_report.heartbeat_timeout_ms());
+        if (event_report.cleanup_grace_ms() > 0)
+            spec.set_cleanup_grace_ms(event_report.cleanup_grace_ms());
+        if (event_report.liveness_check_interval_ms() > 0)
+            spec.set_liveness_check_interval_ms(event_report.liveness_check_interval_ms());
+        storage_config.set_storage_spec(std::make_shared<EventReportingStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
         break;
     }
     default:

@@ -1382,6 +1382,12 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             }
             ++valid_location_count;
             const auto &loc = *loc_ptr;
+            // Event-reported locations are owned and evicted by the inference
+            // engine. They still count as live replicas when deciding whether
+            // deleting the selected KVCM-managed locations removes the key.
+            if (IsEventReportingStorageType(loc.type())) {
+                continue;
+            }
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
@@ -1656,7 +1662,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
 
         for (std::size_t idx = 1; idx < static_cast<std::size_t>(DataStorageType::COUNT); ++idx) {
             const auto type = static_cast<DataStorageType>(idx);
-            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || IsEventReportingStorageType(type)) {
                 continue;
             }
             data->AddGroupUsageByType(type, meta_indexer->GetStorageUsageByType(type));

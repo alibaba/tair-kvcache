@@ -11,6 +11,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
@@ -3252,5 +3253,195 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     }
 
     dsm->storage_map_.erase("vineyard_default");
+}
+
+TEST_F(CacheManagerTest, ReportEventSnapshotAuthoritativelyReplacesHostBlocks) {
+    const std::string instance_id = "snapshot_instance";
+    const std::string host = "192.168.10.1:8080";
+    const std::string other_host = "192.168.10.2:8080";
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_report_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    StorageConfig config;
+    config.set_global_unique_name("event_report_snapshot");
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    config.set_storage_spec(std::make_shared<EventReportingStorageSpec>());
+    ASSERT_EQ(EC_OK, event_report_backend->Open(config, "snapshot_test"));
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["event_report_snapshot"] = event_report_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates(
+        {"event_report_snapshot"});
+
+    auto *snapshot_meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, snapshot_meta_searcher);
+    EXPECT_EQ(EC_MISMATCH,
+              snapshot_meta_searcher->CleanupLocationsByHost(request_context_.get(),
+                                                             event_report_backend->HostSuffix(host),
+                                                             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                                                             1000,
+                                                             [] { return true; }));
+
+    auto add_block = [&](proto::meta::ReportEventRequest &request, int64_t key) {
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block = event->mutable_block_add();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("hbm");
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri("event-report://" + request.host_ip_port() + "/hbm");
+    };
+    auto add_snapshot_block = [&](proto::meta::BlockSnapshotParams *snapshot, int64_t key) {
+        auto *block = snapshot->add_blocks();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("hbm");
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri("event-report://" + host + "/hbm");
+    };
+
+    proto::meta::ReportEventRequest initial;
+    initial.set_instance_id(instance_id);
+    initial.set_host_ip_port(host);
+    initial.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto *register_event = initial.add_events();
+    register_event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    register_event->mutable_node_register()->add_mediums("hbm");
+    add_block(initial, 1);
+    add_block(initial, 2);
+    proto::meta::ReportEventResponse initial_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &initial, &initial_response));
+
+    proto::meta::ReportEventRequest other_host_request;
+    other_host_request.set_instance_id(instance_id);
+    other_host_request.set_host_ip_port(other_host);
+    other_host_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto *other_register = other_host_request.add_events();
+    other_register->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    other_register->mutable_node_register()->add_mediums("hbm");
+    add_block(other_host_request, 4);
+    proto::meta::ReportEventResponse other_host_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &other_host_request, &other_host_response));
+
+    proto::meta::ReportEventRequest mixed_request;
+    mixed_request.set_instance_id(instance_id);
+    mixed_request.set_host_ip_port(host);
+    mixed_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto *mixed_snapshot = mixed_request.add_events();
+    mixed_snapshot->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    add_snapshot_block(mixed_snapshot->mutable_block_snapshot(), 99);
+    add_block(mixed_request, 5);
+    proto::meta::ReportEventResponse mixed_response;
+    EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(request_context_.get(), &mixed_request, &mixed_response));
+
+    BlockMask block_mask = static_cast<size_t>(0);
+    auto [mixed_query_ec, mixed_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, {5, 99}, {}, block_mask, 0, {});
+    ASSERT_EQ(EC_OK, mixed_query_ec);
+    ASSERT_EQ(2, mixed_locations.cache_locations_view().size());
+    expectEmptySpec(mixed_locations.cache_locations_view()[0].location_specs());
+    expectEmptySpec(mixed_locations.cache_locations_view()[1].location_specs());
+
+    proto::meta::ReportEventRequest snapshot_request;
+    snapshot_request.set_instance_id(instance_id);
+    snapshot_request.set_host_ip_port(host);
+    snapshot_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto *snapshot_event = snapshot_request.add_events();
+    snapshot_event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    add_snapshot_block(snapshot_event->mutable_block_snapshot(), 2);
+    add_snapshot_block(snapshot_event->mutable_block_snapshot(), 3);
+    proto::meta::ReportEventResponse snapshot_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &snapshot_request, &snapshot_response));
+
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                  instance_id,
+                                                                  CacheManager::QueryType::QT_BATCH_GET,
+                                                                  {1, 2, 3, 4},
+                                                                  {},
+                                                                  block_mask,
+                                                                  0,
+                                                                  {});
+    ASSERT_EQ(EC_OK, query_ec);
+    ASSERT_EQ(4, locations.cache_locations_view().size());
+    expectEmptySpec(locations.cache_locations_view()[0].location_specs());
+    expectNonEmptySpec(locations.cache_locations_view()[1].location_specs());
+    expectNonEmptySpec(locations.cache_locations_view()[2].location_specs());
+    expectNonEmptySpec(locations.cache_locations_view()[3].location_specs());
+
+    proto::meta::ReportEventRequest empty_snapshot_request;
+    empty_snapshot_request.set_instance_id(instance_id);
+    empty_snapshot_request.set_host_ip_port(host);
+    empty_snapshot_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    auto *empty_snapshot = empty_snapshot_request.add_events();
+    empty_snapshot->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    empty_snapshot->mutable_block_snapshot();
+    proto::meta::ReportEventResponse empty_snapshot_response;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->ReportEvent(request_context_.get(), &empty_snapshot_request, &empty_snapshot_response));
+
+    auto [empty_query_ec, empty_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, {2, 3, 4}, {}, block_mask, 0, {});
+    ASSERT_EQ(EC_OK, empty_query_ec);
+    ASSERT_EQ(3, empty_locations.cache_locations_view().size());
+    expectEmptySpec(empty_locations.cache_locations_view()[0].location_specs());
+    expectEmptySpec(empty_locations.cache_locations_view()[1].location_specs());
+    expectNonEmptySpec(empty_locations.cache_locations_view()[2].location_specs());
+
+    proto::meta::ReportEventRequest registered_add_request;
+    registered_add_request.set_instance_id(instance_id);
+    registered_add_request.set_host_ip_port(host);
+    registered_add_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    add_block(registered_add_request, 6);
+    proto::meta::ReportEventResponse registered_add_response;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->ReportEvent(request_context_.get(), &registered_add_request, &registered_add_response));
+
+    // A timeout cleanup that was queued just before a heartbeat recovery must
+    // not delete the recovered node's current cache state.
+    cache_manager_->CleanupHostLocations(instance_id,
+                                         host,
+                                         event_report_backend->GetNodeGeneration(instance_id, host),
+                                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    auto [recovered_query_ec, recovered_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, {6}, {}, block_mask, 0, {});
+    ASSERT_EQ(EC_OK, recovered_query_ec);
+    ASSERT_EQ(1, recovered_locations.cache_locations_view().size());
+    expectNonEmptySpec(recovered_locations.cache_locations_view()[0].location_specs());
+
+    ASSERT_EQ(EC_OK, event_report_backend->UnregisterNode(instance_id, host));
+    ASSERT_EQ(EC_OK, event_report_backend->RegisterNode("different_instance", host, {"hbm"}));
+
+    auto [cross_instance_query_ec, cross_instance_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, {6}, {}, block_mask, 0, {});
+    ASSERT_EQ(EC_OK, cross_instance_query_ec);
+    ASSERT_EQ(1, cross_instance_locations.cache_locations_view().size());
+    expectEmptySpec(cross_instance_locations.cache_locations_view()[0].location_specs());
+
+    proto::meta::ReportEventRequest unregistered_request;
+    unregistered_request.set_instance_id(instance_id);
+    unregistered_request.set_host_ip_port(host);
+    unregistered_request.set_storage_type(proto::meta::ST_EVENT_REPORT);
+    add_block(unregistered_request, 7);
+    proto::meta::ReportEventResponse unregistered_response;
+    EXPECT_EQ(EC_PARTIAL_OK,
+              cache_manager_->ReportEvent(request_context_.get(), &unregistered_request, &unregistered_response));
+
+    auto [unregistered_query_ec, unregistered_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, {7}, {}, block_mask, 0, {});
+    ASSERT_EQ(EC_OK, unregistered_query_ec);
+    ASSERT_EQ(1, unregistered_locations.cache_locations_view().size());
+    expectEmptySpec(unregistered_locations.cache_locations_view()[0].location_specs());
+
+    ASSERT_EQ(EC_OK, event_report_backend->UnregisterNode("different_instance", host));
+    event_report_backend->Close();
+    dsm->storage_map_.erase("event_report_snapshot");
 }
 } // namespace kv_cache_manager

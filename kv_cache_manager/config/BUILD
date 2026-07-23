@@ -52,18 +52,16 @@ cc_library(
 )
 
 cc_library(
-    name = "config",
+    name = "config_types",
     srcs = [
         "cache_config.cc",
         "cache_reclaim_strategy.cc",
         "data_storage_strategy.cc",
         "instance_group.cc",
         "instance_group_quota.cc",
-        "meta_cache_policy_config.cc",
         "meta_indexer_config.cc",
         "meta_storage_backend_config.cc",
         "quota_config.cc",
-        "registry_manager.cc",
         "trigger_strategy.cc",
     ],
     hdrs = [
@@ -73,21 +71,32 @@ cc_library(
         "data_storage_strategy.h",
         "instance_group.h",
         "instance_group_quota.h",
-        "meta_cache_policy_config.h",
         "meta_indexer_config.h",
         "meta_storage_backend_config.h",
         "quota_config.h",
-        "registry_manager.h",
         "trigger_strategy.h",
     ],
     deps = [
+        ":instance_info",
+        ":meta_cache_policy_config",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+cc_library(
+    name = "config",
+    srcs = ["registry_manager.cc"],
+    hdrs = ["registry_manager.h"],
+    deps = [
+        ":config_types",
         ":instance_info",
         ":registry_backend",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:concurrent_hash_map",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage",
-        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/protocol/protobuf:service_message_cc_proto",
     ],
 )
 
