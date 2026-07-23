@@ -194,6 +194,12 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
         return {};
     }
     auto storage_backend = iter->second;
+    // DisableStorage and this check are serialized by rw_lock_. Keep the lock through Create so a
+    // target cannot become disabled between admission and backend allocation.
+    if (storage_backend == nullptr || !storage_backend->Available()) {
+        KVCM_LOG_WARN("Storage name: %s is unavailable, reject create", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+    }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
     std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =

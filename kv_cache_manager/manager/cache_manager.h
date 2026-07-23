@@ -333,7 +333,7 @@ private:
     // 需要清理
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
-    std::unique_ptr<DataStorageSelector> data_storage_selector_;
+    std::shared_ptr<DataStorageSelector> data_storage_selector_;
     // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责

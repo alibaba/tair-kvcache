@@ -20,6 +20,7 @@
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/migration_event.h"
+#include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
@@ -123,13 +124,15 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
                                    std::shared_ptr<DataStorageManager> data_storage_manager,
                                    std::shared_ptr<MetricsRegistry> metrics_registry,
                                    std::shared_ptr<EventManager> event_manager,
-                                   std::shared_ptr<RegistryManager> registry_manager)
+                                   std::shared_ptr<RegistryManager> registry_manager,
+                                   std::shared_ptr<DataStorageSelector> data_storage_selector)
     : schedule_plan_executor_(std::move(schedule_plan_executor))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , data_storage_manager_(std::move(data_storage_manager))
     , metrics_registry_(std::move(metrics_registry))
     , event_manager_(std::move(event_manager))
-    , registry_manager_(std::move(registry_manager)) {
+    , registry_manager_(std::move(registry_manager))
+    , data_storage_selector_(std::move(data_storage_selector)) {
     if (metrics_registry_ != nullptr) {
         metrics_enabled_ = true;
         m_tasks_submitted_total_ = metrics_registry_->GetCounter("migration.tasks_submitted_total");
@@ -165,6 +168,51 @@ void MigrationManager::UpdateMarksActiveGauge() {
 }
 
 MigrationManager::~MigrationManager() { Stop(); }
+
+ErrorCode MigrationManager::CheckTargetStorageAdmission(const std::string &trace_id,
+                                                        const std::string &instance_group_name,
+                                                        const std::string &instance_id,
+                                                        const std::string &target_storage_name) const {
+    if (data_storage_manager_ == nullptr || target_storage_name.empty()) {
+        return EC_BADARGS;
+    }
+    std::string group_name = instance_group_name;
+    if (group_name.empty() && registry_manager_ != nullptr) {
+        auto request_context = std::make_shared<RequestContext>(
+            trace_id.empty() ? "migration_target_admission" : trace_id);
+        const auto instance_info = registry_manager_->GetInstanceInfo(request_context.get(), instance_id);
+        if (instance_info == nullptr) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        group_name = instance_info->instance_group_name();
+    }
+    if (data_storage_selector_ != nullptr && !group_name.empty()) {
+        auto request_context = std::make_shared<RequestContext>(
+            trace_id.empty() ? "migration_target_admission" : trace_id);
+        const auto admissions =
+            data_storage_selector_->CheckExplicitWriteTargets(request_context.get(), group_name, {target_storage_name});
+        if (admissions.size() != 1 || !admissions[0].Allowed()) {
+            const auto ec = admissions.size() == 1 ? admissions[0].ec : EC_ERROR;
+            KVCM_LOG_WARN("[%s] reject migration target storage %s for instance %s, admission status %d, ec %d",
+                          trace_id.c_str(),
+                          target_storage_name.c_str(),
+                          instance_id.c_str(),
+                          admissions.size() == 1 ? static_cast<int>(admissions[0].status)
+                                                 : static_cast<int>(StorageTargetAdmissionStatus::kReadError),
+                          ec);
+            return ec;
+        }
+        return EC_OK;
+    }
+
+    // Test-only/legacy construction may not provide RegistryManager. Availability is still a
+    // mandatory target invariant; quota evaluation requires the instance-group context.
+    const auto backend = data_storage_manager_->GetDataStorageBackend(target_storage_name);
+    if (backend == nullptr || !backend->Available()) {
+        return EC_NOENT;
+    }
+    return EC_OK;
+}
 
 void MigrationManager::Start() {
     std::unique_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
@@ -394,6 +442,18 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         return reject_not_accepting();
     }
     std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
+    if (request.instance_id.empty() || request.src_location_id.empty() || request.src_storage_name.empty() ||
+        request.dst_storage_name.empty()) {
+        return EC_BADARGS;
+    }
+    if (GetIndexer(request.instance_id) == nullptr) {
+        return EC_INSTANCE_NOT_EXIST;
+    }
+    if (const auto target_ec = CheckTargetStorageAdmission(
+            trace_id, request.instance_group_name, request.instance_id, request.dst_storage_name);
+        target_ec != EC_OK) {
+        return target_ec;
+    }
     {
         std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
         // shared lock 可能排在一次 Stop 后才拿到，必须在真正准入点复查。
@@ -599,6 +659,14 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
             return collect_results();
         }
+    }
+    if (const auto target_ec = CheckTargetStorageAdmission(
+            trace_id, first_req.instance_group_name, first_req.instance_id, first_req.dst_storage_name);
+        target_ec != EC_OK) {
+        for (auto &item : items) {
+            item.MarkFailed(target_ec);
+        }
+        return collect_results();
     }
 
     // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + draining gate + preparing reservation ----
@@ -1219,14 +1287,16 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     if (dst_storage_name.empty() || block_keys.empty()) {
         return EC_OK;
     }
-    // 目标 storage 必须是已注册的 storage。否则打标会产生"永不被满足"的 mark：
-    // 下次写入因目标不存在静默回落热层，且清标条件（目标覆盖 spec）永远不成立，mark 只能等超时。
-    // 在此统一拦截，覆盖 admin 与 reclaimer 两条打标路径。
-    if (data_storage_manager_ == nullptr || data_storage_manager_->GetDataStorageBackend(dst_storage_name) == nullptr) {
-        KVCM_LOG_WARN("MarkForTieredWrite: target storage [%s] not registered, skip marking (instance %s)",
+    // 新 Mark 只写入当前可分配的 target；已存在 Mark 遇到 quota 满或 unavailable 时由消费
+    // 路径暂时忽略并保留，待容量/可用性恢复后自愈。
+    const auto target_ec =
+        CheckTargetStorageAdmission("mark_for_tiered_write", "", instance_id, dst_storage_name);
+    if (target_ec != EC_OK) {
+        KVCM_LOG_WARN("MarkForTieredWrite: target storage [%s] is not writable, skip marking (instance %s, ec %d)",
                       dst_storage_name.c_str(),
-                      instance_id.c_str());
-        return EC_NOENT;
+                      instance_id.c_str(),
+                      target_ec);
+        return target_ec;
     }
     if (timeout_ms <= 0) {
         timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
@@ -2320,8 +2390,10 @@ MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatchWi
         }
     }
     if (params.do_mark && !mark_keys.empty()) {
-        MarkForTieredWrite(instance_id, mark_keys, dst_name, params.mark_timeout_ms);
-        result.mark_submitted = static_cast<int64_t>(mark_keys.size());
+        const auto mark_ec = MarkForTieredWrite(instance_id, mark_keys, dst_name, params.mark_timeout_ms);
+        if (mark_ec == EC_OK) {
+            result.mark_submitted = static_cast<int64_t>(mark_keys.size());
+        }
     }
     return result;
 }

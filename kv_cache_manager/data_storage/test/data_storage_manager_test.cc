@@ -44,6 +44,9 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(EC_OK, data_storage_manager.DisableStorage("storage1"));
     EXPECT_FALSE(data_storage_backend->Available());
     ASSERT_EQ(EC_NOENT, data_storage_manager.DisableStorage("storage2"));
+    auto disabled_create = data_storage_manager.Create(&request_context, "storage1", {"disabled_key"}, 128, []() {});
+    ASSERT_EQ(1u, disabled_create.size());
+    EXPECT_EQ(EC_NOENT, disabled_create[0].first);
 
     // enable storage
     ASSERT_EQ(EC_OK, data_storage_manager.EnableStorage("storage1"));

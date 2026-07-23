@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -243,38 +244,90 @@ bool IsTieredMigrationEnabled(RequestContext *request_context,
            !instance_group->cache_config()->migration_strategies().empty();
 }
 
-// 只把仍存在 backend 的 valid Mark 交给写入过滤逻辑。
-// backend 已被注销时，按查询快照精确清标并让调用方保留普通 write 判定；并发刷新出的新 Mark
-// 会因 target/deadline 不匹配而保留。
-void ResolveUsableTieredWriteTargets(const std::string &trace_id,
+const char *StorageTargetAdmissionStatusName(StorageTargetAdmissionStatus status) {
+    switch (status) {
+    case StorageTargetAdmissionStatus::kAllowed:
+        return "allowed";
+    case StorageTargetAdmissionStatus::kNotFound:
+        return "not_found";
+    case StorageTargetAdmissionStatus::kUnavailable:
+        return "unavailable";
+    case StorageTargetAdmissionStatus::kGroupQuotaExceeded:
+        return "group_quota_exceeded";
+    case StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded:
+        return "storage_type_quota_exceeded";
+    case StorageTargetAdmissionStatus::kReadError:
+        return "read_error";
+    }
+    return "unknown";
+}
+
+// 只把 target 可用且 quota 未超限的 valid Mark 交给写入过滤逻辑。target 被注销时按查询
+// 快照精确清标；unavailable/quota 满属于瞬时状态，保留 Mark 并让本次调用使用普通 write 判定。
+void ResolveUsableTieredWriteTargets(RequestContext *request_context,
                                      const std::string &instance_id,
+                                     const std::string &instance_group_name,
                                      const CacheManager::KeyVector &keys,
                                      const std::vector<MigrationManager::MarkQueryResult> &mark_results,
                                      const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                     const std::shared_ptr<DataStorageSelector> &data_storage_selector,
                                      const std::shared_ptr<MigrationManager> &migration_manager,
                                      std::vector<std::string> &out_targets) {
     const size_t result_count = std::min({keys.size(), mark_results.size(), out_targets.size()});
+    std::vector<std::string> unique_targets;
+    std::unordered_map<std::string, std::size_t> target_indexes;
+    for (size_t i = 0; i < result_count; ++i) {
+        const auto &mark = mark_results[i];
+        if (mark.HasValidMark() && target_indexes.emplace(mark.target, unique_targets.size()).second) {
+            unique_targets.push_back(mark.target);
+        }
+    }
+
+    std::vector<StorageTargetAdmissionResult> admissions;
+    if (data_storage_selector != nullptr) {
+        admissions = data_storage_selector->CheckExplicitWriteTargets(
+            request_context, instance_group_name, unique_targets);
+    }
     for (size_t i = 0; i < result_count; ++i) {
         const auto &mark = mark_results[i];
         if (!mark.HasValidMark()) {
             continue;
         }
-        if (data_storage_manager != nullptr && data_storage_manager->GetDataStorageBackend(mark.target) != nullptr) {
+        StorageTargetAdmissionResult admission;
+        if (const auto it = target_indexes.find(mark.target);
+            it != target_indexes.end() && it->second < admissions.size()) {
+            admission = admissions[it->second];
+        } else if (data_storage_manager != nullptr) {
+            const auto backend = data_storage_manager->GetDataStorageBackend(mark.target);
+            if (backend == nullptr) {
+                admission.status = StorageTargetAdmissionStatus::kNotFound;
+                admission.ec = EC_NOENT;
+            } else if (!backend->Available()) {
+                admission.status = StorageTargetAdmissionStatus::kUnavailable;
+                admission.ec = EC_NOENT;
+            } else {
+                admission.status = StorageTargetAdmissionStatus::kAllowed;
+                admission.ec = EC_OK;
+                admission.type = backend->GetType();
+            }
+        }
+        if (admission.Allowed()) {
             out_targets[i] = mark.target;
             continue;
         }
 
         bool cleared = false;
-        if (migration_manager != nullptr) {
+        if (admission.status == StorageTargetAdmissionStatus::kNotFound && migration_manager != nullptr) {
             cleared =
                 migration_manager->ClearTieredWriteMarkIfMatch(instance_id, keys[i], mark.target, mark.deadline_ms);
         }
-        KVCM_LOG_WARN("trace_id [%s] instance [%s] block [%ld] tiered target storage [%s] not found; "
+        KVCM_LOG_WARN("trace_id [%s] instance [%s] block [%ld] tiered target storage [%s] rejected: %s; "
                       "conditional mark clear [%s], use ordinary write policy",
-                      trace_id.c_str(),
+                      request_context->trace_id().c_str(),
                       instance_id.c_str(),
                       keys[i],
                       mark.target.c_str(),
+                      StorageTargetAdmissionStatusName(admission.status),
                       cleared ? "succeeded" : "skipped");
     }
 }
@@ -287,7 +340,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
     , write_location_manager_(std::make_shared<WriteLocationManager>())
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
-    , data_storage_selector_(std::make_unique<DataStorageSelector>(meta_indexer_manager_, registry_manager))
+    , data_storage_selector_(std::make_shared<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
     , metrics_lifecycle_(metrics_lifecycle ? std::move(metrics_lifecycle) : std::make_shared<MetricsLifecycle>())
@@ -340,7 +393,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                             registry_manager_->data_storage_manager(),
                                                             metrics_registry_,
                                                             event_manager_,
-                                                            registry_manager_);
+                                                            registry_manager_,
+                                                            data_storage_selector_);
     // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
     // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
     assert(migration_manager_ != nullptr);
@@ -1405,11 +1459,13 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                        "tiered mark query partially failed, ec %d; failed keys use ordinary write policy",
                        mark_query_ec);
         }
-        ResolveUsableTieredWriteTargets(trace_id,
+        ResolveUsableTieredWriteTargets(request_context,
                                         instance_id,
+                                        instance_info->instance_group_name(),
                                         keys,
                                         mark_results,
                                         registry_manager_->data_storage_manager(),
+                                        data_storage_selector_,
                                         migration_manager_,
                                         tiered_target_per_key);
     }
@@ -1545,11 +1601,13 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                        "tiered mark query partially failed, ec %d; failed keys use ordinary min-replica policy",
                        mark_query_ec);
         }
-        ResolveUsableTieredWriteTargets(trace_id,
+        ResolveUsableTieredWriteTargets(request_context,
                                         instance_id,
+                                        instance_info->instance_group_name(),
                                         keys,
                                         mark_results,
                                         registry_manager_->data_storage_manager(),
+                                        data_storage_selector_,
                                         migration_manager_,
                                         tiered_target_per_key);
     }

@@ -28,6 +28,7 @@ namespace kv_cache_manager {
 
 class MetaIndexerManager;
 class DataStorageManager;
+class DataStorageSelector;
 class EventManager;
 class RegistryManager;
 class RequestContext;
@@ -96,7 +97,8 @@ public:
                      std::shared_ptr<DataStorageManager> data_storage_manager,
                      std::shared_ptr<MetricsRegistry> metrics_registry = nullptr,
                      std::shared_ptr<EventManager> event_manager = nullptr,
-                     std::shared_ptr<RegistryManager> registry_manager = nullptr);
+                     std::shared_ptr<RegistryManager> registry_manager = nullptr,
+                     std::shared_ptr<DataStorageSelector> data_storage_selector = nullptr);
     ~MigrationManager();
 
     MigrationManager(const MigrationManager &) = delete;
@@ -450,6 +452,10 @@ private:
                                                                     const std::vector<int64_t> &batch,
                                                                     const std::vector<CacheLocationMap> &loc_maps,
                                                                     const DispatchBatchParams &params);
+    ErrorCode CheckTargetStorageAdmission(const std::string &trace_id,
+                                          const std::string &instance_group_name,
+                                          const std::string &instance_id,
+                                          const std::string &target_storage_name) const;
 
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
@@ -457,6 +463,7 @@ private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<EventManager> event_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
+    std::shared_ptr<DataStorageSelector> data_storage_selector_;
     bool metrics_enabled_ = false;
 
     // 活跃 Copy 任务表。

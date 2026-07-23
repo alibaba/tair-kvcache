@@ -126,6 +126,7 @@ cc_library(
     srcs = ["migration_manager.cc"],
     hdrs = ["migration_manager.h"],
     deps = [
+        ":data_storage_selector",
         ":meta_searcher",
         ":schedule_plan_executor",
         "//kv_cache_manager/common",

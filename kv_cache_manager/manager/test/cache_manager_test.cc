@@ -117,7 +117,7 @@ public:
     }
 
     DataStorageType GetType() override { return delegate_->GetType(); }
-    bool Available() override { return delegate_->Available(); }
+    bool Available() override { return IsAvailable() && delegate_->Available(); }
     double GetStorageUsageRatio(const std::string &t) const override { return delegate_->GetStorageUsageRatio(t); }
     const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
     ErrorCode DoOpen(const StorageConfig &c, const std::string &t) override { return delegate_->DoOpen(c, t); }
@@ -3595,6 +3595,87 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheInvalidTieredTargetUsesOrdinaryPoli
     ASSERT_TRUE(new_keys.empty());
     ASSERT_TRUE(new_targets.empty());
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("invalid_tiered_target", 1));
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheUnavailableTieredTargetUsesOrdinaryPolicyAndKeepsMark) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "unavailable_tiered_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("unavailable_tiered_target");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/unavailable_target?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->MarkForTieredWrite(
+                  "unavailable_tiered_target", {1}, "cold_01"));
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "cold_01"));
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "unavailable_tiered_target",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets));
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("unavailable_tiered_target", 1));
+}
+
+TEST_F(CacheManagerTest, TestMigrationTargetsRespectGroupQuota) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->StartMigrationManager();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "migration_target_quota",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto default_group = registry_manager_->instance_group_configs_["default"];
+    ASSERT_NE(nullptr, default_group);
+    default_group->set_quota(InstanceGroupQuota(0, {}));
+
+    EXPECT_EQ(EC_NOSPC,
+              cache_manager_->migration_manager()->MarkForTieredWrite(
+                  "migration_target_quota", {1}, "cold_01"));
+    EXPECT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("migration_target_quota", 1));
+
+    MigrationManager::MigrationRequest request;
+    request.instance_group_name = "default";
+    request.instance_id = "migration_target_quota";
+    request.block_key = 1;
+    request.src_location_id = "source_location";
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.src_specs = {LocationSpec("tp0", "dummy://hot_01/source?size=1")};
+    const auto results = cache_manager_->migration_manager()->BatchSubmit("target-quota", {request});
+    ASSERT_EQ(1u, results.size());
+    EXPECT_EQ(EC_NOSPC, results[0]);
+    EXPECT_EQ(0u, cache_manager_->migration_manager()->GetStats().active_copy_tasks);
 }
 
 TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadError) {
