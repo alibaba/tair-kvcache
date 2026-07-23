@@ -5,6 +5,7 @@ cc_library(
     srcs = [],
     hdrs = [
         "cache_reclaim_event.h",
+        "migration_event.h",
         "optimizer_event.h",
     ],
     deps = [

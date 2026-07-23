@@ -26,6 +26,10 @@ DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
 
+constexpr uint16_t kTairMemPoolMediaTypeUnspecified = 0;
+constexpr uint16_t kTairMemPoolMediaTypeDram = 2;
+constexpr uint16_t kTairMemPoolMediaTypeSsd = 5;
+
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)
 // useful in scenarios like storage usage calculating where subtype
@@ -151,17 +155,20 @@ public:
     const std::string &domain() const { return domain_; }
     int64_t timeout() const { return timeout_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
+    uint16_t media_type() const { return media_type_; }
 
     void set_domain(const std::string &domain) { domain_ = domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
     void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
+    void set_media_type(uint16_t media_type) { media_type_ = media_type; }
 
 private:
     std::string domain_;                // 统一接入
     int64_t timeout_{0};                // 目前连接超时、请求超时时间的值一样
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
+    uint16_t media_type_{kTairMemPoolMediaTypeUnspecified};
 };
 
 class NfsStorageSpec : public StorageSpec {

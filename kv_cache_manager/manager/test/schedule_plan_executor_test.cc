@@ -1,5 +1,10 @@
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -8,6 +13,7 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -104,6 +110,24 @@ public:
         nfs_storage_config.set_storage_spec(nfs_storage_spec);
         auto request_context = std::make_shared<RequestContext>("test_trace_id");
         return data_storage_manager_->RegisterStorage(request_context.get(), "nfs_01", nfs_storage_config);
+    }
+    // 注册一个 Dummy storage（基于文件系统），供 copy 任务做真实文件复制
+    bool CreateDummyStorage(const std::string &name, const std::string &root) {
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path(root);
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto request_context = std::make_shared<RequestContext>("test_trace_id");
+        return data_storage_manager_->RegisterStorage(request_context.get(), name, config) == ErrorCode::EC_OK;
+    }
+    static DataStorageUri MakeUri(const std::string &path) {
+        DataStorageUri uri;
+        uri.SetProtocol("dummy");
+        uri.SetPath(path);
+        return uri;
     }
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
@@ -1082,4 +1106,347 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncRejectedHasNoFuture) {
     const auto meta_submit_result = executor.SubmitAsync(CacheMetaDelRequest{});
     EXPECT_FALSE(meta_submit_result.accepted);
     EXPECT_FALSE(meta_submit_result.future.valid());
+}
+
+// ===== CacheLocationCopyRequest（多层存储迁移 copy 任务）=====
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSuccess) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_01", root));
+    SchedulePlanExecutor executor(2, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    // 准备源文件（含内容），目标父目录尚不存在
+    std::string src = root + "src_block";
+    std::string dst = root + "cold/dst_block";
+    {
+        std::ofstream ofs(src);
+        ofs << "kvcache-bytes";
+    }
+    ASSERT_TRUE(std::filesystem::exists(src));
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1001,
+        .exec_storage_name = "dummy_01",
+        .src_uris = {MakeUri(src)},
+        .dst_uris = {MakeUri(dst)},
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_OK, result.status) << result.error_message;
+    ASSERT_TRUE(std::filesystem::exists(dst));
+    ASSERT_EQ(std::filesystem::file_size(src), std::filesystem::file_size(dst));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSourceMissing) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_miss/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_02", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1002,
+        .exec_storage_name = "dummy_02",
+        .src_uris = {MakeUri(root + "no_such_src")},
+        .dst_uris = {MakeUri(root + "dst")},
+    };
+    auto result = executor.Submit(req).get();
+    // 源端缺失 -> 部分失败（新 PlanExecuteResult 仅 status）
+    ASSERT_EQ(ErrorCode::EC_PARTIAL_OK, result.status);
+    ASSERT_FALSE(std::filesystem::exists(root + "dst"));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSizeMismatch) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_mismatch/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_03", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1003,
+        .exec_storage_name = "dummy_03",
+        .src_uris = {MakeUri(root + "a"), MakeUri(root + "b")},
+        .dst_uris = {MakeUri(root + "a_dst")}, // 数量不匹配
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_BADARGS, result.status);
+}
+
+// Copy 后端返回短 vector（违反 postcondition）时，DoCopyTask 应整体判为失败，
+// 防止 MigrationManager promote 不完整目标 location。
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskShortResultVector) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_short/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_short", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    // 注入一个 Copy 返回短 vector 的 mock 后端（覆盖真实 dummy backend）。
+    class ShortCopyBackend : public DataStorageBackend {
+    public:
+        ShortCopyBackend() : DataStorageBackend(nullptr) { SetOpen(true); SetAvailable(true); }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return true; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override { return {}; }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &, const std::string &, std::function<void()>) override { return {}; }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &u) override { return std::vector<bool>(u.size(), true); }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
+        std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src,
+                                    const std::vector<DataStorageUri> &,
+                                    const std::string &) override {
+            // 故意只返回 1 个结果（输入可能 2 或更多）——违反 postcondition
+            return {ErrorCode::EC_OK};
+        }
+        StorageConfig config_;
+    };
+    data_storage_manager_->storage_map_["dummy_short"] = std::make_shared<ShortCopyBackend>();
+
+    std::string src1 = root + "src1", src2 = root + "src2";
+    std::string dst1 = root + "dst1", dst2 = root + "dst2";
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1005,
+        .exec_storage_name = "dummy_short",
+        .src_uris = {MakeUri(src1), MakeUri(src2)},
+        .dst_uris = {MakeUri(dst1), MakeUri(dst2)},
+    };
+    auto result = executor.Submit(req).get();
+    // 短 vector → 整体失败，不应是 EC_OK
+    ASSERT_NE(ErrorCode::EC_OK, result.status);
+    ASSERT_FALSE(result.error_message.empty());
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskStopped) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_stop/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_04", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    executor.Stop();
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1004,
+        .exec_storage_name = "dummy_04",
+        .src_uris = {MakeUri(root + "x")},
+        .dst_uris = {MakeUri(root + "y")},
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_ERROR, result.status);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestQueuedCopyTaskCompletesOnStop) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1006,
+        .exec_storage_name = "unused_storage",
+        .src_uris = {MakeUri("unused_src")},
+        .dst_uris = {MakeUri("unused_dst")},
+        .delay = std::chrono::hours(1),
+    };
+
+    auto future = executor.Submit(req);
+    ASSERT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(10)));
+    executor.Stop();
+
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    const auto result = future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("before copy task execution"));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetLeavesWorkerForReclaim) {
+    SchedulePlanExecutor executor(4, meta_manager_, data_storage_manager_, metrics_registry_, 2);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release_migrations = false;
+    int running_migrations = 0;
+    int completed_migrations = 0;
+    int max_running_migrations = 0;
+
+    bool all_migrations_accepted = true;
+    for (int i = 0; i < 4; ++i) {
+        all_migrations_accepted &= executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++running_migrations;
+            max_running_migrations = std::max(max_running_migrations, running_migrations);
+            cv.notify_all();
+            cv.wait(lock, [&]() { return release_migrations; });
+            --running_migrations;
+            ++completed_migrations;
+            cv.notify_all();
+        });
+    }
+
+    bool budget_filled = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        budget_filled = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return running_migrations == 2; });
+    }
+
+    std::promise<void> reclaim_ran;
+    auto reclaim_future = reclaim_ran.get_future();
+    const bool reclaim_accepted = executor.SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
+    const bool reclaim_completed = reclaim_accepted &&
+                                   reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_migrations = true;
+    }
+    cv.notify_all();
+    bool all_migrations_completed = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        all_migrations_completed =
+            cv.wait_for(lock, std::chrono::seconds(3), [&]() { return completed_migrations == 4; });
+    }
+
+    EXPECT_TRUE(budget_filled);
+    EXPECT_TRUE(all_migrations_accepted);
+    EXPECT_TRUE(reclaim_accepted);
+    EXPECT_TRUE(reclaim_completed);
+    EXPECT_TRUE(all_migrations_completed);
+    EXPECT_EQ(2, max_running_migrations);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetClampAppliesAcrossPrepareAndContinuation) {
+    auto run_case = [&](unsigned int requested_budget, int expected_running) {
+        auto executor = std::make_unique<SchedulePlanExecutor>(
+            2, meta_manager_, data_storage_manager_, metrics_registry_, requested_budget);
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool release_migrations = false;
+        int running_migrations = 0;
+        int completed_migrations = 0;
+        int max_running_migrations = 0;
+        auto migration_task = [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++running_migrations;
+            max_running_migrations = std::max(max_running_migrations, running_migrations);
+            cv.notify_all();
+            cv.wait(lock, [&]() { return release_migrations; });
+            --running_migrations;
+            ++completed_migrations;
+            cv.notify_all();
+        };
+
+        const bool prepare_accepted =
+            executor->SubmitTask(ScheduleTaskClass::kMigrationPrepare, migration_task);
+        const bool continuation_accepted =
+            executor->SubmitTask(ScheduleTaskClass::kMigrationContinuation, migration_task);
+
+        bool expected_concurrency_reached = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            expected_concurrency_reached = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
+                return running_migrations == expected_running;
+            });
+        }
+
+        // With a clamped budget of one, the second worker must remain available for reclaim
+        // even though one Prepare and one Continuation are both ready.
+        bool reclaim_completed = true;
+        if (expected_running == 1) {
+            std::promise<void> reclaim_ran;
+            auto reclaim_future = reclaim_ran.get_future();
+            const bool reclaim_accepted =
+                executor->SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
+            reclaim_completed = reclaim_accepted &&
+                                reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            release_migrations = true;
+        }
+        cv.notify_all();
+        bool all_completed = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            all_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
+                return completed_migrations == 2;
+            });
+        }
+
+        EXPECT_TRUE(prepare_accepted);
+        EXPECT_TRUE(continuation_accepted);
+        EXPECT_TRUE(expected_concurrency_reached);
+        EXPECT_TRUE(reclaim_completed);
+        EXPECT_TRUE(all_completed);
+        EXPECT_EQ(expected_running, max_running_migrations);
+    };
+
+    run_case(/*requested_budget*/ 0, /*expected_running*/ 1);
+    run_case(/*requested_budget*/ 99, /*expected_running*/ 2);
+    run_case(std::numeric_limits<unsigned int>::max(), /*expected_running*/ 2);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationContinuationPrecedesNewPrepare) {
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_, 1);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool system_started = false;
+    bool release_system = false;
+    std::vector<std::string> execution_order;
+
+    ASSERT_TRUE(executor.SubmitTask([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        system_started = true;
+        cv.notify_all();
+        cv.wait(lock, [&]() { return release_system; });
+    }));
+    bool started = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        started = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return system_started; });
+    }
+
+    const bool prepare_accepted = executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() {
+        std::lock_guard<std::mutex> lock(mutex);
+        execution_order.emplace_back("prepare");
+        cv.notify_all();
+    });
+    const bool continuation_accepted = executor.SubmitTask(ScheduleTaskClass::kMigrationContinuation, [&]() {
+        std::lock_guard<std::mutex> lock(mutex);
+        execution_order.emplace_back("continuation");
+        cv.notify_all();
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release_system = true;
+    }
+    cv.notify_all();
+
+    bool both_completed = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        both_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return execution_order.size() == 2; });
+    }
+    EXPECT_TRUE(started);
+    EXPECT_TRUE(prepare_accepted);
+    EXPECT_TRUE(continuation_accepted);
+    ASSERT_TRUE(both_completed);
+    ASSERT_EQ(2u, execution_order.size());
+    EXPECT_EQ("continuation", execution_order[0]);
+    EXPECT_EQ("prepare", execution_order[1]);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMigrationExceptionReleasesBudget) {
+    SchedulePlanExecutor executor(2, meta_manager_, data_storage_manager_, metrics_registry_, 1);
+
+    std::promise<void> second_ran;
+    auto second_future = second_ran.get_future();
+    ASSERT_TRUE(executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare,
+                                    []() { throw std::runtime_error("injected migration task failure"); }));
+    ASSERT_TRUE(executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() { second_ran.set_value(); }));
+
+    EXPECT_EQ(std::future_status::ready, second_future.wait_for(std::chrono::seconds(3)));
 }

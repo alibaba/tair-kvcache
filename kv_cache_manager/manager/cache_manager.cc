@@ -4,10 +4,12 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -30,6 +32,7 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/hash_util.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
@@ -124,6 +127,211 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
     return {EC_OK, true};
 }
 
+// 共享 helper：收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
+// 一次 O(L·S) 扫描。exclude_loc_ids 用于排除 stale location。
+std::unordered_set<std::string> CollectCoveredSpecNames(
+    const CacheLocationMap &loc_map,
+    const std::string &storage_name,
+    std::initializer_list<CacheLocationStatus> statuses,
+    const std::vector<std::string> &exclude_loc_ids = {}) {
+    std::unordered_set<std::string> covered;
+    for (const auto &[loc_id, loc_ptr] : loc_map) {
+        if (!loc_ptr || std::find(statuses.begin(), statuses.end(), loc_ptr->status()) == statuses.end()) {
+            continue;
+        }
+        if (!exclude_loc_ids.empty() &&
+            std::find(exclude_loc_ids.begin(), exclude_loc_ids.end(), loc_id) != exclude_loc_ids.end()) {
+            continue;
+        }
+        for (const auto &spec : loc_ptr->location_specs()) {
+            if (DataStorageUri uri(spec.uri()); uri.Valid() && uri.GetHostName() == storage_name) {
+                covered.insert(spec.name());
+            }
+        }
+    }
+    return covered;
+}
+
+// 判断目标 storage 上是否有 SERVING/WRITING location（联合）覆盖 requested specs。
+// requested_spec_names 空时只判"有任何 spec 在该 storage 上"。
+bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
+                                     const std::string &storage_name,
+                                     const std::vector<std::string> &requested_spec_names = {},
+                                     const std::vector<std::string> &exclude_loc_ids = {}) {
+    const auto covered = CollectCoveredSpecNames(
+        loc_map, storage_name, {CacheLocationStatus::CLS_SERVING, CacheLocationStatus::CLS_WRITING}, exclude_loc_ids);
+    if (requested_spec_names.empty()) {
+        return !covered.empty();
+    }
+    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(),
+                       [&covered](const auto &name) { return covered.count(name) > 0; });
+}
+
+const CacheLocation *FindLocationById(const CacheLocationMap &loc_map, const std::string &location_id) {
+    auto it = loc_map.find(location_id);
+    if (it == loc_map.end()) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+bool LocationHasSpecOnStorage(const CacheLocation &loc, const std::string &storage_name) {
+    return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&storage_name](const auto &spec) {
+        const DataStorageUri uri(spec.uri());
+        return uri.Valid() && uri.GetHostName() == storage_name;
+    });
+}
+
+std::vector<std::string> BuildAllLocationSpecNames(const std::shared_ptr<const InstanceInfo> &instance_info) {
+    std::vector<std::string> spec_names;
+    if (instance_info == nullptr) {
+        return spec_names;
+    }
+    spec_names.reserve(instance_info->location_spec_infos().size());
+    for (const auto &spec_info : instance_info->location_spec_infos()) {
+        spec_names.push_back(spec_info.name());
+    }
+    return spec_names;
+}
+
+bool LocationsCoverFullBlockOnStorage(const CacheLocationMap &loc_map,
+                                      const std::string &storage_name,
+                                      const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (instance_info == nullptr || instance_info->location_spec_infos().empty()) {
+        return false;
+    }
+    return std::all_of(instance_info->location_spec_infos().begin(),
+                       instance_info->location_spec_infos().end(),
+                       [&loc_map, &storage_name](const LocationSpecInfo &spec_info) {
+                           return std::any_of(loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
+                               const auto &loc_ptr = entry.second;
+                               if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+                                   return false;
+                               }
+                               return std::any_of(
+                                   loc_ptr->location_specs().begin(), loc_ptr->location_specs().end(), [&spec_info, &storage_name](const auto &spec) {
+                                       const DataStorageUri uri(spec.uri());
+                                       return spec.name() == spec_info.name() && uri.Valid() &&
+                                              uri.GetHostName() == storage_name;
+                                   });
+                           });
+                       });
+}
+
+MigrationMarkClearPolicy GetMigrationMarkClearPolicy(RequestContext *request_context,
+                                                     const std::shared_ptr<RegistryManager> &registry_manager,
+                                                     const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (registry_manager == nullptr || instance_info == nullptr) {
+        return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    }
+    auto [ec, instance_group] =
+        registry_manager->GetInstanceGroup(request_context, instance_info->instance_group_name());
+    if (ec != EC_OK || instance_group == nullptr || instance_group->cache_config() == nullptr) {
+        return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    }
+    return instance_group->cache_config()->migration_mark_clear_policy();
+}
+
+bool IsTieredMigrationEnabled(RequestContext *request_context,
+                              const std::shared_ptr<RegistryManager> &registry_manager,
+                              const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (registry_manager == nullptr || instance_info == nullptr) {
+        return false;
+    }
+    auto [ec, instance_group] =
+        registry_manager->GetInstanceGroup(request_context, instance_info->instance_group_name());
+    return ec == EC_OK && instance_group != nullptr && instance_group->cache_config() != nullptr &&
+           !instance_group->cache_config()->migration_strategies().empty();
+}
+
+const char *StorageTargetAdmissionStatusName(StorageTargetAdmissionStatus status) {
+    switch (status) {
+    case StorageTargetAdmissionStatus::kAllowed:
+        return "allowed";
+    case StorageTargetAdmissionStatus::kNotFound:
+        return "not_found";
+    case StorageTargetAdmissionStatus::kUnavailable:
+        return "unavailable";
+    case StorageTargetAdmissionStatus::kGroupQuotaExceeded:
+        return "group_quota_exceeded";
+    case StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded:
+        return "storage_type_quota_exceeded";
+    case StorageTargetAdmissionStatus::kReadError:
+        return "read_error";
+    }
+    return "unknown";
+}
+
+// 只把 target 可用且 quota 未超限的 valid Mark 交给写入过滤逻辑。target 被注销时按查询
+// 快照精确清标；unavailable/quota 满属于瞬时状态，保留 Mark 并让本次调用使用普通 write 判定。
+void ResolveUsableTieredWriteTargets(RequestContext *request_context,
+                                     const std::string &instance_id,
+                                     const std::string &instance_group_name,
+                                     const CacheManager::KeyVector &keys,
+                                     const std::vector<MigrationManager::MarkQueryResult> &mark_results,
+                                     const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                     const std::shared_ptr<DataStorageSelector> &data_storage_selector,
+                                     const std::shared_ptr<MigrationManager> &migration_manager,
+                                     std::vector<std::string> &out_targets) {
+    const size_t result_count = std::min({keys.size(), mark_results.size(), out_targets.size()});
+    std::vector<std::string> unique_targets;
+    std::unordered_map<std::string, std::size_t> target_indexes;
+    for (size_t i = 0; i < result_count; ++i) {
+        const auto &mark = mark_results[i];
+        if (mark.HasValidMark() && target_indexes.emplace(mark.target, unique_targets.size()).second) {
+            unique_targets.push_back(mark.target);
+        }
+    }
+
+    std::vector<StorageTargetAdmissionResult> admissions;
+    if (data_storage_selector != nullptr) {
+        admissions = data_storage_selector->CheckExplicitWriteTargets(
+            request_context, instance_group_name, unique_targets);
+    }
+    for (size_t i = 0; i < result_count; ++i) {
+        const auto &mark = mark_results[i];
+        if (!mark.HasValidMark()) {
+            continue;
+        }
+        StorageTargetAdmissionResult admission;
+        if (const auto it = target_indexes.find(mark.target);
+            it != target_indexes.end() && it->second < admissions.size()) {
+            admission = admissions[it->second];
+        } else if (data_storage_manager != nullptr) {
+            const auto backend = data_storage_manager->GetDataStorageBackend(mark.target);
+            if (backend == nullptr) {
+                admission.status = StorageTargetAdmissionStatus::kNotFound;
+                admission.ec = EC_NOENT;
+            } else if (!backend->Available()) {
+                admission.status = StorageTargetAdmissionStatus::kUnavailable;
+                admission.ec = EC_NOENT;
+            } else {
+                admission.status = StorageTargetAdmissionStatus::kAllowed;
+                admission.ec = EC_OK;
+                admission.type = backend->GetType();
+            }
+        }
+        if (admission.Allowed()) {
+            out_targets[i] = mark.target;
+            continue;
+        }
+
+        bool cleared = false;
+        if (admission.status == StorageTargetAdmissionStatus::kNotFound && migration_manager != nullptr) {
+            cleared =
+                migration_manager->ClearTieredWriteMarkIfMatch(instance_id, keys[i], mark.target, mark.deadline_ms);
+        }
+        KVCM_LOG_WARN("trace_id [%s] instance [%s] block [%ld] tiered target storage [%s] rejected: %s; "
+                      "conditional mark clear [%s], use ordinary write policy",
+                      request_context->trace_id().c_str(),
+                      instance_id.c_str(),
+                      keys[i],
+                      mark.target.c_str(),
+                      StorageTargetAdmissionStatusName(admission.status),
+                      cleared ? "succeeded" : "skipped");
+    }
+}
+
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -132,7 +340,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
     , write_location_manager_(std::make_shared<WriteLocationManager>())
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
-    , data_storage_selector_(std::make_unique<DataStorageSelector>(meta_indexer_manager_, registry_manager))
+    , data_storage_selector_(std::make_shared<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
     , metrics_lifecycle_(metrics_lifecycle ? std::move(metrics_lifecycle) : std::make_shared<MetricsLifecycle>())
@@ -158,11 +366,20 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint64_t cache_reclaimer_del_batch_size,
                         uint32_t cache_reclaimer_idle_interval_ms,
                         uint32_t cache_reclaimer_worker_size,
-                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config) {
+                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config,
+                        uint32_t schedule_plan_migration_worker_budget) {
+    if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
+        schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
+        KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
+                       schedule_plan_executor_thread_count,
+                       schedule_plan_migration_worker_budget);
+        return false;
+    }
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
-                                                                     metrics_registry_);
+                                                                     metrics_registry_,
+                                                                     schedule_plan_migration_worker_budget);
     event_manager_ = std::make_shared<EventManager>();
     if (!event_manager_) {
         KVCM_LOG_WARN("create EventManager failed");
@@ -170,6 +387,17 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     if (!event_manager_->Init()) {
         KVCM_LOG_ERROR("event_manager init failed");
     }
+
+    migration_manager_ = std::make_shared<MigrationManager>(schedule_plan_executor_,
+                                                            meta_indexer_manager_,
+                                                            registry_manager_->data_storage_manager(),
+                                                            metrics_registry_,
+                                                            event_manager_,
+                                                            registry_manager_,
+                                                            data_storage_selector_);
+    // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
+    // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
+    assert(migration_manager_ != nullptr);
 
     cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
                                                         cache_reclaimer_key_sampling_size_per_task,
@@ -183,7 +411,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         metrics_registry_,
                                                         event_manager_,
                                                         write_location_manager_,
-                                                        std::move(cache_reclaimer_async_delete_config));
+                                                        std::move(cache_reclaimer_async_delete_config),
+                                                        migration_manager_);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
@@ -265,13 +494,61 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
 
+    // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
+    // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
+    // 步骤：draining gate（阻止该 instance 所有新 Copy，覆盖 reclaimer + admin 两路）
+    //       → cancel 活跃 copy → 有界等待完成 → 删除并 trim。
+    // RAII guard 保证 EndDraining 在任何出口（含宏 return）都执行，避免 draining set 泄漏。
+    // 不暂停全局 Reclaimer：删除一个 instance 不应阻塞其他 instance，也不能覆盖 Server 生命周期的暂停状态。
+    struct DrainGuard {
+        CacheManager *mgr;
+        std::string instance_id;
+        bool active = false;
+        ~DrainGuard() {
+            if (active) {
+                if (auto mm = mgr->migration_manager()) {
+                    mm->EndDrainingInstance(instance_id);
+                }
+            }
+        }
+    } drain_guard{this, instance_id, false};
+
+    if (migration_manager_ != nullptr) {
+        migration_manager_->BeginDrainingInstance(instance_id); // 契约保证：happens-before 所有后续提交
+        drain_guard.active = true;
+        const auto active_keys = migration_manager_->GetActiveBlockKeysForInstance(instance_id);
+        if (!active_keys.empty()) {
+            migration_manager_->BatchCancel(instance_id, active_keys);
+            // 有界等待：running/cancelling 任务由 monitor 在 copy future 完成后清理；快照中的
+            // preparing 任务则已被置为 kPrepareCancelling，由提交线程在下一安全边界回滚。
+            // draining gate 与锁内 reservation 保证快照不漏掉已准入任务，故无需重复 Cancel。
+            constexpr int kDrainTimeoutMs = 5000;
+            constexpr int kPollIntervalMs = 50;
+            int waited_ms = 0;
+            while (waited_ms < kDrainTimeoutMs) {
+                if (migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+                waited_ms += kPollIntervalMs;
+            }
+            if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
+                KVCM_LOG_WARN("[%s] RemoveInstance drain timeout (%dms) for instance %s, "
+                              "proceeding with trim; residual WRITING targets will be orphan-cleaned",
+                              trace_id.c_str(),
+                              kDrainTimeoutMs,
+                              instance_id.c_str());
+            }
+        }
+    }
+
     auto ec = registry_manager_->RemoveInstance(request_context, instance_group, instance_id);
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
 
     InvalidateInstanceMetrics(instance_id);
 
     ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;
 }
@@ -646,6 +923,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     BlockMask block_mask;
     KeyVector new_keys;
     std::vector<std::string_view> new_location_spec_group_names;
+    std::vector<std::string> new_keys_tiered_targets;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerFilterWriteCache);
     KeyVector query_keys = keys;
 
@@ -660,7 +938,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      location_spec_group_names,
                                      new_location_spec_group_names,
                                      block_mask,
-                                     min_replica_count);
+                                     min_replica_count,
+                                     new_keys_tiered_targets);
     } else {
         auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, StartWriteCacheInfo, "start write cache failed");
@@ -675,7 +954,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      location_spec_group_names,
                                      new_location_spec_group_names,
                                      block_mask,
-                                     min_replica_count);
+                                     min_replica_count,
+                                     new_keys_tiered_targets);
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
@@ -688,7 +968,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     } else {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
-        ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);
+        ec = GenWriteLocation(
+            request_context, instance_id, new_keys, new_location_spec_group_names, new_keys_tiered_targets, new_locations);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, GenWriteLocation);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
@@ -758,6 +1039,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
     }
     std::vector<KeyType> success_batch_keys;
+    std::vector<std::string> success_batch_location_ids;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> success_batch_update_tasks;
     CacheLocationDelRequest failed_del_request{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
 
@@ -765,6 +1047,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         if (IsIndexInMaskRange(success_block_mask, block_key_idx)) {
             // success
             success_batch_keys.push_back(location_info.keys[block_key_idx]);
+            success_batch_location_ids.push_back(location_info.location_ids[block_key_idx]);
             success_batch_update_tasks.push_back(
                 {{location_info.location_ids[block_key_idx], CacheLocationStatus::CLS_SERVING}});
         } else {
@@ -778,8 +1061,8 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, manager, request_key_count, success_batch_keys.size());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchUpdateLocation);
+    std::vector<std::vector<ErrorCode>> out_batch_results;
     if (!success_batch_keys.empty()) {
-        std::vector<std::vector<ErrorCode>> out_batch_results;
         ec = meta_searcher->BatchUpdateLocationStatus(
             request_context, success_batch_keys, success_batch_update_tasks, out_batch_results);
         if (ec != EC_OK) {
@@ -788,6 +1071,66 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
+
+    // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
+    // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
+    // FilterWriteCache 的 mark 消费入口保持对称；非分层 group 无 mark 可清（admin 旁路打的标由 timeout 兜底）。
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!success_batch_keys.empty() &&
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
+        KeyVector mark_candidate_keys;
+        std::vector<std::string> mark_candidate_location_ids;
+        for (size_t i = 0; i < success_batch_keys.size(); ++i) {
+            if (i >= out_batch_results.size() || out_batch_results[i].empty() ||
+                out_batch_results[i][0] != ErrorCode::EC_OK) {
+                continue;
+            }
+            mark_candidate_keys.push_back(success_batch_keys[i]);
+            mark_candidate_location_ids.push_back(success_batch_location_ids[i]);
+        }
+        if (!mark_candidate_keys.empty()) {
+            std::vector<MigrationManager::MarkQueryResult> tiered_targets;
+            const auto mark_query_ec =
+                migration_manager_->BatchGetTieredWriteTargets(instance_id, mark_candidate_keys, tiered_targets);
+            if (mark_query_ec != EC_OK) {
+                PREFIX_LOG(WARN,
+                           "tiered mark query partially failed after write, ec %d; valid keys will still be cleared",
+                           mark_query_ec);
+            }
+            std::vector<CacheLocationMap> loc_maps;
+            static const BlockMask empty_block_mask = static_cast<size_t>(0);
+            const auto get_loc_ec =
+                meta_searcher->BatchGetLocation(request_context, mark_candidate_keys, empty_block_mask, loc_maps);
+            if (get_loc_ec == EC_OK && loc_maps.size() == mark_candidate_keys.size()) {
+                for (size_t i = 0; i < mark_candidate_keys.size(); ++i) {
+                    if (i >= tiered_targets.size() || !tiered_targets[i].HasValidMark()) {
+                        continue;
+                    }
+                    const auto *loc = FindLocationById(loc_maps[i], mark_candidate_location_ids[i]);
+                    if (loc == nullptr || loc->status() != CacheLocationStatus::CLS_SERVING ||
+                        !LocationHasSpecOnStorage(*loc, tiered_targets[i].target)) {
+                        continue;
+                    }
+                    const auto clear_policy =
+                        GetMigrationMarkClearPolicy(request_context, registry_manager_, instance_info);
+                    if (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS ||
+                        (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
+                         LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i].target, instance_info))) {
+                        // 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
+                        migration_manager_->ClearTieredWriteMarkIfMatch(
+                            instance_id, mark_candidate_keys[i],
+                            tiered_targets[i].target, tiered_targets[i].deadline_ms);
+                    }
+                }
+            } else {
+                PREFIX_LOG(WARN,
+                           "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
+                           get_loc_ec,
+                           loc_maps.size(),
+                           mark_candidate_keys.size());
+            }
+        }
+    }
 
     if (!failed_del_request.block_keys.empty()) {
         reclaimer_task_supervisor_->Submit(request_context->trace_id(), std::move(failed_del_request));
@@ -869,6 +1212,105 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
 
+void CacheManager::StartMigrationManager() { migration_manager_->Start(); }
+void CacheManager::StopMigrationManager() { migration_manager_->Stop(); }
+
+CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *request_context,
+                                                            const std::string &trace_id,
+                                                            const std::string &instance_id,
+                                                            const std::string &src_name,
+                                                            const std::string &dst_name,
+                                                            bool do_copy,
+                                                            bool do_mark,
+                                                            const std::vector<int64_t> &explicit_block_keys,
+                                                            int64_t sample_count) {
+    // 薄 facade：只做前置校验（依赖、instance、target storage 和 migration strategy），
+    // 迁移编排（候选/meta/admission/dispatch/计数）下沉 MigrationManager::MigrateCache。
+    MigrateCacheResult result;
+
+    if (migration_manager_ == nullptr || meta_indexer_manager_ == nullptr) {
+        result.ec = EC_ERROR;
+        result.message = "migration manager not available";
+        return result;
+    }
+    // instance 存在性前置（保持错误优先级：instance → target storage → migration strategy）。
+    auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+    if (meta_indexer == nullptr) {
+        result.ec = EC_INSTANCE_NOT_EXIST;
+        result.message = "instance not found: " + instance_id;
+        return result;
+    }
+
+    // target storage 必须已注册：COPY 需在其上分配空间，MARK 需要它可被写路径满足。
+    // 否则会静默降级（写回落热层）并留下永不被满足的 mark。上层直接拒绝，避免误导性的 accepted。
+    {
+        auto data_storage_manager = registry_manager_->data_storage_manager();
+        if (data_storage_manager == nullptr || data_storage_manager->GetDataStorageBackend(dst_name) == nullptr) {
+            result.ec = EC_BADARGS;
+            result.message = "target storage not registered: " + dst_name;
+            return result;
+        }
+    }
+
+    // Admin Copy 与 Reclaimer 共享 instance group 级并发上限。这里取得 group 配置并传给
+    // MigrationManager；最终的原子检查在 BatchSubmit 内完成，避免并发入口的 TOCTOU。
+    const auto group_name = registry_manager_->GetInstanceGroupName(instance_id);
+    auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, group_name);
+    if (group_ec != EC_OK || instance_group == nullptr || instance_group->cache_config() == nullptr) {
+        result.ec = group_ec == EC_OK ? EC_BADARGS : group_ec;
+        result.message = "instance group or cache config not found: " + group_name;
+        return result;
+    }
+    const auto cache_config = instance_group->cache_config();
+    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const std::size_t copy_max_concurrency =
+        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+    int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
+
+    // IsTieredMigrationEnabled 以“group 至少有一条 migration strategy”作为写路径消费 Mark 的
+    // group 级开关，因此无 strategy 时打标会成为“成功的 no-op”，这里直接拒绝。Admin 显式 target
+    // 不受 strategy route 约束；精确匹配到 enabled Mark route 只影响下方 timeout 的选择。
+    if (do_mark) {
+        const bool has_migration_strategy = !cache_config->migration_strategies().empty();
+        if (!has_migration_strategy) {
+            result.ec = EC_BADARGS;
+            result.message =
+                "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
+            return result;
+        }
+
+        // Admin 保留显式指定任意已注册 target 的能力。精确匹配到启用 Mark 的 strategy 时复用其
+        // timeout；没有匹配 route 时仍允许迁移，并使用默认 timeout。
+        for (const auto &strategy : cache_config->migration_strategies()) {
+            if (strategy != nullptr && strategy->source_storage_name() == src_name &&
+                strategy->target_storage_name() == dst_name && strategy->methods().mark().enabled()) {
+                mark_timeout_ms = strategy->methods().mark().timeout_ms();
+                break;
+            }
+        }
+    }
+
+    // 前置通过 → 委派编排。meta_indexer 已取得并校验，直接传入避免二次查找。
+    const auto domain = migration_manager_->MigrateCache(request_context,
+                                                         trace_id,
+                                                         group_name,
+                                                         instance_id,
+                                                         meta_indexer,
+                                                         src_name,
+                                                         dst_name,
+                                                         do_copy,
+                                                         do_mark,
+                                                         explicit_block_keys,
+                                                         sample_count,
+                                                         copy_max_concurrency,
+                                                         mark_timeout_ms);
+    result.ec = domain.ec;
+    result.accepted = domain.accepted;
+    result.rejected = domain.rejected;
+    result.message = domain.message;
+    return result;
+}
+
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {
     if (location_spec_names.empty()) {
@@ -936,7 +1378,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                                          const std::vector<std::string> &location_spec_group_names,
                                          std::vector<std::string_view> &new_location_spec_group_names,
                                          BlockMask &block_mask,
-                                         int32_t min_replica_count) {
+                                         int32_t min_replica_count,
+                                         std::vector<std::string> &new_keys_tiered_targets) {
     if (min_replica_count > 1) {
         return FilterWriteCacheWithMinReplica(request_context,
                                               instance_id,
@@ -946,7 +1389,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                                               location_spec_group_names,
                                               new_location_spec_group_names,
                                               block_mask,
-                                              min_replica_count);
+                                              min_replica_count,
+                                              new_keys_tiered_targets);
     }
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
@@ -965,19 +1409,21 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    // Resolve instance_info for spec-group-aware filtering.
+    // Resolve instance_info for spec-group-aware filtering and full-block tiered target checks.
     // When location_spec_group_names is provided, we check per-spec-group
     // coverage instead of block-level existence, allowing complementary
     // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
-    std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty()) {
-        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    }
+    // Fetched unconditionally: tiered_migration_enabled depends on it, so gating the fetch on
+    // "tiered enabled" would be circular. (Equivalent to prior behavior, which always fetched.)
+    std::shared_ptr<const InstanceInfo> instance_info =
+        registry_manager_->GetInstanceInfo(request_context, instance_id);
+    const bool tiered_migration_enabled =
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
-    auto existsForWrite =
-        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+    auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
         if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
-            return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
+            return nullptr;
         }
         const auto &groups = instance_info->location_spec_groups();
         auto it =
@@ -986,55 +1432,99 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                              location_spec_group_names[i],
                              [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
         if (it == groups.end() || it->name() != location_spec_group_names[i]) {
+            return nullptr;
+        }
+        return &it->spec_names();
+    };
+    auto existsForWrite =
+        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+        const auto *spec_names = requestedSpecNames(i);
+        if (spec_names == nullptr) {
             return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
         }
-        return policy->ExistsForWrite(m, it->spec_names(), check_loc_data_exist, out_prune_loc_ids);
+        return policy->ExistsForWrite(m, *spec_names, check_loc_data_exist, out_prune_loc_ids);
     };
 
-    // Single pass: compute exists status for all blocks.
-    std::vector<bool> exists_flags(location_maps.size());
+    // Single pass: decide whether each block can skip this write.
+    std::vector<bool> skip_write_flags(location_maps.size());
+    // 多层存储 Mark 消费：批量预取各 block 的冷层目标（一次元数据读，避免逐块往返）。
+    // 命中（target 非空）时仅在目标冷 storage 尚无 SERVING/WRITING 副本时纳入待写集合，
+    // 并记录其目标冷 storage，由 GenWriteLocation 按 block 路由到冷层。
+    std::vector<std::string> tiered_target_per_key(location_maps.size());
+    if (tiered_migration_enabled) {
+        std::vector<MigrationManager::MarkQueryResult> mark_results;
+        const auto mark_query_ec = migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        if (mark_query_ec != EC_OK) {
+            PREFIX_LOG(WARN,
+                       "tiered mark query partially failed, ec %d; failed keys use ordinary write policy",
+                       mark_query_ec);
+        }
+        ResolveUsableTieredWriteTargets(request_context,
+                                        instance_id,
+                                        instance_info->instance_group_name(),
+                                        keys,
+                                        mark_results,
+                                        registry_manager_->data_storage_manager(),
+                                        data_storage_selector_,
+                                        migration_manager_,
+                                        tiered_target_per_key);
+    }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
-        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+        skip_write_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        if (!tiered_target_per_key[i].empty()) {
+            const auto *spec_names = requestedSpecNames(i);
+            if (spec_names == nullptr && !all_spec_names.empty()) {
+                spec_names = &all_spec_names;
+            }
+            skip_write_flags[i] =
+                spec_names == nullptr
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], {}, prune_loc_ids)
+                    : HasServingOrWritingLocOnStorage(
+                          location_maps[i], tiered_target_per_key[i], *spec_names, prune_loc_ids);
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
         submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
-    // Analyze the flags: find prefix boundary and check pattern.
-    size_t first_empty_idx = location_maps.size();
-    bool only_prefix_not_empty = true;
+    // Find the first write and check whether all blocks that need writing form a suffix.
+    size_t first_write_idx = location_maps.size();
+    bool writes_form_suffix = true;
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!exists_flags[i]) {
-            if (first_empty_idx == location_maps.size()) {
-                first_empty_idx = i;
+        if (!skip_write_flags[i]) {
+            if (first_write_idx == location_maps.size()) {
+                first_write_idx = i;
             }
-        } else if (first_empty_idx != location_maps.size()) {
-            // Found an "exists" block after an "empty" block — not a clean prefix.
-            only_prefix_not_empty = false;
+        } else if (first_write_idx != location_maps.size()) {
+            // Found a skipped block after a block that needs writing, so writes do not form a suffix.
+            writes_form_suffix = false;
             break;
         }
     }
-    if (only_prefix_not_empty) {
-        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
-        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+    if (writes_form_suffix) {
+        block_mask = static_cast<BlockMaskOffset>(first_write_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_write_idx, keys.end());
+        new_keys_tiered_targets.insert(
+            new_keys_tiered_targets.end(), tiered_target_per_key.begin() + first_write_idx, tiered_target_per_key.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + first_empty_idx,
+                                                 location_spec_group_names.begin() + first_write_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (exists_flags[i]) {
+        if (skip_write_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
+            new_keys_tiered_targets.push_back(tiered_target_per_key[i]);
             if (!location_spec_group_names.empty()) {
                 new_location_spec_group_names.push_back(location_spec_group_names[i]);
             }
@@ -1051,7 +1541,8 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                                                        const std::vector<std::string> &location_spec_group_names,
                                                        std::vector<std::string_view> &new_location_spec_group_names,
                                                        BlockMask &block_mask,
-                                                       int32_t min_replica_count) {
+                                                       int32_t min_replica_count,
+                                                       std::vector<std::string> &new_keys_tiered_targets) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     static const BlockMask empty_block_mask = static_cast<size_t>(0);
@@ -1070,10 +1561,12 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty()) {
-        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    }
+    // Fetched unconditionally: tiered_migration_enabled depends on instance_info (see FilterWriteCache above).
+    std::shared_ptr<const InstanceInfo> instance_info =
+        registry_manager_->GetInstanceInfo(request_context, instance_id);
+    const bool tiered_migration_enabled =
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     static const std::vector<std::string> empty_spec_names;
     auto existsForWrite =
@@ -1097,47 +1590,98 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         return policy->ExistsForWrite(m, *spec_names, check_loc_data_exist, out_prune_loc_ids);
     };
 
-    std::vector<bool> exists_flags(location_maps.size());
+    std::vector<bool> skip_write_flags(location_maps.size());
+    std::vector<std::string> tiered_target_per_key(location_maps.size());
+    std::vector<std::string> tiered_target_to_write(location_maps.size());
+    if (tiered_migration_enabled) {
+        std::vector<MigrationManager::MarkQueryResult> mark_results;
+        const auto mark_query_ec = migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        if (mark_query_ec != EC_OK) {
+            PREFIX_LOG(WARN,
+                       "tiered mark query partially failed, ec %d; failed keys use ordinary min-replica policy",
+                       mark_query_ec);
+        }
+        ResolveUsableTieredWriteTargets(request_context,
+                                        instance_id,
+                                        instance_info->instance_group_name(),
+                                        keys,
+                                        mark_results,
+                                        registry_manager_->data_storage_manager(),
+                                        data_storage_selector_,
+                                        migration_manager_,
+                                        tiered_target_per_key);
+    }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
-        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+        skip_write_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
-            prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
+            // 复制而非 move：下方 tiered 检查还要用 prune_loc_ids 排除 stale 目标副本。
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        if (!tiered_target_per_key[i].empty()) {
+            const std::vector<std::string> *spec_names = &empty_spec_names;
+            if (instance_info && i < location_spec_group_names.size() && !location_spec_group_names[i].empty()) {
+                const auto &groups = instance_info->location_spec_groups();
+                auto it = std::lower_bound(
+                    groups.begin(),
+                    groups.end(),
+                    location_spec_group_names[i],
+                    [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
+                if (it != groups.end() && it->name() == location_spec_group_names[i]) {
+                    spec_names = &it->spec_names();
+                }
+            }
+            if (spec_names->empty() && !all_spec_names.empty()) {
+                spec_names = &all_spec_names;
+            }
+            const bool target_satisfied =
+                spec_names->empty()
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], {}, prune_loc_ids)
+                    : HasServingOrWritingLocOnStorage(
+                          location_maps[i], tiered_target_per_key[i], *spec_names, prune_loc_ids);
+            if (!target_satisfied) {
+                skip_write_flags[i] = false;
+                tiered_target_to_write[i] = tiered_target_per_key[i];
+            }
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
         submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
-    size_t first_empty_idx = location_maps.size();
-    bool only_prefix_not_empty = true;
+    size_t first_write_idx = location_maps.size();
+    bool writes_form_suffix = true;
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!exists_flags[i]) {
-            if (first_empty_idx == location_maps.size()) {
-                first_empty_idx = i;
+        if (!skip_write_flags[i]) {
+            if (first_write_idx == location_maps.size()) {
+                first_write_idx = i;
             }
-        } else if (first_empty_idx != location_maps.size()) {
-            only_prefix_not_empty = false;
+        } else if (first_write_idx != location_maps.size()) {
+            writes_form_suffix = false;
             break;
         }
     }
-    if (only_prefix_not_empty) {
-        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
-        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+    if (writes_form_suffix) {
+        block_mask = static_cast<BlockMaskOffset>(first_write_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_write_idx, keys.end());
+        new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
+                                       tiered_target_to_write.begin() + first_write_idx,
+                                       tiered_target_to_write.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + first_empty_idx,
+                                                 location_spec_group_names.begin() + first_write_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (exists_flags[i]) {
+        if (skip_write_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
+            new_keys_tiered_targets.push_back(tiered_target_to_write[i]);
             if (!location_spec_group_names.empty()) {
                 new_location_spec_group_names.push_back(location_spec_group_names[i]);
             }
@@ -1295,35 +1839,21 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
     return EC_OK;
 }
 
-ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
-                                         const std::string &instance_id,
-                                         const CacheManager::KeyVector &keys,
-                                         const std::vector<std::string_view> &location_spec_group_names,
-                                         CacheLocationVector &new_locations) {
+ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_context,
+                                                  const std::string &instance_id,
+                                                  const CacheManager::KeyVector &keys,
+                                                  const std::vector<std::string_view> &location_spec_group_names,
+                                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                                  const std::string &storage_name,
+                                                  DataStorageType storage_type,
+                                                  CacheLocationVector &out_locations) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
 
     if (keys.empty()) {
-        PREFIX_LOG(INFO, "new keys empty, no need to generate write location");
         return EC_OK;
     }
-
-    auto data_storage_manager = registry_manager_->data_storage_manager();
-    if (data_storage_manager == nullptr) {
-        request_context->error_tracer()->AddErrorMsg("data storage manager not found");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "data storage manager not found");
-    }
-
-    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    if (instance_info == nullptr) {
-        request_context->error_tracer()->AddErrorMsg("instance not found");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
-    }
-
-    // select storage type and unique name
-    const auto select_result = data_storage_selector_->SelectCacheWriteDataStorageBackend(
-        request_context, instance_info->instance_group_name());
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, select_result.ec, "select storage backend failed");
 
     std::vector<DataStorageUri> allocated_uris;
     allocated_uris.reserve(instance_info->location_spec_infos().size() * keys.size());
@@ -1347,7 +1877,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                       location_spec_group_names,
                                       instance_info,
                                       data_storage_manager,
-                                      select_result.name,
+                                      storage_name,
                                       allocated_uris,
                                       key_to_uris,
                                       is_create_success,
@@ -1360,7 +1890,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                location_spec_group_names,
                                instance_info,
                                data_storage_manager,
-                               select_result.name,
+                               storage_name,
                                allocated_uris,
                                key_to_uris,
                                is_create_success);
@@ -1370,7 +1900,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     if (!is_create_success) {
         request_context->error_tracer()->AddErrorMsg("some internal error when GenWriteLocation");
         auto error_codes = data_storage_manager->Delete(
-            request_context, select_result.name, allocated_uris, []() { /* do nothing */ });
+            request_context, storage_name, allocated_uris, []() { /* do nothing */ });
         for (size_t i = 0; i < error_codes.size(); i++) {
             if (i >= allocated_uris.size()) {
                 PREFIX_LOG(WARN,
@@ -1382,7 +1912,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             if (error_codes[i] != ErrorCode::EC_OK) {
                 PREFIX_LOG(WARN,
                            "delete data uri failed, storage unique name: %s, uri: %s",
-                           select_result.name.c_str(),
+                           storage_name.c_str(),
                            allocated_uris[i].ToUriString().c_str());
             }
         }
@@ -1391,7 +1921,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
     for (const auto &uris : key_to_uris) {
         auto cache_location = std::make_shared<CacheLocation>();
-        cache_location->set_type(select_result.type);
+        cache_location->set_type(storage_type);
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
@@ -1399,7 +1929,152 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             cache_location->push_location_spec(std::move(location_spec));
         }
         cache_location->set_spec_size(uris.size());
-        new_locations.push_back(std::move(cache_location));
+        out_locations.push_back(std::move(cache_location));
+    }
+    return EC_OK;
+}
+
+ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         const CacheManager::KeyVector &keys,
+                                         const std::vector<std::string_view> &location_spec_group_names,
+                                         const std::vector<std::string> &tiered_targets,
+                                         CacheLocationVector &new_locations) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+
+    if (keys.empty()) {
+        PREFIX_LOG(INFO, "new keys empty, no need to generate write location");
+        return EC_OK;
+    }
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("data storage manager not found");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "data storage manager not found");
+    }
+
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (instance_info == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("instance not found");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
+    }
+
+    // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；未命中 -> 默认 storage。
+    // FilterWriteCache 已验证 target；若 backend 在两阶段之间消失，拒绝本次写并由重试重新过滤，
+    // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block。
+    const bool has_tiered = tiered_targets.size() == keys.size();
+    std::map<std::string, std::vector<size_t>> indices_by_storage;
+    std::map<std::string, DataStorageType> type_by_storage;
+    std::vector<size_t> default_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (has_tiered && !tiered_targets[i].empty()) {
+            const auto backend = data_storage_manager->GetDataStorageBackend(tiered_targets[i]);
+            if (backend != nullptr) {
+                indices_by_storage[tiered_targets[i]].push_back(i);
+                type_by_storage[tiered_targets[i]] = backend->GetType();
+                continue;
+            }
+            PREFIX_LOG(WARN,
+                       "tiered target storage [%s] disappeared after filtering, reject write instead of falling "
+                       "back to default storage",
+                       tiered_targets[i].c_str());
+            return EC_NOENT;
+        }
+        default_indices.push_back(i);
+    }
+    if (!default_indices.empty()) {
+        const auto select_result = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context, instance_info->instance_group_name());
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, select_result.ec, "select storage backend failed");
+        for (const auto idx : default_indices) {
+            indices_by_storage[select_result.name].push_back(idx);
+        }
+        type_by_storage[select_result.name] = select_result.type;
+    }
+
+    // 输出与 keys 同序对齐（CacheLocationVector 为 shared_ptr 向量，先填空）
+    new_locations.resize(keys.size());
+    auto collect_location_uris = [&](const CacheLocationVector &locations,
+                                     std::map<std::string, std::vector<DataStorageUri>> &uris_by_storage) {
+        for (const auto &location : locations) {
+            if (location == nullptr) {
+                continue;
+            }
+            for (const auto &location_spec : location->location_specs()) {
+                DataStorageUri uri(location_spec.uri());
+                if (!uri.Valid() || uri.GetHostName().empty()) {
+                    PREFIX_LOG(WARN, "skip rollback invalid generated uri: %s", location_spec.uri().c_str());
+                    continue;
+                }
+                uris_by_storage[uri.GetHostName()].push_back(std::move(uri));
+            }
+        }
+    };
+    auto rollback_generated_locations = [&](const CacheLocationVector *extra_locations = nullptr) {
+        std::map<std::string, std::vector<DataStorageUri>> uris_by_storage;
+        collect_location_uris(new_locations, uris_by_storage);
+        if (extra_locations != nullptr) {
+            collect_location_uris(*extra_locations, uris_by_storage);
+        }
+        for (const auto &[storage_name, uris] : uris_by_storage) {
+            const auto results = data_storage_manager->Delete(
+                request_context, storage_name, uris, []() { /* do nothing */ });
+            if (results.size() != uris.size()) {
+                PREFIX_LOG(WARN,
+                           "rollback generated locations on storage %s returned %zu results, request size %zu",
+                           storage_name.c_str(),
+                           results.size(),
+                           uris.size());
+            }
+            for (const auto ec : results) {
+                if (ec != EC_OK) {
+                    PREFIX_LOG(WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
+                }
+            }
+        }
+        new_locations.clear();
+    };
+    const bool has_sgn = !location_spec_group_names.empty();
+    for (const auto &[storage_name, indices] : indices_by_storage) {
+        KeyVector sub_keys;
+        std::vector<std::string_view> sub_sgn;
+        sub_keys.reserve(indices.size());
+        if (has_sgn) {
+            sub_sgn.reserve(indices.size());
+        }
+        for (size_t idx : indices) {
+            sub_keys.push_back(keys[idx]);
+            if (has_sgn) {
+                sub_sgn.push_back(location_spec_group_names[idx]);
+            }
+        }
+        CacheLocationVector sub_locations;
+        auto ec = GenWriteLocationOnStorage(request_context,
+                                            instance_id,
+                                            sub_keys,
+                                            sub_sgn,
+                                            instance_info,
+                                            data_storage_manager,
+                                            storage_name,
+                                            type_by_storage[storage_name],
+                                            sub_locations);
+        if (ec != EC_OK) {
+            rollback_generated_locations(&sub_locations);
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "GenWriteLocationOnStorage failed");
+        }
+        if (sub_locations.size() != indices.size()) {
+            PREFIX_LOG(WARN,
+                       "sub_locations size %zu != indices size %zu for storage %s",
+                       sub_locations.size(),
+                       indices.size(),
+                       storage_name.c_str());
+            rollback_generated_locations(&sub_locations);
+            return EC_ERROR;
+        }
+        for (size_t j = 0; j < indices.size(); ++j) {
+            new_locations[indices[j]] = std::move(sub_locations[j]);
+        }
     }
     return EC_OK;
 }
@@ -1924,8 +2599,21 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
         PREFIX_LOG(WARN, "instance group not found: %s", instance_group_name.c_str());
         return {};
     }
-    const auto &storage_candadates = instance_group->storage_candidates();
-    std::set<std::string_view> storage_candadate_set(storage_candadates.begin(), storage_candadates.end());
+    // storage_candidates only describes normal write placement. Tiered migration may move data to a
+    // source/target storage that is intentionally not a normal write candidate, but workers still need
+    // the corresponding SDK config to read copied data or write data directed by a migration mark.
+    std::set<std::string_view> accessible_storage_names(instance_group->storage_candidates().begin(),
+                                                        instance_group->storage_candidates().end());
+    const auto cache_config = instance_group->cache_config();
+    if (cache_config != nullptr) {
+        for (const auto &strategy : cache_config->migration_strategies()) {
+            if (strategy == nullptr) {
+                continue;
+            }
+            accessible_storage_names.insert(strategy->source_storage_name());
+            accessible_storage_names.insert(strategy->target_storage_name());
+        }
+    }
     // TODO : try optimize these copy operation
     std::vector<const StorageConfig *> result;
     for (const auto &config : all_configs) {
@@ -1934,7 +2622,7 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
         if (config.type() == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
             continue;
         }
-        if (storage_candadate_set.find(config.global_unique_name()) != storage_candadate_set.end()) {
+        if (accessible_storage_names.find(config.global_unique_name()) != accessible_storage_names.end()) {
             result.push_back(&config);
         }
     }

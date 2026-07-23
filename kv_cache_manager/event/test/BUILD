@@ -51,3 +51,16 @@ cc_test(
         "//kv_cache_manager/event:event_publisher",
     ],
 )
+
+cc_test(
+    name = "MigrationEventTest",
+    srcs = [
+        "migration_event_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event/spec_events:spec_events",
+    ],
+)

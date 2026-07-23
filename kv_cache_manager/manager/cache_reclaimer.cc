@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -33,13 +34,18 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/migration_strategy.h"
+#include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/config/trigger_strategy.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -113,6 +119,8 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_complete_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_fail_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(migration_copy_submitted_total);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(migration_mark_submitted_total);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -517,7 +525,8 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<MetricsRegistry> metrics_registry,
                                std::shared_ptr<EventManager> event_manager,
                                std::shared_ptr<WriteLocationManager> write_location_manager,
-                               CacheReclaimerAsyncDeleteConfig async_delete_config)
+                               CacheReclaimerAsyncDeleteConfig async_delete_config,
+                               std::shared_ptr<MigrationManager> migration_manager)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
@@ -525,6 +534,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , metrics_registry_(std::move(metrics_registry))
     , event_manager_(std::move(event_manager))
     , write_location_manager_(std::move(write_location_manager))
+    , migration_manager_(std::move(migration_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
@@ -598,6 +608,8 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_fail_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_copy_submitted_total);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_mark_submitted_total);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -1367,38 +1379,140 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
 
     // inspect the cache location status of each block and get the
     // filtered location ID vecs
+    const bool in_storage_type_eviction_zone = water_level_exceed.CheckStorageTypeWaterLevelExceed();
     out_loc_ids.reserve(loc_maps.size());
+
+    // 多层存储 keep_both 配套：构建"冷层" storage 集合（迁移策略的 target_storage）。
+    // 在"总水位超限"分支下，对同时拥有冷/热副本的 block 优先淘汰热(源)副本、保留冷副本，
+    // 避免 LRU 不分层导致先淘汰冷副本而使 keep_both 失去读加速收益。类型超限(硬驱逐)分支不参与。
+    std::unordered_set<std::string> cold_storages;
+    if (!in_storage_type_eviction_zone && registry_manager_ != nullptr) {
+        if (auto [ig_ec, ig] = registry_manager_->GetInstanceGroup(request_context, ins_gr);
+            ig_ec == ErrorCode::EC_OK && ig != nullptr && ig->cache_config() != nullptr) {
+            for (const auto &s : ig->cache_config()->migration_strategies()) {
+                if (s != nullptr && !s->target_storage_name().empty()) {
+                    cold_storages.insert(s->target_storage_name());
+                }
+            }
+        }
+    }
+    const auto loc_on_cold_storage = [&cold_storages](const CacheLocation &loc) -> bool {
+        if (cold_storages.empty() || loc.location_specs().empty()) {
+            return false;
+        }
+        const DataStorageUri uri(loc.location_specs().front().uri());
+        return cold_storages.count(uri.GetHostName()) > 0;
+    };
+    const auto is_pending_location = [this, &ins_id](const std::int64_t block_key,
+                                                     const std::string &location_id) -> bool {
+        return pending_locations_.find(PendingLocationKey{ins_id, block_key, location_id}) != pending_locations_.end();
+    };
+    const auto cold_locations_cover_specs = [&is_pending_location, &loc_on_cold_storage](
+                                                 const std::int64_t block_key,
+                                                 const CacheLocationMap &loc_map,
+                                                 const CacheLocation &source_loc) -> bool {
+        if (source_loc.location_specs().empty()) {
+            return false;
+        }
+        for (const auto &source_spec : source_loc.location_specs()) {
+            const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
+                const auto &loc_ptr = entry.second;
+                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
+                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
+                    return false;
+                }
+                return std::any_of(loc_ptr->location_specs().begin(),
+                                   loc_ptr->location_specs().end(),
+                                   [&source_spec](const auto &cold_spec) {
+                                       return cold_spec.name() == source_spec.name();
+                                   });
+            });
+            if (!covered) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t create_age_sum = 0;
     int64_t create_age_count = 0;
     std::uint64_t selected_total_bytes = 0;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
+        const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
         std::size_t valid_location_count = 0;
+
+        // 总水位超限分支：若 block 同时有冷层与非冷层(热/源)副本，则只淘汰已被冷层覆盖的热副本、保留冷副本。
+        bool keep_cold_evict_hot = false;
+        if (!in_storage_type_eviction_zone && !cold_storages.empty()) {
+            bool has_cold = false;
+            bool has_hot = false;
+            for (const auto &[_, loc_ptr] : loc_map) {
+                if (!loc_ptr) {
+                    continue;
+                }
+                const auto &loc = *loc_ptr;
+                if (is_pending_location(block_key, loc.id())) {
+                    continue;
+                }
+                const bool is_active_copy_target =
+                    loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
+                    migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
+                const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
+                                                 write_location_manager_ != nullptr &&
+                                                 !write_location_manager_->HasLocationId(loc.id()) &&
+                                                 !is_active_copy_target;
+                if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
+                    continue;
+                }
+                if (loc.status() == CacheLocationStatus::CLS_SERVING && loc_on_cold_storage(loc)) {
+                    has_cold = true;
+                } else if (loc.status() == CacheLocationStatus::CLS_SERVING) {
+                    has_hot = true;
+                }
+            }
+            keep_cold_evict_hot = has_cold && has_hot;
+        }
+
         for (const auto &[_, loc_ptr] : loc_map) {
             if (!loc_ptr) {
                 continue;
             }
             ++valid_location_count;
             const auto &loc = *loc_ptr;
+            if (is_pending_location(block_key, loc.id())) {
+                METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
+                continue;
+            }
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
-            //    no longer active (orphaned after a server restart)
+            //    no longer active (orphaned after a server restart) and
+            //    it is not an active migration copy target.
+            const bool is_active_copy_target =
+                loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
+                migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
             const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
                                              write_location_manager_ != nullptr &&
-                                             !write_location_manager_->HasLocationId(loc.id());
+                                             !write_location_manager_->HasLocationId(loc.id()) &&
+                                             !is_active_copy_target;
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 bool selected_by_water_level = false;
-                if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
-                    // some storage type water level exceeded; only
-                    // collect the location with matched type but
-                    // fairness is ignored
+                if (in_storage_type_eviction_zone) {
+                    // some storage type water level exceeded; only collect the
+                    // location with matched type but fairness is ignored
                     // TODO (rui): implement the fair eviction
                     if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
                         selected_by_water_level = true;
                     }
+                } else if (keep_cold_evict_hot && loc.status() == CacheLocationStatus::CLS_SERVING &&
+                           loc_on_cold_storage(loc)) {
+                    // 多副本 keep_both：保留冷层副本，不淘汰（优先腾出热层空间）。
+                } else if (keep_cold_evict_hot && loc.status() == CacheLocationStatus::CLS_SERVING &&
+                           !cold_locations_cover_specs(block_key, loc_map, loc)) {
+                    // spec group 场景下，只有当该热 location 的 specs 已被冷层 SERVING location 覆盖时才删热。
                 } else {
                     // there's no storage type water level exceeded
                     // and since the reclaiming is triggered, the total
@@ -1407,12 +1521,6 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     selected_by_water_level = true;
                 }
                 if (!selected_by_water_level) {
-                    continue;
-                }
-
-                const PendingLocationKey pending_key{ins_id, batch[block_idx], loc.id()};
-                if (pending_locations_.find(pending_key) != pending_locations_.end()) {
-                    METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
                     continue;
                 }
 
@@ -1484,6 +1592,229 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     }
     out_create_age_stats.avg_us = create_age_sum / create_age_count;
     return true;
+}
+
+void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                                       const std::shared_ptr<const InstanceGroup> &instance_group,
+                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
+    if (!IsRunning() || IsPaused()) {
+        return;
+    }
+    if (instance_group == nullptr || migration_manager_ == nullptr || registry_manager_ == nullptr) {
+        return;
+    }
+    const std::string &ins_gr = instance_group->name();
+
+    const auto cache_config = instance_group->cache_config();
+    if (cache_config == nullptr) {
+        return;
+    }
+    const auto &strategies = cache_config->migration_strategies();
+    if (strategies.empty()) {
+        return;
+    }
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        LOG_WITH_GR(WARN, "data storage manager is nullptr; skip migration");
+        return;
+    }
+    const auto usage = GetGroupUsageData(request_context.get(), instance_infos);
+    if (usage == nullptr) {
+        LOG_WITH_GR(WARN, "group usage data is nullptr; skip migration");
+        return;
+    }
+
+    const auto &quota = instance_group->quota();
+    struct CachedMigrationBatch {
+        bool built = false;
+        bool ok = false;
+        std::vector<std::int64_t> batch;
+    };
+    std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
+    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const std::size_t max_concurrent_copy =
+        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+    // active Copy 与已排队/运行的异步 Prepare 一起用于提前剪枝，避免慢 Create 期间每轮 cron
+    // 都继续给同一 group 堆积新 Job；最终硬限制仍在 BatchSubmit 内原子执行。
+    const std::size_t active_copy = migration_manager_->ActiveTaskCountForGroup(ins_gr);
+    const std::size_t pending_prepare = migration_manager_->PendingAsyncMigrationPrepareCountForGroup(ins_gr);
+    constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
+    const std::size_t estimated_inflight =
+        active_copy > kMaxSize - pending_prepare ? kMaxSize : active_copy + pending_prepare;
+    std::size_t available_copy_slots =
+        max_concurrent_copy > estimated_inflight ? max_concurrent_copy - estimated_inflight : 0;
+
+    for (const auto &strategy : strategies) {
+        if (strategy == nullptr) {
+            continue;
+        }
+        const std::string &src_name = strategy->source_storage_name();
+        const auto backend = data_storage_manager->GetDataStorageBackend(src_name);
+        if (backend == nullptr) {
+            LOG_WITH_GR(WARN, "migration source storage [%s] not found; skip", src_name.c_str());
+            continue;
+        }
+        const DataStorageType src_type = ToBaseType(backend->GetType());
+
+        // NOTE: reclaimer 水位粒度仅到存储 type（per-storage 容量/用量暂不可得，见 GetWaterLevelExceed
+        // 的 TODO），故迁移触发水位用 source storage 对应 type 的 type 级近似。
+        std::int64_t capacity = 0;
+        for (const auto &storage_quota : quota.quota_config()) {
+            if (storage_quota.storage_spec() == src_type) {
+                capacity = storage_quota.capacity();
+                break;
+            }
+        }
+        if (capacity <= 0) {
+            LOG_WITH_GR(DEBUG, "no positive capacity for source type of [%s]; skip migration", src_name.c_str());
+            continue;
+        }
+
+        const double water_level =
+            static_cast<double>(usage->GetGroupUsageByType(src_type)) / static_cast<double>(capacity);
+        const double migration_threshold = strategy->trigger_threshold();
+        if (water_level + kEpsilon <= migration_threshold) {
+            continue; // 低于迁移区间下界
+        }
+
+        const bool copy_enabled = strategy->methods().copy().enabled();
+        const bool mark_enabled = strategy->methods().mark().enabled();
+        if (!copy_enabled && !mark_enabled) {
+            continue;
+        }
+        if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
+            continue;
+        }
+
+        LOG_WITH_GR(DEBUG,
+                    "migration triggered: src_storage [%s] type [%d] wl [%f] migration_thr [%f] "
+                    "group_copy_concurrency [%zu] active_copy [%zu] pending_prepare [%zu] "
+                    "available_copy_slots [%zu]",
+                    src_name.c_str(),
+                    static_cast<std::int32_t>(src_type),
+                    water_level,
+                    migration_threshold,
+                    max_concurrent_copy,
+                    active_copy,
+                    pending_prepare,
+                    available_copy_slots);
+
+        for (const auto &instance_info : instance_infos) {
+            if (instance_info == nullptr) {
+                continue;
+            }
+            // Copy-only route 没有 fallback Mark 可做。异步化后无法在本线程获知每个 Job
+            // 实际提交了几个 Copy，因此按剩余 block slot 至多放行同样数量的 Prepare Job，
+            // 防止 group limit 很小时仍为大量 instance 排队做无效的 fresh meta read。
+            if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
+                break;
+            }
+            auto &cached = migration_batch_cache[instance_info->instance_id()];
+            if (!cached.built) {
+                cached.built = true;
+                cached.ok = BuildMigrationCandidateBatch(request_context, instance_info, cached.batch);
+            }
+            if (!cached.ok || cached.batch.empty()) {
+                continue;
+            }
+            const bool submitted = SubmitMigrationPrepareJob(request_context, instance_info, *strategy, cached.batch);
+            if (submitted && copy_enabled && !mark_enabled) {
+                --available_copy_slots;
+            }
+        }
+    }
+}
+
+bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
+                                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  std::vector<std::int64_t> &out_batch) noexcept {
+    out_batch.clear();
+    if (instance_info == nullptr) {
+        return false;
+    }
+
+    // 采样 + LRU 取最冷 batch（复用回收侧的采样与排序）。
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+    if (!DoKeySampling(request_context, instance_info, keys, maps)) {
+        return false;
+    }
+    AgeStats lru_age_stats;
+    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats)) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::vector<std::string>>
+CacheReclaimer::SnapshotPendingLocations(const std::string &instance_id,
+                                         const std::vector<std::int64_t> &batch) const {
+    std::vector<std::vector<std::string>> snapshot(batch.size());
+    for (std::size_t block_idx = 0; block_idx < batch.size(); ++block_idx) {
+        const auto block_key = batch[block_idx];
+        auto it = pending_locations_.lower_bound(PendingLocationKey{instance_id, block_key, ""});
+        while (it != pending_locations_.end() && it->instance_id == instance_id && it->block_key == block_key) {
+            snapshot[block_idx].push_back(it->location_id);
+            ++it;
+        }
+    }
+    return snapshot;
+}
+
+bool CacheReclaimer::SubmitMigrationPrepareJob(const std::shared_ptr<RequestContext> &request_context,
+                                               const std::shared_ptr<const InstanceInfo> &instance_info,
+                                               const MigrationStrategy &strategy,
+                                               const std::vector<std::int64_t> &batch) noexcept {
+    if (!IsRunning() || IsPaused()) {
+        return false;
+    }
+    if (instance_info == nullptr || migration_manager_ == nullptr) {
+        return false;
+    }
+    if (batch.empty()) {
+        return false;
+    }
+
+    const bool copy_enabled = strategy.methods().copy().enabled();
+    const bool mark_enabled = strategy.methods().mark().enabled();
+    if (!copy_enabled && !mark_enabled) {
+        return false;
+    }
+
+    const std::string &ins_id = instance_info->instance_id();
+    const std::string &ins_gr = instance_info->instance_group_name();
+    const std::string &src_name = strategy.source_storage_name();
+    const std::string &dst_name = strategy.target_storage_name();
+
+    auto copy_counter = METRICS_(cache_reclaimer, migration_copy_submitted_total);
+    auto mark_counter = METRICS_(cache_reclaimer, migration_mark_submitted_total);
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context->trace_id();
+    job.instance_group_name = ins_gr;
+    job.instance_id = ins_id;
+    job.source_storage_name = src_name;
+    job.target_storage_name = dst_name;
+    job.block_keys = batch;
+    // pending_locations_ 由 Reclaimer cron 单线程维护。这里只复制与本 batch 相关的前缀范围；
+    // executor worker 不得读取 CacheReclaimer 的任何可变状态。
+    job.pending_location_ids_by_block = SnapshotPendingLocations(ins_id, batch);
+    job.on_dispatched = [copy_counter, mark_counter, ins_id, src_name, dst_name](
+                            const MigrationManager::DispatchBatchResult &dispatch) mutable {
+        if (dispatch.copy_submitted > 0) {
+            copy_counter += dispatch.copy_submitted;
+        }
+        if (dispatch.mark_submitted > 0) {
+            mark_counter += dispatch.mark_submitted;
+        }
+        KVCM_LOG_DEBUG("async migration dispatched: instance [%s] src [%s] dst [%s] "
+                       "copy_submitted [%lld] mark_submitted [%lld]",
+                       ins_id.c_str(),
+                       src_name.c_str(),
+                       dst_name.c_str(),
+                       static_cast<long long>(dispatch.copy_submitted),
+                       static_cast<long long>(dispatch.mark_submitted));
+    };
+    return migration_manager_->SubmitAsyncMigrationPrepare(std::move(job));
 }
 
 bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
@@ -1825,6 +2156,15 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         METRICS_(cache_reclaimer, reclaim_job_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         result.made_progress = result.made_progress || submitted;
+    }
+
+    // Reclaim admission precedes migration preparation in the same cron round. An accepted
+    // delete is synchronously recorded in pending_locations_, so the migration job snapshot
+    // excludes that exact location before asynchronous Create/Copy starts. This only orders
+    // admission; it does not wait for physical deletion. Migration still runs independently
+    // when its lower watermark is reached before the reclaim threshold.
+    if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
+        TryMigrateOnGroup(request_context, instance_group, instance_infos);
     }
 
     return result;

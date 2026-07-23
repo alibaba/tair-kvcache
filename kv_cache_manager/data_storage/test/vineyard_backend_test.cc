@@ -67,6 +67,11 @@ TEST_F(VineyardBackendTest, OpenStartsLivenessLoopAndCloseStops) {
     ASSERT_TRUE(backend.liveness_checker_running_.load());
     ASSERT_TRUE(backend.liveness_checker_thread_.joinable());
 
+    backend.SetAvailable(false);
+    ASSERT_FALSE(backend.Available());
+    backend.SetAvailable(true);
+    ASSERT_TRUE(backend.Available());
+
     ASSERT_EQ(EC_OK, backend.Close());
     ASSERT_FALSE(backend.Available());
     ASSERT_FALSE(backend.liveness_checker_running_.load());

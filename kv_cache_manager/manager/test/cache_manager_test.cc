@@ -1,30 +1,38 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "stub.h"
 
 namespace {
 static const std::string default_storage_configs(
@@ -33,6 +41,45 @@ static const std::string default_storage_configs(
 } // namespace
 
 namespace kv_cache_manager {
+
+namespace mark_query_read_error_stub {
+ErrorCode ReadError_stub(void * /*obj*/,
+                         const std::string & /*instance_id*/,
+                         const std::vector<int64_t> &block_keys,
+                         std::vector<MigrationManager::MarkQueryResult> &out) {
+    out.assign(block_keys.size(), MigrationManager::MarkQueryResult{});
+    for (auto &result : out) {
+        result.state = MigrationManager::MarkQueryState::kReadError;
+        result.ec = EC_ERROR;
+        // 故意携带 stale target，证明调用方依据 state 而不是 target 是否为空做判断。
+        result.target = "cold_01";
+    }
+    return EC_ERROR;
+}
+} // namespace mark_query_read_error_stub
+
+namespace remove_instance_reclaimer_state_stub {
+CacheReclaimer *reclaimer = nullptr;
+bool called = false;
+bool observed_paused = false;
+
+void Reset(CacheReclaimer *value) {
+    reclaimer = value;
+    called = false;
+    observed_paused = false;
+}
+
+ErrorCode RemoveInstance_stub(void * /*obj*/,
+                              RequestContext * /*request_context*/,
+                              const std::string & /*instance_group*/,
+                              const std::string & /*instance_id*/) {
+    called = true;
+    if (reclaimer != nullptr) {
+        observed_paused = reclaimer->IsPaused();
+    }
+    return EC_ERROR;
+}
+} // namespace remove_instance_reclaimer_state_stub
 
 class MockDataStorageBackend : public DataStorageBackend {
 public:
@@ -70,7 +117,7 @@ public:
     }
 
     DataStorageType GetType() override { return delegate_->GetType(); }
-    bool Available() override { return delegate_->Available(); }
+    bool Available() override { return IsAvailable() && delegate_->Available(); }
     double GetStorageUsageRatio(const std::string &t) const override { return delegate_->GetStorageUsageRatio(t); }
     const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
     ErrorCode DoOpen(const StorageConfig &c, const std::string &t) override { return delegate_->DoOpen(c, t); }
@@ -137,7 +184,45 @@ public:
 
         EXPECT_EQ(EC_OK, cache_manager->DoRecover());
 
+        // 注册 tiered 测试用的冷热 dummy 后端。MarkForTieredWrite 要求 target 已注册，
+        // stale location 测试需要真实 backend 以便用 MightExistInterceptor 构造"meta SERVING 但数据已丢"。
+        RegisterDummyStorage("hot_01");
+        RegisterDummyStorage("cold_01");
+
         return cache_manager;
+    }
+
+    bool RegisterDummyStorage(const std::string &name) {
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path(GetPrivateTestRuntimeDataPath() + name + "/");
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto rc = std::make_shared<RequestContext>("reg_storage");
+        auto dsm = registry_manager_->data_storage_manager();
+        if (dsm->RegisterStorage(rc.get(), name, config) != EC_OK) {
+            return false;
+        }
+        // 默认让数据 MightExist=true，使仅建 meta location(未真正写数据文件)的 tiered 测试仍视其为有效；
+        // 需要模拟"数据已丢"的用例可在测试内覆盖为返回 false 的 interceptor。
+        auto original = dsm->storage_map_[name];
+        dsm->storage_map_[name] = std::make_shared<MightExistInterceptor>(
+            original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), true); });
+        return true;
+    }
+
+    bool RegisterNfsStorage(const std::string &name) {
+        auto spec = std::make_shared<NfsStorageSpec>();
+        spec->set_root_path(GetPrivateTestRuntimeDataPath() + name + "/");
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto rc = std::make_shared<RequestContext>("reg_nfs_storage");
+        return registry_manager_->data_storage_manager()->RegisterStorage(rc.get(), name, config) == EC_OK;
     }
 
     ModelDeployment createModelDeployment() {
@@ -162,6 +247,27 @@ public:
         return location_spec_infos;
     }
 
+    void EnableTieredMigrationStrategy(const std::string &group_name = "default",
+                                       const std::string &source_storage = "hot_01",
+                                       const std::string &target_storage = "cold_01",
+                                       int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs) {
+        auto iter = registry_manager_->instance_group_configs_.find(group_name);
+        ASSERT_TRUE(iter != registry_manager_->instance_group_configs_.end());
+        ASSERT_TRUE(iter->second != nullptr);
+        ASSERT_TRUE(iter->second->cache_config_ != nullptr);
+
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name(source_storage);
+        strategy->set_target_storage_name(target_storage);
+        strategy->set_trigger_threshold(0.01);
+        MigrationMethods methods;
+        methods.mutable_mark().set_enabled(true);
+        methods.mutable_mark().set_timeout_ms(mark_timeout_ms);
+        strategy->set_methods(methods);
+        strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
+        iter->second->cache_config_->set_migration_strategies({strategy});
+    }
+
     void expectEmptySpec(const CacheLocationView::LocationSpecViewVec &specs) {
         for (auto &spec : specs) {
             EXPECT_EQ("", spec.uri());
@@ -178,6 +284,27 @@ public:
     std::shared_ptr<RequestContext> request_context_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
+
+TEST_F(CacheManagerTest, TestInitRejectsInvalidMigrationWorkerBudget) {
+    const std::vector<std::pair<int32_t, uint32_t>> invalid_configs{
+        {1, 1}, // at least one worker must remain available outside migration
+        {2, 0},
+        {2, 2},
+        {2, 3},
+    };
+    for (const auto &[worker_count, migration_budget] : invalid_configs) {
+        auto manager = std::make_unique<CacheManager>(metrics_registry_, registry_manager_);
+        EXPECT_FALSE(manager->Init(worker_count,
+                                   /*cache_reclaimer_key_sampling_size_total*/ 1000,
+                                   /*cache_reclaimer_key_sampling_size_per_task*/ 100,
+                                   /*cache_reclaimer_del_batch_size*/ 100,
+                                   /*cache_reclaimer_idle_interval_ms*/ 100,
+                                   /*cache_reclaimer_worker_size*/ 16,
+                                   CacheReclaimerAsyncDeleteConfig{},
+                                   migration_budget))
+            << "worker_count=" << worker_count << " migration_budget=" << migration_budget;
+    }
+}
 
 TEST_F(CacheManagerTest, TestRegisterInstance) {
     // register same instance in each round
@@ -247,6 +374,39 @@ TEST_F(CacheManagerTest, TestRegisterInstance) {
     }
 }
 
+TEST_F(CacheManagerTest, TestRegisterInstanceReturnsTieredMigrationStorageConfigs) {
+    const std::string migration_source = "nfs_migration_source";
+    const std::string migration_target = "nfs_migration_target";
+    ASSERT_TRUE(RegisterNfsStorage(migration_source));
+    ASSERT_TRUE(RegisterNfsStorage(migration_target));
+
+    auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context_.get(), "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_NE(nullptr, instance_group);
+    const auto original_storage_candidates = instance_group->storage_candidates();
+    ASSERT_EQ(std::vector<std::string>({"nfs_01"}), original_storage_candidates);
+
+    EnableTieredMigrationStrategy("default", migration_source, migration_target);
+    auto [register_ec, storage_configs] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                                           "default",
+                                                                           "tiered_sdk_config_instance",
+                                                                           64,
+                                                                           createLocationSpecInfos(),
+                                                                           createModelDeployment(),
+                                                                           std::vector<LocationSpecGroup>());
+    ASSERT_EQ(EC_OK, register_ec);
+
+    std::vector<std::shared_ptr<StorageConfig>> returned_configs;
+    ASSERT_TRUE(Jsonizable::FromJsonString(storage_configs, returned_configs));
+    std::set<std::string> returned_storage_names;
+    for (const auto &config : returned_configs) {
+        ASSERT_NE(nullptr, config);
+        returned_storage_names.insert(config->global_unique_name());
+    }
+    EXPECT_EQ((std::set<std::string>{"nfs_01", migration_source, migration_target}), returned_storage_names);
+    EXPECT_EQ(original_storage_candidates, instance_group->storage_candidates());
+}
+
 TEST_F(CacheManagerTest, TestRemoveInstance) {
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
@@ -291,6 +451,34 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
         ASSERT_TRUE(Jsonizable::FromJsonString(metas[i], meta));
         ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND), meta.at("status"));
     }
+}
+
+// RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
+// Registry stub 在 drain 与删除的边界观察中间状态：false 场景验证删除 A 不会暂停
+// 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。
+TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseState) {
+    Stub stub;
+    stub.set(ADDR(RegistryManager, RemoveInstance), remove_instance_reclaimer_state_stub::RemoveInstance_stub);
+
+    auto verify_pause_state = [&](bool initially_paused) {
+        if (initially_paused) {
+            cache_manager_->PauseReclaimer();
+        } else {
+            cache_manager_->ResumeReclaimer();
+        }
+        ASSERT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
+
+        remove_instance_reclaimer_state_stub::Reset(cache_manager_->cache_reclaimer().get());
+        RequestContext ctx(initially_paused ? "remove_instance_paused" : "remove_instance_running");
+        EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
+        EXPECT_TRUE(remove_instance_reclaimer_state_stub::called);
+        EXPECT_EQ(initially_paused, remove_instance_reclaimer_state_stub::observed_paused);
+        EXPECT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
+    };
+
+    verify_pause_state(false);
+    verify_pause_state(true);
+    cache_manager_->ResumeReclaimer();
 }
 
 TEST_F(CacheManagerTest, TestRecover) {
@@ -2127,7 +2315,9 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
@@ -2135,20 +2325,22 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     // submit a second request and verify count increases
     func({300}, {{"loc_c"}});
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(2u, executor->tasks_.size());
+        ASSERT_EQ(2u, executor->WaitingTaskCountLocked());
     }
 
     // clean up: clear tasks so executor destructor is clean
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 }
 
@@ -2316,7 +2508,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: key 1 exists, key 2 stale, key 3 exists
@@ -2353,13 +2547,15 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
     // location
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     // clean up
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -2403,7 +2599,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: all stale
@@ -2427,12 +2625,14 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
     // deletion request submitted for the 2 stale keys
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -2476,7 +2676,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
     executor->stop_.store(false);
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
 
     // install interceptor: key 1 valid, key 2 stale, key 3 stale
@@ -2508,12 +2710,14 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
     // deletion request submitted for stale keys 2,3
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
+        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
     {
         std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
+        for (auto &queue : executor->task_queues_) {
+            queue.clear();
+        }
     }
     dsm->storage_map_["nfs_01"] = original;
 }
@@ -3253,4 +3457,1025 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
 
     dsm->storage_map_.erase("vineyard_default");
 }
+// ===== 多层存储 Mark 消费（写路径）=====
+
+// FilterWriteCache 统一入口：命中 mark 的 block 记录目标冷 storage（未命中为空）
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkPropagation) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+
+    // 持久化打标要求 block 先存在：给 block 1 建一个 location。
+    {
+        auto loc = std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, ids));
+    }
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1}, "cold_01");
+
+    CacheManager::KeyVector keys = {1, 2};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(
+        request_context_.get(), "placeholder_id", meta_searcher, keys, new_keys, {}, new_sgn, block_mask, 1, new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, new_keys.size());
+    ASSERT_EQ(new_keys.size(), new_targets.size());
+    for (size_t i = 0; i < new_keys.size(); ++i) {
+        if (new_keys[i] == 1) {
+            ASSERT_EQ("cold_01", new_targets[i]); // 命中 mark -> 目标冷 storage
+        } else {
+            ASSERT_EQ("", new_targets[i]); // 未命中 -> 空（走默认）
+        }
+    }
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheFallsBackToOrdinaryPolicyOnMarkReadError) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "mark_read_error",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("mark_read_error");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/mark_read_error?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    Stub stub;
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), mark_query_read_error_stub::ReadError_stub);
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "mark_read_error",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets));
+
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheInvalidTieredTargetUsesOrdinaryPolicy) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "invalid_tiered_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("invalid_tiered_target");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/invalid_target?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("invalid_tiered_target", {1}, "cold_01"));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("invalid_tiered_target", 1));
+
+    // Mark 创建后 target backend 被注销；hot 副本已满足普通策略，不应 fallback 再写一份 hot。
+    ASSERT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage("cold_01"));
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "invalid_tiered_target",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets));
+
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("invalid_tiered_target", 1));
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheUnavailableTieredTargetUsesOrdinaryPolicyAndKeepsMark) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "unavailable_tiered_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("unavailable_tiered_target");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/unavailable_target?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->MarkForTieredWrite(
+                  "unavailable_tiered_target", {1}, "cold_01"));
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "cold_01"));
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "unavailable_tiered_target",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets));
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("unavailable_tiered_target", 1));
+}
+
+TEST_F(CacheManagerTest, TestMigrationTargetsRespectGroupQuota) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->StartMigrationManager();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "migration_target_quota",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto default_group = registry_manager_->instance_group_configs_["default"];
+    ASSERT_NE(nullptr, default_group);
+    default_group->set_quota(InstanceGroupQuota(0, {}));
+
+    EXPECT_EQ(EC_NOSPC,
+              cache_manager_->migration_manager()->MarkForTieredWrite(
+                  "migration_target_quota", {1}, "cold_01"));
+    EXPECT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("migration_target_quota", 1));
+
+    MigrationManager::MigrationRequest request;
+    request.instance_group_name = "default";
+    request.instance_id = "migration_target_quota";
+    request.block_key = 1;
+    request.src_location_id = "source_location";
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.src_specs = {LocationSpec("tp0", "dummy://hot_01/source?size=1")};
+    const auto results = cache_manager_->migration_manager()->BatchSubmit("target-quota", {request});
+    ASSERT_EQ(1u, results.size());
+    EXPECT_EQ(EC_NOSPC, results[0]);
+    EXPECT_EQ(0u, cache_manager_->migration_manager()->GetStats().active_copy_tasks);
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadError) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_mark_read_error",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
+    ASSERT_TRUE(meta_searcher);
+
+    auto make_hot_loc = [](const std::string &uri) {
+        return std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+    };
+    for (const auto &uri : {"dummy://hot_01/mark_read_error_a?size=1", "dummy://hot_02/mark_read_error_b?size=1"}) {
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {make_hot_loc(uri)}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+            {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> cas_results;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    }
+
+    Stub stub;
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), mark_query_read_error_stub::ReadError_stub);
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_mark_read_error",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets));
+
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaInvalidTieredTargetUsesOrdinaryPolicy) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_invalid_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_invalid_target");
+    ASSERT_TRUE(meta_searcher);
+
+    auto add_serving_location = [&](int64_t block_key, const std::string &uri) {
+        auto loc = std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {block_key}, {loc}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+            {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> cas_results;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher->BatchCASLocationStatus(request_context_.get(), {block_key}, cas_tasks, cas_results));
+    };
+    // block 1 已有两个普通副本，block 2 只有一个；min_replica_count=2。
+    add_serving_location(1, "dummy://hot_01/min_replica_invalid_1a?size=1");
+    add_serving_location(1, "dummy://hot_02/min_replica_invalid_1b?size=1");
+    add_serving_location(2, "dummy://hot_01/min_replica_invalid_2?size=1");
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->MarkForTieredWrite("min_replica_invalid_target", {1, 2}, "cold_01"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage("cold_01"));
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_invalid_target",
+                                               meta_searcher,
+                                               {1, 2},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets));
+
+    // 失效 Mark 不再强制写：已满足的 block 1 跳过；未满足的 block 2 按普通策略走默认层。
+    ASSERT_EQ((CacheManager::KeyVector{2}), new_keys);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_TRUE(new_targets[0].empty());
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("min_replica_invalid_target", 1));
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("min_replica_invalid_target", 2));
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheSkipsTieredMarkWhenMigrationDisabled) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "tiered_disabled",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite("tiered_disabled", {1}, "cold_01"));
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "tiered_disabled",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+
+    auto writing_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        4,
+        std::vector<LocationSpec>{
+            LocationSpec("tp0", "dummy://cold_01/blk1/tp0?size=1"),
+            LocationSpec("tp1", "dummy://cold_01/blk1/tp1?size=1"),
+            LocationSpec("tp2", "dummy://cold_01/blk1/tp2?size=1"),
+            LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
+        });
+    auto serving_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        4,
+        std::vector<LocationSpec>{
+            LocationSpec("tp0", "dummy://cold_01/blk2/tp0?size=1"),
+            LocationSpec("tp1", "dummy://cold_01/blk2/tp1?size=1"),
+            LocationSpec("tp2", "dummy://cold_01/blk2/tp2?size=1"),
+            LocationSpec("tp3", "dummy://cold_01/blk2/tp3?size=1"),
+        });
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1, 2}, {writing_loc, serving_loc}, ids));
+    ASSERT_EQ(2u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[1], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {2}, cas_tasks, cas_results));
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1, 2}, "cold_01");
+
+    CacheManager::KeyVector keys = {1, 2};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(
+        request_context_.get(), "placeholder_id", meta_searcher, keys, new_keys, {}, new_sgn, block_mask, 1, new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+// 冷层 target 有 CLS_SERVING location 但数据已丢（MightExist=false）时，marked write 不应因
+// meta 仍 SERVING 就跳过；应视 target 未满足 → block 进待写集并路由回 cold_01。stale 判断复用普通路径
+// 的 prune 结果(同一次 Exist)，不额外查后端。
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredStaleTargetTriggersRewrite) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "stale_tier_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("stale_tier_instance");
+    ASSERT_TRUE(meta_searcher);
+
+    // block 1: 冷层 cold_01 上有一个覆盖全 spec 的 SERVING location。
+    auto cold_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        4,
+        std::vector<LocationSpec>{
+            LocationSpec("tp0", "dummy://cold_01/blk1/tp0?size=1"),
+            LocationSpec("tp1", "dummy://cold_01/blk1/tp1?size=1"),
+            LocationSpec("tp2", "dummy://cold_01/blk1/tp2?size=1"),
+            LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
+        });
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {cold_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    cache_manager_->migration_manager()->MarkForTieredWrite("stale_tier_instance", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("stale_tier_instance", 1));
+
+    // 让 cold_01 的数据 MightExist=false(模拟数据被驱逐/丢失)——此时 meta 仍 SERVING，但数据不在。
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["cold_01"];
+    dsm->storage_map_["cold_01"] = std::make_shared<MightExistInterceptor>(
+        original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), false); });
+
+    CacheManager::KeyVector keys = {1};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "stale_tier_instance",
+                                               meta_searcher,
+                                               keys,
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets);
+    dsm->storage_map_["cold_01"] = original;
+
+    ASSERT_EQ(EC_OK, ec);
+    // 关键:stale 冷层 target 被视为未满足 → block 1 需重写且路由回 cold_01(而非误判已满足跳过)。
+    ASSERT_EQ(1u, new_keys.size());
+    ASSERT_EQ(1, new_keys[0]);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_EQ("cold_01", new_targets[0]);
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaUsesTieredMarkTarget) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_tiered",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_tiered");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    cache_manager_->migration_manager()->MarkForTieredWrite("min_replica_tiered", {1}, "cold_01");
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_tiered",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, new_keys.size());
+    ASSERT_EQ(1, new_keys[0]);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_EQ("cold_01", new_targets[0]);
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaHonorsTieredMarkWhenReplicaSatisfied) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_satisfied_tiered",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
+    ASSERT_TRUE(meta_searcher);
+
+    auto make_hot_loc = [](const std::string &uri) {
+        return std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+    };
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchAddLocation(
+                  request_context_.get(), {1}, {make_hot_loc("dummy://hot_01/blk1_a?size=1")}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    ids.clear();
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchAddLocation(
+                  request_context_.get(), {1}, {make_hot_loc("dummy://hot_02/blk1_b?size=1")}, ids));
+    ASSERT_EQ(1u, ids.size());
+    cas_tasks = {{MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    cas_results.clear();
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    cache_manager_->migration_manager()->MarkForTieredWrite("min_replica_satisfied_tiered", {1}, "cold_01");
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_satisfied_tiered",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, new_keys.size());
+    ASSERT_EQ(1, new_keys[0]);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_EQ("cold_01", new_targets[0]);
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) {
+    EnableTieredMigrationStrategy();
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+        LocationSpecInfo("tp0_L1", 512),
+        LocationSpecInfo("tp1_L1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}),
+        LocationSpecGroup("L1", {"tp0_L1", "tp1_L1"}),
+    };
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "tiered_spec_group",
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_spec_group");
+    ASSERT_TRUE(meta_searcher);
+
+    auto cold_f0_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        2,
+        std::vector<LocationSpec>{
+            LocationSpec("tp0_F0", "dummy://cold_01/blk1/tp0_F0?size=1"),
+            LocationSpec("tp1_F0", "dummy://cold_01/blk1/tp1_F0?size=1"),
+        });
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {cold_f0_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    cache_manager_->migration_manager()->MarkForTieredWrite("tiered_spec_group", {1}, "cold_01");
+
+    {
+        CacheManager::KeyVector new_keys;
+        std::vector<std::string_view> new_sgn;
+        BlockMask block_mask;
+        std::vector<std::string> new_targets;
+        auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                                   "tiered_spec_group",
+                                                   meta_searcher,
+                                                   {1},
+                                                   new_keys,
+                                                   {"F0"},
+                                                   new_sgn,
+                                                   block_mask,
+                                                   1,
+                                                   new_targets);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_TRUE(new_keys.empty());
+        ASSERT_TRUE(new_targets.empty());
+    }
+
+    {
+        CacheManager::KeyVector new_keys;
+        std::vector<std::string_view> new_sgn;
+        BlockMask block_mask;
+        std::vector<std::string> new_targets;
+        auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                                   "tiered_spec_group",
+                                                   meta_searcher,
+                                                   {1},
+                                                   new_keys,
+                                                   {"L1"},
+                                                   new_sgn,
+                                                   block_mask,
+                                                   1,
+                                                   new_targets);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, new_keys.size());
+        ASSERT_EQ(1, new_keys[0]);
+        ASSERT_EQ(1u, new_sgn.size());
+        ASSERT_EQ("L1", new_sgn[0]);
+        ASSERT_EQ(1u, new_targets.size());
+        ASSERT_EQ("cold_01", new_targets[0]);
+    }
+}
+
+// GenWriteLocation 按 block 路由：marked block 的 location 落在目标冷 storage
+TEST_F(CacheManagerTest, TestGenWriteLocationTieredRouting) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    // cold_01 由 fixture 注册（dummy + MightExist=true）。
+
+    CacheManager::KeyVector new_keys = {1, 2};
+    std::vector<std::string_view> new_sgn;
+    std::vector<std::string> tiered_targets = {"", "cold_01"}; // block 2 -> 冷层
+    CacheLocationVector new_locations;
+    auto ec = cache_manager_->GenWriteLocation(
+        request_context_.get(), "placeholder_id", new_keys, new_sgn, tiered_targets, new_locations);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, new_locations.size());
+    // block 2 被路由到 cold_01（DUMMY 类型）；block 1 走默认 storage（非 DUMMY）
+    ASSERT_TRUE(new_locations[1] != nullptr && new_locations[0] != nullptr);
+    ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, new_locations[1]->type());
+    ASSERT_NE(DataStorageType::DATA_STORAGE_TYPE_DUMMY, new_locations[0]->type());
+}
+
+// 全部 block 都有 tiered target 时，不应因为默认 hot storage 不可选而阻断冷层写入。
+TEST_F(CacheManagerTest, TestGenWriteLocationAllTieredDoesNotRequireDefaultStorage) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "all_tiered_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    // cold_01 由 fixture 注册（dummy + MightExist=true）。
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "nfs_01"));
+
+    CacheManager::KeyVector new_keys = {1, 2};
+    std::vector<std::string_view> new_sgn;
+    std::vector<std::string> tiered_targets = {"cold_01", "cold_01"};
+    CacheLocationVector new_locations;
+    auto ec = cache_manager_->GenWriteLocation(
+        request_context_.get(), "all_tiered_instance", new_keys, new_sgn, tiered_targets, new_locations);
+
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, new_locations.size());
+    for (const auto &location : new_locations) {
+        ASSERT_NE(nullptr, location);
+        ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, location->type());
+        for (const auto &spec : location->location_specs()) {
+            ASSERT_THAT(spec.uri(), HasSubstr("dummy://cold_01/"));
+        }
+    }
+}
+
+TEST_F(CacheManagerTest, TestGenWriteLocationMissingTieredTargetDoesNotFallback) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "missing_tiered_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    ASSERT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage("cold_01"));
+
+    CacheLocationVector new_locations;
+    ASSERT_EQ(EC_NOENT,
+              cache_manager_->GenWriteLocation(
+                  request_context_.get(), "missing_tiered_target", {1}, {}, {"cold_01"}, new_locations));
+    ASSERT_TRUE(new_locations.empty());
+}
+
+// FinishWriteCache 成功把本次 target CacheLocation 置为 SERVING 后清除 tiered-write mark
+TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
+    // 清标是 tiered migration 行为，仅对启用了 migration_strategies 的 group 生效。
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+    std::vector<std::string> source_ids;
+    {
+        auto loc = std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, source_ids));
+    }
+    ASSERT_EQ(1u, source_ids.size());
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
+
+    auto target_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1?size=1")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {target_loc}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    auto info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    info->keys = {1};
+    info->location_ids = {target_ids[0]};
+    BlockMask success_mask = static_cast<BlockMaskOffset>(1); // 全部成功
+    auto ec = cache_manager_->FinishWriteCache(
+        request_context_.get(), "placeholder_id", "sess_p5", success_mask, std::move(info));
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {1}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(2u, location_maps[0].size());
+    EXPECT_NE(location_maps[0].end(), location_maps[0].find(source_ids[0]));
+    EXPECT_NE(location_maps[0].end(), location_maps[0].find(target_ids[0]));
+}
+
+TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
+    constexpr int64_t kTimeoutMs = 3000;
+    EnableTieredMigrationStrategy("default", "hot_01", "cold_01", kTimeoutMs);
+    cache_manager_->StartMigrationManager();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "admin_mark_timeout_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_timeout_instance");
+    ASSERT_TRUE(meta_searcher);
+    auto source_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {source_loc}, source_ids));
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> status_tasks = {
+        {{source_ids[0], CacheLocationStatus::CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> status_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpdateLocationStatus(
+                  request_context_.get(), {1}, status_tasks, status_results));
+
+    const auto before = std::chrono::system_clock::now();
+    const auto result = cache_manager_->MigrateCache(request_context_.get(),
+                                                     "admin-mark-timeout",
+                                                     "admin_mark_timeout_instance",
+                                                     "hot_01",
+                                                     "cold_01",
+                                                     false,
+                                                     true,
+                                                     {1},
+                                                     0);
+    const auto after = std::chrono::system_clock::now();
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.accepted);
+    ASSERT_EQ(0, result.rejected);
+
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->BatchGetTieredWriteTargets(
+                  "admin_mark_timeout_instance", {1}, marks));
+    ASSERT_EQ(1u, marks.size());
+    ASSERT_TRUE(marks[0].HasValidMark());
+    const auto before_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     before.time_since_epoch())
+                                     .count() +
+                                 kTimeoutMs;
+    const auto after_deadline =
+        std::chrono::duration_cast<std::chrono::milliseconds>(after.time_since_epoch()).count() + kTimeoutMs;
+    EXPECT_GE(marks[0].deadline_ms, before_deadline);
+    EXPECT_LE(marks[0].deadline_ms, after_deadline);
+}
+
+TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
+    EnableTieredMigrationStrategy("default", "hot_01", "cold_01", 3000);
+    cache_manager_->StartMigrationManager();
+    ASSERT_TRUE(RegisterDummyStorage("cold_02"));
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "admin_mark_unmatched_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_unmatched_target");
+    ASSERT_TRUE(meta_searcher);
+    auto source_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {source_loc}, source_ids));
+    ASSERT_EQ(1u, source_ids.size());
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> status_tasks = {
+        {{source_ids[0], CacheLocationStatus::CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> status_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpdateLocationStatus(
+                  request_context_.get(), {1}, status_tasks, status_results));
+
+    const auto before = std::chrono::system_clock::now();
+    const auto result = cache_manager_->MigrateCache(request_context_.get(),
+                                                     "admin-mark-unmatched-target",
+                                                     "admin_mark_unmatched_target",
+                                                     "hot_01",
+                                                     "cold_02",
+                                                     false,
+                                                     true,
+                                                     {1},
+                                                     0);
+    const auto after = std::chrono::system_clock::now();
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.accepted);
+    ASSERT_EQ(0, result.rejected);
+
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->BatchGetTieredWriteTargets(
+                  "admin_mark_unmatched_target", {1}, marks));
+    ASSERT_EQ(1u, marks.size());
+    ASSERT_TRUE(marks[0].HasValidMark());
+    EXPECT_EQ("cold_02", marks[0].target);
+    const auto before_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     before.time_since_epoch())
+                                     .count() +
+                                 MigrationMarkMethod::kDefaultTimeoutMs;
+    const auto after_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(after.time_since_epoch()).count() +
+                                MigrationMarkMethod::kDefaultTimeoutMs;
+    EXPECT_GE(marks[0].deadline_ms, before_deadline);
+    EXPECT_LE(marks[0].deadline_ms, after_deadline);
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
+    auto default_group = registry_manager_->instance_group_configs_["default"];
+    ASSERT_TRUE(default_group != nullptr);
+    default_group->cache_config_->set_migration_mark_clear_policy(
+        MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED);
+    // 清标只对启用了 migration_strategies 的 group 生效。
+    EnableTieredMigrationStrategy();
+
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "full_policy_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("full_policy_instance");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> hot_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, hot_ids));
+    cache_manager_->migration_manager()->MarkForTieredWrite("full_policy_instance", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
+
+    auto partial_cold_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1/tp0?size=1")});
+    std::vector<std::string> partial_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {partial_cold_loc}, partial_ids));
+    auto partial_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    partial_info->keys = {1};
+    partial_info->location_ids = {partial_ids[0]};
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "full_policy_instance",
+                                               "sess_partial",
+                                               static_cast<BlockMaskOffset>(1),
+                                               std::move(partial_info)));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
+
+    auto remaining_cold_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        3,
+        std::vector<LocationSpec>{
+            LocationSpec("tp1", "dummy://cold_01/blk1/tp1?size=1"),
+            LocationSpec("tp2", "dummy://cold_01/blk1/tp2?size=1"),
+            LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
+        });
+    std::vector<std::string> remaining_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {remaining_cold_loc}, remaining_ids));
+    auto remaining_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    remaining_info->keys = {1};
+    remaining_info->location_ids = {remaining_ids[0]};
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "full_policy_instance",
+                                               "sess_remaining",
+                                               static_cast<BlockMaskOffset>(1),
+                                               std::move(remaining_info)));
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
+}
+
+// FinishWriteCache 的 mark 清理只对启用了 tiered migration 的 instance group 生效，
+// 与 FilterWriteCache 的 mark 消费入口对称。未配置 migration_strategies 的 group（例如 admin
+// 旁路直接打标）不应在 finish 时清标——这类 mark 由 MigrationManager 的超时线程兜底清理。
+// 旧实现用 `migration_manager_ != nullptr`（恒真）当门，会错误地对无策略 group 也清标。
+TEST_F(CacheManagerTest, TestFinishWriteCacheSkipsTieredMarkWhenMigrationDisabled) {
+    // 注意：默认 "default" group 未启用 migration 策略（未调用 EnableTieredMigrationStrategy）。
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "tiered_disabled_finish",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled_finish");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+    std::vector<std::string> hot_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, hot_ids));
+
+    // 通过 admin 旁路直接打标（该 group 无策略）。
+    cache_manager_->migration_manager()->MarkForTieredWrite("tiered_disabled_finish", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));
+
+    // 构造一个 finish 后会 SERVING 且覆盖 spec 的冷层 target：旧代码（判空恒真）据此清标，
+    // 新代码因该 group 未启用 migration 而跳过整段，mark 应保留。
+    auto target_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1?size=1")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {target_loc}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    auto info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    info->keys = {1};
+    info->location_ids = {target_ids[0]};
+    BlockMask success_mask = static_cast<BlockMaskOffset>(1);
+    auto ec = cache_manager_->FinishWriteCache(
+        request_context_.get(), "tiered_disabled_finish", "sess_disabled", success_mask, std::move(info));
+    ASSERT_EQ(EC_OK, ec);
+    // 关键断言：未启用 migration 的 group，finish 不清标。
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));
+}
+
 } // namespace kv_cache_manager

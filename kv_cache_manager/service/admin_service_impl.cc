@@ -11,9 +11,12 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
@@ -524,6 +527,62 @@ void AdminServiceImpl::RemoveCache(RequestContext *request_context,
         KVCM_LOG_INFO("[traceId: %s] RemoveCache succeeded", request->trace_id().c_str());
     }
 };
+
+void AdminServiceImpl::MigrateCache(RequestContext *request_context,
+                                    const proto::admin::MigrateCacheRequest *request,
+                                    proto::admin::MigrateCacheResponse *response) {
+    API_CALL_GUARD("MigrateCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "instance_id", true);
+    }
+    if (request->source_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "source_storage_name", true);
+    }
+    if (request->target_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "target_storage_name", true);
+    }
+    const auto method = request->method();
+    if (method != proto::admin::MIGRATION_METHOD_COPY && method != proto::admin::MIGRATION_METHOD_MARK &&
+        method != proto::admin::MIGRATION_METHOD_BOTH) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
+    }
+
+    const bool do_copy =
+        method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_mark =
+        method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
+
+    // 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
+    // 显式 block_keys 优先，否则由 facade 按 rule.sample_count 采样（<=0 用默认）。
+    const std::vector<int64_t> block_keys(request->block_keys().begin(), request->block_keys().end());
+    const auto result = cache_manager_->MigrateCache(request_context,
+                                                     request->trace_id(),
+                                                     request->instance_id(),
+                                                     request->source_storage_name(),
+                                                     request->target_storage_name(),
+                                                     do_copy,
+                                                     do_mark,
+                                                     block_keys,
+                                                     request->rule().sample_count());
+
+    response->set_accepted(result.accepted);
+    response->set_rejected(result.rejected);
+    status->set_code(result.ec == EC_OK ? proto::admin::OK : ToAdminPbError(result.ec));
+    status->set_message(result.message);
+    request_context->set_status_code(status->code());
+    KVCM_LOG_INFO("[traceId: %s] MigrateCache instance %s src %s dst %s method %d accepted %lld rejected %lld",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->source_storage_name().c_str(),
+                  request->target_storage_name().c_str(),
+                  static_cast<int>(method),
+                  static_cast<long long>(result.accepted),
+                  static_cast<long long>(result.rejected));
+}
 
 // Instance相关接口实现
 void AdminServiceImpl::RegisterInstance(RequestContext *request_context,

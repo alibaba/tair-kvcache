@@ -1,6 +1,7 @@
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 
 #include <algorithm>
+#include <cassert>
 #include <exception>
 #include <memory>
 #include <unordered_set>
@@ -72,41 +73,68 @@ private:
 
 DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count);
 DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count);
+DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_migration_task_count);
+DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(executing_migration_task_count);
 
 SchedulePlanExecutor::SchedulePlanExecutor(unsigned int thread_count,
                                            const std::shared_ptr<MetaIndexerManager> &meta_manager,
                                            const std::shared_ptr<DataStorageManager> &storage_manager,
-                                           const std::shared_ptr<MetricsRegistry> &metrics_registry)
+                                           const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                                           unsigned int migration_worker_budget)
     : meta_manager_(meta_manager)
     , data_storage_manager_(storage_manager)
     , metrics_registry_(metrics_registry)
     , stop_(false) {
     REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count);
     REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count);
+    REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_migration_task_count);
+    REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_migration_task_count);
 
     if (thread_count == 0)
         thread_count = 1;
+    const std::size_t requested_migration_budget =
+        migration_worker_budget == std::numeric_limits<unsigned int>::max() ? thread_count : migration_worker_budget;
+    // CacheManager/ServerConfig enforce the production invariant budget < worker count. Keep the
+    // standalone executor total here so an invalid direct caller cannot permanently strand migration tasks.
+    migration_worker_budget_ =
+        std::max<std::size_t>(1, std::min<std::size_t>(requested_migration_budget, thread_count));
 
     for (unsigned int i = 0; i < thread_count; ++i) {
         workers_.emplace_back([this]() { WorkerRoutine(); });
     }
-    KVCM_LOG_INFO("SchedulePlanExecutor initialized with %u worker threads", thread_count);
+    KVCM_LOG_INFO("SchedulePlanExecutor initialized with %u worker threads, migration worker budget %zu",
+                  thread_count,
+                  migration_worker_budget_);
 }
 void SchedulePlanExecutor::Stop() {
     KVCM_LOG_DEBUG("Stopping SchedulePlanExecutor...");
     std::vector<std::function<void()>> cancel_tasks;
     {
+        // The stop predicate and both condition-variable waits are synchronized by
+        // queue_mutex_. This prevents a worker from observing stop_ == false and
+        // going to sleep after the shutdown notification has already been sent.
         std::lock_guard<std::mutex> lock(queue_mutex_);
         stop_ = true;
-        cancel_tasks.reserve(tasks_.size());
-        for (const auto &scheduled_task : tasks_) {
-            if (scheduled_task.cancel_task) {
-                cancel_tasks.emplace_back(scheduled_task.cancel_task);
+        const auto waiting_task_count = WaitingTaskCountLocked();
+        std::size_t waiting_migration_task_count = 0;
+        cancel_tasks.reserve(waiting_task_count);
+        for (std::size_t class_idx = 0; class_idx < task_queues_.size(); ++class_idx) {
+            auto &queue = task_queues_[class_idx];
+            if (IsMigrationTaskClass(static_cast<ScheduleTaskClass>(class_idx))) {
+                waiting_migration_task_count += queue.size();
             }
+            for (const auto &scheduled_task : queue) {
+                if (scheduled_task.cancel_task) {
+                    cancel_tasks.emplace_back(scheduled_task.cancel_task);
+                }
+            }
+            queue.clear();
         }
-        if (!tasks_.empty()) {
-            METRICS_(schedule_plan_executor, waiting_task_count) -= tasks_.size();
-            tasks_.clear();
+        if (waiting_task_count > 0) {
+            METRICS_(schedule_plan_executor, waiting_task_count) -= waiting_task_count;
+        }
+        if (waiting_migration_task_count > 0) {
+            METRICS_(schedule_plan_executor, waiting_migration_task_count) -= waiting_migration_task_count;
         }
     }
     condition_.notify_all();
@@ -129,36 +157,69 @@ void SchedulePlanExecutor::Stop() {
 
 SchedulePlanExecutor::~SchedulePlanExecutor() { Stop(); }
 
+bool SchedulePlanExecutor::IsMigrationTaskClass(ScheduleTaskClass task_class) {
+    return task_class == ScheduleTaskClass::kMigrationPrepare ||
+           task_class == ScheduleTaskClass::kMigrationContinuation;
+}
+
+std::size_t SchedulePlanExecutor::TaskClassIndex(ScheduleTaskClass task_class) {
+    return static_cast<std::size_t>(task_class);
+}
+
+std::size_t SchedulePlanExecutor::WaitingTaskCountLocked() const {
+    std::size_t total = 0;
+    for (const auto &queue : task_queues_) {
+        total += queue.size();
+    }
+    return total;
+}
+
 void SchedulePlanExecutor::WorkerRoutine() {
-    while (!stop_) {
+    while (true) {
         std::function<void()> task;
+        bool is_migration_task = false;
 
         {
             auto wait_until_time = std::chrono::steady_clock::time_point::max();
             std::unique_lock<std::mutex> lock(queue_mutex_);
+            if (stop_) {
+                return;
+            }
 
-            // 检查是否有可执行的任务
-            if (!tasks_.empty()) {
-                auto earliest_task = tasks_.begin();
-                auto now = std::chrono::steady_clock::now();
-
-                if (earliest_task->execute_time <= now) {
-                    // 租约时间已到，取出任务执行
-                    task = earliest_task->task;
-                    tasks_.erase(earliest_task);
-                } else {
-                    // 租约时间未到，记录等待时间点
-                    wait_until_time = earliest_task->execute_time;
+            const auto now = std::chrono::steady_clock::now();
+            // task_queues_ 的下标同时是优先级。每类只检查队首，避免 migration budget 满时
+            // 在线性队列中扫描 ready reclaim task，把 queue_mutex_ 变成热点。
+            for (std::size_t class_idx = 0; class_idx < task_queues_.size(); ++class_idx) {
+                auto &queue = task_queues_[class_idx];
+                if (queue.empty()) {
+                    continue;
                 }
+                const auto task_class = static_cast<ScheduleTaskClass>(class_idx);
+                const bool migration_class = IsMigrationTaskClass(task_class);
+                if (migration_class && running_migration_tasks_ >= migration_worker_budget_) {
+                    continue;
+                }
+                auto earliest_task = queue.begin();
+                if (earliest_task->execute_time > now) {
+                    wait_until_time = std::min(wait_until_time, earliest_task->execute_time);
+                    continue;
+                }
+                task = earliest_task->task;
+                is_migration_task = migration_class;
+                queue.erase(earliest_task);
+                if (is_migration_task) {
+                    ++running_migration_tasks_;
+                }
+                break;
             }
 
             if (!task) {
                 if (wait_until_time != std::chrono::steady_clock::time_point::max()) {
-                    // 等待到最早任务的时间或新任务到达
                     condition_.wait_until(lock, wait_until_time);
-                } else if (tasks_.empty()) {
-                    // 队列为空，等待新任务
-                    condition_.wait(lock, [this] { return stop_ || (!tasks_.empty()); });
+                } else {
+                    // 队列为空，或只剩 budget 已满的 ready migration。migration 完成、
+                    // 新 reclaim 入队和 Stop 都会通知这里重新选择。
+                    condition_.wait(lock);
                 }
                 continue;
             }
@@ -167,12 +228,25 @@ void SchedulePlanExecutor::WorkerRoutine() {
         if (task) {
             METRICS_(schedule_plan_executor, waiting_task_count) -= 1;
             METRICS_(schedule_plan_executor, executing_task_count) += 1;
+            if (is_migration_task) {
+                METRICS_(schedule_plan_executor, waiting_migration_task_count) -= 1;
+                METRICS_(schedule_plan_executor, executing_migration_task_count) += 1;
+            }
             try {
                 task();
             } catch (const std::exception &e) {
                 KVCM_LOG_ERROR("schedule plan executor task threw exception: %s", e.what());
             } catch (...) { KVCM_LOG_ERROR("schedule plan executor task threw unknown exception"); }
             METRICS_(schedule_plan_executor, executing_task_count) -= 1;
+            if (is_migration_task) {
+                METRICS_(schedule_plan_executor, executing_migration_task_count) -= 1;
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+                    assert(running_migration_tasks_ > 0);
+                    --running_migration_tasks_;
+                }
+                condition_.notify_one();
+            }
         }
     }
 }
@@ -317,9 +391,14 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     return result;
 }
 
-bool SchedulePlanExecutor::SubmitRaw(const std::function<void()> &task,
+bool SchedulePlanExecutor::SubmitRaw(std::function<void()> task,
                                      std::chrono::microseconds delay,
-                                     const std::function<void()> &cancel_task) {
+                                     std::function<void()> cancel_task,
+                                     ScheduleTaskClass task_class) {
+    const auto task_class_index = TaskClassIndex(task_class);
+    if (task_class_index >= task_queues_.size()) {
+        return false;
+    }
     try {
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -329,8 +408,12 @@ bool SchedulePlanExecutor::SubmitRaw(const std::function<void()> &task,
 
             auto execute_time = std::chrono::steady_clock::now() + delay;
             uint64_t sequence_id = sequence_counter_.fetch_add(1, std::memory_order_relaxed);
-            tasks_.emplace(ScheduledTask{task, cancel_task, execute_time, sequence_id});
+            task_queues_[task_class_index].emplace(
+                ScheduledTask{std::move(task), std::move(cancel_task), execute_time, sequence_id});
             METRICS_(schedule_plan_executor, waiting_task_count) += 1;
+            if (IsMigrationTaskClass(task_class)) {
+                METRICS_(schedule_plan_executor, waiting_migration_task_count) += 1;
+            }
         }
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("enqueue schedule plan executor task failed: %s", e.what());
@@ -344,6 +427,11 @@ bool SchedulePlanExecutor::SubmitRaw(const std::function<void()> &task,
 }
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRequest &task) {
+    return SubmitMetaDelete(task, ScheduleTaskClass::kSystem);
+}
+
+std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const CacheMetaDelRequest &task,
+                                                                     ScheduleTaskClass task_class) {
     KVCM_LOG_DEBUG("Submitting meta delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -439,7 +527,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     auto cancel_task = [promise]() {
         HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before task execution.");
     };
-    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task);
+    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task, task_class);
     if (!submit_result) {
         HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit task failed");
         return future;
@@ -617,7 +705,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
 
 void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                                               std::chrono::microseconds delay,
-                                              const std::function<LocationDelAdmissionResult()> &prepare) {
+                                              const std::function<LocationDelAdmissionResult()> &prepare,
+                                              ScheduleTaskClass task_class) {
     try {
         auto admission_result = prepare();
         if (admission_result.result.status != ErrorCode::EC_OK || !admission_result.needs_physical_delete) {
@@ -639,7 +728,7 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         auto cancel_task = [completion]() {
             completion->Complete(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before physical delete.");
         };
-        if (!SubmitRaw(execute_task, delay, cancel_task)) {
+        if (!SubmitRaw(execute_task, delay, cancel_task, task_class)) {
             completion->Complete(ErrorCode::EC_ERROR, "submit physical delete task failed");
         }
     } catch (const std::exception &e) {
@@ -649,6 +738,11 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
 }
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationDelRequest &task) {
+    return SubmitLocationDelete(task, ScheduleTaskClass::kSystem);
+}
+
+std::future<PlanExecuteResult>
+SchedulePlanExecutor::SubmitLocationDelete(const CacheLocationDelRequest &task, ScheduleTaskClass task_class) {
     KVCM_LOG_DEBUG("Submitting location delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -656,7 +750,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
     auto future = promise->get_future();
     auto completion = std::make_shared<PromiseCompletion>(promise);
-    RunDeleteAdmission(completion, task.delay, [this, &task]() { return PrepareDeleteTask(task); });
+    RunDeleteAdmission(completion, task.delay, [this, &task]() { return PrepareDeleteTask(task); }, task_class);
     return future;
 }
 
@@ -682,30 +776,125 @@ SchedulePlanExecutor::SubmitDeleteTaskAsync(std::chrono::microseconds delay,
     auto future = promise->get_future();
     auto completion = std::make_shared<PromiseCompletion>(promise);
     auto admission_task = [this, completion, delay, prepare = std::move(prepare)]() {
-        RunDeleteAdmission(completion, delay, prepare);
+        RunDeleteAdmission(completion, delay, prepare, ScheduleTaskClass::kReclaim);
     };
     auto cancel_task = [completion]() {
         completion->Complete(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before delete admission.");
     };
-    if (!SubmitRaw(admission_task, std::chrono::microseconds::zero(), cancel_task)) {
+    if (!SubmitRaw(admission_task,
+                   std::chrono::microseconds::zero(),
+                   cancel_task,
+                   ScheduleTaskClass::kReclaim)) {
         return AsyncDeleteSubmitResult{};
     }
     return AsyncDeleteSubmitResult{true, std::move(future)};
 }
 
-bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req) {
-    return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class) {
+    return SubmitRaw(
+        [this, req, task_class]() { SubmitMetaDelete(req, task_class); }, std::chrono::microseconds{0}, {}, task_class);
 }
 
-bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req) {
-    return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req, ScheduleTaskClass task_class) {
+    return SubmitRaw([this, req, task_class]() { SubmitLocationDelete(req, task_class); },
+                     std::chrono::microseconds{0},
+                     {},
+                     task_class);
 }
 
 bool SchedulePlanExecutor::SubmitTask(std::function<void()> task, std::chrono::microseconds delay) {
+    return SubmitTask(ScheduleTaskClass::kSystem, std::move(task), delay);
+}
+
+bool SchedulePlanExecutor::SubmitTask(ScheduleTaskClass task_class,
+                                      std::function<void()> task,
+                                      std::chrono::microseconds delay,
+                                      std::function<void()> cancel_task) {
     if (!task) {
         return false;
     }
-    return SubmitRaw(std::move(task), delay);
+    return SubmitRaw(std::move(task), delay, std::move(cancel_task), task_class);
+}
+
+void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
+                                      const CacheLocationCopyRequest &task) {
+    PlanExecuteResult result;
+    result.status = ErrorCode::EC_OK;
+
+    if (task.src_uris.size() != task.dst_uris.size()) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_BADARGS,
+                           "src_uris size %zu != dst_uris size %zu",
+                           task.src_uris.size(),
+                           task.dst_uris.size());
+        return;
+    }
+    if (task.src_uris.empty()) {
+        promise->set_value(result);
+        return;
+    }
+
+    auto request_context = std::make_shared<RequestContext>("location_copy_task_trace");
+    std::vector<ErrorCode> copy_results =
+        data_storage_manager_->Copy(request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris);
+
+    // 后端必须为每个输入 URI 返回一个结果（接口 postcondition）。短返回意味着部分 spec 的
+    // 复制状态不可知——整体判为失败,防止 MigrationManager promote 不完整的目标 location。
+    if (copy_results.size() != task.src_uris.size()) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Copy returned %zu results, expected %zu (storage: %s, block_key: %ld)",
+                           copy_results.size(),
+                           task.src_uris.size(),
+                           task.exec_storage_name.c_str(),
+                           task.block_key);
+        return;
+    }
+
+    for (size_t i = 0; i < copy_results.size(); ++i) {
+        if (copy_results[i] != ErrorCode::EC_OK) {
+            result.status = ErrorCode::EC_PARTIAL_OK;
+            KVCM_LOG_WARN("Failed to copy kvcache via storage %s, block_key: %ld, src: %s, dst: %s, ec: %d",
+                          task.exec_storage_name.c_str(),
+                          task.block_key,
+                          i < task.src_uris.size() ? task.src_uris[i].ToUriString().c_str() : "",
+                          i < task.dst_uris.size() ? task.dst_uris[i].ToUriString().c_str() : "",
+                          copy_results[i]);
+        }
+    }
+    KVCM_LOG_DEBUG("DoCopyTask completed for instance_id: %s, block_key: %ld, status: %d",
+                   task.instance_id.c_str(),
+                   task.block_key,
+                   result.status);
+    promise->set_value(result);
+}
+
+std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationCopyRequest &task) {
+    KVCM_LOG_DEBUG("Submitting copy task for instance_id: %s, block_key: %ld, uris: %zu",
+                   task.instance_id.c_str(),
+                   task.block_key,
+                   task.src_uris.size());
+
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    std::future<PlanExecuteResult> future = promise->get_future();
+
+    if (stop_) {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
+        return future;
+    }
+
+    // copy 任务是 URI 级（URI 已由 MigrationManager 解析/预分配），无需 meta 解析，直接异步执行。
+    auto execute_task = [this, promise, task]() { DoCopyTask(promise, task); };
+    auto cancel_task = [promise]() {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before copy task execution.");
+    };
+    bool submit_result = this->SubmitRaw(
+        execute_task, task.delay, cancel_task, ScheduleTaskClass::kMigrationContinuation);
+    if (!submit_result) {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit copy task failed");
+        return future;
+    }
+    return future;
 }
 
 } // namespace kv_cache_manager

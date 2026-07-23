@@ -30,7 +30,7 @@ VineyardBackend::~VineyardBackend() {
 
 DataStorageType VineyardBackend::GetType() { return DataStorageType::DATA_STORAGE_TYPE_VINEYARD; }
 
-bool VineyardBackend::Available() { return IsOpen(); }
+bool VineyardBackend::Available() { return IsOpen() && IsAvailable(); }
 
 double VineyardBackend::GetStorageUsageRatio(const std::string & /*trace_id*/) const { return 1.0; }
 
@@ -48,6 +48,7 @@ ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string
     liveness_check_interval_ms_ = spec_.liveness_check_interval_ms();
 
     SetOpen(true);
+    SetAvailable(true);
 
     liveness_checker_running_.store(true, std::memory_order_relaxed);
     liveness_checker_thread_ = std::thread(&VineyardBackend::LivenessCheckerLoop, this);
@@ -63,6 +64,7 @@ ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string
 }
 
 ErrorCode VineyardBackend::Close() {
+    SetAvailable(false);
     SetOpen(false);
     liveness_checker_running_.store(false, std::memory_order_relaxed);
     if (liveness_checker_thread_.joinable()) {

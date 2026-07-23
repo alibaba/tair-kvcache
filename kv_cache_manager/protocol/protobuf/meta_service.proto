@@ -202,6 +202,7 @@ message TairMemPoolStorageSpec {
     // 服务发现 URL，统一抽象不同发现机制；空字符串表示不使用服务发现。
     // 与 admin_service.proto 中 TairMemPoolStorageSpec.service_discovery_url 字段含义一致。
     string service_discovery_url = 5;
+    int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
 }
 
 message NfsStorageSpec {

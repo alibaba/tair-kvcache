@@ -108,6 +108,7 @@ message MooncakeStorageSpec {
 message TairMemPoolStorageSpec {
     string domain = 1; // tair mempool的 meta service挂载的域名
     int32 timeout = 2; // 单位超时时间
+    int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
 }
 
 message NfsStorageSpec {

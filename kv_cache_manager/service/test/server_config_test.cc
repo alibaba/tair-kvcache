@@ -20,6 +20,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         std::unordered_map<std::string, std::string> environ;
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
+        ASSERT_EQ(2, config.GetSchedulePlanExecutorThreadCount());
+        ASSERT_EQ(1u, config.GetSchedulePlanMigrationWorkerBudget());
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
         ASSERT_EQ(100000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(64ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
@@ -79,6 +81,52 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(4, config.GetServiceIoThreadNum());
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
+    }
+}
+
+TEST_F(ServerConfigTest, TestSchedulePlanMigrationWorkerBudget) {
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.schedule_plan_executor_thread_count", "8"},
+            {"kvcm.schedule_plan_migration_worker_budget", "3"},
+        };
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(8, config.GetSchedulePlanExecutorThreadCount());
+        EXPECT_EQ(3u, config.GetSchedulePlanMigrationWorkerBudget());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.schedule_plan_executor_thread_count", "8"},
+            {"kvcm.schedule_plan_migration_worker_budget", "8"},
+        };
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_FALSE(config.Check());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.schedule_plan_executor_thread_count", "8"},
+            {"kvcm.schedule_plan_migration_worker_budget", "0"},
+        };
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_FALSE(config.Check());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.schedule_plan_migration_worker_budget", "3x"},
+        };
+        EXPECT_FALSE(config.Parse("", environ));
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.schedule_plan_migration_worker_budget", "invalid"},
+        };
+        EXPECT_FALSE(config.Parse("", environ));
     }
 }
 

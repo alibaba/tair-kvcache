@@ -27,6 +27,19 @@ cc_test(
 )
 
 cc_test(
+    name = "migration_strategy_test",
+    srcs = [
+        "migration_strategy_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+    ],
+)
+
+cc_test(
     name = "registry_manager_redis_backend_test",
     srcs = [
         "registry_manager_redis_backend_test.cc",

@@ -31,7 +31,9 @@ class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
 struct MetricsLifecycle;
+class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
+constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
 
 class CacheManager {
     // TODO should not public
@@ -72,7 +74,8 @@ public:
               uint64_t cache_reclaimer_del_batch_size = 100,
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
-              CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {});
+              CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -159,6 +162,26 @@ public:
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
 
+    // 分层迁移编排 facade：把原本散在 AdminServiceImpl::MigrateCache 的业务编排
+    // （候选采样 / location 批查 / 逐 block 准入 / Copy+Mark 分发与 fallback / 计数）收到 manager 层，
+    // service 层只做 proto glue。返回内部 ErrorCode + accepted/rejected + message，由调用方映射 proto。
+    struct MigrateCacheResult {
+        ErrorCode ec = EC_OK;
+        int64_t accepted = 0;
+        int64_t rejected = 0;
+        std::string message;
+    };
+    // do_copy/do_mark 由 method 翻译而来；explicit_block_keys 非空则优先，否则按 sample_count 采样。
+    MigrateCacheResult MigrateCache(RequestContext *request_context,
+                                    const std::string &trace_id,
+                                    const std::string &instance_id,
+                                    const std::string &src_name,
+                                    const std::string &dst_name,
+                                    bool do_copy,
+                                    bool do_mark,
+                                    const std::vector<int64_t> &explicit_block_keys,
+                                    int64_t sample_count);
+
     ErrorCode ReportEvent(RequestContext *request_context,
                           const proto::meta::ReportEventRequest *request,
                           proto::meta::ReportEventResponse *response);
@@ -171,11 +194,16 @@ public:
     void PauseReclaimer();
     void ResumeReclaimer();
 
+    // 多层存储迁移控制面随 leader 生命周期启停（OnBecomeLeader/OnNoLongerLeader）。
+    void StartMigrationManager();
+    void StopMigrationManager();
+
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager() { return meta_indexer_manager_; }
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor() { return schedule_plan_executor_; }
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
+    std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
 
     // Set revisit interval histogram configuration for per-instance tracking.
     // Must be called before any MetaIndexer is created.
@@ -190,7 +218,8 @@ private:
                                const std::vector<std::string> &location_spec_group_names,
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask,
-                               int32_t min_replica_count);
+                               int32_t min_replica_count,
+                               std::vector<std::string> &new_keys_tiered_targets);
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -199,12 +228,25 @@ private:
                                              const std::vector<std::string> &location_spec_group_names,
                                              std::vector<std::string_view> &new_location_spec_group_names,
                                              BlockMask &block_mask,
-                                             int32_t min_replica_count);
+                                             int32_t min_replica_count,
+                                             std::vector<std::string> &new_keys_tiered_targets);
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
+                               const std::vector<std::string> &tiered_targets,
                                CacheLocationVector &new_locations);
+    // 在指定 storage 上为 keys 分配写 location（GenWriteLocation 的单 storage 分配单元，
+    // 供多层存储 Mark 路径按 block 路由到不同 storage 复用）。out_locations 与 keys 同序追加。
+    ErrorCode GenWriteLocationOnStorage(RequestContext *request_context,
+                                        const std::string &instance_id,
+                                        const CacheManager::KeyVector &keys,
+                                        const std::vector<std::string_view> &location_spec_group_names,
+                                        const std::shared_ptr<const InstanceInfo> &instance_info,
+                                        const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                        const std::string &storage_name,
+                                        DataStorageType storage_type,
+                                        CacheLocationVector &out_locations);
     ErrorCode CreateInSingleBatch(RequestContext *request_context,
                                   const std::string &instance_id,
                                   const CacheManager::KeyVector &keys,
@@ -291,7 +333,7 @@ private:
     // 需要清理
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
-    std::unique_ptr<DataStorageSelector> data_storage_selector_;
+    std::shared_ptr<DataStorageSelector> data_storage_selector_;
     // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
@@ -300,6 +342,8 @@ private:
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     // 无需清理 - 仅需要暂停
     std::shared_ptr<CacheReclaimer> cache_reclaimer_;
+    // 无需清理 - 随 leader 生命周期 Start/Stop；活跃任务在切主时由 Reclaimer 孤儿检测兜底
+    std::shared_ptr<MigrationManager> migration_manager_;
     // 无需清理 - SchedulePlanExecutor遗留的Plan会继续跑完
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态

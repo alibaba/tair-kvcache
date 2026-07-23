@@ -67,13 +67,17 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
-    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
-                         config_.GetCacheReclaimerKeySamplingSizeTotal(),
-                         config_.GetCacheReclaimerKeySamplingSizePerTask(),
-                         config_.GetCacheReclaimerDelBatchSize(),
-                         config_.GetCacheReclaimerIdleIntervalMs(),
-                         config_.GetCacheReclaimerWorkerSize(),
-                         async_delete_config);
+    if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
+                              config_.GetCacheReclaimerKeySamplingSizeTotal(),
+                              config_.GetCacheReclaimerKeySamplingSizePerTask(),
+                              config_.GetCacheReclaimerDelBatchSize(),
+                              config_.GetCacheReclaimerIdleIntervalMs(),
+                              config_.GetCacheReclaimerWorkerSize(),
+                              async_delete_config,
+                              config_.GetSchedulePlanMigrationWorkerBudget())) {
+        KVCM_LOG_ERROR("cache manager init failed");
+        return false;
+    }
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
 
     // Set revisit interval histogram configuration
@@ -121,6 +125,7 @@ void Server::OnBecomeLeader() {
         return;
     }
     cache_manager_->ResumeReclaimer();
+    cache_manager_->StartMigrationManager();
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
@@ -136,6 +141,10 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+
+    // Stop migration after leader-only requests drain, so MigrateCache cannot submit
+    // new copy tasks after the migration monitor has stopped.
+    cache_manager_->StopMigrationManager();
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {

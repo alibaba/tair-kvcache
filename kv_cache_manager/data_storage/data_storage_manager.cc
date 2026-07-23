@@ -194,6 +194,12 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
         return {};
     }
     auto storage_backend = iter->second;
+    // DisableStorage and this check are serialized by rw_lock_. Keep the lock through Create so a
+    // target cannot become disabled between admission and backend allocation.
+    if (storage_backend == nullptr || !storage_backend->Available()) {
+        KVCM_LOG_WARN("Storage name: %s is unavailable, reject create", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+    }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
     std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
@@ -228,6 +234,32 @@ std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_contex
     }
     auto storage_backend = iter->second;
     return storage_backend->Delete(storage_uris, trace_id, cb);
+}
+
+std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
+                                                const std::string &unique_name,
+                                                const std::vector<DataStorageUri> &src_uris,
+                                                const std::vector<DataStorageUri> &dst_uris) {
+    SPAN_TRACER(request_context);
+    if (src_uris.size() != dst_uris.size()) {
+        KVCM_LOG_WARN("Copy src/dst size mismatch, storage: %s, src: %zu, dst: %zu",
+                      unique_name.c_str(),
+                      src_uris.size(),
+                      dst_uris.size());
+        return std::vector<ErrorCode>(src_uris.size(), ErrorCode::EC_BADARGS);
+    }
+    if (src_uris.empty()) {
+        return {};
+    }
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const std::string &trace_id = request_context->trace_id();
+    auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end()) {
+        KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        return std::vector<ErrorCode>(src_uris.size(), ErrorCode::EC_NOENT);
+    }
+    auto storage_backend = iter->second;
+    return storage_backend->Copy(src_uris, dst_uris, trace_id);
 }
 
 std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,
