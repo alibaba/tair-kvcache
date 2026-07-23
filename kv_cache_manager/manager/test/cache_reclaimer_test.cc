@@ -4618,6 +4618,16 @@ ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
     return ErrorCode::EC_OK;
 }
 
+std::vector<std::int64_t> captured_async_prepare_keys;
+std::vector<std::vector<std::string>> captured_async_prepare_pending_locations;
+
+bool MigrationManager_SubmitAsyncMigrationPrepare_stub(void *obj, MigrationManager::AsyncMigrationPrepareJob job) {
+    static_cast<void>(obj);
+    captured_async_prepare_keys = std::move(job.block_keys);
+    captured_async_prepare_pending_locations = std::move(job.pending_location_ids_by_block);
+    return true;
+}
+
 static MigrationStrategy MakeStrategy(const std::string &src,
                                       const std::string &dst,
                                       bool copy_enabled,
@@ -4755,6 +4765,58 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
     stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
     stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+TEST_F(CacheReclaimerTest, TestReclaimAdmissionExcludesVictimFromSameRoundMigration) {
+    stub_.set(ADDR(MigrationManager, SubmitAsyncMigrationPrepare), MigrationManager_SubmitAsyncMigrationPrepare_stub);
+    cache_reclaimer_->job_state_flag_ = true;
+    captured_async_prepare_keys.clear();
+    captured_async_prepare_pending_locations.clear();
+
+    const auto ins_info = InstanceInfoFactory();
+    instance_infos = {ins_info};
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+
+    QuotaConfig quota_config;
+    quota_config.set_capacity(100);
+    quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    InstanceGroupQuota quota;
+    quota.set_capacity(100);
+    quota.set_quota_config({quota_config});
+    instance_group->set_quota(quota);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 90);
+    sample_reclaim_keys = {10};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"src_10",
+         MakeCacheLocation("src_10",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "dummy://hot_01/src_10?size=50")},
+    }};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, instance_group);
+
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ(1, cache_reclaimer_->pending_locations_.count({ins_info->instance_id(), 10, "src_10"}));
+    EXPECT_EQ((std::vector<std::int64_t>{10}), captured_async_prepare_keys);
+    ASSERT_EQ(1u, captured_async_prepare_pending_locations.size());
+    EXPECT_EQ((std::vector<std::string>{"src_10"}), captured_async_prepare_pending_locations.front());
+
+    stub_.reset(ADDR(MigrationManager, SubmitAsyncMigrationPrepare));
 }
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPendingSnapshotRemainsBlockScoped) {

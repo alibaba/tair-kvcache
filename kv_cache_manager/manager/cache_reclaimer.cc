@@ -2122,12 +2122,6 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         return result;
     }
 
-    // Migration is evaluated independently of eviction because its lower
-    // watermark can be reached before the reclaim threshold.
-    if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
-        TryMigrateOnGroup(request_context, instance_group, instance_infos);
-    }
-
     for (const auto &instance_info : instance_infos) {
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
         const auto water_level_exceed = GetWaterLevelExceed(
@@ -2162,6 +2156,15 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         METRICS_(cache_reclaimer, reclaim_job_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         result.made_progress = result.made_progress || submitted;
+    }
+
+    // Reclaim admission precedes migration preparation in the same cron round. An accepted
+    // delete is synchronously recorded in pending_locations_, so the migration job snapshot
+    // excludes that exact location before asynchronous Create/Copy starts. This only orders
+    // admission; it does not wait for physical deletion. Migration still runs independently
+    // when its lower watermark is reached before the reclaim threshold.
+    if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
+        TryMigrateOnGroup(request_context, instance_group, instance_infos);
     }
 
     return result;
