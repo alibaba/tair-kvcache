@@ -8,17 +8,14 @@ cc_library(
         "hf3fs_backend.cc",
         "mooncake_backend.cc",
         "nfs_backend.cc",
-        "vineyard_backend.cc",
     ],
     hdrs = [
         "data_storage_backend.h",
         "data_storage_manager.h",
         "dummy_backend.h",
-        "event_reporting_backend.h",
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",
-        "vineyard_backend.h",
     ],
     deps = [
         # 不一定用
@@ -26,9 +23,28 @@ cc_library(
         "//3rdparty/mooncake:mooncake_client_c",
         "//kv_cache_manager/common/hash",  # for xxph3
         ":common_define",
+        ":event_reporting",
         # Internal implementations
         "//stub_source/kv_cache_manager/data_storage:vcns_hf3fs",
         "//stub_source/kv_cache_manager/data_storage:tair_mempool",
+    ],
+)
+
+cc_library(
+    name = "event_reporting",
+    srcs = [
+        "vineyard_backend.cc",
+    ],
+    hdrs = [
+        "event_report_backend.h",
+        "event_reporting_backend.h",
+        "vineyard_backend.h",
+    ],
+    deps = [
+        ":common_define",
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
 

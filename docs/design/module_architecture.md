@@ -52,6 +52,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 |---|---|---|
 | **client** | `client/` | C++/Python 客户端 SDK，是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。面向外部，不被服务端核心调用。 |
 | **py_connector** | `py_connector/` | 推理框架集成（Python）。将 client 接入 vLLM/SGLang/TRT-LLM，含 CUDA kernel 辅助，负责在引擎的推理流程中按正确顺序调用元数据面与数据面接口。此外自带一个纯 Python 的 HTTP 元数据面客户端 `KvCacheManagerClient`（`common/manager_client.py`），可通过统一服务发现 URL 获取 Manager 入口，并作为 C++ `MetaClient` 之外的另一条元数据面通路。位于 Python 侧栈顶。 |
+| **cache_event_subscriber** | `cache_event_subscriber/` | 独立的缓存元数据同步进程。消费 RTP-LLM 的全量/增量 gRPC changefeed 或 vLLM 的 ZMQ 事件流，使用 prepare→KVCM ACK→commit 两阶段推进 cursor，并通过 `py_connector/common/KvCacheManagerClient` 调用 `RegisterInstance`/`ReportEvent`。它不参与推理热路径，位于 Python 侧栈顶。 |
 
 > **三个面的界定**：本文档区分三个面——**元数据面**指 MetaService 的接口（`GetCacheLocation`/`StartWriteCache`/`FinishWriteCache`/`GetCacheMeta`/`RemoveCache`/`RegisterInstance` 等）及 client 侧调用这些接口的逻辑，是推理引擎读写 KVCache 的热路径；**数据面**指 KVCache 数据在引擎显存/内存与存储后端之间的实际搬运（`TransferClient`，不经过 KVCM）；**管控面**仅指 AdminService 的接口（Storage 增删改、Instance Group 管理、账号、配置快照、运维监控、Leader 运维等），供运维/管理工具使用，不在推理引擎的读写热路径上。
 
@@ -97,6 +98,7 @@ service → manager → meta → config → data_storage → common
 ### 3.3 客户端与 Optimizer
 
 - **client** 是独立的对外分支，仅共享 `common`、`config`、`data_storage`、`protocol` 以及 `service/util:manager_message_proto_util`；**py_connector** 通过 pybind 位于 client 之上。核心服务端不依赖 client。运行时，元数据面经 gRPC（C++ `MetaClient`）或 HTTP（py_connector 的 Python `KvCacheManagerClient`）调用 KVCM 服务，数据面经 C++ `TransferClient` 直接读写存储后端——这几条链路是理解端到端流程的关键（见第 4 节）。
+- **cache_event_subscriber** 只依赖 `py_connector/common` 的 Python HTTP 客户端和引擎公开的事件协议；服务端核心不反向依赖 Subscriber。KVCM ACK 前不推进引擎 cursor，Manager 不可用时暂停拉取，从而形成有界反压。
 - **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优）。目前通过 `meta:cache_location` 类型与 `event` 的 optimizer 事件与核心关联；在线化能力正在开发中，后续会与现有 optimizer 合并。
 
 ### 3.4 模块关系图
@@ -129,6 +131,7 @@ flowchart TD
     subgraph clientside["客户端侧（对外分支）"]
         client["client SDK"]
         py_connector["py_connector<br/>vLLM/SGLang/TRT-LLM"]
+        cache_event_subscriber["cache_event_subscriber<br/>RTP/vLLM cache events"]
     end
 
     optimizer["optimizer（仿真与优化）"]
@@ -154,6 +157,7 @@ flowchart TD
     metrics -. metrics_reporter .-> manager
 
     %% 客户端分支
+    cache_event_subscriber --> py_connector
     py_connector --> client
     client --> config
     client --> data_storage
@@ -250,6 +254,10 @@ sequenceDiagram
 ### 4.6 HA 故障转移
 
 `LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，降级时调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+
+### 4.7 引擎缓存事件同步
+
+`cache_event_subscriber` 在引擎外部维护已获 KVCM 确认的 cursor 与缓存集合，并通过专用 `ST_EVENT_REPORT` 元数据后端发布 `event-report://` 位置。冷启动、引擎 generation 变化、历史断档和周期校准使用 `EVENT_BLOCK_SNAPSHOT` 权威替换该 host 的全部上报位置；正常运行只发送 `EVENT_BLOCK_ADD`/`EVENT_BLOCK_DELETE`。只有 KVCM 完整 ACK 后才提交 source cursor；请求失败时重试同一更新，不继续消费引擎事件。vLLM replay buffer 不是快照，冷启动只有从 sequence 0 完整重放或收到 `AllBlocksCleared` 才允许建立权威基线；基线建立前不发送 HEARTBEAT。
 
 ---
 

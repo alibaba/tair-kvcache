@@ -45,7 +45,7 @@ public:
                           const std::string &host_ip_port,
                           const std::map<std::string, std::string> &system_status) override;
     void SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) override;
-    bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const;
+    bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const override;
 
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const override;
 
@@ -68,6 +68,13 @@ public:
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
 
+protected:
+    VineyardBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
+                    DataStorageType storage_type,
+                    std::string protocol,
+                    std::string location_id_prefix,
+                    std::string metrics_prefix);
+
 private:
     void LivenessCheckerLoop();
 
@@ -88,7 +95,11 @@ private:
         MetricsTags metrics_tags;
     };
 
-    VineyardStorageSpec spec_;
+    EventReportingStorageSpec spec_;
+    DataStorageType storage_type_;
+    std::string protocol_;
+    std::string location_id_prefix_;
+    std::string metrics_prefix_;
 
     mutable std::shared_mutex nodes_mutex_;
     // instance_id -> (host_ip_port -> NodeInfo)
@@ -100,9 +111,9 @@ private:
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};
 
-    int64_t heartbeat_timeout_ms_ = VineyardStorageSpec::kDefaultHeartbeatTimeoutMs;
-    int64_t cleanup_grace_ms_ = VineyardStorageSpec::kDefaultCleanupGraceMs;
-    int64_t liveness_check_interval_ms_ = VineyardStorageSpec::kDefaultLivenessCheckIntervalMs;
+    int64_t heartbeat_timeout_ms_ = EventReportingStorageSpec::kDefaultHeartbeatTimeoutMs;
+    int64_t cleanup_grace_ms_ = EventReportingStorageSpec::kDefaultCleanupGraceMs;
+    int64_t liveness_check_interval_ms_ = EventReportingStorageSpec::kDefaultLivenessCheckIntervalMs;
 
     void ClearNodeGauges(const NodeInfo &info);
 

@@ -17,6 +17,7 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
     DATA_STORAGE_TYPE_VINEYARD = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT = 8,
     COUNT, // as sentinel, must be last
 };
 
@@ -25,6 +26,14 @@ std::string ToString(const DataStorageType &type);
 DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
+
+// Event-reporting storage records cache state owned by an inference engine.
+// KVCM may index and query these locations, but it must not allocate or reclaim
+// their capacity as if they were KVCM-managed storage.
+constexpr bool IsEventReportingStorageType(const DataStorageType type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD ||
+           type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT;
+}
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)
@@ -198,7 +207,7 @@ private:
     int32_t key_count_per_file_ = 0;
 };
 
-class VineyardStorageSpec : public StorageSpec {
+class EventReportingStorageSpec : public StorageSpec {
 public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;
@@ -222,6 +231,10 @@ private:
     int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;
 };
+
+// Keep the public Vineyard name source-compatible while sharing the generic
+// liveness configuration with other metadata-only event-reporting backends.
+using VineyardStorageSpec = EventReportingStorageSpec;
 
 class StorageConfig : public Jsonizable {
 public:

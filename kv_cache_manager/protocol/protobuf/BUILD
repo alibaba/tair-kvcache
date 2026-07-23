@@ -12,7 +12,7 @@ config_setting(
 )
 
 cc_library(
-    name = "service_cc_proto",
+    name = "service_message_cc_proto",
     srcs = [
         "admin_service.pb.cc",
         "debug_service.pb.cc",
@@ -28,7 +28,15 @@ cc_library(
         "optimizer_service.pb.h",
     ],
     include_prefix = "service/proto",
-    deps = select({
+    deps = [
+        "@com_google_protobuf//:cc_wkt_protos",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
+cc_library(
+    name = "service_cc_proto",
+    deps = [":service_message_cc_proto"] + select({
         "client_only_header": [
             ":admin_service_cc_impl_grpc_header_only",
             ":debug_service_cc_impl_grpc_header_only",

@@ -1,0 +1,2 @@
+msgspec>=0.18
+pyzmq>=25

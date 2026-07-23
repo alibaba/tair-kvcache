@@ -51,6 +51,26 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     EXPECT_EQ(nfs_spec2.key_count_per_file(), nfs_spec.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, TestStorageConfigJsonizeEventReport) {
+    auto spec = std::make_shared<EventReportingStorageSpec>();
+    spec->set_heartbeat_timeout_ms(1000);
+    spec->set_cleanup_grace_ms(2000);
+    spec->set_liveness_check_interval_ms(100);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_01", spec);
+
+    const std::string json = config.ToJsonString();
+    EXPECT_NE(json.find("\"type\":\"event_report\""), std::string::npos);
+
+    StorageConfig parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, parsed.type());
+    auto parsed_spec = std::dynamic_pointer_cast<EventReportingStorageSpec>(parsed.storage_spec());
+    ASSERT_TRUE(parsed_spec);
+    EXPECT_EQ(1000, parsed_spec->heartbeat_timeout_ms());
+    EXPECT_EQ(2000, parsed_spec->cleanup_grace_ms());
+    EXPECT_EQ(100, parsed_spec->liveness_check_interval_ms());
+}
+
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =
@@ -85,9 +105,8 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigr
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecNewSchemaTakesPrecedenceOverLegacy) {
     // 同时有 service_discovery_url 与老字段时，以 service_discovery_url 为准。
-    const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
-        R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
+                             R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-yy");

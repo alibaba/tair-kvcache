@@ -68,3 +68,16 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     data_storage_backends = data_storage_manager.GetAvailableStorages();
     ASSERT_EQ(0, data_storage_backends.size());
 }
+
+TEST_F(DataStorageManagerTest, RegisterEventReportStorage) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+    auto spec = std::make_shared<EventReportingStorageSpec>();
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_01", spec);
+    RequestContext request_context("event_report_test");
+
+    ASSERT_EQ(EC_OK, data_storage_manager.RegisterStorage(&request_context, "event_report_01", config));
+    auto backend = data_storage_manager.GetDataStorageBackend("event_report_01");
+    ASSERT_NE(nullptr, backend);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, backend->GetType());
+    EXPECT_EQ(EC_OK, data_storage_manager.UnRegisterStorage("event_report_01"));
+}

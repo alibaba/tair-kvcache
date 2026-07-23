@@ -3,6 +3,7 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 
@@ -191,6 +192,30 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     ProtoConvert::InstanceGroupFromProto(&proto_msg, restored);
     EXPECT_TRUE(restored.revisit_interval_buckets_raw().empty());
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
+}
+
+TEST_F(InstanceGroupTest, EventReportStorageProtoRoundTrip) {
+    auto spec = std::make_shared<EventReportingStorageSpec>();
+    spec->set_heartbeat_timeout_ms(1000);
+    spec->set_cleanup_grace_ms(2000);
+    spec->set_liveness_check_interval_ms(100);
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_01", spec);
+
+    proto::admin::StorageConfig proto_msg;
+    ProtoConvert::StorageConfigToProto(original, &proto_msg);
+    ASSERT_EQ(proto::admin::StorageConfig::kEventReport, proto_msg.storage_spec_case());
+    EXPECT_EQ(1000, proto_msg.event_report().heartbeat_timeout_ms());
+    EXPECT_EQ(2000, proto_msg.event_report().cleanup_grace_ms());
+    EXPECT_EQ(100, proto_msg.event_report().liveness_check_interval_ms());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_msg, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, restored.type());
+    auto restored_spec = std::dynamic_pointer_cast<EventReportingStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(1000, restored_spec->heartbeat_timeout_ms());
+    EXPECT_EQ(2000, restored_spec->cleanup_grace_ms());
+    EXPECT_EQ(100, restored_spec->liveness_check_interval_ms());
 }
 
 } // namespace kv_cache_manager
