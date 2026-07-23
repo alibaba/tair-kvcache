@@ -78,6 +78,7 @@ TEST_F(StartupConfigLoaderTest, TestStartupConfigJsonize) {
     ASSERT_EQ(reclaim1.reclaim_step_size(), reclaim2.reclaim_step_size());
     ASSERT_EQ(reclaim1.reclaim_step_percentage(), reclaim2.reclaim_step_percentage());
     ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
+    ASSERT_EQ(reclaim1.instance_reclaim_budget_policy(), reclaim2.instance_reclaim_budget_policy());
 
     // Compare TriggerStrategy
     const TriggerStrategy &trigger1 = reclaim1.trigger_strategy();
@@ -131,6 +132,8 @@ TEST_F(StartupConfigLoaderTest, TestLoad) {
         auto [ec, ig] = registry_manager->GetInstanceGroup(request_context1, "default");
         ASSERT_EQ(ErrorCode::EC_OK, ec);
         ASSERT_TRUE(ig);
+        ASSERT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
+                  ig->cache_config()->reclaim_strategy()->instance_reclaim_budget_policy());
         auto [ec2, config_vec] = registry_manager->ListStorage(request_context2);
         ASSERT_EQ(ErrorCode::EC_OK, ec2);
         ASSERT_EQ(1, config_vec.size());
@@ -148,6 +151,8 @@ TEST_F(StartupConfigLoaderTest, TestLoad) {
         auto [ec, ig] = registry_manager->GetInstanceGroup(request_context1, "default");
         ASSERT_EQ(ErrorCode::EC_OK, ec);
         ASSERT_TRUE(ig);
+        ASSERT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
+                  ig->cache_config()->reclaim_strategy()->instance_reclaim_budget_policy());
         auto [ec2, config_vec] = registry_manager->ListStorage(request_context2);
         ASSERT_EQ(ErrorCode::EC_OK, ec2);
         ASSERT_EQ(1, config_vec.size());
@@ -189,6 +194,7 @@ InstanceGroup StartupConfigLoaderTest::MakeInstanceGroup() {
     reclaim_strategy->set_reclaim_step_size(1073741824); // 1GB
     reclaim_strategy->set_reclaim_step_percentage(10);
     reclaim_strategy->set_delay_before_delete_ms(1000);
+    reclaim_strategy->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
 
     // Create meta storage backend config
     auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();

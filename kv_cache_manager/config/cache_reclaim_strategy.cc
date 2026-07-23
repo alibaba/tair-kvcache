@@ -12,6 +12,10 @@ bool CacheReclaimStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "reclaim_step_size", reclaim_step_size_);
     KVCM_JSON_GET_MACRO(rapid_value, "reclaim_step_percentage", reclaim_step_percentage_);
     KVCM_JSON_GET_MACRO(rapid_value, "delay_before_delete_ms", delay_before_delete_ms_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "instance_reclaim_budget_policy",
+                                instance_reclaim_budget_policy_,
+                                InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
     return true;
 }
 
@@ -23,6 +27,7 @@ void CacheReclaimStrategy::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuff
     Put(writer, "reclaim_step_size", reclaim_step_size_);
     Put(writer, "reclaim_step_percentage", reclaim_step_percentage_);
     Put(writer, "delay_before_delete_ms", delay_before_delete_ms_);
+    Put(writer, "instance_reclaim_budget_policy", instance_reclaim_budget_policy_);
 }
 
 bool CacheReclaimStrategy::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -31,6 +36,11 @@ bool CacheReclaimStrategy::ValidateRequiredFields(std::string &invalid_fields) c
     if (storage_unique_name_.empty()) {
         valid = false;
         local_invalid_fields += "{storage_unique_name}";
+    }
+    if (instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL &&
+        instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
+        valid = false;
+        local_invalid_fields += "{instance_reclaim_budget_policy}";
     }
     if (!valid) {
         invalid_fields += "{CacheReclaimStrategy: " + local_invalid_fields + "}";

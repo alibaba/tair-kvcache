@@ -142,7 +142,8 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 },
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
-                "reclaim_step_percentage": 10
+                "reclaim_step_percentage": 10,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {
@@ -193,7 +194,8 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
                 "reclaim_step_percentage": 10,
-                "delay_before_delete_ms": 1000
+                "delay_before_delete_ms": 1000,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {
@@ -249,7 +251,8 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
                 "reclaim_step_percentage": 10,
-                "delay_before_delete_ms": 1000
+                "delay_before_delete_ms": 1000,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {

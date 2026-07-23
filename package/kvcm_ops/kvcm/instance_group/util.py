@@ -102,7 +102,8 @@ class ReclaimStrategy(JsonData):
                  trigger_period_seconds: int = 0,
                  reclaim_step_size: int = 0,
                  reclaim_step_percentage: float = 0.0,
-                 delay_before_delete_ms: int = 1000
+                 delay_before_delete_ms: int = 1000,
+                 instance_reclaim_budget_policy: str = "USAGE_PROPORTIONAL",
                  ):
         self._storage_unique_name = storage_unique_name
         self._reclaim_policy = reclaim_policy
@@ -112,6 +113,7 @@ class ReclaimStrategy(JsonData):
         self._reclaim_step_size = reclaim_step_size
         self._reclaim_step_percentage = reclaim_step_percentage
         self._delay_before_delete_ms = delay_before_delete_ms
+        self._instance_reclaim_budget_policy = instance_reclaim_budget_policy
         self.check()
 
     def to_json_data(self) -> dict:
@@ -125,7 +127,8 @@ class ReclaimStrategy(JsonData):
             "trigger_period_seconds": self._trigger_period_seconds,
             "reclaim_step_size": self._reclaim_step_size,
             "reclaim_step_percentage": self._reclaim_step_percentage,
-            "delay_before_delete_ms": self._delay_before_delete_ms
+            "delay_before_delete_ms": self._delay_before_delete_ms,
+            "instance_reclaim_budget_policy": self._instance_reclaim_budget_policy,
         }
 
     def check(self) -> bool:
@@ -133,6 +136,12 @@ class ReclaimStrategy(JsonData):
         if _reclaim_policy not in ["POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
             raise RuntimeError(f"reclaim_policy {_reclaim_policy} invalid, support POLICY_LRU|POLICY_LFU|POLICY_TTL")
         self._reclaim_policy = _reclaim_policy
+        if not isinstance(self._instance_reclaim_budget_policy, str):
+            raise RuntimeError("instance_reclaim_budget_policy must be a string")
+        self._instance_reclaim_budget_policy = self._instance_reclaim_budget_policy.strip().upper()
+        if self._instance_reclaim_budget_policy not in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+            raise RuntimeError(
+                "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
         return True
 
     @classmethod
@@ -155,6 +164,9 @@ class ReclaimStrategy(JsonData):
             reclaim_step_percentage = float(json_data["reclaim_step_percentage"])
         if JsonData.expect_exist("delay_before_delete_ms", json_data, (str, int)):
             delay_before_delete_ms = int(json_data["delay_before_delete_ms"])
+        instance_reclaim_budget_policy = "USAGE_PROPORTIONAL"
+        if JsonData.maybe_exist("instance_reclaim_budget_policy", json_data, str):
+            instance_reclaim_budget_policy = json_data["instance_reclaim_budget_policy"]
         return cls(
             storage_unique_name,
             reclaim_policy,
@@ -163,7 +175,18 @@ class ReclaimStrategy(JsonData):
             trigger_period_seconds,
             reclaim_step_size,
             reclaim_step_percentage,
-            delay_before_delete_ms)
+            delay_before_delete_ms,
+            instance_reclaim_budget_policy)
+
+
+def instance_reclaim_budget_policy_value(value: str) -> str:
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError("instance_reclaim_budget_policy must be a string")
+    normalized = value.strip().upper()
+    if normalized in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+        return normalized
+    raise argparse.ArgumentTypeError(
+        "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
 
 
 class MetaStorageBackendConfig(JsonData):
@@ -533,6 +556,16 @@ def parse_instance_group_args(is_create: bool):
         type=float,
         default=0.8 if is_create else argparse.SUPPRESS,
         help="reclaim_used_percentage"
+    )
+
+    parser.add_argument(
+        "--instance_reclaim_budget_policy",
+        type=instance_reclaim_budget_policy_value,
+        default="USAGE_PROPORTIONAL" if is_create else argparse.SUPPRESS,
+        help=(
+            "cross-instance reclaim budget policy: USAGE_PROPORTIONAL or FIXED_PER_INSTANCE. "
+            "On update, omit to keep the server-side value"
+        )
     )
 
     parser.add_argument(
