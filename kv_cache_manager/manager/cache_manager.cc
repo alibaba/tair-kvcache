@@ -709,7 +709,17 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
                                    query_keys,
                                    cache_locations);
     query_scope = ChronoScopeGuard{};
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
+    // prefix_match_len: count actual hits (non-empty id), not total returned entries.
+    // BatchGet/ReverseRollSW pad misses with empty CacheLocation objects.
+    {
+        size_t match_len = 0;
+        for (const auto &loc : cache_locations) {
+            if (loc && !loc->id().empty()) {
+                ++match_len;
+            }
+        }
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, match_len);
+    }
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
     // accumulate hit/query block counters for hit-rate monitoring (only on success)
     if (service_metrics_collector) {
@@ -805,7 +815,20 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
     ec = meta_searcher->BatchGetBestLocationByBackend(
         request_context, query_keys, locations_per_key, policy.get(), backend_selectors);
     query_scope = ChronoScopeGuard{};
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, locations_per_key.size());
+    // prefix_match_len: count keys with at least one hit (non-empty id).
+    // Miss keys have empty CacheLocation objects with no id.
+    {
+        size_t match_len = 0;
+        for (const auto &key_locs : locations_per_key) {
+            for (const auto &loc : key_locs) {
+                if (loc && !loc->id().empty()) {
+                    ++match_len;
+                    break;
+                }
+            }
+        }
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, match_len);
+    }
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, BatchLocationsView, "batch get multi locations failed");
 
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
