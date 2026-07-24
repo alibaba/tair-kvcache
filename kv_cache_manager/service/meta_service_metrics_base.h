@@ -72,12 +72,12 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 protected:
-    std::shared_ptr<MetricsCollector> get_metrics_collector_from_map_for_ReportEvent(const std::string &instance_id,
-                                                                                     const std::string &type);
-    std::shared_ptr<MetricsCollector> get_metrics_collector_from_map_for_EventBlockAdd(const std::string &instance_id,
-                                                                                       const std::string &type);
-    std::shared_ptr<MetricsCollector>
-    get_metrics_collector_from_map_for_EventBlockDelete(const std::string &instance_id, const std::string &type);
+    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEvent(const std::string &instance_id,
+                                                                             const std::string &type);
+    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForEventBlockAdd(const std::string &instance_id,
+                                                                               const std::string &type);
+    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForEventBlockDelete(const std::string &instance_id,
+                                                                                  const std::string &type);
 
     static constexpr const char *kEventReportL1P5MetricsType = "event_report_l1p5";
     static constexpr const char *kEventReportL2MetricsType = "event_report_l2";

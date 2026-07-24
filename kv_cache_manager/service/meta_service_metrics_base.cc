@@ -16,7 +16,7 @@
 
 #ifndef KVCM_DEFINE_TYPED_METRICS_COLLECTOR_MAP_METHOD_
 #define KVCM_DEFINE_TYPED_METRICS_COLLECTOR_MAP_METHOD_(name)                                                          \
-    std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::get_metrics_collector_from_map_for_##name(               \
+    std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetTypedMetricsCollectorFor##name(                       \
         const std::string &instance_id, const std::string &type) {                                                     \
         return GetMetricsCollectorFromMap(#name,                                                                       \
                                           KVCM_METRICS_COLLECTOR_MAP_(name),                                           \

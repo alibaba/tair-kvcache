@@ -74,8 +74,8 @@ TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheRemovesEntry) {
 TEST_F(MetaServiceMetricsBaseTest, TypedReportEventCollectorUsesTypeTagAndStableKey) {
     SeedInstance("inst1", "grp1");
 
-    auto l1p5 = base_->get_metrics_collector_from_map_for_ReportEvent("inst1", "event_report_l1p5");
-    auto l2 = base_->get_metrics_collector_from_map_for_ReportEvent("inst1", "event_report_l2");
+    auto l1p5 = base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5");
+    auto l2 = base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l2");
     ASSERT_NE(nullptr, l1p5);
     ASSERT_NE(nullptr, l2);
     ASSERT_NE(l1p5, l2);
@@ -89,25 +89,25 @@ TEST_F(MetaServiceMetricsBaseTest, TypedReportEventCollectorUsesTypeTagAndStable
     ASSERT_EQ(l1p5_tags, l1p5->GetMetricsTags());
     ASSERT_EQ(l2_tags, l2->GetMetricsTags());
 
-    auto l1p5_cached = base_->get_metrics_collector_from_map_for_ReportEvent("inst1", "event_report_l1p5");
+    auto l1p5_cached = base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5");
     ASSERT_EQ(l1p5, l1p5_cached);
 }
 
 TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheRemovesTypedReportEventEntries) {
     SeedInstance("inst1", "grp1");
 
-    auto report_event = base_->get_metrics_collector_from_map_for_ReportEvent("inst1", "event_report_l1p5");
-    auto block_add = base_->get_metrics_collector_from_map_for_EventBlockAdd("inst1", "event_report_l1p5");
-    auto block_delete = base_->get_metrics_collector_from_map_for_EventBlockDelete("inst1", "event_report_l2");
+    auto report_event = base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5");
+    auto block_add = base_->GetTypedMetricsCollectorForEventBlockAdd("inst1", "event_report_l1p5");
+    auto block_delete = base_->GetTypedMetricsCollectorForEventBlockDelete("inst1", "event_report_l2");
     ASSERT_NE(nullptr, report_event);
     ASSERT_NE(nullptr, block_add);
     ASSERT_NE(nullptr, block_delete);
 
     base_->InvalidateCollectorCache("inst1");
 
-    ASSERT_NE(report_event, base_->get_metrics_collector_from_map_for_ReportEvent("inst1", "event_report_l1p5"));
-    ASSERT_NE(block_add, base_->get_metrics_collector_from_map_for_EventBlockAdd("inst1", "event_report_l1p5"));
-    ASSERT_NE(block_delete, base_->get_metrics_collector_from_map_for_EventBlockDelete("inst1", "event_report_l2"));
+    ASSERT_NE(report_event, base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5"));
+    ASSERT_NE(block_add, base_->GetTypedMetricsCollectorForEventBlockAdd("inst1", "event_report_l1p5"));
+    ASSERT_NE(block_delete, base_->GetTypedMetricsCollectorForEventBlockDelete("inst1", "event_report_l2"));
 }
 
 TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheAllMaps) {

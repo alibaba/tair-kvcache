@@ -183,11 +183,11 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
     switch (request->storage_type()) {
     case proto::meta::ST_EVENT_REPORT_L1P5:
         metrics_type = kEventReportL1P5MetricsType;
-        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id(), metrics_type);
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
         break;
     case proto::meta::ST_EVENT_REPORT_L2:
         metrics_type = kEventReportL2MetricsType;
-        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id(), metrics_type);
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
         break;
     default:
         metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
@@ -233,13 +233,13 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
             has_block_delete = true;
     }
     if (has_block_add && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockAdd(request->instance_id(), metrics_type);
+        auto mc = GetTypedMetricsCollectorForEventBlockAdd(request->instance_id(), metrics_type);
         if (mc) {
             request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
         }
     }
     if (has_block_delete && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockDelete(request->instance_id(), metrics_type);
+        auto mc = GetTypedMetricsCollectorForEventBlockDelete(request->instance_id(), metrics_type);
         if (mc) {
             request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
         }
