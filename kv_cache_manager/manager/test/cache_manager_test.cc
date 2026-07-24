@@ -4078,6 +4078,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
 
     {
         CacheManager::KeyVector new_keys;
+        const std::vector<std::string> location_spec_group_names = {"F0"};
         std::vector<std::string_view> new_sgn;
         BlockMask block_mask;
         std::vector<std::string> new_targets;
@@ -4086,7 +4087,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
                                                    meta_searcher,
                                                    {1},
                                                    new_keys,
-                                                   {"F0"},
+                                                   location_spec_group_names,
                                                    new_sgn,
                                                    block_mask,
                                                    1,
@@ -4098,6 +4099,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
 
     {
         CacheManager::KeyVector new_keys;
+        const std::vector<std::string> location_spec_group_names = {"L1"};
         std::vector<std::string_view> new_sgn;
         BlockMask block_mask;
         std::vector<std::string> new_targets;
@@ -4106,7 +4108,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
                                                    meta_searcher,
                                                    {1},
                                                    new_keys,
-                                                   {"L1"},
+                                                   location_spec_group_names,
                                                    new_sgn,
                                                    block_mask,
                                                    1,
