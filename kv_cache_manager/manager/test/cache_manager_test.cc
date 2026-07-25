@@ -3130,6 +3130,96 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     ASSERT_EQ(1, call_count);
 }
 
+TEST_F(CacheManagerTest, TestReportEventRejectsInvalidRequestsAndMapsItemErrors) {
+    auto add_register_event = [](proto::meta::ReportEventRequest &request) {
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        event->mutable_node_register()->add_mediums("mem");
+    };
+
+    {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port("10.0.0.30:8080");
+        add_register_event(request);
+
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        EXPECT_EQ("storage_type is required", response.header().status().message());
+    }
+
+    {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port("10.0.0.30:8080");
+        request.set_storage_type(proto::meta::ST_NFS);
+        add_register_event(request);
+
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+
+    {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("missing_instance");
+        request.set_host_ip_port("10.0.0.30:8080");
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        add_register_event(request);
+
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_INSTANCE_NOT_EXIST, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, response.header().status().code());
+    }
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    StorageConfig config;
+    config.set_global_unique_name("event_backend_errors");
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+    ASSERT_EQ(EC_OK, event_backend->Open(config, "test_trace"));
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_errors"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_errors"});
+
+    {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port("10.0.0.30:8080");
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        add_register_event(request);
+
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_INSTANCE_NOT_EXIST, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, response.header().status().code());
+        EXPECT_FALSE(event_backend->IsNodeAvailable("test_instance", "10.0.0.30:8080"));
+    }
+
+    {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port("10.0.0.30:8080");
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        add_register_event(request);
+
+        auto *invalid_add = request.add_events();
+        invalid_add->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        invalid_add->mutable_block_add()->set_block_key("100");
+        invalid_add->mutable_block_add()->set_medium("mem");
+
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INTERNAL_ERROR, response.header().status().code());
+        ASSERT_EQ(2, response.item_results_size());
+        EXPECT_EQ(proto::meta::OK, response.item_results(0));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(1));
+        EXPECT_TRUE(event_backend->IsNodeAvailable("test_instance", "10.0.0.30:8080"));
+    }
+
+    ASSERT_EQ(EC_OK, event_backend->Close());
+}
+
 TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_report_event_merge";
