@@ -1,4 +1,5 @@
 #include <memory>
+#include <typeinfo>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/dummy_metrics_reporter.h"
@@ -41,9 +42,8 @@ TEST_F(MetricsReporterFactoryTest, TestCreateKmonitorReporter) {
 
 TEST_F(MetricsReporterFactoryTest, TestCreateLocalReporter) {
     auto reporter = factory_->Create("local", "");
-    EXPECT_NE(reporter, nullptr);
-    auto cached_reporter = std::dynamic_pointer_cast<LocalMetricsReporter>(reporter);
-    EXPECT_NE(cached_reporter, nullptr);
+    ASSERT_NE(reporter, nullptr);
+    EXPECT_TRUE(typeid(*reporter) == typeid(LocalMetricsReporter));
 }
 
 TEST_F(MetricsReporterFactoryTest, TestCreateLoggingReporter) {
@@ -54,9 +54,11 @@ TEST_F(MetricsReporterFactoryTest, TestCreateLoggingReporter) {
 }
 
 TEST_F(MetricsReporterFactoryTest, TestCreateDefaultReporter) {
-    auto reporter = factory_->Create("unknown", "");
-    EXPECT_NE(reporter, nullptr);
+    auto reporter = factory_->Create("", "");
+    ASSERT_NE(reporter, nullptr);
+    EXPECT_TRUE(typeid(*reporter) == typeid(LocalMetricsReporter));
+}
 
-    auto default_reporter = std::dynamic_pointer_cast<LoggingMetricsReporter>(reporter);
-    EXPECT_NE(default_reporter, nullptr);
+TEST_F(MetricsReporterFactoryTest, TestCreateUnsupportedReporter) {
+    EXPECT_EQ(nullptr, factory_->Create("unknown", ""));
 }

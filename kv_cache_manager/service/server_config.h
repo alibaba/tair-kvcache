@@ -101,7 +101,7 @@ private:
     uint64_t cache_reclaimer_pending_bytes_limit_per_group_type_ = 0;
     uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
     uint64_t cache_reclaimer_pending_bytes_limit_ = 0;
-    std::string metrics_reporter_type_;
+    std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;
     int64_t metrics_report_interval_ms_ = 0;
     bool enable_prometheus_ = true;

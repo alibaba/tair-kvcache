@@ -84,6 +84,41 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, TestMetricsReporterType) {
+    {
+        ServerConfig config;
+        EXPECT_EQ("local", config.metrics_reporter_type());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ("local", config.metrics_reporter_type());
+    }
+    for (const auto &type : {"", "local", "logging"}) {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{{"kvcm.metrics.reporter_type", type}};
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_TRUE(config.Check()) << "type: " << type;
+        EXPECT_EQ(type, config.metrics_reporter_type());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{{"kvcm.metrics.reporter_type", "logging"}};
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_EQ("logging", config.metrics_reporter_type());
+        ASSERT_TRUE(config.Parse("", {}));
+        EXPECT_EQ("local", config.metrics_reporter_type());
+    }
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{{"kvcm.metrics.reporter_type", "unknown"}};
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_FALSE(config.Check());
+    }
+}
+
 TEST_F(ServerConfigTest, TestSchedulePlanMigrationWorkerBudget) {
     {
         ServerConfig config;
