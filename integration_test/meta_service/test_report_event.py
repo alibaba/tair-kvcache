@@ -906,7 +906,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "instance_group": self.INSTANCE_GROUP_NAME,
             "instance_id": instance_id,
             "block_size": 128,
-            "query_type": "QT_PREFIX_MATCH",
+            "default_query_type": "QT_PREFIX_MATCH",
             "model_deployment": {
                 "model_name": "test_er_model",
                 "dtype": "FP8",

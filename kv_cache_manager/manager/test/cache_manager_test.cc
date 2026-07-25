@@ -2967,8 +2967,8 @@ TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
 }
 
-TEST_F(CacheManagerTest, TestDoRecoverPreservesRegisteredQueryType) {
-    registry_manager_->instance_infos_["test_instance"]->set_query_type(
+TEST_F(CacheManagerTest, TestDoRecoverPreservesRegisteredDefaultQueryType) {
+    registry_manager_->instance_infos_["test_instance"]->set_default_query_type(
         static_cast<int32_t>(CacheManager::QueryType::QT_PREFIX_MATCH));
 
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
@@ -4060,7 +4060,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
-    // --- Test 1b: unspecified query type falls back to RegisterInstance.query_type ---
+    // --- Test 1b: unspecified query type falls back to RegisterInstance.default_query_type ---
     {
         CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
         auto [ec, hosts] = cache_manager_->GetHostCacheState(
@@ -4303,6 +4303,15 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         EXPECT_EQ(-1, find_prefix(matches, host_d));
     };
     expect_mamba_matches(hosts);
+
+    // An explicit request query type takes precedence over the registered default.
+    auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+    ASSERT_EQ(EC_OK, explicit_ec);
+    EXPECT_EQ(4, find_prefix(explicit_hosts, host_a));
+    EXPECT_EQ(4, find_prefix(explicit_hosts, host_b));
+    EXPECT_EQ(2, find_prefix(explicit_hosts, host_c));
+    EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
 
     auto [fallback_ec, fallback_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);

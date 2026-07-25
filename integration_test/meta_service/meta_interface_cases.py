@@ -276,6 +276,7 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
             "instance_group": "default",
             "instance_id": self._instance_id,
             "block_size": 128,
+            "default_query_type": "QT_PREFIX_MATCH_WITH_MAMBA",
             "model_deployment": self._get_test_model_deployment(),
             "location_spec_infos": [
                 {"name": "tp0", "size": 1024},
@@ -297,6 +298,8 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertIn('instance_group', response_data)
         self.assertIn('instance_info', response_data)
         self.assertEqual(response_data['instance_group'], "default")
+        self.assertEqual(response_data['instance_info']['default_query_type'],
+                         "QT_PREFIX_MATCH_WITH_MAMBA")
 
         # Verify model deployment data matches what we registered
         expected_deployment = self._get_test_model_deployment()

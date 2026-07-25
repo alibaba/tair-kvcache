@@ -456,7 +456,7 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
-    QueryType query_type = 8;                            
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
 }
 
 message RegisterInstanceRequest {
@@ -467,7 +467,7 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
-    QueryType query_type = 8;                           
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
 }
 
 message RemoveInstanceRequest {

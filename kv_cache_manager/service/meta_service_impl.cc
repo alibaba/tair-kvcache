@@ -329,7 +329,7 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                          location_spec_infos,
                                          model_deployment_req,
                                          location_spec_groups,
-                                         static_cast<CacheManager::QueryType>(request->query_type()));
+                                         static_cast<CacheManager::QueryType>(request->default_query_type()));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

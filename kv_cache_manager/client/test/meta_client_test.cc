@@ -35,7 +35,8 @@ public:
             },
             "location_spec_groups": {
                 "group0": ["tp0"]
-            }
+            },
+            "default_query_type": 4
         })";
         init_params_.role_type = RoleType::HYBRID;
     }
@@ -70,7 +71,7 @@ public:
                  const LocationSpecInfoMap &location_spec_infos,
                  const ModelDeployment &model_deployment,
                  const LocationSpecGroups &location_spec_groups,
-                 QueryType query_type),
+                 QueryType default_query_type),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, InstanceInfo>),
@@ -161,7 +162,7 @@ TEST_F(MetaClientTest, TestCreateSimple) {
                                  ::testing::_,
                                  ::testing::_,
                                  ::testing::_,
-                                 ::testing::_))
+                                 QueryType::QT_PREFIX_MATCH_WITH_MAMBA))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
     auto ec = client->Init(client_config_, init_params_);

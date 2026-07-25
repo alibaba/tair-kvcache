@@ -21,13 +21,13 @@ curl -g -vvv -X POST http://localhost:6382/api/registerInstance \
         "user_data": "custom_user_data"
     },
     "block_size": 8,
-    "query_type": "QT_PREFIX_MATCH",
+    "default_query_type": "QT_PREFIX_MATCH",
     "location_spec_infos": [
         {"name": "tp0", "size": 4096000}
     ]
 }'
 ```
-`query_type` is optional. When `GetHostCacheState` does not set `query_type`, the service uses this registered value.
+`default_query_type` is optional. When `GetHostCacheState` does not set request-level `query_type`, the service uses this registered value.
 
 ## Get Instance Info
 ```bash

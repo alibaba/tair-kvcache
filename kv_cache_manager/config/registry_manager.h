@@ -63,7 +63,7 @@ public:
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
                                const std::vector<LocationSpecGroup> &location_spec_groups = {},
-                               int32_t query_type = 0);
+                               int32_t default_query_type = 0);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);

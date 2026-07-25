@@ -123,7 +123,7 @@ public:
                  const std::vector<LocationSpecInfo> &location_spec_infos,
                  const ModelDeployment &model_deployment,
                  const std::vector<LocationSpecGroup> &location_spec_groups = {},
-                 int32_t query_type = 0)
+                 int32_t default_query_type = 0)
         : quota_group_name_(quota_group_name)
         , instance_group_name_(instance_group_name)
         , instance_id_(instance_id)
@@ -131,7 +131,7 @@ public:
         , location_spec_infos_(location_spec_infos)
         , model_deployment_(model_deployment)
         , location_spec_groups_(location_spec_groups)
-        , query_type_(query_type) {
+        , default_query_type_(default_query_type) {
         SortLocationSpecGroups();
     };
     ~InstanceInfo() override;
@@ -148,7 +148,7 @@ public:
     const std::vector<LocationSpecInfo> &location_spec_infos() const { return location_spec_infos_; }
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
-    int32_t query_type() const { return query_type_; }
+    int32_t default_query_type() const { return default_query_type_; }
     void set_quota_group_name(const std::string &quota_group_name) { quota_group_name_ = quota_group_name; }
     void set_instance_group_name(const std::string &instance_group_name) { instance_group_name_ = instance_group_name; }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
@@ -161,14 +161,14 @@ public:
         location_spec_groups_ = location_spec_groups;
         SortLocationSpecGroups();
     }
-    void set_query_type(int32_t query_type) { query_type_ = query_type; }
+    void set_default_query_type(int32_t default_query_type) { default_query_type_ = default_query_type; }
     // Returns field names that differ from the given values.
     // Returns empty vector if all fields match.
     [[nodiscard]] std::vector<std::string> MismatchFields(int32_t block_size,
                                                           const std::vector<LocationSpecInfo> &location_spec_infos,
                                                           const ModelDeployment &model_deployment,
                                                           const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                          int32_t query_type = 0) const {
+                                                          int32_t default_query_type = 0) const {
         std::vector<std::string> mismatched;
         if (block_size_ != block_size) {
             mismatched.emplace_back("block_size");
@@ -186,8 +186,8 @@ public:
         if (location_spec_groups_ != sorted_location_spec_groups) {
             mismatched.emplace_back("location_spec_groups");
         }
-        if (query_type_ != query_type) {
-            mismatched.emplace_back("query_type");
+        if (default_query_type_ != default_query_type) {
+            mismatched.emplace_back("default_query_type");
         }
         return mismatched;
     }
@@ -203,7 +203,7 @@ private:
     std::vector<LocationSpecInfo> location_spec_infos_;
     ModelDeployment model_deployment_;
     std::vector<LocationSpecGroup> location_spec_groups_;
-    int32_t query_type_{0};
+    int32_t default_query_type_{0};
 };
 
 using InstanceInfoConstPtr = std::shared_ptr<const InstanceInfo>;
