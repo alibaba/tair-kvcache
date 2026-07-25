@@ -401,6 +401,48 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     EXPECT_FALSE(location_maps[0].empty());
 }
 
+TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsValidatesShapeAndMissingLocationIsIdempotent) {
+    MetaSearcher::KeyVector keys = {10004};
+    const std::string existing_location_id = "event_report#mem#127.0.0.1:8080";
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {existing_location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> mismatched_tasks;
+    EXPECT_EQ(EC_BADARGS,
+              meta_searcher_->BatchDeleteLocationSpecs(
+                  request_context_.get(), keys, mismatched_tasks, delete_results));
+    EXPECT_TRUE(delete_results.empty());
+
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> missing_location_tasks = {{
+        {"event_report#mem#127.0.0.2:8080", {"linear_0"}},
+    }};
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocationSpecs(
+            request_context_.get(), keys, missing_location_tasks, delete_results));
+    ASSERT_EQ(1u, delete_results.size());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    auto existing = location_maps[0].find(existing_location_id);
+    ASSERT_NE(location_maps[0].end(), existing);
+    ASSERT_TRUE(existing->second);
+    ASSERT_EQ(1u, existing->second->location_specs().size());
+    EXPECT_EQ("linear_0", existing->second->location_specs()[0].name());
+}
+
 TEST_F(MetaSearcherTest, TestPrefixMatch) {
     // 首先添加一些测试数据
     MetaSearcher::KeyVector keys = {10, 20, 30};

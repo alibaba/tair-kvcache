@@ -124,6 +124,38 @@ TEST_F(EventReportBackendTest, RegisterNodeWithMediums) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
+TEST_F(EventReportBackendTest, MightExistTracksRegisteredNodeAvailability) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    const std::string instance_id = "test_inst";
+    const std::string available_host = "10.0.0.2:8080";
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, available_host, {"mem"}));
+
+    const DataStorageUri available_uri("event_report://10.0.0.2:8080/mem");
+    const DataStorageUri unregistered_uri("event_report://10.0.0.3:8080/mem");
+    const DataStorageUri invalid_uri;
+
+    auto result = backend.MightExist({available_uri, unregistered_uri, invalid_uri});
+    ASSERT_EQ(3u, result.size());
+    EXPECT_TRUE(result[0]);
+    EXPECT_FALSE(result[1]);
+    // Invalid URIs cannot be checked remotely and intentionally use the conservative fallback.
+    EXPECT_TRUE(result[2]);
+
+    backend.SetNodeUnavailable(instance_id, available_host);
+    result = backend.MightExist({available_uri});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_FALSE(result[0]);
+
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat(instance_id, available_host, {}));
+    result = backend.MightExist({available_uri});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_TRUE(result[0]);
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
 // (3) OnHeartbeat
 TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     EventReportBackend backend(metrics_registry_);
