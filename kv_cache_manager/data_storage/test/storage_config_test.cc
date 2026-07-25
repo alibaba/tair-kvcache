@@ -82,6 +82,11 @@ TEST_F(StorageConfigTest, TestEventReportStorageSpecSnapshotIntervalDefaultAndVa
     std::string invalid_fields;
     EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
     EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {

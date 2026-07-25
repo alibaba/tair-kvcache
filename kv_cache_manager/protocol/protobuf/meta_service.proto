@@ -17,7 +17,7 @@ enum ErrorCode {
     SERVER_NOT_LEADER = 9; // 高可用部署模式下，请求的接口只能在leader执行但请求的节点不是leader
     NODE_NOT_REGISTERED = 10;
     SNAPSHOT_IN_PROGRESS = 11;
-    reserved 12;
+    reserved 12; // DELTA_IN_PROGRESS was removed: admitted deltas wait behind the snapshot gate.
     SNAPSHOT_RATE_LIMITED = 13;
     SNAPSHOT_REQUIRED = 14;
 

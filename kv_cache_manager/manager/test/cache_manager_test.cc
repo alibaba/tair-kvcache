@@ -2971,6 +2971,105 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupPreservesInFlightStableLocationUntil
     EXPECT_TRUE(QueryRawEventReportUris(key).empty());
 }
 
+TEST_F(CacheManagerTest, TestSnapshotCleanupCASPreservesLocationRefreshedAfterScan) {
+    const std::string host = "192.168.10.35:8080";
+    const int64_t key = 9436;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "cleanup_cas_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
+
+    // Publish a new authoritative token without touching this key, leaving the
+    // baseline location stale for the cleanup scan below.
+    std::string cleanup_token;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK,
+              event_backend->BeginSnapshot({"test_instance", host}, cleanup_token, retry_after_ms));
+    ASSERT_NE(baseline_token, cleanup_token);
+    ASSERT_TRUE(event_backend->CommitSnapshotVersion({"test_instance", host}, cleanup_token));
+
+    std::vector<int64_t> captured_keys;
+    std::vector<std::vector<std::string>> captured_location_ids;
+    std::vector<std::vector<std::string>> captured_expected_values;
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    MetaSearcher paused_cleanup_searcher(
+        indexer,
+        [](const CacheLocation &) { return true; },
+        [&](const std::vector<int64_t> &keys,
+            const std::vector<std::vector<std::string>> &location_ids,
+            const std::vector<std::vector<std::string>> &expected_values) {
+            captured_keys = keys;
+            captured_location_ids = location_ids;
+            captured_expected_values = expected_values;
+        });
+    ASSERT_EQ(
+        EC_OK,
+        paused_cleanup_searcher.CleanupLocationsByPredicate(
+            request_context_.get(),
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            1,
+            [&](int64_t block_key, const std::string &location_id, const CacheLocation &location) {
+                if (block_key != key || location_id != event_backend->BuildLocationId("mem", host)) {
+                    return false;
+                }
+                SnapshotUriInfo info;
+                return location.location_specs().size() == 1 &&
+                       SnapshotUriUtils::ParseSnapshotUriInfo(location.location_specs().front().uri(), info) &&
+                       info.version == baseline_token;
+            }));
+    ASSERT_EQ((std::vector<int64_t>{key}), captured_keys);
+    ASSERT_EQ(1u, captured_location_ids.size());
+    ASSERT_EQ(1u, captured_location_ids.front().size());
+    ASSERT_EQ(1u, captured_expected_values.size());
+    ASSERT_EQ(1u, captured_expected_values.front().size());
+
+    // Before the paused cleanup reaches its conditional delete, the next
+    // snapshot refreshes the same stable location with a newer token.
+    std::string refreshed_token;
+    ASSERT_EQ(EC_OK,
+              event_backend->BeginSnapshot({"test_instance", host}, refreshed_token, retry_after_ms));
+    ASSERT_NE(cleanup_token, refreshed_token);
+    std::string refreshed_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://" + host + "/mem?source=refreshed", refreshed_token, refreshed_uri));
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<ErrorCode> replace_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchReplaceLocationSpecs(
+                  request_context_.get(),
+                  {key},
+                  {{{event_backend->BuildLocationId("mem", host),
+                     DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                     CacheLocationStatus::CLS_SERVING,
+                     {LocationSpec("tp0", refreshed_uri)}}}},
+                  replace_results));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), replace_results);
+    ASSERT_TRUE(meta_searcher->Sync({key}));
+    ASSERT_TRUE(event_backend->CommitSnapshotVersion({"test_instance", host}, refreshed_token));
+
+    CacheLocationDelRequest stale_cleanup_request{
+        .instance_id = "test_instance",
+        .block_keys = captured_keys,
+        .location_ids = captured_location_ids,
+        .delay = std::chrono::seconds(0),
+        .expected_location_values = captured_expected_values,
+    };
+    const auto cleanup_result = cache_manager_->schedule_plan_executor_->Submit(stale_cleanup_request).get();
+    ASSERT_EQ(EC_OK, cleanup_result.status);
+
+    const auto raw_uris = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, raw_uris.size());
+    EXPECT_NE(std::string::npos, raw_uris.front().find("source=refreshed"));
+    EXPECT_NE(std::string::npos, raw_uris.front().find("s_version=" + refreshed_token));
+    ASSERT_EQ(1u, QueryEventReportUris({key}).size());
+}
+
 TEST_F(CacheManagerTest, TestReportEventEmptySnapshotCommitsAndReclaimsPreviousBlocks) {
     const std::string host = "192.168.10.6:8080";
     const int64_t key = 9440;

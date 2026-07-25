@@ -56,8 +56,10 @@ class EventReportStorageArgsTest(unittest.TestCase):
         )
 
     def test_snapshot_min_interval_must_be_positive(self):
-        with self.assertRaises(SystemExit):
-            self._parse_args("--snapshot_min_interval_ms", "0")
+        for invalid_value in ("0", "-1"):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaises(SystemExit):
+                    self._parse_args("--snapshot_min_interval_ms", invalid_value)
 
 
 if __name__ == "__main__":
