@@ -193,4 +193,27 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotInterval) {
+    auto spec = std::make_shared<EventReportStorageSpec>();
+    spec->set_heartbeat_timeout_ms(1234);
+    spec->set_cleanup_grace_ms(5678);
+    spec->set_liveness_check_interval_ms(90);
+    spec->set_snapshot_min_interval_ms(4321);
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report_test", spec);
+
+    proto::admin::StorageConfig proto_config;
+    ProtoConvert::StorageConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.has_event_report());
+    EXPECT_EQ(4321, proto_config.event_report().snapshot_min_interval_ms());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_config, restored);
+    auto restored_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(1234, restored_spec->heartbeat_timeout_ms());
+    EXPECT_EQ(5678, restored_spec->cleanup_grace_ms());
+    EXPECT_EQ(90, restored_spec->liveness_check_interval_ms());
+    EXPECT_EQ(4321, restored_spec->snapshot_min_interval_ms());
+}
+
 } // namespace kv_cache_manager

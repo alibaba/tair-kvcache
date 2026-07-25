@@ -1,8 +1,12 @@
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -28,6 +32,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
@@ -136,6 +141,102 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     MightExistFunc fn_;
+};
+
+// A deterministic write gate for ReportEvent ordering tests.  Sleeping in a
+// test cannot prove which request acquired the snapshot fence first; blocking
+// the persistent Upsert lets the test observe and release that exact point.
+class ControllableMetaLocalBackend : public MetaLocalBackend {
+public:
+    void BlockNextUpsert() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        block_next_upsert_ = true;
+        upsert_entered_ = false;
+        release_upsert_ = false;
+    }
+
+    bool WaitUntilUpsertEntered(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(control_mutex_);
+        return control_cv_.wait_for(lock, timeout, [&] { return upsert_entered_; });
+    }
+
+    void ReleaseUpsert() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        release_upsert_ = true;
+        control_cv_.notify_all();
+    }
+
+    void FailKeyOnNextUpsert(int64_t key) {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        fail_key_on_next_upsert_ = key;
+    }
+
+    void FailNextSync() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        fail_next_sync_ = true;
+    }
+
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        MaybeBlockUpsert();
+
+        std::optional<int64_t> failed_key;
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            failed_key = fail_key_on_next_upsert_;
+            fail_key_on_next_upsert_.reset();
+        }
+        if (!failed_key.has_value()) {
+            return MetaLocalBackend::Upsert(request_context, keys, locations, properties);
+        }
+
+        std::vector<ErrorCode> results(keys.size(), EC_ERROR);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == failed_key.value()) {
+                continue;
+            }
+            const auto one_result = MetaLocalBackend::Upsert(
+                request_context,
+                KeyTypeVec{keys[i]},
+                CacheLocationMapVector{locations[i]},
+                PropertyMapVector{properties[i]});
+            results[i] = one_result.empty() ? EC_ERROR : one_result.front();
+        }
+        return results;
+    }
+
+    bool Sync(const KeyTypeVec &keys) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            if (fail_next_sync_) {
+                fail_next_sync_ = false;
+                return false;
+            }
+        }
+        return MetaLocalBackend::Sync(keys);
+    }
+
+private:
+    void MaybeBlockUpsert() {
+        std::unique_lock<std::mutex> lock(control_mutex_);
+        if (!block_next_upsert_) {
+            return;
+        }
+        block_next_upsert_ = false;
+        upsert_entered_ = true;
+        control_cv_.notify_all();
+        control_cv_.wait(lock, [&] { return release_upsert_; });
+    }
+
+    std::mutex control_mutex_;
+    std::condition_variable control_cv_;
+    bool block_next_upsert_ = false;
+    bool upsert_entered_ = false;
+    bool release_upsert_ = false;
+    std::optional<int64_t> fail_key_on_next_upsert_;
+    bool fail_next_sync_ = false;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -275,6 +376,166 @@ public:
         for (auto &spec : specs) {
             EXPECT_NE("", spec.uri());
         }
+    }
+
+    std::shared_ptr<EventReportBackend> InstallEventReportBackend() {
+        const std::string storage_name = "event_report_default";
+        const std::string group_name = registry_manager_->GetInstanceGroupName("test_instance");
+        auto group = registry_manager_->instance_group_configs_.at(group_name);
+        group->set_event_report_storage_candidates({storage_name});
+
+        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+        StorageConfig config;
+        config.set_global_unique_name(storage_name);
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        auto spec = std::make_shared<EventReportStorageSpec>();
+        spec->set_liveness_check_interval_ms(10);
+        config.set_storage_spec(spec);
+        if (backend->Open(config, "report_event_ordering_test") != EC_OK) {
+            return nullptr;
+        }
+        backend->SetSnapshotMinIntervalMsForTest(0);
+        registry_manager_->data_storage_manager_->storage_map_[storage_name] = backend;
+        return backend;
+    }
+
+    std::string InitializeEventReporter(const std::string &instance_id,
+                                        const std::string &host,
+                                        proto::meta::StorageType storage_type) {
+        proto::meta::ReportEventRequest register_request;
+        register_request.set_instance_id(instance_id);
+        register_request.set_host_ip_port(host);
+        register_request.set_storage_type(storage_type);
+        auto *register_event = register_request.add_events();
+        register_event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        register_event->mutable_node_register()->add_mediums("mem");
+        register_event->mutable_node_register()->add_mediums("disk");
+        proto::meta::ReportEventResponse register_response;
+        EXPECT_EQ(EC_OK,
+                  cache_manager_->ReportEvent(request_context_.get(), &register_request, &register_response));
+
+        proto::meta::ReportEventRequest snapshot_request;
+        snapshot_request.set_instance_id(instance_id);
+        snapshot_request.set_host_ip_port(host);
+        snapshot_request.set_storage_type(storage_type);
+        auto *snapshot_event = snapshot_request.add_events();
+        snapshot_event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        snapshot_event->mutable_block_snapshot();
+        proto::meta::ReportEventResponse snapshot_response;
+        EXPECT_EQ(EC_OK,
+                  cache_manager_->ReportEvent(request_context_.get(), &snapshot_request, &snapshot_response));
+        EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(snapshot_response.committed_snapshot_version()));
+        return snapshot_response.committed_snapshot_version();
+    }
+
+    ControllableMetaLocalBackend *InstallControllableMetaBackend() {
+        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+        if (!indexer) {
+            return nullptr;
+        }
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto controlled = std::make_unique<ControllableMetaLocalBackend>();
+        if (controlled->Init("test_instance", config) != EC_OK || controlled->Open() != EC_OK) {
+            return nullptr;
+        }
+        auto *controlled_raw = controlled.get();
+        indexer->backend_manager_->persistent_backend_->Close();
+        indexer->backend_manager_->persistent_backend_ = std::move(controlled);
+        indexer->backend_manager_->cache_backend_.reset();
+        return controlled_raw;
+    }
+
+    static proto::meta::ReportEventRequest MakeSnapshotRequest(
+        const std::string &host,
+        const std::vector<std::pair<int64_t, std::string>> &key_sources) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        auto *snapshot = event->mutable_block_snapshot();
+        for (const auto &[key, source] : key_sources) {
+            auto *block = snapshot->add_blocks();
+            block->set_block_key(std::to_string(key));
+            block->set_medium("mem");
+            auto *spec = block->add_specs();
+            spec->set_name("tp0");
+            spec->set_uri("event_report://" + host + "/mem?source=" + source);
+        }
+        return request;
+    }
+
+    static proto::meta::ReportEventRequest MakeAddRequest(const std::string &host,
+                                                           int64_t key,
+                                                           const std::string &source) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        event->mutable_block_add()->set_block_key(std::to_string(key));
+        event->mutable_block_add()->set_medium("mem");
+        auto *spec = event->mutable_block_add()->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri("event_report://" + host + "/mem?source=" + source);
+        return request;
+    }
+
+    std::pair<ErrorCode, proto::meta::ReportEventResponse>
+    CallReportEvent(const proto::meta::ReportEventRequest &request, const std::string &trace_id) {
+        RequestContext context(trace_id);
+        proto::meta::ReportEventResponse response;
+        const ErrorCode ec = cache_manager_->ReportEvent(&context, &request, &response);
+        return {ec, std::move(response)};
+    }
+
+    std::vector<std::string> QueryEventReportUris(const std::vector<int64_t> &keys) {
+        RequestContext context("query_report_event_ordering");
+        auto [ec, locations] = cache_manager_->GetCacheLocation(&context,
+                                                                "test_instance",
+                                                                CacheManager::QueryType::QT_BATCH_GET,
+                                                                keys,
+                                                                {},
+                                                                BlockMask{},
+                                                                0,
+                                                                {});
+        EXPECT_EQ(EC_OK, ec);
+        std::vector<std::string> uris;
+        for (const auto &location : locations.cache_locations_view()) {
+            for (const auto &spec : location.location_specs()) {
+                if (spec.uri().rfind("event_report://", 0) == 0) {
+                    uris.push_back(spec.uri());
+                }
+            }
+        }
+        return uris;
+    }
+
+    std::vector<std::string> QueryRawEventReportUris(int64_t key) {
+        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        if (!meta_searcher) {
+            return {};
+        }
+        RequestContext context("query_raw_report_event");
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask;
+        const ErrorCode ec = meta_searcher->BatchGetLocation(&context, {key}, mask, location_maps);
+        if ((ec != EC_OK && ec != EC_PARTIAL_OK) || location_maps.empty()) {
+            return {};
+        }
+        std::vector<std::string> uris;
+        for (const auto &[location_id, location] : location_maps.front()) {
+            (void)location_id;
+            if (!location || location->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+                continue;
+            }
+            for (const auto &spec : location->location_specs()) {
+                uris.push_back(spec.uri());
+            }
+        }
+        return uris;
     }
 
     std::unique_ptr<CacheManager> cache_manager_;
@@ -2131,6 +2392,611 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
     ASSERT_EQ(func(loc), true);
 }
 
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed) {
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
+
+    CacheLocation loc;
+    loc.set_id("kvs#event_report_l1p5#mem#192.168.1.100:8080");
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    loc.set_location_specs(
+        {LocationSpec("tp0", "event_report://cache-node/mem?s_version=0123456789abcdef0123456789abcdef")});
+
+    EXPECT_FALSE(func(loc));
+}
+
+TEST_F(CacheManagerTest, TestReportEventDeltaAlreadyAdmittedThenSnapshotWins) {
+    const std::string host = "192.168.10.1:8080";
+    const int64_t key = 9400;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto [baseline_ec, baseline_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "ordering_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline_response.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(baseline_token));
+
+    meta_backend->BlockNextUpsert();
+    auto delta_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(MakeAddRequest(host, key, "delta_before_snapshot"), "ordering_delta_first");
+    });
+    const bool delta_entered = meta_backend->WaitUntilUpsertEntered(std::chrono::seconds(1));
+    if (!delta_entered) {
+        meta_backend->ReleaseUpsert();
+    }
+    ASSERT_TRUE(delta_entered);
+
+    auto snapshot_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(
+            MakeSnapshotRequest(host, {{key, "snapshot_after_delta"}}), "ordering_snapshot_second");
+    });
+    EXPECT_EQ(std::future_status::timeout, snapshot_future.wait_for(std::chrono::milliseconds(30)));
+    EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+
+    meta_backend->ReleaseUpsert();
+    ASSERT_EQ(std::future_status::ready, delta_future.wait_for(std::chrono::seconds(2)));
+    const auto [delta_ec, delta_response] = delta_future.get();
+    ASSERT_EQ(EC_OK, delta_ec);
+    EXPECT_EQ(baseline_token, delta_response.committed_snapshot_version());
+
+    ASSERT_EQ(std::future_status::ready, snapshot_future.wait_for(std::chrono::seconds(2)));
+    const auto [snapshot_ec, snapshot_response] = snapshot_future.get();
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string snapshot_token = snapshot_response.committed_snapshot_version();
+    EXPECT_NE(baseline_token, snapshot_token);
+
+    const auto uris = QueryEventReportUris({key});
+    ASSERT_EQ(1u, uris.size());
+    EXPECT_NE(std::string::npos, uris[0].find("source=snapshot_after_delta"));
+    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + snapshot_token));
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotGateThenDeltaInheritsNewTokenAndWins) {
+    const std::string host = "192.168.10.2:8080";
+    const int64_t key = 9410;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto [baseline_ec, baseline_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "gate_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline_response.committed_snapshot_version();
+
+    meta_backend->BlockNextUpsert();
+    auto snapshot_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(MakeSnapshotRequest(host, {{key, "snapshot_in_flight"}}), "gate_snapshot_first");
+    });
+    const bool snapshot_entered = meta_backend->WaitUntilUpsertEntered(std::chrono::seconds(1));
+    if (!snapshot_entered) {
+        meta_backend->ReleaseUpsert();
+    }
+    ASSERT_TRUE(snapshot_entered);
+    EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+
+    auto delta_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(MakeAddRequest(host, key, "delta_after_snapshot_gate"), "gate_delta_second");
+    });
+    EXPECT_EQ(std::future_status::timeout, delta_future.wait_for(std::chrono::milliseconds(30)));
+
+    meta_backend->ReleaseUpsert();
+    ASSERT_EQ(std::future_status::ready, snapshot_future.wait_for(std::chrono::seconds(2)));
+    const auto [snapshot_ec, snapshot_response] = snapshot_future.get();
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string new_token = snapshot_response.committed_snapshot_version();
+    EXPECT_NE(baseline_token, new_token);
+
+    ASSERT_EQ(std::future_status::ready, delta_future.wait_for(std::chrono::seconds(2)));
+    const auto [delta_ec, delta_response] = delta_future.get();
+    ASSERT_EQ(EC_OK, delta_ec);
+    EXPECT_EQ(new_token, delta_response.committed_snapshot_version());
+
+    const auto uris = QueryEventReportUris({key});
+    ASSERT_EQ(1u, uris.size());
+    EXPECT_NE(std::string::npos, uris[0].find("source=delta_after_snapshot_gate"));
+    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + new_token));
+}
+
+TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
+    const std::string host = "192.168.10.43:8080";
+    const int64_t key = 94'420;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "host_down_snapshot_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
+    ASSERT_EQ(1u, QueryEventReportUris({key}).size());
+
+    meta_backend->BlockNextUpsert();
+    auto snapshot_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(MakeSnapshotRequest(host, {{key, "must_not_commit"}}), "host_down_snapshot_in_flight");
+    });
+    const bool snapshot_entered = meta_backend->WaitUntilUpsertEntered(std::chrono::seconds(1));
+    if (!snapshot_entered) {
+        meta_backend->ReleaseUpsert();
+    }
+    ASSERT_TRUE(snapshot_entered);
+
+    proto::meta::ReportEventRequest host_down;
+    host_down.set_instance_id("test_instance");
+    host_down.set_host_ip_port(host);
+    host_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *host_down_event = host_down.add_events();
+    host_down_event->set_event_type(proto::meta::EVENT_HOST_DOWN);
+    host_down_event->mutable_host_down();
+    const auto [host_down_ec, host_down_response] = CallReportEvent(host_down, "host_down_during_snapshot");
+    ASSERT_EQ(EC_OK, host_down_ec);
+    EXPECT_EQ(proto::meta::OK, host_down_response.header().status().code());
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", host));
+    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
+
+    meta_backend->ReleaseUpsert();
+    ASSERT_EQ(std::future_status::ready, snapshot_future.wait_for(std::chrono::seconds(2)));
+    const auto [snapshot_ec, snapshot_response] = snapshot_future.get();
+    EXPECT_EQ(EC_PARTIAL_OK, snapshot_ec);
+    EXPECT_EQ(proto::meta::INTERNAL_ERROR, snapshot_response.header().status().code());
+    EXPECT_TRUE(snapshot_response.committed_snapshot_version().empty());
+    EXPECT_TRUE(snapshot_response.snapshot_required());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+
+    std::string baseline_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://physical-cache:9600/mem", baseline_token, baseline_uri));
+    EXPECT_EQ((std::vector<bool>{false}), event_backend->MightExist({DataStorageUri(baseline_uri)}));
+}
+
+TEST_F(CacheManagerTest, TestHostDownMakesAlreadyAdmittedDeltaInvisibleWithoutDeadlock) {
+    const std::string host = "192.168.10.44:8080";
+    const int64_t key = 94'421;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "host_down_delta_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(baseline.committed_snapshot_version()));
+
+    meta_backend->BlockNextUpsert();
+    auto delta_future = std::async(std::launch::async, [this, host, key] {
+        return CallReportEvent(MakeAddRequest(host, key, "admitted_before_host_down"), "host_down_delta_in_flight");
+    });
+    const bool delta_entered = meta_backend->WaitUntilUpsertEntered(std::chrono::seconds(1));
+    if (!delta_entered) {
+        meta_backend->ReleaseUpsert();
+    }
+    ASSERT_TRUE(delta_entered);
+
+    proto::meta::ReportEventRequest host_down;
+    host_down.set_instance_id("test_instance");
+    host_down.set_host_ip_port(host);
+    host_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *host_down_event = host_down.add_events();
+    host_down_event->set_event_type(proto::meta::EVENT_HOST_DOWN);
+    host_down_event->mutable_host_down();
+    const auto [host_down_ec, host_down_response] = CallReportEvent(host_down, "host_down_during_delta");
+    ASSERT_EQ(EC_OK, host_down_ec);
+    EXPECT_EQ(proto::meta::OK, host_down_response.header().status().code());
+
+    meta_backend->ReleaseUpsert();
+    ASSERT_EQ(std::future_status::ready, delta_future.wait_for(std::chrono::seconds(2)));
+    const auto [delta_ec, delta_response] = delta_future.get();
+    EXPECT_EQ(EC_OK, delta_ec);
+    EXPECT_TRUE(delta_response.committed_snapshot_version().empty());
+    EXPECT_TRUE(delta_response.snapshot_required());
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", host));
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+}
+
+TEST_F(CacheManagerTest, TestReportEventPartialSnapshotFailureIsFailClosedAndRetryConverges) {
+    const std::string host = "192.168.10.3:8080";
+    const int64_t key_a = 9420;
+    const int64_t key_b = 9421;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto [baseline_ec, baseline_response] = CallReportEvent(
+        MakeSnapshotRequest(host, {{key_a, "baseline_a"}, {key_b, "baseline_b"}}), "partial_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline_response.committed_snapshot_version();
+
+    meta_backend->FailKeyOnNextUpsert(key_b);
+    const auto [failed_ec, failed_response] = CallReportEvent(
+        MakeSnapshotRequest(host, {{key_a, "partial_a"}, {key_b, "partial_b"}}), "partial_injected_failure");
+    EXPECT_NE(EC_OK, failed_ec);
+    EXPECT_EQ(baseline_token, failed_response.committed_snapshot_version());
+    EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+
+    const auto [delta_ec, delta_response] =
+        CallReportEvent(MakeAddRequest(host, key_b, "delta_after_failed_snapshot"), "partial_delta_after_abort");
+    ASSERT_EQ(EC_OK, delta_ec);
+    EXPECT_EQ(baseline_token, delta_response.committed_snapshot_version());
+
+    // key_a was physically overwritten with an uncommitted token and must be
+    // hidden; a delta admitted after abort inherits the old committed token
+    // and keeps the reporter usable until its full retry.
+    const auto visible_after_failure = QueryEventReportUris({key_a, key_b});
+    ASSERT_EQ(1u, visible_after_failure.size());
+    EXPECT_NE(std::string::npos, visible_after_failure[0].find("source=delta_after_failed_snapshot"));
+    EXPECT_NE(std::string::npos, visible_after_failure[0].find("s_version=" + baseline_token));
+
+    const auto [retry_ec, retry_response] = CallReportEvent(
+        MakeSnapshotRequest(host, {{key_a, "retry_a"}, {key_b, "retry_b"}}), "partial_full_retry");
+    ASSERT_EQ(EC_OK, retry_ec);
+    const std::string retry_token = retry_response.committed_snapshot_version();
+    EXPECT_NE(baseline_token, retry_token);
+
+    const auto visible_after_retry = QueryEventReportUris({key_a, key_b});
+    ASSERT_EQ(2u, visible_after_retry.size());
+    std::set<std::string> retry_sources;
+    for (const auto &uri : visible_after_retry) {
+        EXPECT_NE(std::string::npos, uri.find("s_version=" + retry_token));
+        if (uri.find("source=retry_a") != std::string::npos) {
+            retry_sources.insert("retry_a");
+        }
+        if (uri.find("source=retry_b") != std::string::npos) {
+            retry_sources.insert("retry_b");
+        }
+    }
+    EXPECT_EQ((std::set<std::string>{"retry_a", "retry_b"}), retry_sources);
+}
+
+TEST_F(CacheManagerTest, TestReportEventSyncFailureDoesNotPublishAndImmediateFullRetryConverges) {
+    const std::string host = "192.168.10.30:8080";
+    const int64_t key = 9425;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    event_backend->SetSnapshotMinIntervalMsForTest(30'000);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    meta_backend->FailNextSync();
+    const auto [failed_ec, failed_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "sync_failure"}}), "sync_failure_snapshot");
+    EXPECT_EQ(EC_PARTIAL_OK, failed_ec);
+    EXPECT_EQ(proto::meta::INTERNAL_ERROR, failed_response.header().status().code());
+    ASSERT_EQ(1, failed_response.item_results_size());
+    EXPECT_EQ(proto::meta::INTERNAL_ERROR, failed_response.item_results(0));
+    EXPECT_TRUE(failed_response.committed_snapshot_version().empty());
+    EXPECT_TRUE(failed_response.snapshot_required());
+    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+    ASSERT_EQ(1u, QueryRawEventReportUris(key).size());
+
+    // A failed attempt must not start the rate-limit interval.
+    const auto [retry_ec, retry_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "sync_retry"}}), "sync_failure_immediate_retry");
+    ASSERT_EQ(EC_OK, retry_ec);
+    const std::string committed = retry_response.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(committed));
+    EXPECT_FALSE(retry_response.snapshot_required());
+
+    const auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=sync_retry"));
+    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + committed));
+}
+
+TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPerSpec) {
+    const std::string host = "192.168.10.31:8080";
+    const int64_t key = 9426;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "delta_order_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string token = baseline.committed_snapshot_version();
+
+    auto make_delete = [&] {
+        auto request = MakeAddRequest(host, key, "placeholder");
+        request.clear_events();
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+        event->mutable_block_delete()->set_block_key(std::to_string(key));
+        event->mutable_block_delete()->set_medium("mem");
+        event->mutable_block_delete()->add_spec_names("tp0");
+        return request;
+    };
+
+    auto delete_then_add = make_delete();
+    auto add_event = MakeAddRequest(host, key, "last_add").events(0);
+    *delete_then_add.add_events() = add_event;
+    const auto [delete_add_ec, delete_add_response] = CallReportEvent(delete_then_add, "delta_order_delete_then_add");
+    ASSERT_EQ(EC_OK, delete_add_ec);
+    EXPECT_EQ(token, delete_add_response.committed_snapshot_version());
+    auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=last_add"));
+
+    auto add_then_delete = MakeAddRequest(host, key, "add_before_delete");
+    *add_then_delete.add_events() = make_delete().events(0);
+    const auto [add_delete_ec, add_delete_response] = CallReportEvent(add_then_delete, "delta_order_add_then_delete");
+    ASSERT_EQ(EC_OK, add_delete_ec);
+    EXPECT_EQ(token, add_delete_response.committed_snapshot_version());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+
+    auto add_delete_add = MakeAddRequest(host, key, "first_add");
+    *add_delete_add.add_events() = make_delete().events(0);
+    *add_delete_add.add_events() = MakeAddRequest(host, key, "final_add").events(0);
+    const auto [toggle_ec, toggle_response] = CallReportEvent(add_delete_add, "delta_order_add_delete_add");
+    ASSERT_EQ(EC_OK, toggle_ec);
+    EXPECT_EQ(token, toggle_response.committed_snapshot_version());
+    visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=final_add"));
+    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+}
+
+TEST_F(CacheManagerTest, TestReportEventDistinguishesUnregisteredNodeFromMissingSnapshot) {
+    const std::string host = "192.168.10.32:8080";
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    proto::meta::ReportEventRequest heartbeat;
+    heartbeat.set_instance_id("test_instance");
+    heartbeat.set_host_ip_port(host);
+    heartbeat.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    heartbeat.add_events()->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    heartbeat.mutable_events(0)->mutable_heartbeat();
+    const auto [heartbeat_ec, heartbeat_response] = CallReportEvent(heartbeat, "unregistered_heartbeat");
+    EXPECT_EQ(EC_PARTIAL_OK, heartbeat_ec);
+    EXPECT_EQ(proto::meta::NODE_NOT_REGISTERED, heartbeat_response.header().status().code());
+    ASSERT_EQ(1, heartbeat_response.item_results_size());
+    EXPECT_EQ(proto::meta::NODE_NOT_REGISTERED, heartbeat_response.item_results(0));
+
+    const auto [unregistered_delta_ec, unregistered_delta] =
+        CallReportEvent(MakeAddRequest(host, 9427, "unregistered_delta"), "unregistered_delta");
+    EXPECT_EQ(EC_PARTIAL_OK, unregistered_delta_ec);
+    EXPECT_EQ(proto::meta::NODE_NOT_REGISTERED, unregistered_delta.header().status().code());
+    EXPECT_TRUE(unregistered_delta.committed_snapshot_version().empty());
+    EXPECT_TRUE(unregistered_delta.snapshot_required());
+
+    const auto [unregistered_snapshot_ec, unregistered_snapshot] =
+        CallReportEvent(MakeSnapshotRequest(host, {}), "unregistered_snapshot");
+    EXPECT_EQ(EC_PARTIAL_OK, unregistered_snapshot_ec);
+    EXPECT_EQ(proto::meta::NODE_NOT_REGISTERED, unregistered_snapshot.header().status().code());
+    EXPECT_TRUE(unregistered_snapshot.committed_snapshot_version().empty());
+    EXPECT_TRUE(unregistered_snapshot.snapshot_required());
+
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    const auto [missing_snapshot_ec, missing_snapshot] =
+        CallReportEvent(MakeAddRequest(host, 9427, "missing_snapshot"), "registered_without_snapshot");
+    EXPECT_EQ(EC_PARTIAL_OK, missing_snapshot_ec);
+    EXPECT_EQ(proto::meta::SNAPSHOT_REQUIRED, missing_snapshot.header().status().code());
+    EXPECT_TRUE(missing_snapshot.committed_snapshot_version().empty());
+    EXPECT_TRUE(missing_snapshot.snapshot_required());
+
+    const auto [baseline_ec, baseline] = CallReportEvent(MakeSnapshotRequest(host, {}), "registered_empty_snapshot");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(baseline.committed_snapshot_version()));
+
+    event_backend->SetNodeUnavailable("test_instance", host);
+    const auto [unavailable_delta_ec, unavailable_delta] =
+        CallReportEvent(MakeAddRequest(host, 9427, "registered_but_unavailable"), "registered_unavailable_delta");
+    ASSERT_EQ(EC_OK, unavailable_delta_ec);
+    EXPECT_EQ(baseline.committed_snapshot_version(), unavailable_delta.committed_snapshot_version());
+    EXPECT_TRUE(QueryEventReportUris({9427}).empty());
+
+    ASSERT_EQ(EC_OK, event_backend->OnHeartbeat("test_instance", host, {}));
+    const auto visible = QueryEventReportUris({9427});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=registered_but_unavailable"));
+}
+
+TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysButAllowsDifferentMedia) {
+    const std::string host = "192.168.10.33:8080";
+    const int64_t key = 9428;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem", "disk"}));
+
+    auto make_snapshot_with_keys = [&](const std::string &first_key,
+                                       const std::string &first_medium,
+                                       const std::string &second_key,
+                                       const std::string &second_medium) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *snapshot = request.add_events()->mutable_block_snapshot();
+        request.mutable_events(0)->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        for (const auto &[block_key, medium, spec_name] :
+             {std::tuple<std::string, std::string, std::string>{first_key, first_medium, "tp0"},
+              std::tuple<std::string, std::string, std::string>{second_key, second_medium, "tp1"}}) {
+            auto *block = snapshot->add_blocks();
+            block->set_block_key(block_key);
+            block->set_medium(medium);
+            auto *spec = block->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/" + medium + "?source=" + spec_name);
+        }
+        return request;
+    };
+
+    const auto [duplicate_ec, duplicate_response] =
+        CallReportEvent(make_snapshot_with_keys(std::to_string(key), "mem", "0" + std::to_string(key), "mem"),
+                        "canonical_duplicate_snapshot");
+    EXPECT_EQ(EC_PARTIAL_OK, duplicate_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, duplicate_response.header().status().code());
+    EXPECT_TRUE(duplicate_response.committed_snapshot_version().empty());
+    EXPECT_TRUE(duplicate_response.snapshot_required());
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+
+    const auto [different_media_ec, different_media_response] =
+        CallReportEvent(make_snapshot_with_keys(std::to_string(key), "mem", "0" + std::to_string(key), "disk"),
+                        "same_key_different_media_snapshot");
+    ASSERT_EQ(EC_OK, different_media_ec);
+    const std::string token = different_media_response.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(token));
+    const auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(2u, visible.size());
+    for (const auto &uri : visible) {
+        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+    }
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotCommitReclaimsOnlyStaleReporterLocations) {
+    const std::string host_a = "192.168.10.4:8080";
+    const std::string host_b = "192.168.10.5:8080";
+    const int64_t stale_key = 9430;
+    const int64_t current_key = 9431;
+    const int64_t other_host_key = 9432;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_a, {"mem"}));
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_b, {"mem"}));
+
+    const auto [host_a_baseline_ec, host_a_baseline] = CallReportEvent(
+        MakeSnapshotRequest(host_a, {{stale_key, "host_a_stale"}, {current_key, "host_a_old_current"}}),
+        "reclaimer_host_a_baseline");
+    ASSERT_EQ(EC_OK, host_a_baseline_ec);
+    const std::string host_a_old_token = host_a_baseline.committed_snapshot_version();
+
+    const auto [host_b_baseline_ec, host_b_baseline] =
+        CallReportEvent(MakeSnapshotRequest(host_b, {{other_host_key, "host_b_current"}}), "reclaimer_host_b_baseline");
+    ASSERT_EQ(EC_OK, host_b_baseline_ec);
+    const std::string host_b_token = host_b_baseline.committed_snapshot_version();
+    ASSERT_NE(host_a_old_token, host_b_token);
+
+    ASSERT_EQ(1u, QueryRawEventReportUris(stale_key).size());
+    ASSERT_EQ(1u, QueryRawEventReportUris(current_key).size());
+    ASSERT_EQ(1u, QueryRawEventReportUris(other_host_key).size());
+
+    const auto [reconcile_ec, reconcile] = CallReportEvent(
+        MakeSnapshotRequest(host_a, {{current_key, "host_a_new_current"}}), "reclaimer_host_a_reconcile");
+    ASSERT_EQ(EC_OK, reconcile_ec);
+    const std::string host_a_new_token = reconcile.committed_snapshot_version();
+    ASSERT_NE(host_a_old_token, host_a_new_token);
+
+    // Query filtering must hide the omitted block immediately, before making
+    // any assumption about asynchronous physical reclamation.
+    EXPECT_TRUE(QueryEventReportUris({stale_key}).empty());
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline && !QueryRawEventReportUris(stale_key).empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(QueryRawEventReportUris(stale_key).empty());
+
+    // The same cleanup scan must preserve the reporter's current token and
+    // every location belonging to a different reporter.
+    const auto current_uris = QueryRawEventReportUris(current_key);
+    ASSERT_EQ(1u, current_uris.size());
+    EXPECT_NE(std::string::npos, current_uris.front().find("source=host_a_new_current"));
+    EXPECT_NE(std::string::npos, current_uris.front().find("s_version=" + host_a_new_token));
+    const auto other_host_uris = QueryRawEventReportUris(other_host_key);
+    ASSERT_EQ(1u, other_host_uris.size());
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("source=host_b_current"));
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_version=" + host_b_token));
+
+    // Re-scanning after the stale location has already gone is idempotent.
+    EXPECT_EQ(EC_OK,
+              cache_manager_->CleanupStaleSnapshotLocations({"test_instance", host_a},
+                                                             host_a_new_token,
+                                                             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                                             event_backend));
+    EXPECT_TRUE(QueryRawEventReportUris(stale_key).empty());
+    EXPECT_EQ(1u, QueryRawEventReportUris(current_key).size());
+    EXPECT_EQ(1u, QueryRawEventReportUris(other_host_key).size());
+}
+
+TEST_F(CacheManagerTest, TestSnapshotCleanupPreservesInFlightStableLocationUntilAbort) {
+    const std::string host = "192.168.10.34:8080";
+    const int64_t key = 9435;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "cleanup_in_flight_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string committed = baseline.committed_snapshot_version();
+
+    std::string in_flight;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, event_backend->BeginSnapshot({"test_instance", host}, in_flight, retry_after_ms));
+    ASSERT_NE(committed, in_flight);
+    std::string in_flight_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://" + host + "/mem?source=in_flight", in_flight, in_flight_uri));
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<ErrorCode> replace_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchReplaceLocationSpecs(request_context_.get(),
+                                                       {key},
+                                                       {{{event_backend->BuildLocationId("mem", host),
+                                                          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                                          CacheLocationStatus::CLS_SERVING,
+                                                          {LocationSpec("tp0", in_flight_uri)}}}},
+                                                       replace_results));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), replace_results);
+    ASSERT_EQ(1u, QueryRawEventReportUris(key).size());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+
+    ASSERT_EQ(
+        EC_OK,
+        cache_manager_->CleanupStaleSnapshotLocations(
+            {"test_instance", host}, committed, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, event_backend));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(1u, QueryRawEventReportUris(key).size());
+
+    event_backend->AbortSnapshotVersion({"test_instance", host}, in_flight);
+    ASSERT_EQ(
+        EC_OK,
+        cache_manager_->CleanupStaleSnapshotLocations(
+            {"test_instance", host}, committed, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, event_backend));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline && !QueryRawEventReportUris(key).empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+}
+
+TEST_F(CacheManagerTest, TestReportEventEmptySnapshotCommitsAndReclaimsPreviousBlocks) {
+    const std::string host = "192.168.10.6:8080";
+    const int64_t key = 9440;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "empty_snapshot_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(baseline.committed_snapshot_version()));
+    ASSERT_EQ(1u, QueryEventReportUris({key}).size());
+
+    const auto [empty_ec, empty_snapshot] = CallReportEvent(MakeSnapshotRequest(host, {}), "empty_snapshot_commit");
+    ASSERT_EQ(EC_OK, empty_ec);
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(empty_snapshot.committed_snapshot_version()));
+    EXPECT_NE(baseline.committed_snapshot_version(), empty_snapshot.committed_snapshot_version());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline && !QueryRawEventReportUris(key).empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+}
+
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup) {
     // Event report URI hostname is a node IP, not the global_unique_name.
     // The functor should look up the backend via event_report_storage_candidates.
@@ -2175,109 +3041,260 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup)
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.100:8080/mem?gpu=A100")});
-    ASSERT_EQ(func(loc), true);
+    ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase(event_report_storage_name);
     registry_manager_->instance_group_configs_.erase(instance_group);
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncRequiresAllSpecsToMatchCurrentReporterToken) {
+    const std::string host = "192.168.10.35:8080";
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    const auto [snapshot_ec, snapshot_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {}), "query_filter_baseline");
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string token = snapshot_response.committed_snapshot_version();
+
+    std::string current_uri;
+    std::string unknown_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://physical-cache:9600/mem?source=current", token, current_uri));
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://physical-cache:9600/mem?source=unknown", "ffffffffffffffffffffffffffffffff", unknown_uri));
+
+    CacheLocation location;
+    location.set_id(event_backend->BuildLocationId("mem", host));
+    location.set_status(CLS_SERVING);
+    location.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    location.set_location_specs({LocationSpec("tp0", current_uri), LocationSpec("tp1", current_uri)});
+    auto check = cache_manager_->GetCheckLocDataExistFunc("test_instance");
+    EXPECT_TRUE(check(location));
+
+    location.set_location_specs({LocationSpec("tp0", current_uri), LocationSpec("tp1", unknown_uri)});
+    EXPECT_FALSE(check(location));
+    location.set_location_specs({LocationSpec("tp0", current_uri), LocationSpec("tp1", "event_report://raw/mem")});
+    EXPECT_FALSE(check(location));
+    location.set_location_specs({});
+    EXPECT_FALSE(check(location));
+
+    location.set_location_specs({LocationSpec("tp0", current_uri)});
+    event_backend->SetNodeUnavailable("test_instance", host);
+    EXPECT_FALSE(check(location));
+    ASSERT_EQ(EC_OK, event_backend->OnHeartbeat("test_instance", host, {}));
+    EXPECT_TRUE(check(location));
+
+    // A token is opaque, but its owner must still match the reporter encoded
+    // by the stable location id. A healthy token belonging to another host or
+    // another instance must fail closed.
+    const std::string other_host = "192.168.10.36:8080";
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", other_host, {"mem"}));
+    const auto [other_host_ec, other_host_snapshot] =
+        CallReportEvent(MakeSnapshotRequest(other_host, {}), "query_filter_other_host");
+    ASSERT_EQ(EC_OK, other_host_ec);
+    std::string other_host_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://physical-cache:9600/mem", other_host_snapshot.committed_snapshot_version(), other_host_uri));
+    location.set_location_specs({LocationSpec("tp0", other_host_uri)});
+    EXPECT_FALSE(check(location));
+
+    const ReporterSnapshotKey other_instance{"other_instance", host};
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode(other_instance.instance_id, host, {"mem"}));
+    std::string other_instance_token;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, event_backend->BeginSnapshot(other_instance, other_instance_token, retry_after_ms));
+    ASSERT_TRUE(event_backend->CommitSnapshotVersion(other_instance, other_instance_token));
+    std::string other_instance_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://physical-cache:9600/mem", other_instance_token, other_instance_uri));
+    location.set_location_specs({LocationSpec("tp0", other_instance_uri)});
+    EXPECT_FALSE(check(location));
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOrdering) {
+    const std::string host_a = "192.168.10.41:8080";
+    const std::string host_b = "192.168.10.42:8080";
+    const int64_t current_key = 94'410;
+    const int64_t old_key = 94'411;
+    const int64_t down_key = 94'412;
+    const int64_t missing_key = 94'413;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_a, {"mem"}));
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_b, {"mem"}));
+
+    const auto [first_a_ec, first_a] = CallReportEvent(
+        MakeSnapshotRequest(host_a, {{current_key, "a_first"}, {old_key, "a_old"}}), "query_lifecycle_a_first");
+    ASSERT_EQ(EC_OK, first_a_ec);
+    const std::string first_a_token = first_a.committed_snapshot_version();
+    const auto [first_b_ec, first_b] =
+        CallReportEvent(MakeSnapshotRequest(host_b, {{down_key, "b_current"}}), "query_lifecycle_b_first");
+    ASSERT_EQ(EC_OK, first_b_ec);
+    const std::string first_b_token = first_b.committed_snapshot_version();
+
+    auto query_visibility = [&](const std::vector<int64_t> &keys) {
+        RequestContext context("query_reporter_lifecycle");
+        auto [ec, locations] = cache_manager_->GetCacheLocation(
+            &context, "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {});
+        EXPECT_EQ(EC_OK, ec);
+        std::vector<std::vector<std::string>> uris_by_key;
+        for (const auto &location : locations.cache_locations_view()) {
+            auto &uris = uris_by_key.emplace_back();
+            for (const auto &spec : location.location_specs()) {
+                if (spec.uri().rfind("event_report://", 0) == 0) {
+                    uris.push_back(spec.uri());
+                }
+            }
+        }
+        return uris_by_key;
+    };
+
+    // Positive baseline first: all three committed-token locations are
+    // visible through the real GetCacheLocation entry point.
+    auto visible = query_visibility({current_key, old_key, down_key, missing_key});
+    ASSERT_EQ(4u, visible.size());
+    ASSERT_EQ(1u, visible[0].size());
+    ASSERT_EQ(1u, visible[1].size());
+    ASSERT_EQ(1u, visible[2].size());
+    EXPECT_TRUE(visible[3].empty());
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + first_a_token));
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+
+    // A new authoritative snapshot makes the omitted block's old token
+    // invisible immediately, even before its physical cleanup completes.
+    const auto [second_a_ec, second_a] =
+        CallReportEvent(MakeSnapshotRequest(host_a, {{current_key, "a_second"}}), "query_lifecycle_a_second");
+    ASSERT_EQ(EC_OK, second_a_ec);
+    const std::string second_a_token = second_a.committed_snapshot_version();
+    ASSERT_NE(first_a_token, second_a_token);
+    visible = query_visibility({current_key, old_key, down_key, missing_key});
+    ASSERT_EQ(4u, visible.size());
+    ASSERT_EQ(1u, visible[0].size());
+    EXPECT_TRUE(visible[1].empty());
+    ASSERT_EQ(1u, visible[2].size());
+    EXPECT_TRUE(visible[3].empty());
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + second_a_token));
+
+    // Only host B is hidden; host A and the batch result ordering are
+    // unaffected. Heartbeat recovery restores B's original committed token.
+    event_backend->SetNodeUnavailable("test_instance", host_b);
+    visible = query_visibility({current_key, old_key, down_key, missing_key});
+    ASSERT_EQ(4u, visible.size());
+    ASSERT_EQ(1u, visible[0].size());
+    EXPECT_TRUE(visible[1].empty());
+    EXPECT_TRUE(visible[2].empty());
+    EXPECT_TRUE(visible[3].empty());
+    ASSERT_EQ(EC_OK, event_backend->OnHeartbeat("test_instance", host_b, {}));
+    visible = query_visibility({current_key, old_key, down_key, missing_key});
+    ASSERT_EQ(1u, visible[2].size());
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+
+    // Once host A is unregistered, neither heartbeat nor registration alone
+    // may resurrect its old token. A new full snapshot is mandatory.
+    ASSERT_EQ(EC_OK, event_backend->UnregisterNode("test_instance", host_a));
+    visible = query_visibility({current_key, down_key});
+    ASSERT_EQ(2u, visible.size());
+    EXPECT_TRUE(visible[0].empty());
+    ASSERT_EQ(1u, visible[1].size());
+    EXPECT_EQ(EC_NODE_NOT_REGISTERED, event_backend->OnHeartbeat("test_instance", host_a, {}));
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_a, {"mem"}));
+    visible = query_visibility({current_key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_TRUE(visible[0].empty());
+
+    const auto [delta_ec, delta_response] =
+        CallReportEvent(MakeAddRequest(host_a, current_key, "must_be_rejected"), "query_lifecycle_delta_rejected");
+    EXPECT_EQ(EC_PARTIAL_OK, delta_ec);
+    EXPECT_EQ(proto::meta::SNAPSHOT_REQUIRED, delta_response.header().status().code());
+    const auto [third_a_ec, third_a] =
+        CallReportEvent(MakeSnapshotRequest(host_a, {{current_key, "a_third"}}), "query_lifecycle_a_third");
+    ASSERT_EQ(EC_OK, third_a_ec);
+    ASSERT_NE(second_a_token, third_a.committed_snapshot_version());
+    visible = query_visibility({current_key});
+    ASSERT_EQ(1u, visible.size());
+    ASSERT_EQ(1u, visible[0].size());
+    EXPECT_NE(std::string::npos, visible[0][0].find("source=a_third"));
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnavailable) {
-    // When a event report node is registered but unavailable (grace period),
-    // the functor should return false (not reachable).
-    const std::string instance_id = "my_cluster";
-    const std::string instance_group = "my_group";
-    const std::string event_report_storage_name = "event_report_" + instance_group;
+    // Start from a valid committed snapshot. Otherwise an unversioned URI
+    // would be rejected as stale before this test ever reached the node
+    // availability branch.
+    const std::string instance_id = "test_instance";
     const std::string node_host = "192.168.1.200:8080";
+    auto event_report_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_report_backend);
+    ASSERT_EQ(EC_OK, event_report_backend->RegisterNode(instance_id, node_host, {"mem"}));
+    const auto [snapshot_ec, snapshot_response] =
+        CallReportEvent(MakeSnapshotRequest(node_host, {}), "unavailable_valid_snapshot");
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string token = snapshot_response.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(token));
 
-    // Register instance so GetInstanceGroupName works
-    auto instance_info = std::make_shared<InstanceInfo>(
-        "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
-    registry_manager_->instance_infos_[instance_id] = instance_info;
-
-    // Create InstanceGroup with event_report_storage_candidates
-    auto ig = std::make_shared<InstanceGroup>();
-    ig->set_name(instance_group);
-    ig->set_storage_candidates({event_report_storage_name});
-    ig->set_event_report_storage_candidates({event_report_storage_name});
-    ig->set_global_quota_group_name("test_quota_group");
-    ig->set_max_instance_count(10);
-    ig->set_version(1);
-    registry_manager_->instance_group_configs_[instance_group] = ig;
-
-    auto metrics_registry = cache_manager_->metrics_registry_;
-    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
-
-    StorageConfig config;
-    config.set_global_unique_name(event_report_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    auto spec = std::make_shared<EventReportStorageSpec>();
-    config.set_storage_spec(spec);
-    event_report_backend->Open(config, "test_trace");
-
-    event_report_backend->RegisterNode(instance_id, node_host, {"mem"});
-    event_report_backend->SetNodeUnavailable(instance_id, node_host);
-
-    auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[event_report_storage_name] = event_report_backend;
-
+    std::string current_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://physical-cache:9600/mem", token, current_uri));
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
-
     CacheLocation loc;
+    loc.set_id(event_report_backend->BuildLocationId("mem", node_host));
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
-    ASSERT_EQ(func(loc), false);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    loc.set_location_specs({LocationSpec("tp0", current_uri)});
 
-    dsm->storage_map_.erase(event_report_storage_name);
-    registry_manager_->instance_group_configs_.erase(instance_group);
+    ASSERT_TRUE(func(loc));
+    event_report_backend->SetNodeUnavailable(instance_id, node_host);
+    EXPECT_FALSE(func(loc));
+    ASSERT_EQ(EC_OK, event_report_backend->OnHeartbeat(instance_id, node_host, {}));
+    EXPECT_TRUE(func(loc));
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnregistered) {
-    // When a event report node has been unregistered (dead, past grace period),
-    // MightExist returns false -> the functor should return false.
-    const std::string instance_id = "my_cluster";
-    const std::string instance_group = "my_group";
-    const std::string event_report_storage_name = "event_report_" + instance_group;
+    const std::string instance_id = "test_instance";
     const std::string node_host = "192.168.1.200:8080";
+    auto event_report_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_report_backend);
+    ASSERT_EQ(EC_OK, event_report_backend->RegisterNode(instance_id, node_host, {"mem"}));
+    const auto [first_snapshot_ec, first_snapshot] =
+        CallReportEvent(MakeSnapshotRequest(node_host, {}), "unregistered_valid_snapshot");
+    ASSERT_EQ(EC_OK, first_snapshot_ec);
+    const std::string first_token = first_snapshot.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(first_token));
 
-    // Register instance so GetInstanceGroupName works
-    auto instance_info = std::make_shared<InstanceInfo>(
-        "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
-    registry_manager_->instance_infos_[instance_id] = instance_info;
-
-    // Create InstanceGroup with event_report_storage_candidates
-    auto ig = std::make_shared<InstanceGroup>();
-    ig->set_name(instance_group);
-    ig->set_storage_candidates({event_report_storage_name});
-    ig->set_event_report_storage_candidates({event_report_storage_name});
-    ig->set_global_quota_group_name("test_quota_group");
-    ig->set_max_instance_count(10);
-    ig->set_version(1);
-    registry_manager_->instance_group_configs_[instance_group] = ig;
-
-    auto metrics_registry = cache_manager_->metrics_registry_;
-    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
-
-    StorageConfig config;
-    config.set_global_unique_name(event_report_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    auto spec = std::make_shared<EventReportStorageSpec>();
-    config.set_storage_spec(spec);
-    event_report_backend->Open(config, "test_trace");
-
-    auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[event_report_storage_name] = event_report_backend;
-
+    std::string first_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://physical-cache:9600/mem", first_token, first_uri));
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
-
     CacheLocation loc;
+    loc.set_id(event_report_backend->BuildLocationId("mem", node_host));
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
-    ASSERT_EQ(func(loc), false);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    loc.set_location_specs({LocationSpec("tp0", first_uri)});
+    ASSERT_TRUE(func(loc));
 
-    dsm->storage_map_.erase(event_report_storage_name);
-    registry_manager_->instance_group_configs_.erase(instance_group);
+    ASSERT_EQ(EC_OK, event_report_backend->UnregisterNode(instance_id, node_host));
+    EXPECT_FALSE(func(loc));
+
+    // Registration alone starts a fresh reporter lifecycle. It must not
+    // resurrect the previous token.
+    ASSERT_EQ(EC_OK, event_report_backend->RegisterNode(instance_id, node_host, {"mem"}));
+    EXPECT_FALSE(func(loc));
+    std::string committed = "must-be-cleared";
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, event_report_backend->BeginDeltaMutation({instance_id, node_host}, committed));
+    EXPECT_TRUE(committed.empty());
+
+    const auto [second_snapshot_ec, second_snapshot] =
+        CallReportEvent(MakeSnapshotRequest(node_host, {}), "reregister_new_snapshot");
+    ASSERT_EQ(EC_OK, second_snapshot_ec);
+    const std::string second_token = second_snapshot.committed_snapshot_version();
+    ASSERT_NE(first_token, second_token);
+    std::string second_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://physical-cache:9600/mem", second_token, second_uri));
+    loc.set_location_specs({LocationSpec("tp0", second_uri)});
+    EXPECT_TRUE(func(loc));
+    loc.set_location_specs({LocationSpec("tp0", first_uri)});
+    EXPECT_FALSE(func(loc));
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
@@ -2287,59 +3304,9 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
     cache_manager_->schedule_plan_executor_ = nullptr;
 
     auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}});
+    func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}}, {});
 
     cache_manager_->schedule_plan_executor_ = saved;
-}
-
-TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
-    // verify that the functor actually submits a task to the
-    // schedule_plan_executor_ by checking that the internal task queue
-    // grows
-    auto &executor = cache_manager_->schedule_plan_executor_;
-
-    // stop worker threads so tasks accumulate in the queue without
-    // being consumed
-    executor->stop_.store(true);
-    executor->condition_.notify_all();
-    for (auto &w : executor->workers_) {
-        if (w.joinable()) {
-            w.join();
-        }
-    }
-    executor->workers_.clear();
-    // reset stop_ so SubmitRaw accepts new tasks
-    executor->stop_.store(false);
-
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
-
-    auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    func({100, 200}, {{"loc_a"}, {"loc_b"}});
-
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
-    }
-
-    // submit a second request and verify count increases
-    func({300}, {{"loc_c"}});
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(2u, executor->WaitingTaskCountLocked());
-    }
-
-    // clean up: clear tasks so executor destructor is clean
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_DeletesLocationMetadata) {
@@ -2386,7 +3353,7 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_DeletesLocationMetadata) {
 
     // use GetSubmitDelReqFunc to submit a deletion request
     auto del_func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    del_func(keys, loc_ids);
+    del_func(keys, loc_ids, {});
 
     // wait for the async executor to process the request
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -2571,6 +3538,11 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
                                                createLocationSpecInfos(),
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
+
+    // This test inspects the queued delete request directly. Stop the
+    // supervisor so it cannot concurrently consume a future whose scheduled
+    // task is deliberately removed below.
+    cache_manager_->reclaimer_task_supervisor_->Stop();
 
     // write keys {1,2} and finish as CLS_SERVING
     std::vector<std::int64_t> write_keys{1, 2};
@@ -3129,7 +4101,6 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     cm->InvalidateInstanceMetrics("");
     ASSERT_EQ(1, call_count);
 }
-
 TEST_F(CacheManagerTest, TestReportEventRejectsInvalidRequestsAndMapsItemErrors) {
     auto add_register_event = [](proto::meta::ReportEventRequest &request) {
         auto *event = request.add_events();
@@ -3210,7 +4181,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsInvalidRequestsAndMapsItemErrors)
 
         proto::meta::ReportEventResponse response;
         EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
-        EXPECT_EQ(proto::meta::INTERNAL_ERROR, response.header().status().code());
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
         ASSERT_EQ(2, response.item_results_size());
         EXPECT_EQ(proto::meta::OK, response.item_results(0));
         EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(1));
@@ -3250,16 +4221,14 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         {"event_backend_default"});
 
     const std::string host = "10.0.0.9:8080";
+    const std::string snapshot_version =
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
     auto report_specs =
         [&](int64_t key, const std::string &medium, const std::vector<std::vector<LocationSpec>> &spec_groups) {
             proto::meta::ReportEventRequest req;
             req.set_instance_id(instance_id);
             req.set_host_ip_port(host);
             req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-
-            auto *reg = req.add_events();
-            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-            reg->mutable_node_register()->add_mediums("mem");
 
             for (const auto &specs : spec_groups) {
                 auto *ev = req.add_events();
@@ -3298,6 +4267,13 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         }
         return spec_uris;
     };
+    auto versioned_uri = [&](const std::string &raw_uri) {
+        std::string result;
+        EXPECT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, snapshot_version, result));
+        return result;
+    };
+    const std::string mem_uri = versioned_uri("event_report://10.0.0.9:8080/mem");
+    const std::string disk_uri = versioned_uri("event_report://10.0.0.9:8080/disk");
 
     // Case 1: one BlockAdd can create one CacheLocation with multiple specs.
     const int64_t multi_spec_key = 9001;
@@ -3315,8 +4291,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(2u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(2u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
     }
 
     // Case 2: later reports append new specs and overwrite same-name specs.
@@ -3332,9 +4308,9 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(3u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(3u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["full_3"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["full_3"]);
     }
 
     // Case 3: multiple BlockAdd events for the same key in one request are merged before writing meta.
@@ -3354,8 +4330,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(2u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(2u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
     }
 
     // Case 4: same key with different medium uses different location_id and does not merge into one CacheLocation.
@@ -3379,8 +4355,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         auto disk_specs = get_spec_uris(disk_it->second);
         ASSERT_EQ(1u, mem_specs.size());
         ASSERT_EQ(1u, disk_specs.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", mem_specs["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/disk", disk_specs["linear_1"]);
+        EXPECT_EQ(mem_uri, mem_specs["linear_0"]);
+        EXPECT_EQ(disk_uri, disk_specs["linear_1"]);
     }
 }
 
@@ -3422,14 +4398,14 @@ TEST_F(CacheManagerTest, TestReportEventL1P5L2BlockAddAreIsolated) {
 
     const std::string host = "10.0.0.11:8080";
     const int64_t key = 9201;
+    const std::string l1p5_version =
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
+    const std::string l2_version = InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
     auto report_one = [&](proto::meta::StorageType storage_type, const std::string &spec_name, const std::string &uri) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(host);
         req.set_storage_type(storage_type);
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums("mem");
         auto *ev = req.add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
         auto *ba = ev->mutable_block_add();
@@ -3469,9 +4445,15 @@ TEST_F(CacheManagerTest, TestReportEventL1P5L2BlockAddAreIsolated) {
     ASSERT_EQ(1u, l1p5_it->second->location_specs().size());
     ASSERT_EQ(1u, l2_it->second->location_specs().size());
     EXPECT_EQ("linear_0", l1p5_it->second->location_specs()[0].name());
-    EXPECT_EQ("event_report://10.0.0.11:8080/l1p5", l1p5_it->second->location_specs()[0].uri());
+    std::string expected_l1p5_uri;
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://10.0.0.11:8080/l1p5", l1p5_version, expected_l1p5_uri));
+    EXPECT_EQ(expected_l1p5_uri, l1p5_it->second->location_specs()[0].uri());
     EXPECT_EQ("linear_1", l2_it->second->location_specs()[0].name());
-    EXPECT_EQ("event_report://10.0.0.11:8080/l2", l2_it->second->location_specs()[0].uri());
+    std::string expected_l2_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://10.0.0.11:8080/l2", l2_version, expected_l2_uri));
+    EXPECT_EQ(expected_l2_uri, l2_it->second->location_specs()[0].uri());
 }
 
 TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
@@ -3504,14 +4486,12 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
         {"event_backend_delete"});
 
     const std::string host = "10.0.0.10:8080";
+    InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
     auto report_add = [&](int64_t key, const std::string &medium, const std::vector<LocationSpec> &specs) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums(medium);
         auto *ev = req.add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
         auto *ba = ev->mutable_block_add();
@@ -3531,9 +4511,6 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
             req.set_instance_id(instance_id);
             req.set_host_ip_port(host);
             req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-            auto *reg = req.add_events();
-            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-            reg->mutable_node_register()->add_mediums(medium);
             for (const auto &spec_names : spec_name_groups) {
                 auto *ev = req.add_events();
                 ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
@@ -3606,28 +4583,6 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
     }
 }
 
-// =============================================================
-// GetCacheLocationsByBackend with backend_selectors
-// =============================================================
-//
-// Data layout:
-//   3 event report peers: A (192.168.1.1:8080), B (192.168.1.2:8080), C (192.168.1.3:8080)
-//   key 300: peer_A, peer_B, peer_C
-//   key 400: peer_A, peer_B
-//   key 500: peer_B only
-//   key 600: peer_A, peer_B
-//   key 700: no event report
-//   All 5 keys have NFS locations.
-//
-// PREFIX (from key[0]):
-//   peer_A: 300→400→(miss 500) → prefix=2
-//   peer_B: 300→400→500→600    → prefix=4  (winner)
-//   peer_C: 300→(miss 400)     → prefix=1
-//
-// COVERAGE:
-//   peer_A: {300,400,600}      → 3 keys
-//   peer_B: {300,400,500,600}  → 4 keys (winner)
-//   peer_C: {300}              → 1 key
 
 TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
@@ -3682,14 +4637,11 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         {"192.168.1.3:8080", {300}},
     };
     for (const auto &pd : peer_data) {
+        InitializeEventReporter("test_instance", pd.host, proto::meta::ST_EVENT_REPORT_L2);
         proto::meta::ReportEventRequest req;
         req.set_instance_id("test_instance");
         req.set_host_ip_port(pd.host);
         req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
-
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums("mem");
 
         for (int64_t key : pd.keys) {
             auto *ev = req.add_events();
@@ -4009,14 +4961,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         {"10.0.0.4:8080", {200, 300}},
     };
     for (const auto &hd : host_data) {
+        InitializeEventReporter(instance_id, hd.host, proto::meta::ST_EVENT_REPORT_L1P5);
         proto::meta::ReportEventRequest req;
         req.set_instance_id(instance_id);
         req.set_host_ip_port(hd.host);
         req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums("mem");
 
         for (int64_t key : hd.keys) {
             auto *ev = req.add_events();
@@ -4241,10 +5190,6 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
 
-        auto *reg = req.add_events();
-        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
-        reg->mutable_node_register()->add_mediums("mem");
-
         auto *ev = req.add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
         auto *ba = ev->mutable_block_add();
@@ -4257,12 +5202,16 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         }
 
         proto::meta::ReportEventResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp))
+            << "host=" << host << " key=" << key << " response=" << resp.DebugString();
     };
 
     const std::string host_a = "10.0.1.1:8080";
     const std::string host_b = "10.0.1.2:8080";
     const std::string host_c = "10.0.1.3:8080";
+    InitializeEventReporter(instance_id, host_a, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id, host_b, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id, host_c, proto::meta::ST_EVENT_REPORT_L1P5);
 
     report_specs(host_a, 100, {"full_0", "linear_0", "linear_1"});
     report_specs(host_a, 200, {"full_0"});
@@ -4279,6 +5228,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     report_specs(host_c, 200, {"full_0"});
 
     const std::string host_d = "10.0.1.4:8080";
+    InitializeEventReporter(instance_id, host_d, proto::meta::ST_EVENT_REPORT_L1P5);
     report_specs(host_d, 200, {"full_0", "linear_0", "linear_1"});
     report_specs(host_d, 300, {"full_0", "linear_0", "linear_1"});
 
