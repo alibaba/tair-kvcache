@@ -8,6 +8,7 @@
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/metrics/metrics_reporter_factory.h"
 
 namespace kv_cache_manager {
 
@@ -232,6 +233,7 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    metrics_reporter_type_ = "local";
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
@@ -348,6 +350,14 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 bool ServerConfig::Check() {
     // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
     // falls back to local backend. No validation needed for empty value.
+
+    if (!MetricsReporterFactory::IsSupportedType(metrics_reporter_type_)) {
+        fprintf(stderr,
+                "Unsupported kvcm.metrics.reporter_type [%s], supported types: %s\n",
+                metrics_reporter_type_.c_str(),
+                MetricsReporterFactory::SupportedTypes());
+        return false;
+    }
 
     // Validate revisit_interval_buckets if set
     if (!revisit_interval_buckets_.empty()) {

@@ -111,8 +111,8 @@ kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=274877906944
 
-# 可选值有dummy，local，logging，kmonitor；若不配置，默认启用logging
-kvcm.metrics.reporter_type
+# 可选值有dummy，local，logging，kmonitor；若不配置或配置为空，默认使用local
+kvcm.metrics.reporter_type=local
 
 # 传递给metrics reporter的配置值
 kvcm.metrics.reporter_config
