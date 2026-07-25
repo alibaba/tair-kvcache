@@ -43,3 +43,26 @@ py_test(
         "@pip_cpu//protobuf",
     ],
 )
+
+py_test(
+    name = "test_report_event_snapshot",
+    srcs = ["test_report_event_snapshot.py"],
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
+    deps = ["@pip_cpu//requests"],
+)
+
+py_binary(
+    name = "test_report_event_restart",
+    srcs = [
+        "test_report_event_restart.py",
+        "test_report_event_snapshot.py",
+    ],
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
+    deps = ["@pip_cpu//requests"],
+)

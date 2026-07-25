@@ -16,6 +16,10 @@ enum ErrorCode {
     INSTANCE_NOT_EXIST = 8;
     SERVER_NOT_LEADER = 9; // 高可用部署模式下，请求的接口只能在leader执行但请求的节点不是leader
     NODE_NOT_REGISTERED = 10;
+    SNAPSHOT_IN_PROGRESS = 11;
+    reserved 12;
+    SNAPSHOT_RATE_LIMITED = 13;
+    SNAPSHOT_REQUIRED = 14;
 
     IO_ERROR = 20;
     UNKNOWN_ERROR = 100;
@@ -52,11 +56,10 @@ enum StorageType {
 // ReportEvent is the ingestion API used by cache subscribers. A subscriber
 // normalizes engine-specific cache signals (for example RTP-LLM full cache
 // snapshots or vLLM KV events) into block-level mutations on one storage
-// system. `storage_type` names that large storage/cache system; `medium`
-// identifies one diffable cache namespace under the reporter host; LocationSpec
-// describes where each cache component of the block lives. KVCM currently
-// matches only full-attention specs and ignores mamba-state specs by
-// LocationSpec.name.
+// system. `storage_type` names that large storage/cache system; `medium` is
+// a block-level cache-tier attribute. LocationSpec describes every cache
+// component of the block, including
+// full-attention and mamba-state specs.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -65,7 +68,7 @@ enum ReportEventType {
     EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
     EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
     EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
-    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends one complete all-medium host snapshot
 }
 
 message NodeRegisterEventParams {
@@ -82,17 +85,21 @@ message BlockAddEventParams {
 message BlockDeleteEventParams {
     string block_key = 1;
     string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Required component names to remove from this block location.
     repeated string spec_names = 3;
 }
 
 message BlockSnapshotItem {
     string block_key = 1;
-    repeated LocationSpec specs = 2;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated LocationSpec specs = 3;
 }
 
 message BlockSnapshotEventParams {
-    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
-    repeated BlockSnapshotItem blocks = 2;
+    // Complete block set for (instance_id, reporter host_ip_port), across every
+    // medium owned by the reporter. Empty means the host owns no blocks.
+    // Do not paginate.
+    repeated BlockSnapshotItem blocks = 1;
 }
 
 message HostDownEventParams {
@@ -128,6 +135,12 @@ message ReportEventResponse {
     // Non-empty only when partial failures happen.
     repeated ErrorCode item_results = 2;
     string extra_info = 3; // opaque JSON passed through from InstanceGroup
+    // Current process-local committed snapshot token for
+    // (instance_id, reporter host_ip_port). Empty means no snapshot has
+    // committed since KVCM started.
+    string committed_snapshot_version = 4;
+    uint64 retry_after_ms = 5;
+    bool snapshot_required = 6;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析

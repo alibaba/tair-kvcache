@@ -8,6 +8,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/types.h"
@@ -15,7 +16,8 @@
 namespace kv_cache_manager {
 
 using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
-                                            const std::vector<std::vector<std::string>> &loc_ids)>;
+                                            const std::vector<std::vector<std::string>> &loc_ids,
+                                            const std::vector<std::vector<std::string>> &expected_location_values)>;
 
 class MetaIndexer;
 class LocationSpecGroup;
@@ -88,6 +90,18 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<std::string> &out_location_ids);
+    struct ReplaceLocationSpecsTask {
+        std::string location_id;
+        DataStorageType type;
+        CacheLocationStatus status;
+        std::vector<LocationSpec> specs;
+    };
+    // Replaces existing specs or creates the stable location in one metadata
+    // read-modify-write operation per batch.
+    ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
+                                        const KeyVector &keys,
+                                        const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
+                                        std::vector<ErrorCode> &out_per_key_ec);
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -118,6 +132,10 @@ public:
         std::string location_id;
         CacheLocationStatus old_status;
         CacheLocationStatus new_status;
+        // Optional exact serialized value checked inside the metadata RMW.
+        // This closes the gap between a cleanup scan and its status CAS when
+        // a stable location id is refreshed by a newer snapshot.
+        std::string expected_location_value;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
@@ -135,11 +153,24 @@ public:
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec);
+    using LocationVisitor =
+        std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
+    ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);
+    using LocationCleanupPredicate =
+        std::function<bool(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
+    // Returning true from should_abort is a successful cancellation and therefore
+    // returns EC_OK; it is not a storage or scan failure.
+    ErrorCode CleanupLocationsByPredicate(RequestContext *request_context,
+                                          DataStorageType storage_type,
+                                          size_t scan_batch_size,
+                                          LocationCleanupPredicate should_delete,
+                                          std::function<bool()> should_abort = nullptr);
     ErrorCode CleanupLocationsByHost(RequestContext *request_context,
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,
                                      size_t scan_batch_size = 1000,
                                      std::function<bool()> should_abort = nullptr);
+    bool Sync(const KeyVector &keys) noexcept;
 
 private:
     struct StorageTypeWeights {

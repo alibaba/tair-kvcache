@@ -27,6 +27,14 @@ public:
         }
         return hostname_;
     }
+    bool HasParam(const std::string &key) const { return params_.find(key) != params_.end(); }
+    bool HasParamWithPrefix(const std::string &prefix) const {
+        if (prefix.empty()) {
+            return false;
+        }
+        const auto it = params_.lower_bound(prefix);
+        return it != params_.end() && it->first.compare(0, prefix.size(), prefix) == 0;
+    }
     const std::string &GetPath() const { return path_; }
     std::string GetParam(const std::string &key) const;
     template <typename T>
