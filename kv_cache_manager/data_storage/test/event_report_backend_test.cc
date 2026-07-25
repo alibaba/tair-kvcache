@@ -242,7 +242,11 @@ TEST_F(EventReportBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.4:8080", {"mem"}));
     ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "10.0.0.4:8080"));
 
-    std::this_thread::sleep_for(160ms);
+    const auto unavailable_deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < unavailable_deadline &&
+           backend.IsNodeAvailable("test_inst", "10.0.0.4:8080")) {
+        std::this_thread::sleep_for(10ms);
+    }
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.4:8080"));
     EXPECT_EQ(cleanup_calls.load(), 0);
 

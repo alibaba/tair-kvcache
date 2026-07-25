@@ -66,15 +66,46 @@ struct StorageUsageChange {
     bool has_old = false;
 };
 
-std::vector<LocationSpec> MergeLocationSpecsByName(const std::vector<LocationSpec> &old_specs,
-                                                   const std::vector<LocationSpec> &new_specs) {
-    SnapshotUriInfo new_snapshot_info;
-    bool has_snapshot_version =
-        !new_specs.empty() && SnapshotUriUtils::ParseSnapshotUriInfo(new_specs.front().uri(), new_snapshot_info);
-    for (size_t i = 1; has_snapshot_version && i < new_specs.size(); ++i) {
+ErrorCode ParseConsistentSnapshotVersion(const std::vector<LocationSpec> &specs,
+                                         bool &out_has_snapshot_version,
+                                         SnapshotUriInfo &out_snapshot_info) {
+    out_has_snapshot_version = false;
+    out_snapshot_info.version.clear();
+    bool has_unversioned_spec = false;
+    for (const auto &spec : specs) {
+        const size_t version_param_count =
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+        if (version_param_count == 0) {
+            if (out_has_snapshot_version) {
+                return EC_BADARGS;
+            }
+            has_unversioned_spec = true;
+            continue;
+        }
         SnapshotUriInfo info;
-        has_snapshot_version = SnapshotUriUtils::ParseSnapshotUriInfo(new_specs[i].uri(), info) &&
-                               info.version == new_snapshot_info.version;
+        if (has_unversioned_spec || version_param_count != 1 ||
+            !SnapshotUriUtils::ParseSnapshotUriInfo(spec.uri(), info)) {
+            return EC_BADARGS;
+        }
+        if (!out_has_snapshot_version) {
+            out_snapshot_info = std::move(info);
+            out_has_snapshot_version = true;
+        } else if (info.version != out_snapshot_info.version) {
+            return EC_BADARGS;
+        }
+    }
+    return EC_OK;
+}
+
+ErrorCode MergeLocationSpecsByName(const std::vector<LocationSpec> &old_specs,
+                                   const std::vector<LocationSpec> &new_specs,
+                                   std::vector<LocationSpec> &out_specs) {
+    SnapshotUriInfo new_snapshot_info;
+    bool has_snapshot_version = false;
+    const ErrorCode parse_ec =
+        ParseConsistentSnapshotVersion(new_specs, has_snapshot_version, new_snapshot_info);
+    if (parse_ec != EC_OK) {
+        return parse_ec;
     }
 
     std::map<std::string, LocationSpec> merged_specs;
@@ -94,12 +125,12 @@ std::vector<LocationSpec> MergeLocationSpecsByName(const std::vector<LocationSpe
         merged_specs[spec.name()] = spec;
     }
 
-    std::vector<LocationSpec> specs;
-    specs.reserve(merged_specs.size());
+    out_specs.clear();
+    out_specs.reserve(merged_specs.size());
     for (auto &[name, spec] : merged_specs) {
-        specs.push_back(std::move(spec));
+        out_specs.push_back(std::move(spec));
     }
-    return specs;
+    return EC_OK;
 }
 
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
@@ -1145,6 +1176,13 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         const std::unordered_set<std::string> existing_id_set(existing_ids.begin(), existing_ids.end());
         bool created = false;
         for (const auto &entry : tasks_per_key[index]) {
+            bool has_snapshot_version = false;
+            SnapshotUriInfo snapshot_info;
+            const ErrorCode validation_ec =
+                ParseConsistentSnapshotVersion(entry.specs, has_snapshot_version, snapshot_info);
+            if (validation_ec != EC_OK) {
+                return {ModifierAction::MA_FAIL, validation_ec};
+            }
             if (get_ec == ErrorCode::EC_OK && existing_id_set.count(entry.location_id) > 0) {
                 merge_tasks_per_key[index].push_back(entry);
                 continue;
@@ -1251,7 +1289,13 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                 usage.old_size = GetLocationSpecsSize(locs[loc_index]->location_specs());
                 usage.has_old = true;
                 new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
-                auto merged_specs = MergeLocationSpecsByName(new_loc->location_specs(), task.specs);
+                std::vector<LocationSpec> merged_specs;
+                const ErrorCode merge_ec =
+                    MergeLocationSpecsByName(new_loc->location_specs(), task.specs, merged_specs);
+                if (merge_ec != EC_OK) {
+                    modifier_ecs[loc_index] = merge_ec;
+                    continue;
+                }
                 new_loc->set_location_specs(std::move(merged_specs));
             } else {
                 new_loc = std::make_shared<CacheLocation>();

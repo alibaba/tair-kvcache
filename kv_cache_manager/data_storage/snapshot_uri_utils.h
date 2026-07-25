@@ -79,6 +79,10 @@ public:
         return uri.HasParam(kSnapshotVersionParam);
     }
 
+    // DataStorageUri stores query parameters in a map, so duplicate keys from
+    // the original text are no longer observable here. Raw metadata and
+    // protocol input must use the string overload below, which enforces that
+    // s_version occurs exactly once.
     static bool ParseSnapshotUriInfo(const DataStorageUri &uri, SnapshotUriInfo &out) {
         out.version.clear();
         if (!uri.Valid()) {

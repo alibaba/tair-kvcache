@@ -289,6 +289,11 @@ Subscriber 以响应字段为准，不从 URI、时间戳或本地计数猜测 K
 
 `ReportEvent` 是批量接口，RPC 顶层 `ErrorCode` 只表达整批请求的聚合结果：同一批里既有成功事件又有需要重试的事件时可能返回 `EC_PARTIAL_OK`。Subscriber 不应把顶层 `EC_OK/EC_PARTIAL_OK` 当作 snapshot 是否 commit 的唯一依据；必须同时检查逐 event 结果以及 `committed_snapshot_version`、`snapshot_required`、`retry_after_ms`。特别地，只有返回的 committed token 与本次 snapshot ACK 对齐，才能认为本次 snapshot 已提交。
 
+同一批内对相同 `(block, location, spec name)` 的多次 ADD/DELETE 会按数组顺序折叠为最后一个操作，
+中间状态不会独立持久化。被折叠的原始 events 共享最终 metadata mutation 的逐 event 结果：
+最终写入成功时它们均成功，最终写入失败时它们均失败。不能把前序 event 的成功理解为其中间
+状态曾经对查询可见。
+
 如果 mutation 已提交但 ACK 丢失，单写 Subscriber 重试时可以通过返回的 committed token 与自己的上一次已知 token 对比。即使无法确认，也可以稍后重发完整 snapshot，最终状态仍会收敛。
 
 若运维需要不发 mutation 就读取 version，应在现有 host-state 查询接口中显式返回，而不是扫描 URI。
@@ -417,7 +422,7 @@ Cache 不是唯一副本，短暂的 cache miss 只会退化为重新计算或�
 
 ```protobuf
 SNAPSHOT_IN_PROGRESS = 11;
-reserved 12;
+reserved 12; // 曾为 DELTA_IN_PROGRESS；delta 现在等待写门，不再返回 busy
 SNAPSHOT_RATE_LIMITED = 13;
 SNAPSHOT_REQUIRED = 14;
 ```
