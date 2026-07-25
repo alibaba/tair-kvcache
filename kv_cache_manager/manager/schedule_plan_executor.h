@@ -55,6 +55,9 @@ struct CacheLocationDelRequest {
     std::vector<int64_t> block_keys;
     std::vector<std::vector<std::string>> location_ids;
     std::chrono::microseconds delay{std::chrono::seconds(0)};
+    // Optional serialized values observed by the submitter, parallel to
+    // location_ids. A location is reclaimed only if it is still unchanged.
+    std::vector<std::vector<std::string>> expected_location_values;
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -163,6 +166,8 @@ private:
     LocationDelAdmissionResult PrepareDeleteTaskImpl(const std::string &instance_id,
                                                      const std::vector<int64_t> &block_keys,
                                                      const std::vector<std::vector<std::string>> *target_location_ids,
+                                                     const std::vector<std::vector<std::string>>
+                                                         *expected_location_values,
                                                      std::chrono::microseconds delay);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,

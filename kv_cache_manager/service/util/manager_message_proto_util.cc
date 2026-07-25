@@ -70,6 +70,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         spec->set_heartbeat_timeout_ms(er_spec.heartbeat_timeout_ms());
         spec->set_cleanup_grace_ms(er_spec.cleanup_grace_ms());
         spec->set_liveness_check_interval_ms(er_spec.liveness_check_interval_ms());
+        spec->set_snapshot_min_interval_ms(er_spec.snapshot_min_interval_ms());
     }
 }
 
@@ -154,6 +155,8 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
             spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
         if (v.liveness_check_interval_ms() > 0)
             spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
+        if (v.snapshot_min_interval_ms() > 0)
+            spec.set_snapshot_min_interval_ms(v.snapshot_min_interval_ms());
         storage_config.set_storage_spec(std::make_shared<EventReportStorageSpec>(spec));
         DataStorageType event_report_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         ProtoConvert::DataStorageTypeFromProto(proto_storage_config->storage_type(), event_report_type);

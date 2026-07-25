@@ -18,6 +18,7 @@ cc_library(
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",
+        "snapshot_uri_utils.h",
     ],
     deps = [
         # 不一定用

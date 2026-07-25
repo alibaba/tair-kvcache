@@ -4,7 +4,7 @@
 
 > **维护提示**：当模块的职责、依赖方向或调用关系发生变化，或新增/删除模块时，请同步更新本文档与文末的 Mermaid 图，并同步更新 [AGENTS.md](../../AGENTS.md) 中的缩略图。
 
-相关文档：[基本概念](basic_concepts.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
+相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
 
 ---
 

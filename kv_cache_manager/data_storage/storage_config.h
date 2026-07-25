@@ -216,6 +216,7 @@ public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;
     static constexpr int64_t kDefaultLivenessCheckIntervalMs = 5 * 1000;
+    static constexpr int64_t kDefaultSnapshotMinIntervalMs = 30 * 1000;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
@@ -225,15 +226,18 @@ public:
     int64_t heartbeat_timeout_ms() const { return heartbeat_timeout_ms_; }
     int64_t cleanup_grace_ms() const { return cleanup_grace_ms_; }
     int64_t liveness_check_interval_ms() const { return liveness_check_interval_ms_; }
+    int64_t snapshot_min_interval_ms() const { return snapshot_min_interval_ms_; }
 
     void set_heartbeat_timeout_ms(int64_t v) { heartbeat_timeout_ms_ = v; }
     void set_cleanup_grace_ms(int64_t v) { cleanup_grace_ms_ = v; }
     void set_liveness_check_interval_ms(int64_t v) { liveness_check_interval_ms_ = v; }
+    void set_snapshot_min_interval_ms(int64_t v) { snapshot_min_interval_ms_ = v; }
 
 private:
     int64_t heartbeat_timeout_ms_ = kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;
+    int64_t snapshot_min_interval_ms_ = kDefaultSnapshotMinIntervalMs;
 };
 
 class StorageConfig : public Jsonizable {

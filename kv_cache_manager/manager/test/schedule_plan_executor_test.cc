@@ -630,6 +630,7 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
         original_location_ids.push_back(loc_kv.first);
     }
     ASSERT_EQ(3, original_location_ids.size());
+    const CacheLocationStatus untouched_location_status = location_maps[0].at(original_location_ids[2])->status();
 
     // 提交删除特定location的任务
     CacheLocationDelRequest request{
@@ -685,6 +686,26 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     for (const auto &loc_kv : location_maps[0]) {
         ASSERT_EQ(original_location_ids[2], loc_kv.first) << "Only the third location should remain after deletion";
     }
+
+    // Snapshot cleanup carries the serialized location observed by its scan.
+    // If the stable location has since been replaced, the stale cleanup must
+    // not mark the refreshed value as deleting.
+    CacheLocationDelRequest stale_conditional_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {700},
+        .location_ids = {{original_location_ids[2]}},
+        .delay = std::chrono::seconds(0),
+        .expected_location_values = {{"value-observed-before-refresh"}},
+    };
+    auto stale_result = executor.Submit(stale_conditional_request).get();
+    ASSERT_EQ(ErrorCode::EC_OK, stale_result.status);
+
+    location_maps.clear();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {700}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    ASSERT_EQ(untouched_location_status, location_maps[0].at(original_location_ids[2])->status());
 }
 
 // 测试CacheLocationDelRequest的Submit方法 - 非存在实例

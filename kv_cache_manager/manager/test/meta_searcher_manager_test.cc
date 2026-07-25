@@ -20,6 +20,7 @@ namespace {
 
 CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
 SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
+                                           const std::vector<std::vector<std::string>> &,
                                            const std::vector<std::vector<std::string>> &) -> void {};
 } // namespace
 
