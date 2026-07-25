@@ -138,6 +138,21 @@ TEST_F(InstanceInfoTest, TestQueryTypeSerializeAndMismatch) {
     EXPECT_EQ(kQueryType, parsed.query_type());
 }
 
+TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
+    InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
+
+    const auto json = instance_info.ToString();
+    EXPECT_EQ(instance_info.ToJsonString(), json);
+
+    InstanceInfo parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ("quota_group", parsed.quota_group_name());
+    EXPECT_EQ("instance_group", parsed.instance_group_name());
+    EXPECT_EQ("instance_id", parsed.instance_id());
+    EXPECT_EQ(64, parsed.block_size());
+    EXPECT_EQ(4, parsed.query_type());
+}
+
 TEST_F(InstanceInfoTest, TestQueryTypeDefaultsToUnspecifiedForOldJson) {
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
     std::string json = instance_info.ToJsonString();

@@ -29,12 +29,7 @@ void InstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "query_type", query_type_);
 }
 
-std::string InstanceInfo::ToString() const {
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-    ToRapidWriter(writer);
-    return buffer.GetString();
-}
+std::string InstanceInfo::ToString() const { return Jsonizable::ToJsonString(); }
 
 void InstanceInfo::SortLocationSpecGroups() {
     // to use binary search
