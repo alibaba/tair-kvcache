@@ -280,7 +280,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
     };
 
     std::vector<ErrorCode> per_key_ec;
-    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> seed_tasks = {{
         {location_id,
          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
@@ -288,9 +288,14 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
           LocationSpec("mamba_0", uri("old_mamba", version_a)),
           LocationSpec("legacy", "event_report://127.0.0.1:8080/mem?source=legacy")}},
     }};
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, seed_tasks, per_key_ec));
 
-    tasks[0][0].specs = {LocationSpec("linear_0", uri("new_linear", version_b))};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", uri("new_linear", version_b))}},
+    }};
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
 
     std::vector<CacheLocationMap> location_maps;
@@ -317,6 +322,75 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
     ASSERT_EQ(2u, specs.size());
     EXPECT_EQ(uri("newer_linear", version_b), specs["linear_0"]);
     EXPECT_EQ(uri("new_mamba", version_b), specs["mamba_1"]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnapshotVersions) {
+    const MetaSearcher::KeyVector keys = {10012};
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
+    const std::string version_a = "00112233445566778899aabbccddeeff";
+    const std::string version_b = "ffeeddccbbaa99887766554433221100";
+    auto uri = [](const std::string &source, const std::string &version) {
+        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_version=" + version;
+    };
+
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("baseline", uri("baseline", version_a))}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    const std::vector<std::vector<LocationSpec>> invalid_specs = {
+        {
+            LocationSpec("valid", uri("valid", version_b)),
+            LocationSpec("missing", "event_report://127.0.0.1:8080/mem?source=missing"),
+        },
+        {
+            LocationSpec("valid", uri("valid", version_b)),
+            LocationSpec("malformed",
+                         "event_report://127.0.0.1:8080/mem?source=malformed&s_version=not-a-token"),
+        },
+        {
+            LocationSpec("version_a", uri("version_a", version_a)),
+            LocationSpec("version_b", uri("version_b", version_b)),
+        },
+        {
+            LocationSpec("duplicate",
+                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_version=" + version_b +
+                             "&s_version=" + version_b),
+        },
+    };
+
+    for (const auto &specs : invalid_specs) {
+        tasks[0][0].specs = specs;
+        per_key_ec.clear();
+        meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+        ASSERT_EQ(1u, location_maps.size());
+        ASSERT_EQ(1u, location_maps[0].size());
+        const auto &stored_specs = location_maps[0].at(location_id)->location_specs();
+        ASSERT_EQ(1u, stored_specs.size());
+        EXPECT_EQ("baseline", stored_specs[0].name());
+        EXPECT_EQ(uri("baseline", version_a), stored_specs[0].uri());
+    }
+
+    const MetaSearcher::KeyVector new_keys = {10013};
+    tasks[0][0].specs = invalid_specs.front();
+    per_key_ec.clear();
+    meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), new_keys, tasks, per_key_ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), new_keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
 }
 
 TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltasDoNotLoseUpdates) {

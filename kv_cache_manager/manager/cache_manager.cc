@@ -2632,8 +2632,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     // A request is an ordered event stream. Resolve repeated mutations of the
     // same (block, stable location, spec name) by keeping the last operation,
-    // then batch the disjoint final ADD and DELETE sets. This preserves request
-    // order without giving up the existing batched metadata writes.
+    // then batch the disjoint final ADD and DELETE sets. All original events
+    // absorbed into one final mutation share that mutation's write result:
+    // none of the intermediate operations is persisted independently. This
+    // preserves request order without giving up batched metadata writes.
     for (auto &[block_key, mutations_by_location] : delta_spec_mutations) {
         for (auto &[location_id, mutations_by_name] : mutations_by_location) {
             for (auto &[spec_name, mutation] : mutations_by_name) {
