@@ -454,14 +454,17 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
-                               QueryType query_type) {
+                               QueryType default_query_type) {
     SPAN_TRACER(request_context);
     // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
-        auto mismatched = instance_info->MismatchFields(
-            block_size, location_spec_infos, model_deployment, location_spec_groups, static_cast<int32_t>(query_type));
+        auto mismatched = instance_info->MismatchFields(block_size,
+                                                        location_spec_infos,
+                                                        model_deployment,
+                                                        location_spec_groups,
+                                                        static_cast<int32_t>(default_query_type));
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(
@@ -483,7 +486,7 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                                   location_spec_infos,
                                                   model_deployment,
                                                   location_spec_groups,
-                                                  static_cast<int32_t>(query_type));
+                                                  static_cast<int32_t>(default_query_type));
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
     ec = TryCreateMetaSearcher(request_context, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
@@ -2824,7 +2827,7 @@ ErrorCode CacheManager::DoRecoverOnce() {
                                                       instance_info->location_spec_infos(),
                                                       instance_info->model_deployment(),
                                                       instance_info->location_spec_groups(),
-                                                      static_cast<QueryType>(instance_info->query_type()));
+                                                      static_cast<QueryType>(instance_info->default_query_type()));
             if (ec3 != EC_OK) {
                 KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
                               "name[%s] instance_id[%s]",
@@ -3081,7 +3084,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
                 WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
         }
-        query_type = static_cast<QueryType>(instance_info->query_type());
+        query_type = static_cast<QueryType>(instance_info->default_query_type());
         if (query_type == QueryType::QT_UNSPECIFIED) {
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, std::vector<HostCacheMatch>, "unknown query type");
         }

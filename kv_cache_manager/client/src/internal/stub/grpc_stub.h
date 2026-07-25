@@ -23,7 +23,8 @@ public:
                                                              const LocationSpecInfoMap &location_spec_infos,
                                                              const ModelDeployment &model_deployment,
                                                              const LocationSpecGroups &location_spec_groups,
-                                                             QueryType query_type = QueryType::QT_UNSPECIFIED) override;
+                                                             QueryType default_query_type =
+                                                                 QueryType::QT_UNSPECIFIED) override;
 
     std::pair<ClientErrorCode, InstanceInfo> GetInstanceInfo(const std::string &trace_id,
                                                              const std::string &instance_id) override;

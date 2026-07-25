@@ -20,7 +20,7 @@ PR #249 将 Vineyard 专用事件上报泛化为 `EventReportBackend`，并区�
 
 - Storage 的规范类型从 `vineyard` 改为 `event_report_l1p5` 或 `event_report_l2`，storage spec 也从 Vineyard 命名切换为 EventReport 命名。
 - Instance Group 的候选字段从 `event_reporting_storage_candidates` 改为 `event_report_storage_candidates`。
-- Instance/Client 配置新增 `query_type`，用于 GetHostCacheState 请求未指定 QueryType 时的默认查询方式。
+- Instance/Client 配置的实例级默认字段最终统一为 `default_query_type`，用于 GetHostCacheState 请求未指定 QueryType 时的默认查询方式。PR #249 初版使用的 `query_type` 已在后续 review 中纠偏，详见下方不兼容变更。
 
 #### CacheLocation 元数据
 
@@ -51,3 +51,22 @@ PR #249 将 Vineyard 专用事件上报泛化为 `EventReportBackend`，并区�
 ### 回滚说明
 
 回滚到旧 Vineyard 版本同样需要停写并清理 PR #249 生成的 `kvs#event_report_l1p5#...`/`kvs#event_report_l2#...` location，恢复旧 storage/Instance Group 配置，再由旧 reporter 重建元数据。禁止在保留新 EventReport 状态的情况下直接替换为旧二进制。
+
+## Instance 默认查询类型重命名
+
+Introduced by: PR #249 review follow-up
+
+PR #249 review 进一步确认，Instance 注册信息中的 `query_type` 表示请求未显式指定查询类型时使用的 instance 级默认值，而不是某次请求实际采用的查询类型。因此，该字段在 InstanceInfo、注册协议、Registry JSON 和 Client 配置中统一重命名为 `default_query_type`。
+
+### 不兼容内容
+
+- Meta/Admin protobuf 的 `InstanceInfo.query_type` 与 `RegisterInstanceRequest.query_type` 重命名为 `default_query_type`。字段类型和编号 `8` 保持不变，因此 protobuf 二进制 wire 数据兼容，但生成代码的 getter/setter 与源码 API 不兼容，调用方必须重新生成并编译。
+- HTTP/protobuf JSON、Registry 持久化 JSON 和 Client JSON 配置仅接受、序列化 `default_query_type`，不兼容读取旧 `query_type` key。旧配置中的值会回落为 `QT_UNSPECIFIED`。
+- 请求级 `GetHostCacheStateRequest.query_type` 及其他查询、事件和 trace 中的 `query_type` 不变。显式的请求级 `query_type` 始终优先；只有请求值为 `QT_UNSPECIFIED` 时才使用 `InstanceInfo.default_query_type`。
+
+### 升级要求
+
+1. 将 Registry 快照、Client 配置和 RegisterInstance HTTP JSON 中的实例级 `query_type` 改为 `default_query_type`。
+2. 使用新 proto 重新生成并编译所有 Meta/Admin gRPC 与 SDK 调用方，将实例注册和 InstanceInfo accessor 切换为新名称。
+3. 在同一升级窗口更新 KVCM 与注册调用方。混合版本虽然可传输字段号 `8` 的 protobuf 二进制数据，但 Registry/HTTP JSON 与生成源码 API 不构成受支持的混合版本契约。
+4. 升级后检查 GetInstanceInfo/Registry 回显中的 `default_query_type`；未配置时应为 `QT_UNSPECIFIED`，显式请求级 `query_type` 的行为不变。

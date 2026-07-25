@@ -357,13 +357,13 @@ curl -g -vvv -X POST http://localhost:6492/api/registerInstance \
         "user_data": "user_data"
     },
     "block_size": 128,
-    "query_type": "QT_PREFIX_MATCH",
+    "default_query_type": "QT_PREFIX_MATCH",
     "location_spec_infos": [
         {"name": "tp0", "size": 1024}
     ]
 }'
 ```
-`query_type` is optional. When `GetHostCacheState` does not set `query_type`, the service uses this registered value.
+`default_query_type` is optional. When `GetHostCacheState` does not set request-level `query_type`, the service uses this registered value.
 
 ## Remove Instance
 ```bash

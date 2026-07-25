@@ -251,13 +251,13 @@ std::pair<ClientErrorCode, std::string> GrpcStub::RegisterInstance(const std::st
                                                                    const LocationSpecInfoMap &location_spec_infos,
                                                                    const ModelDeployment &model_deployment,
                                                                    const LocationSpecGroups &location_spec_groups,
-                                                                   QueryType query_type) {
+                                                                   QueryType default_query_type) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::RegisterInstanceRequest request;
     SetCommonInfo(request, trace_id, instance_id);
     request.set_instance_group(instance_group);
     request.set_block_size(block_size);
-    request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
+    request.set_default_query_type(static_cast<proto::meta::QueryType>(default_query_type));
     std::vector<LocationSpecInfo> info_vec;
     info_vec.reserve(location_spec_infos.size());
     std::for_each(location_spec_infos.begin(), location_spec_infos.end(), [&info_vec](const auto &info_pair) {

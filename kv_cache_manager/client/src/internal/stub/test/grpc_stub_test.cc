@@ -298,7 +298,7 @@ TEST_F(GrpcStubTest, TestRegisterInstance) {
 
     auto [ec, instance_info] = stub_->GetInstanceInfo("trace4", "instance3");
     ASSERT_EQ(ER_OK, ec);
-    ASSERT_EQ(static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_MAMBA), instance_info.query_type());
+    ASSERT_EQ(static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_MAMBA), instance_info.default_query_type());
 }
 
 TEST_F(GrpcStubTest, TestStartWriteCache) {

@@ -121,21 +121,21 @@ TEST_F(InstanceInfoTest, TestMismatchFieldsIgnoresLocationSpecGroupOrder) {
     EXPECT_EQ("location_spec_groups", mismatched[0]);
 }
 
-TEST_F(InstanceInfoTest, TestQueryTypeSerializeAndMismatch) {
+TEST_F(InstanceInfoTest, TestDefaultQueryTypeSerializeAndMismatch) {
     constexpr int32_t kBlockSize = 64;
     constexpr int32_t kQueryType = 4;
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", kBlockSize, {}, {}, {}, kQueryType);
 
-    EXPECT_EQ(kQueryType, instance_info.query_type());
+    EXPECT_EQ(kQueryType, instance_info.default_query_type());
     EXPECT_TRUE(instance_info.MismatchFields(kBlockSize, {}, {}, {}, kQueryType).empty());
 
     auto mismatched = instance_info.MismatchFields(kBlockSize, {}, {}, {}, 2);
     ASSERT_EQ(1, mismatched.size());
-    EXPECT_EQ("query_type", mismatched[0]);
+    EXPECT_EQ("default_query_type", mismatched[0]);
 
     InstanceInfo parsed;
     ASSERT_TRUE(parsed.FromJsonString(instance_info.ToJsonString()));
-    EXPECT_EQ(kQueryType, parsed.query_type());
+    EXPECT_EQ(kQueryType, parsed.default_query_type());
 }
 
 TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
@@ -150,20 +150,34 @@ TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
     EXPECT_EQ("instance_group", parsed.instance_group_name());
     EXPECT_EQ("instance_id", parsed.instance_id());
     EXPECT_EQ(64, parsed.block_size());
-    EXPECT_EQ(4, parsed.query_type());
+    EXPECT_EQ(4, parsed.default_query_type());
 }
 
-TEST_F(InstanceInfoTest, TestQueryTypeDefaultsToUnspecifiedForOldJson) {
+TEST_F(InstanceInfoTest, TestDefaultQueryTypeDefaultsToUnspecifiedWhenMissing) {
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
     std::string json = instance_info.ToJsonString();
-    const std::string query_type_field = ",\"query_type\":4";
-    const auto pos = json.find(query_type_field);
+    const std::string default_query_type_field = ",\"default_query_type\":4";
+    const auto pos = json.find(default_query_type_field);
     ASSERT_NE(std::string::npos, pos);
-    json.erase(pos, query_type_field.size());
+    json.erase(pos, default_query_type_field.size());
 
     InstanceInfo parsed;
     ASSERT_TRUE(parsed.FromJsonString(json));
-    EXPECT_EQ(0, parsed.query_type());
+    EXPECT_EQ(0, parsed.default_query_type());
+}
+
+TEST_F(InstanceInfoTest, TestLegacyQueryTypeJsonKeyIsIgnored) {
+    InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
+    std::string json = instance_info.ToJsonString();
+    const std::string default_query_type_key = "\"default_query_type\"";
+    const auto pos = json.find(default_query_type_key);
+    ASSERT_NE(std::string::npos, pos);
+    json.replace(pos, default_query_type_key.size(), "\"query_type\"");
+
+    InstanceInfo parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(0, parsed.default_query_type());
+    EXPECT_EQ(std::string::npos, parsed.ToJsonString().find("\"query_type\""));
 }
 
 } // namespace kv_cache_manager

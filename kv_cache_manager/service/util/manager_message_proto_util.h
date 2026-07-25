@@ -379,9 +379,11 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
                               proto_instance_info->mutable_location_spec_groups());
 
     if constexpr (std::is_same_v<T, proto::meta::InstanceInfo>) {
-        proto_instance_info->set_query_type(static_cast<proto::meta::QueryType>(instance_info.query_type()));
+        proto_instance_info->set_default_query_type(
+            static_cast<proto::meta::QueryType>(instance_info.default_query_type()));
     } else {
-        proto_instance_info->set_query_type(static_cast<proto::admin::QueryType>(instance_info.query_type()));
+        proto_instance_info->set_default_query_type(
+            static_cast<proto::admin::QueryType>(instance_info.default_query_type()));
     }
 }
 
@@ -407,7 +409,7 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     LocationSpecGroupsFromProto(proto_instance_info->location_spec_groups(), location_spec_groups);
     instance_info.set_location_spec_groups(location_spec_groups);
 
-    instance_info.set_query_type(static_cast<int32_t>(proto_instance_info->query_type()));
+    instance_info.set_default_query_type(static_cast<int32_t>(proto_instance_info->default_query_type()));
 }
 
 template <typename T>
