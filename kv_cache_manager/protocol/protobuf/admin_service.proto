@@ -131,7 +131,8 @@ message StorageConfig {
         EventReportStorageSpec event_report = 14;
     }
     bool check_storage_available_when_open = 8;
-    // 仅供响应中使用，标识存储类型；请求时类型由 oneof 字段决定。
+    // 响应中用于标识存储类型；请求中通常由 oneof storage_spec 确定类型。
+    // 配置 EventReport storage 时必须显式指定 ST_EVENT_REPORT_L1P5 或 ST_EVENT_REPORT_L2。
     StorageType storage_type = 11;
 }
 

@@ -11,7 +11,7 @@ Usage:
     #        --env kvcm.service.admin_http_port=56040 \
     #        --env kvcm.service.enable_debug_service=false
     # 2. Run this script:
-    python test_vineyard_report_event.py \
+    python3 integration_test/meta_service/test_report_event.py \
         --host localhost --http_port 56020 --admin_http_port 56040 \
         --instance_id event_report_cluster_0
 """
