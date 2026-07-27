@@ -2806,6 +2806,10 @@ TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysBut
     auto event_backend = InstallEventReportBackend();
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem", "disk"}));
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "canonical_duplicate_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
 
     auto make_snapshot_with_keys = [&](const std::string &first_key,
                                        const std::string &first_medium,
@@ -2835,9 +2839,13 @@ TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysBut
                         "canonical_duplicate_snapshot");
     EXPECT_EQ(EC_PARTIAL_OK, duplicate_ec);
     EXPECT_EQ(proto::meta::INVALID_ARGUMENT, duplicate_response.header().status().code());
-    EXPECT_TRUE(duplicate_response.committed_snapshot_version().empty());
-    EXPECT_TRUE(duplicate_response.snapshot_required());
-    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+    EXPECT_EQ(baseline_token, duplicate_response.committed_snapshot_version());
+    EXPECT_FALSE(duplicate_response.snapshot_required());
+    EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+    const auto visible_after_rejection = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_rejection.size());
+    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("source=baseline"));
+    EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
 
     const auto [different_media_ec, different_media_response] =
         CallReportEvent(make_snapshot_with_keys(std::to_string(key), "mem", "0" + std::to_string(key), "disk"),
@@ -2850,6 +2858,232 @@ TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysBut
     for (const auto &uri : visible) {
         EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
     }
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock) {
+    const std::string host = "192.168.10.34:8080";
+    const int64_t key = 9429;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto make_snapshot = [&](const std::vector<std::pair<std::string, std::string>> &spec_sources) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        auto *block = event->mutable_block_snapshot()->add_blocks();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        for (const auto &[spec_name, source] : spec_sources) {
+            auto *spec = block->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/mem?source=" + source);
+        }
+        return request;
+    };
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(make_snapshot({{"tp0", "old_tp0"}, {"tp1", "old_tp1"}}), "complete_specs_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(baseline_token));
+
+    const auto [replace_ec, replacement] =
+        CallReportEvent(make_snapshot({{"tp1", "new_tp1"}, {"tp2", "new_tp2"}}), "complete_specs_replace");
+    ASSERT_EQ(EC_OK, replace_ec);
+    const std::string replacement_token = replacement.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(replacement_token));
+    EXPECT_NE(baseline_token, replacement_token);
+
+    const auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(2u, visible.size());
+    bool found_tp1 = false;
+    bool found_tp2 = false;
+    for (const auto &uri : visible) {
+        EXPECT_EQ(std::string::npos, uri.find("source=old_tp0"));
+        EXPECT_EQ(std::string::npos, uri.find("source=old_tp1"));
+        EXPECT_NE(std::string::npos, uri.find("s_version=" + replacement_token));
+        found_tp1 = found_tp1 || uri.find("source=new_tp1") != std::string::npos;
+        found_tp2 = found_tp2 || uri.find("source=new_tp2") != std::string::npos;
+    }
+    EXPECT_TRUE(found_tp1);
+    EXPECT_TRUE(found_tp2);
+    EXPECT_EQ(2u, QueryRawEventReportUris(key).size());
+}
+
+TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWithoutStateChange) {
+    const std::string host = "192.168.10.35:8080";
+    const int64_t key = 9433;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "physical_duplicate_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
+
+    auto duplicate = MakeSnapshotRequest(host, {});
+    auto *snapshot = duplicate.mutable_events(0)->mutable_block_snapshot();
+    for (int i = 0; i < 2; ++i) {
+        auto *block = snapshot->add_blocks();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri("event_report://" + host + "/mem?source=physical_duplicate");
+    }
+
+    const auto [duplicate_ec, duplicate_response] = CallReportEvent(duplicate, "physical_duplicate_snapshot");
+    EXPECT_EQ(EC_PARTIAL_OK, duplicate_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, duplicate_response.header().status().code());
+    ASSERT_EQ(1, duplicate_response.item_results_size());
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, duplicate_response.item_results(0));
+    EXPECT_EQ(baseline_token, duplicate_response.committed_snapshot_version());
+    EXPECT_FALSE(duplicate_response.snapshot_required());
+    EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+
+    const auto visible_after_rejection = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_rejection.size());
+    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("source=baseline"));
+    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("s_version=" + baseline_token));
+    EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
+
+    const auto [retry_ec, retry] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "deduplicated"}}), "physical_duplicate_retry");
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_NE(baseline_token, retry.committed_snapshot_version());
+    const auto visible_after_retry = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_retry.size());
+    EXPECT_NE(std::string::npos, visible_after_retry.front().find("source=deduplicated"));
+}
+
+TEST_F(CacheManagerTest, TestReportEventRejectsDuplicateSpecNamesWithinSnapshotBlock) {
+    const std::string host = "192.168.10.36:8080";
+    const int64_t key = 9434;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "duplicate_spec_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string baseline_token = baseline.committed_snapshot_version();
+
+    for (const bool same_uri : {true, false}) {
+        SCOPED_TRACE(same_uri ? "same spec name and URI" : "same spec name with conflicting URIs");
+        auto duplicate = MakeSnapshotRequest(host, {});
+        auto *block = duplicate.mutable_events(0)->mutable_block_snapshot()->add_blocks();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        for (int i = 0; i < 2; ++i) {
+            auto *spec = block->add_specs();
+            spec->set_name("tp0");
+            const std::string source = same_uri || i == 0 ? "duplicate_a" : "duplicate_b";
+            spec->set_uri("event_report://" + host + "/mem?source=" + source);
+        }
+
+        const auto [duplicate_ec, duplicate_response] =
+            CallReportEvent(duplicate, same_uri ? "duplicate_spec_same_uri" : "duplicate_spec_conflicting_uri");
+        EXPECT_EQ(EC_PARTIAL_OK, duplicate_ec);
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, duplicate_response.header().status().code());
+        EXPECT_EQ(baseline_token, duplicate_response.committed_snapshot_version());
+        EXPECT_FALSE(duplicate_response.snapshot_required());
+        EXPECT_EQ(baseline_token, event_backend->GetSnapshotVersion({"test_instance", host}));
+        EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
+    }
+
+    const auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=baseline"));
+    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + baseline_token));
+}
+
+TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicatesQueryByName) {
+    const std::string host = "192.168.10.37:8080";
+    const int64_t key = 9435;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem", "disk"}));
+
+    auto snapshot_request = MakeSnapshotRequest(host, {});
+    auto *snapshot = snapshot_request.mutable_events(0)->mutable_block_snapshot();
+    for (const auto &medium : {"mem", "disk"}) {
+        auto *block = snapshot->add_blocks();
+        block->set_block_key(std::to_string(key));
+        block->set_medium(medium);
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri("event_report://" + host + "/" + medium + "?source=" + medium);
+    }
+
+    const auto [snapshot_ec, response] = CallReportEvent(snapshot_request, "same_key_spec_across_media");
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string token = response.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(token));
+
+    const auto raw = QueryRawEventReportUris(key);
+    ASSERT_EQ(2u, raw.size());
+    bool stored_mem = false;
+    bool stored_disk = false;
+    for (const auto &uri : raw) {
+        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+        stored_mem = stored_mem || uri.find("/mem?") != std::string::npos;
+        stored_disk = stored_disk || uri.find("/disk?") != std::string::npos;
+    }
+    EXPECT_TRUE(stored_mem);
+    EXPECT_TRUE(stored_disk);
+
+    // The query path merges locations from the same backend and exposes one
+    // value per spec name. The two media are alternative physical copies, not
+    // two logical tp0 components.
+    const auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+    EXPECT_TRUE(visible.front().find("/mem?") != std::string::npos ||
+                visible.front().find("/disk?") != std::string::npos);
+}
+
+TEST_F(CacheManagerTest, TestReportEventRepeatedPhysicalDeltaUsesSetNotReferenceCountSemantics) {
+    const std::string host = "192.168.10.38:8080";
+    const int64_t key = 9436;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    const auto [baseline_ec, baseline] = CallReportEvent(MakeSnapshotRequest(host, {}), "physical_delta_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const std::string token = baseline.committed_snapshot_version();
+
+    const auto [first_add_ec, first_add] =
+        CallReportEvent(MakeAddRequest(host, key, "physical_0"), "physical_delta_first_add");
+    ASSERT_EQ(EC_OK, first_add_ec);
+    EXPECT_EQ(token, first_add.committed_snapshot_version());
+
+    const auto [second_add_ec, second_add] =
+        CallReportEvent(MakeAddRequest(host, key, "physical_1"), "physical_delta_second_add");
+    ASSERT_EQ(EC_OK, second_add_ec);
+    EXPECT_EQ(token, second_add.committed_snapshot_version());
+    auto visible = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible.size());
+    EXPECT_NE(std::string::npos, visible.front().find("source=physical_1"));
+    EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
+
+    auto delete_request = MakeAddRequest(host, key, "unused");
+    delete_request.clear_events();
+    auto *delete_event = delete_request.add_events();
+    delete_event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+    delete_event->mutable_block_delete()->set_block_key(std::to_string(key));
+    delete_event->mutable_block_delete()->set_medium("mem");
+    delete_event->mutable_block_delete()->add_spec_names("tp0");
+    const auto [delete_ec, deletion] = CallReportEvent(delete_request, "physical_delta_single_delete");
+    ASSERT_EQ(EC_OK, delete_ec);
+    EXPECT_EQ(token, deletion.committed_snapshot_version());
+    EXPECT_TRUE(QueryEventReportUris({key}).empty());
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
 }
 
 TEST_F(CacheManagerTest, TestReportEventSnapshotCommitReclaimsOnlyStaleReporterLocations) {
