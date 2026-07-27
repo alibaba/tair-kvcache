@@ -1,13 +1,32 @@
+"""KVCM vLLM connector (v1), built around per-group transfer.
+
+vLLM models expose one or more ``kv_cache_groups`` (``KVCacheConfig``):
+
+* Pure-attention models: a single ``FullAttentionSpec`` group.
+* Hybrid models (e.g. Qwen3.5): several ``MambaSpec`` groups plus one (or more)
+  ``FullAttentionSpec`` group. With ``mamba_cache_mode="align"`` every group has
+  its own block table (``block_ids`` is a tuple indexed by group) but all groups
+  share the scheduler block size.
+
+The connector treats every group as an independent transfer unit with its own
+KVCM location spec (``tp{rank}_g{group}``), its own block table and its own data
+access strategy (token-granular gather/scatter for attention, per-block byte
+copy for mamba state). There is no separate "hybrid path": a full-attention
+model is simply the one-group case.
+
+A manager block covers the same token range in every group, so one KVCM cache
+key (hashed from token ids) owns the location specs of all groups of all ranks.
+"""
+
 import copy
 import json
 import math
 import time
 import typing
-import inspect
 import threading
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, List, Optional, Tuple
 
 from concurrent.futures import ThreadPoolExecutor
 from kv_cache_manager.client.pybind import kvcm_py_client
@@ -20,6 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 
 try:
@@ -30,6 +50,7 @@ except ImportError:
     # vllm <= v0.11.0
     from vllm.utils import get_kv_cache_torch_dtype, get_ip
 
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -39,8 +60,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSer
 from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
 from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
-from kv_cache_manager.py_connector.common.types import KVCacheInfo
-from kv_cache_manager.py_connector.kernel.gather_scatter_helper import CopyBufferAllocator
+from kv_cache_manager.py_connector.common.types import KVCacheInfo, TransferGroup
 from kv_cache_manager.py_connector.vllm.metadata import SaveRequest, LoadRequest, FinishRequest, ReqStateToWorker, \
     TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
@@ -52,197 +72,190 @@ if typing_extensions.TYPE_CHECKING:
     from vllm.attention import AttentionMetadata
     from vllm.v1.request import Request
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+
+@dataclass
+class GroupMeta:
+    """Static description of one kv_cache_group, derived from KVCacheConfig.
+
+    Available in both scheduler and worker roles (before tensors exist)."""
+
+    group_idx: int
+    is_attention: bool
+    layer_names: List[str]
+    # The group's block table granularity in tokens (spec.block_size).
+    block_size: int
+    # Bytes stored per manager block for the whole group.
+    per_block_bytes: int
+    # Mamba only: bytes per block per layer (page_size_bytes of the spec).
+    page_size_bytes: int = 0
 
 
 @dataclass
 class ReqState:
-    """请求状态类，跟踪单个请求的状态信息"""
+    """Tracks one request. Lives in the scheduler and (mirrored) in workers."""
 
-    # TODO: split this class to ReqStateInScheduler and ReqStateInWorker
     req_id: str
-    token_ids: list[int]
-    local_block_ids: list[int]
+    token_ids: list
+    # Per kv_cache_group block table (same length across groups).
+    block_ids_per_group: List[List[int]]
     has_saved_block_num: int
     local_matched_token_num: int
     remote_matched_token_num: int
 
-    # vllm_request only avail in scheduler
+    # vllm_request only available in scheduler
     vllm_request: Optional["Request"]
 
-    # scheduled_saving_count, sent_saving_count, need_report_after_saving_finished:
-    # not sync between scheduler and worker and have different meaning
-    # only available in scheduler and tp0 worker
+    # Saving progress counters; only meaningful in scheduler and tp0 worker.
     scheduled_saving_count: int = 0
     sent_saving_count: int = 0
     need_report_after_saving_finished: bool = False
 
+    @property
+    def num_allocated_blocks(self) -> int:
+        if not self.block_ids_per_group:
+            return 0
+        return min(len(b) for b in self.block_ids_per_group)
+
     @staticmethod
-    def create_from_delta(req_state_delta: 'ReqStateToWorker'):
-        """从ReqStateToWorker创建ReqState实例"""
+    def create_from_delta(delta: "ReqStateToWorker") -> "ReqState":
         return ReqState(
-            req_id=req_state_delta.req_id,
-            token_ids=req_state_delta.new_tokens_ids,
-            local_block_ids=req_state_delta.new_local_block_ids,
-            has_saved_block_num=req_state_delta.has_saved_block_num,
+            req_id=delta.req_id,
+            token_ids=list(delta.new_tokens_ids),
+            block_ids_per_group=[list(b) for b in delta.new_block_ids_per_group],
+            has_saved_block_num=delta.has_saved_block_num,
             local_matched_token_num=0,
             remote_matched_token_num=0,
-            vllm_request=None
+            vllm_request=None,
         )
 
-    def update_from_delta(self, req_state_delta: 'ReqStateToWorker'):
-        """使用ReqStateToWorker更新当前状态"""
-        self.token_ids.extend(req_state_delta.new_tokens_ids)
-
-        if req_state_delta.resumed_from_preemption:
-            self.local_block_ids = req_state_delta.new_local_block_ids
+    def update_from_delta(self, delta: "ReqStateToWorker"):
+        self.token_ids.extend(delta.new_tokens_ids)
+        if not delta.new_block_ids_per_group:
+            return
+        if delta.resumed_from_preemption:
+            self.block_ids_per_group = [list(b) for b in delta.new_block_ids_per_group]
         else:
-            self.local_block_ids.extend(req_state_delta.new_local_block_ids)
+            if not self.block_ids_per_group:
+                self.block_ids_per_group = [[] for _ in delta.new_block_ids_per_group]
+            for group_ids, new_ids in zip(self.block_ids_per_group, delta.new_block_ids_per_group):
+                group_ids.extend(new_ids)
 
 
-@dataclass
-class TransferTaskArgs:
-    blocks_idx: List[List[int]] = field(default_factory=list)
-    remote_uris: List[str] = field(default_factory=list)
+class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
+    # ------------------------------------------------------------------ #
+    # Init / registration
+    # ------------------------------------------------------------------ #
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
+        super().__init__(vllm_config, role, kv_cache_config)
+        assert kv_cache_config is not None, \
+            "TairKvCacheConnector requires vLLM to pass kv_cache_config (vllm >= 0.11.1)"
 
-class TairKvCacheConnector(KVConnectorBase_V1):
-    def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
-        """Convert TP rank to location spec name."""
-        return f"tp{tp_rank}"
+        logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)",
+                       FULL_VERSION, GIT_COMMIT, BUILD_TIME)
 
-    def __init__(self,
-                 vllm_config: "VllmConfig",
-                 role: KVConnectorRole,
-                 kv_cache_config: Optional["KVCacheConfig"] = None,
-                 ):
-
-        init_params = inspect.signature(KVConnectorBase_V1.__init__).parameters
-        if len(init_params) == 3:
-            # vllm <= 0.11.0
-            super().__init__(vllm_config, role)
-        else:
-            # vllm >= 0.11.1
-            super().__init__(vllm_config, role, kv_cache_config)
-
-        logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
-
-        connector_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._extra_config = TairKvCacheConnectorExtraConfig(connector_extra_config)
-
-        # Apply log level with priority: env var > startup param > default
+        self._extra_config = TairKvCacheConnectorExtraConfig(
+            vllm_config.kv_transfer_config.kv_connector_extra_config)
         configure_log_level(self._extra_config.log_level)
 
-        self._kv_caches: Optional[dict[str, torch.Tensor]] = None
-        self._local_block_size = vllm_config.cache_config.block_size
-
         model_config = vllm_config.model_config
-
-        self._use_mla = (hasattr(model_config, "use_mla") and
-                         isinstance(model_config.use_mla, bool) and
-                         model_config.use_mla)
-
-        manager_block_size = self._local_block_size
-        if self._extra_config.preferred_block_size != 0:
-            manager_block_size = self._extra_config.preferred_block_size
-
-        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
-        kv_dtype = get_kv_cache_torch_dtype(vllm_config.cache_config.cache_dtype, model_config.dtype)
-        num_layer = model_config.get_num_layers(vllm_config.parallel_config)
-        per_tp_rank_kv_head_num = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        head_size = model_config.get_head_size()
-        per_manager_location_spec_shape = [num_layer, 1 if self._use_mla else 2, manager_block_size,
-                                           per_tp_rank_kv_head_num,
-                                           head_size]
-
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
+        if getattr(model_config, "use_mla", False):
+            raise NotImplementedError("MLA models are not supported by TairKvCacheConnector")
+
+        self._vllm_block_size = vllm_config.cache_config.block_size
+        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self._kv_dtype = get_kv_cache_torch_dtype(
+            vllm_config.cache_config.cache_dtype, model_config.dtype)
+
+        # Manager block size: attention KV is token-granular and can be re-blocked,
+        # but mamba state exists once per scheduler block, so hybrid models must
+        # keep manager block == scheduler block.
+        manager_block_size = self._vllm_block_size
+        self._has_state_groups = any(
+            isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups)
+        if self._extra_config.preferred_block_size != 0:
+            if self._has_state_groups:
+                if self._extra_config.preferred_block_size != self._vllm_block_size:
+                    logger.warning(
+                        "preferred_block_size=%d ignored for hybrid model: mamba state is "
+                        "per scheduler block (%d)", self._extra_config.preferred_block_size,
+                        self._vllm_block_size)
+            else:
+                manager_block_size = self._extra_config.preferred_block_size
+        self._manager_block_size = manager_block_size
+
+        self._group_metas = self._parse_groups(kv_cache_config)
+        self._num_groups = len(self._group_metas)
+
         deployment = {
             "model_name": model_config.served_model_name,
-            "dtype": str(kv_dtype)[6:],  # remove "torch."
-            "use_mla": self._use_mla,
-            "tp_size": vllm_config.parallel_config.tensor_parallel_size,
+            "dtype": str(self._kv_dtype)[6:],  # strip "torch."
+            "use_mla": False,
+            "tp_size": self._tp_size,
             "dp_size": vllm_config.parallel_config.data_parallel_size,
             "pp_size": vllm_config.parallel_config.pipeline_parallel_size,
         }
-        logger.info(deployment)
+        logger.info("deployment: %s, groups: %s", deployment, self._group_metas)
 
-        self._manager_client = KvCacheManagerClient.from_connector_config(
-            vars(self._extra_config)
-        )
-        self._manager_block_size = manager_block_size
+        self._manager_client = KvCacheManagerClient.from_connector_config(vars(self._extra_config))
 
         self._alive_requests: dict[str, ReqState] = {}
         self._waiting_to_load_requests: List[LoadRequest] = []
         self._waiting_to_save_requests_lock = threading.Lock()
         self._waiting_to_save_requests: List[SaveRequest] = []
         self._waiting_to_finish_requests: List[FinishRequest] = []
-
         self._canceled_save_request_ids_lock = threading.Lock()
         self._canceled_save_request_ids: List[str] = []
 
-        # TODO: add coordinator host auto detection, maybe use data parallel host
-        # TODO: add DP support
         self._host_ip = get_ip()
         port = self._extra_config.coordinator_base_port
 
         register_response = self._manager_client.register_instance({
-            "trace_id": "trace_trace",
+            "trace_id": "register_%s" % self._extra_config.instance_id,
             "instance_group": self._extra_config.instance_group,
             "instance_id": self._extra_config.instance_id,
             "model_deployment": deployment,
             "block_size": manager_block_size,
-            "location_spec_infos": [{
-                "name": self._tp_rank_to_spec_name(rank),
-                "size": math.prod(per_manager_location_spec_shape) * kv_dtype.itemsize
-            } for rank in range(self._tp_size)],
+            "location_spec_infos": [
+                {"name": self._spec_name(rank, meta.group_idx), "size": meta.per_block_bytes}
+                for rank in range(self._tp_size) for meta in self._group_metas
+            ],
         })
-        # TODO: check conflict and update
-        self._iov_size = math.prod(
-            per_manager_location_spec_shape) * kv_dtype.itemsize * self._extra_config.hf3fs_concurrent_io_block_count
+
+        max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
+        self._iov_size = max_group_bytes * self._extra_config.hf3fs_concurrent_io_block_count
 
         if role == KVConnectorRole.SCHEDULER:
             self._epoch = 0
             self._coordinator_client = TpCoordinatorClient(self._host_ip, port)
             self._http_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kvcm_http_")
-            self._location_query_manager = LocationQueryManager(self._manager_client, self._http_executor,
-                                                                self._extra_config.instance_id,
-                                                                self._extra_config.async_get_cache_location)
-
+            self._location_query_manager = LocationQueryManager(
+                self._manager_client, self._http_executor, self._extra_config.instance_id,
+                self._extra_config.async_get_cache_location)
             logger.warning(
-                "TairKvCacheConnector in scheduler inited, kv_connector_extra_config: %r,"
-                " server block size: %d, vllm block size: %d,",
-                self._extra_config.__dict__,
-                self._manager_block_size,
-                self._local_block_size,
-            )
+                "TairKvCacheConnector scheduler inited, extra_config: %r, manager block size: %d, "
+                "vllm block size: %d, groups: %d",
+                self._extra_config.__dict__, self._manager_block_size,
+                self._vllm_block_size, self._num_groups)
 
         elif role == KVConnectorRole.WORKER:
             self._tp_rank = get_tensor_model_parallel_rank()
             self._device_mod = None
-            self._save_stream = None
-            self._load_stream = None
-
-            logger.warning(
-                "TairKvCacheConnector in worker inited, tp rank: %d, tp size: %d, host_ip: %s, port: %d" % (
-                    self._tp_rank, self._tp_size, self._host_ip, port)
-            )
-
             if self._tp_rank == 0:
-                # start coordinator
-                self._coordinator_server = TpCoordinatorServer(self._host_ip, port, self._tp_size,
-                                                               self.on_save_finished)
-
+                self._coordinator_server = TpCoordinatorServer(
+                    self._host_ip, port, self._tp_size, self.on_save_finished)
             self._coordinator_client = TpCoordinatorClient(self._host_ip, port)
 
             self._storage_configs = register_response["storage_configs"]
-            # data transfer setup
-            self._location_spec_name = self._tp_rank_to_spec_name(self._tp_rank)
-            self._write_timeout_seconds = self._extra_config.write_timeout_seconds
-
-            sdk_backend_configs = []
-
-            hf3fs_configs = self.parse_hf3fs_configs(self._storage_configs)
-            sdk_backend_configs.extend(hf3fs_configs)
-            logger.debug(sdk_backend_configs)
+            sdk_backend_configs = self.parse_hf3fs_configs(self._storage_configs)
+            self._self_spec_names = {
+                meta.group_idx: self._spec_name(self._tp_rank, meta.group_idx)
+                for meta in self._group_metas
+            }
             transfer_client_json = {
                 "instance_group": self._extra_config.instance_group,
                 "instance_id": self._extra_config.instance_id,
@@ -257,26 +270,63 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                     },
                 },
                 "location_spec_infos": {
-                    self._location_spec_name: math.prod(per_manager_location_spec_shape) * kv_dtype.itemsize,
+                    self._self_spec_names[meta.group_idx]: meta.per_block_bytes
+                    for meta in self._group_metas
                 },
             }
-            self._transfer_client_config = json.dumps(transfer_client_json)
-
-            self._init_params = kvcm_py_client.InitParams()
-            self._init_params.role_type = kvcm_py_client.RoleType.WORKER
-            self._init_params.self_location_spec_name = self._location_spec_name
-            self._init_params.storage_configs = f"{self._storage_configs}"
-
-            logger.info("_transfer_client_config:%s, _init_params:%s", self._transfer_client_config, self._init_params)
-
+            init_params = kvcm_py_client.InitParams()
+            init_params.role_type = kvcm_py_client.RoleType.WORKER
+            init_params.self_location_spec_name = self._self_spec_names[self._group_metas[0].group_idx]
+            init_params.storage_configs = f"{self._storage_configs}"
+            transfer_client_config = json.dumps(transfer_client_json)
+            logger.info("transfer_client_config: %s", transfer_client_config)
             self._transfer_client = kvcm_py_client.TransferClient.Create(
-                self._transfer_client_config, self._init_params
-            )
+                transfer_client_config, init_params)
             assert self._transfer_client is not None, "kvcm_py_client.TransferClient.Create failed"
+            logger.warning(
+                "TairKvCacheConnector worker inited, tp rank: %d/%d, host: %s:%d, groups: %d",
+                self._tp_rank, self._tp_size, self._host_ip, port, self._num_groups)
+
+    def _spec_name(self, tp_rank: int, group_idx: int) -> str:
+        return f"tp{tp_rank}_g{group_idx}"
+
+    def _parse_groups(self, kv_cache_config: "KVCacheConfig") -> List[GroupMeta]:
+        metas = []
+        for idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            if getattr(group, "is_eagle_group", False):
+                logger.warning("skip eagle group %d (%d layers)", idx, len(group.layer_names))
+                continue
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                metas.append(GroupMeta(
+                    group_idx=idx,
+                    is_attention=False,
+                    layer_names=list(group.layer_names),
+                    block_size=spec.block_size,
+                    per_block_bytes=spec.page_size_bytes * len(group.layer_names),
+                    page_size_bytes=spec.page_size_bytes,
+                ))
+            elif isinstance(spec, FullAttentionSpec):
+                # Attention KV is token-granular; scale from the spec's page size
+                # to the manager block size.
+                per_token_bytes = spec.page_size_bytes // spec.block_size
+                metas.append(GroupMeta(
+                    group_idx=idx,
+                    is_attention=True,
+                    layer_names=list(group.layer_names),
+                    block_size=spec.block_size,
+                    per_block_bytes=per_token_bytes * self._manager_block_size * len(group.layer_names),
+                ))
+            else:
+                raise NotImplementedError(
+                    f"Unsupported kv cache spec {type(spec).__name__} in group {idx}")
+        assert metas, "no usable kv cache groups"
+        return metas
 
     def shutdown(self):
-        # TODO: stop background threads and cleanup transfer client
         self._manager_client.close()
+        if hasattr(self, "_location_query_manager"):
+            self._location_query_manager.shutdown()
         return None
 
     def parse_hf3fs_configs(self, storage_configs):
@@ -286,7 +336,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             if storage_config["type"] == "vcns_hf3fs":
                 storage_config["type"] = "hf3fs"
             if storage_config["type"] == "hf3fs" and storage_config["is_available"]:
-                hf3fs_config = {
+                hf3fs_configs.append({
                     "type": storage_config["type"],
                     "mountpoint": storage_config["storage_spec"]["mountpoint"],
                     "root_dir": storage_config["storage_spec"]["root_dir"],
@@ -294,371 +344,398 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                     "read_iov_size": self._iov_size,
                     "write_iov_block_size": self._extra_config.write_iov_block_size,
                     "write_iov_size": self._iov_size,
-                }
-                hf3fs_configs.append(hf3fs_config)
+                })
         self._storage_configs = json.dumps(storage_configs_json)
         return hf3fs_configs
 
-    def generate_blocks(self, token_ids, block_size, max_token_length) -> list[dict[str, Any]]:
-        results = []
-        token_length = min(len(token_ids), max_token_length)
-        # token_length = len(token_ids)
-        for i in range(0, token_length, block_size):
-            if i + block_size > token_length:
-                break
-            results.append({
-                "token_ids": token_ids[i:i + block_size],
-                "unique_id": None,
-                "location": None
-            })
-        return results
-
-    # ==============================
-    # Worker-side methods
-    # ==============================
-
-    def generate_blocks_idx(self, manager_block_idxes, local_block_ids):
-        blocks_idx = []
-        for manager_block_idx in manager_block_idxes:
-            # get kvcache index list
-            block_idx = []
-            for i in range(self._manager_block_size):
-                now_token_idx = manager_block_idx * self._manager_block_size + i
-                assert now_token_idx // self._local_block_size < len(local_block_ids)
-                local_block_id = local_block_ids[now_token_idx // self._local_block_size]
-                token_offset = now_token_idx % self._local_block_size
-                block_idx.append(local_block_id * self._local_block_size + token_offset)
-            blocks_idx.append(block_idx)
-        return blocks_idx
-
-    def on_save_finished(self, write_session_id: str, save_context: SaveContext):
-        logger.debug(save_context.result_per_rank)
-        for block_idx in range(len(save_context.locations)):
-            # TODO: report uri when enable local alloc
-            # location_specs = []
-            is_fully_saved = True
-            for rank in range(self._tp_size):
-                is_success = save_context.result_per_rank[rank][block_idx]
-                if not is_success:
-                    # this spec is not fully saved, report failed
-                    is_fully_saved = False
-                # else:
-                #     # Convert the spec to include name field instead of tp_rank
-                #     location_specs.append({
-                #         "name": self._tp_rank_to_spec_name(rank),
-                #         "uri": spec
-                #     })
-            if is_fully_saved:
-                # save_context.locations[block_idx]["location_specs"] = location_specs
-                save_context.success_mask.append(True)
-            else:
-                save_context.success_mask.append(False)
-        logger.debug("finish_write_cache blocks:%s mask:%s write_session_id:%s", save_context.locations,
-                     save_context.success_mask, write_session_id)
-        try:
-            self._manager_client.finish_write_cache({
-                "trace_id": "test_test",
-                "instance_id": self._extra_config.instance_id,
-                "write_session_id": write_session_id,
-                "success_blocks": {
-                    "bool_masks": {
-                        "values": save_context.success_mask
-                    }
-                }
-            })
-        except Exception as e:
-            logger.warning("finish_write_cache failed, write_session_id: %s, error: %s", write_session_id, e)
-
+    # ------------------------------------------------------------------ #
+    # Worker side: KV cache registration
+    # ------------------------------------------------------------------ #
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        _, first_layer_kvcache = next(iter(kv_caches.items()))
         self._kv_caches = kv_caches
-        # TODO: support MLA
-
-        assert self._local_block_size == first_layer_kvcache.shape[2], "kv cache shape error"
-        for layer_name, kvcache in kv_caches.items():
-            assert kvcache.is_contiguous(), "kv cache must be contiguous"
-
-        # torch.Size([2, block_num, block_size, kv_head_num, kv_dim])
-        # 2 -> key, value
-        self._local_block_num = first_layer_kvcache.shape[1]
-        self._local_token_num = self._local_block_num * self._local_block_size
-
-        self._dtype = first_layer_kvcache.dtype
-        self._device = first_layer_kvcache.device
+        first_attn = next(kv_caches[name]
+                          for meta in self._group_metas if meta.is_attention
+                          for name in meta.layer_names)
+        self._dtype = first_attn.dtype
+        self._device = first_attn.device
         self._device_mod = _get_device_module(self._device)
-        self._save_stream = self._device_mod.Stream()
-        self._load_stream = self._device_mod.Stream()
-        self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[0],
-                                                       self._manager_block_size,
-                                                       first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]]
-        self._per_manager_location_spec_layer_byte_size = math.prod(
-            self._per_manager_location_spec_layer_shape) * self._dtype.itemsize
-        self._per_layer_token_key_dim_size = first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]
-        self._per_layer_token_key_byte_size = (first_layer_kvcache.shape[3] *
-                                               first_layer_kvcache.shape[4] * self._dtype.itemsize)
-        assert self._per_layer_token_key_byte_size == first_layer_kvcache[0][0][1].data_ptr() - \
-               first_layer_kvcache[0][0][0].data_ptr(), "kv cache shape error"
-        assert self._per_manager_location_spec_layer_byte_size == 2 * self._manager_block_size * self._per_layer_token_key_byte_size
 
-        self._per_manager_location_spec_shape = [len(self._kv_caches)] + self._per_manager_location_spec_layer_shape
-        self._per_manager_location_spec_byte_size = math.prod(
-            self._per_manager_location_spec_shape) * self._dtype.itemsize
-
-        self._kvcache_ptr_tensor_cpu = torch.tensor(
-            [self._kv_caches[name].data_ptr() for name in self._kv_caches],
-            dtype=torch.int64,
-            device="cpu"
-        )
-        self._kvcache_ptr_tensor_gpu = self._kvcache_ptr_tensor_cpu.to(self._device)
-        if self._use_mla:
-            self._all_kvcache_ptr_tensor_cpu = torch.tensor(
-                [self._kv_caches[name].data_ptr() for name in self._kv_caches],
-                dtype=torch.int64,
-                device="cpu"
-            )
-        else:
-            kvcache_ptrs = []
-            for name in self._kv_caches:
-                kvcache_ptrs.append(self._kv_caches[name][0].data_ptr())
-                kvcache_ptrs.append(self._kv_caches[name][1].data_ptr())
-            self._all_kvcache_ptr_tensor_cpu = torch.tensor(
-                kvcache_ptrs,
-                dtype=torch.int64,
-                device="cpu"
-            )
-        self._all_kvcache_ptr_tensor_gpu = self._all_kvcache_ptr_tensor_cpu.to(self._device)
+        groups = [self._build_transfer_group(meta, kv_caches) for meta in self._group_metas]
 
         self._kvcache_info = KVCacheInfo(
-            self._tp_rank,
-            self._tp_size,
-            self._kv_caches,
-            self._kvcache_ptr_tensor_cpu,
-            self._kvcache_ptr_tensor_gpu,
-            self._all_kvcache_ptr_tensor_gpu,
-            len(self._kv_caches),
-            self._local_token_num,
-            tuple(self._per_manager_location_spec_shape),
-            self._per_manager_location_spec_byte_size,
-            self._per_layer_token_key_dim_size,
-            self._device,
-            self._dtype
+            tp_rank=self._tp_rank,
+            world_size=self._tp_size,
+            groups=groups,
+            device=self._device,
+            dtype=self._dtype,
         )
-        self._copy_buffer_allocator = CopyBufferAllocator(torch.device("cpu"), self._dtype,
-                                                          self._per_manager_location_spec_shape, 1024)
-
-        # 初始化DataTransferManager实例
         self._data_transfer = DataTransferManager(
-            self._kvcache_info,
-            self._manager_block_size,
-            self._copy_buffer_allocator,
-            self._transfer_client,
-            self._coordinator_client,
-            self._extra_config,
+            self._kvcache_info, self._manager_block_size,
+            self._transfer_client, self._coordinator_client, self._extra_config)
+
+        logger.warning("register_kv_caches done: %s", [
+            (g.spec_name, "attn" if g.is_attention else "state",
+             g.layer_num, g.per_block_bytes) for g in groups])
+
+    def _build_transfer_group(self, meta: GroupMeta, kv_caches) -> TransferGroup:
+        spec_name = self._self_spec_names[meta.group_idx]
+        if meta.is_attention:
+            tensors = [kv_caches[name] for name in meta.layer_names]
+            ref = tensors[0]
+            # vLLM >= 0.26.0 packs K and V into the content dim: logical shape
+            # (num_blocks, num_kv_heads, kernel_block_size, 2*head_size). With the
+            # default NHD stride order the memory is laid out token-major as
+            # (num_blocks, kernel_block_size, num_kv_heads, 2*head_size), so a flat
+            # index (global_token * per_token_dim + dim) walks the storage
+            # correctly. K/V packing is opaque to the byte-exact transport.
+            assert ref.dim() == 4, f"unexpected kv layout {ref.shape}"
+            for t in tensors:
+                assert t.shape == ref.shape and t.stride() == ref.stride(), \
+                    "attention layers in one group must share shape/stride"
+            kernel_block_size = ref.shape[2]
+            assert meta.block_size % kernel_block_size == 0, \
+                f"group block size {meta.block_size} not a multiple of kernel " \
+                f"block size {kernel_block_size}"
+            per_token_dim = ref.shape[1] * ref.shape[3]  # num_kv_heads * 2*head_size
+            # The gather/scatter kernel needs token-major memory inside a page:
+            # dims (blk, head, tok, dim) laid out as (blk, tok, head, dim). This
+            # is vLLM's NHD order; HND would interleave heads across tokens.
+            assert ref.stride()[1:] == (ref.shape[3], per_token_dim, 1), \
+                f"kv cache page not token-major: shape={ref.shape} " \
+                f"stride={ref.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
+            # Padded pages (page_size_padded) leave gaps between blocks; the
+            # kernel's strided path skips them. Stride 0 = fast flat indexing.
+            flat = ref.stride(0) == kernel_block_size * per_token_dim
+            block_stride = 0 if flat else ref.stride(0)
+            # One pointer per layer: K and V are packed in the content dim, and
+            # data_ptr() of the permuted view is the storage base.
+            ptrs = [t.data_ptr() for t in tensors]
+            ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cpu").to(self._device)
+            return TransferGroup(
+                group_idx=meta.group_idx,
+                spec_name=spec_name,
+                is_attention=True,
+                layer_names=meta.layer_names,
+                block_size=meta.block_size,
+                per_block_bytes=meta.per_block_bytes,
+                kvcache_ptr_tensor_gpu=ptr_tensor,
+                layer_num=len(meta.layer_names),
+                per_token_dim=per_token_dim,
+                kernel_block_size=kernel_block_size,
+                kv_stride=0,
+                block_stride=block_stride,
+            )
+
+        # Mamba/state group: each layer is a list[Tensor] sharing one storage;
+        # rebuild a (num_blocks, page_size_bytes) byte view for opaque copy.
+        block_views = []
+        for name in meta.layer_names:
+            states = kv_caches[name]
+            assert isinstance(states, (list, tuple)) and len(states) > 0, \
+                f"state layer {name} should be a list of tensors"
+            storage = states[0].untyped_storage()
+            for st in states[1:]:
+                assert st.untyped_storage().data_ptr() == storage.data_ptr(), \
+                    f"state layer {name}: tensors do not share storage"
+            num_blocks = states[0].shape[0]
+            need = num_blocks * meta.page_size_bytes
+            assert storage.nbytes() >= need, \
+                f"state layer {name}: storage {storage.nbytes()} < {need}"
+            byte_view = torch.tensor([], dtype=torch.uint8, device=self._device).set_(storage)
+            block_views.append(byte_view[:need].view(num_blocks, meta.page_size_bytes))
+        return TransferGroup(
+            group_idx=meta.group_idx,
+            spec_name=spec_name,
+            is_attention=False,
+            layer_names=meta.layer_names,
+            block_size=meta.block_size,
+            per_block_bytes=meta.per_block_bytes,
+            layer_num=len(meta.layer_names),
+            block_view_tensors=block_views,
+            page_size_bytes=meta.page_size_bytes,
         )
 
-        logger.warning("register_kv_caches, _per_manager_location_spec_layer_shape: %s",
-                       self._per_manager_location_spec_layer_shape)
+    # ------------------------------------------------------------------ #
+    # Block index translation
+    # ------------------------------------------------------------------ #
+    def _attn_token_indices(self, group: TransferGroup, manager_block_idxes,
+                            block_table) -> List[List[int]]:
+        """Map manager blocks to flat token slots of one attention group.
 
+        Three-tier hierarchy:
+          manager block (KVCM unit) -> global token idx
+          -> group block (block_table unit, group.block_size tokens)
+          -> kernel physical block (tensor unit; ratio physical per group block).
+        """
+        mbs = self._manager_block_size
+        gbs = group.block_size
+        kbs = group.kernel_block_size
+        ratio = gbs // kbs
+        out = []
+        for mb in manager_block_idxes:
+            idxs = []
+            base = mb * mbs
+            for i in range(mbs):
+                tok = base + i
+                logical = tok // gbs
+                assert logical < len(block_table), (
+                    f"group block {logical} out of range (len={len(block_table)})")
+                off = tok % gbs
+                phys = block_table[logical] * ratio + off // kbs
+                idxs.append(phys * kbs + off % kbs)
+            out.append(idxs)
+        return out
+
+    def _state_block_ids(self, group: TransferGroup, manager_block_idxes,
+                         block_table) -> List[int]:
+        """Map manager blocks to block ids of a state (mamba) group.
+
+        State is stored once per group block and covers the whole prefix up to
+        that block, so the manager block's last token selects the block."""
+        mbs = self._manager_block_size
+        gbs = group.block_size
+        out = []
+        for mb in manager_block_idxes:
+            logical = ((mb + 1) * mbs - 1) // gbs
+            assert logical < len(block_table), (
+                f"group block {logical} out of range (len={len(block_table)})")
+            out.append(block_table[logical])
+        return out
+
+    def _self_uris(self, locations, spec_name: str) -> List[str]:
+        uris = []
+        for location in locations:
+            for spec in location.get("location_specs", []):
+                if spec["name"] == spec_name:
+                    uris.append(spec["uri"])
+        return uris
+
+    # ------------------------------------------------------------------ #
+    # Worker side: load / save
+    # ------------------------------------------------------------------ #
+    def _submit_group_tasks(self, task_fn, multi_result, task_idx, group,
+                            uris, token_indices, block_ids, per_task_size, *extra):
+        for i in range(0, len(uris), per_task_size):
+            end = min(len(uris), i + per_task_size)
+            self._data_transfer.submit_task(
+                task_fn, multi_result, task_idx, group, uris[i:end],
+                token_indices[i:end] if token_indices is not None else None,
+                block_ids[i:end] if block_ids is not None else None, *extra)
+            task_idx += 1
+        return task_idx
+
+    def _plan_group_transfers(self, locations, manager_block_idxes, block_ids_per_group):
+        """Build (group, uris, token_indices, block_ids) for every group.
+
+        Returns None if any group's URI list does not cover all blocks."""
+        num_blocks = len(manager_block_idxes)
+        plans = []
+        for group in self._kvcache_info.groups:
+            uris = self._self_uris(locations, group.spec_name)
+            if len(uris) != num_blocks:
+                logger.warning("group %s: %d uris for %d blocks, skip transfer",
+                               group.spec_name, len(uris), num_blocks)
+                return None
+            # block_ids_per_group is indexed by the vLLM group index.
+            block_table = block_ids_per_group[group.group_idx]
+            if group.is_attention:
+                plans.append((group, uris,
+                              self._attn_token_indices(group, manager_block_idxes, block_table),
+                              None))
+            else:
+                plans.append((group, uris, None,
+                              self._state_block_ids(group, manager_block_idxes, block_table)))
+        return plans
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
-
         for load_req in meta.to_load_requests:
-            if len(load_req.need_load_locations) == 0:
+            if not load_req.need_load_locations:
+                continue
+            num_blocks = len(load_req.manager_block_idxes)
+            plans = self._plan_group_transfers(
+                load_req.need_load_locations, load_req.manager_block_idxes,
+                load_req.all_block_ids)
+
+            # Report failures against the block table vLLM can act on: map each
+            # manager block to the logical block holding its first token. vLLM
+            # truncates computed tokens at the first invalid block, so this is
+            # sufficient for recovery. vLLM's invalid-block handling only
+            # supports single-group models; for hybrid models a failed load can
+            # only be logged.
+            report_ids = []
+            if self._num_groups == 1:
+                table = load_req.all_block_ids[0]
+                gbs = self._group_metas[0].block_size
+                report_ids = [table[(mb * self._manager_block_size) // gbs]
+                              for mb in load_req.manager_block_idxes]
+            done_cb = self._data_transfer.create_load_done_callback(
+                load_req.req_id, self._tp_rank, meta.epoch,
+                copy.copy(report_ids), num_blocks,
+                report_failures=self._num_groups == 1)
+
+            if plans is None:
+                # Nothing submitted; report the whole load as failed.
+                mr = MultiResult(1, done_cb)
+                mr.submit_result(0, [False] * num_blocks * self._num_groups)
                 continue
 
-            block_token_indices = self.generate_blocks_idx(load_req.manager_block_idxes, load_req.local_block_ids)
-            all_remote_uris = self.get_self_uris(load_req.need_load_locations)
-
-            per_task_size = self._extra_config.block_per_load_task
-            task_num = math.ceil(len(block_token_indices) / per_task_size)
-            done_callback = self._data_transfer.create_load_done_callback(
-                load_req.req_id,
-                self._kvcache_info.tp_rank,
-                meta.epoch,
-                copy.copy(load_req.local_block_ids)
-            )
-            multi_result = MultiResult(task_num, done_callback)
-
+            per_task = self._extra_config.block_per_load_task
+            task_num = sum(math.ceil(num_blocks / per_task) for _ in plans)
+            multi_result = MultiResult(task_num, done_cb)
             task_idx = 0
-            for i in range(0, len(block_token_indices), per_task_size):
-                end_idx = min(len(block_token_indices), i + per_task_size)
-                task_remote_uris = all_remote_uris[i:end_idx]
-                task_block_token_indices = block_token_indices[i:end_idx]
-                self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
-                                                task_block_token_indices)
-                task_idx += 1
+            for group, uris, token_indices, block_ids in plans:
+                task_idx = self._submit_group_tasks(
+                    self._data_transfer.load_task, multi_result, task_idx,
+                    group, uris, token_indices, block_ids, per_task)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # logger.warning("wait_for_layer_load, layer_name: %s", layer_name)
         pass
 
-    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata",
-                      **kwargs) -> None:
-        # logger.warning("save_kv_layer, layer_name: %s", layer_name)
+    def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
+                      attn_metadata: "AttentionMetadata", **kwargs) -> None:
         pass
 
     def wait_for_save(self):
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
-        # logger.warning("wait_for_save, meta: %r", meta)
+        if not meta.to_save_requests:
+            return
+        ready_event = self._device_mod.Event()
+        ready_event.record(self._device_mod.current_stream())
 
-        kvcache_ready_event = None
-        if len(meta.to_save_requests) > 0:
-            kvcache_ready_event = self._device_mod.Event()
-            kvcache_ready_event.record(self._device_mod.current_stream())
+        for save_req in meta.to_save_requests:
+            req = self._alive_requests[save_req.req_id]
+            num_blocks = len(save_req.manager_block_idxes)
+            plans = self._plan_group_transfers(
+                save_req.target_locations, save_req.manager_block_idxes,
+                req.block_ids_per_group)
 
-        for req_save in meta.to_save_requests:
-            req = self._alive_requests[req_save.req_id]
+            done_cb = self._data_transfer.create_save_done_callback(
+                req.req_id, self._tp_rank, save_req.write_session_id, num_blocks)
 
-            # get idx
-            blocks_idx = self.generate_blocks_idx(req_save.manager_block_idxes, req.local_block_ids)
-            all_remote_uris = self.get_self_uris(req_save.target_locations)
+            if plans is None:
+                mr = MultiResult(1, done_cb)
+                mr.submit_result(0, [False] * num_blocks * self._num_groups)
+                continue
 
-            per_task_size = self._extra_config.block_per_save_task
-            task_num = math.ceil(len(blocks_idx) / per_task_size)
-            done_callback = self._data_transfer.create_save_done_callback(
-                req.req_id,
-                self._kvcache_info.tp_rank,
-                req_save.write_session_id
-            )
-            multi_result = MultiResult(task_num, done_callback)
-
+            per_task = self._extra_config.block_per_save_task
+            task_num = sum(math.ceil(num_blocks / per_task) for _ in plans)
+            multi_result = MultiResult(task_num, done_cb)
             task_idx = 0
-            for i in range(0, len(blocks_idx), per_task_size):
-                end_idx = min(len(blocks_idx), i + per_task_size)
-                task_remote_uris = all_remote_uris[i:end_idx]
-                task_block_token_indices = blocks_idx[i:end_idx]
-                self._data_transfer.submit_task(self._data_transfer.save_task, multi_result, task_idx, task_remote_uris,
-                                                task_block_token_indices,
-                                                kvcache_ready_event)
-                task_idx += 1
+            for group, uris, token_indices, block_ids in plans:
+                task_idx = self._submit_group_tasks(
+                    self._data_transfer.save_task, multi_result, task_idx,
+                    group, uris, token_indices, block_ids, per_task, ready_event)
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
 
-    def get_self_uris(self, locations):
-        all_remote_uris = []
-        for idx, location in enumerate(locations):
-            for location_spec in location["location_specs"]:
-                # Match by location spec name instead of tp_rank
-                if self._tp_rank_to_spec_name(self._kvcache_info.tp_rank) == location_spec["name"]:
-                    all_remote_uris.append(location_spec["uri"])
-        return all_remote_uris
+    def on_save_finished(self, write_session_id: str, save_context: SaveContext):
+        for block_idx in range(len(save_context.locations)):
+            fully_saved = all(save_context.result_per_rank[rank][block_idx]
+                              for rank in range(self._tp_size))
+            save_context.success_mask.append(fully_saved)
+        logger.debug("finish_write_cache mask:%s session:%s",
+                     save_context.success_mask, write_session_id)
+        try:
+            self._manager_client.finish_write_cache({
+                "trace_id": "finish_%s" % write_session_id[:8],
+                "instance_id": self._extra_config.instance_id,
+                "write_session_id": write_session_id,
+                "success_blocks": {"bool_masks": {"values": save_context.success_mask}},
+            })
+        except Exception as e:
+            logger.warning("finish_write_cache failed, session: %s, error: %s",
+                           write_session_id, e)
 
-    def get_finished(
-            self, finished_req_ids: set[str]
-    ) -> Tuple[Optional[set[str]], Optional[set[str]]]:
+    def get_finished(self, finished_req_ids: set) -> Tuple[Optional[set], Optional[set]]:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
 
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
-                req_id = finish_req.req_id
-                if req_id in self._alive_requests:
-                    self._alive_requests.pop(req_id)
+                self._alive_requests.pop(finish_req.req_id, None)
             return None, None
 
-        # self._tp_rank == 0
-        finished_saving_reqs = []
-        # check if any request is saving kvcache
-        (finished_saving_tasks, finished_loading_tasks) = self._coordinator_server.get_finished_tasks()
+        finished_saving = []
+        finished_saving_tasks, finished_loading_tasks = self._coordinator_server.get_finished_tasks()
         for req_id in finished_saving_tasks:
             req = self._alive_requests[req_id]
             req.sent_saving_count += 1
-
             assert req.sent_saving_count <= req.scheduled_saving_count
             if (req.need_report_after_saving_finished and
                     req.sent_saving_count == req.scheduled_saving_count):
-                finished_saving_reqs.append(req_id)
+                finished_saving.append(req_id)
                 self._alive_requests.pop(req_id)
 
         for finish_req in meta.to_finish_requests:
-            req_id = finish_req.req_id
-            if req_id not in self._alive_requests:
-                # called get_num_new_matched_tokens but never scheduled
+            req = self._alive_requests.get(finish_req.req_id)
+            if req is None:
                 continue
-            req = self._alive_requests[req_id]
             if req.sent_saving_count == req.scheduled_saving_count:
-                finished_saving_reqs.append(req_id)
-                self._alive_requests.pop(req_id)
+                finished_saving.append(req.req_id)
+                self._alive_requests.pop(req.req_id)
             else:
-                self._alive_requests[req_id].need_report_after_saving_finished = True
-        return set(finished_saving_reqs), set(finished_loading_tasks)
+                req.need_report_after_saving_finished = True
+        return set(finished_saving), set(finished_loading_tasks)
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_block_ids_with_load_errors(self) -> set:
         if self._tp_rank != 0:
             return set()
-        failed_set = self._coordinator_server.get_failed_loading_block_idxs()
-        if len(failed_set) > 0:
-            logger.warning("block_ids_with_load_errors: %s", failed_set)
-        return failed_set
+        failed = self._coordinator_server.get_failed_loading_block_idxs()
+        if failed:
+            logger.warning("block_ids_with_load_errors: %s", failed)
+        return failed
 
-    def bind_connector_metadata(
-            self, connector_metadata: KVConnectorMetadata) -> None:
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         self._connector_metadata = connector_metadata
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
-
-        for req_state_delta in meta.requests:
-            if req_state_delta.req_id not in self._alive_requests:
-                assert not req_state_delta.is_delta
-            if not req_state_delta.is_delta:
-                self._alive_requests[req_state_delta.req_id] = ReqState.create_from_delta(req_state_delta)
+        for delta in meta.requests:
+            if not delta.is_delta:
+                self._alive_requests[delta.req_id] = ReqState.create_from_delta(delta)
             else:
-                self._alive_requests[req_state_delta.req_id].update_from_delta(req_state_delta)
+                assert delta.req_id in self._alive_requests
+                self._alive_requests[delta.req_id].update_from_delta(delta)
 
-    # ==============================
-    # Scheduler-side methods
-    # ==============================
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> Tuple[int, bool]:
-        # logger.warning("get matched token ids: %s, id: %s", request.prompt_token_ids, request.request_id)
+    # ------------------------------------------------------------------ #
+    # Scheduler side
+    # ------------------------------------------------------------------ #
+    def get_num_new_matched_tokens(self, request: "Request",
+                                   num_computed_tokens: int) -> Tuple[Optional[int], bool]:
+        computed_blocks = num_computed_tokens // self._manager_block_size
 
-        bypass_match = False
-        # TODO: add arrival_time to req_id in order to handle same request id
-        if request.request_id in self._alive_requests:
-            # bypass remote match for alive requests
-            # possible cases:
-            # 1. reschedule when all kvcache loading failed
-            # 2. TODO: no enough hbm to schedule the request
-            # bypass_match = True
-            # logger.warning("bypass match for alive request, req_id: %s", request.request_id)
-            pass
+        is_query_done, need_load_locations = (
+            self._location_query_manager.get_locations_for_query(request, computed_blocks))
+        if not is_query_done:
+            # async query in flight; vLLM will ask again
+            return None, False
 
-        computed_manager_block_size = num_computed_tokens // self._manager_block_size
-        all_calced_remote_block_num = computed_manager_block_size
-        new_matched_count = 0
+        new_matched_count = len(need_load_locations) * self._manager_block_size
+        total_remote_blocks = computed_blocks + len(need_load_locations)
+        logger.info("req:%s matched %d external tokens", request.request_id, new_matched_count)
 
-        if not bypass_match:
-            is_query_done, need_load_locations = (
-                self._location_query_manager.get_locations_for_query(request, computed_manager_block_size))
-            if not is_query_done:
-                # async get_cache_location
-                return None, False
-            new_matched_count = len(need_load_locations) * self._manager_block_size
-            logger.info("req:%s, new_matched_count:%d", request.request_id, new_matched_count)
+        if new_matched_count:
+            self._waiting_to_load_requests.append(LoadRequest(
+                req_id=request.request_id,
+                manager_block_idxes=list(range(computed_blocks, total_remote_blocks)),
+                need_load_locations=need_load_locations,
+            ))
 
-            all_calced_remote_block_num = computed_manager_block_size + len(need_load_locations)
-
-            if new_matched_count != 0:
-                self._waiting_to_load_requests.append(LoadRequest(
-                    req_id=request.request_id,
-                    manager_block_idxes=[i for i in range(computed_manager_block_size, all_calced_remote_block_num)],
-                    need_load_locations=need_load_locations,
-                ))
-
-        new_req_meta = ReqState(request.request_id, copy.copy(request.prompt_token_ids), [],
-                                all_calced_remote_block_num,
-                                num_computed_tokens,
-                                new_matched_count,
-                                request)
-
-        self._alive_requests[request.request_id] = new_req_meta
+        self._alive_requests[request.request_id] = ReqState(
+            req_id=request.request_id,
+            token_ids=copy.copy(request.prompt_token_ids),
+            block_ids_per_group=[],
+            has_saved_block_num=total_remote_blocks,
+            local_matched_token_num=num_computed_tokens,
+            remote_matched_token_num=new_matched_count,
+            vllm_request=request,
+        )
         return new_matched_count, new_matched_count > 0
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
-        if request.request_id not in self._alive_requests:
+    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
+                                 num_external_tokens: int):
+        req_state = self._alive_requests.get(request.request_id)
+        if req_state is None:
             return
-        req_state = self._alive_requests[request.request_id]
-        # blocks_ids[0]: only one KV cache groups for now
-        # refer to vllm/v1/core/kv_cache_manager.py:35
-        req_state.local_block_ids = copy.copy(blocks.get_block_ids()[0])
+        req_state.block_ids_per_group = [list(b) for b in blocks.get_block_ids()]
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         meta = TairKvCacheConnectorMetadata(self._epoch)
@@ -666,89 +743,78 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         for load_req in self._waiting_to_load_requests:
             request = self._alive_requests[load_req.req_id]
-            if len(request.local_block_ids) == 0:
-                # ignore load_req if vllm has not called update_state_after_alloc,
-                # vllm will call get_num_new_matched_tokens again
+            if not request.block_ids_per_group:
+                # update_state_after_alloc was never called; vLLM will re-query.
                 continue
-            load_req.local_block_ids = request.local_block_ids
+            load_req.all_block_ids = [list(b) for b in request.block_ids_per_group]
             meta.add_load_request(load_req)
         self._waiting_to_load_requests = []
 
         for vllm_req in scheduler_output.scheduled_new_reqs:
             request = self._alive_requests[vllm_req.req_id]
-            request.local_block_ids = copy.copy(vllm_req.block_ids[0])
-
-            state_to_worker = ReqStateToWorker(req_id=request.req_id,
-                                               has_saved_block_num=request.has_saved_block_num,
-                                               new_tokens_ids=request.token_ids,
-                                               new_local_block_ids=request.local_block_ids,
-                                               is_delta=False
-                                               )
-            meta.add_req_state_to_worker(state_to_worker)
-            logger.info("new request: %s, block_ids_len: %d", vllm_req.req_id, len(vllm_req.block_ids[0]))
+            request.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
+            meta.add_req_state_to_worker(ReqStateToWorker(
+                req_id=request.req_id,
+                has_saved_block_num=request.has_saved_block_num,
+                new_tokens_ids=request.token_ids,
+                new_block_ids_per_group=request.block_ids_per_group,
+                is_delta=False,
+            ))
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
             request = self._alive_requests[req_id]
-            vllm_req = request.vllm_request
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_current_tokens = len(request.token_ids)
-
-            new_token_ids = vllm_req.all_token_ids[
-                num_current_tokens: num_current_tokens + num_new_tokens
-            ]
-            state_to_worker = ReqStateToWorker(req_id=request.req_id,
-                                               has_saved_block_num=request.has_saved_block_num)
-
+            new_token_ids = request.vllm_request.all_token_ids[
+                num_current_tokens:num_current_tokens + num_new_tokens]
             request.token_ids.extend(new_token_ids)
-            state_to_worker.new_tokens_ids = new_token_ids
 
-            resumed_from_preemption = False
+            delta = ReqStateToWorker(
+                req_id=request.req_id,
+                has_saved_block_num=request.has_saved_block_num,
+                new_tokens_ids=new_token_ids,
+            )
+
             if hasattr(cached_reqs, "resumed_req_ids"):
-                # vllm >= 0.11.1
-                resumed_from_preemption = req_id in cached_reqs.resumed_req_ids
+                resumed = req_id in cached_reqs.resumed_req_ids
             else:
-                # vllm <= 0.11.0
-                resumed_from_preemption = cached_reqs.resumed_from_preemption[idx]
+                resumed = cached_reqs.resumed_from_preemption[idx]
 
-            if resumed_from_preemption:
-                request.local_block_ids = copy.copy(cached_reqs.new_block_ids[idx][0])
-                state_to_worker.resumed_from_preemption = True
-                state_to_worker.new_local_block_ids = request.local_block_ids
-            else:
-                if cached_reqs.new_block_ids[idx] is None:
-                    # https://github.com/vllm-project/vllm/pull/23262
-                    continue
-                new_block_ids = cached_reqs.new_block_ids[idx][0]
-                request.local_block_ids.extend(new_block_ids)
-                state_to_worker.new_local_block_ids = new_block_ids
-            meta.add_req_state_to_worker(state_to_worker)
+            new_block_ids = cached_reqs.new_block_ids[idx]
+            if resumed:
+                request.block_ids_per_group = [list(b) for b in new_block_ids]
+                delta.resumed_from_preemption = True
+                delta.new_block_ids_per_group = request.block_ids_per_group
+            elif new_block_ids is not None:
+                # https://github.com/vllm-project/vllm/pull/23262: may be None
+                delta.new_block_ids_per_group = [list(b) for b in new_block_ids]
+                for group_ids, new_ids in zip(request.block_ids_per_group,
+                                              delta.new_block_ids_per_group):
+                    group_ids.extend(new_ids)
+            meta.add_req_state_to_worker(delta)
 
         for req in self._alive_requests.values():
-            target_save_num = min(len(req.token_ids),
-                                  len(req.local_block_ids) * self._local_block_size) // self._manager_block_size
+            target_save_num = min(
+                len(req.token_ids),
+                req.num_allocated_blocks * self._vllm_block_size) // self._manager_block_size
             if target_save_num > req.has_saved_block_num:
                 req.scheduled_saving_count += 1
                 self._http_executor.submit(
-                    self.start_save_kvcache_async,
-                    req.req_id,
+                    self.start_save_kvcache_async, req.req_id,
                     req.token_ids[:target_save_num * self._manager_block_size],
-                    target_save_num
-                )
+                    target_save_num)
             req.has_saved_block_num = target_save_num
 
-        new_save_reqs: List[SaveRequest] = []
         with self._waiting_to_save_requests_lock:
             new_save_reqs = self._waiting_to_save_requests
             self._waiting_to_save_requests = []
         for save_req in new_save_reqs:
-            if save_req.req_id not in self._alive_requests:
-                # TODO: should not happen anymore
+            req = self._alive_requests.get(save_req.req_id)
+            if req is None:
                 logger.warning("request %s is not alive, skip saving", save_req.req_id)
                 continue
-            req = self._alive_requests[save_req.req_id]
             meta.add_save_request(save_req)
-
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and
                     req.scheduled_saving_count == req.sent_saving_count):
@@ -760,8 +826,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         for finish_req in self._waiting_to_finish_requests:
             meta.add_finish_request(finish_req)
         self._waiting_to_finish_requests = []
-
-        # logger.warning("build_connector_meta: %r", meta)
         return meta
 
     def start_save_kvcache_async(self, req_id, token_ids, target_save_num):
@@ -770,62 +834,49 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             "instance_id": self._extra_config.instance_id,
             "block_keys": [],
             "token_ids": token_ids,
-            "write_timeout_seconds": 30
+            "write_timeout_seconds": self._extra_config.write_timeout_seconds,
         }
-        logger.debug("start_write_cache req: %s", request)
         try:
             response = self._manager_client.start_write_cache(request)
         except Exception as e:
-            logger.warning("start_write_cache error, skip this saving, exception: %s", e)
+            logger.warning("start_write_cache error, skip saving: %s", e)
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
             return
-        # call manager start write
-        logger.debug("start_write_cache resp: %s", response)
+
         locations = response["locations"]
         write_session_id = response["write_session_id"]
-        # check if success
 
-        if len(locations) == 0:
+        if not locations:
             try:
                 self._manager_client.finish_write_cache({
-                    "trace_id": "test_test",
+                    "trace_id": "finish_%s" % write_session_id[:8],
                     "instance_id": self._extra_config.instance_id,
                     "write_session_id": write_session_id,
-                    "success_blocks": {
-                        "bool_masks": {
-                            "offset": 0
-                        }
-                    }
+                    "success_blocks": {"bool_masks": {"offset": 0}},
                 })
             except Exception as e:
-                logger.warning("finish_write_cache failed, write_session_id: %s, error: %s", write_session_id, e)
+                logger.warning("finish_write_cache failed, session: %s, error: %s",
+                               write_session_id, e)
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
             return
 
         need_block_idx = self.parse_block_mask_to_save_indices(response, target_save_num)
-        logger.debug("target_save_num: %s, need_block_idx: %s", target_save_num, need_block_idx)
-        message = CoordinateMessage(time.time(), SendBlockStartEvent(request_id=req_id,
-                                                                     write_session_id=write_session_id,
-                                                                     locations=locations))
+        message = CoordinateMessage(time.time(), SendBlockStartEvent(
+            request_id=req_id, write_session_id=write_session_id, locations=locations))
         self._coordinator_client.send(CoordinateMsgSerializer.dumps(message))
 
         with self._waiting_to_save_requests_lock:
             self._waiting_to_save_requests.append(SaveRequest(
-                req_id,
-                locations,
-                need_block_idx,
-                write_session_id
-            ))
+                req_id, locations, need_block_idx, write_session_id))
 
     def handle_canceled_save_req(self):
-        canceled_save_req_ids = []
         with self._canceled_save_request_ids_lock:
-            canceled_save_req_ids = self._canceled_save_request_ids
+            canceled = self._canceled_save_request_ids
             self._canceled_save_request_ids = []
-        for canceled_req_id in canceled_save_req_ids:
-            req = self._alive_requests[canceled_req_id]
+        for req_id in canceled:
+            req = self._alive_requests[req_id]
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and
                     req.scheduled_saving_count == req.sent_saving_count):
@@ -833,47 +884,37 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 self._alive_requests.pop(req.req_id)
 
     def get_finished_count(self):
-        # only rank0 will return finished
+        # Only rank0 reports finished requests.
         return 1
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
-        """
-        Update KVConnector state from worker-side connectors output.
-
-        Args:
-            connector_output (KVConnectorOutput): the worker-side
-                connectors output.
-        """
-
         return
 
-    def parse_block_mask_to_save_indices(self, response: dict, target_save_num: int) -> list[int]:
-        # 从response中提取block_mask
+    def parse_block_mask_to_save_indices(self, response: dict, target_save_num: int) -> List[int]:
         block_mask = response.get("block_mask", {})
-        save_indices = []
         if "offset" in block_mask:
-            offset = block_mask["offset"]
-            for idx in range(offset, target_save_num):
-                save_indices.append(idx)
-        else:
-            bool_masks = block_mask.get("bool_masks", {}).get("values", [])
-            # 找出所有为False的索引（需要保存的block）
-            for idx, is_saved in enumerate(bool_masks):
-                if not is_saved:  # False表示需要保存
-                    save_indices.append(idx)
+            return list(range(block_mask["offset"], target_save_num))
+        values = block_mask.get("bool_masks", {}).get("values", [])
+        return [idx for idx, saved in enumerate(values) if not saved]
 
-        return save_indices
+    # ------------------------------------------------------------------ #
+    # Request finish
+    # ------------------------------------------------------------------ #
+    def request_finished_all_groups(
+            self, request: "Request",
+            block_ids: Tuple[List[int], ...]) -> Tuple[bool, Optional[dict]]:
+        return self._finish_request(request)
 
-    def request_finished(
-            self,
-            request: "Request",
-            block_ids: list[int],
-    ) -> Tuple[bool, Optional[dict[str, Any]]]:
-        if request.request_id not in self._alive_requests:
-            logger.info("request_finished not alive request: %s", request.request_id)
+    def request_finished(self, request: "Request",
+                         block_ids: List[int]) -> Tuple[bool, Optional[dict]]:
+        return self._finish_request(request)
+
+    def _finish_request(self, request: "Request") -> Tuple[bool, Optional[dict]]:
+        req = self._alive_requests.get(request.request_id)
+        if req is None:
+            logger.info("request_finished for unknown request: %s", request.request_id)
             return False, {}
 
-        req = self._alive_requests[request.request_id]
         extra_info = {"local_matched_token_num": req.local_matched_token_num,
                       "remote_matched_token_num": req.remote_matched_token_num}
 
@@ -882,8 +923,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self._alive_requests.pop(req.req_id)
             return True, extra_info
 
-        # This request still has some save requests waiting to be issued or canceled,
-        # delay finishing this request
+        # Saves still in flight; delay freeing the blocks until they land.
         req.need_report_after_saving_finished = True
-
         return True, extra_info
