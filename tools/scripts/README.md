@@ -25,12 +25,17 @@ behavior, result interpretation, and how to retain request/response artifacts.
 
 `report_event_load.py` mixes incremental ADD/DELETE events, periodic
 authoritative snapshots, heartbeat events, and standalone reads. It establishes
-the required initial snapshot for every reporter before sending deltas.
+an empty initial test baseline for deterministic shadow-state validation;
+production reporters may send deltas immediately after REGISTER.
 
 Every `ReportEvent` request is followed by `GetHostCacheState` and checked
 against a per-host in-memory authoritative state. Report success, committed
 snapshot token continuity, prefix-match contents, snapshot reconciliation, and
 deleted-key invisibility are therefore validated together.
+
+`s_version` is a reconciliation/cleanup generation, not a strict query fence.
+Production queries may return well-formed older or legacy cache candidates
+until a successful snapshot reclaims them.
 
 Run it with a new instance id. By default the tool rejects a reporter that
 already has a committed snapshot, because its startup empty snapshot would
@@ -63,7 +68,7 @@ python3 tools/scripts/report_event_load.py \
 `--snapshot-interval-sec` is per host and must not be shorter than the
 EventReport backend's configured snapshot rate limit. Setting
 `--snapshot-drop-ratio` above zero deliberately omits a portion of the current
-host state from each full snapshot and verifies those omitted blocks become
-invisible. If the backend responds with `SNAPSHOT_RATE_LIMITED`, the tool uses
+host state from each full snapshot and verifies those omitted blocks are
+eventually removed. If the backend responds with `SNAPSHOT_RATE_LIMITED`, the tool uses
 `retry_after_ms` to stop resubmitting that host until its cooldown expires and
 reports the configured interval as invalid.

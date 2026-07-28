@@ -58,6 +58,9 @@ struct CacheLocationDelRequest {
     // Optional serialized values observed by the submitter, parallel to
     // location_ids. A location is reclaimed only if it is still unchanged.
     std::vector<std::vector<std::string>> expected_location_values;
+    // Event-report metadata describes externally owned cache. Its reconciliation
+    // cleanup must remove only KVCM metadata and never call the URI backend.
+    bool metadata_only{false};
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；

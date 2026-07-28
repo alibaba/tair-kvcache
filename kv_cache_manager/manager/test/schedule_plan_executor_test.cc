@@ -708,6 +708,100 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     ASSERT_EQ(untouched_location_status, location_maps[0].at(original_location_ids[2])->status());
 }
 
+TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBackend) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+
+    class CountingDeleteBackend : public DataStorageBackend {
+    public:
+        explicit CountingDeleteBackend(std::atomic<size_t> &delete_calls)
+            : DataStorageBackend(nullptr), delete_calls_(delete_calls) {
+            config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+            config_.set_global_unique_name("external_cache");
+            SetOpen(true);
+            SetAvailable(true);
+        }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return true; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+            return {};
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            ++delete_calls_;
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<bool>(uris.size(), true);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+
+    private:
+        std::atomic<size_t> &delete_calls_;
+        StorageConfig config_;
+    };
+
+    std::atomic<size_t> delete_calls{0};
+    data_storage_manager_->storage_map_["external_cache"] =
+        std::make_shared<CountingDeleteBackend>(delete_calls);
+
+    auto request_context = std::make_shared<RequestContext>("metadata_only_delete");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    const int64_t block_key = 701;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "tp0", "event_report://external_cache/cache/block701?s_version=11111111111111111111111111111111")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              meta_searcher.BatchAddLocation(request_context.get(), {block_key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+        .location_ids = {{location_ids.front()}},
+        .metadata_only = true,
+    };
+    const auto result = executor.Submit(request).get();
+    ASSERT_EQ(EC_OK, result.status);
+    EXPECT_EQ(0u, delete_calls.load());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
+
+    const int64_t control_block_key = 702;
+    std::vector<std::string> control_location_ids;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher.BatchAddLocation(
+            request_context.get(), {control_block_key}, {location}, control_location_ids));
+    ASSERT_EQ(1u, control_location_ids.size());
+    CacheLocationDelRequest control_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {control_block_key},
+        .location_ids = {{control_location_ids.front()}},
+    };
+    const auto control_result = executor.Submit(control_request).get();
+    ASSERT_EQ(EC_OK, control_result.status);
+    EXPECT_EQ(1u, delete_calls.load());
+}
+
 // 测试CacheLocationDelRequest的Submit方法 - 非存在实例
 TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequestNonExistInstance) {
     CreateMetaIndexer(kTestInstanceName, "local");

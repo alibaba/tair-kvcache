@@ -105,20 +105,26 @@ curl -g -vvv -X POST http://localhost:6382/api/removeCache \
 
 ## Report Event
 
+完整的调用方接口契约、错误处理、查询可见性和自动化测试矩阵见
+[ReportEvent 与查询接口行为说明](report_event.md)。
+
 `reportEvent` is the cache-subscriber ingestion API. Subscribers use ordered
-incremental events for steady-state traffic and a complete snapshot to build or
+incremental events for steady-state traffic and may use a complete snapshot to
 repair the baseline:
 
-- RTP-LLM subscriber: poll full cache status, establish an initial snapshot,
-  then compute and send local deltas.
+- Realtime-only subscriber: REGISTER and send local deltas directly; no initial
+  snapshot is required.
+- RTP-LLM subscriber: poll full cache status when authoritative reconciliation
+  is needed, then continue sending local deltas.
 - vLLM subscriber: map KV events to ordered `EVENT_BLOCK_ADD`,
   `EVENT_BLOCK_DELETE`, and snapshots after restart, full-clear, or event gaps.
 
 `EVENT_BLOCK_SNAPSHOT` is authoritative for all GPU, CPU, and Disk cache owned
-by one reporter (`instance_id + host_ip_port`). `medium` is specified by each
-block. The request must contain the complete block set and every block's
-complete spec set; it cannot be paginated or mixed with ADD/DELETE in the same
-request. An empty snapshot clears all media owned by that reporter.
+by one reporter (`instance_id + storage_type + host_ip_port`). `medium` is
+specified by each block. The request must contain the complete block set and
+every block's complete spec set; it cannot be paginated or mixed with
+ADD/DELETE in the same request. An empty snapshot clears all media owned by
+that reporter.
 
 KVCM serializes a reporter's full snapshot and incremental mutations. A
 snapshot first closes the reporter's delta write gate, waits for already
@@ -130,14 +136,27 @@ remain independent. A second concurrent snapshot receives
 KVCM keeps the location id stable and appends only its reserved `s_version`
 parameter to each event-report URI. After all metadata writes and `Sync`
 succeed, KVCM publishes the in-memory committed token and returns it as
-`committed_snapshot_version`. Queries accept only URIs matching that token;
-the existing reclaimer asynchronously removes older metadata. KVCM does not
-restore tokens after restart, so each reporter must submit a new complete
-snapshot when `snapshot_required=true`.
+`committed_snapshot_version`. The token is a reconciliation and cleanup
+generation, not a query visibility fence. While a reporter is registered and
+available, queries accept well-formed legacy, old, current and in-flight
+generations. The existing reclaimer asynchronously removes older KVCM metadata
+after a successful snapshot and never sends a physical DELETE to the external
+reporter URI.
 
-Snapshots should be rare: initial baseline, KVCM restart, event gap or explicit
-repair, with an optional very-low-frequency fallback. The 30-second server-side
-minimum interval is a safety limit, not a recommended reporting period.
+After a KVCM restart, REGISTER makes well-formed historical cache metadata
+readable again. The first ADD/DELETE creates a new process-local generation and
+continues normally. `snapshot_required=true` with an empty committed version is
+an advisory, not a delta admission requirement; realtime-only reporters may
+ignore it. A snapshot-capable reporter may reconcile later.
+
+Event-report metadata is a soft cache index. Stale candidates and partial
+snapshot writes may be returned; a failed physical cache read must be treated
+as a normal cache miss. Reporter registration and liveness remain hard
+visibility gates, and malformed URI metadata is rejected.
+
+Snapshots should be rare: event gap, explicit repair, or an optional
+very-low-frequency fallback. The 30-second server-side minimum interval is a
+safety limit, not a recommended reporting period.
 Callers must not set `s_version`. `EVENT_HOST_DOWN` is terminal and must be sent
 as the only event in its request.
 

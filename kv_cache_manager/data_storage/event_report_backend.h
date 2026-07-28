@@ -45,6 +45,10 @@ public:
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override;
+    // Conservative context-free storage check. Public cache queries use
+    // CacheManager's location-aware checker because this interface has no
+    // instance id or stable location id with which to validate legacy and
+    // mixed-generation metadata.
     std::vector<bool> MightExist(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
@@ -56,6 +60,13 @@ public:
     ErrorCode RegisterNode(const std::string &instance_id,
                            const std::string &host_ip_port,
                            const std::vector<std::string> &mediums);
+    // Rebuilds a missing process-local reporter entry on the first valid
+    // report from a fresh caller or after KVCM restart. Unlike an explicit
+    // REGISTER, the fast path does not refresh liveness, revive an unavailable
+    // reporter, or clear a same-process unregister tombstone.
+    ErrorCode EnsureNodeRegistered(const std::string &instance_id,
+                                   const std::string &host_ip_port,
+                                   const std::vector<std::string> &mediums);
     ErrorCode UnregisterNode(const std::string &instance_id, const std::string &host_ip_port);
     ErrorCode OnHeartbeat(const std::string &instance_id,
                           const std::string &host_ip_port,
@@ -111,12 +122,15 @@ private:
     mutable std::shared_mutex nodes_mutex_;
     // instance_id -> (host_ip_port -> NodeInfo)
     std::unordered_map<std::string, std::unordered_map<std::string, std::unique_ptr<NodeInfo>>> instance_nodes_;
-    // Persists across unregister/register to fence stale cleanup.
+    // Persists across unregister/register to fence stale cleanup. An entry
+    // without a live instance_nodes_ entry is also the same-process
+    // unregister tombstone. Close() clears both maps, so the first valid
+    // report after process restart can lazily rebuild the node.
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
     struct SnapshotVersionState {
-        // Process-local reporter state, not a distributed lock. KVCM restart clears
-        // this state and requires the reporter to rebuild it with a full snapshot.
+        // Process-local reporter state, not a distributed lock. KVCM restart
+        // clears this state; the first valid delta or snapshot rebuilds it.
         std::string committed;
         std::string in_flight;
         uint64_t active_delta_mutations = 0;

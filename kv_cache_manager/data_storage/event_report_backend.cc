@@ -130,7 +130,10 @@ void EventReportBackend::SetCleanupCallback(CleanupCallback cb) {
 ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
                                            const std::string &host_ip_port,
                                            const std::vector<std::string> &mediums) {
-    if (host_ip_port.empty()) {
+    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port) ||
+        std::any_of(mediums.begin(), mediums.end(), [](const std::string &medium) {
+            return !SnapshotUriUtils::IsValidLocationIdComponent(medium);
+        })) {
         return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
@@ -178,8 +181,65 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
     return EC_OK;
 }
 
+ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_id,
+                                                   const std::string &host_ip_port,
+                                                   const std::vector<std::string> &mediums) {
+    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port) ||
+        std::any_of(mediums.begin(), mediums.end(), [](const std::string &medium) {
+            return !SnapshotUriUtils::IsValidLocationIdComponent(medium);
+        })) {
+        return EC_BADARGS;
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+        const auto instance_it = instance_nodes_.find(instance_id);
+        if (instance_it != instance_nodes_.end() &&
+            instance_it->second.find(host_ip_port) != instance_it->second.end()) {
+            // A normal data report must not act as a heartbeat or revive a
+            // node that the liveness loop has marked unavailable.
+            return EC_OK;
+        }
+        const auto generation_it = node_generation_.find(instance_id);
+        if (generation_it != node_generation_.end() && generation_it->second.count(host_ip_port) > 0) {
+            return EC_NODE_NOT_REGISTERED;
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto &host_map = instance_nodes_[instance_id];
+    if (host_map.find(host_ip_port) != host_map.end()) {
+        // Another first report won the race while the lock was upgraded.
+        return EC_OK;
+    }
+    const auto generation_it = node_generation_.find(instance_id);
+    if (generation_it != node_generation_.end() && generation_it->second.count(host_ip_port) > 0) {
+        return EC_NODE_NOT_REGISTERED;
+    }
+
+    const uint64_t generation = ++node_generation_[instance_id][host_ip_port];
+    auto info = std::make_unique<NodeInfo>();
+    info->last_heartbeat_ms.store(NowMillis(), std::memory_order_relaxed);
+    info->available.store(true, std::memory_order_relaxed);
+    info->unavailable_since_ms.store(0, std::memory_order_relaxed);
+    info->mediums = mediums;
+    info->instance_id = instance_id;
+    info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}, {"type", ToString(config_.type())}};
+    host_map[host_ip_port] = std::move(info);
+
+    KVCM_LOG_INFO("EventReportBackend: lazily restored node [%s] in storage [%s] for instance [%s], "
+                  "mediums=%zu, gen=%" PRIu64,
+                  host_ip_port.c_str(),
+                  config_.global_unique_name().c_str(),
+                  instance_id.c_str(),
+                  mediums.size(),
+                  generation);
+    return EC_OK;
+}
+
 ErrorCode EventReportBackend::UnregisterNode(const std::string &instance_id, const std::string &host_ip_port) {
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    node_generation_[instance_id].try_emplace(host_ip_port, 0);
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
         KVCM_LOG_WARN("EventReportBackend: instance [%s] not found for unregister node [%s]",
@@ -223,22 +283,35 @@ ErrorCode EventReportBackend::UnregisterNode(const std::string &instance_id, con
 ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
                                           const std::string &host_ip_port,
                                           const std::map<std::string, std::string> &system_status) {
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto inst_it = instance_nodes_.find(instance_id);
-    if (inst_it == instance_nodes_.end()) {
-        KVCM_LOG_WARN("EventReportBackend: heartbeat from unregistered instance [%s] node [%s], "
-                      "returning NODE_NOT_REGISTERED",
-                      instance_id.c_str(),
-                      host_ip_port.c_str());
-        return EC_NODE_NOT_REGISTERED;
+    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port)) {
+        return EC_BADARGS;
     }
-    auto it = inst_it->second.find(host_ip_port);
-    if (it == inst_it->second.end()) {
-        KVCM_LOG_WARN("EventReportBackend: heartbeat from unregistered node [%s] for instance [%s], "
-                      "returning NODE_NOT_REGISTERED",
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto &host_map = instance_nodes_[instance_id];
+    auto it = host_map.find(host_ip_port);
+    if (it == host_map.end()) {
+        const auto generation_it = node_generation_.find(instance_id);
+        if (generation_it != node_generation_.end() && generation_it->second.count(host_ip_port) > 0) {
+            KVCM_LOG_WARN("EventReportBackend: heartbeat from tombstoned node [%s] for instance [%s], "
+                          "returning NODE_NOT_REGISTERED",
+                          host_ip_port.c_str(),
+                          instance_id.c_str());
+            return EC_NODE_NOT_REGISTERED;
+        }
+        const uint64_t generation = ++node_generation_[instance_id][host_ip_port];
+        auto new_info = std::make_unique<NodeInfo>();
+        new_info->last_heartbeat_ms.store(NowMillis(), std::memory_order_relaxed);
+        new_info->available.store(true, std::memory_order_relaxed);
+        new_info->unavailable_since_ms.store(0, std::memory_order_relaxed);
+        new_info->instance_id = instance_id;
+        new_info->metrics_tags = {
+            {"instance_id", instance_id}, {"host", host_ip_port}, {"type", ToString(config_.type())}};
+        it = host_map.emplace(host_ip_port, std::move(new_info)).first;
+        KVCM_LOG_INFO("EventReportBackend: heartbeat lazily restored node [%s] for instance [%s] "
+                      "(generation=%" PRIu64 ")",
                       host_ip_port.c_str(),
-                      instance_id.c_str());
-        return EC_NODE_NOT_REGISTERED;
+                      instance_id.c_str(),
+                      generation);
     }
     auto &info = *it->second;
     int64_t now_ms = NowMillis();
@@ -488,6 +561,10 @@ std::vector<ErrorCode> EventReportBackend::UnLock(const std::vector<DataStorageU
 }
 
 std::string EventReportBackend::BuildLocationId(const std::string &medium, const std::string &host_ip_port) const {
+    if (!SnapshotUriUtils::IsValidLocationIdComponent(medium) ||
+        !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port)) {
+        return {};
+    }
     const std::string type_token = ToString(config_.type());
     std::string result;
     result.reserve(4 + type_token.size() + 1 + medium.size() + 1 + host_ip_port.size());
@@ -521,14 +598,32 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
         auto it = snapshot_versions_.find(reporter_key);
         return it == snapshot_versions_.end() || it->second.in_flight.empty();
     });
-    auto it = snapshot_versions_.find(reporter_key);
-    if (it == snapshot_versions_.end()) {
-        return EC_SNAPSHOT_REQUIRED;
+    auto state_it = snapshot_versions_.find(reporter_key);
+    if (state_it == snapshot_versions_.end() || state_it->second.committed.empty()) {
+        const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
+        if (instance_it == instance_nodes_.end() ||
+            instance_it->second.find(reporter_key.host_ip_port) == instance_it->second.end()) {
+            return EC_SNAPSHOT_REQUIRED;
+        }
+
+        auto token_in_use = [this](const std::string &token) {
+            if (snapshot_token_owners_.count(token) > 0) {
+                return true;
+            }
+            return std::any_of(snapshot_versions_.begin(), snapshot_versions_.end(), [&token](const auto &entry) {
+                return entry.second.in_flight == token;
+            });
+        };
+        std::string candidate;
+        do {
+            candidate = GenerateSnapshotVersionToken();
+        } while (token_in_use(candidate));
+        auto &new_state = snapshot_versions_[reporter_key];
+        new_state.committed = candidate;
+        snapshot_token_owners_[candidate] = reporter_key;
+        state_it = snapshot_versions_.find(reporter_key);
     }
-    auto &state = it->second;
-    if (state.committed.empty()) {
-        return EC_SNAPSHOT_REQUIRED;
-    }
+    auto &state = state_it->second;
     if (state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {
         return EC_ERROR;
     }
@@ -563,6 +658,11 @@ ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_
         return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
+    if (instance_it == instance_nodes_.end() ||
+        instance_it->second.find(reporter_key.host_ip_port) == instance_it->second.end()) {
+        return EC_SNAPSHOT_REQUIRED;
+    }
     auto &state = snapshot_versions_[reporter_key];
     if (!state.in_flight.empty()) {
         return EC_SNAPSHOT_IN_PROGRESS;

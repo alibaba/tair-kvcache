@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <gtest/gtest.h>
@@ -37,6 +38,21 @@ public:
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
+
+ErrorCode BeginSnapshotForRegisteredReporter(EventReportBackend &backend,
+                                             const ReporterSnapshotKey &reporter_key,
+                                             std::string &out_candidate_version,
+                                             uint64_t &out_retry_after_ms) {
+    if (!reporter_key.instance_id.empty() && !reporter_key.host_ip_port.empty() &&
+        !backend.IsNodeRegistered(reporter_key.instance_id, reporter_key.host_ip_port)) {
+        const ErrorCode register_ec =
+            backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"});
+        if (register_ec != EC_OK) {
+            return register_ec;
+        }
+    }
+    return backend.BeginSnapshot(reporter_key, out_candidate_version, out_retry_after_ms);
+}
 
 // (1) GetType / Available / Create-Delete EC_UNIMPLEMENTED / GetStorageUsageRatio=1.0
 TEST_F(EventReportBackendTest, BasicAccessors) {
@@ -84,6 +100,11 @@ TEST_F(EventReportBackendTest, BuildLocationIdIncludesEventReportType) {
     EXPECT_FALSE(l1p5_backend.ParseLocationId(l2_location, medium, host));
     EXPECT_TRUE(l2_backend.ParseLocationId(l2_location, medium, host));
     EXPECT_FALSE(l2_backend.ParseLocationId(l1p5_location, medium, host));
+    EXPECT_TRUE(l1p5_backend.BuildLocationId("mem#bad", "10.0.0.1:8080").empty());
+    EXPECT_TRUE(l1p5_backend.BuildLocationId("mem", "10.0.0.1#8080").empty());
+    EXPECT_FALSE(SnapshotUriUtils::IsValidLocationIdComponent(""));
+    EXPECT_FALSE(SnapshotUriUtils::IsValidLocationIdComponent("mem#bad"));
+    EXPECT_TRUE(SnapshotUriUtils::IsValidLocationIdComponent("hbm-cache"));
 }
 
 TEST_F(EventReportBackendTest, OpenWithWrongSpecTypeFails) {
@@ -119,6 +140,9 @@ TEST_F(EventReportBackendTest, RegisterNodeWithMediums) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
 
     ASSERT_EQ(EC_BADARGS, backend.RegisterNode("test_inst", "", {"mem"}));
+    ASSERT_EQ(EC_BADARGS, backend.RegisterNode("", "10.0.0.1:8080", {"mem"}));
+    ASSERT_EQ(EC_BADARGS, backend.RegisterNode("test_inst", "10.0.0.1#8080", {"mem"}));
+    ASSERT_EQ(EC_BADARGS, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem#bad"}));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem", "disk"}));
     ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
 
@@ -132,11 +156,19 @@ TEST_F(EventReportBackendTest, RegisterNodeWithMediums) {
 
     backend.SetNodeUnavailable("test_inst", "10.0.0.1:8080");
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
+    ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered("test_inst", "10.0.0.1:8080", {"hbm"}));
+    ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem"}));
     ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
 
     ASSERT_EQ(EC_OK, backend.UnregisterNode("test_inst", "10.0.0.1:8080"));
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
+    ASSERT_EQ(EC_NODE_NOT_REGISTERED,
+              backend.EnsureNodeRegistered("test_inst", "10.0.0.1:8080", {"mem"}));
+    ASSERT_EQ(EC_NODE_NOT_REGISTERED, backend.OnHeartbeat("test_inst", "10.0.0.1:8080", {}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem"}));
+    ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "10.0.0.1:8080"));
+    ASSERT_EQ(EC_OK, backend.UnregisterNode("test_inst", "10.0.0.1:8080"));
     ASSERT_EQ(EC_NOENT, backend.UnregisterNode("test_inst", "10.0.0.1:8080"));
     ASSERT_EQ(EC_OK, backend.Close());
 }
@@ -152,7 +184,7 @@ TEST_F(EventReportBackendTest, MightExistTracksRegisteredNodeAvailability) {
     const ReporterSnapshotKey reporter_key{instance_id, available_host};
     std::string committed_token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, committed_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, committed_token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, committed_token));
 
     std::string available_uri_string;
@@ -221,9 +253,44 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
         ASSERT_EQ(it->second->unavailable_since_ms.load(), 0);
     }
 
-    ASSERT_EQ(EC_NODE_NOT_REGISTERED, backend.OnHeartbeat("test_inst", "99.99.99.99:8080", {{"x", "y"}}));
-    ASSERT_EQ(backend.instance_nodes_["test_inst"].count("99.99.99.99:8080"), 0u);
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "99.99.99.99:8080", {{"x", "y"}}));
+    ASSERT_TRUE(backend.IsNodeRegistered("test_inst", "99.99.99.99:8080"));
+    ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "99.99.99.99:8080"));
+    ASSERT_EQ(backend.instance_nodes_["test_inst"]["99.99.99.99:8080"]->last_system_status.at("x"), "y");
 
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, DataMutationsDoNotRefreshHeartbeat) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+    const ReporterSnapshotKey reporter_key{"test_inst", "10.0.0.31:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    int64_t registered_heartbeat_ms = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(backend.nodes_mutex_);
+        const auto instance_it = backend.instance_nodes_.find(reporter_key.instance_id);
+        ASSERT_NE(backend.instance_nodes_.end(), instance_it);
+        const auto host_it = instance_it->second.find(reporter_key.host_ip_port);
+        ASSERT_NE(instance_it->second.end(), host_it);
+        registered_heartbeat_ms = host_it->second->last_heartbeat_ms.load();
+    }
+
+    std::string delta_version;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, delta_version));
+    backend.EndDeltaMutation(reporter_key);
+
+    std::string snapshot_version;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, snapshot_version, retry_after_ms));
+    backend.AbortSnapshotVersion(reporter_key, snapshot_version);
+
+    {
+        std::shared_lock<std::shared_mutex> lock(backend.nodes_mutex_);
+        const auto &node = backend.instance_nodes_.at(reporter_key.instance_id).at(reporter_key.host_ip_port);
+        EXPECT_EQ(registered_heartbeat_ms, node->last_heartbeat_ms.load());
+    }
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
@@ -308,7 +375,7 @@ TEST_F(EventReportBackendTest, HeartbeatRecoveryFencesCleanupAlreadySelectedByLi
 
     std::string token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, token));
     std::string uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri("event_report://physical-cache:9600/mem", token, uri));
@@ -619,7 +686,7 @@ TEST_F(EventReportBackendTest, TwoInstancesSameHostIsolated) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST(EventReportBackendSnapshotTest, RequiresSnapshotBeforeAnyDelta) {
+TEST(EventReportBackendSnapshotTest, UnregisteredReporterCannotCreateDeltaVersion) {
     EventReportBackend backend(nullptr);
     const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
 
@@ -629,6 +696,58 @@ TEST(EventReportBackendSnapshotTest, RequiresSnapshotBeforeAnyDelta) {
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
 }
 
+TEST(EventReportBackendSnapshotTest, RegisteredReporterFirstDeltaCreatesReusableVersion) {
+    EventReportBackend backend(nullptr);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"hbm"}));
+
+    std::string first;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, first));
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(first));
+    EXPECT_EQ(first, backend.GetSnapshotVersion(reporter_key));
+    backend.EndDeltaMutation(reporter_key);
+
+    std::string second;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, second));
+    EXPECT_EQ(first, second);
+    backend.EndDeltaMutation(reporter_key);
+}
+
+TEST(EventReportBackendSnapshotTest, ConcurrentFirstDeltasPublishExactlyOneReusableVersion) {
+    EventReportBackend backend(nullptr);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.2:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"hbm"}));
+
+    constexpr size_t kThreadCount = 32;
+    std::atomic<bool> start{false};
+    std::vector<ErrorCode> ecs(kThreadCount, EC_ERROR);
+    std::vector<std::string> versions(kThreadCount);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            ecs[i] = backend.BeginDeltaMutation(reporter_key, versions[i]);
+            if (ecs[i] == EC_OK) {
+                backend.EndDeltaMutation(reporter_key);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads) {
+        thread.join();
+    }
+
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(versions.front()));
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        EXPECT_EQ(EC_OK, ecs[i]) << "thread=" << i;
+        EXPECT_EQ(versions.front(), versions[i]) << "thread=" << i;
+    }
+    EXPECT_EQ(versions.front(), backend.GetSnapshotVersion(reporter_key));
+}
+
 TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
@@ -636,7 +755,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
 
     std::string candidate;
     uint64_t retry_after_ms = 123;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, candidate, retry_after_ms));
     EXPECT_EQ(0u, retry_after_ms);
     EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
@@ -659,7 +778,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotTokensAreNeverReusedAcrossAttempts)
     for (size_t attempt = 0; attempt < 128; ++attempt) {
         std::string candidate;
         uint64_t retry_after_ms = 0;
-        ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+        ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
         ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
         EXPECT_TRUE(observed.insert(candidate).second);
         if (attempt % 2 == 0) {
@@ -678,10 +797,12 @@ TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaWaitForEachOther) {
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
 
     std::string concurrent_snapshot;
-    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(reporter_key, concurrent_snapshot, retry_after_ms));
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS,
+              BeginSnapshotForRegisteredReporter(
+                  backend, reporter_key, concurrent_snapshot, retry_after_ms));
 
     std::promise<void> delta_started;
     std::promise<std::pair<ErrorCode, std::string>> delta_result;
@@ -714,7 +835,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaWaitForEachOther) {
         snapshot_started.set_value();
         std::string candidate;
         uint64_t retry_ms = 0;
-        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        const ErrorCode ec = BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_ms);
         snapshot_result.set_value({ec, candidate, retry_ms});
     });
     snapshot_started.get_future().wait();
@@ -740,11 +861,11 @@ TEST(EventReportBackendSnapshotTest, AbortUnblocksWaitingDeltaWithoutPublishingC
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
 
     std::string candidate;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
     std::string observed_committed;
     std::string observed_in_flight;
     backend.GetSnapshotVersionTokens(reporter_key, observed_committed, observed_in_flight);
@@ -781,7 +902,7 @@ TEST(EventReportBackendSnapshotTest, CommitUnblocksAllWaitingDeltasWithNewToken)
 
     std::string candidate;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
 
     constexpr size_t kWaiterCount = 4;
     std::vector<std::future<std::pair<ErrorCode, std::string>>> futures;
@@ -816,7 +937,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotWaitsUntilEveryAdmittedDeltaDrains)
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
 
     constexpr size_t kActiveDeltaCount = 3;
@@ -829,7 +950,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotWaitsUntilEveryAdmittedDeltaDrains)
     auto snapshot = std::async(std::launch::async, [&] {
         std::string candidate;
         uint64_t retry_ms = 0;
-        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        const ErrorCode ec = BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_ms);
         return std::make_tuple(ec, candidate, retry_ms);
     });
     EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
@@ -863,7 +984,7 @@ TEST(EventReportBackendSnapshotTest, ConcurrentSnapshotsHaveExactlyOneWinner) {
             start_signal.wait();
             std::string candidate;
             uint64_t retry_after_ms = 0;
-            const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_after_ms);
+            const ErrorCode ec = BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms);
             return std::make_pair(ec, candidate);
         }));
     }
@@ -900,7 +1021,7 @@ TEST(EventReportBackendSnapshotTest, UnregisterCancelsSnapshotWaitingForActiveDe
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
     std::string committed;
     ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
@@ -908,7 +1029,7 @@ TEST(EventReportBackendSnapshotTest, UnregisterCancelsSnapshotWaitingForActiveDe
     auto snapshot = std::async(std::launch::async, [&] {
         std::string candidate = "stale";
         uint64_t retry_ms = 99;
-        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        const ErrorCode ec = BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_ms);
         return std::make_tuple(ec, candidate, retry_ms);
     });
     EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
@@ -922,6 +1043,35 @@ TEST(EventReportBackendSnapshotTest, UnregisterCancelsSnapshotWaitingForActiveDe
     backend.EndDeltaMutation(reporter_key);
 }
 
+TEST_F(EventReportBackendTest, AutomaticLivenessCleanupCancelsSnapshotWaitingForActiveDelta) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 20, /*grace*/ 20, /*tick*/ 5), "liveness_snapshot_wait"));
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.60:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string committed;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(committed));
+
+    auto snapshot = std::async(std::launch::async, [&] {
+        std::string candidate = "stale";
+        uint64_t retry_after_ms = 99;
+        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_after_ms);
+        return std::make_tuple(ec, candidate, retry_after_ms);
+    });
+    EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(5ms));
+    ASSERT_EQ(std::future_status::ready, snapshot.wait_for(2s));
+    const auto [ec, candidate, retry_after_ms] = snapshot.get();
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, ec);
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(0u, retry_after_ms);
+    EXPECT_FALSE(backend.IsNodeRegistered(reporter_key.instance_id, reporter_key.host_ip_port));
+    EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
 TEST(EventReportBackendSnapshotTest, UnregisterUnblocksWaitingDeltaAndRequiresNewSnapshot) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
@@ -932,10 +1082,10 @@ TEST(EventReportBackendSnapshotTest, UnregisterUnblocksWaitingDeltaAndRequiresNe
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
     std::string second;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, second, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, second, retry_after_ms));
 
     auto delta = std::async(std::launch::async, [&] {
         std::string committed = "stale";
@@ -958,11 +1108,11 @@ TEST(EventReportBackendSnapshotTest, OtherReporterIsNotBlockedBySnapshot) {
     uint64_t retry_after_ms = 0;
 
     std::string token_b;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_b, token_b, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_b, token_b, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_b, token_b));
 
     std::string token_a;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_a, token_a, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_a, token_a, retry_after_ms));
     std::string committed_b;
     EXPECT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_b, committed_b));
     EXPECT_EQ(token_b, committed_b);
@@ -977,17 +1127,19 @@ TEST(EventReportBackendSnapshotTest, AbortNeverPublishesAndWrongTokenCannotCommi
 
     std::string candidate;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, candidate, retry_after_ms));
     EXPECT_FALSE(backend.CommitSnapshotVersion(scope, std::string(32, 'f')));
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
 
     backend.AbortSnapshotVersion(scope, std::string(32, 'e'));
     std::string still_blocked;
-    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(scope, still_blocked, retry_after_ms));
+    EXPECT_EQ(
+        EC_SNAPSHOT_IN_PROGRESS,
+        BeginSnapshotForRegisteredReporter(backend, scope, still_blocked, retry_after_ms));
 
     backend.AbortSnapshotVersion(scope, candidate);
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
-    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, still_blocked, retry_after_ms));
+    EXPECT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, still_blocked, retry_after_ms));
     backend.AbortSnapshotVersion(scope, still_blocked);
 }
 
@@ -998,11 +1150,11 @@ TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first));
 
     std::string second;
-    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, backend.BeginSnapshot(scope, second, retry_after_ms));
+    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, BeginSnapshotForRegisteredReporter(backend, scope, second, retry_after_ms));
     EXPECT_GT(retry_after_ms, 0u);
     EXPECT_LE(retry_after_ms, 30'000u);
     EXPECT_TRUE(second.empty());
@@ -1011,13 +1163,13 @@ TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
     std::this_thread::sleep_for(2ms);
     second = "stale";
     retry_after_ms = 0;
-    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, backend.BeginSnapshot(scope, second, retry_after_ms));
+    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, BeginSnapshotForRegisteredReporter(backend, scope, second, retry_after_ms));
     EXPECT_TRUE(second.empty());
     EXPECT_GT(retry_after_ms, 0u);
     EXPECT_LE(retry_after_ms, first_retry_after_ms);
 
     backend.SetSnapshotMinIntervalMsForTest(0);
-    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, second, retry_after_ms));
+    EXPECT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, second, retry_after_ms));
     backend.AbortSnapshotVersion(scope, second);
 }
 
@@ -1030,11 +1182,13 @@ TEST_F(EventReportBackendTest, ConfiguredSnapshotRateLimitIsAppliedOnOpen) {
     const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
 
     std::string second = "stale";
-    ASSERT_EQ(EC_SNAPSHOT_RATE_LIMITED, backend.BeginSnapshot(reporter_key, second, retry_after_ms));
+    ASSERT_EQ(
+        EC_SNAPSHOT_RATE_LIMITED,
+        BeginSnapshotForRegisteredReporter(backend, reporter_key, second, retry_after_ms));
     EXPECT_TRUE(second.empty());
     EXPECT_GT(retry_after_ms, 100'000u);
     EXPECT_LE(retry_after_ms, 120'000u);
@@ -1052,9 +1206,9 @@ TEST(EventReportBackendSnapshotTest, ScopesAreIsolatedByInstanceAndReporterHost)
     std::string token_b;
     std::string token_c;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_a, token_a, retry_after_ms));
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_b, token_b, retry_after_ms));
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_c, token_c, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope_a, token_a, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope_b, token_b, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope_c, token_c, retry_after_ms));
     EXPECT_NE(token_a, token_b);
     EXPECT_NE(token_a, token_c);
     EXPECT_NE(token_b, token_c);
@@ -1074,15 +1228,23 @@ TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
     const std::string host = "10.0.0.1:8080";
     const ReporterSnapshotKey scope{instance_id, host};
 
+    std::string rejected_token;
+    uint64_t retry_after_ms = 0;
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginSnapshot(scope, rejected_token, retry_after_ms));
+    EXPECT_TRUE(rejected_token.empty());
+    EXPECT_EQ(0u, backend.snapshot_versions_.count(scope));
+
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     std::string token;
-    uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(scope, token));
     ASSERT_EQ(token, backend.GetSnapshotVersion(scope));
 
     ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginSnapshot(scope, rejected_token, retry_after_ms));
+    EXPECT_TRUE(rejected_token.empty());
+    EXPECT_EQ(0u, backend.snapshot_versions_.count(scope));
     std::string committed;
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
 }
@@ -1101,7 +1263,7 @@ TEST(EventReportBackendSnapshotTest, FailedDeltaClearsOutputAndDoesNotCreateACom
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
 }
 
-TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterRequiresNewSnapshot) {
+TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterLetsFirstDeltaCreateNewVersion) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
     const std::string instance_id = "instance-a";
@@ -1111,18 +1273,20 @@ TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterRequiresNewSnapshot
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     std::string first_token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, first_token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first_token));
 
     ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
     std::string committed = "stale-token";
-    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
-    EXPECT_TRUE(committed.empty());
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed));
+    EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(committed));
+    EXPECT_NE(first_token, committed);
+    backend.EndDeltaMutation(scope);
 
     std::string second_token;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, second_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, second_token, retry_after_ms));
     EXPECT_NE(first_token, second_token);
     EXPECT_TRUE(backend.CommitSnapshotVersion(scope, second_token));
 }
@@ -1151,7 +1315,7 @@ TEST(EventReportBackendSnapshotTest, RegisterAndHeartbeatPreserveCommittedToken)
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm"}));
     std::string token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, token));
 
     EXPECT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"memory"}));
@@ -1171,11 +1335,14 @@ TEST(EventReportBackendSnapshotTest, InvalidInputsDoNotMutateOrReleaseSnapshotSt
 
     std::string candidate = "stale";
     uint64_t retry_after_ms = 99;
-    EXPECT_EQ(EC_BADARGS, backend.BeginSnapshot({"", reporter_key.host_ip_port}, candidate, retry_after_ms));
+    EXPECT_EQ(
+        EC_BADARGS,
+        BeginSnapshotForRegisteredReporter(
+            backend, {"", reporter_key.host_ip_port}, candidate, retry_after_ms));
     EXPECT_TRUE(candidate.empty());
     EXPECT_EQ(0u, retry_after_ms);
 
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
     EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, ""));
     EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(31, 'a')));
@@ -1184,12 +1351,14 @@ TEST(EventReportBackendSnapshotTest, InvalidInputsDoNotMutateOrReleaseSnapshotSt
     backend.AbortSnapshotVersion(reporter_key, std::string(32, 'f'));
     std::string blocked = "stale";
     retry_after_ms = 99;
-    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(reporter_key, blocked, retry_after_ms));
+    EXPECT_EQ(
+        EC_SNAPSHOT_IN_PROGRESS,
+        BeginSnapshotForRegisteredReporter(backend, reporter_key, blocked, retry_after_ms));
     EXPECT_TRUE(blocked.empty());
     EXPECT_EQ(0u, retry_after_ms);
 
     backend.AbortSnapshotVersion(reporter_key, candidate);
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
     backend.AbortSnapshotVersion(reporter_key, candidate);
 }
 
@@ -1247,7 +1416,7 @@ TEST(EventReportBackendSnapshotTest, MightExistRequiresCurrentTokenAndAvailableR
 
     std::string token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, token, retry_after_ms));
 
     // The URI endpoint may differ from the reporter identity. The opaque
     // token must resolve the owner; URI hostname must not be used for liveness.
@@ -1273,7 +1442,7 @@ TEST(EventReportBackendSnapshotTest, MightExistRequiresCurrentTokenAndAvailableR
     EXPECT_EQ((std::vector<bool>{true}), backend.MightExist({committed_uri}));
 
     std::string replacement_token;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, replacement_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, replacement_token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, replacement_token));
     std::string replacement_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, replacement_token, replacement_uri));
@@ -1296,7 +1465,7 @@ TEST_F(EventReportBackendTest, MightExistFollowsAutomaticLivenessAndFullReporter
 
     std::string first_token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first_token, retry_after_ms));
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first_token));
     std::string first_uri;
     ASSERT_TRUE(
@@ -1328,11 +1497,13 @@ TEST_F(EventReportBackendTest, MightExistFollowsAutomaticLivenessAndFullReporter
     EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
     EXPECT_EQ((std::vector<bool>{false}), backend.MightExist({DataStorageUri(first_uri)}));
     std::string committed = "must-be-cleared";
-    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(reporter_key, committed));
-    EXPECT_TRUE(committed.empty());
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(committed));
+    EXPECT_NE(first_token, committed);
+    backend.EndDeltaMutation(reporter_key);
 
     std::string second_token;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, second_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, second_token, retry_after_ms));
     ASSERT_NE(first_token, second_token);
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, second_token));
     std::string second_uri;
@@ -1355,7 +1526,7 @@ TEST(EventReportBackendSnapshotTest, MightExistBatchPreservesOrderAcrossTokenAnd
     auto commit = [&](const ReporterSnapshotKey &reporter) {
         std::string token;
         uint64_t retry_after_ms = 0;
-        EXPECT_EQ(EC_OK, backend.BeginSnapshot(reporter, token, retry_after_ms));
+        EXPECT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter, token, retry_after_ms));
         EXPECT_TRUE(backend.CommitSnapshotVersion(reporter, token));
         return token;
     };
@@ -1399,7 +1570,7 @@ TEST(EventReportBackendSnapshotTest, MightExistUsesTokenOwnerAcrossInstancesAndP
     auto commit_snapshot = [&](const ReporterSnapshotKey &reporter_key) {
         std::string token;
         uint64_t retry_after_ms = 0;
-        EXPECT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+        EXPECT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, token, retry_after_ms));
         EXPECT_TRUE(backend.CommitSnapshotVersion(reporter_key, token));
         return token;
     };
@@ -1416,7 +1587,7 @@ TEST(EventReportBackendSnapshotTest, MightExistUsesTokenOwnerAcrossInstancesAndP
 
     std::string aborted_token;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_a, aborted_token, retry_after_ms));
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_a, aborted_token, retry_after_ms));
     std::string aborted_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, aborted_token, aborted_uri));
     EXPECT_EQ((std::vector<bool>{true, false}),
@@ -1444,7 +1615,7 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
         std::string token;
         uint64_t retry_after_ms = 0;
-        ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+        ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, token, retry_after_ms));
         ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, token));
         std::string committed;
         ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
@@ -1452,7 +1623,7 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         auto waiting_snapshot = std::async(std::launch::async, [&] {
             std::string candidate;
             uint64_t retry_ms = 0;
-            return backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+            return BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_ms);
         });
         ASSERT_EQ(std::future_status::timeout, waiting_snapshot.wait_for(20ms));
         ASSERT_EQ(EC_OK, backend.Close());
@@ -1468,10 +1639,10 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
         std::string first;
         uint64_t retry_after_ms = 0;
-        ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+        ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
         ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
         std::string second;
-        ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, second, retry_after_ms));
+        ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, second, retry_after_ms));
 
         auto waiting_delta = std::async(std::launch::async, [&] {
             std::string committed;

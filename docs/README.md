@@ -12,6 +12,7 @@
 - [Commit 要求](develop/commit_requirements.md) - 提交前检查和 commit message 格式约定
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式
 - [API 文档](api/) - API 接口说明和使用示例
+- [ReportEvent 与查询接口行为](api/report_event.md) - 面向调用方的事件上报、全量对账、查询、错误处理和测试覆盖清单
 
 ### 部署文档
 - [镜像文档](../open_source/docker/README.md) - Docker镜像构建和使用说明
