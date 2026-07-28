@@ -7,6 +7,7 @@ load("@python_platform//:platform.bzl", "python_platform")
 py_library(
     name = "vllm_connector",
     srcs = glob(["*.py"]),
+    visibility = ["//kv_cache_manager/py_connector:__subpackages__"],
     deps = ["//kv_cache_manager/py_connector/common:common",
             "//kv_cache_manager/py_connector/kernel:kernel",
             "//kv_cache_manager/client/pybind:kvcm_py_client_lib"]
