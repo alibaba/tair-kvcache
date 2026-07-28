@@ -709,6 +709,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return None, False
 
         new_matched_count = len(need_load_locations) * self._manager_block_size
+        # This connector loads synchronously (load_kv_async=False), so vLLM will
+        # schedule num_tokens - num_computed_tokens new tokens and asserts that
+        # count is > 0 (vllm/v1/core/sched/scheduler.py). If the whole prompt is
+        # externally cached, drop trailing blocks so at least one token is
+        # recomputed locally.
+        while new_matched_count and num_computed_tokens + new_matched_count >= request.num_tokens:
+            need_load_locations = need_load_locations[:-1]
+            new_matched_count -= self._manager_block_size
         total_remote_blocks = computed_blocks + len(need_load_locations)
         logger.info("req:%s matched %d external tokens", request.request_id, new_matched_count)
 
@@ -876,7 +884,12 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             canceled = self._canceled_save_request_ids
             self._canceled_save_request_ids = []
         for req_id in canceled:
-            req = self._alive_requests[req_id]
+            # Cancellations come from http_executor threads; the request may
+            # already have been finished and removed by the scheduler loop.
+            req = self._alive_requests.get(req_id)
+            if req is None:
+                logger.warning("canceled save for unknown request %s, skip", req_id)
+                continue
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and
                     req.scheduled_saving_count == req.sent_saving_count):
