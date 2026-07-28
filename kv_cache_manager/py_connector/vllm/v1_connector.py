@@ -700,6 +700,22 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------ #
     def get_num_new_matched_tokens(self, request: "Request",
                                    num_computed_tokens: int) -> Tuple[Optional[int], bool]:
+        prev = self._alive_requests.get(request.request_id)
+        if (prev is not None and prev.remote_matched_token_num
+                and prev.block_ids_per_group):
+            # The request already went through an external load (blocks were
+            # allocated) and returned to WAITING -- a KV load failure or a
+            # preemption. The manager may still advertise blocks whose storage
+            # is gone, so re-matching risks an endless fail-reschedule loop;
+            # recompute locally instead. (A pending re-query after a failed
+            # allocation has empty block_ids_per_group and is not affected.)
+            logger.warning("req:%s re-queried after an external load attempt, "
+                           "skip external match", request.request_id)
+            prev.local_matched_token_num = num_computed_tokens
+            prev.remote_matched_token_num = 0
+            prev.has_saved_block_num = num_computed_tokens // self._manager_block_size
+            return 0, False
+
         computed_blocks = num_computed_tokens // self._manager_block_size
 
         is_query_done, need_load_locations = (

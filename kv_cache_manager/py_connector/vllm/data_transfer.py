@@ -113,18 +113,31 @@ class DataTransferManager:
 
         block_token_indices: attention -> list[list[int]] flat token slots per block.
         block_ids:           state     -> list[int] block id per manager block;
-                             id 0 is vLLM's null block: the boundary state was
-                             never materialized, so that block cannot be saved.
+                             id 0 is vLLM's null block: no state exists at that
+                             boundary by design (mamba "align" sparse states),
+                             the block is reported saved vacuously.
         """
         n = len(remote_uris)
         if group.is_attention:
             valid = list(range(n))
         else:
+            # vLLM's mamba "align" mode only materializes the state block at
+            # segment boundaries (single_type_kv_cache_manager.MambaManager
+            # allocates the null block for intermediate positions; a hit only
+            # ever consumes the state ending the matched region). A null
+            # (id 0) state target therefore means "no state exists by design",
+            # not a failure: report it saved vacuously. Failing it would
+            # stride-AND the whole manager block out of the manager's prefix
+            # chain and kill multi-block hybrid caching entirely.
             valid = [i for i in range(n) if block_ids[i] != 0]
             if len(valid) < n:
-                logger.warning("save group %s: %d/%d blocks have no materialized "
-                               "state, failing them", group.spec_name, n - len(valid), n)
-        ok_mask = [False] * n
+                logger.info("save group %s: %d/%d blocks have no materialized "
+                            "state, saving vacuously", group.spec_name,
+                            n - len(valid), n)
+        # Vacuous (skipped) blocks succeed; transferred blocks start False and
+        # are flipped by the transfer result below.
+        valid_set = set(valid)
+        ok_mask = [i not in valid_set for i in range(n)]
         if valid:
             cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
                                      device="cpu", pin_memory=True)
@@ -184,17 +197,29 @@ class DataTransferManager:
     def load_task(self, multi_result: MultiResult, task_idx, group: TransferGroup,
                   remote_uris, block_token_indices, block_ids):
         n = len(remote_uris)
-        if not group.is_attention and any(b == 0 for b in block_ids):
-            # Null block: nowhere to scatter the state. Should not happen for
-            # loads (vLLM allocates real blocks for external tokens).
-            logger.warning("load group %s: null block in targets, failing task",
-                           group.spec_name)
-            multi_result.submit_result(task_idx, [False] * n)
+        if group.is_attention:
+            valid = list(range(n))
+        else:
+            # Mirror of save_task: in mamba "align" mode vLLM only allocates a
+            # real state block for the final matched boundary; intermediate
+            # manager blocks get the null block (their state is not needed to
+            # resume). Skip them vacuously and load only materialized targets.
+            valid = [i for i in range(n) if block_ids[i] != 0]
+            if len(valid) < n:
+                logger.info("load group %s: %d/%d blocks have null state "
+                            "targets, skipping them", group.spec_name,
+                            n - len(valid), n)
+        valid_set = set(valid)
+        ok_mask = [i not in valid_set for i in range(n)]
+        if not valid:
+            multi_result.submit_result(task_idx, ok_mask)
             return
-        cpu_buffer = torch.empty(n * group.per_block_bytes, dtype=torch.uint8,
+        cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
                                  device="cpu", pin_memory=True)
-        buffers = self._make_block_buffers(cpu_buffer.data_ptr(), group.per_block_bytes, n)
-        result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
+        buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
+                                           group.per_block_bytes, len(valid))
+        uris = [remote_uris[i] for i in valid]
+        result = self._transfer_client.LoadKvCaches(uris, buffers)
         ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
         if ok:
             with self._device_mod.stream(self._load_stream):
@@ -208,18 +233,20 @@ class DataTransferManager:
                         kv_stride=group.kv_stride, block_stride=group.block_stride,
                         local_block_size=group.kernel_block_size)
                 else:
-                    for i, block_id in enumerate(block_ids):
+                    for out_i, i in enumerate(valid):
                         for layer_idx in range(group.layer_num):
-                            src = (i * group.layer_num + layer_idx) * group.page_size_bytes
-                            group.block_view_tensors[layer_idx][block_id].copy_(
+                            src = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
+                            group.block_view_tensors[layer_idx][block_ids[i]].copy_(
                                 gpu_buffer[src:src + group.page_size_bytes])
                 done = self._device_mod.Event()
                 done.record(self._load_stream)
             done.synchronize()
         else:
             logger.warning("load task failed group=%s uris=%d result=%s",
-                           group.spec_name, n, result)
-        multi_result.submit_result(task_idx, [ok] * n)
+                           group.spec_name, len(uris), result)
+        for i in valid:
+            ok_mask[i] = ok
+        multi_result.submit_result(task_idx, ok_mask)
 
     def create_load_done_callback(self, req_id, tp_rank, epoch, block_ids, num_blocks,
                                   report_failures=True):

@@ -132,5 +132,42 @@ class TestLoadDoneCallback(unittest.TestCase):
         self.assertEqual(evt.failed_block_idxs, [])
 
 
+class TestNullStateBlocks(unittest.TestCase):
+    """Mamba 'align' mode: null (id 0) state targets carry no state by design
+    (vLLM materializes states only at segment boundaries), so save/load must
+    treat them as vacuous successes -- failing them would stride-AND whole
+    manager blocks out of the manager's prefix chain and kill multi-block
+    hybrid caching. The all-null path takes no GPU work, so it runs on CPU."""
+
+    @staticmethod
+    def _state_group():
+        from kv_cache_manager.py_connector.common.types import TransferGroup
+        return TransferGroup(
+            group_idx=0, spec_name="tp0_g0", is_attention=False,
+            layer_names=["m0"], block_size=528, per_block_bytes=1024,
+            kernel_block_size=528)
+
+    def test_save_all_null_blocks_vacuously_succeed(self):
+        dtm = _make_dtm()
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        dtm.save_task(mr, 0, self._state_group(),
+                      remote_uris=["u0", "u1"],
+                      block_token_indices=None,
+                      block_ids=[0, 0],
+                      ready_event=None)
+        self.assertEqual(results["flat"], [True, True])
+
+    def test_load_all_null_blocks_vacuously_succeed(self):
+        dtm = _make_dtm()
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        dtm.load_task(mr, 0, self._state_group(),
+                      remote_uris=["u0", "u1", "u2"],
+                      block_token_indices=None,
+                      block_ids=[0, 0, 0])
+        self.assertEqual(results["flat"], [True, True, True])
+
+
 if __name__ == "__main__":
     unittest.main()

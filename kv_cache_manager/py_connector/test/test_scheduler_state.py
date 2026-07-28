@@ -139,6 +139,28 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         self.assertEqual(matched, 0)
         self.assertFalse(async_load)
 
+    def test_requery_after_load_attempt_skips_external(self):
+        # A request that already went through an external load (blocks were
+        # allocated) and returned to WAITING -- KV load failure with
+        # policy=recompute, or preemption -- must not re-match: the manager may
+        # still advertise blocks whose storage is gone, and re-matching loops
+        # fail -> reschedule forever.
+        conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, 2 * self.MBS)
+        # vLLM allocates blocks for the load attempt.
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), matched)
+        # Retry: same request re-enters the waiting queue with 0 computed.
+        matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched2, 0)
+        self.assertFalse(async2)
+        self.assertEqual(len(conn._waiting_to_load_requests), 1)  # no new load
+        state = conn._alive_requests["r0"]
+        self.assertEqual(state.remote_matched_token_num, 0)
+        self.assertEqual(state.has_saved_block_num, 0)
+
 
 # --------------------------------------------------------------------------- #
 # parse_block_mask_to_save_indices
