@@ -314,4 +314,33 @@ TEST(RequestPreprocessTest, AppliesRollingPrefixHashWhenEnabled) {
     EXPECT_EQ((std::vector<int64_t>{1, 2, 3}), passthrough.block_keys);
 }
 
+TEST(RequestPreprocessTest, ReblocksToCoarserGranularity) {
+    // Trace granularity 4, analysis granularity 8: keep every 2nd chained
+    // key, drop the incomplete tail; the token denominator is untouched.
+    const NormalizedRequest coarse = NormalizeRequest({1, 2, 3, 4, 5}, 21, 8, false, 4);
+    EXPECT_EQ(21, coarse.input_token_len);
+    EXPECT_EQ((std::vector<int64_t>{2, 4}), coarse.block_keys);
+
+    // stride 1 (explicit trace granularity == analysis granularity).
+    const NormalizedRequest same = NormalizeRequest({1, 2, 3}, 13, 4, false, 4);
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3}), same.block_keys);
+
+    // Raw per-block hashes are chained at trace granularity first, then
+    // sampled, so the coarse keys still encode their whole prefix.
+    const NormalizedRequest hashed = NormalizeRequest({1, 2, 3, 4}, 16, 8, true, 4);
+    const std::vector<int64_t> chained = ApplyPrefixHash({1, 2, 3, 4});
+    EXPECT_EQ((std::vector<int64_t>{chained[1], chained[3]}), hashed.block_keys);
+
+    // Fewer trace blocks than one coarse block yields an empty request.
+    const NormalizedRequest tiny = NormalizeRequest({1}, 4, 8, false, 4);
+    EXPECT_EQ(4, tiny.input_token_len);
+    EXPECT_TRUE(tiny.block_keys.empty());
+
+    // Length contract is checked at trace granularity.
+    EXPECT_THROW(NormalizeRequest({1, 2}, 21, 8, false, 4), std::invalid_argument);
+    // Coarsening only: analysis granularity must be an exact multiple.
+    EXPECT_THROW(NormalizeRequest({1, 2}, 8, 6, false, 4), std::invalid_argument);
+    EXPECT_THROW(NormalizeRequest({1}, 8, 4, false, 8), std::invalid_argument);
+}
+
 } // namespace kv_cache_manager

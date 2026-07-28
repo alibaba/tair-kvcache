@@ -20,8 +20,12 @@ int main(int argc, char *argv[]) {
         std::cerr << "Apply capacities afterwards with lite_hit_facts_query_main." << std::endl;
         std::cerr << std::endl;
         std::cerr << "Config fields: trace_file_path, output_result_path (directory)," << std::endl;
-        std::cerr << "instance_groups (online OptimizerInstanceGroup list), instances" << std::endl;
-        std::cerr << "(OptimizerInstanceInfo list), override_instance_id, pipeline_worker_count." << std::endl;
+        std::cerr << "instance_groups (online OptimizerInstanceGroup list; enable_prefix_hash" << std::endl;
+        std::cerr << "lives here), instances (OptimizerInstanceInfo list), override_instance_id," << std::endl;
+        std::cerr << "block_size (trace granularity in tokens, default 256; every instance's" << std::endl;
+        std::cerr << "block_size must be a multiple of it and requests are re-blocked per lane)," << std::endl;
+        std::cerr << "fanout_all_instances (replay every request into every instance, e.g. to" << std::endl;
+        std::cerr << "sweep several block sizes in one run), pipeline_worker_count." << std::endl;
         kv_cache_manager::LoggerBroker::DestroyLogger();
         return 1;
     }

@@ -26,25 +26,49 @@ std::vector<int64_t> ApplyPrefixHash(const std::vector<int64_t> &raw_keys) {
 NormalizedRequest NormalizeRequest(const std::vector<int64_t> &block_keys,
                                    int64_t input_token_len,
                                    uint64_t block_size_tokens,
-                                   bool enable_prefix_hash) {
+                                   bool enable_prefix_hash,
+                                   uint64_t trace_block_size_tokens) {
     if (block_size_tokens == 0) {
         throw std::invalid_argument("NormalizeRequest block_size_tokens must be positive");
     }
     if (input_token_len < 0) {
         throw std::invalid_argument("NormalizeRequest input_token_len must not be negative");
     }
-
-    NormalizedRequest normalized;
-    normalized.input_token_len = input_token_len > 0 ? static_cast<uint64_t>(input_token_len)
-                                                     : static_cast<uint64_t>(block_keys.size()) * block_size_tokens;
-
-    const uint64_t expected_complete_blocks = normalized.input_token_len / block_size_tokens;
-    if (expected_complete_blocks != static_cast<uint64_t>(block_keys.size())) {
+    if (trace_block_size_tokens == 0) {
+        trace_block_size_tokens = block_size_tokens;
+    }
+    if (block_size_tokens % trace_block_size_tokens != 0) {
         throw std::invalid_argument(
-            "NormalizeRequest block_keys must contain exactly floor(input_token_len / block_size_tokens) blocks");
+            "NormalizeRequest block_size_tokens must be a multiple of the trace block size (coarsening only)");
     }
 
-    normalized.block_keys = enable_prefix_hash ? ApplyPrefixHash(block_keys) : block_keys;
+    NormalizedRequest normalized;
+    normalized.input_token_len = input_token_len > 0
+                                     ? static_cast<uint64_t>(input_token_len)
+                                     : static_cast<uint64_t>(block_keys.size()) * trace_block_size_tokens;
+
+    const uint64_t expected_trace_blocks = normalized.input_token_len / trace_block_size_tokens;
+    if (expected_trace_blocks != static_cast<uint64_t>(block_keys.size())) {
+        throw std::invalid_argument(
+            "NormalizeRequest block_keys must contain exactly floor(input_token_len / trace_block_size) blocks");
+    }
+
+    std::vector<int64_t> chained = enable_prefix_hash ? ApplyPrefixHash(block_keys) : block_keys;
+
+    const uint64_t stride = block_size_tokens / trace_block_size_tokens;
+    if (stride == 1) {
+        normalized.block_keys = std::move(chained);
+        return normalized;
+    }
+
+    // Re-block to the coarser analysis granularity: the (j*stride)-th chained
+    // key encodes exactly the first j coarse blocks, so sampling every
+    // stride-th key yields the coarse prefix chain; an incomplete tail is
+    // dropped, matching an engine that only caches complete blocks.
+    normalized.block_keys.reserve(chained.size() / stride);
+    for (std::size_t i = stride - 1; i < chained.size(); i += stride) {
+        normalized.block_keys.push_back(chained[i]);
+    }
     return normalized;
 }
 

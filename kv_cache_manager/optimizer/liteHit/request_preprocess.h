@@ -28,18 +28,27 @@ struct NormalizedRequest {
 //
 // - An explicit positive input_token_len is the authoritative denominator;
 //   a non-positive value is treated as missing and derived as
-//   block_keys.size() * block_size_tokens (token_ids fallbacks are resolved
-//   by the caller before this function).
-// - Validates block_keys.size() == floor(input_token_len / block_size_tokens).
-//   Zero-length input with empty keys is legal.
+//   block_keys.size() * trace_block_size_tokens (token_ids fallbacks are
+//   resolved by the caller before this function).
+// - trace_block_size_tokens is the granularity the trace keys were produced
+//   at; 0 means "same as block_size_tokens" (no re-blocking). When it is
+//   smaller than block_size_tokens, block_size_tokens must be an exact
+//   multiple k of it and the request is re-blocked to the coarser analysis
+//   granularity by keeping every k-th prefix-chained key (an incomplete tail
+//   is dropped). A prefix-chained key encodes its whole prefix, so sampling
+//   preserves cross-request matching and the fork contract.
+// - Validates block_keys.size() == floor(input_token_len /
+//   trace_block_size_tokens). Zero-length input with empty keys is legal.
 // - When enable_prefix_hash is true the input keys are interpreted as
-//   per-block raw hashes and converted to rolling prefix-chained keys;
-//   otherwise they must already be prefix-chained and are passed through.
+//   per-block raw hashes and converted to rolling prefix-chained keys (at
+//   trace granularity, before any re-blocking); otherwise they must already
+//   be prefix-chained and are passed through.
 //
 // Throws std::invalid_argument on violations.
 NormalizedRequest NormalizeRequest(const std::vector<int64_t> &block_keys,
                                    int64_t input_token_len,
                                    uint64_t block_size_tokens,
-                                   bool enable_prefix_hash);
+                                   bool enable_prefix_hash,
+                                   uint64_t trace_block_size_tokens = 0);
 
 } // namespace kv_cache_manager

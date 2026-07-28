@@ -36,6 +36,12 @@ cc_library(
 )
 
 cc_library(
+    name = "trace_router",
+    srcs = ["trace_router.cc"],
+    hdrs = ["trace_router.h"],
+)
+
+cc_library(
     name = "lite_hit",
     srcs = ["lite_hit.cc"],
     hdrs = ["lite_hit.h"],

@@ -73,6 +73,8 @@ protected:
         config.set_output_result_path(output_dir);
         config.set_instance_groups({MakeGroup()});
         config.set_instances({MakeInfo("i1")});
+        // The fixtures produce 4-token blocks; the production default is 256.
+        config.set_block_size(4);
         return config;
     }
 
@@ -152,10 +154,11 @@ TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
     const std::string query_log = output_dir + "/query.jsonl";
     ASSERT_TRUE(RunLiteHitFactsQuery(facts_path, {capacity_2_blocks_gb, -1.0}, query_log, error)) << error;
     const std::vector<std::string> query_lines = ReadLines(query_log);
-    ASSERT_EQ(4, query_lines.size());
-    EXPECT_NE(std::string::npos, query_lines[3].find("\"summary\":true"));
-    EXPECT_NE(std::string::npos, query_lines[3].find("\"total_hit_blocks\":[4,5]"));
-    EXPECT_NE(std::string::npos, query_lines[3].find("\"total_input_tokens\":38"));
+    ASSERT_EQ(5, query_lines.size()); // 3 requests + i1 summary + overall summary
+    EXPECT_NE(std::string::npos, query_lines[3].find("\"summary\":true,\"instance_id\":\"i1\""));
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"summary\":true"));
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"total_hit_blocks\":[4,5]"));
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"total_input_tokens\":38"));
 
     auto registry = std::make_shared<OptimizerRegistryManager>("");
     OnlineOptimizerManager manager(registry);
@@ -285,6 +288,67 @@ TEST_F(LiteHitOfflineRunnerTest, IgnoresWriteEvents) {
     ASSERT_TRUE(ParseLiteHitFactRow(lines[2], r2, error)) << error;
     // The write event neither produced a fact row nor touched the LRU.
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), r2.fact.hit_curve);
+}
+
+TEST_F(LiteHitOfflineRunnerTest, FanoutSweepsMultipleBlockSizes) {
+    // Trace granularity 4 tokens/block. Two lanes: bs4 replays as-is, bs8
+    // re-blocks by keeping every 2nd prefix-chained key.
+    const std::string trace_path = WriteTrace("facts_fanout.jsonl",
+                                              {
+                                                  TraceLine("ignored", "r1", 1000, {1, 2, 3}, 13),
+                                                  TraceLine("ignored", "r2", 2000, {1, 2, 3}, 13),
+                                              });
+    const std::string output_dir = GetTestTempRootPath() + "/fanout";
+    ASSERT_EQ(0, ::system(("mkdir -p " + output_dir).c_str()));
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, output_dir);
+    config.set_instances({MakeInfo("bs4", 4), MakeInfo("bs8", 8)});
+    config.set_fanout_all_instances(true);
+    ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
+
+    const std::vector<std::string> lines = ReadLines(output_dir + "/" + kLiteHitFactsFileName);
+    ASSERT_EQ(5, lines.size()); // header + 2 requests x 2 lanes
+
+    std::string error;
+    uint64_t bs4_rows = 0;
+    uint64_t bs8_rows = 0;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        LiteHitFactRecord record;
+        ASSERT_TRUE(ParseLiteHitFactRow(lines[i], record, error)) << error;
+        EXPECT_EQ(13, record.input_token_len);
+        if (record.instance_id == "bs4") {
+            ++bs4_rows;
+            EXPECT_EQ(4, record.block_size_tokens);
+            if (record.trace_id == "r2") {
+                EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), record.fact.hit_curve);
+            }
+        } else {
+            ++bs8_rows;
+            EXPECT_EQ("bs8", record.instance_id);
+            EXPECT_EQ(8, record.block_size_tokens);
+            if (record.trace_id == "r2") {
+                // 13 tokens = 1 complete 8-token block (chained key at index 1).
+                EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), record.fact.hit_curve);
+            }
+        }
+    }
+    EXPECT_EQ(2, bs4_rows);
+    EXPECT_EQ(2, bs8_rows);
+
+    // The query emits one summary per lane plus the overall one.
+    const std::string query_log = output_dir + "/query.jsonl";
+    ASSERT_TRUE(RunLiteHitFactsQuery(output_dir + "/" + kLiteHitFactsFileName, {-1.0}, query_log, error)) << error;
+    const std::vector<std::string> query_lines = ReadLines(query_log);
+    ASSERT_EQ(7, query_lines.size()); // 4 requests + 2 instance summaries + overall
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"summary\":true,\"instance_id\":\"bs4\""));
+    EXPECT_NE(std::string::npos, query_lines[5].find("\"summary\":true,\"instance_id\":\"bs8\""));
+    EXPECT_NE(std::string::npos, query_lines[6].find("\"summary\":true,\"requests\":4"));
+}
+
+TEST_F(LiteHitOfflineRunnerTest, RejectsNonMultipleAnalysisBlockSize) {
+    const std::string trace_path = WriteTrace("facts_badbs.jsonl", {TraceLine("i1", "r1", 1000, {1}, 4)});
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, GetTestTempRootPath());
+    config.set_instances({MakeInfo("i1", 6)}); // 6 % 4 != 0: coarsening only
+    EXPECT_FALSE(LiteHitOfflineRunner(config).Run());
 }
 
 } // namespace kv_cache_manager

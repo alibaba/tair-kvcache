@@ -45,9 +45,12 @@ online optimizer 按请求持续向 LiteHit 输入有序 block key，逐请求�
 
 - 输入由按时间排序的请求组成；Offline 对时间戳乱序 fail-fast。
 - 每个请求包含有序完整 block key 列表和原始 `input_token_len`。
-- 共享预处理 `NormalizeRequest` 校验
-  `block_keys.size() == floor(input_token_len / block_size_tokens)`；
+- 共享预处理 `NormalizeRequest` 在 **trace 原生粒度**上校验
+  `block_keys.size() == floor(input_token_len / trace_block_size_tokens)`；
   `input_token_len <= 0` 视为缺省并按 key 数推导；违约抛异常。
+- 支持重分块（re-blocking）：分析粒度 `block_size_tokens` 必须是 trace 粒度的整数倍（只允许变粗）；
+  重分块零重 hash——前缀链式 key 的第 `j*k` 个恰好编码前 j 个粗 block，先链后每 k 取 1，
+  凑不满的尾部细块丢弃（token 留在分母）。Offline 配置字段 `block_size`（默认 256）声明 trace 粒度。
 - 不足一个完整 block 的尾部 token 不进入 LRU，但保留在命中率分母中。
 - 请求之间共享同一 LRU 状态；请求边界必须保留。
 
@@ -97,7 +100,8 @@ trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,
 
 ### 6.3 投影输出
 
-- facts query：JSONL，每请求一行（逐 slot hit_blocks/hit_rates）+ summary 行
+- facts query：JSONL，每请求一行（逐 slot hit_blocks/hit_rates）
+  + 每个 instance_id 一行 summary（字典序）+ 一行总计 summary
   （requests / total_input_tokens / capacity_gb / total_hit_blocks / total_hit_tokens / hit_rates）。
 - Online：逐 slot 命中数与 token 命中率
   `hit_rate = hit_blocks * block_size_tokens / input_token_len`；
@@ -118,6 +122,8 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
 - `FR-7`：计数器和位置索引使用 64 位整数，避免溢出。
 - `FR-8`：核心、预处理、投影器可被 Offline 工具和 online optimizer 复用，不依赖完整 optimizer manager。
 - `FR-9`：Online / Offline 共享同一预处理（长度校验推导 + 可选 prefix hash），hash 与 Python 生产端逐 bit 一致。
+- `FR-10`：预处理支持零重 hash 的重分块（只允许变粗）；Offline 在 lane 初始化时对"分析粒度非 trace 粒度整数倍"fail-fast。
+- `FR-11`：Offline 支持 `fanout_all_instances`：每条请求广播到全部 instance lane（各自独立 LRU 与 facts 行），一次回放扫多个 block size；与 `override_instance_id` 互斥。facts query summary 按 instance 分组。
 
 ## 8. 性能要求
 
@@ -126,7 +132,7 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
 - 事实体积由等差段 RLE 控制：段数 = 1 + 插队次数，与请求长度无关。
 - 核心不做基于容量的剪枝（容量事后才知道），保留全部历史 unique key；Fenwick 位置空间通过 compaction 回收废弃位置，由活跃 key 数主导。
 - Offline 流水线以有界批窗口（`pipeline_worker_count * 256`）并行预处理、按 instance lane 串行提交、按输入顺序写出，内存有界。
-- facts query 内存为 O(容量 slot 数) 累计整数，逐行流式处理。
+- facts query 内存为 O(instance 数 × 容量 slot 数) 累计整数，逐行流式处理。
 
 ## 9. 非目标
 
@@ -144,7 +150,8 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
 - RLE 形态验证：整链重放单段、插队断段、相邻段不可合并。
 - 覆盖 cold miss、立即重复访问、容量 0、字节 floor 换算边界、尾部 token 留在分母。
 - Offline facts 投影与 Online 逐请求投影交叉对账一致；并行度 4 与串行输出逐字节相同。
-- fail-fast 场景（乱序 / 未知 instance / 长度违约 / 零有效行）整体失败且不发布 facts。
+- fail-fast 场景（乱序 / 未知 instance / 长度违约 / 零有效行 / 分析粒度非 trace 粒度整数倍）整体失败且不发布 facts。
+- 重分块采样正确（含 prefix hash 链后采样、尾部丢弃、过短请求得空 key 列表）；fanout 一次回放对多个 block size 各产出独立 facts，query summary 按 instance 分组且总计正确。
 - prefix hash golden vector 与 Python 生产端逐 bit 一致。
 - compaction 后所有历史 key 仍可命中（不丢历史）。
 - 空 trace 不崩溃、不除零；长 trace 计数无溢出。
@@ -162,6 +169,8 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
 8. TraceQuery 显式传 `input_token_len`；缺省时先从 `token_ids` 推导，再缺省则按 `block_keys.size() * block_size_tokens` 推导。
 9. LRU 状态更新固定为请求内倒序提交，不提供开关。
 10. `enable_prefix_hash` 是 `OptimizerInstanceGroup` 字段：online 经建组/更新组 RPC 配置，offline 在配置的 instance_groups 里设置，作用于 group 内全部实例；两端 hash 行为一致。
+11. 重分块只允许变粗（变细需要 block 内部 token 信息，trace 中不存在）；实现为前缀链后每 k 取 1，零重 hash。Offline 配置字段命名 `block_size`（trace 原生粒度，默认 256），instance 自身的 `block_size` 即该 lane 的分析粒度。
+12. fanout 用"多个 instance 并行"表达多 block size 扫描：`fanout_all_instances = true` 时请求广播到全部 lane，与 `override_instance_id` 互斥；不引入独立的 sweep 配置结构。
 
 ## 12. 相关文档
 

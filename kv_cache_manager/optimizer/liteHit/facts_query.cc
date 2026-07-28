@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "kv_cache_manager/optimizer/liteHit/facts_csv.h"
@@ -103,6 +104,14 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
     std::vector<uint64_t> total_hit_blocks(slots.size(), 0);
     std::vector<uint64_t> total_hit_tokens(slots.size(), 0);
 
+    struct InstanceTotals {
+        uint64_t requests = 0;
+        uint64_t total_input_tokens = 0;
+        std::vector<uint64_t> hit_blocks;
+        std::vector<uint64_t> hit_tokens;
+    };
+    std::map<std::string, InstanceTotals> instance_totals;
+
     std::size_t line_number = 1;
     while (std::getline(in, line)) {
         ++line_number;
@@ -122,6 +131,11 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
 
         std::vector<uint64_t> hit_blocks(slots.size(), 0);
         std::vector<double> hit_rates(slots.size(), 0.0);
+        InstanceTotals &totals = instance_totals[record.instance_id];
+        if (totals.hit_blocks.empty()) {
+            totals.hit_blocks.assign(slots.size(), 0);
+            totals.hit_tokens.assign(slots.size(), 0);
+        }
         for (std::size_t i = 0; i < slots.size(); ++i) {
             const uint64_t hits =
                 slots[i].infinite
@@ -134,6 +148,8 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
                                : static_cast<double>(hit_tokens) / static_cast<double>(record.input_token_len);
             total_hit_blocks[i] += hits;
             total_hit_tokens[i] += hit_tokens;
+            totals.hit_blocks[i] += hits;
+            totals.hit_tokens[i] += hit_tokens;
         }
 
         out << "{\"trace_id\":\"" << EscapeJsonString(record.trace_id) << "\",\"instance_id\":\""
@@ -146,6 +162,30 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
 
         ++requests;
         total_input_tokens += record.input_token_len;
+        ++totals.requests;
+        totals.total_input_tokens += record.input_token_len;
+    }
+
+    // One summary per instance (std::map keeps them in deterministic order).
+    // A fanout run over several block sizes reads as one line per granularity.
+    for (const auto &[instance_id, totals] : instance_totals) {
+        std::vector<double> instance_rates(slots.size(), 0.0);
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            instance_rates[i] = totals.total_input_tokens == 0 ? 0.0
+                                                               : static_cast<double>(totals.hit_tokens[i]) /
+                                                                     static_cast<double>(totals.total_input_tokens);
+        }
+        out << "{\"summary\":true,\"instance_id\":\"" << EscapeJsonString(instance_id)
+            << "\",\"requests\":" << totals.requests << ",\"total_input_tokens\":" << totals.total_input_tokens
+            << ",\"capacity_gb\":";
+        WriteJsonArray(out, capacity_gb);
+        out << ",\"total_hit_blocks\":";
+        WriteJsonArray(out, totals.hit_blocks);
+        out << ",\"total_hit_tokens\":";
+        WriteJsonArray(out, totals.hit_tokens);
+        out << ",\"hit_rates\":";
+        WriteJsonArray(out, instance_rates);
+        out << "}\n";
     }
 
     std::vector<double> cumulative_rates(slots.size(), 0.0);

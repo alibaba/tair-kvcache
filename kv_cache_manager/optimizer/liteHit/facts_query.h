@@ -14,7 +14,10 @@ namespace kv_cache_manager {
 // The output is JSONL: one line per request
 //   {"trace_id":...,"instance_id":...,"timestamp_ns":...,
 //    "input_token_len":...,"hit_blocks":[...],"hit_rates":[...]}
-// and one final summary line
+// then one summary line per instance_id (deterministic order; a fanout run
+// over several block sizes reads as one line per granularity)
+//   {"summary":true,"instance_id":...,"requests":...,...}
+// and one final overall summary line
 //   {"summary":true,"requests":N,"total_input_tokens":T,
 //    "capacity_gb":[...],"total_hit_blocks":[...],"total_hit_tokens":[...],
 //    "hit_rates":[...]}

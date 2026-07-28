@@ -68,14 +68,18 @@ block_keys[]            按请求从前到后排列的完整 block key（或原�
 input_token_len         原始请求的 input token 数
 ```
 
-`NormalizeRequest(block_keys, input_token_len, block_size_tokens, enable_prefix_hash)`：
+`NormalizeRequest(block_keys, input_token_len, block_size_tokens, enable_prefix_hash, trace_block_size_tokens = 0)`：
 
-- `input_token_len > 0` 时为权威分母，并校验
-  `block_keys.size() == floor(input_token_len / block_size_tokens)`；
-- `input_token_len <= 0` 视为缺省，按 `block_keys.size() * block_size_tokens` 推导；
-- 违反约束抛 `std::invalid_argument`（Offline 对此 fail-fast，见第 7 节）。
+- `trace_block_size_tokens` 是 trace 原生 block 粒度（0 = 与 `block_size_tokens` 相同，不重分块）；长度校验发生在 trace 粒度：
+  `block_keys.size() == floor(input_token_len / trace_block_size_tokens)`；
+- `input_token_len > 0` 时为权威分母；`input_token_len <= 0` 视为缺省，按 `block_keys.size() * trace_block_size_tokens` 推导；
+- 违反约束（含 `block_size_tokens` 不是 `trace_block_size_tokens` 的整数倍——只允许变粗）抛 `std::invalid_argument`（Offline 对此 fail-fast，见第 7 节）。
 
 不足一个完整 block 的尾部 token 不进入 LRU，但保留在命中率分母中。
+
+### 1.1a 重分块（re-blocking）：零重 hash 的粒度变粗
+
+分析粒度粗于 trace 粒度时（`block_size_tokens = k * trace_block_size_tokens`，k > 1），无需重算任何 hash：前缀链式 key 的第 `j*k` 个恰好编码了前 j 个粗 block 的全部 token，因此**先做前缀链（若输入是逐块 hash）、再每 k 个取第 k 个**即得到粗粒度下合法的前缀链式 key，凑不满 k 个细块的尾部丢弃（其 token 留在分母中）。只允许变粗——变细需要 block 内部的 token 信息，trace 中不存在。
 
 ### 1.2 block key 契约：前缀链式 hash
 
@@ -260,6 +264,10 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
   └─ 按输入顺序串行写出 facts 行
 ```
 
+**trace 粒度与重分块**：配置字段 `block_size`（默认 256）声明 trace 的原生 block 粒度；每个 instance 的 `block_size` 是该 lane 的分析粒度，必须是它的整数倍（只允许变粗，违约在 lane 初始化时整体失败），按 1.1a 的采样方式重分块。
+
+**fanout 模式**：`fanout_all_instances = true` 时每条请求广播到全部 lane（各 lane 独立 LRU 状态、独立 facts 行），配合多个不同 `block_size` 的 instance 即可一次回放对同一份 trace 扫多个分析粒度；与 `override_instance_id` 互斥。facts query 的 summary 按 instance 分组输出（每 instance 一行 + 总计一行），fanout 结果直接可读。
+
 **fail-fast**：时间戳乱序、未知 instance、长度校验失败、全文件零有效行，任一发生即整体失败并给出原因——facts 是全有或全无的对账账本，不允许静默丢行。
 
 **原子发布**：先写 `litehit_facts.csv.tmp`，全部成功后 `rename` 为 `litehit_facts.csv`；读者永远不会看到半成品。
@@ -278,11 +286,12 @@ trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,
 
 ```text
 输入：facts CSV + capacity_gb 列表（保序、允许重复和 0，负数 = 无限容量）
-输出：JSONL，每请求一行（hit_blocks/hit_rates 按 slot）+ 一行 summary
+输出：JSONL，每请求一行（hit_blocks/hit_rates 按 slot）
+     + 每个 instance_id 一行 summary（instance_id 字典序）+ 一行总计 summary
      （requests / total_input_tokens / total_hit_blocks / total_hit_tokens / hit_rates）
 ```
 
-内存只有 O(容量 slot 数) 个累计整数；任一畸形行使整个查询失败。
+内存只有 O(instance 数 × 容量 slot 数) 个累计整数；任一畸形行使整个查询失败。
 
 ---
 
@@ -353,9 +362,10 @@ block_size_tokens = 4，block_bytes = 1024
 3. RLE 形态：整链重放单段、插队断段、相邻段不可合并；
 4. 投影边界：容量 0、段边界、字节 floor 换算；
 5. Offline facts 与 Online 逐请求投影交叉对账一致；并行度 4 与串行输出逐字节相同；
-6. fail-fast：乱序时间戳、未知 instance、长度违约、零有效行；
+6. fail-fast：乱序时间戳、未知 instance、长度违约、零有效行、分析粒度非 trace 粒度整数倍；
 7. prefix hash golden vector 与 Python 生产端逐 bit 一致；
-8. compaction 后所有 key 仍可命中（不丢历史）。
+8. compaction 后所有 key 仍可命中（不丢历史）；
+9. 重分块：粗粒度采样 key / 尾部丢弃 / 只允许变粗；fanout 一次回放对多 block_size 各产出独立 facts，query summary 按 instance 分组。
 
 ---
 

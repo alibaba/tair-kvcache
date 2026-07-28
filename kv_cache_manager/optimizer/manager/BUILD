@@ -81,6 +81,7 @@ cc_library(
         "//kv_cache_manager/optimizer/liteHit:facts_csv",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
         "//kv_cache_manager/optimizer/liteHit:request_preprocess",
+        "//kv_cache_manager/optimizer/liteHit:trace_router",
         "//kv_cache_manager/optimizer/trace_loader",
     ],
 )

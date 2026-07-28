@@ -18,6 +18,7 @@
 #include "kv_cache_manager/optimizer/liteHit/facts_csv.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
 #include "kv_cache_manager/optimizer/liteHit/request_preprocess.h"
+#include "kv_cache_manager/optimizer/liteHit/trace_router.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 #include "kv_cache_manager/optimizer/trace_loader/standard_trace_loader.h"
@@ -95,11 +96,22 @@ bool LiteHitOfflineRunner::Run() {
     // config and yields size_full_only, the per-block byte charge recorded
     // into every fact row.
     std::unordered_map<std::string, std::unique_ptr<InstanceLane>> lanes;
+    std::vector<std::string> instance_ids;
+    instance_ids.reserve(config_.instances().size());
     for (const auto &instance : config_.instances()) {
         if (instance.linear_step() != 0) {
             KVCM_LOG_ERROR("LiteHitOfflineRunner: instance[%s] has linear_step=%d; the facts replay is Full-only",
                            instance.instance_id().c_str(),
                            instance.linear_step());
+            return false;
+        }
+        if (static_cast<uint64_t>(instance.block_size()) % config_.block_size() != 0) {
+            KVCM_LOG_ERROR(
+                "LiteHitOfflineRunner: instance[%s] block_size=%ld is not a multiple of the trace block_size=%lu "
+                "(re-blocking is coarsening only)",
+                instance.instance_id().c_str(),
+                static_cast<long>(instance.block_size()),
+                static_cast<unsigned long>(config_.block_size()));
             return false;
         }
         RegisterInstanceResult register_result;
@@ -118,12 +130,13 @@ bool LiteHitOfflineRunner::Run() {
         // already guaranteed the group exists.
         lane->enable_prefix_hash = groups_by_name.at(instance.instance_group_name())->enable_prefix_hash();
         lanes.emplace(instance.instance_id(), std::move(lane));
+        instance_ids.push_back(instance.instance_id());
     }
 
-    const std::string &override_id = config_.override_instance_id();
-    if (!override_id.empty() && lanes.find(override_id) == lanes.end()) {
-        KVCM_LOG_ERROR("LiteHitOfflineRunner: override_instance_id[%s] has no matching configured instance",
-                       override_id.c_str());
+    const LiteHitTraceRouter router(config_.fanout_all_instances(), config_.override_instance_id(), instance_ids);
+    std::string router_error;
+    if (!router.Validate(router_error)) {
+        KVCM_LOG_ERROR("LiteHitOfflineRunner: %s", router_error.c_str());
         return false;
     }
 
@@ -167,8 +180,11 @@ bool LiteHitOfflineRunner::Run() {
             const auto *read_trace = static_cast<const GetLocationSchemaTrace *>(item.trace.get());
             const int64_t input_len = read_trace->input_len() > 0 ? read_trace->input_len() : 0;
             try {
-                item.normalized = NormalizeRequest(
-                    read_trace->keys(), input_len, item.lane->block_size_tokens, item.lane->enable_prefix_hash);
+                item.normalized = NormalizeRequest(read_trace->keys(),
+                                                   input_len,
+                                                   item.lane->block_size_tokens,
+                                                   item.lane->enable_prefix_hash,
+                                                   config_.block_size());
             } catch (const std::exception &e) { item.error = e.what(); }
         });
         for (const BatchItem &item : batch) {
@@ -220,19 +236,23 @@ bool LiteHitOfflineRunner::Run() {
             return;
         }
 
-        BatchItem item;
-        item.trace = trace;
-        item.instance_id = override_id.empty() ? trace->instance_id() : override_id;
-        const auto lane_it = lanes.find(item.instance_id);
-        if (lane_it == lanes.end()) {
-            fail_with("unknown instance[" + item.instance_id + "] at trace_id[" + trace->trace_id() + "]");
+        const std::string trace_id = trace->trace_id().empty() ? DefaultTraceId(*trace) : trace->trace_id();
+        std::vector<std::string> targets;
+        std::string route_error;
+        if (!router.Route(trace->instance_id(), targets, route_error)) {
+            fail_with(route_error + " at trace_id[" + trace_id + "]");
             return;
         }
-        item.lane = lane_it->second.get();
-        item.record.trace_id = trace->trace_id().empty() ? DefaultTraceId(*trace) : trace->trace_id();
-        item.record.instance_id = item.instance_id;
-        item.record.timestamp_ns = trace->timestamp_ns();
-        batch.push_back(std::move(item));
+        for (const std::string &instance_id : targets) {
+            BatchItem item;
+            item.trace = trace;
+            item.instance_id = instance_id;
+            item.lane = lanes.at(instance_id).get();
+            item.record.trace_id = trace_id;
+            item.record.instance_id = instance_id;
+            item.record.timestamp_ns = trace->timestamp_ns();
+            batch.push_back(std::move(item));
+        }
         if (batch.size() >= batch_capacity) {
             process_batch();
         }

@@ -37,6 +37,15 @@ public:
     // replayed as a single service-wide cache. The instances() list must define
     // exactly this id.
     [[nodiscard]] const std::string &override_instance_id() const { return override_instance_id_; }
+    // Native granularity (tokens per block) the trace keys were produced at.
+    // Every instance's block_size must be an exact multiple of it; requests
+    // are re-blocked (coarsening only) per lane during preprocessing.
+    [[nodiscard]] uint64_t block_size() const { return block_size_; }
+    // When true, every request is replayed into EVERY configured instance
+    // (the trace's own instance_id is ignored). Combined with instances of
+    // different block_size this sweeps several granularities over one trace
+    // in a single run. Mutually exclusive with override_instance_id.
+    [[nodiscard]] bool fanout_all_instances() const { return fanout_all_instances_; }
     // The only public parallelism knob of the offline pipeline. Values < 1 are
     // clamped to 1; queue/window sizes are derived internally.
     [[nodiscard]] int32_t pipeline_worker_count() const { return pipeline_worker_count_; }
@@ -46,6 +55,8 @@ public:
     void set_instance_groups(const std::vector<OptimizerInstanceGroup> &groups) { instance_groups_ = groups; }
     void set_instances(const std::vector<OptimizerInstanceInfo> &instances) { instances_ = instances; }
     void set_override_instance_id(const std::string &id) { override_instance_id_ = id; }
+    void set_block_size(uint64_t block_size) { block_size_ = block_size; }
+    void set_fanout_all_instances(bool fanout) { fanout_all_instances_ = fanout; }
     void set_pipeline_worker_count(int32_t count) { pipeline_worker_count_ = count; }
 
 private:
@@ -54,6 +65,8 @@ private:
     std::vector<OptimizerInstanceGroup> instance_groups_;
     std::vector<OptimizerInstanceInfo> instances_;
     std::string override_instance_id_;
+    uint64_t block_size_ = 256;
+    bool fanout_all_instances_ = false;
     int32_t pipeline_worker_count_ = 1;
 };
 
