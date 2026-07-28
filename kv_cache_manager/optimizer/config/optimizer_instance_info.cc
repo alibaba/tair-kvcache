@@ -23,7 +23,6 @@ bool OptimizerInstanceInfo::FromRapidValue(const rapidjson::Value &rapid_value) 
     KVCM_JSON_GET_MACRO(rapid_value, "location_spec_groups", location_spec_groups_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "linear_step", linear_step_, int32_t(0));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "optimizer_state_info", optimizer_state_info_, OptimizerStateInfo());
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_prefix_hash", enable_prefix_hash_, false);
     return true;
 }
 
@@ -35,7 +34,6 @@ void OptimizerInstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuf
     Put(writer, "location_spec_groups", location_spec_groups_);
     Put(writer, "linear_step", linear_step_);
     Put(writer, "optimizer_state_info", optimizer_state_info_);
-    Put(writer, "enable_prefix_hash", enable_prefix_hash_);
 }
 
 } // namespace kv_cache_manager

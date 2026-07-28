@@ -476,7 +476,7 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             normalized = NormalizeRequest(block_keys,
                                           input_token_len,
                                           static_cast<uint64_t>(state->instance_info->block_size()),
-                                          state->instance_info->enable_prefix_hash());
+                                          state->instance_group->enable_prefix_hash());
         } catch (const std::invalid_argument &e) {
             KVCM_LOG_ERROR(
                 "TraceQuery failed: invalid LiteHit request for instance[%s]: %s", instance_id.c_str(), e.what());
@@ -533,7 +533,7 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     }
     // Legacy analyzers keep their algorithm but share the same prefix-hash
     // preprocessing switch.
-    if (state->instance_info->enable_prefix_hash()) {
+    if (state->instance_group->enable_prefix_hash()) {
         state->indexer->ProcessKeys(ApplyPrefixHash(block_keys), hit_count, max_hit_count);
     } else {
         state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);

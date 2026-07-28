@@ -79,6 +79,7 @@ bool LiteHitOfflineRunner::Run() {
     auto registry = std::make_shared<OptimizerRegistryManager>("");
     OnlineOptimizerManager manager(registry);
 
+    std::unordered_map<std::string, const OptimizerInstanceGroup *> groups_by_name;
     for (const auto &group : config_.instance_groups()) {
         ErrorCode ec = manager.CreateInstanceGroup(group);
         if (ec != EC_OK) {
@@ -87,6 +88,7 @@ bool LiteHitOfflineRunner::Run() {
                            static_cast<int>(ec));
             return false;
         }
+        groups_by_name.emplace(group.name(), &group);
     }
 
     // Per-instance lanes. Registration through the manager validates the
@@ -111,7 +113,10 @@ bool LiteHitOfflineRunner::Run() {
         auto lane = std::make_unique<InstanceLane>();
         lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
         lane->block_bytes = static_cast<uint64_t>(register_result.size_full_only);
-        lane->enable_prefix_hash = instance.enable_prefix_hash();
+        // Key shape follows the model deployment, so the switch lives on the
+        // instance group and applies to every instance in it. RegisterInstance
+        // already guaranteed the group exists.
+        lane->enable_prefix_hash = groups_by_name.at(instance.instance_group_name())->enable_prefix_hash();
         lanes.emplace(instance.instance_id(), std::move(lane));
     }
 

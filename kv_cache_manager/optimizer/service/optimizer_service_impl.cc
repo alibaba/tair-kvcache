@@ -37,6 +37,7 @@ OptimizerInstanceGroup ConvertProtoToInstanceGroup(const proto::optimizer::Optim
     group.set_shared_group_quota(pb.shared_group_quota());
     group.set_enable_theoretical_max_cache(pb.enable_theoretical_max_cache());
     group.set_ttl_seconds(pb.ttl_seconds());
+    group.set_enable_prefix_hash(pb.enable_prefix_hash());
     return group;
 }
 
@@ -49,6 +50,7 @@ void ConvertInstanceGroupToProto(const OptimizerInstanceGroup &group,
     pb->set_shared_group_quota(group.shared_group_quota());
     pb->set_ttl_seconds(group.ttl_seconds());
     pb->set_enable_theoretical_max_cache(group.enable_theoretical_max_cache());
+    pb->set_enable_prefix_hash(group.enable_prefix_hash());
     if (group.eviction_policy() == "lru") {
         pb->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
     } else {
@@ -79,8 +81,7 @@ OptimizerInstanceInfo ConvertProtoToInstanceInfo(const proto::optimizer::Optimiz
                                  specs,
                                  groups,
                                  request.linear_step(),
-                                 optimizer_state_info,
-                                 request.enable_prefix_hash());
+                                 optimizer_state_info);
 }
 
 void SetErrorOnCollector(RequestContext *request_context, ErrorCode ec) {

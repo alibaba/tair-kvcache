@@ -41,16 +41,14 @@ public:
                           const std::vector<LocationSpecInfo> &location_spec_infos,
                           const std::vector<LocationSpecGroup> &location_spec_groups,
                           int32_t linear_step = 0,
-                          const OptimizerStateInfo &optimizer_state_info = OptimizerStateInfo(),
-                          bool enable_prefix_hash = false)
+                          const OptimizerStateInfo &optimizer_state_info = OptimizerStateInfo())
         : instance_group_name_(instance_group_name)
         , instance_id_(instance_id)
         , block_size_(block_size)
         , location_spec_infos_(location_spec_infos)
         , location_spec_groups_(location_spec_groups)
         , linear_step_(linear_step)
-        , optimizer_state_info_(optimizer_state_info)
-        , enable_prefix_hash_(enable_prefix_hash) {}
+        , optimizer_state_info_(optimizer_state_info) {}
     ~OptimizerInstanceInfo() override = default;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -63,7 +61,6 @@ public:
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
     int32_t linear_step() const { return linear_step_; }
     const OptimizerStateInfo &optimizer_state_info() const { return optimizer_state_info_; }
-    bool enable_prefix_hash() const { return enable_prefix_hash_; }
 
     void set_instance_group_name(const std::string &v) { instance_group_name_ = v; }
     void set_instance_id(const std::string &v) { instance_id_ = v; }
@@ -72,7 +69,6 @@ public:
     void set_location_spec_groups(const std::vector<LocationSpecGroup> &v) { location_spec_groups_ = v; }
     void set_linear_step(int32_t v) { linear_step_ = v; }
     void set_optimizer_state_info(const OptimizerStateInfo &v) { optimizer_state_info_ = v; }
-    void set_enable_prefix_hash(bool v) { enable_prefix_hash_ = v; }
 
 private:
     std::string instance_group_name_;
@@ -82,9 +78,6 @@ private:
     std::vector<LocationSpecGroup> location_spec_groups_;
     int32_t linear_step_ = 0;
     OptimizerStateInfo optimizer_state_info_;
-    // When true, incoming block keys are per-block raw hashes and are
-    // converted to rolling prefix-chained keys before analysis.
-    bool enable_prefix_hash_ = false;
 };
 
 } // namespace kv_cache_manager

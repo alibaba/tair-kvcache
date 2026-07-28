@@ -87,7 +87,7 @@ key_j = hash(请求前 j 个完整 block 的全部 token)
 
 key 相等当且仅当整个 token 前缀完全相同。合法的 trace 形态是"共享前缀 + 分叉"，例如 `[A, B, C]` 与 `[A, B, D]` 共享前两个 block；`[B, A, C]` 这类重排序列在契约下不可能出现。
 
-当输入是逐块独立 hash 时，置 `enable_prefix_hash = true`，预处理用滚动 hash 把它转成前缀链式 key：
+当输入是逐块独立 hash 时，在 **Instance Group** 上置 `enable_prefix_hash = true`（key 形态跟模型部署走，group 正是这个粒度；online 建组 RPC 与 offline 配置共用同一字段），预处理用滚动 hash 把它转成前缀链式 key：
 
 ```text
 PrefixHashNext(prev, raw)：Jenkins 64 位变体，显式 uint64 运算（逻辑右移），

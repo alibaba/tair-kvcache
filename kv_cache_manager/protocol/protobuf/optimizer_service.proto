@@ -62,6 +62,7 @@ message OptimizerInstanceGroupProto {
     bool shared_group_quota = 4;         // true 表示 group 内 instance 共享容量预算
     int64 ttl_seconds = 5;               // TTL 秒数，0 表示不启用 TTL
     bool enable_theoretical_max_cache = 6; // 是否启用 theoretical/max cache
+    bool enable_prefix_hash = 7;         // true 时 group 内所有实例输入的 block_keys 为逐 block raw hash，统一转换为 rolling prefix hash
 }
 
 // InstanceGroup 增删改查
@@ -111,7 +112,6 @@ message OptimizerRegisterInstanceRequest {
     repeated LocationSpecGroup location_spec_groups = 6; // KVCM 风格 spec group 定义
     OptimizerStateInfo optimizer_state_info = 7; // 显式声明 optimizer full/linear 状态如何映射到 KVCM group
     int32 linear_step = 8;       // 0 表示 full-only；>0 表示每 linear_step 个 block 产生一次 full+linear checkpoint
-    bool enable_prefix_hash = 9; // true 时输入 block_keys 为逐 block raw hash，服务端统一转换为 rolling prefix hash
 }
 
 message OptimizerRegisterInstanceResponse {

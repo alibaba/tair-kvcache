@@ -29,16 +29,14 @@ protected:
         return group;
     }
 
-    static OptimizerInstanceInfo
-    MakeInfo(const std::string &instance_id, int32_t block_size = 4, bool enable_prefix_hash = false) {
+    static OptimizerInstanceInfo MakeInfo(const std::string &instance_id, int32_t block_size = 4) {
         return OptimizerInstanceInfo("g1",
                                      instance_id,
                                      block_size,
                                      {LocationSpecInfo("tp0", 8192), LocationSpecInfo("tp1", 8192)},
                                      {LocationSpecGroup("full", {"tp0", "tp1"})},
                                      0,
-                                     OptimizerStateInfo("full", ""),
-                                     enable_prefix_hash);
+                                     OptimizerStateInfo("full", ""));
     }
 
     static std::string TraceLine(const std::string &instance_id,
@@ -206,15 +204,19 @@ TEST_F(LiteHitOfflineRunnerTest, ParallelPipelineMatchesSerialOutput) {
 }
 
 TEST_F(LiteHitOfflineRunnerTest, AppliesOverrideInstanceIdAndPrefixHash) {
-    // Raw per-block hashes; the instance enables prefix hashing, so the two
-    // pods share one lane and the second request re-hits the shared prefix.
+    // Raw per-block hashes; the instance group enables prefix hashing, so
+    // the two pods share one lane and the second request re-hits the shared
+    // prefix.
     const std::string trace_path = WriteTrace("facts_override.jsonl",
                                               {
                                                   TraceLine("pod-a", "r1", 1000, {7, 8}, 8),
                                                   TraceLine("pod-b", "r2", 2000, {7, 8}, 8),
                                               });
     OptimizerLiteHitConfig config = MakeConfig(trace_path, GetTestTempRootPath());
-    config.set_instances({MakeInfo("service", 4, true)});
+    OptimizerInstanceGroup group = MakeGroup();
+    group.set_enable_prefix_hash(true);
+    config.set_instance_groups({group});
+    config.set_instances({MakeInfo("service")});
     config.set_override_instance_id("service");
     ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
 

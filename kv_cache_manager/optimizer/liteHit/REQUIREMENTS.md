@@ -37,7 +37,7 @@ online optimizer 按请求持续向 LiteHit 输入有序 block key，逐请求�
 
 - 一个访问对象对应一个 full-attention cache block，以 block key 唯一标识。
 - block key 必须满足前缀链式 hash 契约：请求第 j 个 key 是前 j 个完整 block 全部 token 的 hash，key 相等当且仅当整个 token 前缀相同。
-- 当输入为逐块独立 hash 时，实例可开启 `enable_prefix_hash`，由共享预处理用滚动 hash（与 Python 生产端 `prefix_hash.py` 逐 bit 一致的 Jenkins 64 位变体，uint64 逻辑右移）转换为前缀链式 key。
+- 当输入为逐块独立 hash 时，在 Instance Group 上开启 `enable_prefix_hash`（key 形态跟模型部署走，作用于 group 内全部实例；online 建组 RPC 与 offline 配置共用同一字段），由共享预处理用滚动 hash（与 Python 生产端 `prefix_hash.py` 逐 bit 一致的 Jenkins 64 位变体，uint64 逻辑右移）转换为前缀链式 key。
 - 由契约可知同一请求内 key 互不相同；核心对非契约输入施加单调防御（门槛只抬不降），投影悲观、绝不乐观。
 - 所有 full-attention block 的 cache charge 相同（等 charge 不变量）；`linear_step != 0` 的实例 Offline 拒绝。
 
@@ -161,7 +161,7 @@ LiteHit 不输出逐 key 命中结果、reuse distance 明细、LRU 栈内容、
 7. full-attention + TTL 明确不支持，注册时返回参数错误。
 8. TraceQuery 显式传 `input_token_len`；缺省时先从 `token_ids` 推导，再缺省则按 `block_keys.size() * block_size_tokens` 推导。
 9. LRU 状态更新固定为请求内倒序提交，不提供开关。
-10. 实例级 `enable_prefix_hash` 经注册 RPC / 配置透传，Online 与 Offline 行为一致。
+10. `enable_prefix_hash` 是 `OptimizerInstanceGroup` 字段：online 经建组/更新组 RPC 配置，offline 在配置的 instance_groups 里设置，作用于 group 内全部实例；两端 hash 行为一致。
 
 ## 12. 相关文档
 
