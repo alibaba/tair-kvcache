@@ -267,12 +267,16 @@ class VerifyingConnector(TairKvCacheConnector):
                     flat = kv_cache.permute(0, 2, 1, 3).reshape(-1, per_token)
                     gathered = flat[slot_tensor, :].contiguous()  # [n_tok, per_token]
                     kv_by_layer[layer_name] = gathered.cpu()
-                    kv_by_layer[layer_name] = gathered.cpu()
             else:
                 # State stored once per group block; the manager block's last
-                # token selects the block (mirrors _state_block_ids).
+                # token selects the block (mirrors _state_block_ids). vLLM's
+                # mamba "align" mode materializes states only at segment
+                # boundaries -- interior blocks hold the null block (id 0) and
+                # carry no state to capture (the connector skips them too).
                 logical = ((manager_block_idx + 1) * mbs - 1) // group_bs
                 block_id = block_table[logical]
+                if block_id == 0:
+                    continue
                 for layer_name in layer_names:
                     states = self._kv_caches[layer_name]  # list[Tensor]
                     kv_by_layer[layer_name] = [s[block_id].detach().cpu() for s in states]
@@ -285,3 +289,27 @@ class VerifyingConnector(TairKvCacheConnector):
         logger.warning(
             "VerifyingConnector captured %s block=%d tokens=%d..%d tp=%s -> %s",
             kind, manager_block_idx, positions[0], positions[-1], self._tp_rank, path)
+
+
+class MutatedConnector(VerifyingConnector):
+    """Meta-test connector: injects an off-by-one into the attention token
+    translation (every gathered/scattered slot shifted by -1).
+
+    The shift is symmetric between save and load, so with contiguous block
+    tables a transport round trip cancels it in the interior of the loaded
+    range (slot(t)-1 == slot(t-1)); the leak is at the boundary: the last
+    loaded token's true slot is never written and keeps stale (uninitialized)
+    data. The capture-based verification reads the cache through vLLM's own
+    slot mapping and must observe that divergence -- the mutation e2e test
+    asserts that verification FAILS with this connector.
+
+    -1 (not +1) keeps every shifted slot in bounds: vLLM reserves physical
+    block 0 as the null block, so real slots are >= kernel_block_size and
+    slot-1 >= 0, while slot+1 of the cache's last block would read/write out
+    of bounds. Only reachable through the test-side ``kv_connector_module_path``
+    injection; never part of the production wheel.
+    """
+
+    def _attn_token_indices(self, group, manager_block_idxes, block_table):
+        out = super()._attn_token_indices(group, manager_block_idxes, block_table)
+        return [[slot - 1 for slot in block] for block in out]

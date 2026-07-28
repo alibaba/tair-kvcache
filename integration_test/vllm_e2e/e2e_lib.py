@@ -43,9 +43,17 @@ from typing import Optional
 import requests
 
 logger = logging.getLogger("vllm_e2e")
+# This module only runs inside test drivers; make the orchestration evidence
+# (block counts, verification report, log-scan results) visible in test.log.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 MODEL_PATH = os.environ.get("KVCM_E2E_MODEL", "/root/ws/resources/models/Qwen2.5-7B-Instruct")
 COSINE_THRESHOLD = 0.9999
+# Bit-exact comparison is the default (empirically all scenarios achieve it).
+# Cosine fallback must be explicitly requested.
+ALLOW_COSINE = os.environ.get("KVCM_E2E_ALLOW_COSINE", "0") == "1"
 
 
 def is_hybrid_model(model_path: str) -> bool:
@@ -137,7 +145,7 @@ def wait_http(url: str, timeout: float, post_body: Optional[dict] = None) -> boo
 # KVCM manager
 # --------------------------------------------------------------------------- #
 class ManagerProcess:
-    def __init__(self, workdir: str, storage_root: str):
+    def __init__(self, workdir: str, storage_root: str, key_count_per_file: int = 8):
         self.workdir = workdir
         os.makedirs(workdir, exist_ok=True)
         self.rpc_port = free_port()
@@ -145,6 +153,7 @@ class ManagerProcess:
         self.admin_rpc_port = free_port()
         self.admin_http_port = free_port()
         self.storage_root = storage_root
+        self.key_count_per_file = key_count_per_file
         self.proc: Optional[subprocess.Popen] = None
         self.config_path = os.path.join(workdir, "startup_config.json")
 
@@ -157,8 +166,10 @@ class ManagerProcess:
                 "type": "file",
                 "global_unique_name": "nfs_01",
                 "storage_spec": {
-                    "root_path": self.storage_root,
-                    "key_count_per_file": 8,
+                    # The backend concatenates root_path + key with no
+                    # separator; the trailing slash keeps files inside the dir.
+                    "root_path": self.storage_root.rstrip("/") + "/",
+                    "key_count_per_file": self.key_count_per_file,
                 },
             },
             "instance_group": {
@@ -247,7 +258,11 @@ class VllmServer:
     def __init__(self, workdir: str, capture_dir: str, manager_uri: str,
                  tp_size: int, coordinator_base_port: int,
                  instance_id: str, preferred_block_size: int,
-                 enable_prefix_caching: bool):
+                 enable_prefix_caching: bool,
+                 connector_name: str = "VerifyingConnector",
+                 log_level: str = "INFO",
+                 extra_config_overrides: Optional[dict] = None,
+                 kv_load_failure_policy: Optional[str] = None):
         self.workdir = workdir
         os.makedirs(workdir, exist_ok=True)
         self.capture_dir = capture_dir
@@ -259,6 +274,10 @@ class VllmServer:
         self.instance_id = instance_id
         self.preferred_block_size = preferred_block_size
         self.enable_prefix_caching = enable_prefix_caching
+        self.connector_name = connector_name
+        self.log_level = log_level
+        self.extra_config_overrides = extra_config_overrides or {}
+        self.kv_load_failure_policy = kv_load_failure_policy
         self.proc: Optional[subprocess.Popen] = None
 
     def base_url(self) -> str:
@@ -271,14 +290,17 @@ class VllmServer:
             "instance_group": "default",
             "instance_id": self.instance_id,
             "preferred_block_size": self.preferred_block_size,
-            "log_level": "INFO",
+            "log_level": self.log_level,
         }
+        extra_config.update(self.extra_config_overrides)
         kv_transfer_config = {
-            "kv_connector": "VerifyingConnector",
+            "kv_connector": self.connector_name,
             "kv_role": "kv_both",
             "kv_connector_module_path": "test_connector",
             "kv_connector_extra_config": extra_config,
         }
+        if self.kv_load_failure_policy:
+            kv_transfer_config["kv_load_failure_policy"] = self.kv_load_failure_policy
         cmd = [
             find_python(), "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
@@ -345,13 +367,43 @@ def tokenize(base_url: str, prompt: str) -> list[int]:
     return r.json()["tokens"]
 
 
+def get_manager_block_size(manager_uri: str, instance_id: str) -> int:
+    """Ask the manager for the registered instance's manager block size."""
+    r = requests.post(f"{manager_uri}/api/getInstanceInfo",
+                      json={"trace_id": "e2e_bs", "instance_id": instance_id},
+                      timeout=10)
+    r.raise_for_status()
+    block_size = r.json()["instance_info"]["block_size"]
+    assert block_size > 0, f"bad manager block size: {block_size}"
+    return block_size
+
+
+def block_token_hash(token_ids: list[int]) -> str:
+    """Token-content hash used in capture file names (mirrors test_connector)."""
+    import hashlib
+    import torch
+    return hashlib.sha256(
+        torch.tensor(token_ids, dtype=torch.int64).numpy().tobytes()
+    ).hexdigest()[:16]
+
+
+def full_block_hashes(token_ids: list[int], manager_block_size: int) -> list[str]:
+    """Per-manager-block capture hashes for the full blocks of a token stream."""
+    n = len(token_ids) // manager_block_size
+    return [
+        block_token_hash(token_ids[i * manager_block_size:(i + 1) * manager_block_size])
+        for i in range(n)
+    ]
+
+
 def wait_for_prefix_cached(manager_uri: str, instance_id: str,
-                           token_ids: list[int], timeout: float = 120.0) -> bool:
-    """Poll the manager until the prefix for token_ids is cached (committed).
+                           token_ids: list[int], min_blocks: int,
+                           timeout: float = 120.0) -> bool:
+    """Poll the manager until at least min_blocks of the prefix are committed.
 
     Mirrors what the connector's get_num_new_matched_tokens queries
     (query_type=QT_PREFIX_MATCH, block_mask offset=0 for a fresh request), so it
-    guarantees phase 2 will actually hit the external cache.
+    guarantees phase 2 will actually hit the external cache for all min_blocks.
     """
     deadline = time.time() + timeout
     payload = {
@@ -369,7 +421,7 @@ def wait_for_prefix_cached(manager_uri: str, instance_id: str,
                 data = r.json()
                 if data.get("header", {}).get("status", {}).get("code") == "OK":
                     locs = data.get("locations", [])
-                    if locs:
+                    if len(locs) >= min_blocks:
                         logger.info("prefix cached: %d location(s)", len(locs))
                         return True
         except Exception:
@@ -379,19 +431,24 @@ def wait_for_prefix_cached(manager_uri: str, instance_id: str,
     return False
 
 
-def send_completions(base_url: str, prompts: list[str], max_tokens: int = 4,
-                     temperature: float = 0.0) -> list[dict]:
-    """Send prompts concurrently and return the OpenAI responses."""
+def send_completions(base_url: str, prompts: list, max_tokens: int = 4,
+                     temperature: float = 0.0, **extra_payload) -> list[dict]:
+    """Send prompts concurrently and return the OpenAI responses.
+
+    Each prompt may be a string or a list of token ids (the completions API
+    accepts both). extra_payload is merged into the request body (e.g.
+    return_token_ids=True)."""
     from concurrent.futures import ThreadPoolExecutor
 
     client_url = f"{base_url}/v1/completions"
 
-    def _one(prompt: str) -> dict:
+    def _one(prompt) -> dict:
         payload = {
             "model": "qwen",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            **extra_payload,
         }
         r = requests.post(client_url, json=payload, timeout=300)
         r.raise_for_status()
@@ -409,7 +466,13 @@ def count_captures(capture_dir: str, kind: str) -> int:
 
 
 def wait_for_captures(capture_dir: str, kind: str, expected: int,
-                      timeout: float = 120.0):
+                      timeout: float = 120.0) -> int:
+    """Wait until at least ``expected`` captures of ``kind`` exist.
+
+    Raises AssertionError on timeout: a missing capture means the connector
+    never exercised the code path under test, so the scenario must fail rather
+    than silently verify fewer blocks.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         n = count_captures(capture_dir, kind)
@@ -418,9 +481,8 @@ def wait_for_captures(capture_dir: str, kind: str, expected: int,
             return n
         time.sleep(1.0)
     n = count_captures(capture_dir, kind)
-    logger.warning("timed out waiting for %s captures: got %d, want %d",
-                   kind, n, expected)
-    return n
+    raise AssertionError(
+        f"timed out waiting for {kind} captures: got {n}, want {expected}")
 
 
 def _cosine(a, b) -> float:
@@ -461,6 +523,7 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
         "cosine_pass": 0,
         "failures": [],
         "loaded_without_ref": [],
+        "matched_keys": [],
     }
 
     for key, loaded_path in sorted(loaded.items()):
@@ -474,8 +537,16 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
 
         all_bit_exact = True
         worst_cosine = 1.0
-        for layer_name, ref_kv in ref["kv"].items():
-            got_kv = got["kv"][layer_name]
+        # Compare every layer present in the *loaded* capture: each one was
+        # actually written by the connector and must match its reference.
+        # Mamba "align" state layers can legitimately be absent on either side
+        # (vLLM materializes states only at segment boundaries; interior blocks
+        # get the null block and the connector transfers them vacuously) -- but
+        # a loaded layer without a reference is a hard error.
+        for layer_name, got_kv in got["kv"].items():
+            assert layer_name in ref["kv"], (
+                f"loaded layer {layer_name} of {key} has no reference capture")
+            ref_kv = ref["kv"][layer_name]
             # Attention groups are a single Tensor; mamba/linear/gdn groups are a
             # list[Tensor] (e.g. [conv_state, ssm_state]). Compare uniformly.
             if isinstance(ref_kv, (list, tuple)):
@@ -497,7 +568,7 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
                     all_bit_exact = False
                     cos = _cosine(ref_t, got_t)
                     worst_cosine = min(worst_cosine, cos)
-                    if cos < COSINE_THRESHOLD:
+                    if not ALLOW_COSINE or cos < COSINE_THRESHOLD:
                         report["failures"].append({
                             "key": key,
                             "layer": f"{layer_name}[{si}]",
@@ -505,6 +576,7 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
                         })
 
         report["matched"] += 1
+        report["matched_keys"].append(key)
         if all_bit_exact:
             report["bit_exact"] += 1
         else:
@@ -515,16 +587,25 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
     return report
 
 
-def assert_report_ok(report: dict):
+def assert_report_ok(report: dict, min_matched: int = 1):
+    """Assert the comparison succeeded.
+
+    min_matched is the exact lower bound of (ref, loaded) capture pairs computed
+    from the prompts' tokenization (num full manager blocks x tp ranks); a lower
+    count means some blocks were silently never saved or never loaded.
+    """
     problems = []
     if report["loaded_without_ref"]:
         problems.append(
             f"loaded captures with no matching reference: {report['loaded_without_ref']}"
         )
     if report["failures"]:
-        problems.append(f"cosine failures: {report['failures']}")
-    if report["matched"] == 0:
-        problems.append("no loaded captures were matched against references")
+        kind = "cosine" if ALLOW_COSINE else "bit-exact"
+        problems.append(f"{kind} failures: {report['failures']}")
+    if report["matched"] < min_matched:
+        problems.append(
+            f"matched {report['matched']} loaded captures, expected >= {min_matched}"
+        )
     if problems:
         raise AssertionError("KV verification failed: " + "; ".join(problems))
     logger.info(
@@ -537,100 +618,216 @@ def assert_report_ok(report: dict):
 # --------------------------------------------------------------------------- #
 # Scenario runner
 # --------------------------------------------------------------------------- #
+class ScenarioEnv:
+    """Owns one scenario's manager + vLLM server lifecycle and scratch dirs.
+
+    Custom scenarios (partial-hit, full-hit, load-failure, multi-turn) share
+    this; run_e2e keeps its own two-phase flow on top of the same pieces.
+    """
+
+    def __init__(self, scenario: str, tp_size: int = 1,
+                 preferred_block_size: int = 0,
+                 enable_prefix_caching: Optional[bool] = None,
+                 connector_name: str = "VerifyingConnector",
+                 log_level: str = "INFO",
+                 extra_config_overrides: Optional[dict] = None,
+                 key_count_per_file: int = 8,
+                 kv_load_failure_policy: Optional[str] = None):
+        self.scenario = scenario
+        self.tp_size = tp_size
+        self.hybrid = is_hybrid_model(MODEL_PATH)
+        self.preferred_block_size = 0 if self.hybrid else preferred_block_size
+        self.enable_prefix_caching = (self.hybrid if enable_prefix_caching is None
+                                      else enable_prefix_caching)
+        self.connector_name = connector_name
+        self.log_level = log_level
+        self.extra_config_overrides = extra_config_overrides
+        self.kv_load_failure_policy = kv_load_failure_policy
+
+        self.repo_root = find_repo_root()
+        scratch_root = (os.environ.get("TEST_TMPDIR")
+                        or os.environ.get("TMPDIR") or "/tmp")
+        self.base_workdir = os.path.join(scratch_root, "kvcm_vllm_e2e", scenario)
+        if os.path.exists(self.base_workdir):
+            shutil.rmtree(self.base_workdir)
+        self.storage_root = os.path.join(self.base_workdir, "nfs")
+        self.capture_dir = os.path.join(self.base_workdir, "captures")
+        self.vllm_dir = os.path.join(self.base_workdir, "vllm")
+        os.makedirs(self.storage_root, exist_ok=True)
+
+        self.instance_id = f"e2e-{scenario}-{uuid.uuid4().hex[:8]}"
+        self.manager = ManagerProcess(
+            os.path.join(self.base_workdir, "manager"), self.storage_root,
+            key_count_per_file=key_count_per_file)
+        self.vllm: Optional[VllmServer] = None
+
+    def start_manager(self):
+        self.manager.start(self.repo_root)
+
+    def start_vllm(self, log_suffix: str = "") -> VllmServer:
+        self.vllm = VllmServer(
+            self.vllm_dir, self.capture_dir, self.manager.manager_uri(),
+            self.tp_size, coordinator_base_port=free_port(),
+            instance_id=self.instance_id,
+            preferred_block_size=self.preferred_block_size,
+            enable_prefix_caching=self.enable_prefix_caching,
+            connector_name=self.connector_name,
+            log_level=self.log_level,
+            extra_config_overrides=self.extra_config_overrides,
+            kv_load_failure_policy=self.kv_load_failure_policy,
+        )
+        self.vllm.start(self.repo_root, log_suffix=log_suffix)
+        return self.vllm
+
+    def restart_vllm(self, log_suffix: str = "") -> VllmServer:
+        """Restart vLLM to drop its local prefix cache (KVCM state persists)."""
+        if self.vllm:
+            self.vllm.stop()
+        return self.start_vllm(log_suffix)
+
+    def manager_block_size(self) -> int:
+        return get_manager_block_size(self.manager.manager_uri(), self.instance_id)
+
+    def scan_connector_logs(self, pattern: str) -> list:
+        """Regex-scan all vLLM std streams; returns list of match groups."""
+        import re
+        out = []
+        for path in glob.glob(os.path.join(self.vllm_dir, "vllm*.std*")):
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = re.search(pattern, line)
+                    if m:
+                        out.append(m.groups() if m.groups() else m.group(0))
+        return out
+
+    def stop(self):
+        if self.vllm:
+            self.vllm.stop()
+        self.manager.stop()
+
+
+def make_base_prompts(num_prompts: int, hybrid: bool) -> list[str]:
+    """Distinct, deterministic prompts. Each sentence carries a unique counter
+    so every manager block has unique token content -- this avoids hash
+    collisions between blocks with identical text but different KV (RoPE is
+    position-dependent).
+
+    Hybrid models pin the manager block size to the scheduler block size (528),
+    so their prompts must be much longer to span multiple manager blocks
+    (empirically 140 sentences ~ 2100 tokens > 3 x 528). Full-attention models
+    use manager blocks of 16/32 tokens, where 40 sentences (~580 tokens) already
+    span dozens of blocks.
+    """
+    num_sentences = 140 if hybrid else 40
+    return [
+        f"Prompt number {i}. " + " ".join(
+            f"Sentence {j} of prompt {i} has value {j * 7 + i * 131}."
+            for j in range(num_sentences)
+        )
+        for i in range(num_prompts)
+    ]
+
+
+def shared_token_prefix_len(a: list[int], b: list[int]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
 def run_e2e(scenario: str, tp_size: int, num_prompts: int,
-            preferred_block_size: int):
+            preferred_block_size: int, connector_name: str = "VerifyingConnector",
+            expect_verification_failure: bool = False):
     """Run one full save-then-load verification scenario.
 
     Full-attention models: prefix caching off, one server across both phases.
     Hybrid models: prefix caching on (align mode -> per-group block tables), the
     vLLM server is restarted between phases so phase 2 loads from KVCM instead of
     hitting the local prefix cache.
+
+    connector_name selects the connector class inside test_connector.py; the
+    mutation meta-test passes "MutatedConnector" and sets
+    expect_verification_failure=True to prove the harness detects an injected
+    off-by-one in the token translation.
     """
     import torch  # noqa: F401  (ensure torch importable early for clear errors)
 
-    hybrid = is_hybrid_model(MODEL_PATH)
-    # Hybrid mamba state is per scheduler block, so preferred_block_size can only
-    # differ from the vLLM block size for pure-attention models.
-    if hybrid:
-        preferred_block_size = 0
-
-    repo_root = find_repo_root()
-    scratch_root = os.environ.get("TEST_TMPDIR") or os.environ.get("TMPDIR") or "/tmp"
-    base_workdir = os.path.join(scratch_root, "kvcm_vllm_e2e", scenario)
-    if os.path.exists(base_workdir):
-        shutil.rmtree(base_workdir)
-    storage_root = os.path.join(base_workdir, "nfs")
-    manager_dir = os.path.join(base_workdir, "manager")
-    vllm_dir = os.path.join(base_workdir, "vllm")
-    capture_dir = os.path.join(base_workdir, "captures")
-    os.makedirs(storage_root, exist_ok=True)
-
-    instance_id = f"e2e-{scenario}-{uuid.uuid4().hex[:8]}"
+    env = ScenarioEnv(scenario, tp_size=tp_size,
+                      preferred_block_size=preferred_block_size,
+                      connector_name=connector_name)
+    hybrid = env.hybrid
+    capture_dir = env.capture_dir
     logger.info("scenario=%s model=%s hybrid=%s tp=%d prompts=%d preferred_bs=%d",
-                scenario, MODEL_PATH, hybrid, tp_size, num_prompts, preferred_block_size)
-
-    manager = ManagerProcess(manager_dir, storage_root)
-
-    def make_server(coordinator_port):
-        return VllmServer(
-            vllm_dir, capture_dir, manager.manager_uri(), tp_size,
-            coordinator_base_port=coordinator_port,
-            instance_id=instance_id,
-            preferred_block_size=preferred_block_size,
-            enable_prefix_caching=hybrid,
-        )
-
-    vllm = make_server(free_port())
+                scenario, MODEL_PATH, hybrid, tp_size, num_prompts,
+                env.preferred_block_size)
 
     try:
-        manager.start(repo_root)
-        vllm.start(repo_root, log_suffix="" if not hybrid else "_p1")
+        env.start_manager()
+        vllm = env.start_vllm(log_suffix="" if not hybrid else "_p1")
 
-        # Distinct, deterministic prompts. Each sentence carries a unique counter
-        # so every manager block has unique token content -- this avoids hash
-        # collisions between blocks with identical text but different KV (RoPE is
-        # position-dependent). Long enough to span several manager blocks so the
-        # translation layer is actually exercised.
-        base_prompts = [
-            f"Prompt number {i}. " + " ".join(
-                f"Sentence {j} of prompt {i} has value {j * 7 + i * 131}."
-                for j in range(40)
-            )
-            for i in range(num_prompts)
-        ]
+        base_prompts = make_base_prompts(num_prompts, hybrid)
         suffixes = [f" Now answer question {i}: what is 2+2?" for i in range(num_prompts)]
+        phase2_prompts = [p + s for p, s in zip(base_prompts, suffixes)]
+
+        # Compute per-prompt expected block counts from the actual tokenization
+        # so a silently dropped prompt (or block) fails the run.
+        mbs = env.manager_block_size()
+        base_tokens = [tokenize(vllm.base_url(), p) for p in base_prompts]
+        phase2_tokens = [tokenize(vllm.base_url(), p) for p in phase2_prompts]
+        expected_save_blocks = [len(t) // mbs for t in base_tokens]
+        # Loads cover the shared token prefix (the base/suffix boundary token may
+        # re-merge under tokenization, shortening the shared prefix by one).
+        expected_load_blocks = [
+            min(shared_token_prefix_len(b, p2) // mbs, s)
+            for b, p2, s in zip(base_tokens, phase2_tokens, expected_save_blocks)
+        ]
+        assert all(n >= 1 for n in expected_load_blocks), (
+            f"prompts too short to span a manager block (mbs={mbs}): "
+            f"{expected_load_blocks}")
+        logger.info("mbs=%d expected save blocks=%s load blocks=%s",
+                    mbs, expected_save_blocks, expected_load_blocks)
 
         # ---- Phase 1: fresh prefill -> connector saves -> reference capture.
         logger.info("phase 1: sending %d fresh prompts", num_prompts)
         send_completions(vllm.base_url(), base_prompts)
-        wait_for_captures(capture_dir, "ref", expected=num_prompts, timeout=180)
+        wait_for_captures(capture_dir, "ref",
+                          expected=tp_size * sum(expected_save_blocks), timeout=180)
 
         # The save is committed to the manager asynchronously after the ref
         # capture (which fires when the save is submitted). Wait until the manager
         # actually has the prefix, otherwise phase 2 would find no match.
-        phase2_prompts = [p + s for p, s in zip(base_prompts, suffixes)]
-        for p in base_prompts:
-            toks = tokenize(vllm.base_url(), p)
-            if not wait_for_prefix_cached(manager.manager_uri(), instance_id, toks):
+        for toks, blocks in zip(base_tokens, expected_save_blocks):
+            if not wait_for_prefix_cached(env.manager.manager_uri(), env.instance_id,
+                                          toks, min_blocks=blocks):
                 raise AssertionError("save was not committed to the manager in time")
 
         # Hybrid models keep prefix caching on, which also populates the local
         # prefix cache; restart vLLM so phase 2 loads from KVCM, not locally.
         if hybrid:
             logger.info("restarting vLLM before phase 2 (clear local prefix cache)")
-            vllm.stop()
-            vllm = make_server(free_port())
-            vllm.start(repo_root, log_suffix="_p2")
+            vllm = env.restart_vllm(log_suffix="_p2")
 
         # ---- Phase 2: same prefix + suffix -> connector loads -> loaded capture.
         logger.info("phase 2: sending %d prefix+suffix prompts", num_prompts)
         send_completions(vllm.base_url(), phase2_prompts)
-        wait_for_captures(capture_dir, "loaded", expected=num_prompts, timeout=180)
+        wait_for_captures(capture_dir, "loaded",
+                          expected=tp_size * sum(expected_load_blocks), timeout=180)
 
         report = compare_captures(capture_dir, tp_size)
-        assert_report_ok(report)
+        min_matched = tp_size * sum(expected_load_blocks)
+        if expect_verification_failure:
+            try:
+                assert_report_ok(report, min_matched=min_matched)
+            except AssertionError as e:
+                logger.info("verification failed as expected: %s", e)
+                return
+            raise AssertionError(
+                "mutated connector passed KV verification; the harness is blind")
+        assert_report_ok(report, min_matched=min_matched)
         logger.info("scenario %s PASSED: %s", scenario, json.dumps(
-            {k: v for k, v in report.items() if k != "failures"}, default=str))
+            {k: v for k, v in report.items() if k not in ("failures", "matched_keys")},
+            default=str))
     finally:
-        vllm.stop()
-        manager.stop()
+        env.stop()
