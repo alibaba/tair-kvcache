@@ -252,8 +252,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalStaticMetrics) {
 
     MetricsTags tags = {{"instance_id", "inst1"}};
 
-    Gauge avg_bytes = registry_->GetGauge("trace_query_avg_bytes_per_block", tags);
-    EXPECT_DOUBLE_EQ(1024.0, avg_bytes.Get());
+    Gauge bytes_per_block_gauge = registry_->GetGauge("trace_query_bytes_per_block", tags);
+    EXPECT_DOUBLE_EQ(1024.0, bytes_per_block_gauge.Get());
 
     Gauge linear_step = registry_->GetGauge("trace_query_linear_step", tags);
     EXPECT_DOUBLE_EQ(0.0, linear_step.Get());

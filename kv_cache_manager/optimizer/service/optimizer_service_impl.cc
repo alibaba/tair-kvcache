@@ -339,7 +339,8 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
         if (collector) {
             collector->set_instance_id(request->instance_id());
             collector->set_total_blocks(result.total_blocks);
-            collector->set_cache_hit_count(result.cache_hit_count);
+            collector->set_cache_hit_count(
+                result.hit_count_per_capacity.empty() ? 0 : result.hit_count_per_capacity.front());
             std::vector<PerCapacityHitInfo> per_cap;
             for (size_t i = 0; i < result.capacity_gb.size() && i < result.hit_count_per_capacity.size(); i++) {
                 const double hit_rate = i < result.hit_rate_per_capacity.size() ? result.hit_rate_per_capacity[i] : 0.0;

@@ -201,11 +201,11 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryBasic) {
     std::vector<int64_t> keys = {1, 2, 3, 4, 5};
     TraceQueryResult result;
     EXPECT_EQ(EC_OK, mgr_->TraceQuery("i1", keys, result));
-    EXPECT_EQ(0, result.cache_hit_count);
+    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
 
     EXPECT_EQ(EC_OK, mgr_->TraceQuery("i1", keys, result));
-    EXPECT_EQ(5, result.cache_hit_count);
+    EXPECT_EQ(5, result.hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
 }
 
@@ -220,7 +220,7 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryPrefixMatch) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 100, 200}, result);
-    EXPECT_EQ(3, result.cache_hit_count);
+    EXPECT_EQ(3, result.hit_count_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, TraceQueryNonExistentInstance) {
@@ -249,7 +249,7 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
     // simulator: cache_hit_count uses index 0 (smallest capacity ~6 blocks),
     // prefix match starts at key 0 whose stack distance (99) exceeds the small
     // capacity, so prefix hit = 0.
-    EXPECT_EQ(0, result.cache_hit_count);
+    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
     // Large capacity (index 1) should hit all 100 keys
     ASSERT_EQ(2, result.hit_count_per_capacity.size());
     EXPECT_EQ(100, result.hit_count_per_capacity[1]);
@@ -396,13 +396,13 @@ TEST_F(OnlineOptimizerManagerTest, LruIndexerType) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5}, result);
-    EXPECT_EQ(0, result.cache_hit_count);
+    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
     EXPECT_EQ(5, result.total_blocks);
-    EXPECT_EQ(5, result.current_unique_keys);
+    EXPECT_EQ(5, result.unique_keys_per_capacity.at(0));
 
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5}, result);
-    EXPECT_EQ(5, result.cache_hit_count);
-    EXPECT_EQ(5, result.current_unique_keys);
+    EXPECT_EQ(5, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(5, result.unique_keys_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, CapacityEvictionLimitsUniqueCount) {
@@ -413,7 +413,7 @@ TEST_F(OnlineOptimizerManagerTest, CapacityEvictionLimitsUniqueCount) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5, 6, 7}, result);
-    EXPECT_LE(result.current_unique_keys, 5);
+    EXPECT_LE(result.unique_keys_per_capacity.at(0), 5);
 }
 
 TEST_F(OnlineOptimizerManagerTest, LargeCapacityNotTruncatedBySmallCapacity) {
@@ -448,11 +448,11 @@ TEST_F(OnlineOptimizerManagerTest, LruIndexerMaxKeyCountUnlimited) {
     }
     TraceQueryResult result;
     mgr_->TraceQuery("i1", keys, result);
-    EXPECT_EQ(200, result.current_unique_keys);
+    EXPECT_EQ(200, result.unique_keys_per_capacity.at(0));
 
     mgr_->TraceQuery("i1", keys, result);
-    EXPECT_EQ(200, result.cache_hit_count);
-    EXPECT_EQ(200, result.current_unique_keys);
+    EXPECT_EQ(200, result.hit_count_per_capacity.at(0));
+    EXPECT_EQ(200, result.unique_keys_per_capacity.at(0));
 }
 
 TEST_F(OnlineOptimizerManagerTest, ReRegisterReplacesPrevious) {

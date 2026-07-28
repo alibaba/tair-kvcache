@@ -47,14 +47,12 @@ struct InstanceState {
 };
 
 struct TraceQueryResult {
-    int64_t cache_hit_count = 0;
     int64_t total_blocks = 0;
     int64_t input_token_len = 0;
     std::vector<int64_t> hit_count_per_capacity;
     std::vector<double> hit_rate_per_capacity;
     std::vector<double> capacity_gb;
     std::vector<int64_t> unique_keys_per_capacity;
-    int64_t current_unique_keys = 0;
     int64_t theoretical_unique_keys = 0;
     int64_t max_hit_count = -1;
     double max_hit_rate = 0.0;
@@ -88,7 +86,7 @@ struct InstanceSummary {
     int64_t total_max_hits = 0;
     double max_hit_rate = 0.0;
     int64_t unique_keys = 0;
-    int64_t avg_bytes_per_block = 0;
+    int64_t bytes_per_block = 0;
     int32_t linear_step = 0;
     int64_t eviction_count = 0;
     int64_t memory_usage_bytes = 0;

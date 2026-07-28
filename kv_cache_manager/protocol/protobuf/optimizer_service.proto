@@ -173,8 +173,8 @@ message TraceQueryCapacityResult {
 
 message TraceQueryTheoreticalResult {
     int64 max_hit_count = 1;        // theoretical/max cache 前缀连续命中长度（block 数），未启用时为 -1
-    int64 current_unique_keys = 2;  // theoretical/max cache 当前 resident unique key 数
-    double hit_rate = 3;
+    int64 current_unique_keys = 2;  // theoretical/max cache 当前 resident unique key 数，未启用时为 -1
+    double hit_rate = 3;            // 未启用时为 -1（与 max_hit_count 同哨兵；0 表示已计算且为 0）
 }
 
 // Instance 列表/统计重置
@@ -192,7 +192,7 @@ message OptimizerCapacitySummary {
 
 message OptimizerTheoreticalSummary {
     int64 total_max_hits = 1;
-    double max_hit_rate = 2;
+    double max_hit_rate = 2;    // full-attention 实例未启用 theoretical max cache 时为 -1
 }
 
 message OptimizerInstanceDebugInfo {
@@ -201,7 +201,7 @@ message OptimizerInstanceDebugInfo {
     int32 linear_step = 3;
     int64 eviction_count = 4;
     int64 memory_usage_bytes = 5;
-    int64 kv_cache_usage_bytes = 6;
+    int64 kv_cache_usage_bytes = 6;  // full-attention 实例为无限容量口径：历史 unique block 数 × block_bytes
     int64 ttl_eviction_count = 7;
 }
 

@@ -498,7 +498,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
                 normalized.input_token_len == 0 ? 0.0 : static_cast<double>(hits * block_size) / token_denominator);
             state->total_hits_per_capacity[i] += static_cast<int64_t>(hits);
         }
-        result.cache_hit_count = result.hit_count_per_capacity.empty() ? 0 : result.hit_count_per_capacity.front();
 
         const uint64_t unique_blocks = state->lite_hit->current_unique_blocks();
         result.unique_keys_per_capacity.reserve(state->lite_hit_capacity_blocks.size());
@@ -506,8 +505,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             result.unique_keys_per_capacity.push_back(
                 ClampToInt64(std::min(unique_blocks, static_cast<uint64_t>(capacity))));
         }
-        result.current_unique_keys =
-            result.unique_keys_per_capacity.empty() ? 0 : result.unique_keys_per_capacity.front();
 
         if (state->instance_group->enable_theoretical_max_cache()) {
             const uint64_t max_hits = HitCurveProjector::ProjectInfinite(fact);
@@ -517,6 +514,9 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             result.theoretical_unique_keys = ClampToInt64(unique_blocks);
             state->total_max_hits += static_cast<int64_t>(max_hits);
         } else {
+            // Match the -1 sentinel of max_hit_count/theoretical_unique_keys:
+            // "not computed" must stay distinguishable from "computed as 0".
+            result.max_hit_rate = -1.0;
             result.theoretical_unique_keys = -1;
         }
 
@@ -550,7 +550,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         state->total_max_hits += max_hit_count;
     }
 
-    result.cache_hit_count = hit_count.empty() ? 0 : hit_count[0];
     hit_count.resize(num_caps);
     result.hit_count_per_capacity = std::move(hit_count);
     result.hit_rate_per_capacity.reserve(num_caps);
@@ -558,7 +557,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         result.hit_rate_per_capacity.push_back(total_blocks > 0 ? static_cast<double>(hits) / total_blocks : 0.0);
     }
     result.unique_keys_per_capacity = state->indexer->capacity_unique_counts();
-    result.current_unique_keys = state->indexer->unique_count();
     result.theoretical_unique_keys = max_hit_count >= 0 ? state->indexer->unique_count() : -1;
     result.max_hit_count = max_hit_count;
     result.max_hit_rate = total_blocks > 0 && max_hit_count >= 0
@@ -585,7 +583,7 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.instance_group = state->instance_info->instance_group_name();
         s.block_size = state->instance_info->block_size();
         s.total_blocks_queried = state->total_blocks_queried;
-        s.avg_bytes_per_block =
+        s.bytes_per_block =
             (state->linear_step == 0)
                 ? state->size_full_only
                 : ((state->linear_step - 1) * state->size_full_only + state->size_full_linear) / state->linear_step;
@@ -601,14 +599,11 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
-            uint64_t largest_resident_blocks = 0;
-            for (int64_t capacity : state->lite_hit_capacity_blocks) {
-                largest_resident_blocks =
-                    std::max(largest_resident_blocks,
-                             std::min(state->lite_hit->current_unique_blocks(), static_cast<uint64_t>(capacity)));
-            }
-            s.kv_cache_usage_bytes =
-                SaturatingMultiplyToInt64(largest_resident_blocks, static_cast<uint64_t>(state->size_full_only));
+            // Infinite-capacity residency: nothing is ever evicted, so every
+            // distinct block ever seen counts. Finite tiers are min(U, C) of
+            // this same U and need no separate report.
+            s.kv_cache_usage_bytes = SaturatingMultiplyToInt64(state->lite_hit->current_unique_blocks(),
+                                                               static_cast<uint64_t>(state->size_full_only));
 
             // Full-attention rates are token based: cumulative hit blocks are
             // converted to tokens with the fixed block size and divided by the
@@ -630,6 +625,10 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
                 s.max_hit_rate = state->total_input_tokens > 0
                                      ? static_cast<double>(s.total_max_hits * block_size_tokens) / token_denominator
                                      : 0.0;
+            } else {
+                // Same -1 sentinel as TraceQuery: "not computed" stays
+                // distinguishable from "computed as 0".
+                s.max_hit_rate = -1.0;
             }
         } else {
             if (!state->indexer) {
