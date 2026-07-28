@@ -225,25 +225,7 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                   request->events_size(),
                   first_event_type.c_str(),
                   first_block_key.c_str());
-    bool has_block_add = false, has_block_delete = false;
-    for (int i = 0; i < request->events_size(); ++i) {
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
-            has_block_add = true;
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
-            has_block_delete = true;
-    }
-    if (has_block_add && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = GetTypedMetricsCollectorForEventBlockAdd(request->instance_id(), metrics_type);
-        if (mc) {
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-        }
-    }
-    if (has_block_delete && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = GetTypedMetricsCollectorForEventBlockDelete(request->instance_id(), metrics_type);
-        if (mc) {
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-        }
-    }
+    AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
 }
 

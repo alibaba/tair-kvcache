@@ -17,7 +17,10 @@ namespace kv_cache_manager {
 
 using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
                                             const std::vector<std::vector<std::string>> &loc_ids,
-                                            const std::vector<std::vector<std::string>> &expected_location_values)>;
+                                            const std::vector<std::vector<std::string>> &expected_location_values,
+                                            // Skip physical URI deletion for
+                                            // externally owned metadata.
+                                            bool metadata_only)>;
 
 class MetaIndexer;
 class LocationSpecGroup;
@@ -36,6 +39,8 @@ struct BackendSelector {
 
 class MetaSearcher {
 public:
+    using MetadataWriteLease = std::shared_ptr<void>;
+    using AcquireMetadataWriteLeaseFunc = std::function<std::pair<ErrorCode, MetadataWriteLease>()>;
     using KeyType = int64_t;
     using KeyVector = std::vector<KeyType>;
     using UriType = std::string;
@@ -101,7 +106,8 @@ public:
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
-                                        std::vector<ErrorCode> &out_per_key_ec);
+                                        std::vector<ErrorCode> &out_per_key_ec,
+                                        AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -111,15 +117,21 @@ public:
     ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
-                                      std::vector<ErrorCode> &out_per_key_ec);
+                                      std::vector<ErrorCode> &out_per_key_ec,
+                                      AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct DeleteLocationSpecsTask {
         std::string location_id;
         std::vector<std::string> spec_names;
     };
+    // Missing block/location targets are idempotent EC_OK. When requested,
+    // out_missing_targets mirrors tasks_per_key and marks those no-op targets;
+    // an existing location with only missing spec_names is not marked.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
-                                       std::vector<std::vector<ErrorCode>> &out_batch_results);
+                                       std::vector<std::vector<ErrorCode>> &out_batch_results,
+                                       std::vector<std::vector<bool>> *out_missing_targets = nullptr,
+                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
@@ -152,7 +164,8 @@ public:
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
-                                   std::vector<std::vector<ErrorCode>> &out_per_location_ec);
+                                   std::vector<std::vector<ErrorCode>> &out_per_location_ec,
+                                   const std::vector<std::vector<std::string>> &expected_location_values = {});
     using LocationVisitor =
         std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);
@@ -169,7 +182,8 @@ public:
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,
                                      size_t scan_batch_size = 1000,
-                                     std::function<bool()> should_abort = nullptr);
+                                     std::function<bool()> should_abort = nullptr,
+                                     AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
     bool Sync(const KeyVector &keys) noexcept;
 
 private:

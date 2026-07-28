@@ -193,18 +193,31 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
-TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotInterval) {
+TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings) {
+    proto::admin::StorageConfig legacy_proto_config;
+    legacy_proto_config.set_global_unique_name("legacy_event_report");
+    legacy_proto_config.set_storage_type(proto::admin::ST_EVENT_REPORT_L2);
+    legacy_proto_config.mutable_event_report();
+    StorageConfig legacy_restored;
+    ProtoConvert::StorageFromProto(&legacy_proto_config, legacy_restored);
+    auto legacy_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(legacy_restored.storage_spec());
+    ASSERT_NE(nullptr, legacy_spec);
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs,
+              legacy_spec->snapshot_delta_drain_timeout_ms());
+
     auto spec = std::make_shared<EventReportStorageSpec>();
     spec->set_heartbeat_timeout_ms(1234);
     spec->set_cleanup_grace_ms(5678);
     spec->set_liveness_check_interval_ms(90);
     spec->set_snapshot_min_interval_ms(4321);
+    spec->set_snapshot_delta_drain_timeout_ms(8765);
     StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report_test", spec);
 
     proto::admin::StorageConfig proto_config;
     ProtoConvert::StorageConfigToProto(original, &proto_config);
     ASSERT_TRUE(proto_config.has_event_report());
     EXPECT_EQ(4321, proto_config.event_report().snapshot_min_interval_ms());
+    EXPECT_EQ(8765, proto_config.event_report().snapshot_delta_drain_timeout_ms());
 
     StorageConfig restored;
     ProtoConvert::StorageFromProto(&proto_config, restored);
@@ -214,6 +227,7 @@ TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotI
     EXPECT_EQ(5678, restored_spec->cleanup_grace_ms());
     EXPECT_EQ(90, restored_spec->liveness_check_interval_ms());
     EXPECT_EQ(4321, restored_spec->snapshot_min_interval_ms());
+    EXPECT_EQ(8765, restored_spec->snapshot_delta_drain_timeout_ms());
 }
 
 } // namespace kv_cache_manager

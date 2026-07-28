@@ -104,6 +104,19 @@ class KVCMClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_cache_locations_by_backend(self, data, check_response=True):
+        url = f"{self.base_url}/api/getCacheLocationsByBackend"
+        resp = self.session.post(url, json=data)
+        resp.raise_for_status()
+        body = resp.json()
+        if check_response:
+            code = body.get("header", {}).get("status", {}).get("code")
+            assert code == "OK", (
+                "getCacheLocationsByBackend failed: "
+                f"{json.dumps(body, ensure_ascii=False)}"
+            )
+        return body
+
     def start_write_cache_with_min_replica(self, data, check_response=True):
         url = f"{self.base_url}/api/startWriteCache"
         resp = self.session.post(url, json=data)
@@ -223,6 +236,16 @@ def _build_event_report_uri(host_ip_port, medium, params=None):
     return f"{base}?{query}"
 
 
+def _uri_identity_without_snapshot_version(uri):
+    parsed = urlsplit(uri)
+    params = tuple(
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "s_version"
+    )
+    return parsed.scheme, parsed.netloc, parsed.path, params
+
+
 def _query_block_specs(client, instance_id, block_key, trace_id):
     """Return the flattened location specs visible for one block."""
     resp = client.get_cache_location({
@@ -239,6 +262,30 @@ def _query_block_specs(client, instance_id, block_key, trace_id):
     return [
         spec
         for location in resp.get("locations", [])
+        for spec in location.get("location_specs", [])
+        if spec.get("uri")
+    ]
+
+
+def _query_block_specs_by_backend(
+    client, instance_id, block_key, storage_type, trace_id
+):
+    """Return visible specs through the backend-selected business query."""
+    resp = client.get_cache_locations_by_backend({
+        "trace_id": trace_id,
+        "instance_id": instance_id,
+        "query_type": "QT_BATCH_GET",
+        "block_keys": [block_key],
+        "block_mask": {"offset": 0},
+        "backend_selectors": [{
+            "backend_type": storage_type,
+            "strategy": "LSS_WEIGHTED_RANDOM",
+        }],
+    })
+    return [
+        spec
+        for key_location in resp.get("key_locations", [])
+        for location in key_location.get("locations", [])
         for spec in location.get("location_specs", [])
         if spec.get("uri")
     ]
@@ -312,6 +359,7 @@ class EventReportFunctionalTest(unittest.TestCase):
     HOST = "192.168.1.200:8080"
     EVENT_REPORT_STORAGE_NAME = "event_report_default"
     INSTANCE_GROUP_NAME = "event_report_test_group"
+    INSTANCE_GROUP_EXTRA_INFO = '{"contract":"report_event"}'
     LIVENESS_STORAGE_NAME = "event_report_liveness"
     LIVENESS_INSTANCE_GROUP_NAME = "event_report_liveness_group"
 
@@ -378,13 +426,19 @@ class EventReportFunctionalTest(unittest.TestCase):
         })
         code = existing.get("header", {}).get("status", {}).get("code")
         if code == "OK":
-            candidates = existing.get("instance_group", {}).get(
+            instance_group = existing.get("instance_group", {})
+            candidates = instance_group.get(
                 "event_report_storage_candidates", []
             )
             if cls.EVENT_REPORT_STORAGE_NAME not in candidates:
                 raise AssertionError(
                     f"InstanceGroup {cls.INSTANCE_GROUP_NAME!r} does not use "
                     f"EventReport storage {cls.EVENT_REPORT_STORAGE_NAME!r}"
+                )
+            if instance_group.get("extra_info", "") != cls.INSTANCE_GROUP_EXTRA_INFO:
+                raise AssertionError(
+                    f"InstanceGroup {cls.INSTANCE_GROUP_NAME!r} has unexpected "
+                    f"extra_info={instance_group.get('extra_info')!r}"
                 )
             print(f"[SETUP] InstanceGroup '{cls.INSTANCE_GROUP_NAME}' reused")
             return
@@ -422,6 +476,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                     },
                 },
                 "event_report_storage_candidates": [cls.EVENT_REPORT_STORAGE_NAME],
+                "extra_info": cls.INSTANCE_GROUP_EXTRA_INFO,
                 "version": 1,
             },
         })
@@ -562,7 +617,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t01",
             )
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertEqual(body.get("retry_after_ms", "0"), "0")
+        self.assertEqual(body.get("extra_info"), self.INSTANCE_GROUP_EXTRA_INFO)
 
     # 2. NODE_REGISTER is idempotent and merges mediums
     def test_02_node_register_idempotent(self):
@@ -573,7 +631,10 @@ class EventReportFunctionalTest(unittest.TestCase):
         body = self.client.report_event(
             _make_request(self.instance_id, host, [_ev_node_register(["mem", "disk"])], trace_id="t02b")
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertTrue(body.get("snapshot_required"))
+        self.assertEqual(body.get("committed_snapshot_version", ""), "")
 
     # 3. BLOCK_ADD with single spec
     def test_03_block_add(self):
@@ -585,7 +646,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t03",
             )
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertFalse(body.get("snapshot_required"))
 
     # 4. BLOCK_ADD then query: spec name/uri should match what was sent
     def test_04_block_add_then_query(self):
@@ -650,7 +714,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t05b",
             )
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertFalse(body.get("snapshot_required"))
 
         resp = self.client.get_cache_location({
             "trace_id": "t05_query",
@@ -701,7 +768,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t05b_add",
             )
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertFalse(body.get("snapshot_required"))
 
         resp = self.client.get_cache_location({
             "trace_id": "t05b_query",
@@ -755,22 +825,28 @@ class EventReportFunctionalTest(unittest.TestCase):
 
     # 7. BLOCK_DELETE on missing key/medium is a no-op (idempotent)
     def test_07_block_delete_nonexistent(self):
+        missing_keys = [99_997, 99_998, 99_999]
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_delete(99999, "mem", ["spec_4096"])],
-                trace_id="t07",
+                [
+                    _ev_block_delete(key, "mem", ["spec_4096"])
+                    for key in missing_keys
+                ],
+                trace_id="t07_three_missing_blocks",
             ),
             check_ok=False,
         )
         self.assertEqual(body["header"]["status"]["code"], "OK")
-        _wait_for_block_spec_names(
-            self.client,
-            self.instance_id,
-            99999,
-            set(),
-            "t07_query_missing",
-        )
+        self.assertEqual(body.get("item_results", []), [])
+        for key in missing_keys:
+            _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                key,
+                set(),
+                f"t07_query_missing_{key}",
+            )
 
     # 8. HOST_DOWN cleans up all mediums under the host
     def test_08_host_down(self):
@@ -850,38 +926,75 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t10",
             )
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertFalse(body.get("snapshot_required"))
 
     # 11. Mixed batch: register + add + heartbeat in a single RPC
     def test_11_mixed_batch(self):
-        host = "192.168.1.230:8080"
-        block_key = 9030
+        host = f"mixed-batch-{time.time_ns()}:8080"
+        block_key = 9_030_000_000 + time.time_ns() % 1_000_000_000
+        reported_uri = _build_event_report_uri(
+            host, "mem", {"source": "first_delta"}
+        )
         events = [
             _ev_node_register(["mem"]),
-            _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
+            _ev_block_add(
+                block_key,
+                "mem",
+                _make_single_spec("spec_4096", reported_uri),
+            ),
             _ev_heartbeat({"phase": "boot"}),
         ]
-        self.client.report_event(
-            _make_request(self.instance_id, host, events[:1], trace_id="t11_register")
-        )
-        self.client.report_event(
-            _make_request(
-                self.instance_id, host,
-                [_ev_block_snapshot([])],
-                trace_id="t11_initial_snapshot",
-            )
-        )
         body = self.client.report_event(
-            _make_request(self.instance_id, host, events[1:], trace_id="t11")
+            _make_request(self.instance_id, host, events, trace_id="t11")
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        version = body["committed_snapshot_version"]
+        self.assertEqual(len(version), 32)
+        self.assertFalse(body.get("snapshot_required"))
+
+        specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            {"spec_4096"},
+            "t11_query_first_delta",
+        )
+        _assert_reporter_scope(
+            self,
+            specs[0]["uri"],
+            reported_uri,
+            self.instance_id,
+            host,
+            "mem",
+            version,
+        )
+
+        host_state = self.client.get_host_cache_state({
+            "trace_id": "t11_get_host_cache_state",
+            "instance_id": self.instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        matches = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in host_state.get("hosts", [])
+        }
+        self.assertEqual(matches.get(host), 1)
 
     # 12. Empty events array: should be a no-op success
     def test_12_empty_batch(self):
         body = self.client.report_event(
             _make_request(self.instance_id, self.HOST, [], trace_id="t12")
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertEqual(body.get("item_results", []), [])
+        self.assertEqual(body.get("committed_snapshot_version", ""), "")
+        self.assertFalse(body.get("snapshot_required"))
+        self.assertEqual(body.get("retry_after_ms", "0"), "0")
+        self.assertEqual(body.get("extra_info"), self.INSTANCE_GROUP_EXTRA_INFO)
 
     # 13. Missing block_add params: server must surface a per-item failure
     def test_13_block_add_missing_params(self):
@@ -893,8 +1006,8 @@ class EventReportFunctionalTest(unittest.TestCase):
             ),
             check_ok=False,
         )
-        self.assertIn("header", body)
-        self.assertIn("item_results", body)
+        self.assertEqual(body["header"]["status"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(body.get("item_results"), ["INVALID_ARGUMENT"])
 
     # 14. Empty top-level host_ip_port: request-level validation must reject
     def test_14_missing_host_ip_port(self):
@@ -908,7 +1021,8 @@ class EventReportFunctionalTest(unittest.TestCase):
             },
             check_ok=False,
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "INVALID_ARGUMENT")
+        self.assertEqual(body.get("item_results", []), [])
 
     # 15. StartWriteCacheWithMinReplica: event report eviction with min_replica_count=2
     def test_15_start_write_cache_with_min_replica(self):
@@ -999,6 +1113,28 @@ class EventReportFunctionalTest(unittest.TestCase):
             _snapshot_version_from_uri(self, target_specs[0]["uri"]),
             committed_token,
         )
+        target_backend_specs = _query_block_specs_by_backend(
+            self.client,
+            instance_id,
+            block_key,
+            "ST_EVENT_REPORT_L2",
+            "t16a_target_backend_positive",
+        )
+        self.assertEqual(
+            {spec.get("name") for spec in target_backend_specs},
+            {"spec_4096"},
+        )
+        target_host_state = self.client.get_host_cache_state({
+            "trace_id": "t16a_target_host_state_positive",
+            "instance_id": instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        target_prefixes = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in target_host_state.get("hosts", [])
+        }
+        self.assertEqual(target_prefixes.get(host), 1)
 
         self.client.report_event(
             _make_request(
@@ -1094,6 +1230,32 @@ class EventReportFunctionalTest(unittest.TestCase):
             [],
             "automatic heartbeat timeout must hide the committed location",
         )
+        self.assertEqual(
+            _query_block_specs_by_backend(
+                self.client,
+                instance_id,
+                block_key,
+                "ST_EVENT_REPORT_L2",
+                "t16a_backend_query_hidden",
+            ),
+            [],
+            "backend-selected query must apply the same liveness gate",
+        )
+        hidden_host_state = self.client.get_host_cache_state({
+            "trace_id": "t16a_host_state_hidden",
+            "instance_id": instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        hidden_prefixes = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in hidden_host_state.get("hosts", [])
+        }
+        self.assertEqual(
+            hidden_prefixes.get(host, 0),
+            0,
+            "GetHostCacheState must not count an unavailable reporter",
+        )
         _wait_for_block_spec_names(
             self.client,
             instance_id,
@@ -1172,6 +1334,28 @@ class EventReportFunctionalTest(unittest.TestCase):
             _snapshot_version_from_uri(self, recovered_delta_specs[0]["uri"]),
             committed_token,
         )
+        recovered_backend_specs = _query_block_specs_by_backend(
+            self.client,
+            instance_id,
+            block_key,
+            "ST_EVENT_REPORT_L2",
+            "t16a_backend_query_recovered",
+        )
+        self.assertEqual(
+            {spec.get("name") for spec in recovered_backend_specs},
+            {"spec_4096"},
+        )
+        recovered_host_state = self.client.get_host_cache_state({
+            "trace_id": "t16a_host_state_recovered",
+            "instance_id": instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        recovered_prefixes = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in recovered_host_state.get("hosts", [])
+        }
+        self.assertEqual(recovered_prefixes.get(host), 1)
 
     # 16b. Heartbeat timeout exceeds cleanup_grace_ms -> CleanupHostLocations triggered.
     def test_16b_heartbeat_exceeds_grace_triggers_cleanup(self):
@@ -1265,8 +1449,9 @@ class EventReportFunctionalTest(unittest.TestCase):
             "t16b_old_data_hidden_after_unregister",
         )
 
-        # Registration and heartbeat only recreate liveness state. They must
-        # not restore a token left in Redis/meta cache from the old lifecycle.
+        # Registration and heartbeat only recreate process-local liveness
+        # state. The old committed generation is not restored, although
+        # already-persisted cache metadata may remain as a soft candidate.
         reregister = self.client.report_event(
             _make_request(
                 instance_id,
@@ -1287,32 +1472,55 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertTrue(heartbeat.get("snapshot_required"))
         self.assertEqual(heartbeat.get("committed_snapshot_version", ""), "")
-        _wait_for_block_spec_names(
+        historical_specs = _query_block_specs(
             self.client,
             instance_id,
             block_key,
-            set(),
-            "t16b_register_heartbeat_do_not_restore",
+            "t16b_register_may_reuse_historical_cache",
+        )
+        self.assertIn(
+            {spec.get("name") for spec in historical_specs},
+            (set(), {"before_cleanup"}),
         )
 
-        rejected_delta = self.client.report_event(
+        # Refresh liveness immediately before the delta so the following
+        # assertion changes only the delta/snapshot condition.
+        heartbeat = self.client.report_event(
+            _make_request(
+                instance_id,
+                host,
+                [_ev_heartbeat({"phase": "before_delta_without_snapshot"})],
+                trace_id="t16b_refresh_heartbeat_before_delta",
+            )
+        )
+        self.assertTrue(heartbeat.get("snapshot_required"))
+
+        delta_key = block_key + 3
+        accepted_delta = self.client.report_event(
             _make_request(
                 instance_id,
                 host,
                 [_ev_block_add(
-                    block_key,
+                    delta_key,
                     "mem",
                     _make_single_spec(
                         "delta_without_snapshot",
                         _build_event_report_uri(host, "mem"),
                     ),
                 )],
-                trace_id="t16b_delta_requires_snapshot",
-            ),
-            check_ok=False,
+                trace_id="t16b_delta_without_snapshot",
+            )
         )
         self.assertEqual(
-            rejected_delta["header"]["status"]["code"], "SNAPSHOT_REQUIRED"
+            accepted_delta["header"]["status"]["code"], "OK"
+        )
+        self.assertFalse(accepted_delta.get("snapshot_required"))
+        _wait_for_block_spec_names(
+            self.client,
+            instance_id,
+            delta_key,
+            {"delta_without_snapshot"},
+            "t16b_delta_without_snapshot_visible",
         )
 
         recovered_snapshot = self.client.report_event(
@@ -1349,6 +1557,13 @@ class EventReportFunctionalTest(unittest.TestCase):
             omitted_key,
             set(),
             "t16b_omitted_old_token_remains_hidden",
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            instance_id,
+            delta_key,
+            set(),
+            "t16b_delta_omitted_by_snapshot_is_reclaimed",
         )
 
     # 16. GetHostCacheState — per-host prefix match verification
@@ -1619,13 +1834,12 @@ class EventReportFunctionalTest(unittest.TestCase):
                     ),
                 )],
                 trace_id="t19_delta_before_snapshot",
-            ),
-            check_ok=False,
+            )
         )
-        self.assertEqual(
-            delta["header"]["status"]["code"],
-            "SNAPSHOT_REQUIRED",
-        )
+        self.assertEqual(delta["header"]["status"]["code"], "OK")
+        delta_version = delta["committed_snapshot_version"]
+        self.assertEqual(len(delta_version), 32)
+        self.assertFalse(delta.get("snapshot_required"))
 
         duplicate = self.client.report_event(
             _make_request(
@@ -1646,8 +1860,10 @@ class EventReportFunctionalTest(unittest.TestCase):
             duplicate["header"]["status"]["code"],
             "INVALID_ARGUMENT",
         )
-        self.assertEqual(duplicate.get("committed_snapshot_version", ""), "")
-        self.assertTrue(duplicate.get("snapshot_required"))
+        self.assertEqual(
+            duplicate.get("committed_snapshot_version", ""), delta_version
+        )
+        self.assertFalse(duplicate.get("snapshot_required"))
 
         committed = self.client.report_event(
             _make_request(
@@ -1692,7 +1908,83 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(malformed.get("committed_snapshot_version", ""), "")
         self.assertTrue(malformed.get("snapshot_required"))
 
-    def test_20_host_down_then_reregister_requires_new_snapshot(self):
+        invalid_reporter = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                "192.168.1.245#8080",
+                [_ev_node_register(["mem"])],
+                trace_id="t19_invalid_reporter_delimiter",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            invalid_reporter["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+
+        invalid_medium_delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    "9193",
+                    "mem#invalid",
+                    _make_single_spec(
+                        "linear_0", _build_event_report_uri(host, "mem")
+                    ),
+                )],
+                trace_id="t19_invalid_delta_medium_delimiter",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            invalid_medium_delta["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(
+            invalid_medium_delta.get("committed_snapshot_version"),
+            committed["committed_snapshot_version"],
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            "9193",
+            set(),
+            "t19_invalid_delta_medium_query",
+        )
+
+        invalid_medium_snapshot = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([{
+                    "block_key": "9194",
+                    "medium": "mem#invalid",
+                    "specs": _make_single_spec(
+                        "linear_0", _build_event_report_uri(host, "mem")
+                    ),
+                }])],
+                trace_id="t19_invalid_snapshot_medium_delimiter",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            invalid_medium_snapshot["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(
+            invalid_medium_snapshot.get("committed_snapshot_version"),
+            committed["committed_snapshot_version"],
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            "9194",
+            set(),
+            "t19_invalid_snapshot_medium_query",
+        )
+
+    def test_20_host_down_then_reregister_allows_first_delta(self):
         host = "192.168.1.244:8080"
         register = self.client.report_event(
             _make_request(
@@ -1735,7 +2027,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertTrue(reregister.get("snapshot_required"))
         self.assertEqual(reregister.get("committed_snapshot_version", ""), "")
 
-        rejected_delta = self.client.report_event(
+        first_delta = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
@@ -1746,14 +2038,13 @@ class EventReportFunctionalTest(unittest.TestCase):
                         "linear_0", _build_event_report_uri(host, "mem")
                     ),
                 )],
-                trace_id="t20_delta_before_resnapshot",
-            ),
-            check_ok=False,
+                trace_id="t20_delta_without_resnapshot",
+            )
         )
-        self.assertEqual(
-            rejected_delta["header"]["status"]["code"],
-            "SNAPSHOT_REQUIRED",
-        )
+        self.assertEqual(first_delta["header"]["status"]["code"], "OK")
+        delta_token = first_delta["committed_snapshot_version"]
+        self.assertEqual(len(delta_token), 32)
+        self.assertNotEqual(first_token, delta_token)
 
         second = self.client.report_event(
             _make_request(
@@ -1836,19 +2127,19 @@ class EventReportFunctionalTest(unittest.TestCase):
             duplicate["header"]["status"]["code"], "INVALID_ARGUMENT"
         )
 
-        still_requires_snapshot = self.client.report_event(
+        accepted_delta = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
                 [delta],
                 trace_id="t21_delta_after_invalid_requests",
-            ),
-            check_ok=False,
+            )
         )
         self.assertEqual(
-            still_requires_snapshot["header"]["status"]["code"],
-            "SNAPSHOT_REQUIRED",
+            accepted_delta["header"]["status"]["code"],
+            "OK",
         )
+        self.assertEqual(len(accepted_delta["committed_snapshot_version"]), 32)
 
         committed = self.client.report_event(
             _make_request(
@@ -2755,8 +3046,16 @@ class EventReportFunctionalTest(unittest.TestCase):
             version,
         )
 
-    def test_26_unregistered_and_snapshot_required_errors_are_distinct(self):
+    def test_26_unregistered_errors_remain_distinct_from_delta_only_mode(self):
         host = "192.168.1.250:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_host_down()],
+                trace_id="t26_reset_reporter",
+            )
+        )
         heartbeat = self.client.report_event(
             _make_request(
                 self.instance_id,
@@ -2814,7 +3113,35 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertTrue(registered.get("snapshot_required"))
 
-        missing_snapshot = self.client.report_event(
+        invalid_first_delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(25_000_251, "mem", [])],
+                trace_id="t26_invalid_first_delta",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            invalid_first_delta["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(
+            invalid_first_delta.get("committed_snapshot_version", ""), ""
+        )
+        self.assertTrue(invalid_first_delta.get("snapshot_required"))
+        self.assertEqual(
+            invalid_first_delta.get("item_results"), ["INVALID_ARGUMENT"]
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            25_000_251,
+            set(),
+            "t26_invalid_first_delta_has_no_side_effect",
+        )
+
+        first_delta = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
@@ -2826,12 +3153,58 @@ class EventReportFunctionalTest(unittest.TestCase):
                     ),
                 )],
                 trace_id="t26_registered_without_snapshot",
-            ),
-            check_ok=False,
+            )
+        )
+        self.assertEqual(first_delta["header"]["status"]["code"], "OK")
+        self.assertFalse(first_delta.get("snapshot_required"))
+        delta_version = first_delta["committed_snapshot_version"]
+        self.assertEqual(len(delta_version), 32)
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            25_000_250,
+            {"linear_0"},
+            "t26_delta_without_snapshot_visible",
+        )
+        host_state = self.client.get_host_cache_state({
+            "trace_id": "t26_delta_only_host_state",
+            "instance_id": self.instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [25_000_250],
+        })
+        matches = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in host_state.get("hosts", [])
+        }
+        self.assertEqual(matches.get(host), 1)
+        heartbeat = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_heartbeat({"mode": "delta_only"})],
+                trace_id="t26_delta_only_heartbeat",
+            )
         )
         self.assertEqual(
-            missing_snapshot["header"]["status"]["code"],
-            "SNAPSHOT_REQUIRED",
+            heartbeat.get("committed_snapshot_version"), delta_version
+        )
+        deletion = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_delete(25_000_250, "mem", ["linear_0"])],
+                trace_id="t26_delta_only_delete",
+            )
+        )
+        self.assertEqual(
+            deletion.get("committed_snapshot_version"), delta_version
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            25_000_250,
+            set(),
+            "t26_delta_only_delete_visible",
         )
 
     def test_27_snapshot_rejects_canonical_duplicate_block_keys(self):
@@ -2923,6 +3296,618 @@ class EventReportFunctionalTest(unittest.TestCase):
                 _snapshot_version_from_uri(self, spec["uri"]), version
             )
 
+    def test_28_concurrent_first_deltas_share_one_generation(self):
+        host = f"first-delta-race-{time.time_ns()}:8080"
+        first_key = 28_000_000_000 + time.time_ns() % 1_000_000_000
+        writer_count = 24
+
+        def send_first_delta(writer):
+            client = KVCMClient(BASE_URL, ADMIN_URL)
+            try:
+                block_key = first_key + writer
+                uri = _build_event_report_uri(
+                    host, "mem", {"writer": str(writer)}
+                )
+                return client.report_event(
+                    _make_request(
+                        self.instance_id,
+                        host,
+                        [_ev_block_add(
+                            block_key,
+                            "mem",
+                            _make_single_spec(f"writer_{writer}", uri),
+                        )],
+                        trace_id=f"t28_delta_{writer}",
+                    )
+                )
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=writer_count) as pool:
+            responses = list(pool.map(send_first_delta, range(writer_count)))
+
+        versions = {
+            response.get("committed_snapshot_version", "")
+            for response in responses
+        }
+        self.assertEqual(len(versions), 1, responses)
+        version = versions.pop()
+        self.assertEqual(len(version), 32)
+        for response in responses:
+            self.assertEqual(
+                response["header"]["status"]["code"], "OK", response
+            )
+            self.assertFalse(response.get("snapshot_required"))
+
+        for writer in range(writer_count):
+            specs = _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                first_key + writer,
+                {f"writer_{writer}"},
+                f"t28_query_{writer}",
+            )
+            self.assertEqual(
+                _snapshot_version_from_uri(self, specs[0]["uri"]), version
+            )
+
+        host_state = self.client.get_host_cache_state({
+            "trace_id": "t28_get_host_cache_state",
+            "instance_id": self.instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [
+                first_key + writer for writer in range(writer_count)
+            ],
+        })
+        matches = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in host_state.get("hosts", [])
+        }
+        self.assertEqual(matches.get(host), writer_count)
+
+    def test_29_register_snapshot_and_heartbeat_in_one_request(self):
+        host = f"snapshot-boot-{time.time_ns()}:8080"
+        block_key = 29_000_000_000 + time.time_ns() % 1_000_000_000
+        reported_uri = _build_event_report_uri(
+            host, "gpu", {"source": "boot_snapshot"}
+        )
+        response = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_node_register(["gpu"]),
+                    _ev_block_snapshot([{
+                        "block_key": block_key,
+                        "medium": "gpu",
+                        "specs": _make_single_spec(
+                            "gpu_0", reported_uri
+                        ),
+                    }]),
+                    _ev_heartbeat({"phase": "boot"}),
+                ],
+                trace_id="t29_register_snapshot_heartbeat",
+            )
+        )
+        self.assertEqual(response["header"]["status"]["code"], "OK")
+        self.assertEqual(response.get("item_results", []), [])
+        version = response["committed_snapshot_version"]
+        self.assertEqual(len(version), 32)
+        self.assertFalse(response.get("snapshot_required"))
+        specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            {"gpu_0"},
+            "t29_query",
+        )
+        _assert_reporter_scope(
+            self,
+            specs[0]["uri"],
+            reported_uri,
+            self.instance_id,
+            host,
+            "gpu",
+            version,
+        )
+
+    def test_30_delta_before_explicit_register_succeeds(self):
+        host = f"wrong-order-{time.time_ns()}:8080"
+        block_key = 30_000_000_000 + time.time_ns() % 1_000_000_000
+        reported_uri = _build_event_report_uri(
+            host, "mem", {"source": "ordered_retry"}
+        )
+        response = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_block_add(
+                        block_key,
+                        "mem",
+                        _make_single_spec("linear_0", reported_uri),
+                    ),
+                    _ev_node_register(["mem"]),
+                    _ev_heartbeat({"phase": "boot"}),
+                ],
+                trace_id="t30_delta_before_register",
+            ),
+        )
+        self.assertEqual(response["header"]["status"]["code"], "OK")
+        self.assertEqual(response.get("item_results", []), [])
+        self.assertEqual(len(response["committed_snapshot_version"]), 32)
+        self.assertFalse(response.get("snapshot_required"))
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            {"linear_0"},
+            "t30_query_without_register",
+        )
+
+    def test_31_first_delete_without_snapshot_creates_reusable_generation(self):
+        host = f"first-delete-{time.time_ns()}:8080"
+        block_key = 31_000_000_000 + time.time_ns() % 1_000_000_000
+        deleted = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_delete(block_key, "mem", ["linear_0"])],
+                trace_id="t31_first_delete",
+            )
+        )
+        version = deleted["committed_snapshot_version"]
+        self.assertEqual(len(version), 32)
+        self.assertFalse(deleted.get("snapshot_required"))
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            set(),
+            "t31_query_after_missing_delete",
+        )
+
+        empty_host_state = self.client.get_host_cache_state({
+            "trace_id": "t31_empty_host_state",
+            "instance_id": self.instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        empty_matches = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in empty_host_state.get("hosts", [])
+        }
+        self.assertNotIn(host, empty_matches)
+
+        reported_uri = _build_event_report_uri(
+            host, "mem", {"source": "after_first_delete"}
+        )
+        added = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    block_key,
+                    "mem",
+                    _make_single_spec("linear_0", reported_uri),
+                )],
+                trace_id="t31_add_after_first_delete",
+            )
+        )
+        self.assertEqual(added["committed_snapshot_version"], version)
+        self.assertFalse(added.get("snapshot_required"))
+        specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            {"linear_0"},
+            "t31_query_after_add",
+        )
+        _assert_reporter_scope(
+            self,
+            specs[0]["uri"],
+            reported_uri,
+            self.instance_id,
+            host,
+            "mem",
+            version,
+        )
+
+        visible_host_state = self.client.get_host_cache_state({
+            "trace_id": "t31_visible_host_state",
+            "instance_id": self.instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": [block_key],
+        })
+        visible_matches = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in visible_host_state.get("hosts", [])
+        }
+        self.assertEqual(visible_matches.get(host), 1)
+
+    def test_32_post_snapshot_delta_survives_stale_cleanup(self):
+        host = f"post-snapshot-delta-{time.time_ns()}:8080"
+        block_key = 32_000_000_000 + time.time_ns() % 1_000_000_000
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem"])],
+                trace_id="t32_register",
+            )
+        )
+
+        old_tp0_uri = _build_event_report_uri(
+            host, "mem", {"source": "old_tp0"}
+        )
+        old_tp1_uri = _build_event_report_uri(
+            host, "mem", {"source": "old_tp1"}
+        )
+        baseline = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([{
+                    "block_key": block_key,
+                    "medium": "mem",
+                    "specs": [
+                        {"name": "tp0", "uri": old_tp0_uri},
+                        {"name": "tp1", "uri": old_tp1_uri},
+                    ],
+                }])],
+                trace_id="t32_baseline",
+            )
+        )
+        old_version = baseline["committed_snapshot_version"]
+
+        retry_deadline = (
+            time.monotonic() + SNAPSHOT_MIN_INTERVAL_MS / 1000.0 + 1.0
+        )
+        while True:
+            omitted = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_snapshot([])],
+                    trace_id="t32_omit_block",
+                ),
+                check_ok=False,
+            )
+            if omitted["header"]["status"]["code"] == "OK":
+                break
+            self.assertEqual(
+                omitted["header"]["status"]["code"],
+                "SNAPSHOT_RATE_LIMITED",
+            )
+            self.assertLess(time.monotonic(), retry_deadline)
+            time.sleep(
+                min(
+                    max(int(omitted.get("retry_after_ms", 1)), 1) / 1000.0,
+                    0.1,
+                )
+            )
+
+        current_version = omitted["committed_snapshot_version"]
+        self.assertNotEqual(old_version, current_version)
+        new_tp0_uri = _build_event_report_uri(
+            host, "mem", {"source": "new_tp0"}
+        )
+        delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    block_key,
+                    "mem",
+                    _make_single_spec("tp0", new_tp0_uri),
+                )],
+                trace_id="t32_post_commit_delta",
+            )
+        )
+        self.assertEqual(
+            delta.get("committed_snapshot_version"), current_version
+        )
+
+        # The cleanup may run before or after this delta. The omitted tp1 is
+        # therefore allowed to be already gone or temporarily stale, but the
+        # successful post-commit tp0 write must never be reclaimed with it.
+        deadline = time.monotonic() + 3.0
+        while True:
+            specs = _query_block_specs(
+                self.client,
+                self.instance_id,
+                block_key,
+                "t32_query_after_cleanup",
+            )
+            by_name = {spec["name"]: spec for spec in specs}
+            tp0 = by_name.get("tp0")
+            if (
+                tp0
+                and _uri_identity_without_snapshot_version(tp0["uri"])
+                == _uri_identity_without_snapshot_version(new_tp0_uri)
+            ):
+                break
+            self.assertLess(
+                time.monotonic(),
+                deadline,
+                f"post-snapshot delta disappeared: {specs}",
+            )
+            time.sleep(0.05)
+        self.assertEqual(
+            _snapshot_version_from_uri(self, tp0["uri"]), current_version
+        )
+        stabilization_deadline = time.monotonic() + 1.0
+        while time.monotonic() < stabilization_deadline:
+            specs = _query_block_specs(
+                self.client,
+                self.instance_id,
+                block_key,
+                "t32_query_during_cleanup_window",
+            )
+            by_name = {spec["name"]: spec for spec in specs}
+            tp0 = by_name.get("tp0")
+            self.assertIsNotNone(
+                tp0,
+                f"post-snapshot delta was reclaimed after becoming visible: {specs}",
+            )
+            self.assertEqual(
+                _uri_identity_without_snapshot_version(tp0["uri"]),
+                _uri_identity_without_snapshot_version(new_tp0_uri),
+            )
+            self.assertEqual(
+                _snapshot_version_from_uri(self, tp0["uri"]),
+                current_version,
+            )
+            time.sleep(0.05)
+
+    def test_33_payload_shape_validation_is_fail_closed_without_side_effects(self):
+        host = f"payload-validation-{time.time_ns()}:8080"
+        block_key = 33_000_000_000 + time.time_ns() % 1_000_000_000
+        lazy_restore_key = block_key + 100
+
+        def assert_single_invalid(body):
+            self.assertEqual(
+                body.get("header", {}).get("status", {}).get("code"),
+                "INVALID_ARGUMENT",
+                body,
+            )
+            self.assertEqual(body.get("item_results"), ["INVALID_ARGUMENT"])
+
+        # event_type and its oneof payload must agree. A malformed REGISTER
+        # must not accidentally register the reporter.
+        missing_register_payload = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [{"event_type": "EVENT_NODE_REGISTER"}],
+                trace_id="t33_register_missing_payload",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(missing_register_payload)
+        wrong_register_payload = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [{
+                    "event_type": "EVENT_NODE_REGISTER",
+                    "heartbeat": {"system_status": {}},
+                }],
+                trace_id="t33_register_wrong_payload",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(wrong_register_payload)
+
+        same_batch_wrong_register = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    {
+                        "event_type": "EVENT_NODE_REGISTER",
+                        "heartbeat": {"system_status": {}},
+                    },
+                    _ev_block_add(
+                        lazy_restore_key,
+                        "mem",
+                        _make_single_spec(
+                            "valid_after_bad_register",
+                            _build_event_report_uri(host, "mem"),
+                        ),
+                    ),
+                ],
+                trace_id="t33_wrong_register_then_add_same_batch",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            same_batch_wrong_register["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(
+            same_batch_wrong_register.get("item_results"),
+            ["INVALID_ARGUMENT", "OK"],
+        )
+        self.assertFalse(same_batch_wrong_register.get("snapshot_required"))
+        self.assertEqual(
+            {spec.get("name") for spec in _query_block_specs(
+                self.client,
+                self.instance_id,
+                lazy_restore_key,
+                "t33_valid_add_after_wrong_register_visible",
+            )},
+            {"valid_after_bad_register"},
+        )
+
+        registered = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem"])],
+                trace_id="t33_valid_register",
+            )
+        )
+        self.assertFalse(registered.get("snapshot_required"))
+        self.assertEqual(
+            registered.get("committed_snapshot_version"),
+            same_batch_wrong_register.get("committed_snapshot_version"),
+        )
+
+        missing_heartbeat_payload = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [{"event_type": "EVENT_HEARTBEAT"}],
+                trace_id="t33_heartbeat_missing_payload",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(missing_heartbeat_payload)
+
+        baseline_uri = _build_event_report_uri(
+            host, "mem", {"source": "baseline"}
+        )
+        baseline = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    block_key,
+                    "mem",
+                    _make_single_spec("baseline", baseline_uri),
+                )],
+                trace_id="t33_valid_baseline",
+            )
+        )
+        baseline_version = baseline["committed_snapshot_version"]
+        self.assertEqual(len(baseline_version), 32)
+        self.assertEqual(
+            {spec.get("name") for spec in _query_block_specs(
+                self.client,
+                self.instance_id,
+                block_key,
+                "t33_baseline_visible",
+            )},
+            {"baseline"},
+        )
+
+        # A malformed HOST_DOWN must not alter liveness. The request-level
+        # HOST_DOWN exclusivity check must also happen before any event runs.
+        missing_host_down_payload = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [{"event_type": "EVENT_HOST_DOWN"}],
+                trace_id="t33_host_down_missing_payload",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(missing_host_down_payload)
+
+        mixed_host_down = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_host_down(), _ev_heartbeat({})],
+                trace_id="t33_host_down_mixed_request",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            mixed_host_down["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(mixed_host_down.get("item_results", []), [])
+        self.assertEqual(
+            {spec.get("name") for spec in _query_block_specs(
+                self.client,
+                self.instance_id,
+                block_key,
+                "t33_still_visible_after_bad_host_down",
+            )},
+            {"baseline"},
+        )
+
+        # Invalid mutation parameters do not advance the generation and do
+        # not modify either the target block or existing metadata.
+        invalid_add_key = block_key + 1
+        client_version_uri = (
+            _build_event_report_uri(host, "mem")
+            + "?s_version="
+            + "a" * 32
+        )
+        invalid_add = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    invalid_add_key,
+                    "mem",
+                    _make_single_spec("client_version", client_version_uri),
+                )],
+                trace_id="t33_add_client_version",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(invalid_add)
+        self.assertEqual(
+            invalid_add.get("committed_snapshot_version"),
+            baseline_version,
+        )
+        self.assertEqual(
+            _query_block_specs(
+                self.client,
+                self.instance_id,
+                invalid_add_key,
+                "t33_invalid_add_absent",
+            ),
+            [],
+        )
+
+        invalid_delete = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_delete(block_key, "mem", [])],
+                trace_id="t33_delete_empty_names",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(invalid_delete)
+        invalid_snapshot = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([{
+                    "block_key": block_key,
+                    "medium": "mem",
+                    "specs": [],
+                }])],
+                trace_id="t33_snapshot_empty_specs",
+            ),
+            check_ok=False,
+        )
+        assert_single_invalid(invalid_snapshot)
+        self.assertEqual(
+            invalid_snapshot.get("committed_snapshot_version"),
+            baseline_version,
+        )
+        remaining = _query_block_specs(
+            self.client,
+            self.instance_id,
+            block_key,
+            "t33_baseline_preserved",
+        )
+        self.assertEqual(
+            {spec.get("name") for spec in remaining},
+            {"baseline"},
+        )
+        self.assertEqual(
+            _snapshot_version_from_uri(self, remaining[0]["uri"]),
+            baseline_version,
+        )
+
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------
@@ -2952,7 +3937,8 @@ class EventReportBenchTest(unittest.TestCase):
 
     @staticmethod
     def _ensure_host_registered(client, instance_id, host):
-        # Register and establish the initial snapshot so deltas are accepted.
+        # The benchmark uses an empty deterministic baseline; production
+        # deltas are accepted immediately after registration.
         client.report_event(
             _make_request(instance_id, host,
                           [_ev_node_register(["mem"])],
@@ -3087,6 +4073,96 @@ class EventReportBenchTest(unittest.TestCase):
             print(f"  Latency avg:   {statistics.mean(latencies):.2f}ms")
         self.assertEqual(len(errors), 0, f"Bench had errors: {errors[:5]}")
 
+    # 19. Typical full-snapshot capacity: 10 reporters x 5000 blocks.
+    def test_19_ten_reporters_full_snapshot_capacity(self):
+        host_count = 10
+        blocks_per_host = 5000
+        snapshot_latencies = []
+
+        for host_index in range(host_count):
+            host = f"192.168.2.{host_index + 1}:8080"
+            base_key = 30_000_000 + host_index * 10_000
+            register = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_node_register(["mem"])],
+                    trace_id=f"bench_snapshot_register_{host_index}",
+                )
+            )
+            self.assertTrue(register.get("snapshot_required"))
+
+            blocks = [
+                {
+                    "block_key": base_key + offset,
+                    "medium": "mem",
+                    "specs": _make_single_spec(
+                        "spec_4096",
+                        _build_event_report_uri(
+                            host,
+                            "mem",
+                            {"block": str(base_key + offset)},
+                        ),
+                    ),
+                }
+                for offset in range(blocks_per_host)
+            ]
+            start = time.monotonic()
+            snapshot = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_snapshot(blocks)],
+                    trace_id=f"bench_snapshot_{host_index}",
+                )
+            )
+            snapshot_latencies.append((time.monotonic() - start) * 1000)
+            version = snapshot.get("committed_snapshot_version", "")
+            self.assertEqual(len(version), 32)
+            self.assertFalse(snapshot.get("snapshot_required"))
+
+            # Validate data, not only the ReportEvent status. The first,
+            # middle and last item catch truncation and batching boundaries.
+            for offset in (0, blocks_per_host // 2, blocks_per_host - 1):
+                block_key = base_key + offset
+                specs = _query_block_specs(
+                    self.client,
+                    self.instance_id,
+                    block_key,
+                    f"bench_snapshot_query_{host_index}_{offset}",
+                )
+                self.assertEqual(
+                    {spec.get("name") for spec in specs},
+                    {"spec_4096"},
+                )
+                self.assertEqual(len(specs), 1)
+                _assert_reporter_scope(
+                    self,
+                    specs[0]["uri"],
+                    _build_event_report_uri(
+                        host, "mem", {"block": str(block_key)}
+                    ),
+                    self.instance_id,
+                    host,
+                    "mem",
+                    version,
+                )
+
+        ordered_latencies = sorted(snapshot_latencies)
+        print("\n[BENCH] Full snapshot capacity:")
+        print(
+            f"  Reporters:    {host_count}, "
+            f"blocks/reporter: {blocks_per_host}, "
+            f"total blocks: {host_count * blocks_per_host}"
+        )
+        print(
+            f"  Latency p50: {self._percentile(ordered_latencies, 50):.2f}ms"
+        )
+        print(
+            f"  Latency p99: {self._percentile(ordered_latencies, 99):.2f}ms"
+        )
+        print(f"  Latency max: {max(ordered_latencies):.2f}ms")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Event Report ReportEvent HTTP integration tests")
@@ -3115,7 +4191,10 @@ def main():
     parser.add_argument(
         "--meta-storage-uri",
         default="",
-        help="Persistent local/Redis metadata URI used when creating the test instance group.",
+        help=(
+            "Metadata backend URI used when creating the test instance group. "
+            "Use redis:// for tests that restart the KVCM process."
+        ),
     )
 
     args, _ = parser.parse_known_args()

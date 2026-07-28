@@ -884,11 +884,10 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                   request->events_size());
 
     auto ec = cache_manager_->ReportEvent(request_context, request, response);
-    if (ec != EC_OK) {
-        KVCM_LOG_WARN("[traceId: %s] ReportEvent %s, ec=%d",
-                      request->trace_id().c_str(),
-                      (ec == EC_PARTIAL_OK) ? "partially failed" : "failed",
-                      ec);
+    // Partial failures are logged once with bounded per-type/error counts by
+    // CacheManager::ReportEvent. Keep this generic log for top-level failures.
+    if (ec != EC_OK && ec != EC_PARTIAL_OK) {
+        KVCM_LOG_WARN("[traceId: %s] ReportEvent failed, ec=%d", request->trace_id().c_str(), ec);
     }
     if (!request->instance_id().empty()) {
         response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));

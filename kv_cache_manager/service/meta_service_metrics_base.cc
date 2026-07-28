@@ -1,7 +1,12 @@
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
 
+#include <array>
+#include <cstdint>
+
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
+#include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/util/common.h"
 
 #ifndef KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_
@@ -63,10 +68,18 @@ void MetaServiceMetricsBase::InvalidateCollectorCache(const std::string &instanc
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetClusterInfo, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(ReportEvent, instance_id);
     KVCM_INVALIDATE_TYPED_METRICS_COLLECTOR_MAP_(ReportEvent, instance_id);
-    KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(EventBlockAdd, instance_id);
-    KVCM_INVALIDATE_TYPED_METRICS_COLLECTOR_MAP_(EventBlockAdd, instance_id);
-    KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(EventBlockDelete, instance_id);
-    KVCM_INVALIDATE_TYPED_METRICS_COLLECTOR_MAP_(EventBlockDelete, instance_id);
+    {
+        std::scoped_lock guard(mutex_ReportEventType_);
+        const std::string prefix = instance_id + "#";
+        auto &collectors = KVCM_METRICS_COLLECTOR_MAP_(ReportEventType);
+        for (auto iter = collectors.begin(); iter != collectors.end();) {
+            if (iter->first.compare(0, prefix.size(), prefix) == 0) {
+                iter = collectors.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+    }
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetHostCacheState, instance_id);
 }
 
@@ -120,6 +133,83 @@ std::string MetaServiceMetricsBase::MakeTypedCollectorKey(const std::string &ins
     return instance_id + "#" + type;
 }
 
+std::string MetaServiceMetricsBase::MakeEventTypeCollectorKey(const std::string &instance_id,
+                                                              const std::string &type,
+                                                              const std::string &event_type) {
+    return instance_id + "#" + type + "#" + event_type;
+}
+
+std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetEventTypeMetricsCollectorFromMap(
+    const std::string &instance_id, const std::string &type, const std::string &event_type) {
+    const std::string collector_key = MakeEventTypeCollectorKey(instance_id, type, event_type);
+    {
+        std::shared_lock read_guard(mutex_ReportEventType_);
+        auto iter = KVCM_METRICS_COLLECTOR_MAP_(ReportEventType).find(collector_key);
+        if (iter != KVCM_METRICS_COLLECTOR_MAP_(ReportEventType).end()) {
+            return iter->second;
+        }
+    }
+
+    std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
+    std::scoped_lock write_guard(mutex_ReportEventType_);
+    auto iter = KVCM_METRICS_COLLECTOR_MAP_(ReportEventType).find(collector_key);
+    if (iter != KVCM_METRICS_COLLECTOR_MAP_(ReportEventType).end()) {
+        return iter->second;
+    }
+    auto instance_group = registry_manager_->GetInstanceGroupName(instance_id);
+    if (instance_group.empty()) {
+        return nullptr;
+    }
+    MetricsTags tags = {
+        {"instance_group", instance_group}, {"instance_id", instance_id}, {"type", type}, {"event_type", event_type}};
+    auto collector = std::make_shared<EventReportMetricsCollector>(metrics_registry_, std::move(tags));
+    if (!collector->Init()) {
+        return nullptr;
+    }
+    KVCM_METRICS_COLLECTOR_MAP_(ReportEventType)[collector_key] = collector;
+    return collector;
+}
+
+std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetTypedMetricsCollectorForReportEventType(
+    const std::string &instance_id, const std::string &type, const std::string &event_type) {
+    return GetEventTypeMetricsCollectorFromMap(instance_id, type, event_type);
+}
+
+void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto::meta::ReportEventRequest &request,
+                                                                    const std::string &type,
+                                                                    RequestContext *request_context) {
+    if (request.instance_id().empty() || type.empty() || request_context == nullptr) {
+        return;
+    }
+
+    uint32_t event_type_mask = 0;
+    for (const auto &event : request.events()) {
+        const int event_type = static_cast<int>(event.event_type());
+        event_type_mask |=
+            1U << ((event_type >= proto::meta::EVENT_NODE_REGISTER && event_type <= proto::meta::EVENT_BLOCK_SNAPSHOT)
+                       ? event_type
+                       : 0);
+    }
+
+    static constexpr std::array<const char *, 7> kEventTypeTags = {
+        "unknown", "node_register", "block_add", "block_delete", "host_down", "heartbeat", "block_snapshot"};
+    for (size_t event_type = 0; event_type < kEventTypeTags.size(); ++event_type) {
+        if ((event_type_mask & (1U << event_type)) == 0) {
+            continue;
+        }
+        auto shared_collector =
+            GetTypedMetricsCollectorForReportEventType(request.instance_id(), type, kEventTypeTags[event_type]);
+        auto event_collector = std::dynamic_pointer_cast<EventReportMetricsCollector>(shared_collector);
+        if (event_collector) {
+            // The cached object owns the registry handles. Each request gets a
+            // lightweight view with the same handles but private sample state,
+            // avoiding both registry re-registration and cross-request races.
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(
+                std::make_shared<EventReportMetricsCollector>(*event_collector));
+        }
+    }
+}
+
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocation);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocationsByBackend);
@@ -130,11 +220,7 @@ KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(RemoveCache);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(TrimCache);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetClusterInfo);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
-KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
-KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 KVCM_DEFINE_TYPED_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
-KVCM_DEFINE_TYPED_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
-KVCM_DEFINE_TYPED_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
 
 } // namespace kv_cache_manager

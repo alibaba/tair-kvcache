@@ -162,12 +162,22 @@ KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `event_report.qps` | `rate(kvcm_event_report_request_counter[1m])` |
+| `event_report.error_qps` | `rate(kvcm_event_report_error_counter[1m])` |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
 | `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
 
 Prometheus 侧存储的是底层 *counter*（单调递增），KMonitor 的
 `*.qps` 值由 agent 在上报时计算。两种视图反映的是同一事件流，
 查询 Prometheus 时直接用 counter + `rate` 即可。
+
+`event_report.*` 按固定标签 `instance_group`、`instance_id`、`type` 和
+`event_type` 拆分。其中 `type` 为 `event_report_l1p5` 或
+`event_report_l2`，`event_type` 为协议定义的六种事件类型之一（未知值
+统一记为 `unknown`）。一个批量请求包含某事件类型时，该类型 QPS 计一次；
+同一请求内同类型的多个 event 不重复计数。`event_report.request_rt_us`
+记录整次 `ReportEvent` 请求的端到端耗时；请求失败时
+`event_report.error_qps` 按该请求包含的事件类型分别计一次。
 
 注：`data_storage.create_keys_qps` 在 Prom 侧也会以 gauge 形式
 导出"最近一次批次大小"（不是每秒速率）。每秒速率请使用

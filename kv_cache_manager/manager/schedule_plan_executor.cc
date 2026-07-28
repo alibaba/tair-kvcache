@@ -305,11 +305,13 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            for (const auto &loc_spec : iter->second->location_specs()) {
-                DataStorageUri uri(loc_spec.uri());
-                if (uri.Valid()) {
-                    std::string storage_unique_name = uri.GetHostName();
-                    delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
+            if (!task.metadata_only) {
+                for (const auto &loc_spec : iter->second->location_specs()) {
+                    DataStorageUri uri(loc_spec.uri());
+                    if (uri.Valid()) {
+                        std::string storage_unique_name = uri.GetHostName();
+                        delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
+                    }
                 }
             }
             cad_tasks.push_back({iter->first, CacheLocationStatus::CLS_DELETING});
@@ -612,8 +614,10 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
     }
     const auto *expected_location_values =
         task.expected_location_values.empty() ? nullptr : &task.expected_location_values;
-    return PrepareDeleteTaskImpl(
+    auto result = PrepareDeleteTaskImpl(
         task.instance_id, task.block_keys, &task.location_ids, expected_location_values, task.delay);
+    result.actual_task.metadata_only = task.metadata_only;
+    return result;
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult

@@ -22,6 +22,11 @@ namespace kv_cache_manager {
 
 class RequestContext : std::enable_shared_from_this<RequestContext> {
 public:
+    // All public KVCM service protocols use numeric value 1 for their OK enum.
+    // Keep the convention here so request-local observability does not mistake
+    // proto3's default UNSPECIFIED=0 for success.
+    static constexpr int kOkStatusCode = 1;
+
     RequestContext() = delete;
     explicit RequestContext(const std::string &trace_id);
     RequestContext(const std::string &trace_id, std::shared_ptr<MetricsCollector> metrics_collector);

@@ -38,6 +38,10 @@ class SnapshotUriUtils {
 public:
     inline static constexpr const char *kSnapshotVersionParam = "s_version";
 
+    static bool IsValidLocationIdComponent(const std::string &value) {
+        return !value.empty() && value.find('#') == std::string::npos;
+    }
+
     static size_t CountUriParam(const std::string &uri_text, const std::string &key) {
         const size_t query_begin = uri_text.find('?');
         if (query_begin == std::string::npos) {

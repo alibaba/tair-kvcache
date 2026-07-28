@@ -311,7 +311,8 @@ private:
     ErrorCode CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
                                             const std::string &snapshot_version,
                                             DataStorageType storage_type,
-                                            const std::shared_ptr<EventReportBackend> &event_backend);
+                                            const std::shared_ptr<EventReportBackend> &event_backend,
+                                            uint64_t snapshot_attempt_epoch = 0);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,

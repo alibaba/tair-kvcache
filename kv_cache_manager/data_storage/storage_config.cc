@@ -420,6 +420,10 @@ bool EventReportStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value)
                                 "snapshot_min_interval_ms",
                                 snapshot_min_interval_ms_,
                                 static_cast<int64_t>(kDefaultSnapshotMinIntervalMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "snapshot_delta_drain_timeout_ms",
+                                snapshot_delta_drain_timeout_ms_,
+                                static_cast<int64_t>(kDefaultSnapshotDeltaDrainTimeoutMs));
     return true;
 }
 
@@ -428,6 +432,7 @@ void EventReportStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
     Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
     Put(writer, "snapshot_min_interval_ms", snapshot_min_interval_ms_);
+    Put(writer, "snapshot_delta_drain_timeout_ms", snapshot_delta_drain_timeout_ms_);
 }
 
 bool EventReportStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -449,6 +454,10 @@ bool EventReportStorageSpec::ValidateRequiredFields(std::string &invalid_fields)
         valid = false;
         local_invalid_fields += "{snapshot_min_interval_ms}";
     }
+    if (snapshot_delta_drain_timeout_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{snapshot_delta_drain_timeout_ms}";
+    }
     if (!valid) {
         invalid_fields += "{EventReportStorageSpec: " + local_invalid_fields + "}";
     }
@@ -459,7 +468,8 @@ std::string EventReportStorageSpec::ToString() const {
     std::ostringstream oss;
     oss << "heartbeat_timeout_ms: " << heartbeat_timeout_ms_ << ", cleanup_grace_ms: " << cleanup_grace_ms_
         << ", liveness_check_interval_ms: " << liveness_check_interval_ms_
-        << ", snapshot_min_interval_ms: " << snapshot_min_interval_ms_;
+        << ", snapshot_min_interval_ms: " << snapshot_min_interval_ms_
+        << ", snapshot_delta_drain_timeout_ms: " << snapshot_delta_drain_timeout_ms_;
     return oss.str();
 }
 

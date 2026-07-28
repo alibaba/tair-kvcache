@@ -63,7 +63,11 @@ enum StorageType {
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // Reporter node starts up and registers with KVCM
+    // Optional startup signal. A fresh reporter, including one observed after
+    // KVCM restart, may also be lazily initialized by its first valid
+    // HEARTBEAT/ADD/DELETE/SNAPSHOT. REGISTER is required to clear a
+    // same-process HOST_DOWN or liveness-cleanup tombstone.
+    EVENT_NODE_REGISTER = 1;
     EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
     EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
     EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
@@ -96,10 +100,12 @@ message BlockSnapshotItem {
 }
 
 message BlockSnapshotEventParams {
+    // Legacy single-medium form. New callers should set medium on every block.
+    string medium = 1 [deprecated = true];
     // Complete block set for (instance_id, reporter host_ip_port), across every
     // medium owned by the reporter. Empty means the host owns no blocks.
     // Do not paginate.
-    repeated BlockSnapshotItem blocks = 1;
+    repeated BlockSnapshotItem blocks = 2;
 }
 
 message HostDownEventParams {
@@ -134,13 +140,17 @@ message ReportEventResponse {
     CommonResponseHeader header = 1;
     // Non-empty only when partial failures happen.
     repeated ErrorCode item_results = 2;
-    string extra_info = 3; // opaque JSON passed through from InstanceGroup
-    // Current process-local committed snapshot token for
-    // (instance_id, reporter host_ip_port). Empty means no snapshot has
-    // committed since KVCM started.
-    string committed_snapshot_version = 4;
-    uint64 retry_after_ms = 5;
-    bool snapshot_required = 6;
+    // Current process-local reconciliation generation for
+    // (instance_id, storage_type, reporter host_ip_port). The first
+    // ADD/DELETE may create it. After a successful full snapshot it is also
+    // the strict query-visibility generation; restart or snapshot failure
+    // temporarily falls back to soft visibility until a later snapshot.
+    string committed_snapshot_version = 3;
+    uint64 retry_after_ms = 4;
+    // Advisory: true while this process has no generation yet. ADD/DELETE do
+    // not require an initial snapshot and may create the generation.
+    bool snapshot_required = 5;
+    string extra_info = 6; // opaque JSON passed through from InstanceGroup
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析

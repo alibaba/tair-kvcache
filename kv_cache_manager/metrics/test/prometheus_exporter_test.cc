@@ -4,6 +4,7 @@
 #include <variant>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
@@ -56,6 +57,26 @@ TEST_F(PrometheusExporterTest, MetricsWithTags) {
               std::string::npos)
         << "Actual output:\n"
         << output;
+}
+
+TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsExposeIndependentTagsAndValues) {
+    MetricsTags tags = {{"event_type", "block_snapshot"},
+                        {"instance_group", "group_a"},
+                        {"instance_id", "instance_a"},
+                        {"type", "event_report_l2"}};
+    EventReportMetricsCollector collector(registry_, tags);
+    ASSERT_TRUE(collector.Init());
+    Counter request_counter;
+    COPY_METRICS_(&collector, event_report, request_counter, request_counter);
+    ++request_counter;
+    SET_METRICS_(&collector, event_report, request_rt_us, 321.);
+
+    const std::string output = PrometheusExporter::Expose(*registry_);
+    const std::string labels = "{event_type=\"block_snapshot\",instance_group=\"group_a\",instance_id=\"instance_a\","
+                               "type=\"event_report_l2\"}";
+    EXPECT_NE(output.find("kvcm_event_report_request_counter" + labels + " 1"), std::string::npos) << output;
+    EXPECT_NE(output.find("kvcm_event_report_request_rt_us" + labels + " 321"), std::string::npos) << output;
+    EXPECT_EQ(output.find("kvcm_event_report_error_counter"), std::string::npos) << output;
 }
 
 TEST_F(PrometheusExporterTest, MultipleTagSets) {

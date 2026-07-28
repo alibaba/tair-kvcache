@@ -1,6 +1,9 @@
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <thread>
 
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -15,6 +18,7 @@
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/service/util/service_call_guard.h"
 #include "stub.h"
 
 using namespace kv_cache_manager;
@@ -200,6 +204,88 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
         GET_METRICS_(&collector, service, error_counter, v);
         EXPECT_EQ(1, v);
     }
+}
+
+TEST_F(LocalMetricsReporterTest, TestReportPerQueryEventReport) {
+    EventReportMetricsCollector collector(metrics_registry_, {{"event_type", "block_snapshot"}});
+    ASSERT_TRUE(collector.Init());
+
+    reporter_->ReportPerQuery(&collector);
+    std::uint64_t value = 0;
+    GET_METRICS_(&collector, event_report, request_counter, value);
+    EXPECT_EQ(1, value);
+    GET_METRICS_(&collector, event_report, error_counter, value);
+    EXPECT_EQ(0, value);
+
+    SET_METRICS_(&collector, event_report, error_code, 10.);
+    reporter_->ReportPerQuery(&collector);
+    GET_METRICS_(&collector, event_report, request_counter, value);
+    EXPECT_EQ(2, value);
+    GET_METRICS_(&collector, event_report, error_counter, value);
+    EXPECT_EQ(1, value);
+}
+
+TEST_F(LocalMetricsReporterTest, ConcurrentEventCollectorsDoNotShareErrorSamples) {
+    const MetricsTags tags{{"event_type", "block_snapshot"}};
+    EventReportMetricsCollector success(metrics_registry_, tags);
+    EventReportMetricsCollector failure(metrics_registry_, tags);
+    ASSERT_TRUE(success.Init());
+    ASSERT_TRUE(failure.Init());
+
+    success.SetRequestSample(10.0, 0.0);
+    failure.SetRequestSample(20.0, 1.0);
+    // Both objects point at the same tagged registry gauge. Deliberately leave
+    // that shared gauge in the failed state before reporting the success.
+    SET_METRICS_(&success, event_report, error_code, 0.0);
+    SET_METRICS_(&failure, event_report, error_code, 1.0);
+
+    reporter_->ReportPerQuery(&success);
+    reporter_->ReportPerQuery(&failure);
+
+    EXPECT_EQ(2u, success.get_event_report_request_counter_metrics());
+    EXPECT_EQ(1u, success.get_event_report_error_counter_metrics());
+}
+
+TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventReportMetrics) {
+    auto service_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    auto snapshot_collector =
+        std::make_shared<EventReportMetricsCollector>(metrics_registry_, MetricsTags{{"event_type", "block_snapshot"}});
+    ASSERT_TRUE(service_collector->Init());
+    ASSERT_TRUE(snapshot_collector->Init());
+    SET_METRICS_(service_collector, service, error_code, 10.);
+
+    RequestContext request_context("event-report-metrics", service_collector);
+    request_context.set_status_code(10);
+    request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(snapshot_collector);
+    {
+        ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    EXPECT_GT(snapshot_collector->get_event_report_request_rt_us_metrics(), 0.);
+    EXPECT_DOUBLE_EQ(1., snapshot_collector->get_event_report_error_code_metrics());
+    EXPECT_EQ(1, snapshot_collector->get_event_report_request_counter_metrics());
+    EXPECT_EQ(1, snapshot_collector->get_event_report_error_counter_metrics());
+}
+
+TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadOfSharedServiceGauge) {
+    auto service_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    auto heartbeat_collector =
+        std::make_shared<EventReportMetricsCollector>(metrics_registry_, MetricsTags{{"event_type", "heartbeat"}});
+    ASSERT_TRUE(service_collector->Init());
+    ASSERT_TRUE(heartbeat_collector->Init());
+    // Model another concurrent request leaving a failure sample in the
+    // instance-scoped master collector.
+    SET_METRICS_(service_collector, service, error_code, 1.);
+
+    RequestContext request_context("event-report-success", service_collector);
+    request_context.set_status_code(RequestContext::kOkStatusCode);
+    request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(heartbeat_collector);
+    { ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get()); }
+
+    EXPECT_DOUBLE_EQ(0., heartbeat_collector->get_event_report_error_code_metrics());
+    EXPECT_EQ(1, heartbeat_collector->get_event_report_request_counter_metrics());
+    EXPECT_EQ(0, heartbeat_collector->get_event_report_error_counter_metrics());
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportInterval00) {

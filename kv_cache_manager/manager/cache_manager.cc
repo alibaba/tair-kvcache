@@ -131,42 +131,66 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 }
 class DeltaMutationGuard {
 public:
+    struct LeaseInfo {
+        std::string snapshot_version;
+        uint64_t lifecycle_generation = 0;
+    };
     explicit DeltaMutationGuard(std::shared_ptr<EventReportBackend> backend) : backend_(std::move(backend)) {}
     DeltaMutationGuard(const DeltaMutationGuard &) = delete;
     DeltaMutationGuard &operator=(const DeltaMutationGuard &) = delete;
 
     ~DeltaMutationGuard() {
         for (const auto &entry : versions_) {
-            backend_->EndDeltaMutation(entry.first);
+            backend_->EndDeltaMutation(entry.first, entry.second.lifecycle_generation);
         }
     }
 
-    ErrorCode Acquire(const ReporterSnapshotKey &reporter_key, std::string &out_committed_version) {
+    ErrorCode Acquire(const ReporterSnapshotKey &reporter_key,
+                      std::string &out_committed_version,
+                      uint64_t &out_lifecycle_generation) {
+        const auto failure_it = snapshot_wait_failures_.find(reporter_key);
+        if (failure_it != snapshot_wait_failures_.end()) {
+            out_committed_version.clear();
+            out_lifecycle_generation = 0;
+            return failure_it->second;
+        }
         const auto it = versions_.find(reporter_key);
         if (it != versions_.end()) {
-            out_committed_version = it->second;
+            out_committed_version = it->second.snapshot_version;
+            out_lifecycle_generation = it->second.lifecycle_generation;
             return EC_OK;
         }
-        const ErrorCode ec = backend_->BeginDeltaMutation(reporter_key, out_committed_version);
+        const ErrorCode ec =
+            backend_->BeginDeltaMutation(reporter_key, out_committed_version, &out_lifecycle_generation);
         if (ec != EC_OK) {
+            if (ec == EC_SNAPSHOT_IN_PROGRESS) {
+                snapshot_wait_failures_.emplace(reporter_key, ec);
+            }
             return ec;
         }
-        versions_.emplace(reporter_key, out_committed_version);
+        versions_.emplace(reporter_key, LeaseInfo{out_committed_version, out_lifecycle_generation});
         return EC_OK;
+    }
+
+    void AdoptLifecycleGeneration(const ReporterSnapshotKey &reporter_key, uint64_t lifecycle_generation) {
+        const auto it = versions_.find(reporter_key);
+        if (it != versions_.end()) {
+            it->second.lifecycle_generation = lifecycle_generation;
+        }
     }
 
 private:
     std::shared_ptr<EventReportBackend> backend_;
-    std::unordered_map<ReporterSnapshotKey, std::string, ReporterSnapshotKeyHash> versions_;
+    std::unordered_map<ReporterSnapshotKey, LeaseInfo, ReporterSnapshotKeyHash> versions_;
+    std::unordered_map<ReporterSnapshotKey, ErrorCode, ReporterSnapshotKeyHash> snapshot_wait_failures_;
 };
 
 // 共享 helper：收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
 // 一次 O(L·S) 扫描。exclude_loc_ids 用于排除 stale location。
-std::unordered_set<std::string> CollectCoveredSpecNames(
-    const CacheLocationMap &loc_map,
-    const std::string &storage_name,
-    std::initializer_list<CacheLocationStatus> statuses,
-    const std::vector<std::string> &exclude_loc_ids = {}) {
+std::unordered_set<std::string> CollectCoveredSpecNames(const CacheLocationMap &loc_map,
+                                                        const std::string &storage_name,
+                                                        std::initializer_list<CacheLocationStatus> statuses,
+                                                        const std::vector<std::string> &exclude_loc_ids = {}) {
     std::unordered_set<std::string> covered;
     for (const auto &[loc_id, loc_ptr] : loc_map) {
         if (!loc_ptr || std::find(statuses.begin(), statuses.end(), loc_ptr->status()) == statuses.end()) {
@@ -196,8 +220,9 @@ bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
     if (requested_spec_names.empty()) {
         return !covered.empty();
     }
-    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(),
-                       [&covered](const auto &name) { return covered.count(name) > 0; });
+    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(), [&covered](const auto &name) {
+        return covered.count(name) > 0;
+    });
 }
 
 const CacheLocation *FindLocationById(const CacheLocationMap &loc_map, const std::string &location_id) {
@@ -236,18 +261,20 @@ bool LocationsCoverFullBlockOnStorage(const CacheLocationMap &loc_map,
     return std::all_of(instance_info->location_spec_infos().begin(),
                        instance_info->location_spec_infos().end(),
                        [&loc_map, &storage_name](const LocationSpecInfo &spec_info) {
-                           return std::any_of(loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
-                               const auto &loc_ptr = entry.second;
-                               if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
-                                   return false;
-                               }
-                               return std::any_of(
-                                   loc_ptr->location_specs().begin(), loc_ptr->location_specs().end(), [&spec_info, &storage_name](const auto &spec) {
-                                       const DataStorageUri uri(spec.uri());
-                                       return spec.name() == spec_info.name() && uri.Valid() &&
-                                              uri.GetHostName() == storage_name;
-                                   });
-                           });
+                           return std::any_of(
+                               loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
+                                   const auto &loc_ptr = entry.second;
+                                   if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+                                       return false;
+                                   }
+                                   return std::any_of(loc_ptr->location_specs().begin(),
+                                                      loc_ptr->location_specs().end(),
+                                                      [&spec_info, &storage_name](const auto &spec) {
+                                                          const DataStorageUri uri(spec.uri());
+                                                          return spec.name() == spec_info.name() && uri.Valid() &&
+                                                                 uri.GetHostName() == storage_name;
+                                                      });
+                               });
                        });
 }
 
@@ -318,8 +345,8 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
 
     std::vector<StorageTargetAdmissionResult> admissions;
     if (data_storage_selector != nullptr) {
-        admissions = data_storage_selector->CheckExplicitWriteTargets(
-            request_context, instance_group_name, unique_targets);
+        admissions =
+            data_storage_selector->CheckExplicitWriteTargets(request_context, instance_group_name, unique_targets);
     }
     for (size_t i = 0; i < result_count; ++i) {
         const auto &mark = mark_results[i];
@@ -1033,8 +1060,12 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     } else {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
-        ec = GenWriteLocation(
-            request_context, instance_id, new_keys, new_location_spec_group_names, new_keys_tiered_targets, new_locations);
+        ec = GenWriteLocation(request_context,
+                              instance_id,
+                              new_keys,
+                              new_location_spec_group_names,
+                              new_keys_tiered_targets,
+                              new_locations);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, GenWriteLocation);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
@@ -1141,8 +1172,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
     // FilterWriteCache 的 mark 消费入口保持对称；非分层 group 无 mark 可清（admin 旁路打的标由 timeout 兜底）。
     const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    if (!success_batch_keys.empty() &&
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
+    if (!success_batch_keys.empty() && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
         KeyVector mark_candidate_keys;
         std::vector<std::string> mark_candidate_location_ids;
         for (size_t i = 0; i < success_batch_keys.size(); ++i) {
@@ -1182,17 +1212,19 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                         (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
                          LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i].target, instance_info))) {
                         // 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
-                        migration_manager_->ClearTieredWriteMarkIfMatch(
-                            instance_id, mark_candidate_keys[i],
-                            tiered_targets[i].target, tiered_targets[i].deadline_ms);
+                        migration_manager_->ClearTieredWriteMarkIfMatch(instance_id,
+                                                                        mark_candidate_keys[i],
+                                                                        tiered_targets[i].target,
+                                                                        tiered_targets[i].deadline_ms);
                     }
                 }
             } else {
-                PREFIX_LOG(WARN,
-                           "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
-                           get_loc_ec,
-                           loc_maps.size(),
-                           mark_candidate_keys.size());
+                PREFIX_LOG(
+                    WARN,
+                    "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
+                    get_loc_ec,
+                    loc_maps.size(),
+                    mark_candidate_keys.size());
             }
         }
     }
@@ -1339,8 +1371,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         const bool has_migration_strategy = !cache_config->migration_strategies().empty();
         if (!has_migration_strategy) {
             result.ec = EC_BADARGS;
-            result.message =
-                "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
+            result.message = "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
             return result;
         }
 
@@ -1482,8 +1513,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     // "tiered enabled" would be circular. (Equivalent to prior behavior, which always fetched.)
     std::shared_ptr<const InstanceInfo> instance_info =
         registry_manager_->GetInstanceInfo(request_context, instance_id);
-    const bool tiered_migration_enabled =
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const bool tiered_migration_enabled = IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
@@ -1554,7 +1584,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
-        submit_del_req(prune_keys, prune_loc_ids_vec, {});
+        submit_del_req(prune_keys, prune_loc_ids_vec, {}, false);
     }
 
     // Find the first write and check whether all blocks that need writing form a suffix.
@@ -1574,8 +1604,9 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (writes_form_suffix) {
         block_mask = static_cast<BlockMaskOffset>(first_write_idx);
         new_keys.insert(new_keys.end(), keys.begin() + first_write_idx, keys.end());
-        new_keys_tiered_targets.insert(
-            new_keys_tiered_targets.end(), tiered_target_per_key.begin() + first_write_idx, tiered_target_per_key.end());
+        new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
+                                       tiered_target_per_key.begin() + first_write_idx,
+                                       tiered_target_per_key.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
                                                  location_spec_group_names.begin() + first_write_idx,
@@ -1629,8 +1660,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     // Fetched unconditionally: tiered_migration_enabled depends on instance_info (see FilterWriteCache above).
     std::shared_ptr<const InstanceInfo> instance_info =
         registry_manager_->GetInstanceInfo(request_context, instance_id);
-    const bool tiered_migration_enabled =
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const bool tiered_migration_enabled = IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     static const std::vector<std::string> empty_spec_names;
@@ -1712,7 +1742,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
-        submit_del_req(prune_keys, prune_loc_ids_vec, {});
+        submit_del_req(prune_keys, prune_loc_ids_vec, {}, false);
     }
 
     size_t first_write_idx = location_maps.size();
@@ -1964,8 +1994,8 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
 
     if (!is_create_success) {
         request_context->error_tracer()->AddErrorMsg("some internal error when GenWriteLocation");
-        auto error_codes = data_storage_manager->Delete(
-            request_context, storage_name, allocated_uris, []() { /* do nothing */ });
+        auto error_codes =
+            data_storage_manager->Delete(request_context, storage_name, allocated_uris, []() { /* do nothing */ });
         for (size_t i = 0; i < error_codes.size(); i++) {
             if (i >= allocated_uris.size()) {
                 PREFIX_LOG(WARN,
@@ -2083,8 +2113,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             collect_location_uris(*extra_locations, uris_by_storage);
         }
         for (const auto &[storage_name, uris] : uris_by_storage) {
-            const auto results = data_storage_manager->Delete(
-                request_context, storage_name, uris, []() { /* do nothing */ });
+            const auto results =
+                data_storage_manager->Delete(request_context, storage_name, uris, []() { /* do nothing */ });
             if (results.size() != uris.size()) {
                 PREFIX_LOG(WARN,
                            "rollback generated locations on storage %s returned %zu results, request size %zu",
@@ -2094,7 +2124,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             }
             for (const auto ec : results) {
                 if (ec != EC_OK) {
-                    PREFIX_LOG(WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
+                    PREFIX_LOG(
+                        WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
                 }
             }
         }
@@ -2211,17 +2242,69 @@ bool IsSnapshotLocationStale(const EventReportBackend *event_backend,
     if (location.location_specs().empty()) {
         return true;
     }
-    bool matches_committed = !committed_version.empty();
-    bool matches_in_flight = preserve_in_flight && !in_flight_version.empty();
+    bool contains_committed = false;
+    bool contains_in_flight = false;
     for (const auto &spec : location.location_specs()) {
+        const size_t version_param_count =
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+        if (version_param_count == 0) {
+            // Legacy metadata is a stale reconciliation component, but a
+            // current delta spec in the same stable location still protects
+            // the location from coarse-grained cleanup.
+            continue;
+        }
         SnapshotUriInfo info;
-        if (!SnapshotUriUtils::ParseSnapshotUriInfo(spec.uri(), info)) {
+        if (version_param_count != 1 || !SnapshotUriUtils::ParseSnapshotUriInfo(spec.uri(), info)) {
             return true;
         }
-        matches_committed = matches_committed && info.version == committed_version;
-        matches_in_flight = matches_in_flight && info.version == in_flight_version;
+        contains_committed = contains_committed || (!committed_version.empty() && info.version == committed_version);
+        contains_in_flight = contains_in_flight ||
+                             (preserve_in_flight && !in_flight_version.empty() && info.version == in_flight_version);
     }
-    return !matches_committed && !matches_in_flight;
+    // Delta merge is spec-granular and can temporarily leave multiple
+    // generations in one stable location. Cleanup is location-granular, so it
+    // must preserve the whole location when any current/in-flight spec is
+    // present; deleting stale sibling specs is deferred to a later complete
+    // snapshot rather than risking a false negative for a successful delta.
+    return !contains_committed && !contains_in_flight;
+}
+
+bool IsEventReportLocationReadable(const CacheLocation &location,
+                                   bool strict_query_visibility,
+                                   const std::string &committed_version) {
+    if (location.location_specs().empty()) {
+        return false;
+    }
+    bool contains_readable_version = !strict_query_visibility;
+    for (const auto &spec : location.location_specs()) {
+        const DataStorageUri uri(spec.uri());
+        if (!uri.Valid()) {
+            return false;
+        }
+        const size_t version_param_count =
+            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
+        if (version_param_count > 1) {
+            return false;
+        }
+        if (version_param_count == 1) {
+            SnapshotUriInfo info;
+            // Count on the raw text first so duplicate parameters remain
+            // observable, then reuse the parsed URI instead of parsing it a
+            // second time on every query.
+            if (!SnapshotUriUtils::ParseSnapshotUriInfo(uri, info)) {
+                return false;
+            }
+            if (strict_query_visibility && info.version == committed_version) {
+                contains_readable_version = true;
+            }
+        }
+    }
+    // Delta merge is spec-granular. A post-snapshot ADD may refresh one spec
+    // in a stable location while an untouched sibling still carries an older
+    // generation. The committed spec keeps that location readable; a
+    // location composed entirely of candidate/older/legacy specs is fenced
+    // until the candidate commits or the attempt fails back to soft mode.
+    return contains_readable_version;
 }
 
 } // namespace
@@ -2235,10 +2318,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     const std::string &host_ip_port = request->host_ip_port();
     auto *response_status = response->mutable_header()->mutable_status();
 
-    if (instance_id.empty() || host_ip_port.empty()) {
-        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: empty instance_id or host_ip_port", trace_id.c_str());
+    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port)) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: invalid instance_id or host_ip_port", trace_id.c_str());
         response_status->set_code(proto::meta::INVALID_ARGUMENT);
-        response_status->set_message("empty instance_id or host_ip_port");
+        response_status->set_message("invalid instance_id or host_ip_port");
         return EC_BADARGS;
     }
     if (request->events_size() == 0) {
@@ -2347,12 +2430,24 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     const int events_size = request->events_size();
     std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
     DeltaMutationGuard delta_mutations(event_backend);
+    uint64_t mutation_lifecycle_generation = 0;
 
-    bool has_register = false;
     bool has_heartbeat = false;
     bool has_host_down = false;
     std::vector<std::string> register_mediums;
     std::map<std::string, std::string> heartbeat_status;
+    for (const auto &item : request->events()) {
+        if (item.event_type() != proto::meta::EVENT_NODE_REGISTER || !item.has_node_register()) {
+            continue;
+        }
+        for (const auto &medium : item.node_register().mediums()) {
+            if (std::find(register_mediums.begin(), register_mediums.end(), medium) == register_mediums.end()) {
+                register_mediums.push_back(medium);
+            }
+        }
+    }
+    bool registration_applied = false;
+    ErrorCode register_ec = EC_OK;
 
     struct BlockAddEntry {
         std::string location_id;
@@ -2382,6 +2477,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     struct SnapshotCommitTask {
         ReporterSnapshotKey reporter_key;
         std::string version;
+        uint64_t attempt_epoch;
         int event_index;
         KeyVector block_keys;
     };
@@ -2401,27 +2497,38 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         const auto &item = request->events(i);
         switch (item.event_type()) {
         case proto::meta::EVENT_NODE_REGISTER: {
-            has_register = true;
-            if (item.has_node_register()) {
-                for (const auto &medium : item.node_register().mediums()) {
-                    if (std::find(register_mediums.begin(), register_mediums.end(), medium) == register_mediums.end()) {
-                        register_mediums.push_back(medium);
-                    }
+            if (!item.has_node_register()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (!registration_applied) {
+                register_ec = event_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
+                registration_applied = true;
+                if (register_ec == EC_OK) {
+                    mutation_lifecycle_generation = event_backend->GetNodeGeneration(instance_id, host_ip_port);
+                    delta_mutations.AdoptLifecycleGeneration(reporter_key, mutation_lifecycle_generation);
                 }
             }
+            per_item_ec[i] = register_ec;
             break;
         }
         case proto::meta::EVENT_HEARTBEAT: {
+            if (!item.has_heartbeat()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
             has_heartbeat = true;
-            if (item.has_heartbeat()) {
-                heartbeat_status.clear();
-                for (const auto &kv : item.heartbeat().system_status()) {
-                    heartbeat_status[kv.first] = kv.second;
-                }
+            heartbeat_status.clear();
+            for (const auto &kv : item.heartbeat().system_status()) {
+                heartbeat_status[kv.first] = kv.second;
             }
             break;
         }
         case proto::meta::EVENT_HOST_DOWN:
+            if (!item.has_host_down()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
             has_host_down = true;
             break;
         case proto::meta::EVENT_BLOCK_ADD: {
@@ -2431,7 +2538,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             const auto &params = item.block_add();
             int64_t block_key = 0;
-            if (!ParseInt64(params.block_key(), block_key) || params.medium().empty() || params.specs_size() == 0) {
+            if (!ParseInt64(params.block_key(), block_key) ||
+                !SnapshotUriUtils::IsValidLocationIdComponent(params.medium()) || params.specs_size() == 0) {
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
@@ -2451,13 +2559,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            if (!has_register && !event_backend->IsNodeRegistered(instance_id, host_ip_port)) {
-                per_item_ec[i] = EC_NODE_NOT_REGISTERED;
+            const ErrorCode ensure_node_ec =
+                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {params.medium()});
+            if (ensure_node_ec != EC_OK) {
+                per_item_ec[i] = ensure_node_ec;
                 break;
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, committed_version);
+            const ErrorCode fence_ec =
+                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
@@ -2492,8 +2603,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             const auto &params = item.block_delete();
             int64_t block_key = 0;
-            if (!ParseInt64(params.block_key(), block_key) || params.medium().empty() ||
-                params.spec_names_size() == 0) {
+            if (!ParseInt64(params.block_key(), block_key) ||
+                !SnapshotUriUtils::IsValidLocationIdComponent(params.medium()) || params.spec_names_size() == 0) {
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
@@ -2510,13 +2621,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            if (!has_register && !event_backend->IsNodeRegistered(instance_id, host_ip_port)) {
-                per_item_ec[i] = EC_NODE_NOT_REGISTERED;
+            const ErrorCode ensure_node_ec =
+                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {params.medium()});
+            if (ensure_node_ec != EC_OK) {
+                per_item_ec[i] = ensure_node_ec;
                 break;
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, committed_version);
+            const ErrorCode fence_ec =
+                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
@@ -2548,11 +2662,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             std::unordered_set<std::string> seen_blocks;
             for (const auto &block : params.blocks()) {
                 int64_t block_key = 0;
-                if (!ParseInt64(block.block_key(), block_key) || block.medium().empty() || block.specs_size() == 0) {
+                const std::string &block_medium = block.medium().empty() ? params.medium() : block.medium();
+                if (!ParseInt64(block.block_key(), block_key) ||
+                    !SnapshotUriUtils::IsValidLocationIdComponent(block_medium) || block.specs_size() == 0) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
-                const std::string duplicate_key = block.medium() + "\n" + std::to_string(block_key);
+                const std::string duplicate_key = block_medium + "\n" + std::to_string(block_key);
                 if (!seen_blocks.insert(duplicate_key).second) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
@@ -2572,21 +2688,31 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                validated_blocks.push_back(ValidatedBlock{block_key, block.medium(), std::move(specs)});
+                validated_blocks.push_back(ValidatedBlock{block_key, block_medium, std::move(specs)});
             }
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            if (!has_register && !event_backend->IsNodeRegistered(instance_id, host_ip_port)) {
-                per_item_ec[i] = EC_NODE_NOT_REGISTERED;
+            std::vector<std::string> snapshot_mediums;
+            snapshot_mediums.reserve(validated_blocks.size());
+            for (const auto &block : validated_blocks) {
+                if (std::find(snapshot_mediums.begin(), snapshot_mediums.end(), block.medium) ==
+                    snapshot_mediums.end()) {
+                    snapshot_mediums.push_back(block.medium);
+                }
+            }
+            const ErrorCode ensure_node_ec =
+                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, snapshot_mediums);
+            if (ensure_node_ec != EC_OK) {
+                per_item_ec[i] = ensure_node_ec;
                 break;
             }
 
             // Keep the reporter write gate short: all request parsing and
             // validation above is complete before BeginSnapshot closes it.
             uint64_t retry_after_ms = 0;
-            const ErrorCode begin_ec =
-                event_backend->BeginSnapshot(reporter_key, request_snapshot_version, retry_after_ms);
+            const ErrorCode begin_ec = event_backend->BeginSnapshot(
+                reporter_key, request_snapshot_version, retry_after_ms, &mutation_lifecycle_generation);
             if (begin_ec != EC_OK) {
                 per_item_ec[i] = begin_ec;
                 if (begin_ec == EC_SNAPSHOT_RATE_LIMITED) {
@@ -2620,8 +2746,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 request_snapshot_version.clear();
                 break;
             }
-            snapshot_commit_tasks.push_back(SnapshotCommitTask{
-                reporter_key, request_snapshot_version, i, std::move(snapshot_block_keys)});
+            snapshot_commit_tasks.push_back(SnapshotCommitTask{reporter_key,
+                                                               request_snapshot_version,
+                                                               event_backend->GetSnapshotAttemptEpoch(reporter_key),
+                                                               i,
+                                                               std::move(snapshot_block_keys)});
             break;
         }
         default:
@@ -2650,16 +2779,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     }
 
-    if (has_register) {
-        const ErrorCode ec = event_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
-        if (ec != EC_OK) {
-            for (int i = 0; i < events_size; ++i) {
-                if (request->events(i).event_type() == proto::meta::EVENT_NODE_REGISTER) {
-                    per_item_ec[i] = ec;
-                }
-            }
-        }
-    }
     if (has_heartbeat) {
         const ErrorCode ec = event_backend->OnHeartbeat(instance_id, host_ip_port, heartbeat_status);
         if (ec != EC_OK) {
@@ -2670,20 +2789,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
         }
     }
-
-    auto find_sub_collector = [&request_context](const std::string &api_name) -> ServiceMetricsCollector * {
-        for (const auto &mc : request_context->GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
-            auto *smc = dynamic_cast<ServiceMetricsCollector *>(mc.get());
-            if (smc) {
-                const auto &tags = smc->GetMetricsTags();
-                auto it = tags.find("api_name");
-                if (it != tags.end() && it->second == api_name) {
-                    return smc;
-                }
-            }
-        }
-        return nullptr;
-    };
 
     if (!block_to_add.empty()) {
         KeyVector add_keys_aggr;
@@ -2735,7 +2840,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<ErrorCode> per_key_ec;
-        meta_searcher->BatchMergeLocationSpecs(request_context, add_keys_aggr, merge_tasks, per_key_ec);
+        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
+            EventReportBackend::LifecycleMutationLease lease;
+            const ErrorCode ec =
+                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
+            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
+        };
+        meta_searcher->BatchMergeLocationSpecs(
+            request_context, add_keys_aggr, merge_tasks, per_key_ec, acquire_write_lease);
 
         for (size_t k = 0; k < add_keys_aggr.size(); ++k) {
             ErrorCode key_ec = (k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR;
@@ -2749,10 +2861,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     }
                 }
             }
-        }
-        if (auto *add_mc = find_sub_collector("EventBlockAdd")) {
-            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, manager, request_key_count, add_keys_aggr.size());
-            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, meta_indexer, query_key_count, add_keys_aggr.size());
         }
     }
 
@@ -2785,7 +2893,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<std::vector<ErrorCode>> per_location_ec;
+        std::vector<std::vector<bool>> missing_delete_targets;
         std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks(del_keys_aggr.size());
+        size_t delete_target_count = 0;
         for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
             const auto &entries = del_merged_entries_aggr[i];
             delete_tasks[i].reserve(entries.size());
@@ -2795,8 +2905,20 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     entry.spec_names,
                 });
             }
+            delete_target_count += delete_tasks[i].size();
         }
-        meta_searcher->BatchDeleteLocationSpecs(request_context, del_keys_aggr, delete_tasks, per_location_ec);
+        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
+            EventReportBackend::LifecycleMutationLease lease;
+            const ErrorCode ec =
+                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
+            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
+        };
+        meta_searcher->BatchDeleteLocationSpecs(request_context,
+                                                del_keys_aggr,
+                                                delete_tasks,
+                                                per_location_ec,
+                                                &missing_delete_targets,
+                                                acquire_write_lease);
 
         for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
             ErrorCode key_ec = EC_OK;
@@ -2821,9 +2943,21 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 }
             }
         }
-        if (auto *del_mc = find_sub_collector("EventBlockDelete")) {
-            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, manager, request_key_count, del_keys_aggr.size());
-            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, meta_indexer, query_key_count, del_keys_aggr.size());
+        size_t missing_block_count = 0;
+        for (const auto &missing_per_key : missing_delete_targets) {
+            missing_block_count +=
+                static_cast<size_t>(std::count(missing_per_key.begin(), missing_per_key.end(), true));
+        }
+        if (missing_block_count > 0) {
+            KVCM_LOG_DEBUG("trace_id [%s] | EVENT_BLOCK_DELETE: attempted to delete %zu non-existent block(s) "
+                           "(block_key + medium) out of %zu unique target(s); treated as idempotent success, "
+                           "instance [%s], host [%s], storage_type [%s]",
+                           trace_id.c_str(),
+                           missing_block_count,
+                           delete_target_count,
+                           instance_id.c_str(),
+                           host_ip_port.c_str(),
+                           ToString(requested_type).c_str());
         }
     }
 
@@ -2852,7 +2986,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<ErrorCode> per_key_ec;
-        meta_searcher->BatchReplaceLocationSpecs(request_context, snapshot_keys, replace_tasks, per_key_ec);
+        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
+            EventReportBackend::LifecycleMutationLease lease;
+            const ErrorCode ec =
+                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
+            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
+        };
+        meta_searcher->BatchReplaceLocationSpecs(
+            request_context, snapshot_keys, replace_tasks, per_key_ec, acquire_write_lease);
         for (size_t key_index = 0; key_index < snapshot_keys.size(); ++key_index) {
             const ErrorCode key_ec = key_index < per_key_ec.size() ? per_key_ec[key_index] : EC_ERROR;
             if (key_ec == EC_OK) {
@@ -2894,10 +3035,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             event_backend->AbortSnapshotVersion(task.reporter_key, task.version);
         } else if (schedule_plan_executor_) {
             const auto cleanup_backend = event_backend;
-            if (!schedule_plan_executor_->SubmitTask(
-                    [this, reporter_key = task.reporter_key, version = task.version, requested_type, cleanup_backend] {
-                        this->CleanupStaleSnapshotLocations(reporter_key, version, requested_type, cleanup_backend);
-                    })) {
+            if (!schedule_plan_executor_->SubmitTask([this,
+                                                      reporter_key = task.reporter_key,
+                                                      version = task.version,
+                                                      attempt_epoch = task.attempt_epoch,
+                                                      requested_type,
+                                                      cleanup_backend] {
+                    this->CleanupStaleSnapshotLocations(
+                        reporter_key, version, requested_type, cleanup_backend, attempt_epoch);
+                })) {
                 KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to submit stale-data scan for host [%s]",
                               trace_id.c_str(),
                               task.reporter_key.host_ip_port.c_str());
@@ -2906,17 +3052,26 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_host_down) {
-        event_backend->SetNodeUnavailable(instance_id, host_ip_port);
-        uint64_t gen_at_trigger = event_backend->GetNodeGeneration(instance_id, host_ip_port);
+        uint64_t gen_at_trigger = 0;
+        event_backend->UnregisterNodeForHostDown(instance_id, host_ip_port, gen_at_trigger);
         assert(schedule_plan_executor_);
-        schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
-            this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
-        });
-        event_backend->UnregisterNode(instance_id, host_ip_port);
-        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled "
-                      "(gen=%" PRIu64 ") and removed from node table",
+        const bool cleanup_scheduled =
+            schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
+                this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
+            });
+        if (!cleanup_scheduled) {
+            KVCM_LOG_WARN("trace_id [%s] | HOST_DOWN: failed to submit metadata cleanup for host [%s], "
+                          "instance [%s], gen=%" PRIu64,
+                          trace_id.c_str(),
+                          host_ip_port.c_str(),
+                          instance_id.c_str(),
+                          gen_at_trigger);
+        }
+        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] removed from node table, cleanup_scheduled=%s "
+                      "(gen=%" PRIu64 ")",
                       trace_id.c_str(),
                       host_ip_port.c_str(),
+                      cleanup_scheduled ? "true" : "false",
                       gen_at_trigger);
     }
 
@@ -2954,6 +3109,39 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     refresh_snapshot_response();
     if (any_failure) {
+        std::map<std::pair<proto::meta::ReportEventType, proto::meta::ErrorCode>, size_t> failure_counts;
+        size_t failed_item_count = 0;
+        for (int i = 0; i < request->events_size(); ++i) {
+            if (per_item_ec[i] == EC_OK) {
+                continue;
+            }
+            ++failed_item_count;
+            ++failure_counts[{request->events(i).event_type(), map_error(per_item_ec[i])}];
+        }
+        std::string failure_summary;
+        for (const auto &[event_and_error, count] : failure_counts) {
+            if (!failure_summary.empty()) {
+                failure_summary.append(", ");
+            }
+            const int event_type = static_cast<int>(event_and_error.first);
+            const std::string event_type_name = proto::meta::ReportEventType_IsValid(event_type)
+                                                    ? proto::meta::ReportEventType_Name(event_and_error.first)
+                                                    : "EVENT_UNKNOWN(" + std::to_string(event_type) + ")";
+            failure_summary.append(event_type_name)
+                .append(":")
+                .append(proto::meta::ErrorCode_Name(event_and_error.second))
+                .append("=")
+                .append(std::to_string(count));
+        }
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent partial failure: failed_items [%zu/%d], summary [%s], "
+                      "instance [%s], host [%s], storage_type [%s]",
+                      trace_id.c_str(),
+                      failed_item_count,
+                      request->events_size(),
+                      failure_summary.c_str(),
+                      instance_id.c_str(),
+                      host_ip_port.c_str(),
+                      ToString(requested_type).c_str());
         for (const ErrorCode ec : per_item_ec) {
             response->add_item_results(map_error(ec));
         }
@@ -3000,9 +3188,22 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
         }
         return event_backend->GetNodeGeneration(instance_id, host_ip_port) != cleanup_generation;
     };
+    auto acquire_cleanup_lease = [event_backend, instance_id, host_ip_port, cleanup_generation] {
+        EventReportBackend::LifecycleMutationLease lease;
+        if (!event_backend) {
+            return std::make_pair(EC_OK, MetaSearcher::MetadataWriteLease{});
+        }
+        const ErrorCode ec =
+            event_backend->AcquireLifecycleCleanupLease({instance_id, host_ip_port}, cleanup_generation, lease);
+        return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
+    };
 
-    auto ec = meta_searcher->CleanupLocationsByHost(
-        &cleanup_ctx, host_suffix, storage_type, /*scan_batch_size=*/1000, abort_if_reregistered);
+    auto ec = meta_searcher->CleanupLocationsByHost(&cleanup_ctx,
+                                                    host_suffix,
+                                                    storage_type,
+                                                    /*scan_batch_size=*/1000,
+                                                    abort_if_reregistered,
+                                                    acquire_cleanup_lease);
 
     if (ec == EC_OK) {
         KVCM_LOG_INFO("CleanupHostLocations: finished cleaning host [%s] from instance [%s]",
@@ -3018,9 +3219,12 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
 ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
                                                       const std::string &snapshot_version,
                                                       DataStorageType storage_type,
-                                                      const std::shared_ptr<EventReportBackend> &event_backend) {
+                                                      const std::shared_ptr<EventReportBackend> &event_backend,
+                                                      uint64_t snapshot_attempt_epoch) {
     if (!event_backend || snapshot_version.empty() || event_backend->GetStorageType() != storage_type ||
-        event_backend->GetSnapshotVersion(reporter_key) != snapshot_version) {
+        event_backend->GetSnapshotVersion(reporter_key) != snapshot_version ||
+        (snapshot_attempt_epoch != 0 &&
+         event_backend->GetSnapshotAttemptEpoch(reporter_key) != snapshot_attempt_epoch)) {
         return EC_OK;
     }
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(reporter_key.instance_id);
@@ -3032,8 +3236,12 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
 
     const auto scan_begin = std::chrono::steady_clock::now();
     RequestContext cleanup_ctx("reclaim_snapshot_" + reporter_key.host_ip_port);
-    auto should_delete = [event_backend,
-                          reporter_key](int64_t, const std::string &location_id, const CacheLocation &location) {
+    auto should_delete = [event_backend, reporter_key, snapshot_attempt_epoch](
+                             int64_t, const std::string &location_id, const CacheLocation &location) {
+        if (snapshot_attempt_epoch != 0 &&
+            event_backend->GetSnapshotAttemptEpoch(reporter_key) != snapshot_attempt_epoch) {
+            return false;
+        }
         std::string medium;
         std::string reporter_host;
         return event_backend->ParseLocationId(location_id, medium, reporter_host) &&
@@ -3041,8 +3249,15 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
                IsSnapshotLocationStale(
                    event_backend.get(), reporter_key.instance_id, location, /*preserve_in_flight=*/true);
     };
-    const ErrorCode ec = meta_searcher->CleanupLocationsByPredicate(
-        &cleanup_ctx, storage_type, /*scan_batch_size=*/1000, std::move(should_delete));
+    auto should_abort = [event_backend, reporter_key, snapshot_attempt_epoch] {
+        return snapshot_attempt_epoch != 0 &&
+               event_backend->GetSnapshotAttemptEpoch(reporter_key) != snapshot_attempt_epoch;
+    };
+    const ErrorCode ec = meta_searcher->CleanupLocationsByPredicate(&cleanup_ctx,
+                                                                    storage_type,
+                                                                    /*scan_batch_size=*/1000,
+                                                                    std::move(should_delete),
+                                                                    std::move(should_abort));
     const auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scan_begin).count();
     KVCM_LOG_INFO("SnapshotReclaimer: scanned instance [%s] host [%s] token [%s] in [%" PRId64 "] ms, ec [%d]",
@@ -3051,6 +3266,17 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
                   snapshot_version.c_str(),
                   static_cast<int64_t>(elapsed_ms),
                   ec);
+    if (metrics_registry_) {
+        const MetricsTags metrics_tags = {
+            {"instance_id", reporter_key.instance_id},
+            {"host", reporter_key.host_ip_port},
+            {"type", ToString(storage_type)},
+        };
+        REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                              "event_report.snapshot_cleanup_scan_latency_ms",
+                              metrics_tags,
+                              static_cast<double>(elapsed_ms));
+    }
     return ec;
 }
 
@@ -3410,14 +3636,7 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         if (IsEventReportStorageType(loc.type())) {
             auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id, loc.type());
             auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
-            // Event-report metadata has no meaningful physical-backend
-            // fallback. If its typed backend is absent, the process-local
-            // committed token and node liveness cannot be verified, so keep
-            // the location invisible.
             if (!event_backend || loc.type() != event_backend->GetStorageType()) {
-                return false;
-            }
-            if (IsSnapshotLocationStale(event_backend, instance_id, loc)) {
                 return false;
             }
             std::string reporter_medium;
@@ -3425,7 +3644,13 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
             if (!event_backend->ParseLocationId(loc.id(), reporter_medium, reporter_host)) {
                 return false;
             }
-            return event_backend->IsNodeAvailable(instance_id, reporter_host);
+            bool strict_query_visibility = false;
+            std::string committed_version;
+            if (!event_backend->GetQueryVisibilityState(
+                    {instance_id, reporter_host}, strict_query_visibility, committed_version)) {
+                return false;
+            }
+            return IsEventReportLocationReadable(loc, strict_query_visibility, committed_version);
         }
 
         std::vector<DataStorageUri> storage_uris;
@@ -3447,13 +3672,15 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
 SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_id) const {
     return [this, instance_id](const std::vector<std::int64_t> &blk_keys,
                                const std::vector<std::vector<std::string>> &loc_ids,
-                               const std::vector<std::vector<std::string>> &expected_location_values) -> void {
+                               const std::vector<std::vector<std::string>> &expected_location_values,
+                               bool metadata_only) -> void {
         CacheLocationDelRequest request;
         request.instance_id = instance_id;
         request.delay = std::chrono::seconds(0);
         request.block_keys = blk_keys;
         request.location_ids = loc_ids;
         request.expected_location_values = expected_location_values;
+        request.metadata_only = metadata_only;
         if (reclaimer_task_supervisor_) {
             reclaimer_task_supervisor_->Submit(instance_id, std::move(request));
             KVCM_LOG_DEBUG("meta data del request submitted to reclaimer supervisor");
