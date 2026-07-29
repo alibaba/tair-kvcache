@@ -1,0 +1,249 @@
+{
+  "prefix": "kvcache_subscriber_",
+  "description": "All metrics emitted by kvcache-event-subscriber. Dual-written via dashlog (Prometheus) and PAI-EAS realtime_metrics (SLS). Tags are Prometheus labels / PAI-EAS tag keys.",
+  "eas_reporting": {
+    "endpoint": "http://localhost:8080/api/builtin/realtime_metrics",
+    "flush_interval_s": 10,
+    "sls_prefix": "custom_kvcache_subscriber_",
+    "counter_semantics": "per-interval delta (reset each flush)",
+    "histogram_semantics": "aggregated into _avg and _max suffixes per flush window"
+  },
+  "sources": {
+    "MetricsReporter": "Async main-path flush. Reads a BatchTelemetry per event; emits per-stage histograms, e2e latency, aggregate counters, and (for dropped batches) a drop-count counter plus partial-stage histograms tagged with drop_reason.",
+    "lifecycle": "Synchronous point-event helpers in subscriber.metrics.lifecycle (report_engine_probe, report_heartbeat, report_shutdown, report_zmq_message, ...). Called directly from health, kvcm, and adapter code paths."
+  },
+  "metrics": [
+    {
+      "name": "kvcache_subscriber_kv_stage_decode_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot", "drop_reason": "epoch_changed | send_failed | filtered_empty | engine_not_ready | generation_reset | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Latency of decoding a ZMQ frame into KV events (incremental, vLLM adapter) or msgpack-decoding a fetched snapshot payload (snapshot). Emitted on every submitted telemetry that reached this stage; drop_reason tag is present when the batch was ultimately dropped."
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_replay_fetch_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental", "drop_reason": "epoch_changed | send_failed | engine_not_ready | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Latency of fetching replay batches from the engine after a sequence gap"
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_snapshot_fetch_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "snapshot", "drop_reason": "fetch_failed | generation_reset | empty_snapshot | schema_mismatch | decode_failed | engine_not_ready | epoch_changed | send_failed | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Latency of the gRPC round-trip for a full KV cache snapshot. Emitted on every poll including fetch_failed drops (the stage span is closed before the drop is recorded)."
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_snapshot_build_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "snapshot", "drop_reason": "generation_reset | engine_not_ready | epoch_changed | send_failed | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Latency of building a BlockSnapshot event from a fetched snapshot response. Not emitted on drops that occur before this stage (fetch_failed, empty_snapshot, schema_mismatch, decode_failed, first generation_reset check)."
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_expand_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot"},
+      "source": "MetricsReporter",
+      "description": "Latency of expanding KV events or snapshot blocks into the KVCM reportEvent wire payload (serialization). Marked inside report_kv_events and report_snapshot after the expand step completes."
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_queue_wait_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot", "drop_reason": "epoch_changed | send_failed | filtered_empty | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Time a batch spends waiting in the internal producer/consumer queue"
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_engine_gate_wait_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot", "drop_reason": "epoch_changed | send_failed | filtered_empty | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Time waiting for the engine health coordinator to grant a sendable epoch"
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_block_filter_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental", "drop_reason": "send_failed | filtered_empty | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Time spent filtering redundant block removals before sending"
+    },
+    {
+      "name": "kvcache_subscriber_kv_stage_kvcm_send_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot"},
+      "source": "MetricsReporter",
+      "description": "Time spent on the HTTP round-trip to KVCM (POST reportEvent and response handling). Serialization cost is excluded (covered by expand). Only emitted on successful send."
+    },
+    {
+      "name": "kvcache_subscriber_kv_event_e2e_latency_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"pipeline": "incremental | snapshot"},
+      "source": "MetricsReporter",
+      "description": "End-to-end latency from event receipt to the pipeline terminal action (KVCM send for both incremental and snapshot). Only emitted on successful telemetry; dropped batches expose their partial timeline through the individual kv_stage_*_ms histograms with drop_reason tag."
+    },
+    {
+      "name": "kvcache_subscriber_stored_block_hash_count",
+      "type": "counter",
+      "unit": "blocks",
+      "tags": {"pipeline": "incremental"},
+      "source": "MetricsReporter",
+      "description": "Number of block hashes forwarded as BLOCK_ADD events per batch"
+    },
+    {
+      "name": "kvcache_subscriber_removed_block_hash_count",
+      "type": "counter",
+      "unit": "blocks",
+      "tags": {"pipeline": "incremental"},
+      "source": "MetricsReporter",
+      "description": "Number of block hashes forwarded as BLOCK_DELETE events per batch"
+    },
+    {
+      "name": "kvcache_subscriber_snapshot_block_count",
+      "type": "counter",
+      "unit": "blocks",
+      "tags": {"pipeline": "snapshot"},
+      "source": "MetricsReporter",
+      "description": "Blocks contained in full KV cache snapshots forwarded to KVCM per successful send"
+    },
+    {
+      "name": "kvcache_subscriber_zmq_sequence_gap_count",
+      "type": "counter",
+      "unit": "gaps",
+      "tags": {"pipeline": "incremental"},
+      "source": "MetricsReporter",
+      "description": "Sequence gaps detected in the ZMQ pub stream, attributed to the replay batch that exposed the gap"
+    },
+    {
+      "name": "kvcache_subscriber_zmq_missed_message_count",
+      "type": "counter",
+      "unit": "messages",
+      "tags": {"pipeline": "incremental"},
+      "source": "MetricsReporter",
+      "description": "Messages missed across sequence gaps, attributed to the replay batch that exposed the gap"
+    },
+    {
+      "name": "kvcache_subscriber_kv_batch_drop_count",
+      "type": "counter",
+      "unit": "batches",
+      "tags": {"pipeline": "incremental | snapshot", "reason": "epoch_changed | send_failed | filtered_empty | engine_not_ready | fetch_failed | generation_reset | empty_snapshot | schema_mismatch | decode_failed"},
+      "source": "MetricsReporter",
+      "description": "Batches or polls dropped before reaching downstream. Incremental reasons: epoch_changed, send_failed, filtered_empty (all events removed by the block filter; benign no-op, not a failure), engine_not_ready. Snapshot reasons: fetch_failed (gRPC error), generation_reset (poll spanned a reset_generation_state call), empty_snapshot (engine returned no raw snapshot payload), schema_mismatch (msgpack payload failed schema validation), decode_failed (msgpack payload could not be decoded), engine_not_ready, epoch_changed, send_failed. Emitted once per submitted dropped BatchTelemetry."
+    },
+    {
+      "name": "kvcache_subscriber_zmq_received_message_count",
+      "type": "counter",
+      "unit": "messages",
+      "tags": {},
+      "source": "lifecycle",
+      "description": "Total ZMQ pub messages received from the engine. Background throughput counter; not tied to any specific batch."
+    },
+    {
+      "name": "kvcache_subscriber_kvcm_heartbeat_count",
+      "type": "counter",
+      "unit": "heartbeats",
+      "tags": {"status": "success | failure"},
+      "source": "lifecycle",
+      "description": "Heartbeat reports to KVCM (use rate() for heartbeat QPS, group by status)"
+    },
+    {
+      "name": "kvcache_subscriber_kvcm_registration_recovery_count",
+      "type": "counter",
+      "unit": "recoveries",
+      "tags": {},
+      "source": "lifecycle",
+      "description": "Number of times KVCM registration recovered after a failure"
+    },
+    {
+      "name": "kvcache_subscriber_kvcm_registration_transition_count",
+      "type": "counter",
+      "unit": "transitions",
+      "tags": {"from": "registered | unregistered", "to": "registered | unregistered"},
+      "source": "lifecycle",
+      "description": "KVCM registration state transitions"
+    },
+    {
+      "name": "kvcache_subscriber_engine_health_probe_count",
+      "type": "counter",
+      "unit": "probes",
+      "tags": {"result": "alive | dead | timeout | rpc_error"},
+      "source": "lifecycle",
+      "description": "Engine health probe outcomes, labeled by result"
+    },
+    {
+      "name": "kvcache_subscriber_engine_health_probe_latency_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"result": "alive | dead | timeout | rpc_error"},
+      "source": "lifecycle",
+      "description": "Engine health probe latency, labeled by result"
+    },
+    {
+      "name": "kvcache_subscriber_full_snapshot_payload_bytes",
+      "type": "gauge",
+      "unit": "bytes",
+      "tags": {"pipeline": "snapshot", "drop_reason": "generation_reset | empty_snapshot | schema_mismatch | decode_failed | engine_not_ready | epoch_changed | send_failed | (absent on success)"},
+      "source": "MetricsReporter",
+      "description": "Serialized protobuf response size for each full KV cache snapshot fetch that produced a response. Emitted on success and on every post-fetch drop so an empty payload (0 bytes) is observable as a real 0 rather than a missing datapoint. Not emitted on fetch_failed drops (no response object exists)."
+    },
+    {
+      "name": "kvcache_subscriber_engine_health_state_transition_count",
+      "type": "counter",
+      "unit": "transitions",
+      "tags": {"from": "starting | healthy | dead", "to": "starting | healthy | dead"},
+      "source": "lifecycle",
+      "description": "Engine health state machine transitions"
+    },
+    {
+      "name": "kvcache_subscriber_subscriber_phase_transition_count",
+      "type": "counter",
+      "unit": "transitions",
+      "tags": {"from": "starting | active | inactive | failed", "to": "starting | active | inactive | failed"},
+      "source": "lifecycle",
+      "description": "Subscriber phase transitions reported to DashServing"
+    },
+    {
+      "name": "kvcache_subscriber_dashserving_heartbeat_count",
+      "type": "counter",
+      "unit": "heartbeats",
+      "tags": {"status": "success | failure"},
+      "source": "lifecycle",
+      "description": "DashServing state heartbeat outcomes (use rate() for QPS, group by status)"
+    },
+    {
+      "name": "kvcache_subscriber_dashserving_state_report_count",
+      "type": "counter",
+      "unit": "reports",
+      "tags": {"state": "active | inactive | failed", "result": "accepted | error | stale"},
+      "source": "lifecycle",
+      "description": "State report outcomes to DashServing, labeled by state and result"
+    },
+    {
+      "name": "kvcache_subscriber_dashserving_state_report_latency_ms",
+      "type": "histogram",
+      "unit": "ms",
+      "tags": {"state": "active | inactive | failed", "result": "accepted | error | stale"},
+      "source": "lifecycle",
+      "description": "State report latency to DashServing, labeled by state and result"
+    },
+    {
+      "name": "kvcache_subscriber_subscriber_shutdown_count",
+      "type": "counter",
+      "unit": "shutdowns",
+      "tags": {"outcome": "host_down_sent:<reason> | host_down_failed:<reason>"},
+      "source": "lifecycle",
+      "description": "Shutdown/HostDown emission outcomes"
+    }
+  ]
+}
