@@ -74,6 +74,75 @@ if typing.TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
+def attn_kv_views(ref: torch.Tensor) -> List[torch.Tensor]:
+    """Normalize one attention layer's paged KV cache into per-pointer views.
+
+    vLLM's flash_attn backend changed ``get_kv_cache_shape`` twice; the three
+    layouts are detected from the tensor shape itself (never from version
+    strings):
+
+    * 4-D ``(num_blocks, H, block, 2*D)``  -- K/V packed into the content dim
+      (vLLM >= 0.26.0). One transfer pointer per layer.
+    * 5-D ``(num_blocks, 2, block, H, D)`` -- N-first split K/V
+      (vLLM 0.23.0 - 0.25.x). Two pointers per layer: ``t[:, 0]`` / ``t[:, 1]``.
+    * 5-D ``(2, num_blocks, block, H, D)`` -- KV-first split K/V
+      (vLLM <= 0.22.1). Two pointers per layer: ``t[0]`` / ``t[1]``.
+
+    Every returned view has the logical shape
+    ``(num_blocks, kernel_block_size, heads, content_dim)`` matching the NHD
+    memory order, so all downstream math (per-token dim, token-major check,
+    block stride, data_ptr) is layout-independent. Unrecognized layouts raise.
+    """
+    if ref.dim() == 4:
+        # Packed content dim; permute to token-major logical order. The permuted
+        # view shares storage, data_ptr() is the storage base.
+        return [ref.permute(0, 2, 1, 3)]
+    if ref.dim() == 5:
+        kv_first = ref.shape[0] == 2
+        n_first = ref.shape[1] == 2
+        if kv_first and n_first:
+            raise NotImplementedError(
+                f"ambiguous kv layout {tuple(ref.shape)}: cannot tell the K/V "
+                f"dim from a num_blocks dim of size 2")
+        if kv_first:
+            return [ref[0], ref[1]]
+        if n_first:
+            return [ref[:, 0], ref[:, 1]]
+    raise NotImplementedError(
+        f"unrecognized kv cache layout {tuple(ref.shape)}; expected the packed "
+        f"4-D (vllm >= 0.26.0) or one of the split K/V 5-D layouts "
+        f"(vllm <= 0.25.x)")
+
+
+def _hybrid_external_load_supported() -> bool:
+    """vLLM <= 0.22.x cannot combine mamba align mode with a KV connector:
+    ``Scheduler._mamba_block_aligned_split`` asserts
+    ``num_external_computed_tokens == 0`` ("External KV connector is not
+    verified yet"), so the first external match would crash the scheduler.
+    Probe the installed vLLM for that blocking assert (a capability check,
+    not a version-string comparison)."""
+    try:
+        import inspect
+        from vllm.v1.core.sched.scheduler import Scheduler
+        src = inspect.getsource(Scheduler._mamba_block_aligned_split)
+    except Exception:  # cannot probe (no source, refactored away): don't block
+        return True
+    return "External KV connector is not verified yet" not in src
+
+
+def ensure_hybrid_supported():
+    """Fail fast with a clear message when a hybrid (mamba) model is served on
+    a vLLM whose scheduler rejects external KV loads (vllm <= 0.22.x)."""
+    if not _hybrid_external_load_supported():
+        raise NotImplementedError(
+            "TairKvCacheConnector: this vLLM version cannot combine hybrid "
+            "(mamba) models with an external KV connector -- its scheduler "
+            "asserts num_external_computed_tokens == 0 in "
+            "_mamba_block_aligned_split ('External KV connector is not "
+            "verified yet'). Upgrade to vLLM >= 0.23.0 for hybrid model "
+            "support; full-attention models are unaffected.")
+
+
 @dataclass
 class GroupMeta:
     """Static description of one kv_cache_group, derived from KVCacheConfig.
@@ -176,6 +245,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         manager_block_size = self._vllm_block_size
         self._has_state_groups = any(
             isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups)
+        if self._has_state_groups:
+            ensure_hybrid_supported()
         if self._extra_config.preferred_block_size != 0:
             if self._has_state_groups:
                 if self._extra_config.preferred_block_size != self._vllm_block_size:
@@ -381,34 +452,37 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if meta.is_attention:
             tensors = [kv_caches[name] for name in meta.layer_names]
             ref = tensors[0]
-            # vLLM >= 0.26.0 packs K and V into the content dim: logical shape
-            # (num_blocks, num_kv_heads, kernel_block_size, 2*head_size). With the
-            # default NHD stride order the memory is laid out token-major as
-            # (num_blocks, kernel_block_size, num_kv_heads, 2*head_size), so a flat
-            # index (global_token * per_token_dim + dim) walks the storage
-            # correctly. K/V packing is opaque to the byte-exact transport.
-            assert ref.dim() == 4, f"unexpected kv layout {ref.shape}"
             for t in tensors:
                 assert t.shape == ref.shape and t.stride() == ref.stride(), \
                     "attention layers in one group must share shape/stride"
-            kernel_block_size = ref.shape[2]
+            # Normalize the layout into per-pointer token-major views of shape
+            # (num_blocks, kernel_block_size, heads, content_dim); everything
+            # below is layout-independent. Split-K/V layouts (vllm <= 0.25.x)
+            # yield two views (= two transfer pointers) per layer, the packed
+            # layout (vllm >= 0.26.0) yields one.
+            ref_views = attn_kv_views(ref)
+            view = ref_views[0]
+            kernel_block_size = view.shape[1]
             assert meta.block_size % kernel_block_size == 0, \
                 f"group block size {meta.block_size} not a multiple of kernel " \
                 f"block size {kernel_block_size}"
-            per_token_dim = ref.shape[1] * ref.shape[3]  # num_kv_heads * 2*head_size
+            per_token_dim = view.shape[2] * view.shape[3]  # heads * content_dim
             # The gather/scatter kernel needs token-major memory inside a page:
-            # dims (blk, head, tok, dim) laid out as (blk, tok, head, dim). This
+            # logical dims (blk, tok, head, dim) contiguous within a block. This
             # is vLLM's NHD order; HND would interleave heads across tokens.
-            assert ref.stride()[1:] == (ref.shape[3], per_token_dim, 1), \
-                f"kv cache page not token-major: shape={ref.shape} " \
-                f"stride={ref.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
-            # Padded pages (page_size_padded) leave gaps between blocks; the
-            # kernel's strided path skips them. Stride 0 = fast flat indexing.
-            flat = ref.stride(0) == kernel_block_size * per_token_dim
-            block_stride = 0 if flat else ref.stride(0)
-            # One pointer per layer: K and V are packed in the content dim, and
-            # data_ptr() of the permuted view is the storage base.
-            ptrs = [t.data_ptr() for t in tensors]
+            for v in ref_views:
+                assert v.stride()[1:] == (per_token_dim, v.shape[3], 1), \
+                    f"kv cache page not token-major: shape={tuple(v.shape)} " \
+                    f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
+            # Non-flat block layouts (page_size_padded gaps, or split K/V
+            # interleaved per block as in the 5-D N-first layout) go through the
+            # kernel's strided path. Stride 0 = fast flat indexing.
+            flat = view.stride(0) == kernel_block_size * per_token_dim
+            block_stride = 0 if flat else view.stride(0)
+            # Pointer array ordered [K0, V0, K1, V1, ...] for split layouts and
+            # [L0, L1, ...] for the packed layout; each view's data_ptr() is its
+            # own storage base, so the kernel never adds a K->V offset.
+            ptrs = [v.data_ptr() for t in tensors for v in attn_kv_views(t)]
             ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cpu").to(self._device)
             return TransferGroup(
                 group_idx=meta.group_idx,
@@ -419,6 +493,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 per_block_bytes=meta.per_block_bytes,
                 kvcache_ptr_tensor_gpu=ptr_tensor,
                 layer_num=len(meta.layer_names),
+                num_kv_ptrs=len(ptrs),
                 per_token_dim=per_token_dim,
                 kernel_block_size=kernel_block_size,
                 kv_stride=0,

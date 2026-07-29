@@ -6,7 +6,8 @@ End-to-end integration tests for the KVCM vLLM connector
 through the OpenAI API and verifies that the KV cache data saved to / loaded
 from KVCM is correct.
 
-Requires 1-2 GPUs and vLLM >= 0.26.0.
+Requires 1-2 GPUs and vLLM (0.22.1, 0.23.0 and 0.26.0 are e2e-verified; the
+connector detects the KV cache layout of each era from the tensor shape).
 
 ## What is verified
 
@@ -98,7 +99,7 @@ All environment variables used by the e2e harness:
 | Variable | Required | Meaning |
 |---|---|---|
 | `KVCM_E2E_MODEL` | yes | Path to a local HF model directory (`config.json` + weights). Full-attention coverage needs a plain attention model (e.g. Qwen2.5-7B-Instruct); hybrid coverage needs a mamba/linear + attention model (e.g. Qwen3.5-4B). Hybrid models are auto-detected from `config.json`. |
-| `KVCM_E2E_PYTHON` | yes | Python interpreter of a venv with vLLM >= 0.26.0 and both KVCM wheels (`kvcm_py_client`, `kvcm_vllm_connector`) installed. |
+| `KVCM_E2E_PYTHON` | yes | Python interpreter of a venv with vLLM (any supported version, see above) and both KVCM wheels (`kvcm_py_client`, `kvcm_vllm_connector`) installed. |
 | `KVCM_E2E_CAPTURE_DIR` | internal | Set by the driver for the vLLM subprocess; tells `VerifyingConnector` where to write `.pt` captures. Do not set manually. |
 
 The driver also sets vLLM knobs for the spawned server (`VLLM_KV_CACHE_LAYOUT=NHD`,

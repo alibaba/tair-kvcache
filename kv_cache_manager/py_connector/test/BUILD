@@ -29,6 +29,13 @@ py_test(
 )
 
 py_test(
+    name = "test_kv_layouts",
+    srcs = ["test_kv_layouts.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
+
+py_test(
     name = "test_scheduler_state",
     srcs = ["test_scheduler_state.py"],
     tags = ["no-remote-exec"],

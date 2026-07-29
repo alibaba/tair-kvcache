@@ -64,7 +64,8 @@ import torch
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
-from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
+from kv_cache_manager.py_connector.vllm.v1_connector import (
+    TairKvCacheConnector, attn_kv_views)
 
 CAPTURE_DIR_ENV = "KVCM_E2E_CAPTURE_DIR"
 
@@ -89,7 +90,7 @@ class VerifyingConnector(TairKvCacheConnector):
         for meta in self._group_metas:
             if meta.is_attention:
                 ref = kv_caches[meta.layer_names[0]]
-                kernel_bs = ref.shape[2]
+                kernel_bs = attn_kv_views(ref)[0].shape[1]
             else:
                 kernel_bs = 0
             self._cap_groups.append(
@@ -259,13 +260,20 @@ class VerifyingConnector(TairKvCacheConnector):
                 slot_tensor = torch.tensor(slots, dtype=torch.long, device=self._device)
                 for layer_name in layer_names:
                     kv_cache = self._kv_caches[layer_name]
-                    # vLLM >= 0.26.0: (num_blocks, num_kv_heads, kernel_bs,
-                    # 2*head_size) packed, NHD memory order is token-major. Flatten
-                    # the (block, token) dims and gather the whole per-token vector
-                    # (K and V packed) -- the packing is opaque to verification.
-                    per_token = kv_cache.shape[1] * kv_cache.shape[3]
-                    flat = kv_cache.permute(0, 2, 1, 3).reshape(-1, per_token)
-                    gathered = flat[slot_tensor, :].contiguous()  # [n_tok, per_token]
+                    # Normalize the layout (packed 4-D or split K/V 5-D) into
+                    # token-major views via the production helper and gather the
+                    # whole per-token vector by (block, token) advanced indexing
+                    # -- split K/V views are non-contiguous, so flattening them
+                    # first would copy the entire cache tensor. Split views are
+                    # concatenated on the content dim, so a capture is
+                    # comparable across save/load within one run.
+                    parts = []
+                    for v in attn_kv_views(kv_cache):
+                        blk = slot_tensor // kernel_bs
+                        tok = slot_tensor % kernel_bs
+                        parts.append(v[blk, tok].reshape(len(slots), -1))
+                    gathered = (parts[0] if len(parts) == 1
+                                else torch.cat(parts, dim=-1)).contiguous()
                     kv_by_layer[layer_name] = gathered.cpu()
             else:
                 # State stored once per group block; the manager block's last

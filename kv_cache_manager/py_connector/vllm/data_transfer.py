@@ -147,7 +147,7 @@ class DataTransferManager:
                                          dtype=torch.uint8, device=self._device)
                 if group.is_attention:
                     view = gpu_buffer.view(self._info.dtype).view(
-                        len(valid), group.layer_num,
+                        len(valid), group.num_kv_ptrs,
                         self._manager_block_size, group.per_token_dim)
                     batch_gather_scatter_helper.batch_gather_kv_caches(
                         group.kvcache_ptr_tensor_gpu, view, block_token_indices,
@@ -226,7 +226,7 @@ class DataTransferManager:
                 gpu_buffer = cpu_buffer.to(self._device, non_blocking=True)
                 if group.is_attention:
                     view = gpu_buffer.view(self._info.dtype).view(
-                        n, group.layer_num, self._manager_block_size, group.per_token_dim)
+                        n, group.num_kv_ptrs, self._manager_block_size, group.per_token_dim)
                     batch_gather_scatter_helper.batch_scatter_kv_caches(
                         group.kvcache_ptr_tensor_gpu, view, block_token_indices,
                         list(range(n)), self._manager_block_size, group.per_token_dim,

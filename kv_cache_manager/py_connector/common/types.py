@@ -30,12 +30,19 @@ class TransferGroup:
     layer_num: int = 0
 
     # --- Attention-only fields (is_attention == True) ---
-    # int64 tensor of [K0, V0, K1, V1, ...] data ptrs on the compute device.
+    # int64 tensor of transfer-pointer bases on the compute device. For packed
+    # K/V layouts (vllm >= 0.26.0) one pointer per layer [L0, L1, ...]; for
+    # split K/V layouts (vllm <= 0.25.x) two per layer [K0, V0, K1, V1, ...].
     kvcache_ptr_tensor_gpu: Optional[torch.Tensor] = None
-    per_token_dim: int = 0          # num_kv_heads * head_size
-    kernel_block_size: int = 0      # tensor.shape[2]
-    kv_stride: int = 0              # tensor.stride(0), 0 => contiguous flat layout
-    block_stride: int = 0           # tensor.stride(1), 0 => contiguous flat layout
+    # Number of transfer pointers (rows of the staging buffer view per block).
+    # layer_num for packed layouts, 2 * layer_num for split K/V layouts.
+    num_kv_ptrs: int = 0
+    per_token_dim: int = 0          # heads * content dim per pointer
+    kernel_block_size: int = 0      # tokens per kernel page
+    kv_stride: int = 0              # K->V element offset added by the kernel; 0
+                                    # because every pointer is its own base
+    block_stride: int = 0           # element stride between kernel pages of one
+                                    # pointer, 0 => contiguous flat layout
 
     # --- State-only fields (is_attention == False) ---
     # Per layer (num_blocks, page_size_bytes) uint8 views into the state storage.
