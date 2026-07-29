@@ -3709,18 +3709,19 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                           instance_id.c_str());
     }
 
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!instance_info) {
+        request_context->error_tracer()->AddErrorMsg("instance not found");
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+            WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
+    }
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (!instance_info) {
-            request_context->error_tracer()->AddErrorMsg("instance not found");
-            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
-                WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
-        }
         query_type = static_cast<QueryType>(instance_info->default_query_type());
         if (query_type == QueryType::QT_UNSPECIFIED) {
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, std::vector<HostCacheMatch>, "unknown query type");
         }
     }
+    const bool use_eagle_pop = instance_info->model_deployment().use_eagle_pop();
     if (query_type != QueryType::QT_PREFIX_MATCH && query_type != QueryType::QT_PREFIX_MATCH_WITH_MAMBA) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
                                           EC_BADARGS,
@@ -3737,17 +3738,17 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatchByHost(request_context, block_cache_keys, medium_filter, host_matches);
+        ec = meta_searcher->PrefixMatchByHost(
+            request_context, block_cache_keys, use_eagle_pop, medium_filter, host_matches);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
-        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (!instance_info) {
-            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
-                WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
-        }
-        ec = meta_searcher->PrefixMatchWithMambaByHost(
-            request_context, block_cache_keys, medium_filter, instance_info->location_spec_groups(), host_matches);
+        ec = meta_searcher->PrefixMatchWithMambaByHost(request_context,
+                                                       block_cache_keys,
+                                                       use_eagle_pop,
+                                                       medium_filter,
+                                                       instance_info->location_spec_groups(),
+                                                       host_matches);
         break;
     }
     default:

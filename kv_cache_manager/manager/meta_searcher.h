@@ -80,10 +80,12 @@ public:
                                           SelectLocationPolicy *policy) const;
     ErrorCode PrefixMatchByHost(RequestContext *request_context,
                                 const KeyVector &keys,
+                                bool use_eagle_pop,
                                 const std::vector<std::string> &medium_filter,
                                 std::vector<HostCacheMatch> &out_matches) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
+                                         bool use_eagle_pop,
                                          const std::vector<std::string> &medium_filter,
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
                                          std::vector<HostCacheMatch> &out_matches) const;

@@ -376,6 +376,12 @@ public:
         return model_deployment;
     }
 
+    ModelDeployment createModelDeploymentWithEaglePop() {
+        ModelDeployment model_deployment = createModelDeployment();
+        model_deployment.set_use_eagle_pop(true);
+        return model_deployment;
+    }
+
     std::vector<LocationSpecInfo> createLocationSpecInfos() {
         std::vector<LocationSpecInfo> location_spec_infos = {
             LocationSpecInfo("tp0", 512),
@@ -6680,7 +6686,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
                                                instance_id,
                                                64,
                                                location_spec_infos,
-                                               createModelDeployment(),
+                                               createModelDeploymentWithEaglePop(),
                                                location_spec_groups,
                                                CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA));
 
@@ -6722,9 +6728,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     const std::string host_a = "10.0.1.1:8080";
     const std::string host_b = "10.0.1.2:8080";
     const std::string host_c = "10.0.1.3:8080";
+    const std::string host_e = "10.0.1.5:8080";
     InitializeEventReporter(instance_id, host_a, proto::meta::ST_EVENT_REPORT_L1P5);
     InitializeEventReporter(instance_id, host_b, proto::meta::ST_EVENT_REPORT_L1P5);
     InitializeEventReporter(instance_id, host_c, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id, host_e, proto::meta::ST_EVENT_REPORT_L1P5);
 
     report_specs(host_a, 100, {"full_0", "linear_0", "linear_1"});
     report_specs(host_a, 200, {"full_0"});
@@ -6739,6 +6747,10 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
 
     report_specs(host_c, 100, {"full_0"});
     report_specs(host_c, 200, {"full_0"});
+
+    report_specs(host_e, 100, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_e, 200, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_e, 300, {"full_0", "linear_0", "linear_1"});
 
     const std::string host_d = "10.0.1.4:8080";
     InitializeEventReporter(instance_id, host_d, proto::meta::ST_EVENT_REPORT_L1P5);
@@ -6761,9 +6773,10 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
 
     auto expect_mamba_matches = [&](const std::vector<CacheManager::HostCacheMatch> &matches) {
         EXPECT_EQ(3, find_prefix(matches, host_a));
-        EXPECT_EQ(4, find_prefix(matches, host_b));
+        EXPECT_EQ(-1, find_prefix(matches, host_b));
         EXPECT_EQ(-1, find_prefix(matches, host_c));
         EXPECT_EQ(-1, find_prefix(matches, host_d));
+        EXPECT_EQ(2, find_prefix(matches, host_e));
     };
     expect_mamba_matches(hosts);
 
@@ -6771,10 +6784,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
     ASSERT_EQ(EC_OK, explicit_ec);
-    EXPECT_EQ(4, find_prefix(explicit_hosts, host_a));
-    EXPECT_EQ(4, find_prefix(explicit_hosts, host_b));
-    EXPECT_EQ(2, find_prefix(explicit_hosts, host_c));
+    EXPECT_EQ(3, find_prefix(explicit_hosts, host_a));
+    EXPECT_EQ(3, find_prefix(explicit_hosts, host_b));
+    EXPECT_EQ(1, find_prefix(explicit_hosts, host_c));
     EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
+    EXPECT_EQ(2, find_prefix(explicit_hosts, host_e));
 
     auto [fallback_ec, fallback_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);
@@ -6786,10 +6800,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         auto [break_ec, break_hosts] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, break_keys);
         ASSERT_EQ(EC_OK, break_ec);
-        EXPECT_EQ(1, find_prefix(break_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_a));
         EXPECT_EQ(-1, find_prefix(break_hosts, host_b));
         EXPECT_EQ(-1, find_prefix(break_hosts, host_c));
         EXPECT_EQ(-1, find_prefix(break_hosts, host_d));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_e));
     }
 
     {
@@ -6800,10 +6815,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
                                               keys_without_host_d_first);
         ASSERT_EQ(EC_OK, absent_ec);
-        EXPECT_EQ(3, find_prefix(absent_hosts, host_a));
+        EXPECT_EQ(1, find_prefix(absent_hosts, host_a));
         EXPECT_EQ(-1, find_prefix(absent_hosts, host_b));
         EXPECT_EQ(-1, find_prefix(absent_hosts, host_c));
         EXPECT_EQ(-1, find_prefix(absent_hosts, host_d));
+        EXPECT_EQ(2, find_prefix(absent_hosts, host_e));
     }
 
     dsm->storage_map_.erase("event_backend_mamba");

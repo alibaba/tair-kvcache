@@ -11,6 +11,8 @@ cc_test(
     deps = [
         ":service_util_test_cc_proto",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
     ],
 )

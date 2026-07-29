@@ -1,6 +1,8 @@
 #include <algorithm>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "service/util/proto_message_json_util.h"
 #include "service/util/test/service_util_test.pb.h"
 
@@ -435,6 +437,31 @@ TEST_F(ProtoMessageJsonUtilTest, TestFromJsonRepeated) {
             ASSERT_EQ("hello", msg.oneofvec(2).v3().stringvalue());
         }
     }
+}
+
+} // namespace kv_cache_manager
+
+namespace kv_cache_manager {
+
+TEST_F(ProtoMessageJsonUtilTest, TestModelDeploymentUseEaglePopConversion) {
+    ModelDeployment default_model_deployment;
+    EXPECT_FALSE(default_model_deployment.use_eagle_pop());
+
+    proto::meta::ModelDeployment proto_model_deployment;
+    proto_model_deployment.set_model_name("m");
+    proto_model_deployment.set_dtype("fp8");
+    proto_model_deployment.set_use_eagle_pop(false);
+
+    ModelDeployment model_deployment;
+    ProtoConvert::ModelDeploymentFromProto(&proto_model_deployment, model_deployment);
+    EXPECT_FALSE(model_deployment.use_eagle_pop());
+
+    ProtoConvert::ModelDeploymentToProto(model_deployment, &proto_model_deployment);
+    EXPECT_FALSE(proto_model_deployment.use_eagle_pop());
+
+    proto_model_deployment.set_use_eagle_pop(true);
+    ProtoConvert::ModelDeploymentFromProto(&proto_model_deployment, model_deployment);
+    EXPECT_TRUE(model_deployment.use_eagle_pop());
 }
 
 } // namespace kv_cache_manager

@@ -765,6 +765,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
 
 ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           const KeyVector &keys,
+                                          bool use_eagle_pop,
                                           const std::vector<std::string> &medium_filter,
                                           std::vector<HostCacheMatch> &out_matches) const {
     SPAN_TRACER(request_context);
@@ -810,13 +811,19 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
             }
             ++prefix_len;
         }
-        out_matches.push_back(HostCacheMatch{host, prefix_len});
+        if (use_eagle_pop) {
+            prefix_len = std::max<int64_t>(prefix_len - 1, 0);
+        }
+        if (prefix_len > 0) {
+            out_matches.push_back(HostCacheMatch{host, prefix_len});
+        }
     }
     return EC_OK;
 }
 
 ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_context,
                                                    const KeyVector &keys,
+                                                   bool use_eagle_pop,
                                                    const std::vector<std::string> &medium_filter,
                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                                    std::vector<HostCacheMatch> &out_matches) const {
@@ -878,6 +885,9 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                 !HasAllLocationSpecGroups(host_it->second, full_groups)) {
                 break;
             }
+        }
+        if (use_eagle_pop && full_prefix_len > 0) {
+            --full_prefix_len;
         }
         if (full_prefix_len == 0) {
             continue;
