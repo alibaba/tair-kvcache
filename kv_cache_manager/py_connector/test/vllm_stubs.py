@@ -1,12 +1,16 @@
 """Shared test stubs: make ``v1_connector`` importable without vLLM/CUDA/pybind.
 
-``v1_connector`` imports vLLM and the compiled ``kvcm_py_client`` at module
+``v1_connector`` imports vLLM, the compiled ``kvcm_py_client`` and several
+third-party runtime deps (torch, triton, orjson, zmq, requests) at module
 level. For pure-logic unit tests we register lightweight stand-ins in
 ``sys.modules`` *before* the first import, then build connector instances via
 ``__new__`` with only the attributes the code under test reads. No production
-module is modified.
+module is modified; real modules are preferred whenever they are importable
+(e.g. on a dev machine with a full vLLM venv).
 """
 
+import importlib.util
+import json
 import sys
 import types
 from typing import Optional
@@ -21,7 +25,35 @@ def _module(name: str) -> types.ModuleType:
     return mod
 
 
+def _importable(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _stub_third_party():
+    """Register stand-ins for third-party deps missing from the environment
+    (the open-source CI runs these tests without torch/triton/orjson/zmq/
+    requests installed). Real modules always win."""
+    # Pure-attribute deps: a MagicMock module is enough because the pure-logic
+    # tests never execute tensor/socket/http work at module import time.
+    for name in ("torch", "triton", "triton.language", "zmq", "requests"):
+        if name not in sys.modules and not _importable(name):
+            sys.modules[name] = MagicMock(__name__=name)
+
+    # orjson is used functionally (CoordinateMsgSerializer round trips), so
+    # the stand-in must actually (de)serialize; stdlib json handles the
+    # dataclass payloads via __dict__.
+    if "orjson" not in sys.modules and not _importable("orjson"):
+        orjson = _module("orjson")
+        orjson.dumps = lambda obj: json.dumps(
+            obj, default=lambda o: o.__dict__).encode()
+        orjson.loads = json.loads
+
+
 def _install_stubs():
+    _stub_third_party()
     existing = sys.modules.get("vllm")
     if existing is not None:
         # Either our stub is already in place or the real vLLM is importable;

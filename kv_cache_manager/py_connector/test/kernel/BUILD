@@ -8,9 +8,10 @@ py_test(
     ],
     main = "test_strided_gather_scatter.py",
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1 GPU
         "exclusive",  # GPU tests run serially to avoid CUDA contention
+        "gpu",  # requires 1 GPU
+        "manual",  # needs torch/triton + GPU; not runnable in open-source CI
+        "no-remote-exec",
     ],
     deps = [
         "//kv_cache_manager/py_connector/kernel",

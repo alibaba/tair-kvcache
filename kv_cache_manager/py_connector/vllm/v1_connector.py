@@ -32,7 +32,6 @@ from concurrent.futures import ThreadPoolExecutor
 from kv_cache_manager.client.pybind import kvcm_py_client
 
 import torch
-import typing_extensions
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -67,7 +66,7 @@ from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraC
 from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQueryManager
 from kv_cache_manager.py_connector.vllm.data_transfer import MultiResult, DataTransferManager, _get_device_module
 
-if typing_extensions.TYPE_CHECKING:
+if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.attention import AttentionMetadata
     from vllm.v1.request import Request
