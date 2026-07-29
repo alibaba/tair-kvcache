@@ -13,6 +13,30 @@ cc_binary(
         "//kv_cache_manager/common:logger"
     ],
 )
+
+cc_binary(
+    name = "lite_hit_main",
+    srcs = [
+        "lite_hit_main.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/optimizer/manager:lite_hit_offline_runner",
+        "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_binary(
+    name = "lite_hit_facts_query_main",
+    srcs = [
+        "lite_hit_facts_query_main.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/optimizer/liteHit:facts_query",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
 cc_library(
     name = "config",
     hdrs = [
@@ -21,24 +45,6 @@ cc_library(
     ],
     srcs = [
 
-    ],
-)
-
-cc_library(
-    name = "online_optimizer_manager",
-    srcs = [
-        "online_runtime/online_optimizer_manager.cc",
-    ],
-    hdrs = [
-        "online_runtime/online_optimizer_manager.h",
-    ],
-    deps = [
-        "//kv_cache_manager/common",
-        "//kv_cache_manager/optimizer/config:online_optimizer_config",
-        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
-        "//kv_cache_manager/optimizer/index:cache_indexer",
-        "//kv_cache_manager/optimizer/index:cache_indexer_factory",
-        "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
     ],
 )
 
@@ -65,7 +71,7 @@ cc_library(
         "service/metrics/optimizer_metrics_reporter.h",
     ],
     deps = [
-        ":online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         ":optimizer_metrics_collector",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:common_util",
@@ -100,7 +106,7 @@ cc_library(
         "service/optimizer_service_impl.h",
     ],
     deps = [
-        ":online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         ":optimizer_call_guard",
         ":optimizer_metrics_collector",
         ":optimizer_metrics_reporter",
@@ -181,7 +187,7 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
-        ":online_optimizer_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         ":online_optimizer_server_config",
         ":optimizer_metrics_reporter",
         ":optimizer_service_grpc",

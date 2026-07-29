@@ -10,7 +10,7 @@
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/metrics/kmon_param.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
 
 namespace kv_cache_manager {
@@ -35,7 +35,7 @@ struct OptimizerMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_blocks_total);
     DECLARE_METRICS(trace, query_max_hit_rate);
     DECLARE_METRICS(trace, query_unique_keys);
-    DECLARE_METRICS(trace, query_avg_bytes_per_block);
+    DECLARE_METRICS(trace, query_bytes_per_block);
     DECLARE_METRICS(trace, query_linear_step);
     DECLARE_METRICS(trace, query_eviction_count);
     DECLARE_METRICS(trace, query_memory_usage_bytes);
@@ -205,7 +205,7 @@ bool OptimizerMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_blocks_total);
     REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_unique_keys);
-    REGISTER_GAUGE_METRIC(trace, query_avg_bytes_per_block);
+    REGISTER_GAUGE_METRIC(trace, query_bytes_per_block);
     REGISTER_GAUGE_METRIC(trace, query_linear_step);
     REGISTER_GAUGE_METRIC(trace, query_eviction_count);
     REGISTER_GAUGE_METRIC(trace, query_memory_usage_bytes);
@@ -274,14 +274,16 @@ void OptimizerMetricsReporter::ReportInterval() {
         Gauge blocks_total = metrics_registry_->GetGauge("trace_query_blocks_total", prom_tags);
         blocks_total = static_cast<double>(s.total_blocks_queried);
 
-        Gauge max_hit_rate = metrics_registry_->GetGauge("trace_query_max_hit_rate", prom_tags);
-        max_hit_rate = s.max_hit_rate;
+        if (s.max_hit_rate >= 0) {
+            Gauge max_hit_rate = metrics_registry_->GetGauge("trace_query_max_hit_rate", prom_tags);
+            max_hit_rate = s.max_hit_rate;
+        }
 
         Gauge unique_keys = metrics_registry_->GetGauge("trace_query_unique_keys", prom_tags);
         unique_keys = static_cast<double>(s.unique_keys);
 
-        Gauge avg_bytes = metrics_registry_->GetGauge("trace_query_avg_bytes_per_block", prom_tags);
-        avg_bytes = static_cast<double>(s.avg_bytes_per_block);
+        Gauge bytes_per_block_gauge = metrics_registry_->GetGauge("trace_query_bytes_per_block", prom_tags);
+        bytes_per_block_gauge = static_cast<double>(s.bytes_per_block);
 
         Gauge linear_step = metrics_registry_->GetGauge("trace_query_linear_step", prom_tags);
         linear_step = static_cast<double>(s.linear_step);
@@ -330,9 +332,11 @@ void OptimizerMetricsReporter::ReportInterval() {
 
         REPORT_METRICS(trace, query_total, static_cast<double>(s.total_queries));
         REPORT_METRICS(trace, query_blocks_total, static_cast<double>(s.total_blocks_queried));
-        REPORT_METRICS(trace, query_max_hit_rate, s.max_hit_rate);
+        if (s.max_hit_rate >= 0) {
+            REPORT_METRICS(trace, query_max_hit_rate, s.max_hit_rate);
+        }
         REPORT_METRICS(trace, query_unique_keys, static_cast<double>(s.unique_keys));
-        REPORT_METRICS(trace, query_avg_bytes_per_block, static_cast<double>(s.avg_bytes_per_block));
+        REPORT_METRICS(trace, query_bytes_per_block, static_cast<double>(s.bytes_per_block));
         REPORT_METRICS(trace, query_linear_step, static_cast<double>(s.linear_step));
         REPORT_METRICS(trace, query_eviction_count, static_cast<double>(s.eviction_count));
         REPORT_METRICS(trace, query_memory_usage_bytes, static_cast<double>(s.memory_usage_bytes));
@@ -393,7 +397,9 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         const auto &instance_id = p->instance_id();
 
         for (const auto &info : per_cap) {
-            double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
+            double hit_rate = info.hit_rate >= 0.0
+                                  ? info.hit_rate
+                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
             MetricsTags prom_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
@@ -443,7 +449,9 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         const auto &instance_id = p->instance_id();
 
         for (const auto &info : per_cap) {
-            double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
+            double hit_rate = info.hit_rate >= 0.0
+                                  ? info.hit_rate
+                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
             MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};

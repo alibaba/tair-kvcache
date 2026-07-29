@@ -1,7 +1,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
@@ -379,6 +379,64 @@ TEST_F(OptimizerServiceImplTest, TraceQuery) {
     ASSERT_EQ(1, tq_resp2.capacity_results_size());
     EXPECT_EQ(3, tq_resp2.capacity_results(0).cache_hit_count());
     EXPECT_EQ(3, tq_resp2.capacity_results(0).current_unique_keys());
+}
+
+TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {
+    CreateTestGroup("grp1");
+
+    auto req = MakeRegisterRequest("grp1", "inst1", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::TraceQueryRequest tq_req;
+    tq_req.set_trace_id("trace2");
+    tq_req.set_instance_id("inst1");
+    tq_req.set_input_token_len(13);
+    tq_req.add_block_keys(1);
+    tq_req.add_block_keys(2);
+    tq_req.add_block_keys(3);
+
+    proto::optimizer::TraceQueryResponse first;
+    service_->TraceQuery(&ctx, &tq_req, &first);
+    ASSERT_EQ(proto::optimizer::OK, first.header().status().code());
+    EXPECT_EQ(13, first.input_token_len());
+    ASSERT_EQ(1, first.capacity_results_size());
+    EXPECT_EQ(0, first.capacity_results(0).cache_hit_count());
+
+    proto::optimizer::TraceQueryResponse second;
+    service_->TraceQuery(&ctx, &tq_req, &second);
+    ASSERT_EQ(proto::optimizer::OK, second.header().status().code());
+    EXPECT_EQ(3, second.capacity_results(0).cache_hit_count());
+    EXPECT_DOUBLE_EQ(12.0 / 13.0, second.capacity_results(0).hit_rate());
+
+    proto::optimizer::OptimizerListInstancesRequest list_req;
+    list_req.set_instance_group("grp1");
+    proto::optimizer::OptimizerListInstancesResponse list_resp;
+    service_->ListInstances(&ctx, &list_req, &list_resp);
+    ASSERT_EQ(1, list_resp.instances_size());
+    EXPECT_EQ(26, list_resp.instances(0).total_input_tokens());
+    ASSERT_EQ(1, list_resp.instances(0).capacity_summaries_size());
+    EXPECT_DOUBLE_EQ(12.0 / 26.0, list_resp.instances(0).capacity_summaries(0).hit_rate());
+}
+
+TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryKeepsBlockOnlyCompatibility) {
+    CreateTestGroup("grp1");
+
+    auto req = MakeRegisterRequest("grp1", "inst1", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::TraceQueryRequest tq_req;
+    tq_req.set_instance_id("inst1");
+    tq_req.add_block_keys(1);
+    proto::optimizer::TraceQueryResponse response;
+    service_->TraceQuery(&ctx, &tq_req, &response);
+    EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
+    EXPECT_EQ(4, response.input_token_len());
 }
 
 TEST_F(OptimizerServiceImplTest, TraceQueryNonExistentInstance) {

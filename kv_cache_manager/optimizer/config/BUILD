@@ -46,6 +46,21 @@ cc_library(
 )
 
 cc_library(
+    name = "optimizer_lite_hit_config",
+    srcs = [
+        "optimizer_lite_hit_config.cc",
+    ],
+    hdrs = [
+        "optimizer_lite_hit_config.h",
+    ],
+    deps = [
+        ":online_optimizer_config",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:jsonizable",
+    ],
+)
+
+cc_library(
     name = "config",
     deps = [
         ":online_optimizer_config",
