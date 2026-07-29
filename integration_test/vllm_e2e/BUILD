@@ -14,113 +14,120 @@ py_library(
 
 py_test(
     name = "test_basic",
+    timeout = "eternal",
     srcs = ["test_basic.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_concurrent",
+    timeout = "eternal",
     srcs = ["test_concurrent.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_tp",
+    timeout = "eternal",
     srcs = ["test_tp.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_full_hit",
+    timeout = "eternal",
     srcs = ["test_full_hit.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_partial_hit",
+    timeout = "eternal",
     srcs = ["test_partial_hit.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_load_failure",
+    timeout = "eternal",
     srcs = ["test_load_failure.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
 py_test(
     name = "test_multi_turn",
+    timeout = "eternal",
     srcs = ["test_multi_turn.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
 )
 
@@ -128,16 +135,34 @@ py_test(
 # asserts the KV verification FAILS -- proof the harness is not vacuous.
 py_test(
     name = "test_mutation",
+    timeout = "eternal",
     srcs = ["test_mutation.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
     ],
     imports = ["."],
     tags = [
-        "no-remote-exec",
-        "gpu",  # requires 1+ GPU
         "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
     ],
-    timeout = "eternal",
     deps = [":e2e_lib"],
+)
+
+# Wildcards skip "manual" targets; run the whole suite explicitly with
+#   bazelisk test //integration_test/vllm_e2e:e2e_tests
+test_suite(
+    name = "e2e_tests",
+    tags = ["manual"],  # keep wildcard builds from expanding into the GPU tests
+    tests = [
+        ":test_basic",
+        ":test_concurrent",
+        ":test_full_hit",
+        ":test_load_failure",
+        ":test_multi_turn",
+        ":test_mutation",
+        ":test_partial_hit",
+        ":test_tp",
+    ],
 )

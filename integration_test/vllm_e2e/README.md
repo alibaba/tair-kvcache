@@ -29,8 +29,8 @@ block-table mapping:
 2. **Phase 2** — same prompts + suffix: connector reports an external match and
    loads from KVCM. The loaded blocks are captured (**loaded** captures).
 3. The driver (`e2e_lib.py`) matches loaded captures against references by
-   token content and compares per layer: bit-exact preferred, cosine
-   similarity > 99.99% as fallback.
+   token content and compares per layer, requiring bit-exact equality (the
+   transfer is a verbatim byte round trip; all scenarios achieve it).
 
 ## Model coverage
 
@@ -56,8 +56,17 @@ Hybrid specifics verified:
 | `test_basic` | 1 | 1 | Minimal save -> load round trip |
 | `test_concurrent` | 1 | 4 | Concurrent requests: ReqState tracking, per-request block attribution |
 | `test_tp` | 2 | 2 | TP coordination; for full-attention models also `preferred_block_size=32` != vLLM block size (16), forcing real cross-block translation |
+| `test_partial_hit` | 1 | 1 | Phase 2 extends the prompt mid-block: partial external hit |
+| `test_full_hit` | 1 | 1 | Phase 2 resends the identical prompt: full-prompt hit is capped so >= 1 token is recomputed |
+| `test_multi_turn` | 1 | 1 | Growing conversation: each turn loads the previous turns' blocks and saves new ones |
+| `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes |
+| `test_mutation` | 1 | 1 | Meta-test: injected off-by-one in the slot translation must make verification FAIL (proves the harness is not vacuous) |
 
 ## Running
+
+These targets are tagged `manual`: they need a GPU machine with a prepared
+vLLM venv and a local model, so `bazelisk test //integration_test/...` skips
+them and they must be requested explicitly (see below).
 
 Build prerequisites (from the repo root):
 
@@ -75,19 +84,27 @@ from the wheel's `METADATA`).
 Run (tagged `exclusive`, so they execute serially):
 
 ```bash
-bazelisk test //integration_test/vllm_e2e/... \
+bazelisk test //integration_test/vllm_e2e:e2e_tests \
   --cache_test_results=no --test_output=errors \
   --test_env=KVCM_E2E_PYTHON=/path/to/vllm-venv/bin/python \
   --test_env=KVCM_E2E_MODEL=/path/to/model \
   --per_file_copt='external/jsoncpp_git/.*@-Wno-error'
 ```
 
-Environment variables:
+## Environment variables
 
-| Variable | Meaning |
-|---|---|
-| `KVCM_E2E_PYTHON` | Python interpreter with vLLM + both KVCM wheels installed |
-| `KVCM_E2E_MODEL` | Model path; hybrid models are auto-detected from `config.json` |
+All environment variables used by the e2e harness:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `KVCM_E2E_MODEL` | yes | Path to a local HF model directory (`config.json` + weights). Full-attention coverage needs a plain attention model (e.g. Qwen2.5-7B-Instruct); hybrid coverage needs a mamba/linear + attention model (e.g. Qwen3.5-4B). Hybrid models are auto-detected from `config.json`. |
+| `KVCM_E2E_PYTHON` | yes | Python interpreter of a venv with vLLM >= 0.26.0 and both KVCM wheels (`kvcm_py_client`, `kvcm_vllm_connector`) installed. |
+| `KVCM_E2E_CAPTURE_DIR` | internal | Set by the driver for the vLLM subprocess; tells `VerifyingConnector` where to write `.pt` captures. Do not set manually. |
+
+The driver also sets vLLM knobs for the spawned server (`VLLM_KV_CACHE_LAYOUT=NHD`,
+`VLLM_ATTENTION_BACKEND=FLASH_ATTN`, `VLLM_USE_FLASHINFER_SAMPLER=0`,
+`FLASHINFER_DISABLE_VERSION_CHECK=1`) via `env.setdefault`, so a value you
+export yourself wins.
 
 ## Debugging
 

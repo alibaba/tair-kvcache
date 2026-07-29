@@ -2,7 +2,7 @@
 
 Sends one prompt (prefill + save -> reference capture), then the same prompt
 with a suffix (load + prefill -> loaded capture), and verifies the prefix KV
-data matches (bit-exact preferred, cosine > 99.99% as fallback).
+data matches bit-exactly.
 
 Works for both full-attention and hybrid models (selected via KVCM_E2E_MODEL);
 see e2e_lib.run_e2e for the per-model orchestration differences.

@@ -49,11 +49,21 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-MODEL_PATH = os.environ.get("KVCM_E2E_MODEL", "/root/ws/resources/models/Qwen2.5-7B-Instruct")
-COSINE_THRESHOLD = 0.9999
-# Bit-exact comparison is the default (empirically all scenarios achieve it).
-# Cosine fallback must be explicitly requested.
-ALLOW_COSINE = os.environ.get("KVCM_E2E_ALLOW_COSINE", "0") == "1"
+# Required: path to a local HF model directory (config.json + weights).
+# Full-attention coverage needs a plain attention model (e.g.
+# Qwen2.5-7B-Instruct); hybrid coverage needs a mamba/linear + attention model
+# (e.g. Qwen3.5-4B). Hybrid models are auto-detected from config.json.
+MODEL_PATH = os.environ.get("KVCM_E2E_MODEL")
+if not MODEL_PATH:
+    raise RuntimeError(
+        "KVCM_E2E_MODEL is not set. Point it at a local model directory, e.g. "
+        "--test_env=KVCM_E2E_MODEL=/path/to/Qwen2.5-7B-Instruct (full "
+        "attention) or /path/to/Qwen3.5-4B (hybrid). See "
+        "integration_test/vllm_e2e/README.md.")
+
+# Model-agnostic alias the driver uses in OpenAI API requests, so the tests do
+# not depend on the model directory name.
+SERVED_MODEL_NAME = "e2e-model"
 
 
 def is_hybrid_model(model_path: str) -> bool:
@@ -116,7 +126,16 @@ def find_manager_binary(repo_root: str) -> str:
 
 
 def find_python() -> str:
-    return os.environ.get("KVCM_E2E_PYTHON", "/root/ws/env/global_vllm/.venv/bin/python")
+    # Required: python interpreter of a venv with vLLM >= 0.26.0 and both KVCM
+    # wheels (kvcm_py_client, kvcm_vllm_connector) installed; see README.md.
+    python = os.environ.get("KVCM_E2E_PYTHON")
+    if not python:
+        raise RuntimeError(
+            "KVCM_E2E_PYTHON is not set. Point it at the python of a vLLM "
+            "venv with the KVCM wheels installed, e.g. "
+            "--test_env=KVCM_E2E_PYTHON=/path/to/venv/bin/python. See "
+            "integration_test/vllm_e2e/README.md.")
+    return python
 
 
 def free_port() -> int:
@@ -304,7 +323,7 @@ class VllmServer:
         cmd = [
             find_python(), "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
-            "--served-model-name", "qwen",
+            "--served-model-name", SERVED_MODEL_NAME,
             "--port", str(self.port),
             "--tensor-parallel-size", str(self.tp_size),
             "--max-model-len", "4096",
@@ -362,7 +381,7 @@ class VllmServer:
 # --------------------------------------------------------------------------- #
 def tokenize(base_url: str, prompt: str) -> list[int]:
     r = requests.post(f"{base_url}/tokenize",
-                      json={"model": "qwen", "prompt": prompt}, timeout=60)
+                      json={"model": SERVED_MODEL_NAME, "prompt": prompt}, timeout=60)
     r.raise_for_status()
     return r.json()["tokens"]
 
@@ -444,7 +463,7 @@ def send_completions(base_url: str, prompts: list, max_tokens: int = 4,
 
     def _one(prompt) -> dict:
         payload = {
-            "model": "qwen",
+            "model": SERVED_MODEL_NAME,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -485,14 +504,6 @@ def wait_for_captures(capture_dir: str, kind: str, expected: int,
         f"timed out waiting for {kind} captures: got {n}, want {expected}")
 
 
-def _cosine(a, b) -> float:
-    import torch
-    a = a.reshape(-1).float()
-    b = b.reshape(-1).float()
-    denom = (a.norm() * b.norm()).clamp_min(1e-12)
-    return float((a @ b) / denom)
-
-
 def compare_captures(capture_dir: str, tp_size: int) -> dict:
     """Compare loaded captures against reference captures.
 
@@ -520,7 +531,6 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
         "num_loaded": len(loaded),
         "matched": 0,
         "bit_exact": 0,
-        "cosine_pass": 0,
         "failures": [],
         "loaded_without_ref": [],
         "matched_keys": [],
@@ -536,7 +546,6 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
         assert ref["token_ids"] == got["token_ids"], f"token id mismatch for {key}"
 
         all_bit_exact = True
-        worst_cosine = 1.0
         # Compare every layer present in the *loaded* capture: each one was
         # actually written by the connector and must match its reference.
         # Mamba "align" state layers can legitimately be absent on either side
@@ -564,25 +573,21 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
                 assert ref_t.shape == got_t.shape, (
                     f"shape mismatch {layer_name}[{si}]: {ref_t.shape} vs {got_t.shape}"
                 )
+                # The transfer is a verbatim byte round trip, so the loaded data
+                # must be bit-identical to what was saved -- no tolerance.
                 if not torch.equal(ref_t, got_t):
                     all_bit_exact = False
-                    cos = _cosine(ref_t, got_t)
-                    worst_cosine = min(worst_cosine, cos)
-                    if not ALLOW_COSINE or cos < COSINE_THRESHOLD:
-                        report["failures"].append({
-                            "key": key,
-                            "layer": f"{layer_name}[{si}]",
-                            "cosine": cos,
-                        })
+                    report["failures"].append({
+                        "key": key,
+                        "layer": f"{layer_name}[{si}]",
+                        "mismatched_elems": int((ref_t != got_t).sum()),
+                        "num_elems": ref_t.numel(),
+                    })
 
         report["matched"] += 1
         report["matched_keys"].append(key)
         if all_bit_exact:
             report["bit_exact"] += 1
-        else:
-            report["cosine_pass"] += 1
-            logger.warning("capture %s not bit-exact (worst cosine=%.6f)",
-                           key, worst_cosine)
 
     return report
 
@@ -600,8 +605,7 @@ def assert_report_ok(report: dict, min_matched: int = 1):
             f"loaded captures with no matching reference: {report['loaded_without_ref']}"
         )
     if report["failures"]:
-        kind = "cosine" if ALLOW_COSINE else "bit-exact"
-        problems.append(f"{kind} failures: {report['failures']}")
+        problems.append(f"bit-exact failures: {report['failures']}")
     if report["matched"] < min_matched:
         problems.append(
             f"matched {report['matched']} loaded captures, expected >= {min_matched}"
@@ -609,8 +613,8 @@ def assert_report_ok(report: dict, min_matched: int = 1):
     if problems:
         raise AssertionError("KV verification failed: " + "; ".join(problems))
     logger.info(
-        "KV verification OK: matched=%d bit_exact=%d cosine_pass=%d (refs=%d loaded=%d)",
-        report["matched"], report["bit_exact"], report["cosine_pass"],
+        "KV verification OK: matched=%d bit_exact=%d (refs=%d loaded=%d)",
+        report["matched"], report["bit_exact"],
         report["num_refs"], report["num_loaded"],
     )
 
