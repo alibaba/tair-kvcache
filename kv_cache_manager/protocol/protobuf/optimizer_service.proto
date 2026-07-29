@@ -159,9 +159,9 @@ message TraceQueryRequest {
 message TraceQueryResponse {
     CommonResponseHeader header = 1;
     int64 total_blocks = 2;    // 本次请求的总 block 数
-    int64 input_token_len = 3;
-    repeated TraceQueryCapacityResult capacity_results = 4;
-    TraceQueryTheoreticalResult theoretical_result = 5;
+    repeated TraceQueryCapacityResult capacity_results = 3;
+    TraceQueryTheoreticalResult theoretical_result = 4;
+    int64 input_token_len = 5;
 }
 
 message TraceQueryCapacityResult {

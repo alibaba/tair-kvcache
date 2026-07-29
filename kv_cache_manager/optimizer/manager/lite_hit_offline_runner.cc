@@ -98,6 +98,12 @@ bool LiteHitOfflineRunner::Run() {
     std::unordered_map<std::string, std::unique_ptr<InstanceLane>> lanes;
     std::vector<std::string> instance_ids;
     instance_ids.reserve(config_.instances().size());
+    // JSON loading validates this too; guard the programmatic-setter path
+    // because block_size is a modulo divisor below.
+    if (config_.block_size() == 0) {
+        KVCM_LOG_ERROR("LiteHitOfflineRunner: trace block_size must be positive");
+        return false;
+    }
     for (const auto &instance : config_.instances()) {
         if (instance.linear_step() != 0) {
             KVCM_LOG_ERROR("LiteHitOfflineRunner: instance[%s] has linear_step=%d; the facts replay is Full-only",
@@ -129,7 +135,10 @@ bool LiteHitOfflineRunner::Run() {
         // instance group and applies to every instance in it. RegisterInstance
         // already guaranteed the group exists.
         lane->enable_prefix_hash = groups_by_name.at(instance.instance_group_name())->enable_prefix_hash();
-        lanes.emplace(instance.instance_id(), std::move(lane));
+        if (!lanes.emplace(instance.instance_id(), std::move(lane)).second) {
+            KVCM_LOG_ERROR("LiteHitOfflineRunner: duplicate instance_id[%s] in config", instance.instance_id().c_str());
+            return false;
+        }
         instance_ids.push_back(instance.instance_id());
     }
 

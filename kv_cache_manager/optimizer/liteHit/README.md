@@ -268,6 +268,8 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
 
 **trace 粒度与重分块**：配置字段 `block_size`（默认 256）声明 trace 的原生 block 粒度；每个 instance 的 `block_size` 是该 lane 的分析粒度，必须是它的整数倍（只允许变粗，违约在 lane 初始化时整体失败），按 1.1a 的采样方式重分块。
 
+**写事件**：`write` trace 事件会被识别并忽略。`get` 提交时视为全部 block 已写回（§2 的物理依据：写回本身就是一次 touch），因此拆分的 `get`/`write` trace 中的 `write` 行对 facts 无影响；delayed write 建模只属于 replay 路径。
+
 **fanout 模式**：`fanout_all_instances = true` 时每条请求广播到全部 lane（各 lane 独立 LRU 状态、独立 facts 行），配合多个不同 `block_size` 的 instance 即可一次回放对同一份 trace 扫多个分析粒度；与 `override_instance_id` 互斥。facts query 的 summary 按 instance 分组输出（每 instance 一行 + 总计一行），fanout 结果直接可读。
 
 **fail-fast**：时间戳乱序、未知 instance、长度校验失败、全文件零有效行，任一发生即整体失败并给出原因——facts 是全有或全无的对账账本，不允许静默丢行。

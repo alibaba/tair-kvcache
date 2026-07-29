@@ -165,6 +165,10 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
         ++totals.requests;
         totals.total_input_tokens += record.input_token_len;
     }
+    if (in.bad()) {
+        error = "I/O error while reading facts file: " + facts_csv_path;
+        return false;
+    }
 
     // One summary per instance (std::map keeps them in deterministic order).
     // A fanout run over several block sizes reads as one line per granularity.

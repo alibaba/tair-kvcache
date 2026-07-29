@@ -97,6 +97,9 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 
         traces.push_back(ParseLine(line, fail));
     }
+    if (file.bad()) {
+        fail("I/O error while reading trace file");
+    }
 
     file.close();
     if (traces.empty()) {
@@ -132,6 +135,9 @@ void StandardTraceLoader::StreamFromFile(const std::string &trace_file_path, con
 
         on_trace(ParseLine(line, fail));
         emitted++;
+    }
+    if (file.bad()) {
+        fail("I/O error while reading trace file");
     }
 
     file.close();
