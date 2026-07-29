@@ -9,6 +9,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 - 多种驱逐策略的模拟和对比
 - 缓存命中率的实时统计和分析
 - Radix Tree 索引结构的可视化
+- LiteHit：full-attention 场景的容量无关命中率分析（一次回放产出事实，任意 LRU 容量事后投影，支持重分块与多 block size fanout），见 [liteHit/README.md](liteHit/README.md)
 
 ## 动机
 

@@ -114,6 +114,8 @@ PrefixHashNext(prev, raw)：Jenkins 64 位变体，显式 uint64 运算（逻辑
 
 full-attention 请求采用 prefix hit：对某个容量，一条请求的命中块数是从请求第一个 block 开始连续命中的完整 block 数，即首个 miss 的位置。首个 miss 只截断本条请求的命中，不停止 LRU 状态更新——所有完整 block 仍然全部提交，否则后续请求看到的缓存状态会错误。
 
+提交不区分 hit / miss 的物理依据是：真实 prefix cache 里 miss 的 block 会被重算并**写回**缓存，写入本身就是一次 touch——请求结束后无论命中与否，block 都在 MRU 端。于是"LRU 更新"与"命中判定"天然解耦（Mattson 栈算法性质）：命中判定依赖容量，推迟到投影层；LRU 更新不依赖容量，核心无条件把所有 block 提交到位置末尾。这也意味着若 trace 带 output（decode 生成的新 block），同一机制可按**读写分离**扩展：output block 不参与阶段一的命中评估（新生成的块谈不上命中），照常参与阶段二提交进入 LRU，供后续请求命中。
+
 ### 2.2 状态提交按请求倒序（尾先、头后）
 
 正序 touch 会让链头最老、最先被驱逐——对 prefix 语义这是**价值倒挂**：没有链头，链上其余 resident block 一个 prefix hit 都贡献不了，却还占着容量。生产 prefix cache 全部选择尾先驱逐：vLLM 按逆序把 block 放回 free 队列，SGLang radix cache 只驱逐 LRU 叶子。
