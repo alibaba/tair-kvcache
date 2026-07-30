@@ -63,6 +63,18 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
             COPY_METRICS_(p, service, error_counter, service_error_counter);
             ++service_error_counter;
         } while (false);
+    } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
+        auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
+        Counter request_counter;
+        COPY_METRICS_(p, event_report, request_counter, request_counter);
+        ++request_counter;
+
+        const double error_code = p->GetErrorCodeSample();
+        if (!CommonUtil::IsZeroDouble(error_code)) {
+            Counter error_counter;
+            COPY_METRICS_(p, event_report, error_counter, error_counter);
+            ++error_counter;
+        }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
 
@@ -191,12 +203,28 @@ void LocalMetricsReporter::ReportInterval() {
                                 MetricsTags{{"instance_group", instance_group_name}, {"instance_id", instance_id}});
                     SET_METRICS_(p, cache_manager_instance, key_count, static_cast<double>(instance_metric.key_count));
                     SET_METRICS_(p, cache_manager_instance, byte_size, static_cast<double>(instance_metric.byte_size));
-                    SET_METRICS_(p, cache_manager_instance, max_lru_age_us, static_cast<double>(instance_metric.max_lru_age_us));
-                    SET_METRICS_(p, cache_manager_instance, async_queue_max_size, static_cast<double>(instance_metric.async_queue_max_size));
-                    SET_METRICS_(p, cache_manager_instance, async_queue_avg_size, static_cast<double>(instance_metric.async_queue_avg_size));
-                    SET_METRICS_(p, cache_manager_instance, async_flush_key_count, static_cast<double>(instance_metric.async_flush_key_count));
-                    SET_METRICS_(p, cache_manager_instance, async_batch_flush_time_us, static_cast<double>(instance_metric.async_batch_flush_time_us));
-                    SET_METRICS_(p, cache_manager_instance, async_pipeline_error_count, static_cast<double>(instance_metric.async_pipeline_error_count));
+                    SET_METRICS_(
+                        p, cache_manager_instance, max_lru_age_us, static_cast<double>(instance_metric.max_lru_age_us));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_queue_max_size,
+                                 static_cast<double>(instance_metric.async_queue_max_size));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_queue_avg_size,
+                                 static_cast<double>(instance_metric.async_queue_avg_size));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_flush_key_count,
+                                 static_cast<double>(instance_metric.async_flush_key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_batch_flush_time_us,
+                                 static_cast<double>(instance_metric.async_batch_flush_time_us));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_pipeline_error_count,
+                                 static_cast<double>(instance_metric.async_pipeline_error_count));
                 }
             }
         }

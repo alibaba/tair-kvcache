@@ -51,6 +51,60 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     EXPECT_EQ(nfs_spec2.key_count_per_file(), nfs_spec.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings) {
+    EventReportStorageSpec spec;
+    spec.set_heartbeat_timeout_ms(1234);
+    spec.set_cleanup_grace_ms(5678);
+    spec.set_liveness_check_interval_ms(90);
+    spec.set_snapshot_min_interval_ms(4321);
+    spec.set_snapshot_delta_drain_timeout_ms(8765);
+
+    const std::string json = spec.ToJsonString();
+    EXPECT_NE(json.find("\"snapshot_min_interval_ms\":4321"), std::string::npos);
+    EXPECT_NE(json.find("\"snapshot_delta_drain_timeout_ms\":8765"), std::string::npos);
+
+    EventReportStorageSpec parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(1234, parsed.heartbeat_timeout_ms());
+    EXPECT_EQ(5678, parsed.cleanup_grace_ms());
+    EXPECT_EQ(90, parsed.liveness_check_interval_ms());
+    EXPECT_EQ(4321, parsed.snapshot_min_interval_ms());
+    EXPECT_EQ(8765, parsed.snapshot_delta_drain_timeout_ms());
+    std::string invalid_fields;
+    EXPECT_TRUE(parsed.ValidateRequiredFields(invalid_fields));
+    EXPECT_TRUE(invalid_fields.empty());
+}
+
+TEST_F(StorageConfigTest, TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation) {
+    EventReportStorageSpec default_spec;
+    ASSERT_TRUE(default_spec.FromJsonString(
+        R"({"heartbeat_timeout_ms":1000,"cleanup_grace_ms":2000,"liveness_check_interval_ms":100})"));
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs, default_spec.snapshot_min_interval_ms());
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs,
+              default_spec.snapshot_delta_drain_timeout_ms());
+
+    default_spec.set_snapshot_min_interval_ms(0);
+    std::string invalid_fields;
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs);
+    default_spec.set_snapshot_delta_drain_timeout_ms(0);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+
+    default_spec.set_snapshot_delta_drain_timeout_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+}
+
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =

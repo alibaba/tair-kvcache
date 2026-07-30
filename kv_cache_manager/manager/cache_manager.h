@@ -3,14 +3,17 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
@@ -31,6 +34,7 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+class EventReportBackend;
 struct MetricsLifecycle;
 class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
@@ -304,6 +308,11 @@ private:
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
+    ErrorCode CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
+                                            const std::string &snapshot_version,
+                                            DataStorageType storage_type,
+                                            const std::shared_ptr<EventReportBackend> &event_backend,
+                                            uint64_t snapshot_attempt_epoch = 0);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,

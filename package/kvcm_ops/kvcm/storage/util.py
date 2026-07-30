@@ -40,6 +40,8 @@ def gen_event_report_config_data(args):
         storage_spec["cleanup_grace_ms"] = args.cleanup_grace_ms
     if args.liveness_check_interval_ms is not None:
         storage_spec["liveness_check_interval_ms"] = args.liveness_check_interval_ms
+    if args.snapshot_min_interval_ms is not None:
+        storage_spec["snapshot_min_interval_ms"] = args.snapshot_min_interval_ms
     return storage_spec
 
 
@@ -111,6 +113,11 @@ def add_event_report_sub_parser(subparsers, name, help_text, event_report_storag
         type=int,
         default=None,
         help='liveness check interval in ms (server default: 5000)')
+    parser.add_argument(
+        '--snapshot_min_interval_ms',
+        type=positive_int,
+        default=None,
+        help='minimum interval between successful snapshots per reporter in ms (server default: 30000)')
     parser.set_defaults(event_report_storage_type=event_report_storage_type)
     return parser
 

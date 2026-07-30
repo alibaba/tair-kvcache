@@ -44,7 +44,13 @@ private:                                                                        
 #endif
 
 class RegistryManager;
+class RequestContext;
 struct MetricsLifecycle;
+namespace proto {
+namespace meta {
+class ReportEventRequest;
+}
+} // namespace proto
 
 class MetaServiceMetricsBase {
 public:
@@ -67,17 +73,17 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(TrimCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetClusterInfo);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
-    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
-    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 protected:
     std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEvent(const std::string &instance_id,
                                                                              const std::string &type);
-    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForEventBlockAdd(const std::string &instance_id,
-                                                                               const std::string &type);
-    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForEventBlockDelete(const std::string &instance_id,
-                                                                                  const std::string &type);
+    std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEventType(const std::string &instance_id,
+                                                                                 const std::string &type,
+                                                                                 const std::string &event_type);
+    void AttachReportEventTypeMetricsCollectors(const proto::meta::ReportEventRequest &request,
+                                                const std::string &type,
+                                                RequestContext *request_context);
 
     static constexpr const char *kEventReportL1P5MetricsType = "event_report_l1p5";
     static constexpr const char *kEventReportL2MetricsType = "event_report_l2";
@@ -95,8 +101,7 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(TrimCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetClusterInfo);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(ReportEvent);
-    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockAdd);
-    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockDelete);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(ReportEventType);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetHostCacheState);
 
 private:
@@ -108,9 +113,15 @@ private:
         const std::string &collector_key,
         const MetricsTags &extra_tags);
     static std::string MakeTypedCollectorKey(const std::string &instance_id, const std::string &type);
+    static std::string
+    MakeEventTypeCollectorKey(const std::string &instance_id, const std::string &type, const std::string &event_type);
+    std::shared_ptr<MetricsCollector> GetEventTypeMetricsCollectorFromMap(const std::string &instance_id,
+                                                                          const std::string &type,
+                                                                          const std::string &event_type);
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<RegistryManager> registry_manager_;
+    std::shared_mutex mutex_ReportEventType_;
     // shared coarse-grained lock that excludes RemoveInstance /
     // RemoveInstanceGroup; held in shared mode while the slow-path
     // macro creates a new ServiceMetricsCollector so that the new

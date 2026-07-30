@@ -116,6 +116,10 @@ message EventReportStorageSpec {
     int64 heartbeat_timeout_ms = 1;
     int64 cleanup_grace_ms = 2;
     int64 liveness_check_interval_ms = 3;
+    int64 snapshot_min_interval_ms = 4;
+    // Shared bound for snapshot waiting on admitted deltas and new deltas
+    // waiting on an in-flight snapshot.
+    int64 snapshot_delta_drain_timeout_ms = 5;
 }
 
 message StorageConfig {

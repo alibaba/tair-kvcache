@@ -1,12 +1,15 @@
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
 
 using namespace kv_cache_manager;
@@ -97,17 +100,94 @@ TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheRemovesTypedReportEve
     SeedInstance("inst1", "grp1");
 
     auto report_event = base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5");
-    auto block_add = base_->GetTypedMetricsCollectorForEventBlockAdd("inst1", "event_report_l1p5");
-    auto block_delete = base_->GetTypedMetricsCollectorForEventBlockDelete("inst1", "event_report_l2");
+    auto block_add = base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l1p5", "block_add");
+    auto block_delete = base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_delete");
     ASSERT_NE(nullptr, report_event);
     ASSERT_NE(nullptr, block_add);
     ASSERT_NE(nullptr, block_delete);
+    ASSERT_NE(
+        nullptr,
+        dynamic_cast<EventReportMetricsCollector *>(
+            base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l1p5", "block_snapshot").get()));
 
     base_->InvalidateCollectorCache("inst1");
 
     ASSERT_NE(report_event, base_->GetTypedMetricsCollectorForReportEvent("inst1", "event_report_l1p5"));
-    ASSERT_NE(block_add, base_->GetTypedMetricsCollectorForEventBlockAdd("inst1", "event_report_l1p5"));
-    ASSERT_NE(block_delete, base_->GetTypedMetricsCollectorForEventBlockDelete("inst1", "event_report_l2"));
+    ASSERT_NE(block_add, base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l1p5", "block_add"));
+    ASSERT_NE(block_delete,
+              base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_delete"));
+}
+
+TEST_F(MetaServiceMetricsBaseTest, ReportEventTypeCollectorUsesBoundedTagsAndStableKey) {
+    SeedInstance("inst1", "grp1");
+
+    auto snapshot = base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_snapshot");
+    ASSERT_NE(nullptr, snapshot);
+    ASSERT_NE(nullptr, dynamic_cast<EventReportMetricsCollector *>(snapshot.get()));
+    MetricsTags expected_tags = {{"instance_group", "grp1"},
+                                 {"instance_id", "inst1"},
+                                 {"type", "event_report_l2"},
+                                 {"event_type", "block_snapshot"}};
+    EXPECT_EQ(expected_tags, snapshot->GetMetricsTags());
+    EXPECT_EQ(snapshot,
+              base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_snapshot"));
+}
+
+TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBoundsUnknownValues) {
+    SeedInstance("inst1", "grp1");
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("inst1");
+    request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    request.add_events()->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    request.add_events()->set_event_type(static_cast<proto::meta::ReportEventType>(99));
+    RequestContext request_context("trace");
+
+    base_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &request_context);
+
+    const auto collectors = request_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+    ASSERT_EQ(3, collectors.size());
+    std::set<std::string> event_types;
+    for (const auto &collector : collectors) {
+        ASSERT_NE(nullptr, dynamic_cast<EventReportMetricsCollector *>(collector.get()));
+        event_types.insert(collector->GetMetricsTags().at("event_type"));
+    }
+    EXPECT_EQ((std::set<std::string>{"block_snapshot", "heartbeat", "unknown"}), event_types);
+}
+
+TEST_F(MetaServiceMetricsBaseTest, AttachedEventCollectorsHaveRequestLocalSamplesAndSharedCounters) {
+    SeedInstance("inst1", "grp1");
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("inst1");
+    request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    RequestContext first_context("first");
+    RequestContext second_context("second");
+
+    base_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &first_context);
+    base_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &second_context);
+    const auto first_collectors = first_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+    const auto second_collectors = second_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+    ASSERT_EQ(1, first_collectors.size());
+    ASSERT_EQ(1, second_collectors.size());
+    auto first = std::dynamic_pointer_cast<EventReportMetricsCollector>(first_collectors.front());
+    auto second = std::dynamic_pointer_cast<EventReportMetricsCollector>(second_collectors.front());
+    ASSERT_NE(nullptr, first);
+    ASSERT_NE(nullptr, second);
+    EXPECT_NE(first.get(), second.get());
+
+    first->SetRequestSample(10.0, 0.0);
+    second->SetRequestSample(20.0, 1.0);
+    EXPECT_DOUBLE_EQ(10.0, first->GetRequestRtUsSample());
+    EXPECT_DOUBLE_EQ(0.0, first->GetErrorCodeSample());
+    EXPECT_DOUBLE_EQ(20.0, second->GetRequestRtUsSample());
+    EXPECT_DOUBLE_EQ(1.0, second->GetErrorCodeSample());
+
+    Counter first_counter;
+    Counter second_counter;
+    first->copy_event_report_request_counter_metrics(first_counter);
+    second->copy_event_report_request_counter_metrics(second_counter);
+    ++first_counter;
+    EXPECT_EQ(1u, second_counter.Get());
 }
 
 TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheAllMaps) {

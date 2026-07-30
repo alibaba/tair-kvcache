@@ -129,12 +129,29 @@ ServiceCallGuard::~ServiceCallGuard() {
     // ReportPerQuery would read the stale value from the previous request.
     query_scope_ = ChronoScopeGuard{};
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context_->metrics_collector());
+    const auto extra_collectors = request_context_->GetMetricsCollectorsVehicle().GetMetricsCollectors();
+    const double request_rt_us =
+        static_cast<double>(TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us());
+    // MetricsReporter treats any non-zero error_code sample as a failed
+    // request, so this gauge is deliberately a 0/1 failure flag rather than
+    // the wire enum value (where a successful request is non-zero).
+    const double error_code = request_context_->status_code() == RequestContext::kOkStatusCode ? 0.0 : 1.0;
     if (response_debug_setter_) {
         response_debug_setter_();
     }
     if (metrics_reporter_) {
         metrics_reporter_->ReportPerQuery(service_metrics_collector);
-        for (const auto &mc : request_context_->GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
+        for (const auto &mc : extra_collectors) {
+            if (auto *event_metrics_collector = dynamic_cast<EventReportMetricsCollector *>(mc.get())) {
+                // The master ServiceMetricsCollector is cached per instance and
+                // its gauges can be overwritten by concurrent requests. Source
+                // event samples from this request's private context instead,
+                // and write immediately before reporting to minimize the shared
+                // registry gauge race window.
+                SET_METRICS_(event_metrics_collector, event_report, request_rt_us, request_rt_us);
+                SET_METRICS_(event_metrics_collector, event_report, error_code, error_code);
+                event_metrics_collector->SetRequestSample(request_rt_us, error_code);
+            }
             metrics_reporter_->ReportPerQuery(mc.get());
         }
     }
