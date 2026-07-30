@@ -186,7 +186,6 @@ public:
                                      size_t scan_batch_size = 1000,
                                      std::function<bool()> should_abort = nullptr,
                                      AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
-    bool Sync(const KeyVector &keys) noexcept;
 
 private:
     struct StorageTypeWeights {

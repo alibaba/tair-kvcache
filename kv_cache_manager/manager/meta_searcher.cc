@@ -1944,8 +1944,6 @@ MetaSearcher::VisitAllLocations(RequestContext *request_context, size_t scan_bat
     return has_failure ? EC_PARTIAL_OK : EC_OK;
 }
 
-bool MetaSearcher::Sync(const KeyVector &keys) noexcept { return meta_indexer_->Sync(keys); }
-
 ErrorCode MetaSearcher::CleanupLocationsByPredicate(RequestContext *request_context,
                                                     DataStorageType storage_type,
                                                     size_t scan_batch_size,

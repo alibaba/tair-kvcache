@@ -190,9 +190,9 @@ public:
         fail_key_on_next_upsert_ = key;
     }
 
-    void FailNextSync() {
+    size_t GetSyncCallCount() {
         std::lock_guard<std::mutex> lock(control_mutex_);
-        fail_next_sync_ = true;
+        return sync_call_count_;
     }
 
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
@@ -236,10 +236,7 @@ public:
     bool Sync(const KeyTypeVec &keys) noexcept override {
         {
             std::lock_guard<std::mutex> lock(control_mutex_);
-            if (fail_next_sync_) {
-                fail_next_sync_ = false;
-                return false;
-            }
+            ++sync_call_count_;
         }
         return MetaLocalBackend::Sync(keys);
     }
@@ -276,7 +273,7 @@ private:
     bool location_read_entered_ = false;
     bool release_location_read_ = false;
     std::optional<int64_t> fail_key_on_next_upsert_;
-    bool fail_next_sync_ = false;
+    size_t sync_call_count_ = 0;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -2810,42 +2807,30 @@ TEST_F(CacheManagerTest, TestReportEventPartialSnapshotFailureKeepsCacheReadable
     EXPECT_EQ((std::set<std::string>{"retry_a", "retry_b"}), retry_sources);
 }
 
-TEST_F(CacheManagerTest, TestReportEventSyncFailureKeepsWrittenCacheReadableAndImmediateRetryConverges) {
+TEST_F(CacheManagerTest, TestReportEventSnapshotCommitsWithoutWaitingForPersistentSync) {
     const std::string host = "192.168.10.30:8080";
     const int64_t key = 9425;
     auto event_backend = InstallEventReportBackend();
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, event_backend);
     ASSERT_NE(nullptr, meta_backend);
-    event_backend->SetSnapshotMinIntervalMsForTest(30'000);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
 
-    meta_backend->FailNextSync();
-    const auto [failed_ec, failed_response] =
-        CallReportEvent(MakeSnapshotRequest(host, {{key, "sync_failure"}}), "sync_failure_snapshot");
-    EXPECT_EQ(EC_PARTIAL_OK, failed_ec);
-    EXPECT_EQ(proto::meta::INTERNAL_ERROR, failed_response.header().status().code());
-    ASSERT_EQ(1, failed_response.item_results_size());
-    EXPECT_EQ(proto::meta::INTERNAL_ERROR, failed_response.item_results(0));
-    EXPECT_TRUE(failed_response.committed_snapshot_version().empty());
-    EXPECT_TRUE(failed_response.snapshot_required());
-    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
-    const auto visible_after_failure = QueryEventReportUris({key});
-    ASSERT_EQ(1u, visible_after_failure.size());
-    EXPECT_NE(std::string::npos, visible_after_failure.front().find("source=sync_failure"));
-    ASSERT_EQ(1u, QueryRawEventReportUris(key).size());
-
-    // A failed attempt must not start the rate-limit interval.
-    const auto [retry_ec, retry_response] =
-        CallReportEvent(MakeSnapshotRequest(host, {{key, "sync_retry"}}), "sync_failure_immediate_retry");
-    ASSERT_EQ(EC_OK, retry_ec);
-    const std::string committed = retry_response.committed_snapshot_version();
+    ASSERT_EQ(0u, meta_backend->GetSyncCallCount());
+    const auto [snapshot_ec, snapshot_response] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "async_snapshot"}}), "async_snapshot_no_sync");
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    EXPECT_EQ(proto::meta::OK, snapshot_response.header().status().code());
+    EXPECT_EQ(0, snapshot_response.item_results_size());
+    const std::string committed = snapshot_response.committed_snapshot_version();
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(committed));
-    EXPECT_FALSE(retry_response.snapshot_required());
+    EXPECT_FALSE(snapshot_response.snapshot_required());
+    EXPECT_EQ(committed, event_backend->GetSnapshotVersion({"test_instance", host}));
+    EXPECT_EQ(0u, meta_backend->GetSyncCallCount());
 
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
-    EXPECT_NE(std::string::npos, visible.front().find("source=sync_retry"));
+    EXPECT_NE(std::string::npos, visible.front().find("source=async_snapshot"));
     EXPECT_NE(std::string::npos, visible.front().find("s_version=" + committed));
 }
 
@@ -3875,7 +3860,6 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupCASPreservesLocationRefreshedAfterSc
                                                           {LocationSpec("tp0", refreshed_uri)}}}},
                                                        replace_results));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), replace_results);
-    ASSERT_TRUE(meta_searcher->Sync({key}));
     ASSERT_TRUE(event_backend->CommitSnapshotVersion({"test_instance", host}, refreshed_token));
 
     CacheLocationDelRequest stale_cleanup_request{

@@ -406,7 +406,7 @@ ADD A -> DELETE A -> ADD A(new URI)
         |
 snapshot 关闭新的 delta 入口
         |
-snapshot replace + Sync + commit/abort
+snapshot replace + commit/abort
         |
 等待中的 delta 使用 commit 后的 generation 继续
 ```
@@ -418,6 +418,11 @@ snapshot replace + Sync + commit/abort
 - ADD/DELETE 等待超过统一写门超时后返回可重试的 `SNAPSHOT_IN_PROGRESS`，且不会获得
   delta lease 或取消 snapshot；
 - snapshot commit 后，等待中的增量不会再被刚完成的 snapshot 覆盖；
+
+当 meta storage 使用 `cached + persistent_type=async_redis` 时，snapshot 与增量具有相同的
+Redis 返回点：mutation 成功进入异步队列并更新 local cache 后即可 commit/返回，不等待 Redis
+consumer flush。`committed_snapshot_version` 是当前 KVCM 进程的查询栅栏，不是 Redis flush
+checkpoint；响应后的 pipeline 失败不会改写已经返回的 ReportEvent 状态。
 - snapshot abort 后，等待中的增量继续执行；
 - 第二个并发 snapshot 返回 `SNAPSHOT_IN_PROGRESS`；
 - 不同 host、instance 或 storage type 不共享该写门。
@@ -539,7 +544,7 @@ REGISTER 成功后重试该 ADD。
 | `SNAPSHOT_IN_PROGRESS` | 同 reporter 已有 snapshot、snapshot 未能及时排空已准入 delta，或 delta 未能及时等到 snapshot 完成 | 按失败事件类型退避重试：SNAPSHOT 重发完整全量，ADD/DELETE 幂等重试失败项 |
 | `SNAPSHOT_RATE_LIMITED` | 距上次成功 snapshot 太近 | 按 `retry_after_ms` 重试完整 snapshot |
 | `SNAPSHOT_REQUIRED` | 等待期间 reporter 被注销/关闭等状态变化 | 重新 REGISTER；realtime-only 可直接重试增量 |
-| `INTERNAL_ERROR` | metadata replace、Sync、commit 等内部失败 | 保留实时链路；完整重试 snapshot 或幂等重试增量 |
+| `INTERNAL_ERROR` | metadata replace、commit 等内部失败 | 保留实时链路；完整重试 snapshot 或幂等重试增量 |
 
 ## 11. 查询行为
 
@@ -676,7 +681,7 @@ Snapshot 使用稳定 location 原地更新，不提供原子查询视图：
 | 限流/并发拒绝 | 旧值 | 原数据 | 按错误码退避 |
 | snapshot 写入中 | 旧值 | 新旧合法 candidate | 不做版本大小判断 |
 | 部分 replace 失败 | 旧值 | 已写入的新数据 + 未覆盖的旧数据 | 完整重试 |
-| Sync/commit 失败 | 旧值 | 已写入的新数据可能可见 | 完整重试 |
+| commit 失败 | 旧值 | 已写入的新数据可能可见 | 完整重试 |
 | commit 成功、cleanup 未完成 | 新值 | 完全属于旧 version 的遗漏 block 已不可见 | cleanup 仅回收空间 |
 | cleanup 与新写重叠 | 新值 | 新写必须保留 | 无需特殊处理 |
 | KVCM 重启 | 空 | 第一条合法汇报后历史数据可能可见 | 正常继续心跳/增量；可选低频全量 |
@@ -762,7 +767,7 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | S-06 | snapshot 遗漏 block 后 cleanup 最终删除 | `TestReportEventSnapshotCommitReclaimsOnlyStaleReporterLocations`；snapshot 集成 `test_22` |
 | S-07 | snapshot 和 delta 两种先后顺序均收敛 | `TestReportEventDeltaAlreadyAdmittedThenSnapshotWins`、`TestReportEventSnapshotGateThenDeltaInheritsNewTokenAndWins`；snapshot 集成 `test_24` |
 | S-08 | 第二个 snapshot busy，成功后 rate limit 带 retry_after | `ConcurrentSnapshotsHaveExactlyOneWinner`、`SnapshotRateLimitReturnsRetryDelay`；snapshot 集成 `test_18/24` |
-| S-09 | snapshot 部分 replace/Sync 失败后仍可读并可完整重试 | `TestReportEventPartialSnapshotFailureKeepsCacheReadableAndRetryConverges`、`TestReportEventSyncFailureKeepsWrittenCacheReadableAndImmediateRetryConverges` |
+| S-09 | snapshot 部分 replace 失败后仍可读并可完整重试；成功路径不等待 persistent Sync | `TestReportEventPartialSnapshotFailureKeepsCacheReadableAndRetryConverges`、`TestReportEventSnapshotCommitsWithoutWaitingForPersistentSync` |
 | S-10 | cleanup 与下一轮写入 CAS/attempt epoch 竞争不删除新值，并在 epoch 变化后按批次提前退出 | `TestSnapshotCleanupPreservesInFlightStableLocationUntilAbort`、`TestSnapshotCleanupCASPreservesLocationRefreshedAfterScan`、`TestOldSnapshotCleanupDoesNotDeleteLaterAbortedAttemptWrites` |
 | S-11 | snapshot commit 后增量刷新 mixed/legacy location，旧 cleanup 不删除新写 | `TestSnapshotCleanupPreservesPostCommitDeltaOnMixedGenerationLocation`、`TestSnapshotCleanupPreservesCurrentDeltaBesideLegacySpec`；snapshot 集成 `test_32_*` |
 | S-12 | snapshot cleanup 只删 metadata，不调用外部 URI backend | `TestMetadataOnlyLocationDeleteSkipsPhysicalBackend`、`TestCleanupLocationsByPredicateSubmitsExactObservedValue` |

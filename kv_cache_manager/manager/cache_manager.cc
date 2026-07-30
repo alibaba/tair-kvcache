@@ -2479,7 +2479,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         std::string version;
         uint64_t attempt_epoch;
         int event_index;
-        KeyVector block_keys;
     };
     struct DeltaSpecMutation {
         bool is_add = false;
@@ -2721,8 +2720,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            KeyVector snapshot_block_keys;
-            snapshot_block_keys.reserve(validated_blocks.size());
             for (auto &block : validated_blocks) {
                 for (auto &spec : block.specs) {
                     std::string versioned_uri;
@@ -2736,7 +2733,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                snapshot_block_keys.push_back(block.block_key);
                 snapshot_to_replace[block.block_key].push_back(SnapshotReplaceEntry{
                     event_backend->BuildLocationId(block.medium, host_ip_port), std::move(block.specs), i});
             }
@@ -2746,11 +2742,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 request_snapshot_version.clear();
                 break;
             }
-            snapshot_commit_tasks.push_back(SnapshotCommitTask{reporter_key,
-                                                               request_snapshot_version,
-                                                               event_backend->GetSnapshotAttemptEpoch(reporter_key),
-                                                               i,
-                                                               std::move(snapshot_block_keys)});
+            snapshot_commit_tasks.push_back(SnapshotCommitTask{
+                reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i});
             break;
         }
         default:
@@ -3010,17 +3003,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     if (!snapshot_commit_tasks.empty()) {
         const auto &task = snapshot_commit_tasks.front();
         bool snapshot_failed = per_item_ec[task.event_index] != EC_OK;
-        // An empty snapshot is a valid authoritative "reporter owns no blocks"
-        // update.  With no block writes there is nothing to flush before the
-        // in-memory token is published; stale locations are removed by the
-        // cleanup task below.
-        if (!snapshot_failed && !task.block_keys.empty() && !meta_searcher->Sync(task.block_keys)) {
-            KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to sync host [%s] token [%s]",
-                          trace_id.c_str(),
-                          task.reporter_key.host_ip_port.c_str(),
-                          task.version.c_str());
-            snapshot_failed = true;
-        }
+        // Event-report metadata is a soft cache index. Like delta mutations,
+        // a snapshot commits after every persistent write has been accepted
+        // by the async backend and mirrored into the local cache; it does not
+        // wait for Redis consumers to flush their queues.
         if (!snapshot_failed && !event_backend->CommitSnapshotVersion(task.reporter_key, task.version)) {
             KVCM_LOG_ERROR("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to publish host [%s] token [%s]",
                            trace_id.c_str(),

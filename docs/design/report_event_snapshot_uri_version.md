@@ -244,10 +244,15 @@ Generation 在获得 delta lease 时建立。参数校验、tombstone 等准入�
    超时则 abort candidate、重新打开写门并返回可重试的 `SNAPSHOT_IN_PROGRESS`；
 6. 为本次全部 URI 追加 candidate `s_version`；
 7. 使用稳定 location id 原地替换完整 specs；
-8. 对本次 block keys 执行 `Sync`；
-9. 更新内存 committed generation并打开写门；
-10. 返回新的 `committed_snapshot_version`；
-11. 异步扫描并回收该 reporter 的旧 generation。
+8. 更新内存 committed generation并打开写门；
+9. 返回新的 `committed_snapshot_version`；
+10. 异步扫描并回收该 reporter 的旧 generation。
+
+当 meta storage 使用 `cached + persistent_type=async_redis` 时，第 7 步与增量使用相同的写入
+语义：先把 Redis mutation 放入异步队列，再同步更新 local cache。Snapshot 不等待 Redis
+consumer flush；成功响应表示本次全部 mutation 已成功 enqueue 且 local cache 已更新，不表示
+Redis 已经执行完成。响应后发生的 pipeline 失败通过异步 Redis 日志和指标暴露，不回溯修改
+已经返回的 ReportEvent 结果。
 
 不同 reporter、不同 storage type 可以并行。第二个并发 snapshot 返回
 `SNAPSHOT_IN_PROGRESS`。
@@ -268,7 +273,7 @@ Snapshot 期间到达的 ADD/DELETE 会在配置的上限内等待。Snapshot �
 
 Snapshot 使用稳定 location id 原地覆盖，不做 copy-on-write。
 
-如果部分 replace、Sync 或 commit 失败：
+如果部分 replace 或 commit 失败：
 
 - candidate 不成为 committed generation；
 - snapshot abort，等待中的 delta 继续；
@@ -288,7 +293,7 @@ abort，committed generation 和已有 metadata 都不变。
 | 参数校验 | 不变 | 原数据不变 | 修正请求 |
 | 频率限制 | 不变 | 原数据不变 | 按 `retry_after_ms` 重试 |
 | 部分 replace | 不变 | 新旧候选可能共存 | 完整重试 |
-| Sync/commit | 不变 | 已写候选仍可能可见 | 完整重试 |
+| commit | 不变 | 已写候选仍可能可见 | 完整重试 |
 | cleanup 中断 | 已更新 | 完全属于旧 version 的 location 已被 strict 隐藏 | 下次 snapshot 再清理空间 |
 
 ## 8. 查询规则
@@ -357,7 +362,7 @@ snapshot 关闭新 delta 入口
         |
 等待已有 delta 完成
         |
-snapshot replace + Sync + commit/abort
+snapshot replace + commit/abort
         |
 打开入口，等待中的 delta 继续
 ```
@@ -446,7 +451,7 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - snapshot 与 delta 两种先后顺序、commit 和 abort 均不死锁；
 - snapshot 等待 active delta、delta 等待 in-flight snapshot 两个方向均有统一可配置超时，
   且超时后可重试；
-- snapshot 部分失败或 Sync 失败后，已写候选仍可见且完整重试收敛；
+- snapshot 部分失败后，已写候选仍可见且完整重试收敛；
 - cleanup 与下一轮 snapshot 的 CAS 竞态不删除新值；
 - snapshot commit 后 delta 刷新 mixed-generation location 时，旧 cleanup 不删除新写；
 - snapshot cleanup 只删除 metadata，不调用外部 URI backend；
@@ -465,7 +470,7 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - realtime-only reporter 不补 snapshot 也能持续 ADD/DELETE；
 - heartbeat timeout、恢复、超过 grace cleanup；
 - 多 reporter、多 instance、多 storage type 隔离；
-- snapshot partial/Sync failure、完整重试；
+- snapshot partial failure、完整重试；
 - snapshot commit 后立即到达的 delta 在异步 cleanup 后仍可查询；
 - reporter host 或 medium 含 `#` 时 fail closed 且无写入副作用；
 - ASAN/TSAN 或等价并发检测（仅记录实际执行结果，不能由普通 CI 结果推断）。
