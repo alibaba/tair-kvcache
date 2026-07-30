@@ -633,7 +633,15 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         """Map manager blocks to block ids of a state (mamba) group.
 
         State is stored once per group block and covers the whole prefix up to
-        that block, so the manager block's last token selects the block."""
+        that block, so the manager block's last token selects the block.
+
+        KNOWN LIMITATION (mamba_cache_mode="none"): without prefix caching
+        vLLM keeps only one resident state block per request, so every manager
+        block resolves to that same block id here. Saves then publish the
+        *current* state bytes under every manager block's key (mislabeled as
+        earlier prefixes) and loads overwrite one block repeatedly (last write
+        wins). Hybrid serving is only supported with prefix caching enabled
+        (mamba_cache_mode="align"), where the table is position-indexed."""
         mbs = self._manager_block_size
         gbs = group.block_size
         out = []
@@ -702,9 +710,18 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # Report failures against the block table vLLM can act on: map each
             # manager block to the logical block holding its first token. vLLM
             # truncates computed tokens at the first invalid block, so this is
-            # sufficient for recovery. vLLM's invalid-block handling only
-            # supports single-group models; for hybrid models a failed load can
-            # only be logged.
+            # sufficient for recovery.
+            #
+            # UPSTREAM LIMITATION: vLLM's invalid-block recovery
+            # (Scheduler._update_requests_with_invalid_blocks, vllm/v1/core/
+            # sched/scheduler.py) unpacks a single-group block table --
+            # "(req_block_ids,) = ...get_block_ids(req_id)" under
+            # "TODO (davidb): add support for hybrid memory allocator" -- so
+            # for hybrid (multi-group) models a failed load CANNOT be reported
+            # and is only logged; vLLM then decodes from whatever bytes the
+            # partial load left in the paged cache, which can produce corrupt
+            # output. Remove report_failures gating once upstream supports
+            # multi-group invalid-block recovery.
             report_ids = []
             if self._num_groups == 1:
                 # Index by the transferred group's own vLLM group index: with
