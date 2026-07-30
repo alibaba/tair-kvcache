@@ -122,6 +122,65 @@ TEST_F(LiteHitOfflineRunnerTest, FactsCsvRowRoundTrips) {
     EXPECT_FALSE(ParseLiteHitFactRow("t,i,x,2,3,4,\"[]\"", bad, error));
 }
 
+TEST_F(LiteHitOfflineRunnerTest, TtlGroupLayersTtlOntoTheHitCurve) {
+    // Group TTL is 3s; timestamps in ns make ages 2s/1s/3s at the later
+    // requests. TTL rows are ordinary hit-curve facts: the fixed TTL was
+    // applied during the replay, the capacity axis stays queryable.
+    const std::string trace_path = WriteTrace("facts_ttl.jsonl",
+                                              {
+                                                  TraceLine("i1", "r1", 1000000000, {1, 2, 3}, 13),
+                                                  TraceLine("i1", "r2", 3000000000, {1, 2, 9}, 12),
+                                                  TraceLine("i1", "r3", 4000000000, {1, 2, 3}, 13),
+                                              });
+    const std::string output_dir = GetTestTempRootPath() + "/ttl";
+    ASSERT_EQ(0, ::system(("mkdir -p " + output_dir).c_str()));
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, output_dir);
+    OptimizerInstanceGroup group = MakeGroup();
+    group.set_ttl_seconds(3);
+    config.set_instance_groups({group});
+    ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
+
+    const std::vector<std::string> lines = ReadLines(output_dir + "/" + kLiteHitFactsFileName);
+    ASSERT_EQ(4, lines.size());
+    std::string error;
+    LiteHitFactRecord r1;
+    ASSERT_TRUE(ParseLiteHitFactRow(lines[1], r1, error)) << error;
+    EXPECT_TRUE(r1.fact.hit_curve.empty()); // cold
+
+    LiteHitFactRecord r2;
+    ASSERT_TRUE(ParseLiteHitFactRow(lines[2], r2, error)) << error;
+    // Blocks 1,2 are 2s old (alive); 9 was never seen.
+    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 2}}), r2.fact.hit_curve);
+
+    LiteHitFactRecord r3;
+    ASSERT_TRUE(ParseLiteHitFactRow(lines[3], r3, error)) << error;
+    // Blocks 1,2 refreshed by r2 (1s old); block 3 is 3s old: deadline
+    // reached, the prefix stops there for every capacity. Without the TTL
+    // this request would produce thresholds 1,2,4.
+    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 2}}), r3.fact.hit_curve);
+
+    // Capacity stays a query-time axis on top of the fixed TTL.
+    const double capacity_1_block_gb = 16384.0 / (1024.0 * 1024.0 * 1024.0);
+    const std::string query_log = output_dir + "/query.jsonl";
+    ASSERT_TRUE(
+        RunLiteHitFactsQuery(output_dir + "/" + kLiteHitFactsFileName, {capacity_1_block_gb, -1.0}, query_log, error))
+        << error;
+    const std::vector<std::string> query_lines = ReadLines(query_log);
+    ASSERT_EQ(5, query_lines.size()); // 3 requests + i1 summary + overall
+    EXPECT_NE(std::string::npos, query_lines[2].find("\"hit_blocks\":[1,2]"));
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"total_hit_blocks\":[2,4]"));
+    EXPECT_NE(std::string::npos, query_lines[4].find("\"total_input_tokens\":38"));
+}
+
+TEST_F(LiteHitOfflineRunnerTest, RejectsNegativeTtlGroup) {
+    const std::string trace_path = WriteTrace("facts_ttl_bad.jsonl", {TraceLine("i1", "r1", 1000, {1}, 4)});
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, GetTestTempRootPath());
+    OptimizerInstanceGroup group = MakeGroup();
+    group.set_ttl_seconds(-1);
+    config.set_instance_groups({group});
+    EXPECT_FALSE(LiteHitOfflineRunner(config).Run());
+}
+
 TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
     const std::string trace_path = WriteTrace("facts_ok.jsonl",
                                               {

@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer_factory.h"
 #include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
@@ -269,11 +270,6 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         KVCM_LOG_ERROR("RegisterInstance failed: negative TTL for instance[%s]", instance_id.c_str());
         return EC_BADARGS;
     }
-    if (linear_step == 0 && instance_group.ttl_seconds() > 0) {
-        KVCM_LOG_ERROR("RegisterInstance failed: LiteHit full-attention mode does not support TTL for instance[%s]",
-                       instance_id.c_str());
-        return EC_BADARGS;
-    }
 
     const auto &optimizer_state_info = instance_info.optimizer_state_info();
     if (optimizer_state_info.full_location_spec_group_name().empty()) {
@@ -359,7 +355,10 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
 
     if (linear_step == 0) {
         state->lite_hit_capacity_blocks = estimated_capacity_blocks;
-        state->lite_hit = std::make_unique<LiteHit>();
+        // A group TTL is layered onto the LiteHit core; online time is the
+        // wall clock, mirroring the linear-path TtlCacheIndexerWrapper.
+        state->lite_hit =
+            std::make_unique<LiteHit>(static_cast<uint64_t>(instance_group.ttl_seconds()) * 1000000000ULL);
     } else {
         auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
                                                                instance_group.enable_theoretical_max_cache(),
@@ -483,7 +482,8 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_BADARGS;
         }
 
-        const RequestFact fact = state->lite_hit->ProcessRequest(normalized.block_keys);
+        const RequestFact fact =
+            state->lite_hit->ProcessRequest(normalized.block_keys, TimestampUtil::GetCurrentTimeUs() * 1000);
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());

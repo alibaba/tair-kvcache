@@ -11,11 +11,26 @@ constexpr std::size_t kCompactionSlackPositions = 4096;
 
 } // namespace
 
-RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys) {
+RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns) {
+    if (ttl_ns_ > 0) {
+        AdvanceTtlWatermark(now_ns);
+    }
     RequestFact fact = BuildHitCurve(block_keys);
-    CommitRequest(block_keys);
+    CommitRequest(block_keys, now_ns);
     MaybeCompactPositions();
     return fact;
+}
+
+void LiteHit::AdvanceTtlWatermark(int64_t now_ns) {
+    // Strict boundary: an epoch whose deadline has been reached is dead,
+    // matching the online TtlCacheIndexerWrapper harvest. Every position of
+    // a dead epoch is below the next epoch's start (or below everything when
+    // it is the last one).
+    while (!position_epochs_.empty() &&
+           position_epochs_.front().timestamp_ns <= now_ns - static_cast<int64_t>(ttl_ns_)) {
+        position_epochs_.pop_front();
+        dead_below_position_ = position_epochs_.empty() ? fenwick_.size() + 1 : position_epochs_.front().start_position;
+    }
 }
 
 RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const {
@@ -25,8 +40,8 @@ RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const
     }
 
     // All ranks are read from one immutable request-start snapshot. Repeated
-    // keys reuse the same snapshot entry. A cold key stops every capacity's
-    // prefix, so its later occurrence cannot revive the prefix.
+    // keys reuse the same snapshot entry. A cold or expired key stops every
+    // capacity's prefix, so its later occurrence cannot revive the prefix.
     std::unordered_map<int64_t, SnapshotEntry> snapshot_entries;
     snapshot_entries.reserve(block_keys.size());
     for (int64_t block_key : block_keys) {
@@ -35,7 +50,7 @@ RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const
             continue;
         }
         const auto previous = last_positions_.find(block_key);
-        if (previous != last_positions_.end()) {
+        if (previous != last_positions_.end() && previous->second >= dead_below_position_) {
             entry_it->second.is_resident = true;
             entry_it->second.required_blocks = ReuseDistance(previous->second) + 1;
         }
@@ -66,9 +81,21 @@ RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const
     return fact;
 }
 
-void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys) {
+void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns) {
     if (block_keys.empty()) {
         return;
+    }
+
+    if (ttl_ns_ > 0) {
+        // Positions appended below belong to this commit's epoch. Merge with
+        // the previous epoch when the timestamp did not advance; clamp a
+        // defensively out-of-order timestamp so the deque stays monotone
+        // (equivalent to the age-clamp of a per-key timestamp table).
+        const int64_t epoch_ns =
+            position_epochs_.empty() ? now_ns : std::max(now_ns, position_epochs_.back().timestamp_ns);
+        if (position_epochs_.empty() || position_epochs_.back().timestamp_ns != epoch_ns) {
+            position_epochs_.push_back(PositionEpoch{fenwick_.size() + 1, epoch_ns});
+        }
     }
 
     // State commits tail-to-head: sequentially touching the request in
@@ -120,6 +147,24 @@ void LiteHit::MaybeCompactPositions() {
     }
     std::sort(ordered_positions.begin(), ordered_positions.end());
 
+    // Old position boundary S maps to (surviving markers below S) + 1; the
+    // mapping is monotone, so epoch starts and the watermark keep their
+    // order and semantics.
+    const auto remap_boundary = [&ordered_positions](std::size_t old_position) -> std::size_t {
+        const auto it = std::lower_bound(
+            ordered_positions.begin(),
+            ordered_positions.end(),
+            old_position,
+            [](const std::pair<std::size_t, int64_t> &entry, std::size_t value) { return entry.first < value; });
+        return static_cast<std::size_t>(it - ordered_positions.begin()) + 1;
+    };
+    for (PositionEpoch &epoch : position_epochs_) {
+        epoch.start_position = remap_boundary(epoch.start_position);
+    }
+    if (dead_below_position_ > 0) {
+        dead_below_position_ = remap_boundary(dead_below_position_);
+    }
+
     DynamicFenwickTree compacted_fenwick;
     for (const auto &[_, block_key] : ordered_positions) {
         compacted_fenwick.AppendZero();
@@ -137,6 +182,8 @@ uint64_t LiteHit::ReuseDistance(std::size_t previous_position) const {
 void LiteHit::Reset() {
     fenwick_.Clear();
     last_positions_.clear();
+    position_epochs_.clear();
+    dead_below_position_ = 0;
 }
 
 uint64_t LiteHit::memory_usage_bytes() const {
@@ -145,6 +192,7 @@ uint64_t LiteHit::memory_usage_bytes() const {
     constexpr uint64_t kEstimatedHashNodeOverhead = sizeof(void *) * 2;
     bytes += static_cast<uint64_t>(last_positions_.size()) *
              (sizeof(std::pair<const int64_t, std::size_t>) + kEstimatedHashNodeOverhead);
+    bytes += static_cast<uint64_t>(position_epochs_.size()) * sizeof(PositionEpoch);
     return bytes;
 }
 

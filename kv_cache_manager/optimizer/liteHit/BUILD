@@ -50,3 +50,4 @@ cc_library(
         ":hit_curve",
     ],
 )
+

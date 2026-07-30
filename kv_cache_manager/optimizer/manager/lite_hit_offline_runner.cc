@@ -30,7 +30,10 @@ namespace {
 
 // One per-instance replay lane. LiteHit state updates are serial inside a
 // lane; preprocessing and row formatting are parallel across the batch.
+// A group with ttl_seconds > 0 layers that fixed TTL onto the lane's core.
 struct InstanceLane {
+    explicit InstanceLane(uint64_t ttl_ns) : core(ttl_ns) {}
+
     LiteHit core;
     uint64_t block_size_tokens = 0;
     uint64_t block_bytes = 0;
@@ -128,13 +131,14 @@ bool LiteHitOfflineRunner::Run() {
                            static_cast<int>(ec));
             return false;
         }
-        auto lane = std::make_unique<InstanceLane>();
-        lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
-        lane->block_bytes = static_cast<uint64_t>(register_result.size_full_only);
         // Key shape follows the model deployment, so the switch lives on the
         // instance group and applies to every instance in it. RegisterInstance
         // already guaranteed the group exists.
-        lane->enable_prefix_hash = groups_by_name.at(instance.instance_group_name())->enable_prefix_hash();
+        const OptimizerInstanceGroup &group = *groups_by_name.at(instance.instance_group_name());
+        auto lane = std::make_unique<InstanceLane>(static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL);
+        lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
+        lane->block_bytes = static_cast<uint64_t>(register_result.size_full_only);
+        lane->enable_prefix_hash = group.enable_prefix_hash();
         if (!lanes.emplace(instance.instance_id(), std::move(lane)).second) {
             KVCM_LOG_ERROR("LiteHitOfflineRunner: duplicate instance_id[%s] in config", instance.instance_id().c_str());
             return false;
@@ -207,7 +211,7 @@ bool LiteHitOfflineRunner::Run() {
         // Lane commits stay in input order; only same-lane order is
         // semantically required, and input order trivially satisfies it.
         for (BatchItem &item : batch) {
-            item.record.fact = item.lane->core.ProcessRequest(item.normalized.block_keys);
+            item.record.fact = item.lane->core.ProcessRequest(item.normalized.block_keys, item.record.timestamp_ns);
         }
 
         ParallelForIndex(batch.size(), worker_count, [&](std::size_t i) {
