@@ -10,6 +10,7 @@ py_library(
     ],
     imports = ["."],
     tags = ["no-remote-exec"],
+    deps = ["@pip_cpu//requests"],
 )
 
 py_test(
