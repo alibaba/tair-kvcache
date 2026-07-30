@@ -196,11 +196,13 @@ class TestParseGroups(unittest.TestCase):
     def _kv_cache_config(self, groups):
         return SimpleNamespace(kv_cache_groups=groups)
 
-    def _attn_group(self, layers, block_size=16, page_size_bytes=32768):
+    def _attn_group(self, layers, block_size=16, page_size_bytes=32768,
+                    page_size_padded=None):
         from vllm.v1.kv_cache_interface import FullAttentionSpec
         return SimpleNamespace(
             layer_names=layers,
-            kv_cache_spec=FullAttentionSpec(block_size, page_size_bytes))
+            kv_cache_spec=FullAttentionSpec(block_size, page_size_bytes,
+                                            page_size_padded=page_size_padded))
 
     def _mamba_group(self, layers, block_size=528, page_size_bytes=1024):
         from vllm.v1.kv_cache_interface import MambaSpec
@@ -242,6 +244,36 @@ class TestParseGroups(unittest.TestCase):
         self.assertEqual(len(metas), 1)
         self.assertEqual(metas[0].layer_names, ["a0"])
         self.assertEqual(metas[0].group_idx, 1)  # group_idx keeps vLLM numbering
+
+    def test_padded_attention_page_uses_compact_size(self):
+        # page_size_padded inflates spec.page_size_bytes with an allocation
+        # gap the gather kernel never copies; per_block_bytes must come from
+        # the compact real_page_size_bytes.
+        conn = make_connector(manager_block_size=16)
+        metas = conn._parse_groups(self._kv_cache_config(
+            [self._attn_group(["l0", "l1"], block_size=16,
+                              page_size_bytes=32768, page_size_padded=40960)]))
+        # per_token = 32768 // 16 = 2048 (not 40960 // 16 = 2560).
+        self.assertEqual(metas[0].per_block_bytes, 2048 * 16 * 2)
+
+    def test_padded_attention_without_compact_size_raises(self):
+        # A padded spec that exposes no real_page_size_bytes cannot be sized
+        # correctly -- must refuse, not silently over-allocate.
+        conn = make_connector(manager_block_size=16)
+        group = self._attn_group(["l0"], block_size=16,
+                                 page_size_bytes=32768, page_size_padded=40960)
+        del group.kv_cache_spec.real_page_size_bytes
+        with self.assertRaises(NotImplementedError):
+            conn._parse_groups(self._kv_cache_config([group]))
+
+    def test_unpadded_attention_without_compact_size_falls_back(self):
+        # No padding + no real_page_size_bytes: page_size_bytes is already
+        # compact, use it.
+        conn = make_connector(manager_block_size=16)
+        group = self._attn_group(["l0"], block_size=16, page_size_bytes=32768)
+        del group.kv_cache_spec.real_page_size_bytes
+        metas = conn._parse_groups(self._kv_cache_config([group]))
+        self.assertEqual(metas[0].per_block_bytes, 2048 * 16)
 
     def test_unsupported_spec_raises(self):
         conn = make_connector()

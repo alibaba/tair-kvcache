@@ -384,8 +384,22 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 ))
             elif isinstance(spec, FullAttentionSpec):
                 # Attention KV is token-granular; scale from the spec's page size
-                # to the manager block size.
-                per_token_bytes = spec.page_size_bytes // spec.block_size
+                # to the manager block size. Use the *compact* page size:
+                # spec.page_size_bytes returns page_size_padded when set, which
+                # includes an allocation-alignment gap the gather kernel never
+                # copies -- sizing locations/staging buffers with it would break
+                # the staging view() and waste storage. real_page_size_bytes is
+                # exactly the raw KV bytes (2 * block * heads * head_dim * dtype).
+                compact_page_bytes = getattr(spec, "real_page_size_bytes", None)
+                if compact_page_bytes is None:
+                    if getattr(spec, "page_size_padded", None) is not None:
+                        raise NotImplementedError(
+                            f"group {idx}: page_size_padded="
+                            f"{spec.page_size_padded} but this vLLM exposes no "
+                            f"real_page_size_bytes to recover the compact page "
+                            f"size; padded attention layouts are unsupported here")
+                    compact_page_bytes = spec.page_size_bytes
+                per_token_bytes = compact_page_bytes // spec.block_size
                 metas.append(GroupMeta(
                     group_idx=idx,
                     is_attention=True,

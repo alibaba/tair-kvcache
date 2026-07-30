@@ -122,9 +122,14 @@ def _install_stubs():
     kv_cache_interface = _module("vllm.v1.kv_cache_interface")
 
     class FullAttentionSpec:
-        def __init__(self, block_size, page_size_bytes):
+        def __init__(self, block_size, page_size_bytes, page_size_padded=None):
             self.block_size = block_size
-            self.page_size_bytes = page_size_bytes
+            self.page_size_padded = page_size_padded
+            self.real_page_size_bytes = page_size_bytes
+            # Mirror vLLM's AttentionSpec: page_size_bytes returns the padded
+            # size when padding is set.
+            self.page_size_bytes = (page_size_padded if page_size_padded
+                                    is not None else page_size_bytes)
 
     class MambaSpec:
         def __init__(self, block_size, page_size_bytes):
