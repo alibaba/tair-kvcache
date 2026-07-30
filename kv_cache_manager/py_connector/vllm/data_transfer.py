@@ -65,6 +65,34 @@ class MultiResult:
                 self._callback(flat)
 
 
+class _PinnedBudget:
+    """Byte budget for pinned staging buffers.
+
+    Save/load tasks each stage ``len(valid) * per_block_bytes`` bytes of
+    pinned host memory; with a 32-thread executor and no cap the worst case
+    is GiB-scale pinned allocation. ``acquire`` blocks until the requested
+    bytes fit under the capacity; a request larger than the whole capacity
+    is allowed to run alone (never deadlocks)."""
+
+    def __init__(self, capacity: int):
+        assert capacity > 0
+        self._capacity = capacity
+        self._used = 0
+        self._cond = threading.Condition()
+
+    def acquire(self, nbytes: int):
+        with self._cond:
+            while self._used > 0 and self._used + nbytes > self._capacity:
+                self._cond.wait()
+            self._used += nbytes
+
+    def release(self, nbytes: int):
+        with self._cond:
+            self._used -= nbytes
+            assert self._used >= 0
+            self._cond.notify_all()
+
+
 class DataTransferManager:
     def __init__(self, kvcache_info: KVCacheInfo, manager_block_size: int,
                  transfer_client, coordinator_client: TpCoordinatorClient, extra_config):
@@ -83,6 +111,25 @@ class DataTransferManager:
 
         self._io_executor = ThreadPoolExecutor(
             max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker)
+
+        capacity = self._staging_capacity_bytes(kvcache_info, extra_config)
+        self._pinned_budget = _PinnedBudget(capacity)
+        logger.info("pinned staging budget: %d bytes", capacity)
+
+    @staticmethod
+    def _staging_capacity_bytes(kvcache_info: KVCacheInfo, extra_config) -> int:
+        """Pinned staging budget: explicit staging_buffer_max_bytes wins;
+        otherwise two max-size tasks in flight per group (double buffering:
+        one staging on CPU while another is in SDK I/O), floored at 1 GiB so
+        small-block configs keep enough parallelism."""
+        capacity = extra_config.staging_buffer_max_bytes
+        if capacity > 0:
+            return capacity
+        per_task_blocks = max(extra_config.block_per_save_task,
+                              extra_config.block_per_load_task)
+        per_task_peak = max(g.per_block_bytes for g in kvcache_info.groups) \
+            * per_task_blocks
+        return max(2 * per_task_peak * len(kvcache_info.groups), 1 << 30)
 
     def submit_task(self, func, *args, **kwargs):
         return self._io_executor.submit(func, *args, **kwargs)
@@ -139,44 +186,56 @@ class DataTransferManager:
         valid_set = set(valid)
         ok_mask = [i not in valid_set for i in range(n)]
         if valid:
-            cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
-                                     device="cpu", pin_memory=True)
-            with self._device_mod.stream(self._save_stream):
-                ready_event.wait()
-                gpu_buffer = torch.empty(len(valid) * group.per_block_bytes,
-                                         dtype=torch.uint8, device=self._device)
-                if group.is_attention:
-                    view = gpu_buffer.view(self._info.dtype).view(
-                        len(valid), group.num_kv_ptrs,
-                        self._manager_block_size, group.per_token_dim)
-                    batch_gather_scatter_helper.batch_gather_kv_caches(
-                        group.kvcache_ptr_tensor_gpu, view, block_token_indices,
-                        list(range(len(valid))), self._manager_block_size,
-                        group.per_token_dim,
-                        kv_stride=group.kv_stride, block_stride=group.block_stride,
-                        local_block_size=group.kernel_block_size)
-                else:
-                    for out_i, i in enumerate(valid):
-                        for layer_idx in range(group.layer_num):
-                            dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                            gpu_buffer[dst:dst + group.page_size_bytes].copy_(
-                                group.block_view_tensors[layer_idx][block_ids[i]])
-                cpu_buffer.copy_(gpu_buffer, non_blocking=True)
-                done = self._device_mod.Event()
-                done.record(self._save_stream)
-            done.synchronize()
-
-            buffers = self._make_block_buffers(
-                cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
-            uris = [remote_uris[i] for i in valid]
-            result = self._transfer_client.SaveKvCaches(uris, buffers)
-            ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
-            if not ok:
-                logger.warning("save task failed group=%s uris=%d result=%s",
-                               group.spec_name, len(uris), result)
-            for i in valid:
-                ok_mask[i] = ok
+            stage_bytes = len(valid) * group.per_block_bytes
+            self._pinned_budget.acquire(stage_bytes)
+            try:
+                self._save_valid_blocks(group, remote_uris,
+                                        block_token_indices, block_ids,
+                                        ready_event, valid, ok_mask)
+            finally:
+                self._pinned_budget.release(stage_bytes)
         multi_result.submit_result(task_idx, ok_mask)
+
+    def _save_valid_blocks(self, group, remote_uris,
+                           block_token_indices, block_ids, ready_event,
+                           valid, ok_mask):
+        cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
+                                 device="cpu", pin_memory=True)
+        with self._device_mod.stream(self._save_stream):
+            ready_event.wait()
+            gpu_buffer = torch.empty(len(valid) * group.per_block_bytes,
+                                     dtype=torch.uint8, device=self._device)
+            if group.is_attention:
+                view = gpu_buffer.view(self._info.dtype).view(
+                    len(valid), group.num_kv_ptrs,
+                    self._manager_block_size, group.per_token_dim)
+                batch_gather_scatter_helper.batch_gather_kv_caches(
+                    group.kvcache_ptr_tensor_gpu, view, block_token_indices,
+                    list(range(len(valid))), self._manager_block_size,
+                    group.per_token_dim,
+                    kv_stride=group.kv_stride, block_stride=group.block_stride,
+                    local_block_size=group.kernel_block_size)
+            else:
+                for out_i, i in enumerate(valid):
+                    for layer_idx in range(group.layer_num):
+                        dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
+                        gpu_buffer[dst:dst + group.page_size_bytes].copy_(
+                            group.block_view_tensors[layer_idx][block_ids[i]])
+            cpu_buffer.copy_(gpu_buffer, non_blocking=True)
+            done = self._device_mod.Event()
+            done.record(self._save_stream)
+        done.synchronize()
+
+        buffers = self._make_block_buffers(
+            cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
+        uris = [remote_uris[i] for i in valid]
+        result = self._transfer_client.SaveKvCaches(uris, buffers)
+        ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+        if not ok:
+            logger.warning("save task failed group=%s uris=%d result=%s",
+                           group.spec_name, len(uris), result)
+        for i in valid:
+            ok_mask[i] = ok
 
     def create_save_done_callback(self, req_id, tp_rank, write_session_id, num_blocks):
         """block success = AND across all groups. task results are ordered
@@ -214,6 +273,20 @@ class DataTransferManager:
         if not valid:
             multi_result.submit_result(task_idx, ok_mask)
             return
+        stage_bytes = len(valid) * group.per_block_bytes
+        self._pinned_budget.acquire(stage_bytes)
+        try:
+            ok = self._load_valid_blocks(group, remote_uris,
+                                         block_token_indices, block_ids,
+                                         n, valid)
+        finally:
+            self._pinned_budget.release(stage_bytes)
+        for i in valid:
+            ok_mask[i] = ok
+        multi_result.submit_result(task_idx, ok_mask)
+
+    def _load_valid_blocks(self, group, remote_uris, block_token_indices,
+                           block_ids, n, valid) -> bool:
         cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
                                  device="cpu", pin_memory=True)
         buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
@@ -244,9 +317,7 @@ class DataTransferManager:
         else:
             logger.warning("load task failed group=%s uris=%d result=%s",
                            group.spec_name, len(uris), result)
-        for i in valid:
-            ok_mask[i] = ok
-        multi_result.submit_result(task_idx, ok_mask)
+        return ok
 
     def create_load_done_callback(self, req_id, tp_rank, epoch, block_ids, num_blocks,
                                   report_failures=True):
