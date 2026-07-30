@@ -140,7 +140,8 @@ def find_python() -> str:
 
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
+        # Loopback only: everything in this harness is single-machine.
+        s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
@@ -324,6 +325,7 @@ class VllmServer:
             find_python(), "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
             "--served-model-name", SERVED_MODEL_NAME,
+            "--host", "127.0.0.1",  # loopback only: single-machine harness
             "--port", str(self.port),
             "--tensor-parallel-size", str(self.tp_size),
             "--max-model-len", "4096",
