@@ -114,33 +114,69 @@ def attn_kv_views(ref: torch.Tensor) -> List[torch.Tensor]:
         f"(vllm <= 0.25.x)")
 
 
-def _hybrid_external_load_supported() -> bool:
+def _hybrid_external_load_supported() -> Optional[bool]:
     """vLLM <= 0.22.x cannot combine mamba align mode with a KV connector:
     ``Scheduler._mamba_block_aligned_split`` asserts
     ``num_external_computed_tokens == 0`` ("External KV connector is not
     verified yet"), so the first external match would crash the scheduler.
     Probe the installed vLLM for that blocking assert (a capability check,
-    not a version-string comparison)."""
+    not a version-string comparison).
+
+    Returns:
+        True   -- supported (assert absent, or the method was removed by a
+                  newer vLLM: the assert went away with it);
+        False  -- unsupported (the blocking assert is present);
+        None   -- the method exists but its source is unavailable (frozen /
+                  bytecode-only install), so the assert cannot be ruled out.
+    """
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        method = Scheduler._mamba_block_aligned_split
+    except (ImportError, AttributeError):
+        # No such method: the blocking assert was removed/refactored away.
+        return True
     try:
         import inspect
-        from vllm.v1.core.sched.scheduler import Scheduler
-        src = inspect.getsource(Scheduler._mamba_block_aligned_split)
-    except Exception:  # cannot probe (no source, refactored away): don't block
-        return True
+        src = inspect.getsource(method)
+    except Exception:
+        return None  # method exists but cannot be inspected
     return "External KV connector is not verified yet" not in src
 
 
-def ensure_hybrid_supported():
+def ensure_hybrid_supported(force: bool = False):
     """Fail fast with a clear message when a hybrid (mamba) model is served on
-    a vLLM whose scheduler rejects external KV loads (vllm <= 0.22.x)."""
-    if not _hybrid_external_load_supported():
+    a vLLM whose scheduler rejects external KV loads (vllm <= 0.22.x).
+
+    When the probe is inconclusive (method present but source unavailable) the
+    gate fails closed: a wrong guess would crash the scheduler on the first
+    external match. ``force`` (extra_config ``force_hybrid_support``) bypasses
+    the inconclusive case for source-restricted environments."""
+    supported = _hybrid_external_load_supported()
+    if supported:
+        return
+    if supported is None:
+        if force:
+            logger.warning(
+                "force_hybrid_support=true: skipping the hybrid external-load "
+                "capability probe; if this vLLM's scheduler still asserts "
+                "'External KV connector is not verified yet' the first "
+                "external match will crash it")
+            return
         raise NotImplementedError(
-            "TairKvCacheConnector: this vLLM version cannot combine hybrid "
-            "(mamba) models with an external KV connector -- its scheduler "
-            "asserts num_external_computed_tokens == 0 in "
-            "_mamba_block_aligned_split ('External KV connector is not "
-            "verified yet'). Upgrade to vLLM >= 0.23.0 for hybrid model "
-            "support; full-attention models are unaffected.")
+            "TairKvCacheConnector: cannot verify that this vLLM supports "
+            "hybrid (mamba) models with an external KV connector -- "
+            "Scheduler._mamba_block_aligned_split exists but its source is "
+            "unavailable, so the vllm <= 0.22.x blocking assert cannot be "
+            "ruled out. If you know this vLLM is >= 0.23.0, set "
+            "kv_connector_extra_config {\"force_hybrid_support\": true} to "
+            "bypass this check.")
+    raise NotImplementedError(
+        "TairKvCacheConnector: this vLLM version cannot combine hybrid "
+        "(mamba) models with an external KV connector -- its scheduler "
+        "asserts num_external_computed_tokens == 0 in "
+        "_mamba_block_aligned_split ('External KV connector is not "
+        "verified yet'). Upgrade to vLLM >= 0.23.0 for hybrid model "
+        "support; full-attention models are unaffected.")
 
 
 @dataclass
@@ -240,7 +276,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._has_state_groups = any(
             isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups)
         if self._has_state_groups:
-            ensure_hybrid_supported()
+            ensure_hybrid_supported(force=self._extra_config.force_hybrid_support)
         if self._extra_config.preferred_block_size != 0:
             if self._has_state_groups:
                 if self._extra_config.preferred_block_size != self._vllm_block_size:

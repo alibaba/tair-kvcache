@@ -36,3 +36,9 @@ class TairKvCacheConnectorExtraConfig:
         self.request_timeout_seconds: float = extra_config.get("request_timeout_seconds", 1.0)
 
         self.log_level: str = extra_config.get("log_level", "")
+
+        # Escape hatch for the hybrid capability probe: when
+        # Scheduler._mamba_block_aligned_split exists but its source cannot be
+        # inspected (frozen/bytecode-only vLLM) the connector fails closed;
+        # set this to true to force-enable hybrid models there.
+        self.force_hybrid_support: bool = extra_config.get("force_hybrid_support", False)

@@ -231,6 +231,16 @@ class _OpenScheduler:
         return num_new_tokens
 
 
+# Method exists but inspect.getsource fails (frozen / bytecode-only vLLM):
+# compiled from a string, so there is no source file to read.
+_exec_ns = {}
+exec(compile("def _mamba_block_aligned_split(self, *a, **kw):\n    pass\n",
+             "<kvcm-test-no-source>", "exec"), _exec_ns)
+_SourcelessScheduler = type(
+    "_SourcelessScheduler", (),
+    {"_mamba_block_aligned_split": _exec_ns["_mamba_block_aligned_split"]})
+
+
 class TestHybridGate(unittest.TestCase):
     MOD = "vllm.v1.core.sched.scheduler"
 
@@ -254,9 +264,31 @@ class TestHybridGate(unittest.TestCase):
         self._with_scheduler(_OpenScheduler)
         ensure_hybrid_supported()  # must not raise
 
-    def test_unprobeable_scheduler_does_not_block(self):
+    def test_method_removed_does_not_block(self):
+        # Future vLLM refactors _mamba_block_aligned_split away: the blocking
+        # assert went with it, so hybrid must not be blocked.
         self._with_scheduler(object)  # no _mamba_block_aligned_split at all
         ensure_hybrid_supported()  # must not raise
+
+    def test_sourceless_method_fails_closed(self):
+        # Method exists but its source is unavailable: the vllm <= 0.22.x
+        # blocking assert cannot be ruled out, so the gate must fail closed
+        # with an actionable override hint.
+        self._with_scheduler(_SourcelessScheduler)
+        with self.assertRaises(NotImplementedError) as ctx:
+            ensure_hybrid_supported()
+        self.assertIn("force_hybrid_support", str(ctx.exception))
+
+    def test_sourceless_method_force_override(self):
+        self._with_scheduler(_SourcelessScheduler)
+        ensure_hybrid_supported(force=True)  # must not raise
+
+    def test_force_does_not_unblock_known_bad_vllm(self):
+        # force only bypasses the *inconclusive* probe; a positively detected
+        # blocking assert still raises.
+        self._with_scheduler(_BlockedScheduler)
+        with self.assertRaises(NotImplementedError):
+            ensure_hybrid_supported(force=True)
 
 
 if __name__ == "__main__":
