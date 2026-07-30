@@ -162,4 +162,9 @@ def make_connector(manager_block_size: int = 16,
     conn._manager_block_size = manager_block_size
     conn._vllm_block_size = vllm_block_size or manager_block_size
     conn._num_groups = num_groups
+    conn._group_metas = [
+        GroupMeta(group_idx=i, is_attention=True, layer_names=[f"l{i}"],
+                  block_size=conn._vllm_block_size, per_block_bytes=0)
+        for i in range(num_groups)
+    ]
     return conn

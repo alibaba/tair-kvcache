@@ -22,7 +22,8 @@ from unittest.mock import MagicMock
 from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector, ReqState, GroupMeta)
 from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
-from kv_cache_manager.py_connector.vllm.metadata import SaveRequest
+from kv_cache_manager.py_connector.vllm.metadata import (
+    SaveRequest, LoadRequest, TairKvCacheConnectorMetadata)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +253,84 @@ class TestParseGroups(unittest.TestCase):
         conn = make_connector()
         with self.assertRaises(AssertionError):
             conn._parse_groups(self._kv_cache_config([]))
+
+
+# --------------------------------------------------------------------------- #
+# Skipped (EAGLE/MTP drafter) groups: block tables indexed by vLLM group idx
+# --------------------------------------------------------------------------- #
+class TestSkippedGroupIndexing(unittest.TestCase):
+    """When _parse_groups skips a group (EAGLE/MTP drafter), its block table is
+    still present in block_ids_per_group / all_block_ids at its vLLM group
+    index. Consumers must index by GroupMeta.group_idx, never assume the
+    transferred groups start at 0 or include every table."""
+
+    MBS = 16
+
+    def _skipped_group0_connector(self):
+        """Connector where vLLM group 0 is a skipped drafter and group 1 is the
+        transferred attention group."""
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [GroupMeta(
+            group_idx=1, is_attention=True, layer_names=["a0"],
+            block_size=self.MBS, per_block_bytes=0)]
+        conn._num_groups = 1
+        return conn
+
+    def test_num_allocated_blocks_ignores_skipped_group(self):
+        conn = self._skipped_group0_connector()
+        req = ReqState(
+            req_id="r0", token_ids=list(range(64)),
+            # Drafter table (group 0) lags with 1 block; attention has 4.
+            block_ids_per_group=[[100], [200, 201, 202, 203]],
+            has_saved_block_num=0, local_matched_token_num=0,
+            remote_matched_token_num=0, vllm_request=None)
+        self.assertEqual(conn._num_allocated_blocks(req), 4)
+
+    def test_num_allocated_blocks_still_mins_transferred_groups(self):
+        # Two transferred groups (1 and 2), one skipped drafter (0): min is
+        # taken over the transferred ones only.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [
+            GroupMeta(group_idx=1, is_attention=True, layer_names=["a0"],
+                      block_size=self.MBS, per_block_bytes=0),
+            GroupMeta(group_idx=2, is_attention=False, layer_names=["m0"],
+                      block_size=self.MBS, per_block_bytes=0),
+        ]
+        conn._num_groups = 2
+        req = ReqState(
+            req_id="r0", token_ids=[], block_ids_per_group=[[9], [1, 2, 3], [4, 5]],
+            has_saved_block_num=0, local_matched_token_num=0,
+            remote_matched_token_num=0, vllm_request=None)
+        self.assertEqual(conn._num_allocated_blocks(req), 2)
+
+    def test_num_allocated_blocks_empty(self):
+        conn = self._skipped_group0_connector()
+        req = ReqState(
+            req_id="r0", token_ids=[], block_ids_per_group=[],
+            has_saved_block_num=0, local_matched_token_num=0,
+            remote_matched_token_num=0, vllm_request=None)
+        self.assertEqual(conn._num_allocated_blocks(req), 0)
+
+    def test_load_failure_report_uses_transferred_group_table(self):
+        # start_load_kv reports failed loads against the block table of the
+        # single transferred group -- which is group 1 here, not group 0.
+        conn = self._skipped_group0_connector()
+        conn._tp_rank = 0
+        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(LoadRequest(
+            req_id="r0", manager_block_idxes=[0, 1],
+            need_load_locations=[{"location_specs": []}] * 2,
+            # Group 0 (drafter) has a lagging 1-entry table; indexing it would
+            # IndexError / report the wrong block ids.
+            all_block_ids=[[999], [10, 11]]))
+        conn._connector_metadata = meta
+        conn.start_load_kv(MagicMock())
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [10, 11])  # report_ids from group 1's table
+        self.assertTrue(kwargs["report_failures"])
 
 
 # --------------------------------------------------------------------------- #

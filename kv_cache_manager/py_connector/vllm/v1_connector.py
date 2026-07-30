@@ -180,12 +180,6 @@ class ReqState:
     sent_saving_count: int = 0
     need_report_after_saving_finished: bool = False
 
-    @property
-    def num_allocated_blocks(self) -> int:
-        if not self.block_ids_per_group:
-            return 0
-        return min(len(b) for b in self.block_ids_per_group)
-
     @staticmethod
     def create_from_delta(delta: "ReqStateToWorker") -> "ReqState":
         return ReqState(
@@ -359,6 +353,18 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _spec_name(self, tp_rank: int, group_idx: int) -> str:
         return f"tp{tp_rank}_g{group_idx}"
+
+    def _num_allocated_blocks(self, req: ReqState) -> int:
+        """Min allocated block-table length across the *transferred* groups.
+
+        ``block_ids_per_group`` is indexed by the vLLM group index and includes
+        groups skipped by ``_parse_groups`` (EAGLE/MTP drafters). A drafter's
+        block table can lag behind the target model's, so including it in the
+        min would permanently understate how many blocks are saveable."""
+        if not req.block_ids_per_group:
+            return 0
+        return min(len(req.block_ids_per_group[meta.group_idx])
+                   for meta in self._group_metas)
 
     def _parse_groups(self, kv_cache_config: "KVCacheConfig") -> List[GroupMeta]:
         metas = []
@@ -639,8 +645,12 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # only be logged.
             report_ids = []
             if self._num_groups == 1:
-                table = load_req.all_block_ids[0]
-                gbs = self._group_metas[0].block_size
+                # Index by the transferred group's own vLLM group index: with
+                # skipped groups (EAGLE/MTP drafters) the single transferred
+                # group is not necessarily group 0.
+                only = self._group_metas[0]
+                table = load_req.all_block_ids[only.group_idx]
+                gbs = only.block_size
                 report_ids = [table[(mb * self._manager_block_size) // gbs]
                               for mb in load_req.manager_block_idxes]
             done_cb = self._data_transfer.create_load_done_callback(
@@ -895,7 +905,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         for req in self._alive_requests.values():
             target_save_num = min(
                 len(req.token_ids),
-                req.num_allocated_blocks * self._vllm_block_size) // self._manager_block_size
+                self._num_allocated_blocks(req) * self._vllm_block_size) // self._manager_block_size
             if target_save_num > req.has_saved_block_num:
                 req.scheduled_saving_count += 1
                 self._http_executor.submit(
