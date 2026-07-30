@@ -275,6 +275,29 @@ class TestParseGroups(unittest.TestCase):
         metas = conn._parse_groups(self._kv_cache_config([group]))
         self.assertEqual(metas[0].per_block_bytes, 2048 * 16)
 
+    def test_windowed_attention_spec_rejected(self):
+        # vLLM can merge SWA / chunked-attention layers into a
+        # FullAttentionSpec that keeps sliding_window / attention_chunk_size
+        # set; such blocks are not full-prefix KV and must be refused.
+        for window_field in ("sliding_window", "attention_chunk_size"):
+            with self.subTest(field=window_field):
+                conn = make_connector(manager_block_size=16)
+                group = self._attn_group(["l0"])
+                setattr(group.kv_cache_spec, window_field, 1024)
+                with self.assertRaises(NotImplementedError) as cm:
+                    conn._parse_groups(self._kv_cache_config([group]))
+                self.assertIn(window_field, str(cm.exception))
+
+    def test_windowed_fields_none_accepted(self):
+        # Real FullAttentionSpec objects carry the fields as None; that is the
+        # ordinary full-attention case and must still parse.
+        conn = make_connector(manager_block_size=16)
+        group = self._attn_group(["l0"])
+        group.kv_cache_spec.sliding_window = None
+        group.kv_cache_spec.attention_chunk_size = None
+        metas = conn._parse_groups(self._kv_cache_config([group]))
+        self.assertEqual(len(metas), 1)
+
     def test_unsupported_spec_raises(self):
         conn = make_connector()
         bad = SimpleNamespace(layer_names=["x"], kv_cache_spec=object())

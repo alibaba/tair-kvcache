@@ -383,6 +383,18 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     page_size_bytes=spec.page_size_bytes,
                 ))
             elif isinstance(spec, FullAttentionSpec):
+                # FullAttentionSpec doubles as the merged spec of hybrid
+                # SWA/chunked-attention models (vLLM merges window layers into
+                # it, keeping sliding_window/attention_chunk_size set). Those
+                # blocks hold windowed KV, not the full prefix -- publishing
+                # them as prefix caches would corrupt reuse. Refuse explicitly.
+                for window_field in ("sliding_window", "attention_chunk_size"):
+                    if getattr(spec, window_field, None) is not None:
+                        raise NotImplementedError(
+                            f"group {idx}: FullAttentionSpec has {window_field}="
+                            f"{getattr(spec, window_field)}; sliding-window / "
+                            f"chunked attention KV is not full-prefix and is "
+                            f"not yet supported by TairKvCacheConnector")
                 # Attention KV is token-granular; scale from the spec's page size
                 # to the manager block size. Use the *compact* page size:
                 # spec.page_size_bytes returns page_size_padded when set, which
