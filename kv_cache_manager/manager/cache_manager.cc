@@ -147,22 +147,26 @@ public:
 
     ErrorCode Acquire(const ReporterSnapshotKey &reporter_key,
                       std::string &out_committed_version,
-                      uint64_t &out_lifecycle_generation) {
+                      uint64_t &out_lifecycle_generation,
+                      bool &out_created_generation) {
         const auto failure_it = snapshot_wait_failures_.find(reporter_key);
         if (failure_it != snapshot_wait_failures_.end()) {
             out_committed_version.clear();
             out_lifecycle_generation = 0;
+            out_created_generation = false;
             return failure_it->second;
         }
         const auto it = versions_.find(reporter_key);
         if (it != versions_.end()) {
             out_committed_version = it->second.snapshot_version;
             out_lifecycle_generation = it->second.lifecycle_generation;
+            out_created_generation = false;
             return EC_OK;
         }
-        const ErrorCode ec =
-            backend_->BeginDeltaMutation(reporter_key, out_committed_version, &out_lifecycle_generation);
+        const ErrorCode ec = backend_->BeginDeltaMutation(
+            reporter_key, out_committed_version, &out_lifecycle_generation, &out_created_generation);
         if (ec != EC_OK) {
+            out_created_generation = false;
             if (ec == EC_SNAPSHOT_IN_PROGRESS) {
                 snapshot_wait_failures_.emplace(reporter_key, ec);
             }
@@ -2399,12 +2403,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
-    auto refresh_snapshot_response = [&]() {
+    bool request_created_generation = false;
+    auto refresh_snapshot_response = [&](bool force_snapshot_required) {
         const std::string committed = event_backend->GetSnapshotVersion(reporter_key);
         response->set_committed_snapshot_version(committed);
-        response->set_snapshot_required(committed.empty());
+        response->set_snapshot_required(committed.empty() || force_snapshot_required);
     };
-    refresh_snapshot_response();
+    refresh_snapshot_response(false);
 
     if (!event_backend->IsCleanupCallbackSet()) {
         event_backend->SetCleanupCallback([this, requested_type](const std::string &cleanup_instance,
@@ -2566,11 +2571,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec =
-                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
+            bool created_generation = false;
+            const ErrorCode fence_ec = delta_mutations.Acquire(
+                reporter_key, committed_version, mutation_lifecycle_generation, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
+            }
+            if (created_generation) {
+                request_created_generation = true;
             }
             for (auto &spec : specs) {
                 std::string versioned_uri;
@@ -2628,11 +2637,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec =
-                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
+            bool created_generation = false;
+            const ErrorCode fence_ec = delta_mutations.Acquire(
+                reporter_key, committed_version, mutation_lifecycle_generation, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
+            }
+            if (created_generation) {
+                request_created_generation = true;
             }
             const std::string location_id = event_backend->BuildLocationId(params.medium(), host_ip_port);
             auto &mutations_by_name = delta_spec_mutations[block_key][location_id];
@@ -3093,7 +3106,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     };
 
-    refresh_snapshot_response();
+    refresh_snapshot_response(request_created_generation);
     if (any_failure) {
         std::map<std::pair<proto::meta::ReportEventType, proto::meta::ErrorCode>, size_t> failure_counts;
         size_t failed_item_count = 0;

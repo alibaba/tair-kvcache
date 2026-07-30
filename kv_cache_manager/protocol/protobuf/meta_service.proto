@@ -147,8 +147,10 @@ message ReportEventResponse {
     // temporarily falls back to soft visibility until a later snapshot.
     string committed_snapshot_version = 3;
     uint64 retry_after_ms = 4;
-    // Advisory: true while this process has no generation yet. ADD/DELETE do
-    // not require an initial snapshot and may create the generation.
+    // Advisory: true while this process has no generation yet, and once on
+    // the ADD/DELETE request that lazily creates the first generation. The
+    // caller should schedule a full snapshot for reconciliation; realtime
+    // mutations remain accepted while that snapshot is pending.
     bool snapshot_required = 5;
     string extra_info = 6; // opaque JSON passed through from InstanceGroup
 }
