@@ -601,6 +601,7 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // last request.
             state->lite_hit->AdvanceTime(static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000);
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
+            s.ttl_eviction_count = ClampToInt64(state->lite_hit->ttl_expired_blocks());
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
             // Infinite-capacity residency: nothing is ever evicted, so every

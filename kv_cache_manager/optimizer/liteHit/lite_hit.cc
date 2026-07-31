@@ -26,10 +26,18 @@ void LiteHit::AdvanceTtlWatermark(int64_t now_ns) {
     // matching the online TtlCacheIndexerWrapper harvest. Every position of
     // a dead epoch is below the next epoch's start (or below everything when
     // it is the last one).
+    const std::size_t old_watermark = dead_below_position_;
     while (!position_epochs_.empty() &&
            position_epochs_.front().timestamp_ns <= now_ns - static_cast<int64_t>(ttl_ns_)) {
         position_epochs_.pop_front();
         dead_below_position_ = position_epochs_.empty() ? fenwick_.size() + 1 : position_epochs_.front().start_position;
+    }
+    // Markers the watermark sweeps over are blocks that reached the deadline
+    // without a refreshing access (re-touched blocks moved their marker
+    // above); this equals the online wrapper's harvested-eviction count.
+    if (dead_below_position_ > old_watermark) {
+        const uint64_t already_dead = old_watermark > 1 ? fenwick_.PrefixSum(old_watermark - 1) : 0;
+        ttl_expired_blocks_ += fenwick_.PrefixSum(dead_below_position_ - 1) - already_dead;
     }
 }
 
@@ -214,6 +222,7 @@ void LiteHit::Reset() {
     last_positions_.clear();
     position_epochs_.clear();
     dead_below_position_ = 0;
+    ttl_expired_blocks_ = 0;
 }
 
 uint64_t LiteHit::memory_usage_bytes() const {

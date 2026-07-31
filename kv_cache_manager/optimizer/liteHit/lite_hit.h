@@ -77,6 +77,12 @@ public:
     // are excluded even though their table entries linger until compaction.
     uint64_t current_unique_blocks() const { return alive_marker_count(); }
 
+    // Cumulative blocks that reached the TTL deadline without a refreshing
+    // access; counted when the watermark sweeps over them, matching the
+    // online TtlCacheIndexerWrapper eviction statistics. A revived block
+    // counts again on its next expiry.
+    uint64_t ttl_expired_blocks() const { return ttl_expired_blocks_; }
+
     // Coarse memory estimate for observability. It is derived from the state
     // already required by the algorithm and does not retain extra trace data.
     uint64_t memory_usage_bytes() const;
@@ -112,6 +118,7 @@ private:
     // expired.
     std::deque<PositionEpoch> position_epochs_;
     std::size_t dead_below_position_ = 0;
+    uint64_t ttl_expired_blocks_ = 0;
 };
 
 } // namespace kv_cache_manager
