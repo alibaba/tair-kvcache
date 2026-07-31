@@ -72,7 +72,8 @@ public:
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
                                             SelectLocationPolicy *policy,
-                                            const std::vector<BackendSelector> &selectors) const;
+                                            const std::vector<BackendSelector> &selectors,
+                                            const std::vector<std::string> &requested_spec_names = {}) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,
