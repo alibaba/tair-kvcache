@@ -290,6 +290,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._group_metas = self._parse_groups(kv_cache_config)
         self._num_groups = len(self._group_metas)
+        self._state_group_idxs = [m.group_idx for m in self._group_metas
+                                  if not m.is_attention]
 
         deployment = {
             "model_name": model_config.served_model_name,
@@ -314,7 +316,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._host_ip = get_ip()
         port = self._extra_config.coordinator_base_port
 
-        register_response = self._manager_client.register_instance({
+        register_request = {
             "trace_id": "register_%s" % self._extra_config.instance_id,
             "instance_group": self._extra_config.instance_group,
             "instance_id": self._extra_config.instance_id,
@@ -324,7 +326,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 {"name": self._spec_name(rank, meta.group_idx), "size": meta.per_block_bytes}
                 for rank in range(self._tp_size) for meta in self._group_metas
             ],
-        })
+        }
+        if self._spec_groups:
+            # Hybrid models publish per-block spec coverage (see _spec_groups).
+            register_request["location_spec_groups"] = self._spec_groups
+        register_response = self._manager_client.register_instance(register_request)
 
         max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
         self._iov_size = max_group_bytes * self._extra_config.hf3fs_concurrent_io_block_count
@@ -389,6 +395,73 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _spec_name(self, tp_rank: int, group_idx: int) -> str:
         return f"tp{tp_rank}_g{group_idx}"
+
+    # Spec group names advertised at registration and used per key in
+    # start_write_cache. See _spec_groups for the semantics.
+    ATTN_SPEC_GROUP = "attn"
+    FULL_SPEC_GROUP = "full"
+
+    @property
+    def _spec_groups(self) -> List[dict]:
+        """LocationSpecGroups describing which specs a block may carry.
+
+        Hybrid (mamba "align") models write a *sparse* set of recurrent states:
+        vLLM materializes a state only at segment boundaries, so the interior
+        manager blocks of a request have attention KV but no state. Declaring
+        two groups lets ``start_write_cache`` say, per block, which specs that
+        block will actually hold:
+
+        * ``full`` -- every group's spec (attention KV + all states);
+        * ``attn`` -- attention specs only (no state was materialized).
+
+        The manager then stores exactly the advertised specs, reports the real
+        per-block coverage in ``getCacheLocation``, and later lets a
+        complementary write fill in a block's missing state specs.
+
+        Full-attention models have nothing to be sparse about: they declare no
+        groups at all, which keeps their requests byte-identical to before (and
+        compatible with managers that predate spec groups).
+        """
+        if not self._state_group_idxs:
+            return []
+        attn_specs = sorted(
+            self._spec_name(rank, meta.group_idx)
+            for rank in range(self._tp_size)
+            for meta in self._group_metas if meta.is_attention)
+        all_specs = sorted(
+            self._spec_name(rank, meta.group_idx)
+            for rank in range(self._tp_size) for meta in self._group_metas)
+        return [{"name": self.ATTN_SPEC_GROUP, "spec_names": attn_specs},
+                {"name": self.FULL_SPEC_GROUP, "spec_names": all_specs}]
+
+    def _state_complete_mask(self, req: "ReqState", manager_block_idxes) -> List[bool]:
+        """Per manager block: does *every* state group hold a real state?
+
+        vLLM's block table is the ground truth: in "align" mode a manager block
+        whose state block is the null block (id 0) has no materialized state.
+        Attention-only models return all True (nothing can be missing).
+        """
+        if not self._state_group_idxs:
+            return [True] * len(manager_block_idxes)
+        mbs = self._manager_block_size
+        mask = []
+        for mb in manager_block_idxes:
+            complete = True
+            for group_idx in self._state_group_idxs:
+                table = req.block_ids_per_group[group_idx]
+                # State covers the prefix ending at the block's last token.
+                logical = ((mb + 1) * mbs - 1) // self._group_block_size(group_idx)
+                if logical >= len(table) or table[logical] == 0:
+                    complete = False
+                    break
+            mask.append(complete)
+        return mask
+
+    def _group_block_size(self, group_idx: int) -> int:
+        for meta in self._group_metas:
+            if meta.group_idx == group_idx:
+                return meta.block_size
+        raise KeyError(f"no such transferred group: {group_idx}")
 
     def _num_allocated_blocks(self, req: ReqState) -> int:
         """Min allocated block-table length across the *transferred* groups.
@@ -652,13 +725,25 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             out.append(block_table[logical])
         return out
 
-    def _self_uris(self, locations, spec_name: str) -> List[str]:
-        uris = []
+    def _self_uris(self, locations, spec_name: str) -> List[Optional[str]]:
+        """This rank's URI for ``spec_name`` in every location, positionally.
+
+        ``None`` marks a block that carries no data for this spec: hybrid
+        models publish per-block spec coverage (see ``_spec_groups``), so a
+        block saved without a recurrent state has no URI for the state specs.
+        Positional alignment with the block list is what makes that legible --
+        a flat list of "the URIs that exist" would silently shift blocks.
+        """
+        uris: List[Optional[str]] = []
         for location in locations:
+            uri = None
             for spec in location.get("location_specs", []):
                 if spec["name"] == spec_name:
-                    uris.append(spec["uri"])
+                    uri = spec["uri"]
+                    break
+            uris.append(uri)
         return uris
+
 
     # ------------------------------------------------------------------ #
     # Worker side: load / save
@@ -677,15 +762,22 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def _plan_group_transfers(self, locations, manager_block_idxes, block_ids_per_group):
         """Build (group, uris, token_indices, block_ids) for every group.
 
-        Returns None if any group's URI list does not cover all blocks."""
+        ``uris`` is positionally aligned with ``manager_block_idxes`` and may
+        contain ``None`` where a block carries no data for that group's spec
+        (hybrid per-block spec coverage, see ``_spec_groups``). Deciding what a
+        hole means is the transfer task's job: for attention groups a hole is a
+        failure, for state groups it must agree with the block table (a null
+        state block). Returns None only if the manager returned the wrong
+        number of locations altogether.
+        """
         num_blocks = len(manager_block_idxes)
+        if len(locations) != num_blocks:
+            logger.warning("%d locations for %d blocks, skip transfer",
+                           len(locations), num_blocks)
+            return None
         plans = []
         for group in self._kvcache_info.groups:
             uris = self._self_uris(locations, group.spec_name)
-            if len(uris) != num_blocks:
-                logger.warning("group %s: %d uris for %d blocks, skip transfer",
-                               group.spec_name, len(uris), num_blocks)
-                return None
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
             if group.is_attention:
@@ -861,6 +953,42 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------ #
     # Scheduler side
     # ------------------------------------------------------------------ #
+    def _location_covers_states(self, location: dict) -> bool:
+        """Does this published block carry every state group's spec for a rank?
+
+        A hybrid block saved without a materialized recurrent state is published
+        under the attention-only spec group, so its location simply has no spec
+        for the state groups. ``getCacheLocation`` reports the real coverage,
+        which is what makes the sparsity visible here.
+        """
+        names = {spec.get("name") for spec in location.get("location_specs", [])}
+        return all(self._spec_name(rank, group_idx) in names
+                   for rank in range(self._tp_size)
+                   for group_idx in self._state_group_idxs)
+
+    def _truncate_to_state_complete(self, req_id: str, locations: List[dict]) -> List[dict]:
+        """Cut an external match back to the last state-complete block.
+
+        Resuming a hybrid (mamba) model requires the recurrent state at the
+        *end* of the reused prefix; the attention KV of a longer prefix is
+        useless without it. Blocks published without a state must therefore not
+        terminate a match -- loading them would either fail (no URI) or, worse,
+        leave the request running on a state it never had.
+
+        Full-attention models have no state groups, so nothing is truncated.
+        """
+        if not self._state_group_idxs or not locations:
+            return locations
+        keep = 0
+        for i, location in enumerate(locations):
+            if self._location_covers_states(location):
+                keep = i + 1
+        if keep < len(locations):
+            logger.info("req:%s truncated external match from %d to %d blocks: "
+                        "later blocks carry no recurrent state",
+                        req_id, len(locations), keep)
+        return locations[:keep]
+
     def get_num_new_matched_tokens(self, request: "Request",
                                    num_computed_tokens: int) -> Tuple[Optional[int], bool]:
         prev = self._alive_requests.get(request.request_id)
@@ -886,6 +1014,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if not is_query_done:
             # async query in flight; vLLM will ask again
             return None, False
+
+        # Hybrid models can only resume from a block that carries the recurrent
+        # state ending it; truncate to the last such block before anything else.
+        need_load_locations = self._truncate_to_state_complete(
+            request.request_id, need_load_locations)
 
         new_matched_count = len(need_load_locations) * self._manager_block_size
         # This connector loads synchronously (load_kv_async=False), so vLLM will
@@ -987,10 +1120,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._num_allocated_blocks(req) * self._vllm_block_size) // self._manager_block_size
             if target_save_num > req.has_saved_block_num:
                 req.scheduled_saving_count += 1
+                # Per-block state completeness must be read here, in the
+                # scheduler loop: it comes from vLLM's block table, which the
+                # http_executor thread would race against later steps.
                 self._http_executor.submit(
                     self.start_save_kvcache_async, req.req_id,
                     req.token_ids[:target_save_num * self._manager_block_size],
-                    target_save_num)
+                    target_save_num,
+                    self._state_complete_mask(req, range(target_save_num)))
             req.has_saved_block_num = target_save_num
 
         with self._waiting_to_save_requests_lock:
@@ -1015,7 +1152,17 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._waiting_to_finish_requests = []
         return meta
 
-    def start_save_kvcache_async(self, req_id, token_ids, target_save_num):
+    def start_save_kvcache_async(self, req_id, token_ids, target_save_num,
+                                 state_complete_mask):
+        """Ask the manager for write locations for a request's first
+        ``target_save_num`` manager blocks.
+
+        ``state_complete_mask[i]`` says whether manager block i has a
+        materialized recurrent state. Blocks without one are announced under
+        the attention-only spec group, so the manager allocates (and later
+        advertises) only the specs that will really hold data -- absence is
+        never encoded as a successful write.
+        """
         request = {
             "trace_id": "%s_%d" % (req_id, self._epoch),
             "instance_id": self._extra_config.instance_id,
@@ -1023,6 +1170,16 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "token_ids": token_ids,
             "write_timeout_seconds": self._extra_config.write_timeout_seconds,
         }
+        if self._spec_groups:
+            assert len(state_complete_mask) == target_save_num, (
+                f"state mask {len(state_complete_mask)} != {target_save_num} blocks")
+            request["location_spec_group_names"] = [
+                self.FULL_SPEC_GROUP if complete else self.ATTN_SPEC_GROUP
+                for complete in state_complete_mask]
+            if not all(state_complete_mask):
+                logger.info("req:%s saving %d/%d blocks without a recurrent "
+                            "state (attention specs only)", req_id,
+                            state_complete_mask.count(False), target_save_num)
         try:
             response = self._manager_client.start_write_cache(request)
         except Exception as e:

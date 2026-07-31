@@ -159,32 +159,24 @@ class DataTransferManager:
         """Gather one group's manager blocks from HBM and save them.
 
         block_token_indices: attention -> list[list[int]] flat token slots per block.
-        block_ids:           state     -> list[int] block id per manager block;
-                             id 0 is vLLM's null block: no state exists at that
-                             boundary by design (mamba "align" sparse states),
-                             the block is reported saved vacuously.
+        block_ids:           state     -> list[int] block id per manager block.
+        remote_uris:         positionally aligned with the manager blocks; None
+                             where the manager allocated no location for this
+                             group's spec (see ``_spec_groups``).
+
+        A block is reported successful only when its data was actually written.
+        Where a state group has no state (vLLM's null block in mamba "align"
+        mode) the manager was already told so at start_write_cache time -- the
+        block simply carries no spec for this group -- so nothing is written and
+        nothing is claimed: the block is *excluded* from this group's verdict
+        rather than reported as a success.
         """
         n = len(remote_uris)
-        if group.is_attention:
-            valid = list(range(n))
-        else:
-            # vLLM's mamba "align" mode only materializes the state block at
-            # segment boundaries (single_type_kv_cache_manager.MambaManager
-            # allocates the null block for intermediate positions; a hit only
-            # ever consumes the state ending the matched region). A null
-            # (id 0) state target therefore means "no state exists by design",
-            # not a failure: report it saved vacuously. Failing it would
-            # stride-AND the whole manager block out of the manager's prefix
-            # chain and kill multi-block hybrid caching entirely.
-            valid = [i for i in range(n) if block_ids[i] != 0]
-            if len(valid) < n:
-                logger.info("save group %s: %d/%d blocks have no materialized "
-                            "state, saving vacuously", group.spec_name,
-                            n - len(valid), n)
-        # Vacuous (skipped) blocks succeed; transferred blocks start False and
-        # are flipped by the transfer result below.
-        valid_set = set(valid)
-        ok_mask = [i not in valid_set for i in range(n)]
+        # Three dispositions per block: abstain (this group holds no data for
+        # it by design), transfer, or fail outright.
+        skipped, failed = self._save_dispositions(group, remote_uris, block_ids, n)
+        valid = [i for i in range(n) if i not in skipped and i not in failed]
+        ok_mask = [None if i in skipped else False for i in range(n)]
         if valid:
             stage_bytes = len(valid) * group.per_block_bytes
             self._pinned_budget.acquire(stage_bytes)
@@ -196,9 +188,80 @@ class DataTransferManager:
                 self._pinned_budget.release(stage_bytes)
         multi_result.submit_result(task_idx, ok_mask)
 
+    def _save_dispositions(self, group: TransferGroup, remote_uris, block_ids, n):
+        """Split the task's blocks into (abstained, failed); the rest transfer.
+
+        A state group abstains for a manager block exactly when vLLM's block
+        table points at the null block *and* the manager allocated no URI for
+        the group's spec. The two must agree, because the scheduler derived the
+        announced spec coverage from that very block table. Either disagreement
+        fails the block:
+
+        * location but no state -- writing the null block's bytes would publish
+          a state the model never produced;
+        * state but no location -- the state cannot be published at all.
+
+        Attention KV is never sparse, so a missing location simply fails.
+        """
+        if group.is_attention:
+            failed = {i for i in range(n) if remote_uris[i] is None}
+            if failed:
+                logger.warning("save group %s: %d/%d attention blocks have no "
+                               "location, failing them", group.spec_name,
+                               len(failed), n)
+            return set(), failed
+        skipped, failed = set(), set()
+        for i in range(n):
+            is_null = block_ids[i] == 0
+            has_uri = remote_uris[i] is not None
+            if is_null and not has_uri:
+                skipped.add(i)
+            elif is_null:
+                failed.add(i)
+                logger.warning("save group %s: block %d has a location but no "
+                               "materialized state; failing it instead of "
+                               "publishing bytes the model never produced",
+                               group.spec_name, i)
+            elif not has_uri:
+                failed.add(i)
+                logger.warning("save group %s: block %d has a materialized "
+                               "state but no location to write it to; failing it",
+                               group.spec_name, i)
+        if skipped:
+            logger.debug("save group %s: %d/%d blocks carry no state "
+                         "(not published)", group.spec_name, len(skipped), n)
+        return skipped, failed
+
+    @staticmethod
+    def _load_skipped_blocks(group: TransferGroup, remote_uris, block_ids, n) -> set:
+        """Blocks this group has nothing to load into.
+
+        Asymmetric with the save side on purpose: on load, a null target means
+        vLLM does not *need* this group's data for that block (in mamba "align"
+        mode only the block ending the reused prefix needs its state), so the
+        block is skipped whatever the manager published. The reverse -- a real
+        target with nothing published -- is a genuine failure: the request would
+        run on an unwritten state.
+        """
+        if group.is_attention:
+            missing = sum(uri is None for uri in remote_uris)
+            if missing:
+                logger.warning("load group %s: %d/%d attention blocks have no "
+                               "location, failing them", group.spec_name, missing, n)
+            return set()
+        skipped = {i for i in range(n) if block_ids[i] == 0}
+        if skipped:
+            logger.debug("load group %s: %d/%d blocks need no state",
+                         group.spec_name, len(skipped), n)
+        return skipped
+
     def _save_valid_blocks(self, group, remote_uris,
                            block_token_indices, block_ids, ready_event,
                            valid, ok_mask):
+        uris = [remote_uris[i] for i in valid]
+        assert all(uri is not None for uri in uris), \
+            f"group {group.spec_name}: save batch contains a block without a " \
+            f"location; _save_dispositions must have failed it"
         cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
                                  device="cpu", pin_memory=True)
         with self._device_mod.stream(self._save_stream):
@@ -210,7 +273,8 @@ class DataTransferManager:
                     len(valid), group.num_kv_ptrs,
                     self._manager_block_size, group.per_token_dim)
                 batch_gather_scatter_helper.batch_gather_kv_caches(
-                    group.kvcache_ptr_tensor_gpu, view, block_token_indices,
+                    group.kvcache_ptr_tensor_gpu, view,
+                    [block_token_indices[i] for i in valid],
                     list(range(len(valid))), self._manager_block_size,
                     group.per_token_dim,
                     kv_stride=group.kv_stride, block_stride=group.block_stride,
@@ -228,7 +292,6 @@ class DataTransferManager:
 
         buffers = self._make_block_buffers(
             cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
-        uris = [remote_uris[i] for i in valid]
         result = self._transfer_client.SaveKvCaches(uris, buffers)
         ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
         if not ok:
@@ -238,12 +301,24 @@ class DataTransferManager:
             ok_mask[i] = ok
 
     def create_save_done_callback(self, req_id, tp_rank, write_session_id, num_blocks):
-        """block success = AND across all groups. task results are ordered
-        group0[blocks], group1[blocks], ... so we AND stride-wise."""
+        """block success = AND across all groups that had data for the block.
+
+        Task results are ordered group0[blocks], group1[blocks], ... so a
+        block's verdict is the stride-AND ``flat[i % num_blocks]``. ``None``
+        entries mean "this group holds no data for this block by design" (see
+        save_task) and are skipped: they neither pass nor fail the block. A
+        block whose every group is None was never written at all and must not
+        be published.
+        """
         def cb(flat):
-            is_success = [True] * num_blocks
+            is_success = [None] * num_blocks
             for i, ok in enumerate(flat):
-                is_success[i % num_blocks] = is_success[i % num_blocks] and ok
+                if ok is None:
+                    continue
+                b = i % num_blocks
+                is_success[b] = ok if is_success[b] is None else (is_success[b] and ok)
+            # No group wrote anything for the block -> nothing to publish.
+            is_success = [bool(ok) for ok in is_success]
             msg = CoordinateMessage(time.time(), SendBlockFinishedEvent(
                 request_id=req_id, tp_rank=tp_rank,
                 write_session_id=write_session_id, is_success_list=is_success))
@@ -255,21 +330,22 @@ class DataTransferManager:
     # ------------------------------------------------------------------ #
     def load_task(self, multi_result: MultiResult, task_idx, group: TransferGroup,
                   remote_uris, block_token_indices, block_ids):
+        """Load one group's manager blocks from storage into HBM.
+
+        Mirror of ``save_task``: ``remote_uris`` is positionally aligned with
+        the manager blocks and holds None where the published block carries no
+        data for this group's spec. A state group's block is skipped only when
+        vLLM's target is the null block *and* nothing was published -- i.e. the
+        state is neither needed nor available. Everything else must transfer.
+        """
         n = len(remote_uris)
-        if group.is_attention:
-            valid = list(range(n))
-        else:
-            # Mirror of save_task: in mamba "align" mode vLLM only allocates a
-            # real state block for the final matched boundary; intermediate
-            # manager blocks get the null block (their state is not needed to
-            # resume). Skip them vacuously and load only materialized targets.
-            valid = [i for i in range(n) if block_ids[i] != 0]
-            if len(valid) < n:
-                logger.info("load group %s: %d/%d blocks have null state "
-                            "targets, skipping them", group.spec_name,
-                            n - len(valid), n)
-        valid_set = set(valid)
-        ok_mask = [i not in valid_set for i in range(n)]
+        skipped = self._load_skipped_blocks(group, remote_uris, block_ids, n)
+        # A block we must restore but nothing was published for cannot be
+        # loaded; fail it without letting it shift the staging batch.
+        failed = {i for i in range(n)
+                  if i not in skipped and remote_uris[i] is None}
+        valid = [i for i in range(n) if i not in skipped and i not in failed]
+        ok_mask = [None if i in skipped else False for i in range(n)]
         if not valid:
             multi_result.submit_result(task_idx, ok_mask)
             return
@@ -278,7 +354,7 @@ class DataTransferManager:
         try:
             ok = self._load_valid_blocks(group, remote_uris,
                                          block_token_indices, block_ids,
-                                         n, valid)
+                                         valid)
         finally:
             self._pinned_budget.release(stage_bytes)
         for i in valid:
@@ -286,12 +362,15 @@ class DataTransferManager:
         multi_result.submit_result(task_idx, ok_mask)
 
     def _load_valid_blocks(self, group, remote_uris, block_token_indices,
-                           block_ids, n, valid) -> bool:
+                           block_ids, valid) -> bool:
         cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
                                  device="cpu", pin_memory=True)
         buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
                                            group.per_block_bytes, len(valid))
         uris = [remote_uris[i] for i in valid]
+        assert all(uri is not None for uri in uris), \
+            f"group {group.spec_name}: load batch contains a block without a " \
+            f"location; load_task must have failed it"
         result = self._transfer_client.LoadKvCaches(uris, buffers)
         ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
         if ok:
@@ -299,10 +378,13 @@ class DataTransferManager:
                 gpu_buffer = cpu_buffer.to(self._device, non_blocking=True)
                 if group.is_attention:
                     view = gpu_buffer.view(self._info.dtype).view(
-                        n, group.num_kv_ptrs, self._manager_block_size, group.per_token_dim)
+                        len(valid), group.num_kv_ptrs,
+                        self._manager_block_size, group.per_token_dim)
                     batch_gather_scatter_helper.batch_scatter_kv_caches(
-                        group.kvcache_ptr_tensor_gpu, view, block_token_indices,
-                        list(range(n)), self._manager_block_size, group.per_token_dim,
+                        group.kvcache_ptr_tensor_gpu, view,
+                        [block_token_indices[i] for i in valid],
+                        list(range(len(valid))), self._manager_block_size,
+                        group.per_token_dim,
                         kv_stride=group.kv_stride, block_stride=group.block_stride,
                         local_block_size=group.kernel_block_size)
                 else:
@@ -321,16 +403,26 @@ class DataTransferManager:
 
     def create_load_done_callback(self, req_id, tp_rank, epoch, block_ids, num_blocks,
                                   report_failures=True):
-        """A manager block is loaded only if every group succeeded for it.
+        """A manager block is loaded only if every group that had data for it
+        succeeded.
+
+        ``None`` entries mean "this group has no data for this block by design"
+        (mamba "align" interior blocks, see load_task) and are skipped, exactly
+        as in the save callback.
 
         block_ids is the block table used to report vLLM-visible invalid block
         ids. vLLM's invalid-block recovery only understands single-group block
         tables, so multi-group (hybrid) connectors pass report_failures=False
         and rely on request rescheduling instead."""
         def cb(flat):
-            merged = [True] * num_blocks
+            merged = [None] * num_blocks
             for i, ok in enumerate(flat):
-                merged[i % num_blocks] = merged[i % num_blocks] and ok
+                if ok is None:
+                    continue
+                b = i % num_blocks
+                merged[b] = ok if merged[b] is None else (merged[b] and ok)
+            # A block no group loaded anything for was not restored.
+            merged = [bool(ok) for ok in merged]
             failed = []
             if report_failures:
                 failed = [block_ids[i] for i in range(min(num_blocks, len(block_ids)))
