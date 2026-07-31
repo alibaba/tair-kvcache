@@ -64,7 +64,9 @@ public:
 
     uint64_t ttl_ns() const { return ttl_ns_; }
 
-    uint64_t current_unique_blocks() const { return static_cast<uint64_t>(last_positions_.size()); }
+    // Unique blocks currently alive: expired markers below the TTL watermark
+    // are excluded even though their table entries linger until compaction.
+    uint64_t current_unique_blocks() const { return alive_marker_count(); }
 
     // Coarse memory estimate for observability. It is derived from the state
     // already required by the algorithm and does not retain extra trace data.
@@ -88,6 +90,9 @@ private:
     void CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns);
     void MaybeCompactPositions();
     uint64_t ReuseDistance(std::size_t previous_position) const;
+    // Resident markers at or above the TTL watermark (all markers when no
+    // watermark is active).
+    uint64_t alive_marker_count() const;
     // Pops expired epochs and advances dead_below_position_.
     void AdvanceTtlWatermark(int64_t now_ns);
 

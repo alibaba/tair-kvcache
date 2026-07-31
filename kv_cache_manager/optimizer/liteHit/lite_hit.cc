@@ -131,7 +131,7 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_
 }
 
 void LiteHit::MaybeCompactPositions() {
-    const std::size_t active_positions = last_positions_.size();
+    const std::size_t active_positions = static_cast<std::size_t>(alive_marker_count());
     if (fenwick_.size() <= kCompactionSlackPositions) {
         return;
     }
@@ -140,10 +140,18 @@ void LiteHit::MaybeCompactPositions() {
         return;
     }
 
+    // Markers below the TTL watermark are a miss for every capacity forever,
+    // so compaction drops them together with their table entries; the state
+    // afterwards is bounded by the alive working set again.
     std::vector<std::pair<std::size_t, int64_t>> ordered_positions;
     ordered_positions.reserve(active_positions);
-    for (const auto &[block_key, position] : last_positions_) {
-        ordered_positions.emplace_back(position, block_key);
+    for (auto it = last_positions_.begin(); it != last_positions_.end();) {
+        if (it->second < dead_below_position_) {
+            it = last_positions_.erase(it);
+        } else {
+            ordered_positions.emplace_back(it->second, it->first);
+            ++it;
+        }
     }
     std::sort(ordered_positions.begin(), ordered_positions.end());
 
@@ -177,6 +185,14 @@ void LiteHit::MaybeCompactPositions() {
 
 uint64_t LiteHit::ReuseDistance(std::size_t previous_position) const {
     return fenwick_.PrefixSum(fenwick_.size()) - fenwick_.PrefixSum(previous_position);
+}
+
+uint64_t LiteHit::alive_marker_count() const {
+    const uint64_t total = fenwick_.PrefixSum(fenwick_.size());
+    if (dead_below_position_ <= 1) {
+        return total;
+    }
+    return total - fenwick_.PrefixSum(dead_below_position_ - 1);
 }
 
 void LiteHit::Reset() {

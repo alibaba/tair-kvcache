@@ -98,6 +98,38 @@ TEST_F(LiteHitTtlTest, ResetClearsTtlState) {
     EXPECT_TRUE(core.ProcessRequest({1, 2}, 2000).hit_curve.empty());
 }
 
+TEST_F(LiteHitTtlTest, UniqueBlocksExcludeExpired) {
+    LiteHit core(1000);
+    core.ProcessRequest({1, 2, 3}, 0);
+    EXPECT_EQ(3, core.current_unique_blocks());
+    // All three expire; only the new key is alive even though the expired
+    // table entries linger until compaction.
+    core.ProcessRequest({100}, 5000);
+    EXPECT_EQ(1, core.current_unique_blocks());
+}
+
+TEST_F(LiteHitTtlTest, CompactionDropsExpiredEntries) {
+    LiteHit core(1000);
+    for (int64_t r = 0; r < 600; ++r) {
+        std::vector<int64_t> keys;
+        keys.reserve(10);
+        for (int64_t i = 0; i < 10; ++i) {
+            keys.push_back(1000000 + r * 100 + i);
+        }
+        core.ProcessRequest(keys, 0);
+    }
+    EXPECT_EQ(6000, core.current_unique_blocks());
+    // Every block expires; the next request pushes the state past the
+    // compaction threshold and the dead entries are dropped, not carried.
+    core.ProcessRequest({1, 2, 3}, 5000);
+    EXPECT_EQ(3, core.current_unique_blocks());
+    EXPECT_EQ(3u, core.last_positions_.size());
+    // Semantics survive the cleanup: dropped keys stay cold, alive ones hit
+    // (the re-committed cold key occupies MRU, shifting thresholds by one).
+    EXPECT_TRUE(core.ProcessRequest({1000000}, 5001).hit_curve.empty());
+    EXPECT_EQ((std::vector<HitCurveSegment>{{2, 3}}), core.ProcessRequest({1, 2, 3}, 5001).hit_curve);
+}
+
 TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
     std::mt19937_64 rng(20260730);
     std::uniform_int_distribution<int64_t> base_dist(0, 12);
