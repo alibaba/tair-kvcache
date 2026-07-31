@@ -140,6 +140,9 @@ TEST_F(LiteHitTtlTest, CompactionDropsExpiredEntries) {
     core.ProcessRequest({1, 2, 3}, 5000);
     EXPECT_EQ(3, core.current_unique_blocks());
     EXPECT_EQ(3u, core.last_positions_.size());
+    // The bucket array shrinks with the entries instead of staying at the
+    // 6000-key high-water mark.
+    EXPECT_LT(core.last_positions_.bucket_count(), 1000u);
     // Semantics survive the cleanup: dropped keys stay cold, alive ones hit
     // (the re-committed cold key occupies MRU, shifting thresholds by one).
     EXPECT_TRUE(core.ProcessRequest({1000000}, 5001).hit_curve.empty());

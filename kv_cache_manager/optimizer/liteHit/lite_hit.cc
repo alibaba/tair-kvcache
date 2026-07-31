@@ -163,6 +163,14 @@ void LiteHit::MaybeCompactPositions() {
     }
     std::sort(ordered_positions.begin(), ordered_positions.end());
 
+    // The bucket array never shrinks on erase and would otherwise stay at
+    // the historical peak. Shrink only when it is far above the surviving
+    // set (with headroom) so oscillating working sets do not rehash back and
+    // forth.
+    if (last_positions_.bucket_count() > 4 * (last_positions_.size() + 1)) {
+        last_positions_.rehash(2 * last_positions_.size());
+    }
+
     // Old position boundary S maps to (surviving markers below S) + 1; the
     // mapping is monotone, so epoch starts and the watermark keep their
     // order and semantics.
