@@ -169,6 +169,20 @@ void LiteHit::MaybeCompactPositions() {
     for (PositionEpoch &epoch : position_epochs_) {
         epoch.start_position = remap_boundary(epoch.start_position);
     }
+    // Equal remapped starts prove there is no alive marker between the two
+    // epochs, so the earlier one governs an empty range and can be dropped
+    // without changing any future liveness answer. Keeping the last epoch per
+    // start bounds the deque by the alive working set (hot keys otherwise
+    // accumulate one empty epoch per request until the TTL elapses).
+    std::size_t deduped_size = 0;
+    for (const PositionEpoch &epoch : position_epochs_) {
+        if (deduped_size > 0 && position_epochs_[deduped_size - 1].start_position == epoch.start_position) {
+            position_epochs_[deduped_size - 1].timestamp_ns = epoch.timestamp_ns;
+        } else {
+            position_epochs_[deduped_size++] = epoch;
+        }
+    }
+    position_epochs_.resize(deduped_size);
     if (dead_below_position_ > 0) {
         dead_below_position_ = remap_boundary(dead_below_position_);
     }

@@ -130,6 +130,22 @@ TEST_F(LiteHitTtlTest, CompactionDropsExpiredEntries) {
     EXPECT_EQ((std::vector<HitCurveSegment>{{2, 3}}), core.ProcessRequest({1, 2, 3}, 5001).hit_curve);
 }
 
+TEST_F(LiteHitTtlTest, CompactionCollapsesEmptyEpochs) {
+    LiteHit core(1000000000); // TTL far beyond the replayed horizon
+    // A single hot key with a distinct timestamp per request: every commit
+    // moves the marker and leaves the previous epoch's range empty. Without
+    // the compaction dedupe the deque would hold one epoch per request.
+    for (int64_t t = 1; t <= 10000; ++t) {
+        core.ProcessRequest({7}, t);
+    }
+    EXPECT_LE(core.position_epochs_.size(), 4200u);
+    EXPECT_EQ(1, core.current_unique_blocks());
+    // Exactness survives the collapse: alive within TTL, dead at the strict
+    // deadline measured from the true last access.
+    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), core.ProcessRequest({7}, 10001).hit_curve);
+    EXPECT_TRUE(core.ProcessRequest({7}, 10001 + 1000000000).hit_curve.empty());
+}
+
 TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
     std::mt19937_64 rng(20260730);
     std::uniform_int_distribution<int64_t> base_dist(0, 12);
