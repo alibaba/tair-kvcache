@@ -31,18 +31,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: unit_test
-            test_target: "//kv_cache_manager/..."
-            test_args: ""
-          - name: integration_test
-            test_target: "//integration_test/..."
+          - name: normal_test
+            test_target: "//kv_cache_manager/... //integration_test/..."
             test_args: ""
           - name: asan_test
             test_target: "//kv_cache_manager/... //integration_test/..."
             test_args: "--config=debug --config=asan"
-          - name: client_test
-            test_target: "//kv_cache_manager/client/..."
-            test_args: "--config=client"
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || vars.TEST_OPEN_SRC_RUNS_ON || 'ubuntu-latest' }}
     container:
