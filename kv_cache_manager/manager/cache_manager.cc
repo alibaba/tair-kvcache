@@ -147,22 +147,26 @@ public:
 
     ErrorCode Acquire(const ReporterSnapshotKey &reporter_key,
                       std::string &out_committed_version,
-                      uint64_t &out_lifecycle_generation) {
+                      uint64_t &out_lifecycle_generation,
+                      bool &out_created_generation) {
         const auto failure_it = snapshot_wait_failures_.find(reporter_key);
         if (failure_it != snapshot_wait_failures_.end()) {
             out_committed_version.clear();
             out_lifecycle_generation = 0;
+            out_created_generation = false;
             return failure_it->second;
         }
         const auto it = versions_.find(reporter_key);
         if (it != versions_.end()) {
             out_committed_version = it->second.snapshot_version;
             out_lifecycle_generation = it->second.lifecycle_generation;
+            out_created_generation = false;
             return EC_OK;
         }
-        const ErrorCode ec =
-            backend_->BeginDeltaMutation(reporter_key, out_committed_version, &out_lifecycle_generation);
+        const ErrorCode ec = backend_->BeginDeltaMutation(
+            reporter_key, out_committed_version, &out_lifecycle_generation, &out_created_generation);
         if (ec != EC_OK) {
+            out_created_generation = false;
             if (ec == EC_SNAPSHOT_IN_PROGRESS) {
                 snapshot_wait_failures_.emplace(reporter_key, ec);
             }
@@ -2399,12 +2403,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
-    auto refresh_snapshot_response = [&]() {
+    bool request_created_generation = false;
+    auto refresh_snapshot_response = [&](bool force_snapshot_required) {
         const std::string committed = event_backend->GetSnapshotVersion(reporter_key);
         response->set_committed_snapshot_version(committed);
-        response->set_snapshot_required(committed.empty());
+        response->set_snapshot_required(committed.empty() || force_snapshot_required);
     };
-    refresh_snapshot_response();
+    refresh_snapshot_response(false);
 
     if (!event_backend->IsCleanupCallbackSet()) {
         event_backend->SetCleanupCallback([this, requested_type](const std::string &cleanup_instance,
@@ -2479,7 +2484,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         std::string version;
         uint64_t attempt_epoch;
         int event_index;
-        KeyVector block_keys;
     };
     struct DeltaSpecMutation {
         bool is_add = false;
@@ -2567,11 +2571,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec =
-                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
+            bool created_generation = false;
+            const ErrorCode fence_ec = delta_mutations.Acquire(
+                reporter_key, committed_version, mutation_lifecycle_generation, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
+            }
+            if (created_generation) {
+                request_created_generation = true;
             }
             for (auto &spec : specs) {
                 std::string versioned_uri;
@@ -2629,11 +2637,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
 
             std::string committed_version;
-            const ErrorCode fence_ec =
-                delta_mutations.Acquire(reporter_key, committed_version, mutation_lifecycle_generation);
+            bool created_generation = false;
+            const ErrorCode fence_ec = delta_mutations.Acquire(
+                reporter_key, committed_version, mutation_lifecycle_generation, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
+            }
+            if (created_generation) {
+                request_created_generation = true;
             }
             const std::string location_id = event_backend->BuildLocationId(params.medium(), host_ip_port);
             auto &mutations_by_name = delta_spec_mutations[block_key][location_id];
@@ -2721,8 +2733,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            KeyVector snapshot_block_keys;
-            snapshot_block_keys.reserve(validated_blocks.size());
             for (auto &block : validated_blocks) {
                 for (auto &spec : block.specs) {
                     std::string versioned_uri;
@@ -2736,7 +2746,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                snapshot_block_keys.push_back(block.block_key);
                 snapshot_to_replace[block.block_key].push_back(SnapshotReplaceEntry{
                     event_backend->BuildLocationId(block.medium, host_ip_port), std::move(block.specs), i});
             }
@@ -2746,11 +2755,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 request_snapshot_version.clear();
                 break;
             }
-            snapshot_commit_tasks.push_back(SnapshotCommitTask{reporter_key,
-                                                               request_snapshot_version,
-                                                               event_backend->GetSnapshotAttemptEpoch(reporter_key),
-                                                               i,
-                                                               std::move(snapshot_block_keys)});
+            snapshot_commit_tasks.push_back(SnapshotCommitTask{
+                reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i});
             break;
         }
         default:
@@ -3010,17 +3016,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     if (!snapshot_commit_tasks.empty()) {
         const auto &task = snapshot_commit_tasks.front();
         bool snapshot_failed = per_item_ec[task.event_index] != EC_OK;
-        // An empty snapshot is a valid authoritative "reporter owns no blocks"
-        // update.  With no block writes there is nothing to flush before the
-        // in-memory token is published; stale locations are removed by the
-        // cleanup task below.
-        if (!snapshot_failed && !task.block_keys.empty() && !meta_searcher->Sync(task.block_keys)) {
-            KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to sync host [%s] token [%s]",
-                          trace_id.c_str(),
-                          task.reporter_key.host_ip_port.c_str(),
-                          task.version.c_str());
-            snapshot_failed = true;
-        }
+        // Event-report metadata is a soft cache index. Like delta mutations,
+        // a snapshot commits after every persistent write has been accepted
+        // by the async backend and mirrored into the local cache; it does not
+        // wait for Redis consumers to flush their queues.
         if (!snapshot_failed && !event_backend->CommitSnapshotVersion(task.reporter_key, task.version)) {
             KVCM_LOG_ERROR("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to publish host [%s] token [%s]",
                            trace_id.c_str(),
@@ -3107,7 +3106,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     };
 
-    refresh_snapshot_response();
+    refresh_snapshot_response(request_created_generation);
     if (any_failure) {
         std::map<std::pair<proto::meta::ReportEventType, proto::meta::ErrorCode>, size_t> failure_counts;
         size_t failed_item_count = 0;
@@ -3709,18 +3708,19 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                           instance_id.c_str());
     }
 
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!instance_info) {
+        request_context->error_tracer()->AddErrorMsg("instance not found");
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+            WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
+    }
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (!instance_info) {
-            request_context->error_tracer()->AddErrorMsg("instance not found");
-            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
-                WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
-        }
         query_type = static_cast<QueryType>(instance_info->default_query_type());
         if (query_type == QueryType::QT_UNSPECIFIED) {
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, std::vector<HostCacheMatch>, "unknown query type");
         }
     }
+    const bool use_eagle_pop = instance_info->model_deployment().use_eagle_pop();
     if (query_type != QueryType::QT_PREFIX_MATCH && query_type != QueryType::QT_PREFIX_MATCH_WITH_MAMBA) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
                                           EC_BADARGS,
@@ -3737,17 +3737,17 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatchByHost(request_context, block_cache_keys, medium_filter, host_matches);
+        ec = meta_searcher->PrefixMatchByHost(
+            request_context, block_cache_keys, use_eagle_pop, medium_filter, host_matches);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
-        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (!instance_info) {
-            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
-                WARN, EC_INSTANCE_NOT_EXIST, std::vector<HostCacheMatch>, "instance not found");
-        }
-        ec = meta_searcher->PrefixMatchWithMambaByHost(
-            request_context, block_cache_keys, medium_filter, instance_info->location_spec_groups(), host_matches);
+        ec = meta_searcher->PrefixMatchWithMambaByHost(request_context,
+                                                       block_cache_keys,
+                                                       use_eagle_pop,
+                                                       medium_filter,
+                                                       instance_info->location_spec_groups(),
+                                                       host_matches);
         break;
     }
     default:

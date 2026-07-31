@@ -670,7 +670,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
             self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
-            self.assertFalse(body.get("snapshot_required"))
+            self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
                 profile_name,
@@ -701,7 +701,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
             self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
-            self.assertFalse(body.get("snapshot_required"))
+            self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
                 profile_name,
@@ -839,7 +839,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
             self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
-            self.assertFalse(body.get("snapshot_required"))
+            self.assertTrue(body.get("snapshot_required"))
         self._for_each_profile(run)
 
     # 12. Empty events array: should be a no-op success

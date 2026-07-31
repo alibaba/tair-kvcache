@@ -147,8 +147,10 @@ message ReportEventResponse {
     // temporarily falls back to soft visibility until a later snapshot.
     string committed_snapshot_version = 3;
     uint64 retry_after_ms = 4;
-    // Advisory: true while this process has no generation yet. ADD/DELETE do
-    // not require an initial snapshot and may create the generation.
+    // Advisory: true while this process has no generation yet, and once on
+    // the ADD/DELETE request that lazily creates the first generation. The
+    // caller should schedule a full snapshot for reconciliation; realtime
+    // mutations remain accepted while that snapshot is pending.
     bool snapshot_required = 5;
     string extra_info = 6; // opaque JSON passed through from InstanceGroup
 }
@@ -184,6 +186,7 @@ message ModelDeployment {
     int32 pp_size = 7;            // Pipeline模式下使用，Pipeline数量
     string extra = 8;             // 额外字段，用于标识模型，参与判断唯一标识校验
     string user_data = 9;        // 用户自定义数据，不参与判断唯一标识校验
+    bool use_eagle_pop = 10;    // EaglePop 模式下 full attention 前缀长度减一
 }
 
 message LocationSpecGroup {

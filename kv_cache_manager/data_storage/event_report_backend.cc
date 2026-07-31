@@ -705,10 +705,14 @@ std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) cons
 
 ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &reporter_key,
                                                  std::string &out_committed_version,
-                                                 uint64_t *out_lifecycle_generation) {
+                                                 uint64_t *out_lifecycle_generation,
+                                                 bool *out_created_generation) {
     out_committed_version.clear();
     if (out_lifecycle_generation) {
         *out_lifecycle_generation = 0;
+    }
+    if (out_created_generation) {
+        *out_created_generation = false;
     }
     if (reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return EC_BADARGS;
@@ -747,6 +751,9 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
         new_state.committed = candidate;
         snapshot_token_owners_[candidate] = reporter_key;
         state_it = snapshot_versions_.find(reporter_key);
+        if (out_created_generation) {
+            *out_created_generation = true;
+        }
     }
     auto &state = state_it->second;
     if (state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {

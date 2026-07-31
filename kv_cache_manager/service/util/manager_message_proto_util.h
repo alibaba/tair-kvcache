@@ -177,6 +177,7 @@ void ProtoConvert::ModelDeploymentToProto(const ModelDeployment &model_deploymen
     proto_model_deployment->set_pp_size(model_deployment_info.pp_size());
     proto_model_deployment->set_extra(model_deployment_info.extra());
     proto_model_deployment->set_user_data(model_deployment_info.user_data());
+    proto_model_deployment->set_use_eagle_pop(model_deployment_info.use_eagle_pop());
 }
 // DONE
 template <typename T>
@@ -193,6 +194,7 @@ void ProtoConvert::ModelDeploymentFromProto(const T *proto_model_deployment, Mod
     model_deployment_info.set_pp_size(proto_model_deployment->pp_size());
     model_deployment_info.set_extra(proto_model_deployment->extra());
     model_deployment_info.set_user_data(proto_model_deployment->user_data());
+    model_deployment_info.set_use_eagle_pop(proto_model_deployment->use_eagle_pop());
 }
 // DONE
 template <typename T>

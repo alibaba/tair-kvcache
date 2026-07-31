@@ -91,7 +91,8 @@ public:
     // timeout for commit/abort instead of racing it.
     ErrorCode BeginDeltaMutation(const ReporterSnapshotKey &reporter_key,
                                  std::string &out_committed_version,
-                                 uint64_t *out_lifecycle_generation = nullptr);
+                                 uint64_t *out_lifecycle_generation = nullptr,
+                                 bool *out_created_generation = nullptr);
     void EndDeltaMutation(const ReporterSnapshotKey &reporter_key, uint64_t lifecycle_generation = 0);
     ErrorCode BeginSnapshot(const ReporterSnapshotKey &reporter_key,
                             std::string &out_candidate_version,

@@ -953,7 +953,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(body.get("item_results", []), [])
         version = body["committed_snapshot_version"]
         self.assertEqual(len(version), 32)
-        self.assertFalse(body.get("snapshot_required"))
+        self.assertTrue(body.get("snapshot_required"))
 
         specs = _wait_for_block_spec_names(
             self.client,
@@ -1514,7 +1514,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(
             accepted_delta["header"]["status"]["code"], "OK"
         )
-        self.assertFalse(accepted_delta.get("snapshot_required"))
+        self.assertTrue(accepted_delta.get("snapshot_required"))
         _wait_for_block_spec_names(
             self.client,
             instance_id,
@@ -1839,7 +1839,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(delta["header"]["status"]["code"], "OK")
         delta_version = delta["committed_snapshot_version"]
         self.assertEqual(len(delta_version), 32)
-        self.assertFalse(delta.get("snapshot_required"))
+        self.assertTrue(delta.get("snapshot_required"))
 
         duplicate = self.client.report_event(
             _make_request(
@@ -3156,7 +3156,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         self.assertEqual(first_delta["header"]["status"]["code"], "OK")
-        self.assertFalse(first_delta.get("snapshot_required"))
+        self.assertTrue(first_delta.get("snapshot_required"))
         delta_version = first_delta["committed_snapshot_version"]
         self.assertEqual(len(delta_version), 32)
         _wait_for_block_spec_names(
@@ -3337,7 +3337,11 @@ class EventReportFunctionalTest(unittest.TestCase):
             self.assertEqual(
                 response["header"]["status"]["code"], "OK", response
             )
-            self.assertFalse(response.get("snapshot_required"))
+        self.assertEqual(
+            sum(response.get("snapshot_required") is True for response in responses),
+            1,
+            responses,
+        )
 
         for writer in range(writer_count):
             specs = _wait_for_block_spec_names(
@@ -3436,7 +3440,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(response["header"]["status"]["code"], "OK")
         self.assertEqual(response.get("item_results", []), [])
         self.assertEqual(len(response["committed_snapshot_version"]), 32)
-        self.assertFalse(response.get("snapshot_required"))
+        self.assertTrue(response.get("snapshot_required"))
         _wait_for_block_spec_names(
             self.client,
             self.instance_id,
@@ -3458,7 +3462,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         version = deleted["committed_snapshot_version"]
         self.assertEqual(len(version), 32)
-        self.assertFalse(deleted.get("snapshot_required"))
+        self.assertTrue(deleted.get("snapshot_required"))
         _wait_for_block_spec_names(
             self.client,
             self.instance_id,
@@ -3729,7 +3733,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             same_batch_wrong_register.get("item_results"),
             ["INVALID_ARGUMENT", "OK"],
         )
-        self.assertFalse(same_batch_wrong_register.get("snapshot_required"))
+        self.assertTrue(same_batch_wrong_register.get("snapshot_required"))
         self.assertEqual(
             {spec.get("name") for spec in _query_block_specs(
                 self.client,
@@ -4016,7 +4020,7 @@ class EventReportBenchTest(unittest.TestCase):
             print(f"  Latency avg: {statistics.mean(latencies):.2f}ms")
         self.assertEqual(len(errors), 0, f"Bench had errors: {errors[:5]}")
 
-    # 18. Mixed ADD/DELETE/HEARTBEAT batch throughput.
+    # 18. Mixed ADD/DELETE batch throughput.
     def test_18_block_add_delete_mixed(self):
         num_threads = 50
         ops_per_thread = 100
@@ -4033,7 +4037,7 @@ class EventReportBenchTest(unittest.TestCase):
             for i in range(ops_per_thread):
                 block_key = thread_id * ops_per_thread + i + 200000
                 events = [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(
-                    host, "mem"))), _ev_block_delete(block_key, "mem", ["spec_4096"]), _ev_heartbeat({"thread": str(thread_id)}), ]
+                    host, "mem"))), _ev_block_delete(block_key, "mem", ["spec_4096"]), ]
                 payload = _make_request(
                     self.instance_id, host, events,
                     trace_id=f"bench_mixed_{thread_id}_{i}",
@@ -4063,7 +4067,7 @@ class EventReportBenchTest(unittest.TestCase):
         p50 = self._percentile(latencies, 50)
         p99 = self._percentile(latencies, 99)
 
-        print(f"\n[BENCH] Mixed ADD/DELETE/HEARTBEAT batch:")
+        print(f"\n[BENCH] Mixed ADD/DELETE batch:")
         print(f"  Total batches: {len(latencies)} / {total_batches} (errors: {len(errors)})")
         print(f"  Elapsed:       {elapsed:.2f}s")
         print(f"  Batch QPS:     {qps:.1f}")
