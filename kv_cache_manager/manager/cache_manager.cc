@@ -942,8 +942,19 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (!location_spec_group_names.empty()) {
+        // The group names are per *block*. A token-only request carries no
+        // block keys (they are generated from the tokens below), so the block
+        // count must come from the tokens in that case -- otherwise a valid
+        // token-only request with group names is always rejected against a
+        // key count of 0.
+        size_t block_count = keys.size();
+        if (block_count == 0 && !tokens.empty()) {
+            auto [ec_bs, block_size] = GetBlockSize(request_context, instance_id);
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_bs, StartWriteCacheInfo, "start write cache failed");
+            block_count = tokens.size() / block_size;
+        }
         auto check_ec =
-            CheckLocationSpecGroupNames(request_context, instance_id, keys.size(), location_spec_group_names);
+            CheckLocationSpecGroupNames(request_context, instance_id, block_count, location_spec_group_names);
         RETURN_IF_EC_NOT_OK_WITH_TYPE(check_ec, StartWriteCacheInfo);
     }
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);

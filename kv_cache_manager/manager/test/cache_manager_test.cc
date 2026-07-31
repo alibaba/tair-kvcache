@@ -574,6 +574,54 @@ TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {
     }
 }
 
+// A token-only StartWriteCache (block_keys empty, keys derived from token_ids)
+// must accept per-block location_spec_group_names: the size check has to count
+// blocks, not the empty block_keys vector. Regression for hybrid connectors,
+// which announce per-block spec coverage on token-only writes.
+TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupNamesWithTokenIdsOnly) {
+    constexpr int64_t kBlockSize = 4;
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_attn", 512),
+        LocationSpecInfo("tp0_state", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("attn", {"tp0_attn"}),
+        LocationSpecGroup("full", {"tp0_attn", "tp0_state"}),
+    };
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "token_only_sg",
+                                               kBlockSize,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // 3 blocks of tokens, no block_keys: the middle block carries no state.
+    CacheManager::TokenIdsVector tokens;
+    for (int64_t i = 0; i < 3 * kBlockSize; ++i) {
+        tokens.push_back(i);
+    }
+    const std::vector<std::string> group_names{"full", "attn", "full"};
+    auto [ec, info] = cache_manager_->StartWriteCache(
+        request_context_.get(), "token_only_sg", {}, tokens, group_names, 100000000);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &locs = info.locations().cache_locations_view();
+    ASSERT_EQ(3u, locs.size());
+    // Each block is allocated exactly the specs of its announced group, so the
+    // state-less block is never published as holding a state.
+    ASSERT_EQ(2, locs[0].spec_size());
+    ASSERT_EQ(1, locs[1].spec_size());
+    ASSERT_EQ(2, locs[2].spec_size());
+    ASSERT_EQ("tp0_attn", locs[1].location_specs()[0].name());
+
+    // A mismatched length must still be rejected.
+    auto [ec_bad, info_bad] = cache_manager_->StartWriteCache(
+        request_context_.get(), "token_only_sg", {}, tokens, {"full"}, 100000000);
+    ASSERT_NE(EC_OK, ec_bad);
+}
+
 // StartWriteCache with min_replica_count > 1 requires n_total >= min_replica_count to skip,
 // whereas min_replica_count=1 (default) skips with any 1 replica.
 // Also tests spec-group-aware filtering with location_spec_group_names.
