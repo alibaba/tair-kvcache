@@ -602,6 +602,10 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             state->lite_hit->AdvanceTime(static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000);
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             s.ttl_eviction_count = ClampToInt64(state->lite_hit->ttl_expired_blocks());
+            // Total-eviction contract: LiteHit has no capacity evictions, so
+            // the total equals the TTL expirations (the linear wrapper also
+            // counts harvested entries in both).
+            s.eviction_count = s.ttl_eviction_count;
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
             // Capacity-unbounded residency: without a TTL every distinct

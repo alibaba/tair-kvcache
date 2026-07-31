@@ -331,6 +331,13 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
     EXPECT_EQ(2, second.max_hit_count);
     EXPECT_EQ(2, second.hit_count_per_capacity.at(0));
 
+    // Total-eviction contract: LiteHit has no capacity evictions, so the
+    // summary total must always equal the TTL eviction count.
+    std::vector<InstanceSummary> summaries;
+    mgr_->ListInstances("g1", summaries);
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(summaries[0].ttl_eviction_count, summaries[0].eviction_count);
+
     // Negative TTL is still rejected.
     auto bad_info = MakeInfo("i2", "g2", 4, 0);
     auto bad_group = MakeGroup("g2", {FullCapacityGb(2)}, "lru", false, /*ttl=*/-1);
