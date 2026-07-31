@@ -161,6 +161,24 @@ TEST_F(LiteHitTtlTest, CompactionCollapsesEmptyEpochs) {
     EXPECT_TRUE(core.ProcessRequest({7}, 10001 + 1000000000).hit_curve.empty());
 }
 
+TEST_F(LiteHitTtlTest, AdvanceTimeRefreshesUniqueCount) {
+    LiteHit core(1000);
+    core.ProcessRequest({1, 2}, 0);
+    EXPECT_EQ(2, core.current_unique_blocks());
+    core.AdvanceTime(999); // ages 999 < 1000: still alive
+    EXPECT_EQ(2, core.current_unique_blocks());
+    core.AdvanceTime(1000); // strict deadline: dead without any request
+    EXPECT_EQ(0, core.current_unique_blocks());
+    // Re-access after the observational advance still revives normally.
+    core.ProcessRequest({1}, 1000);
+    EXPECT_EQ(1, core.current_unique_blocks());
+
+    LiteHit pure_lru;
+    pure_lru.ProcessRequest({1, 2}, 0);
+    pure_lru.AdvanceTime(1000000000); // no TTL: a pure no-op
+    EXPECT_EQ(2, pure_lru.current_unique_blocks());
+}
+
 TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
     std::mt19937_64 rng(20260730);
     std::uniform_int_distribution<int64_t> base_dist(0, 12);

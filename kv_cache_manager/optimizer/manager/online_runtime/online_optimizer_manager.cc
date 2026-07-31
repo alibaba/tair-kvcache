@@ -596,6 +596,10 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             }
             s.total_queries = state->total_queries;
             s.total_input_tokens = state->total_input_tokens;
+            // Summaries arrive without traffic; advance the TTL watermark so
+            // idle instances report the alive set as of now, not as of the
+            // last request.
+            state->lite_hit->AdvanceTime(static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000);
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 

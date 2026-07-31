@@ -64,6 +64,15 @@ public:
 
     uint64_t ttl_ns() const { return ttl_ns_; }
 
+    // Advances the TTL watermark to now_ns without processing a request, so
+    // observability reads reflect the current time instead of the last
+    // request's. No-op without a TTL.
+    void AdvanceTime(int64_t now_ns) {
+        if (ttl_ns_ > 0) {
+            AdvanceTtlWatermark(now_ns);
+        }
+    }
+
     // Unique blocks currently alive: expired markers below the TTL watermark
     // are excluded even though their table entries linger until compaction.
     uint64_t current_unique_blocks() const { return alive_marker_count(); }
