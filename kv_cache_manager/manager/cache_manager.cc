@@ -886,7 +886,12 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
 
     LocationsPerKey locations_per_key;
     ec = meta_searcher->BatchGetBestLocationByBackend(
-        request_context, query_keys, locations_per_key, policy.get(), backend_selectors);
+        request_context,
+        query_keys,
+        locations_per_key,
+        policy.get(),
+        backend_selectors,
+        location_spec_names);
     query_scope = ChronoScopeGuard{};
     // prefix_match_len: count keys with at least one hit (non-empty id).
     // Miss keys have empty CacheLocation objects with no id.

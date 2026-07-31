@@ -533,7 +533,8 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                                                       const KeyVector &keys,
                                                       LocationsPerKey &out_locations,
                                                       SelectLocationPolicy *policy,
-                                                      const std::vector<BackendSelector> &selectors) const {
+                                                      const std::vector<BackendSelector> &selectors,
+                                                      const std::vector<std::string> &requested_spec_names) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
@@ -594,6 +595,15 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 for (const auto &[id, loc] : vmap) {
                     if (loc->type() != target_type)
                         continue;
+                    if (!requested_spec_names.empty() &&
+                        std::none_of(loc->location_specs().begin(),
+                                     loc->location_specs().end(),
+                                     [&requested_spec_names](const LocationSpec &spec) {
+                                         return std::find(requested_spec_names.begin(),
+                                                          requested_spec_names.end(),
+                                                          spec.name()) != requested_spec_names.end();
+                                     }))
+                        continue;
                     std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())
                         continue;
@@ -642,7 +652,16 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() == target_type) {
+                    const bool matches_requested_spec =
+                        requested_spec_names.empty() ||
+                        std::any_of(loc->location_specs().begin(),
+                                    loc->location_specs().end(),
+                                    [&requested_spec_names](const LocationSpec &spec) {
+                                        return std::find(requested_spec_names.begin(),
+                                                         requested_spec_names.end(),
+                                                         spec.name()) != requested_spec_names.end();
+                                    });
+                    if (loc->type() == target_type && matches_requested_spec) {
                         filtered.try_emplace(id, loc);
                     }
                 }
