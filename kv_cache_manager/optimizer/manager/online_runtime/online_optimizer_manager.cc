@@ -604,9 +604,10 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             s.ttl_eviction_count = ClampToInt64(state->lite_hit->ttl_expired_blocks());
             s.memory_usage_bytes = ClampToInt64(state->lite_hit->memory_usage_bytes());
 
-            // Infinite-capacity residency: nothing is ever evicted, so every
-            // distinct block ever seen counts. Finite tiers are min(U, C) of
-            // this same U and need no separate report.
+            // Capacity-unbounded residency: without a TTL every distinct
+            // block ever seen counts; with a group TTL only the alive working
+            // set does. Finite tiers are min(U, C) of this same U and need no
+            // separate report.
             s.kv_cache_usage_bytes = SaturatingMultiplyToInt64(state->lite_hit->current_unique_blocks(),
                                                                static_cast<uint64_t>(state->size_full_only));
 
