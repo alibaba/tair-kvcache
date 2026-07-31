@@ -132,6 +132,23 @@ py_test(
     deps = [":e2e_lib"],
 )
 
+py_test(
+    name = "test_cross_request_prefix",
+    timeout = "eternal",
+    srcs = ["test_cross_request_prefix.py"],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    imports = ["."],
+    tags = [
+        "exclusive",  # GPU tests must run serially to avoid CUDA OOM contention
+        "gpu",  # requires 1+ GPU
+        "manual",  # needs a GPU machine + vLLM venv + model; see README.md
+        "no-remote-exec",
+    ],
+    deps = [":e2e_lib"],
+)
+
 # Meta-test: injects an off-by-one into the connector's token translation and
 # asserts the KV verification FAILS -- proof the harness is not vacuous.
 py_test(
@@ -159,6 +176,7 @@ test_suite(
     tests = [
         ":test_basic",
         ":test_concurrent",
+        ":test_cross_request_prefix",
         ":test_full_hit",
         ":test_load_failure",
         ":test_multi_turn",
