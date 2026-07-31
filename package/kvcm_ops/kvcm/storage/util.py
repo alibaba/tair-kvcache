@@ -32,6 +32,19 @@ def gen_3fs_config_data(args):
     return storage_spec
 
 
+def gen_event_report_config_data(args):
+    storage_spec = {}
+    if args.heartbeat_timeout_ms is not None:
+        storage_spec["heartbeat_timeout_ms"] = args.heartbeat_timeout_ms
+    if args.cleanup_grace_ms is not None:
+        storage_spec["cleanup_grace_ms"] = args.cleanup_grace_ms
+    if args.liveness_check_interval_ms is not None:
+        storage_spec["liveness_check_interval_ms"] = args.liveness_check_interval_ms
+    if args.snapshot_min_interval_ms is not None:
+        storage_spec["snapshot_min_interval_ms"] = args.snapshot_min_interval_ms
+    return storage_spec
+
+
 def add_nfs_sub_parser(subparsers):
     parser_nfs = subparsers.add_parser('nfs', help='NFS storage options')
     parser_nfs.add_argument('--root_path', "-r", required=True, help='Root path for NFS, eg. /tmp/dir')
@@ -83,7 +96,34 @@ def add_3fs_sub_parser(subparsers):
     return parser_3fs
 
 
-def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs):
+def add_event_report_sub_parser(subparsers, name, help_text, event_report_storage_type):
+    parser = subparsers.add_parser(name, help=help_text)
+    parser.add_argument(
+        '--heartbeat_timeout_ms',
+        type=int,
+        default=None,
+        help='heartbeat timeout in ms (server default: 30000)')
+    parser.add_argument(
+        '--cleanup_grace_ms',
+        type=int,
+        default=None,
+        help='cleanup grace period in ms (server default: 300000)')
+    parser.add_argument(
+        '--liveness_check_interval_ms',
+        type=int,
+        default=None,
+        help='liveness check interval in ms (server default: 5000)')
+    parser.add_argument(
+        '--snapshot_min_interval_ms',
+        type=positive_int,
+        default=None,
+        help='minimum interval between successful snapshots per reporter in ms (server default: 30000)')
+    parser.set_defaults(event_report_storage_type=event_report_storage_type)
+    return parser
+
+
+def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
+                       handle_event_report):
     common_parser = create_common_parser()
     parser = argparse.ArgumentParser(
         prog=f"python3 script.kvcm.storage.{method}",
@@ -109,10 +149,22 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs):
     parser_nfs = add_nfs_sub_parser(subparsers)
     parser_pace = add_pace_sub_parser(subparsers)
     parser_3fs = add_3fs_sub_parser(subparsers)
+    parser_event_report_l1p5 = add_event_report_sub_parser(
+        subparsers,
+        'event_report_l1p5',
+        'L1.5 event report storage options',
+        'ST_EVENT_REPORT_L1P5')
+    parser_event_report_l2 = add_event_report_sub_parser(
+        subparsers,
+        'event_report_l2',
+        'L2 event report storage options',
+        'ST_EVENT_REPORT_L2')
 
     parser_nfs.set_defaults(func=handle_nfs)
     parser_pace.set_defaults(func=handle_pace)
     parser_3fs.set_defaults(func=handle_3fs)
+    parser_event_report_l1p5.set_defaults(func=handle_event_report)
+    parser_event_report_l2.set_defaults(func=handle_event_report)
 
     args = parser.parse_args()
 

@@ -616,3 +616,48 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota01) {
         ASSERT_EQ("nfs_storage_00", result.name);
     }
 }
+
+TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabilityAndQuota) {
+    auto target = avail_backends_g[1];
+    ASSERT_NE(nullptr, target);
+    data_storage_manager_g->storage_map_["3fs_storage_01"] = target;
+
+    auto admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01", "missing_storage"});
+    ASSERT_EQ(2u, admissions.size());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kAllowed, admissions[0].status);
+    EXPECT_EQ(StorageTargetAdmissionStatus::kNotFound, admissions[1].status);
+
+    target->SetAvailable(false);
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    ASSERT_EQ(1u, admissions.size());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kUnavailable, admissions[0].status);
+    target->SetAvailable(true);
+
+    InstanceGroupQuota quota;
+    quota.set_capacity(0);
+    instance_group_g->set_quota(quota);
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kGroupQuotaExceeded, admissions[0].status);
+
+    quota.set_capacity(1024);
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_HF3FS)});
+    instance_group_g->set_quota(quota);
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded, admissions[0].status);
+
+    // An absent quota entry for the target type means "not limited by type", matching normal selection.
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    instance_group_g->set_quota(quota);
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kAllowed, admissions[0].status);
+
+    meta_indexer_g.reset();
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    EXPECT_EQ(StorageTargetAdmissionStatus::kReadError, admissions[0].status);
+}

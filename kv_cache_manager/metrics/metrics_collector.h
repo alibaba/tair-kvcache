@@ -262,7 +262,10 @@ class ServiceMetricsCollector final : public MetricsCollector {
     // manager metrics
     KVCM_GAUGE_METRICS(manager, request_key_count)
     KVCM_GAUGE_METRICS(manager, prefix_match_len)
+    KVCM_COUNTER_METRICS(manager, get_cache_location_query_block_counter)
+    KVCM_COUNTER_METRICS(manager, get_cache_location_hit_block_counter)
     KVCM_CHRONO_METRICS(manager, prefix_match_time_us, ManagerPrefixMatch)
+    KVCM_CHRONO_METRICS(manager, batch_get_time_us, ManagerBatchGet)
     KVCM_GAUGE_METRICS(manager, lock_write_location_retry_times)
     KVCM_GAUGE_METRICS(manager, write_cache_io_cost_us)
     KVCM_CHRONO_METRICS(manager, filter_write_cache_time_us, ManagerFilterWriteCache)
@@ -316,6 +319,45 @@ public:
     bool Init() override;
 };
 
+// Lightweight per-event observability for ReportEvent. This intentionally
+// avoids registering the manager/meta metric families carried by a full
+// ServiceMetricsCollector.
+class EventReportMetricsCollector final : public MetricsCollector {
+    KVCM_COUNTER_METRICS(event_report, request_counter)
+    KVCM_GAUGE_METRICS(event_report, request_rt_us)
+    KVCM_GAUGE_METRICS(event_report, error_code)
+    KVCM_COUNTER_METRICS(event_report, error_counter)
+
+public:
+    EventReportMetricsCollector() = delete;
+    EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
+    EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept;
+    ~EventReportMetricsCollector() override = default;
+
+    bool Init() override;
+
+    // Collector objects are request-local, while registry gauges with the
+    // same event_type tag are shared. Synchronous reporters must consume this
+    // local sample so concurrent requests cannot attribute one another's
+    // latency or error.
+    void SetRequestSample(double request_rt_us, double error_code) noexcept {
+        request_rt_us_sample_ = request_rt_us;
+        error_code_sample_ = error_code;
+        has_request_sample_ = true;
+    }
+    [[nodiscard]] double GetRequestRtUsSample() const noexcept {
+        return has_request_sample_ ? request_rt_us_sample_ : get_event_report_request_rt_us_metrics();
+    }
+    [[nodiscard]] double GetErrorCodeSample() const noexcept {
+        return has_request_sample_ ? error_code_sample_ : get_event_report_error_code_metrics();
+    }
+
+private:
+    double request_rt_us_sample_ = 0.0;
+    double error_code_sample_ = 0.0;
+    bool has_request_sample_ = false;
+};
+
 /* ------------------ DataStorageMetricsCollector ------------------- */
 
 #ifndef KVCM_DATA_STORAGE_METRICS_COLLECTOR_PTR
@@ -331,6 +373,9 @@ class DataStorageMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(data_storage, create_keys_counter) // for local metrics registry
 
     KVCM_CHRONO_METRICS(data_storage, create_time_us, DataStorageCreate)
+
+    KVCM_GAUGE_METRICS(data_storage, copy_keys_qps)
+    KVCM_CHRONO_METRICS(data_storage, copy_time_us, DataStorageCopy)
 
 public:
     DataStorageMetricsCollector() = delete;

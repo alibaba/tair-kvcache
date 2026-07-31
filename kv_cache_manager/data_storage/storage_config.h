@@ -16,15 +16,25 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
-    DATA_STORAGE_TYPE_VINEYARD = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L2 = 8,
     COUNT, // as sentinel, must be last
 };
+
+constexpr uint16_t kTairMemPoolMediaTypeUnspecified = 0;
+constexpr uint16_t kTairMemPoolMediaTypeDram = 2;
+constexpr uint16_t kTairMemPoolMediaTypeSsd = 5;
 
 std::string ToString(const DataStorageType &type);
 
 DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
+
+constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
+           type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+}
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)
@@ -151,17 +161,20 @@ public:
     const std::string &domain() const { return domain_; }
     int64_t timeout() const { return timeout_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
+    uint16_t media_type() const { return media_type_; }
 
     void set_domain(const std::string &domain) { domain_ = domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
     void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
+    void set_media_type(uint16_t media_type) { media_type_ = media_type; }
 
 private:
     std::string domain_;                // 统一接入
     int64_t timeout_{0};                // 目前连接超时、请求超时时间的值一样
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
+    uint16_t media_type_{kTairMemPoolMediaTypeUnspecified};
 };
 
 class NfsStorageSpec : public StorageSpec {
@@ -198,32 +211,37 @@ private:
     int32_t key_count_per_file_ = 0;
 };
 
-class VineyardStorageSpec : public StorageSpec {
+class EventReportStorageSpec : public StorageSpec {
 public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;
     static constexpr int64_t kDefaultLivenessCheckIntervalMs = 5 * 1000;
+    static constexpr int64_t kDefaultSnapshotMinIntervalMs = 30 * 1000;
+    static constexpr int64_t kDefaultSnapshotDeltaDrainTimeoutMs = 10 * 1000;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
     bool ValidateRequiredFields(std::string &invalid_fields) const override;
     std::string ToString() const override;
 
-    const std::string &cluster_name() const { return cluster_name_; }
     int64_t heartbeat_timeout_ms() const { return heartbeat_timeout_ms_; }
     int64_t cleanup_grace_ms() const { return cleanup_grace_ms_; }
     int64_t liveness_check_interval_ms() const { return liveness_check_interval_ms_; }
+    int64_t snapshot_min_interval_ms() const { return snapshot_min_interval_ms_; }
+    int64_t snapshot_delta_drain_timeout_ms() const { return snapshot_delta_drain_timeout_ms_; }
 
-    void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_heartbeat_timeout_ms(int64_t v) { heartbeat_timeout_ms_ = v; }
     void set_cleanup_grace_ms(int64_t v) { cleanup_grace_ms_ = v; }
     void set_liveness_check_interval_ms(int64_t v) { liveness_check_interval_ms_ = v; }
+    void set_snapshot_min_interval_ms(int64_t v) { snapshot_min_interval_ms_ = v; }
+    void set_snapshot_delta_drain_timeout_ms(int64_t v) { snapshot_delta_drain_timeout_ms_ = v; }
 
 private:
-    std::string cluster_name_;
     int64_t heartbeat_timeout_ms_ = kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;
+    int64_t snapshot_min_interval_ms_ = kDefaultSnapshotMinIntervalMs;
+    int64_t snapshot_delta_drain_timeout_ms_ = kDefaultSnapshotDeltaDrainTimeoutMs;
 };
 
 class StorageConfig : public Jsonizable {

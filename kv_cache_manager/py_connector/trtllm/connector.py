@@ -52,15 +52,7 @@ def init_kvcm_config():
 
 def init_kvcm_meta_client(llm_args: TorchLlmArgs):
     kvcm_config = init_kvcm_config()
-    manager_client = KvCacheManagerClient(
-        kvcm_config["manager_uri"],
-        instance_id=kvcm_config.get("instance_id", ""),
-        auto_discover_leader=kvcm_config.get("auto_discover_leader", False),
-        leader_retry_count=kvcm_config.get("leader_retry_count", 1),
-        leader_retry_base_interval_seconds=kvcm_config.get("leader_retry_base_interval_seconds", 0.005),
-        discovery_refresh_interval_seconds=kvcm_config.get("discovery_refresh_interval_seconds", 30),
-        min_discover_interval_seconds=kvcm_config.get("min_discover_interval_seconds", 1),
-    )
+    manager_client = KvCacheManagerClient.from_connector_config(kvcm_config)
     logger.info("kvcm manager_client initialized")
     return kvcm_config, manager_client
 
@@ -80,8 +72,8 @@ def init_kvcm_transfer_client(llm_args, kvcm_config, extra_config):
     # sdk
     sdk_thread_num = kvcm_config.get("sdk_thread_num", 4)
     sdk_queue_size = kvcm_config.get("sdk_queue_size", 1000)
-    sdk_get_timeout_ms = kvcm_config.get("sdk_get_timeout_ms", 5000)
-    sdk_put_timeout_ms = kvcm_config.get("sdk_put_timeout_ms", 10000)
+    sdk_get_timeout_ms = kvcm_config.get("sdk_get_timeout_ms", 15000)
+    sdk_put_timeout_ms = kvcm_config.get("sdk_put_timeout_ms", 15000)
 
     # data transfer setup
     # TODO: sdk_config

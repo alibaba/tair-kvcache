@@ -177,6 +177,7 @@ void ProtoConvert::ModelDeploymentToProto(const ModelDeployment &model_deploymen
     proto_model_deployment->set_pp_size(model_deployment_info.pp_size());
     proto_model_deployment->set_extra(model_deployment_info.extra());
     proto_model_deployment->set_user_data(model_deployment_info.user_data());
+    proto_model_deployment->set_use_eagle_pop(model_deployment_info.use_eagle_pop());
 }
 // DONE
 template <typename T>
@@ -193,6 +194,7 @@ void ProtoConvert::ModelDeploymentFromProto(const T *proto_model_deployment, Mod
     model_deployment_info.set_pp_size(proto_model_deployment->pp_size());
     model_deployment_info.set_extra(proto_model_deployment->extra());
     model_deployment_info.set_user_data(proto_model_deployment->user_data());
+    model_deployment_info.set_use_eagle_pop(proto_model_deployment->use_eagle_pop());
 }
 // DONE
 template <typename T>
@@ -298,8 +300,12 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_DUMMY;
         break;
     }
-    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD: {
-        *proto_data_storage_type = T::ST_VINEYARD;
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5: {
+        *proto_data_storage_type = T::ST_EVENT_REPORT_L1P5;
+        break;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2: {
+        *proto_data_storage_type = T::ST_EVENT_REPORT_L2;
         break;
     }
     default: {
@@ -342,8 +348,12 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
         break;
     }
-    case T::ST_VINEYARD: {
-        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+    case T::ST_EVENT_REPORT_L1P5: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        break;
+    }
+    case T::ST_EVENT_REPORT_L2: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
         break;
     }
     default: {
@@ -369,6 +379,14 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
     // 添加location_spec_groups字段
     LocationSpecGroupsToProto(instance_info.location_spec_groups(),
                               proto_instance_info->mutable_location_spec_groups());
+
+    if constexpr (std::is_same_v<T, proto::meta::InstanceInfo>) {
+        proto_instance_info->set_default_query_type(
+            static_cast<proto::meta::QueryType>(instance_info.default_query_type()));
+    } else {
+        proto_instance_info->set_default_query_type(
+            static_cast<proto::admin::QueryType>(instance_info.default_query_type()));
+    }
 }
 
 template <typename T>
@@ -392,6 +410,8 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     std::vector<LocationSpecGroup> location_spec_groups;
     LocationSpecGroupsFromProto(proto_instance_info->location_spec_groups(), location_spec_groups);
     instance_info.set_location_spec_groups(location_spec_groups);
+
+    instance_info.set_default_query_type(static_cast<int32_t>(proto_instance_info->default_query_type()));
 }
 
 template <typename T>

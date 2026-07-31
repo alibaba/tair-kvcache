@@ -739,15 +739,17 @@ TEST_F(MetaLocalBackendTest, TestDeleteFields) {
 
     // Seed two keys: one with multiple location-prefixed fields, another with
     // a single location field plus a normal field.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              PutWithFieldMaps(meta_storage_backend_.get(),
-                               {1, 2},
-                               {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}},
-                                {{LOCATION_PREFIX + "c", "lc"}, {PROPERTY_URI, "u2"}}}));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        PutWithFieldMaps(
+            meta_storage_backend_.get(),
+            {1, 2},
+            {{{PROPERTY_LOCATION_PREFIX + "a", "la"}, {PROPERTY_LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}},
+             {{PROPERTY_LOCATION_PREFIX + "c", "lc"}, {PROPERTY_URI, "u2"}}}));
 
     // key 1: delete one of two location fields; key 2: delete its only
     // location field; key 3: does not exist -> EC_NOENT.
-    // DeleteLocations takes location ids without LOCATION_PREFIX.
+    // DeleteLocations takes location ids without PROPERTY_LOCATION_PREFIX.
     AssertDeleteLocations(
         meta_storage_backend_.get(), {1, 2, 3}, {{"a"}, {"c"}, {"anything"}}, {EC_OK, EC_OK, EC_NOENT});
 
@@ -772,11 +774,12 @@ TEST_F(MetaLocalBackendTest, TestExistsFieldWithPrefix) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_exists_prefix", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
-    // key 1: has LOCATION_PREFIX field; key 2: only normal fields; key 3: not exist.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              PutWithFieldMaps(meta_storage_backend_.get(),
-                               {1, 2},
-                               {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}}));
+    // key 1: has PROPERTY_LOCATION_PREFIX field; key 2: only normal fields; key 3: not exist.
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        PutWithFieldMaps(meta_storage_backend_.get(),
+                         {1, 2},
+                         {{{PROPERTY_LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}}));
 
     AssertExistsLocation(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_NOENT}, {true, false, false});
 
@@ -794,9 +797,10 @@ TEST_F(MetaLocalBackendTest, TestTombstoneNotTreatedAsValidLocation) {
 
     // Put key 1 with a real location and a tombstone (empty value) location.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              PutWithFieldMaps(meta_storage_backend_.get(),
-                               {1},
-                               {{{LOCATION_PREFIX + "real", "valid_data"}, {LOCATION_PREFIX + "tomb", ""}}}));
+              PutWithFieldMaps(
+                  meta_storage_backend_.get(),
+                  {1},
+                  {{{PROPERTY_LOCATION_PREFIX + "real", "valid_data"}, {PROPERTY_LOCATION_PREFIX + "tomb", ""}}}));
 
     // ExistsLocation should return true (real location exists).
     AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
@@ -868,8 +872,8 @@ TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
               PutWithFieldMaps(meta_storage_backend_.get(),
                                {1, 2},
-                               {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}},
-                                {{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u2"}}}));
+                               {{{PROPERTY_LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}},
+                                {{PROPERTY_LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u2"}}}));
 
     // previous_error_codes[0]=EC_OK -> actually delete; [1]=EC_EXIST -> passthrough untouched.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_EXIST}),
@@ -906,7 +910,8 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     // Writer threads: Upsert + DeleteFields on rotating location fields.
     auto writer_fn = [&](int writer_id) {
         for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
-            std::string field_name = LOCATION_PREFIX + "w" + std::to_string(writer_id) + "_" + std::to_string(i);
+            std::string field_name =
+                PROPERTY_LOCATION_PREFIX + "w" + std::to_string(writer_id) + "_" + std::to_string(i);
             std::string field_value = "value_" + std::to_string(i);
 
             auto update_ec =
@@ -1020,7 +1025,7 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     // Use a location field so that DeleteLocations can remove it.
     std::string loc_id_b = "loc_b";
     std::string loc_value_b(512, 'y'); // non-JSON value, stored as-is
-    std::string field_name_b_full = LOCATION_PREFIX + loc_id_b;
+    std::string field_name_b_full = PROPERTY_LOCATION_PREFIX + loc_id_b;
     // SplitFieldMaps creates a CacheLocation with id=loc_id_b and no specs.
     // EstimateMemUsage = sizeof(CacheLocation) + loc_id_b.size()
     // MetaMemCacheItem::Size location overhead = sizeof(void*)*4 + loc_id.size() + EstimateMemUsage

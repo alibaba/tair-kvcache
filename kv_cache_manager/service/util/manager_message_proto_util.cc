@@ -1,5 +1,6 @@
 #include "manager_message_proto_util.h"
 
+#include <limits>
 #include <type_traits>
 
 #include "kv_cache_manager/common/logger.h"
@@ -49,6 +50,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
         tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
+        tair_mem_pool->set_media_type(tair_mem_pool_storage.media_type());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
         const auto &nfs_storage = *std::dynamic_pointer_cast<NfsStorageSpec>(storage_config.storage_spec());
         auto *nfs = proto_storage_config->mutable_nfs();
@@ -59,10 +61,17 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
-    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
-        const auto &vineyard_storage = *std::dynamic_pointer_cast<VineyardStorageSpec>(storage_config.storage_spec());
-        auto *vineyard = proto_storage_config->mutable_vineyard();
-        vineyard->set_cluster_name(vineyard_storage.cluster_name());
+    } else if (IsEventReportStorageType(type)) {
+        const auto &er_spec = *std::dynamic_pointer_cast<EventReportStorageSpec>(storage_config.storage_spec());
+        proto::admin::EventReportStorageSpec *spec = proto_storage_config->mutable_event_report();
+        proto::admin::StorageType proto_storage_type = proto::admin::ST_UNSPECIFIED;
+        ProtoConvert::DataStorageTypeToProto(type, &proto_storage_type);
+        proto_storage_config->set_storage_type(proto_storage_type);
+        spec->set_heartbeat_timeout_ms(er_spec.heartbeat_timeout_ms());
+        spec->set_cleanup_grace_ms(er_spec.cleanup_grace_ms());
+        spec->set_liveness_check_interval_ms(er_spec.liveness_check_interval_ms());
+        spec->set_snapshot_min_interval_ms(er_spec.snapshot_min_interval_ms());
+        spec->set_snapshot_delta_drain_timeout_ms(er_spec.snapshot_delta_drain_timeout_ms());
     }
 }
 
@@ -114,6 +123,10 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_domain(proto_storage_config->tair_mem_pool().domain());
         spec.set_timeout(proto_storage_config->tair_mem_pool().timeout());
         spec.set_service_discovery_url(proto_storage_config->tair_mem_pool().service_discovery_url());
+        const int32_t media_type = proto_storage_config->tair_mem_pool().media_type();
+        spec.set_media_type(media_type < 0 || media_type > std::numeric_limits<uint16_t>::max()
+                                ? std::numeric_limits<uint16_t>::max()
+                                : static_cast<uint16_t>(media_type));
         storage_config.set_storage_spec(std::make_shared<TairMemPoolStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
         break;
@@ -134,11 +147,28 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
         break;
     }
-    case proto::admin::StorageConfig::kVineyard: {
-        VineyardStorageSpec spec;
-        spec.set_cluster_name(proto_storage_config->vineyard().cluster_name());
-        storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
-        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    case proto::admin::StorageConfig::kEventReport: {
+        EventReportStorageSpec spec;
+        const auto &v = proto_storage_config->event_report();
+        if (v.heartbeat_timeout_ms() > 0)
+            spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
+        if (v.cleanup_grace_ms() > 0)
+            spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
+        if (v.liveness_check_interval_ms() > 0)
+            spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
+        if (v.snapshot_min_interval_ms() > 0)
+            spec.set_snapshot_min_interval_ms(v.snapshot_min_interval_ms());
+        if (v.snapshot_delta_drain_timeout_ms() > 0)
+            spec.set_snapshot_delta_drain_timeout_ms(v.snapshot_delta_drain_timeout_ms());
+        storage_config.set_storage_spec(std::make_shared<EventReportStorageSpec>(spec));
+        DataStorageType event_report_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        ProtoConvert::DataStorageTypeFromProto(proto_storage_config->storage_type(), event_report_type);
+        if (!IsEventReportStorageType(event_report_type)) {
+            KVCM_LOG_WARN("event_report storage requires storage_type ST_EVENT_REPORT_L1P5 or "
+                          "ST_EVENT_REPORT_L2");
+            event_report_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        }
+        storage_config.set_type(event_report_type);
         break;
     }
     default:
@@ -199,6 +229,27 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             meta_cache_policy_config->set_high_pri_pool_ratio(origin_meta_cache_policy_config->GetHighPriPoolRatio());
         }
     }
+
+    // 转换migration_config
+    auto *migration_config = proto_cache_config->mutable_migration_config();
+    migration_config->mutable_copy_max_concurrency()->set_value(cache_config_info.migration_copy_max_concurrency());
+    migration_config->set_mark_clear_policy(
+        static_cast<proto::admin::MigrationMarkClearPolicy>(cache_config_info.migration_mark_clear_policy()));
+    for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
+        if (migration_strategy == nullptr) {
+            continue;
+        }
+        auto *proto_migration_strategy = migration_config->add_strategies();
+        proto_migration_strategy->set_source_storage_name(migration_strategy->source_storage_name());
+        proto_migration_strategy->set_target_storage_name(migration_strategy->target_storage_name());
+        proto_migration_strategy->set_trigger_threshold(migration_strategy->trigger_threshold());
+        auto *method_configs = proto_migration_strategy->mutable_method_configs();
+        method_configs->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
+        method_configs->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
+        method_configs->mutable_mark()->mutable_timeout_ms()->set_value(migration_strategy->methods().mark().timeout_ms());
+        proto_migration_strategy->set_retention(
+            static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
+    }
 }
 
 void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_cache_config,
@@ -225,6 +276,14 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     // 转换data_storage_strategy (cache_prefer_strategy)
     cache_config_info.set_cache_prefer_strategy(
         static_cast<CachePreferStrategy>(proto_cache_config->data_storage_strategy()));
+    const auto &proto_migration_config = proto_cache_config->migration_config();
+    if (proto_migration_config.has_copy_max_concurrency()) {
+        cache_config_info.set_migration_copy_max_concurrency(proto_migration_config.copy_max_concurrency().value());
+    } else {
+        cache_config_info.set_migration_copy_max_concurrency(CacheConfig::kDefaultMigrationCopyMaxConcurrency);
+    }
+    cache_config_info.set_migration_mark_clear_policy(
+        static_cast<MigrationMarkClearPolicy>(proto_migration_config.mark_clear_policy()));
 
     // 转换meta_indexer_config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
@@ -256,6 +315,29 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
+
+    // 转换migration_config.strategies
+    std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies;
+    migration_strategies.reserve(proto_migration_config.strategies_size());
+    for (const auto &proto_migration_strategy : proto_migration_config.strategies()) {
+        auto migration_strategy = std::make_shared<MigrationStrategy>();
+        migration_strategy->set_source_storage_name(proto_migration_strategy.source_storage_name());
+        migration_strategy->set_target_storage_name(proto_migration_strategy.target_storage_name());
+        migration_strategy->set_trigger_threshold(proto_migration_strategy.trigger_threshold());
+        MigrationMethods methods;
+        methods.mutable_copy().set_enabled(proto_migration_strategy.method_configs().copy().enabled());
+        methods.mutable_mark().set_enabled(proto_migration_strategy.method_configs().mark().enabled());
+        if (proto_migration_strategy.method_configs().mark().has_timeout_ms()) {
+            methods.mutable_mark().set_timeout_ms(proto_migration_strategy.method_configs().mark().timeout_ms().value());
+        } else {
+            methods.mutable_mark().set_timeout_ms(MigrationMarkMethod::kDefaultTimeoutMs);
+        }
+        migration_strategy->set_methods(methods);
+        migration_strategy->set_retention(
+            static_cast<MigrationRetention>(proto_migration_strategy.retention()));
+        migration_strategies.push_back(migration_strategy);
+    }
+    cache_config_info.set_migration_strategies(migration_strategies);
 }
 
 void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info,
@@ -286,6 +368,11 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
 
     proto_instance_group->set_user_data(instance_group_info.user_data());
     proto_instance_group->set_version(instance_group_info.version());
+    proto_instance_group->set_extra_info(instance_group_info.extra_info());
+    for (const auto &candidate : instance_group_info.event_report_storage_candidates()) {
+        proto_instance_group->add_event_report_storage_candidates(candidate);
+    }
+    proto_instance_group->set_revisit_interval_buckets(instance_group_info.revisit_interval_buckets_raw());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -323,6 +410,12 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
 
     instance_group_info.set_user_data(proto_instance_group->user_data());
     instance_group_info.set_version(proto_instance_group->version());
+    instance_group_info.set_extra_info(proto_instance_group->extra_info());
+    std::vector<std::string> event_report_storage_candidates(
+        proto_instance_group->event_report_storage_candidates().begin(),
+        proto_instance_group->event_report_storage_candidates().end());
+    instance_group_info.set_event_report_storage_candidates(event_report_storage_candidates);
+    instance_group_info.set_revisit_interval_buckets(proto_instance_group->revisit_interval_buckets());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {

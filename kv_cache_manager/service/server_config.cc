@@ -2,12 +2,28 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
+#include <sstream>
 #include <stdio.h>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/metrics/metrics_reporter_factory.h"
 
 namespace kv_cache_manager {
+
+std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+    auto boundaries = StringUtil::ParseBucketBoundaries(buckets_str);
+    if (!buckets_str.empty() && boundaries.empty()) {
+        fprintf(stderr, "Invalid revisit_interval_buckets: must be positive numbers in strictly ascending order\n");
+    }
+    return boundaries;
+}
+
+const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
+    static const std::vector<double> kDefaults = {1, 5, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 21600, 86400};
+    return kDefaults;
+}
 
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
@@ -90,6 +106,20 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->schedule_plan_executor_thread_count_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.schedule_plan_migration_worker_budget",
+     [](const std::string &value, ServerConfig *config) {
+         try {
+             std::size_t parsed_length = 0;
+             const auto parsed = std::stoull(value, &parsed_length);
+             if (parsed_length != value.size() || parsed > std::numeric_limits<uint32_t>::max()) {
+                 return false;
+             }
+             config->schedule_plan_migration_worker_budget_ = static_cast<uint32_t>(parsed);
+             return true;
+         } catch (...) {
+             return false;
+         }
+     }},
     {"kvcm.cache_reclaimer.key_sampling_size_total",
      [](const std::string &value, ServerConfig *config) {
          config->cache_reclaimer_key_sampling_size_total_ = std::stoull(value);
@@ -114,7 +144,32 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->cache_reclaimer_worker_size_ = std::stol(value);
          return true;
-    }},
+     }},
+    {"kvcm.cache_reclaimer.inflight_delete_timeout_ms",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_inflight_delete_timeout_ms_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_location_limit_per_group_type",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_location_limit_per_group_type_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_bytes_limit_per_group_type",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_bytes_limit_per_group_type_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_delete_handler_limit",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_delete_handler_limit_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.pending_bytes_limit",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_pending_bytes_limit_ = std::stoull(value);
+         return true;
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -153,6 +208,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->prometheus_prefix_ = value;
          return true;
+     }},
+    {"kvcm.metrics.revisit_interval_buckets",
+     [](const std::string &value, ServerConfig *config) {
+         config->revisit_interval_buckets_ = value;
+         return true;
      }}};
 // clang-format on
 
@@ -173,14 +233,22 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    metrics_reporter_type_ = "local";
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
+    schedule_plan_executor_thread_count_ = 2;
+    schedule_plan_migration_worker_budget_ = 1;
     cache_reclaimer_key_sampling_size_total_ = 1000;
     cache_reclaimer_key_sampling_size_per_task_ = 100;
     cache_reclaimer_del_batch_size_ = 100;
     cache_reclaimer_idle_interval_ms_ = 100;
     cache_reclaimer_worker_size_ = 16;
+    cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
+    cache_reclaimer_pending_location_limit_per_group_type_ = 100000;
+    cache_reclaimer_pending_bytes_limit_per_group_type_ = 64ULL * 1024 * 1024 * 1024;
+    cache_reclaimer_pending_delete_handler_limit_ = 1024;
+    cache_reclaimer_pending_bytes_limit_ = 256ULL * 1024 * 1024 * 1024;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {
@@ -280,10 +348,40 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 }
 
 bool ServerConfig::Check() {
-    if (registry_storage_uri_.empty()) {
-        fprintf(stderr, "registry_storage_uri must be set\n");
+    // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
+    // falls back to local backend. No validation needed for empty value.
+
+    if (!MetricsReporterFactory::IsSupportedType(metrics_reporter_type_)) {
+        fprintf(stderr,
+                "Unsupported kvcm.metrics.reporter_type [%s], supported types: %s\n",
+                metrics_reporter_type_.c_str(),
+                MetricsReporterFactory::SupportedTypes());
         return false;
     }
+
+    // Validate revisit_interval_buckets if set
+    if (!revisit_interval_buckets_.empty()) {
+        auto boundaries = ParseRevisitIntervalBuckets(revisit_interval_buckets_);
+        if (boundaries.empty()) {
+            return false; // ParseRevisitIntervalBuckets already printed the error
+        }
+    }
+
+    if (cache_reclaimer_inflight_delete_timeout_ms_ == 0 ||
+        cache_reclaimer_pending_location_limit_per_group_type_ == 0 ||
+        cache_reclaimer_pending_bytes_limit_per_group_type_ == 0 ||
+        cache_reclaimer_pending_delete_handler_limit_ == 0 || cache_reclaimer_pending_bytes_limit_ == 0) {
+        fprintf(stderr, "CacheReclaimer async delete limits and timeout must be greater than zero\n");
+        return false;
+    }
+
+    if (schedule_plan_executor_thread_count_ <= 1 || schedule_plan_migration_worker_budget_ == 0 ||
+        schedule_plan_migration_worker_budget_ >= static_cast<uint32_t>(schedule_plan_executor_thread_count_)) {
+        fprintf(stderr,
+                "SchedulePlanExecutor requires thread_count > 1 and 0 < migration_worker_budget < thread_count\n");
+        return false;
+    }
+
     return true;
 }
 

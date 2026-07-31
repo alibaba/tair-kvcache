@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import requests
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.service_discovery import ServiceEndpoint
 
 
 def _ok_response_json(data=None):
@@ -51,6 +52,178 @@ def _make_mock_response(json_data, status_code=200):
     mock_resp.status_code = status_code
     mock_resp.json.return_value = json_data
     return mock_resp
+
+
+class TestServiceDiscoveryInit(unittest.TestCase):
+    """Tests for resolving manager service-discovery URLs."""
+
+    def test_static_url_resolves_before_api_request(self):
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:9090",
+            auto_discover_leader=False,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+            self.assertIsNotNone(client._service_discovery)
+
+            client.session.post = MagicMock(
+                return_value=_make_mock_response(_ok_response_json())
+            )
+            client.register_instance({"trace_id": "test"})
+            client.session.post.assert_called_once()
+            self.assertEqual(
+                client.session.post.call_args[0][0],
+                "http://10.0.0.1:8080/api/registerInstance",
+            )
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_direct_https_url_bypasses_service_discovery(self, mock_create):
+        client = KvCacheManagerClient("https://manager.example.test:8443/")
+        try:
+            self.assertEqual(client.base_url, "https://manager.example.test:8443")
+            self.assertIsNone(client._service_discovery)
+            mock_create.assert_not_called()
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_unavailable_discovery_implementation_fails_fast(self, mock_create):
+        mock_create.return_value = None
+        with self.assertRaisesRegex(ValueError, "failed to create service discovery"):
+            KvCacheManagerClient("custom://manager-service")
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_empty_discovery_result_fails_fast_and_closes(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = None
+        mock_create.return_value = discovery
+
+        with self.assertRaisesRegex(RuntimeError, "returned no manager endpoints"):
+            KvCacheManagerClient("custom://manager-service")
+
+        discovery.close.assert_called_once_with()
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_leader_discovery_uses_fresh_service_endpoint(self, mock_post):
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.99:9090")
+            self.assertEqual(
+                mock_post.call_args[0][0],
+                "http://10.0.0.2:8080/api/getClusterInfo",
+            )
+
+            mock_post.reset_mock()
+            mock_post.return_value = _make_mock_response(
+                _cluster_info_response("10.0.0.50", 7070)
+            )
+            self.assertTrue(client._refresh_manager_route())
+            self.assertEqual(
+                mock_post.call_args[0][0],
+                "http://10.0.0.1:8080/api/getClusterInfo",
+            )
+            self.assertEqual(client.base_url, "http://10.0.0.50:7070")
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_close_releases_service_discovery(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = ServiceEndpoint(
+            ip="10.0.0.1",
+            port=8080,
+            host="10.0.0.1:8080",
+        )
+        discovery.get_type.return_value = "Test"
+        mock_create.return_value = discovery
+
+        client = KvCacheManagerClient("custom://manager-service")
+        client.close()
+        client.close()
+
+        discovery.close.assert_called_once_with()
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """Tests for the configurable Manager HTTP request timeout."""
+
+    def test_non_positive_timeout_is_rejected(self):
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    KvCacheManagerClient(
+                        "http://10.0.0.1:8080",
+                        request_timeout_seconds=timeout,
+                    )
+
+    def test_connector_config_forwards_request_timeout(self):
+        client = KvCacheManagerClient.from_connector_config({
+            "manager_uri": "http://10.0.0.1:8080",
+            "instance_id": "connector-instance",
+            "request_timeout_seconds": 3.5,
+        })
+        try:
+            self.assertEqual(client._instance_id, "connector-instance")
+            self.assertEqual(client._request_timeout_seconds, 3.5)
+        finally:
+            client.close()
+
+    def test_connector_config_uses_request_timeout_default(self):
+        client = KvCacheManagerClient.from_connector_config({
+            "manager_uri": "http://10.0.0.1:8080",
+        })
+        try:
+            self.assertEqual(client._request_timeout_seconds, 1.0)
+        finally:
+            client.close()
+
+    def test_api_request_uses_configured_timeout(self):
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            request_timeout_seconds=1.5,
+        )
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_ok_response_json())
+        )
+
+        try:
+            client.register_instance({"trace_id": "test"})
+        finally:
+            client.close()
+
+        self.assertEqual(client.session.post.call_args.kwargs["timeout"], 1.5)
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_leader_discovery_uses_dedicated_timeout(self, mock_post):
+        mock_post.return_value = _make_mock_response(_cluster_info_response())
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+            request_timeout_seconds=2.5,
+        )
+
+        try:
+            self.assertEqual(mock_post.call_args.kwargs["timeout"], 5.0)
+        finally:
+            client.close()
 
 
 class TestLeaderDiscoveryInit(unittest.TestCase):
@@ -201,7 +374,7 @@ class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):
         mock_post.side_effect = capture_url
 
         try:
-            result = client._discover_leader()
+            result = client._refresh_manager_route()
             self.assertTrue(result)
             self.assertEqual(client.base_url, "http://10.0.0.50:7070")
             # Only the seed discovery_url should have been called
@@ -301,9 +474,31 @@ class TestServerNotLeaderRetry(unittest.TestCase):
         finally:
             client.close()
 
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_not_leader_does_not_rotate_service_endpoint_when_disabled(
+        self,
+        mock_discovery_post,
+    ):
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8080",
+            auto_discover_leader=False,
+            min_discover_interval_seconds=0,
+        )
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_not_leader_response())
+        )
+
+        try:
+            with self.assertRaises(AssertionError):
+                client.register_instance({"trace_id": "test"})
+            self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+            mock_discovery_post.assert_not_called()
+        finally:
+            client.close()
+
 
 class TestConnectionErrorHandling(unittest.TestCase):
-    """Tests for ConnectionError handling and background refresh wakeup."""
+    """Tests for transport error handling and route refresh wakeup."""
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_connection_error_wakes_background_refresh(self, mock_discovery_post):
@@ -351,6 +546,48 @@ class TestConnectionErrorHandling(unittest.TestCase):
         finally:
             client.close()
 
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_transport_error_refreshes_service_endpoint_without_leader_discovery(
+        self,
+        mock_discovery_post,
+    ):
+        for error in (
+            requests.ConnectionError("Connection refused"),
+            requests.Timeout("Request timed out"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                client = KvCacheManagerClient(
+                    "static://10.0.0.1:8080,10.0.0.2:8080",
+                    auto_discover_leader=False,
+                    min_discover_interval_seconds=0,
+                )
+                discovery = client._service_discovery
+                discovery.refresh = MagicMock(wraps=discovery.refresh)
+                client.session.post = MagicMock(side_effect=error)
+                route_refreshed = threading.Event()
+                original_refresh = client._refresh_manager_route
+
+                def refresh_and_signal(*args, **kwargs):
+                    try:
+                        return original_refresh(*args, **kwargs)
+                    finally:
+                        route_refreshed.set()
+
+                client._refresh_manager_route = refresh_and_signal
+                try:
+                    with self.assertRaises(type(error)):
+                        client.register_instance({"trace_id": "test"})
+
+                    self.assertTrue(
+                        route_refreshed.wait(timeout=5),
+                        "route refresh did not finish after the transport failure",
+                    )
+                    self.assertEqual(client.base_url, "http://10.0.0.2:8080")
+                    discovery.refresh.assert_called_once_with()
+                    mock_discovery_post.assert_not_called()
+                finally:
+                    client.close()
+
 
 class TestBackgroundRefresh(unittest.TestCase):
     """Tests for background leader refresh thread."""
@@ -376,7 +613,7 @@ class TestBackgroundRefresh(unittest.TestCase):
                 _cluster_info_response("10.0.0.2", 9090)
             )
             # Reset last discover time so min interval doesn't block
-            client._last_discover_time = 0
+            client._last_route_refresh_time = 0
 
             # Trigger urgent wakeup
             client._refresh_event.set()
@@ -444,11 +681,11 @@ class TestCloseLifecycle(unittest.TestCase):
 
 
 class TestThreadSafety(unittest.TestCase):
-    """Tests for thread-safe leader discovery dedup."""
+    """Tests for thread-safe Manager route refresh dedup."""
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_concurrent_discover_dedup(self, mock_post):
-        """Multiple threads calling _discover_leader should dedup via lock."""
+        """Concurrent Manager route refresh calls should dedup via lock."""
         actual_discover_count = [0]
         original_post = mock_post
 
@@ -470,13 +707,13 @@ class TestThreadSafety(unittest.TestCase):
             actual_discover_count[0] = 0
             client.base_url = "http://10.0.0.1:8080"  # reset to trigger discovery
 
-            # Launch many threads that all call _discover_leader
+            # Launch many threads that all refresh the Manager route.
             threads = []
             results = []
             lock = threading.Lock()
 
             def do_discover():
-                result = client._discover_leader()
+                result = client._refresh_manager_route()
                 with lock:
                     results.append(result)
 
@@ -492,7 +729,7 @@ class TestThreadSafety(unittest.TestCase):
             # All should have succeeded
             self.assertTrue(all(results))
             # But the actual HTTP call should only have happened once (or very few times)
-            # due to the snapshot-check dedup in _discover_leader
+            # due to the snapshot-check dedup in _refresh_manager_route
             self.assertLessEqual(actual_discover_count[0], 2)
         finally:
             client.close()
@@ -521,6 +758,107 @@ class TestGetClusterInfoPublicApi(unittest.TestCase):
             self.assertIn("leader_endpoint", result)
         finally:
             client.close()
+
+
+class TestMetaServiceApiWrappers(unittest.TestCase):
+    """Tests for MetaService API wrappers not covered by integration-style tests."""
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_report_event_forwards_request(self, mock_make_api_request):
+        """report_event() should forward the request to reportEvent unchanged."""
+        mock_make_api_request.return_value = _ok_response_json()
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        self.addCleanup(client.close)
+        request = {
+            "trace_id": "report-1",
+            "instance_id": "instance-1",
+            "host_ip_port": "10.0.0.2:9600",
+            "storage_type": "ST_EVENT_REPORT_L2",
+            "events": [
+                {
+                    "event_type": "EVENT_HEARTBEAT",
+                    "heartbeat": {"system_status": {"version": "v6d_1.0"}},
+                }
+            ],
+        }
+
+        result = client.report_event(request, check_response=False)
+        self.assertEqual(result["header"]["status"]["code"], "OK")
+        mock_make_api_request.assert_called_once_with(
+            "/api/reportEvent", request, False
+        )
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_get_cache_locations_by_backend_forwards_request(
+        self, mock_make_api_request
+    ):
+        """Backend-aware lookup should use getCacheLocationsByBackend."""
+        mock_make_api_request.return_value = _ok_response_json(
+            {"key_locations": []}
+        )
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        self.addCleanup(client.close)
+        request = {
+            "trace_id": "lookup-1",
+            "instance_id": "instance-1",
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [123],
+            "backend_selectors": [
+                {
+                    "backend_type": "ST_EVENT_REPORT_L2",
+                    "strategy": "LSS_V6D_PREFIX",
+                }
+            ],
+        }
+
+        result = client.get_cache_locations_by_backend(request)
+        self.assertEqual(result["key_locations"], [])
+        mock_make_api_request.assert_called_once_with(
+            "/api/getCacheLocationsByBackend", request, True
+        )
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_get_cache_meta_forwards_request(self, mock_make_api_request):
+        """get_cache_meta() should forward metadata queries unchanged."""
+        mock_make_api_request.return_value = _ok_response_json(
+            {"locations": [], "metas": []}
+        )
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        self.addCleanup(client.close)
+        request = {
+            "trace_id": "meta-1",
+            "instance_id": "instance-1",
+            "block_keys": [123],
+            "detail_level": 1,
+        }
+
+        result = client.get_cache_meta(request)
+        self.assertEqual(result["locations"], [])
+        self.assertEqual(result["metas"], [])
+        mock_make_api_request.assert_called_once_with(
+            "/api/getCacheMeta", request, True
+        )
+
+    @patch.object(KvCacheManagerClient, "_make_api_request")
+    def test_get_cache_location_len_forwards_request(self, mock_make_api_request):
+        """get_cache_location_len() should use getCacheLocationLen."""
+        mock_make_api_request.return_value = _ok_response_json(
+            {"cache_location_len": 2}
+        )
+        client = KvCacheManagerClient("http://10.0.0.1:8080")
+        self.addCleanup(client.close)
+        request = {
+            "trace_id": "location-len-1",
+            "instance_id": "instance-1",
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [123, 456],
+        }
+
+        result = client.get_cache_location_len(request, check_response=False)
+        self.assertEqual(result["cache_location_len"], 2)
+        mock_make_api_request.assert_called_once_with(
+            "/api/getCacheLocationLen", request, False
+        )
 
 
 class TestNormalApiStillWorks(unittest.TestCase):

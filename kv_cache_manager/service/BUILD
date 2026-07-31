@@ -33,6 +33,7 @@ cc_library(
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/manager:write_location_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
@@ -69,6 +70,7 @@ cc_library(
         ":grpc_wrapper",
         ":service_impl_base",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
@@ -78,6 +80,7 @@ cc_library(
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
+        "@rapidjson",
     ],
 )
 
@@ -97,6 +100,7 @@ cc_library(
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",
@@ -148,6 +152,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/config",
         "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/service/util:common",
     ],
 )

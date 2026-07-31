@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
 
+#include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
@@ -14,6 +15,7 @@
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
@@ -34,8 +36,17 @@ bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
+    // single shared lifecycle handle: producers hold it as a reader
+    // around metric registration; AdminServiceImpl::RemoveInstance and
+    // RemoveInstanceGroup hold it as a writer for the entire removal
+    metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
 
     config_ = config;
+
+    if (!config_.Check()) {
+        KVCM_LOG_ERROR("server config check failed");
+        return false;
+    }
 
     if (!CreateLeaderElector()) {
         return false;
@@ -43,16 +54,38 @@ bool Server::Init(const ServerConfig &config) {
 
     auto registry_storage_uri = config_.GetRegistryStorageUri();
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
-    registry_manager_->Init();
+    if (!registry_manager_->Init()) {
+        KVCM_LOG_ERROR("registry manager init failed");
+        return false;
+    }
 
-    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
-    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
-                         config_.GetCacheReclaimerKeySamplingSizeTotal(),
-                         config_.GetCacheReclaimerKeySamplingSizePerTask(),
-                         config_.GetCacheReclaimerDelBatchSize(),
-                         config_.GetCacheReclaimerIdleIntervalMs(),
-                         config_.GetCacheReclaimerWorkerSize());
+    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
+    CacheReclaimerAsyncDeleteConfig async_delete_config;
+    async_delete_config.inflight_delete_timeout_ms = config_.GetCacheReclaimerInflightDeleteTimeoutMs();
+    async_delete_config.pending_location_limit_per_group_type =
+        config_.GetCacheReclaimerPendingLocationLimitPerGroupType();
+    async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
+    async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
+    async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
+    if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
+                              config_.GetCacheReclaimerKeySamplingSizeTotal(),
+                              config_.GetCacheReclaimerKeySamplingSizePerTask(),
+                              config_.GetCacheReclaimerDelBatchSize(),
+                              config_.GetCacheReclaimerIdleIntervalMs(),
+                              config_.GetCacheReclaimerWorkerSize(),
+                              async_delete_config,
+                              config_.GetSchedulePlanMigrationWorkerBudget())) {
+        KVCM_LOG_ERROR("cache manager init failed");
+        return false;
+    }
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
+
+    // Set revisit interval histogram configuration
+    auto boundaries = ServerConfig::ParseRevisitIntervalBuckets(config_.GetRevisitIntervalBuckets());
+    if (boundaries.empty()) {
+        boundaries = ServerConfig::GetDefaultRevisitIntervalBuckets();
+    }
+    cache_manager_->SetRevisitHistogramConfig(boundaries);
 
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
@@ -92,6 +125,7 @@ void Server::OnBecomeLeader() {
         return;
     }
     cache_manager_->ResumeReclaimer();
+    cache_manager_->StartMigrationManager();
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
@@ -107,6 +141,10 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+
+    // Stop migration after leader-only requests drain, so MigrateCache cannot submit
+    // new copy tasks after the migration monitor has stopped.
+    cache_manager_->StopMigrationManager();
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -133,15 +171,33 @@ bool Server::Start() {
         KVCM_LOG_ERROR("init http server failed");
         return false;
     }
+
+    // wire up instance-removal callback: invalidate per-instance
+    // collector caches on both gRPC and HTTP meta services
+    // registered before leader election so no RemoveInstance can arrive
+    // before the callback is in place (API_CALL_GUARD rejects requests
+    // when not leader)
+    std::weak_ptr<MetaServiceGRpc> grpc_weak = meta_service_;
+    std::weak_ptr<MetaServiceHttp> http_weak = meta_http_service_;
+    cache_manager_->SetOnInstanceRemoved(
+        [grpc_weak = std::move(grpc_weak), http_weak = std::move(http_weak)](const std::string &instance_id) {
+            if (const auto grpc = grpc_weak.lock()) {
+                grpc->InvalidateCollectorCache(instance_id);
+            }
+            if (const auto http = http_weak.lock()) {
+                http->InvalidateCollectorCache(instance_id);
+            }
+        });
+
     if (!leader_elector_->Start()) {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
     }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
-                  KVCM_ART,
-                  SYS_GLB_VERSION,
-                  SYS_GLB_GIT_INFO,
-                  SYS_GLB_BUILD_TIME);
+                  kKvcmArt,
+                  kKvcmFullVersion,
+                  kKvcmGitCommit,
+                  kKvcmBuildTime);
     return true;
 }
 
@@ -169,7 +225,7 @@ bool Server::StartRpcServer() {
     // grpc::EnableDefaultHealthCheckService(true);
     // grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_));
+    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
 
@@ -222,7 +278,13 @@ bool Server::StartHttpServer() {
     int32_t http_port = config_.GetServiceHttpPort();
     int32_t admin_http_port = config_.GetServiceAdminHttpPort();
 
-    meta_http_service_ = std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_);
+    const int32_t configured_io_thread_num = config_.GetServiceIoThreadNum();
+    const size_t io_thread_num = configured_io_thread_num > 0 ? static_cast<size_t>(configured_io_thread_num)
+                                                              : std::thread::hardware_concurrency();
+    KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
+
+    meta_http_service_ =
+        std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
     admin_http_service_ = std::make_shared<AdminServiceHttp>(
         metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);
@@ -240,9 +302,9 @@ bool Server::StartHttpServer() {
     }
 
     // 在单独的线程中启动HTTP服务
-    meta_http_thread_ = std::thread([this, http_port]() {
+    meta_http_thread_ = std::thread([this, http_port, io_thread_num]() {
         KVCM_LOG_INFO("Meta http server starting on port %d", http_port);
-        bool meta_started = meta_http_service_->Start(http_port);
+        bool meta_started = meta_http_service_->Start(http_port, io_thread_num);
 
         if (!meta_started) {
             KVCM_LOG_ERROR("Failed to start meta http server on port %d", http_port);
@@ -250,9 +312,9 @@ bool Server::StartHttpServer() {
             KVCM_LOG_INFO("Meta HTTP server exited on port %d", http_port);
         }
     });
-    admin_http_thread_ = std::thread([this, admin_http_port]() {
+    admin_http_thread_ = std::thread([this, admin_http_port, io_thread_num]() {
         KVCM_LOG_INFO("Admin http server starting on port %d", admin_http_port);
-        bool admin_started = admin_http_service_->Start(admin_http_port); // 使用不同端口启动admin服务
+        bool admin_started = admin_http_service_->Start(admin_http_port, io_thread_num); // 使用不同端口启动admin服务
         if (!admin_started) {
             KVCM_LOG_ERROR("Failed to start admin http server on port %d", admin_http_port);
         } else {
@@ -263,10 +325,10 @@ bool Server::StartHttpServer() {
     // 可以考虑把三个HTTP服务合并到一个端口上，重复的API只注册一次
     // 如果有同名的不同API，可以通过特殊字段区分
     if (config_.IsEnableDebugService()) {
-        debug_http_thread_ = std::thread([this, http_port]() {
+        debug_http_thread_ = std::thread([this, http_port, io_thread_num]() {
             int32_t debug_http_port = http_port + 3000;
             KVCM_LOG_INFO("Debug http server starting on port %d", debug_http_port);
-            bool debug_started = debug_http_service_->Start(debug_http_port);
+            bool debug_started = debug_http_service_->Start(debug_http_port, io_thread_num);
             if (!debug_started) {
                 KVCM_LOG_ERROR("Failed to start debug http server on port %d", debug_http_port);
             } else {

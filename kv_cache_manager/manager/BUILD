@@ -22,6 +22,7 @@ cc_library(
         ":data_storage_selector",
         ":hash_util",
         ":meta_searcher",
+        ":migration_manager",
         ":reclaimer_task_supervisor",
         ":startup_config_loader",
         ":write_location_manager",
@@ -30,6 +31,7 @@ cc_library(
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
@@ -68,6 +70,7 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",
+        "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/manager:schedule_plan_executor",
         "//kv_cache_manager/manager:write_location_manager",
         "//kv_cache_manager/meta",
@@ -119,6 +122,25 @@ cc_library(
 )
 
 cc_library(
+    name = "migration_manager",
+    srcs = ["migration_manager.cc"],
+    hdrs = ["migration_manager.h"],
+    deps = [
+        ":data_storage_selector",
+        ":meta_searcher",
+        ":schedule_plan_executor",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/metrics:metrics_registry",
+    ],
+)
+
+cc_library(
     name = "reclaimer_task_supervisor",
     srcs = ["reclaimer_task_supervisor.cc"],
     hdrs = ["reclaimer_task_supervisor.h"],
@@ -155,5 +177,7 @@ cc_library(
         ":write_location_manager",
         "//kv_cache_manager/config",
         "//kv_cache_manager/meta:meta_indexer_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )
+

@@ -40,10 +40,14 @@ public:
     std::vector<bool> MightExist(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
+    std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src_uris,
+                                const std::vector<DataStorageUri> &dst_uris,
+                                const std::string &trace_id) override;
 
 private:
     DummyStorageSpec spec_;
     std::filesystem::path base_path_;
+    bool memory_only_ = false;
 };
 
 } // namespace kv_cache_manager

@@ -234,7 +234,8 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
                                                             client_config->block_size(),
                                                             client_config->location_spec_infos(),
                                                             client_config->model_deployment(),
-                                                            client_config->location_spec_groups());
+                                                            client_config->location_spec_groups(),
+                                                            client_config->default_query_type());
     if (reg_ec == ER_OK) {
         storage_config_ = storage_config;
     }

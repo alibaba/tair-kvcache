@@ -43,7 +43,16 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
-    ST_VINEYARD = 7;
+    ST_EVENT_REPORT_L1P5 = 7;
+    ST_EVENT_REPORT_L2 = 8;
+}
+
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+    QT_PREFIX_MATCH = 2;
+    QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
 message LocalStorageSpec {}
@@ -95,6 +104,7 @@ message TairMemPoolStorageSpec {
     //     spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000
     //     static://11.22.33.44:8080,33.55.66.77:8080
     string service_discovery_url = 5;
+    int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
 }
 
 message NfsStorageSpec {
@@ -102,8 +112,14 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
-message VineyardStorageSpec {
-    string cluster_name = 1;
+message EventReportStorageSpec {
+    int64 heartbeat_timeout_ms = 1;
+    int64 cleanup_grace_ms = 2;
+    int64 liveness_check_interval_ms = 3;
+    int64 snapshot_min_interval_ms = 4;
+    // Shared bound for snapshot waiting on admitted deltas and new deltas
+    // waiting on an in-flight snapshot.
+    int64 snapshot_delta_drain_timeout_ms = 5;
 }
 
 message StorageConfig {
@@ -116,9 +132,12 @@ message StorageConfig {
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
-        VineyardStorageSpec vineyard = 10;
+        EventReportStorageSpec event_report = 14;
     }
     bool check_storage_available_when_open = 8;
+    // 响应中用于标识存储类型；请求中通常由 oneof storage_spec 确定类型。
+    // 配置 EventReport storage 时必须显式指定 ST_EVENT_REPORT_L1P5 或 ST_EVENT_REPORT_L2。
+    StorageType storage_type = 11;
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -188,6 +207,55 @@ message CacheReclaimStrategy {
     int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
 }
 
+// ===== 多层存储迁移（Tiered Storage Migration）配置 =====
+
+// 复制完成后源端 location 的处理方式
+enum MigrationRetention {
+    MIGRATION_RETENTION_UNSPECIFIED = 0;
+    MIGRATION_RETENTION_DELETE_SOURCE = 1; // 复制完成后立即删除源端 location，尽量只保留单副本
+    MIGRATION_RETENTION_KEEP_BOTH = 2;     // 保留双副本，由 Reclaimer 后续回收
+}
+
+// Mark 被 StartWriteCache 消费后的清理策略
+enum MigrationMarkClearPolicy {
+    MIGRATION_MARK_CLEAR_ON_NEXT_WRITE_SUCCESS = 0; // 本次 target CacheLocation 成功 SERVING 后清标
+    MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
+}
+
+// 执行方式配置（Config 后缀用于区分 MigrationMethod 请求枚举）。
+
+// Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
+message MigrationCopyMethodConfig {
+    bool enabled = 1;
+}
+
+// Mark 执行方式配置：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
+message MigrationMarkMethodConfig {
+    bool enabled = 1;
+    google.protobuf.Int64Value timeout_ms = 3;
+}
+
+// 执行方式配置集合，Copy / Mark 可同时开启（与触发模式正交）
+message MigrationMethodConfigs {
+    MigrationCopyMethodConfig copy = 1;
+    MigrationMarkMethodConfig mark = 2;
+}
+
+// 单条迁移规则，绑定一个源 storage
+message MigrationStrategy {
+    string source_storage_name = 1;   // 源 storage（热层）unique name
+    string target_storage_name = 2;   // 目标 storage（冷层）unique name
+    double trigger_threshold = 3;     // 水位触发阈值（迁移区间下界），如 0.70
+    MigrationMethodConfigs method_configs = 4;
+    MigrationRetention retention = 5;
+}
+
+message MigrationConfig {
+    repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
+    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
+}
+
 enum CachePreferStrategy {
     CPS_UNSPECIFIED = 0;
     CPS_ALWAYS_3FS = 1;
@@ -234,6 +302,7 @@ message CacheConfig {
     CacheReclaimStrategy reclaim_strategy = 1;
     CachePreferStrategy data_storage_strategy = 2;
     MetaIndexerConfig meta_indexer_config = 3;
+    MigrationConfig migration_config = 4;
 }
 
 message InstanceGroup {
@@ -245,6 +314,9 @@ message InstanceGroup {
     CacheConfig cache_config = 6; // 后面改成instance级别的
     string user_data = 7;
     int64 version = 8;
+    string extra_info = 9; // opaque JSON passed through to clients
+    repeated string event_report_storage_candidates = 10; // backends that handle ReportEvent
+    string revisit_interval_buckets = 11; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
 }
 
 message CreateInstanceGroupRequest {
@@ -338,6 +410,37 @@ message RemoveCacheRequest {
     BlockMask block_mask = 5;
 }
 
+// ===== 多层存储迁移 API 触发 =====
+
+enum MigrationMethod {
+    MIGRATION_METHOD_UNSPECIFIED = 0;
+    MIGRATION_METHOD_COPY = 1; // 仅 Copy
+    MIGRATION_METHOD_MARK = 2; // 仅 Mark
+    MIGRATION_METHOD_BOTH = 3; // Copy + Mark
+}
+
+// 规则触发：block_keys 为空时按规则采样过滤候选
+message MigrationRule {
+    int32 sample_count = 1; // 采样数量上限
+}
+
+// 跨存储层迁移指定 block 的 cache
+message MigrateCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string source_storage_name = 3;
+    string target_storage_name = 4;
+    repeated int64 block_keys = 5; // 显式指定；非空时直接使用，忽略 rule
+    MigrationRule rule = 6;        // block_keys 为空时按规则采样过滤
+    MigrationMethod method = 7;    // COPY / MARK / BOTH
+}
+
+message MigrateCacheResponse {
+    CommonResponseHeader header = 1;
+    int64 accepted = 2; // 接受并投递的 block 数
+    int64 rejected = 3; // 被准入策略 / 校验拒绝的 block 数
+}
+
 message ModelDeployment {
     string model_name = 1;
     string dtype = 2;             // torch的数据类型，比如FP8、BP8，TODO 对齐torch
@@ -348,6 +451,7 @@ message ModelDeployment {
     int32 pp_size = 7;            // Pipeline模式下使用，Pipeline数量
     string extra = 8;             // 额外字段，用于标识模型，参与判断唯一标识校验
     string user_data = 9;        // 用户自定义数据，不参与判断唯一标识校验
+    bool use_eagle_pop = 10;     // EaglePop 模式下 full attention 前缀长度减一
 }
 
 message InstanceInfo {
@@ -358,6 +462,7 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
 }
 
 message RegisterInstanceRequest {
@@ -368,6 +473,7 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
 }
 
 message RemoveInstanceRequest {
@@ -532,6 +638,8 @@ service AdminService {
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
     // 删除指定key的cache,用于修复用户反馈的单query异常,暂时与meta_service保持一致
     rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
+    // 跨存储层迁移指定 block 的 cache（Copy / Mark），支持显式 block_keys 或规则采样
+    rpc MigrateCache(MigrateCacheRequest) returns (MigrateCacheResponse);
     // 增删改查instance信息
     rpc RegisterInstance(RegisterInstanceRequest) returns (CommonResponse);
     rpc RemoveInstance(RemoveInstanceRequest) returns (CommonResponse);

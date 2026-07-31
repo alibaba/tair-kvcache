@@ -6,11 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kv_cache_manager/common/build_version.h"
-
 namespace kv_cache_manager {
 
-static constexpr const char *KVCM_ART = R"D(
+static constexpr const char *kKvcmArt = R"D(
 __/\\\________/\\\__/\\\________/\\\________/\\\\\\\\\__/\\\\____________/\\\\
  _\/\\\_____/\\\//__\/\\\_______\/\\\_____/\\\////////__\/\\\\\\________/\\\\\\
   _\/\\\__/\\\//_____\//\\\______/\\\____/\\\/___________\/\\\//\\\____/\\\//\\\
@@ -21,10 +19,6 @@ __/\\\________/\\\__/\\\________/\\\________/\\\\\\\\\__/\\\\____________/\\\\
        _\/\\\______\//\\\______\//\\\__________\////\\\\\\\\\_\/\\\_____________\/\\\
         _\///________\///________\///______________\/////////__\///______________\///_
 )D";
-
-static constexpr const char *SYS_GLB_BUILD_TIME = KVCM_BUILD_TIME;
-static constexpr const char *SYS_GLB_GIT_INFO = KVCM_GIT_COMMIT;
-static constexpr const char *SYS_GLB_VERSION = KVCM_FULL_VERSION;
 
 class Server;
 class CommandLine;

@@ -50,3 +50,45 @@ cc_library(
         "//kv_cache_manager/optimizer/tier_flow",
     ],
 )
+
+cc_library(
+    name = "online_optimizer_manager",
+    srcs = [
+        "online_runtime/online_optimizer_manager.cc",
+    ],
+    hdrs = [
+        "online_runtime/online_optimizer_manager.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/optimizer/config:online_optimizer_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/index:cache_indexer",
+        "//kv_cache_manager/optimizer/index:cache_indexer_factory",
+        "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:request_preprocess",
+    ],
+)
+
+cc_library(
+    name = "lite_hit_offline_runner",
+    srcs = [
+        "lite_hit_offline_runner.cc",
+    ],
+    hdrs = [
+        "lite_hit_offline_runner.h",
+    ],
+    deps = [
+        ":online_optimizer_manager",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/optimizer/config:optimizer_lite_hit_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/liteHit:facts_csv",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:request_preprocess",
+        "//kv_cache_manager/optimizer/liteHit:trace_router",
+        "//kv_cache_manager/optimizer/trace_loader",
+    ],
+)

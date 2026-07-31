@@ -71,6 +71,46 @@ TEST_F(MetaRedisBackendRealServiceTest, TestOpenAndClose) {
     ASSERT_TRUE(meta_redis_backend_->client_pool_ == nullptr);
 }
 
+TEST_F(MetaRedisBackendRealServiceTest, TestRedisDbIsolation) {
+    auto make_config = [](int64_t db) {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
+                              "?client_max_pool_size=2&db=" +
+                              std::to_string(db));
+        return config;
+    };
+
+    MetaRedisBackend backend_db0;
+    MetaRedisBackend backend_db1;
+    ASSERT_EQ(EC_OK, backend_db0.Init("test_redis_db_isolation", make_config(0)));
+    ASSERT_EQ(EC_OK, backend_db1.Init("test_redis_db_isolation", make_config(1)));
+    ASSERT_EQ(EC_OK, backend_db0.Open());
+    ASSERT_EQ(EC_OK, backend_db1.Open());
+
+    // Use the same instance and cache key so Redis DB is the only isolation boundary.
+    const KeyTypeVec keys{987654321};
+    backend_db0.Delete(nullptr, keys);
+    backend_db1.Delete(nullptr, keys);
+    const FieldMapVec expected{{{"field", "db1"}}};
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              backend_db1.Put(nullptr, keys, CacheLocationMapVector(keys.size()), expected));
+
+    std::vector<bool> exists;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_db0.Exists(nullptr, keys, exists));
+    EXPECT_EQ(std::vector<bool>{false}, exists);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_db1.Exists(nullptr, keys, exists));
+    EXPECT_EQ(std::vector<bool>{true}, exists);
+
+    FieldMapVec actual;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_db1.GetProperties(nullptr, keys, {"field"}, actual));
+    EXPECT_EQ(expected, actual);
+
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, backend_db1.Delete(nullptr, keys));
+    EXPECT_EQ(EC_OK, backend_db0.Close());
+    EXPECT_EQ(EC_OK, backend_db1.Close());
+}
+
 TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_multi_thread_simple", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());

@@ -1,0 +1,94 @@
+package com.alibaba.tair.kvcm.client;
+
+import kv_cache_manager.proto.meta.MetaServiceOuterClass.*;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Integration tests for CacheAware RPCs using HTTP transport.
+ * <p>
+ * All CacheAware RPCs are covered via HTTP, including GetCacheLocationLen.
+ */
+public class CacheAwareHttpTest extends CacheAwareTestBase {
+
+    @Override
+    protected MetaClient getClient() {
+        return httpClient;
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_basicQuery() {
+        super.testGetCacheLocationsByBackend_basicQuery();
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_partialKeyMatch() {
+        super.testGetCacheLocationsByBackend_partialKeyMatch();
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_instanceNotExist() {
+        super.testGetCacheLocationsByBackend_instanceNotExist();
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_emptyBackendSelectors() {
+        super.testGetCacheLocationsByBackend_emptyBackendSelectors();
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_locationSpecNamesFilter() {
+        super.testGetCacheLocationsByBackend_locationSpecNamesFilter();
+    }
+
+    @Test
+    void testGetCacheLocationsByBackend_tokenIdsConversion() {
+        super.testGetCacheLocationsByBackend_tokenIdsConversion();
+    }
+
+    @Test
+    void testGetCacheMeta_servingStatus() {
+        super.testGetCacheMeta_servingStatus();
+    }
+
+    @Test
+    void testGetCacheMeta_notFoundStatus() {
+        super.testGetCacheMeta_notFoundStatus();
+    }
+
+    @Test
+    void testGetCacheMeta_instanceNotExist() {
+        super.testGetCacheMeta_instanceNotExist();
+    }
+
+    @Test
+    void testGetCacheMeta_validateJsonStructure() {
+        super.testGetCacheMeta_validateJsonStructure();
+    }
+
+    @Test
+    void testGetCacheLocationLen_prefixMatch() {
+        super.testGetCacheLocationLen_prefixMatch();
+    }
+
+    @Test
+    void testGetCacheLocationLen_noMatches() {
+        super.testGetCacheLocationLen_noMatches();
+    }
+
+    @Test
+    void testGetCacheLocationLen_batchGet() {
+        super.testGetCacheLocationLen_batchGet();
+    }
+
+    @Test
+    void testGetCacheLocationLen_batchGetNoMatches() {
+        super.testGetCacheLocationLen_batchGetNoMatches();
+    }
+
+    @Test
+    void testGetCacheLocationLen_consistency() {
+        super.testGetCacheLocationLen_consistency();
+    }
+}

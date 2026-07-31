@@ -112,6 +112,10 @@ build:release -c opt
 build:release --copt -g --copt -O2
 build:release --strip=never
 
+build:ci_fast --force_pic
+build:ci_fast --per_file_copt=external/mooncake/.*@-g0
+build:ci_fast --per_file_copt=external/mooncake/.*@-O1
+
 # asan
 build:asan --copt -fsanitize=address
 build:asan --copt -DADDRESS_SANITIZER

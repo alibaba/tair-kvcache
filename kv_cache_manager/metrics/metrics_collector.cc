@@ -52,12 +52,17 @@ DEFINE_METRICS_NAME_FOR_SERVICE(request_queue_size);
 
 // manager metrics
 #define DEFINE_METRICS_NAME_FOR_MANAGER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, manager, name)
+#define REGISTER_COUNTER_METRICS_FOR_MANAGER(name)                                                                     \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, manager, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_MANAGER(name)                                                                       \
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_MANAGER(request_key_count);
 DEFINE_METRICS_NAME_FOR_MANAGER(prefix_match_len);
+DEFINE_METRICS_NAME_FOR_MANAGER(get_cache_location_query_block_counter);
+DEFINE_METRICS_NAME_FOR_MANAGER(get_cache_location_hit_block_counter);
 DEFINE_METRICS_NAME_FOR_MANAGER(prefix_match_time_us);
+DEFINE_METRICS_NAME_FOR_MANAGER(batch_get_time_us);
 DEFINE_METRICS_NAME_FOR_MANAGER(lock_write_location_retry_times);
 DEFINE_METRICS_NAME_FOR_MANAGER(write_cache_io_cost_us);
 DEFINE_METRICS_NAME_FOR_MANAGER(filter_write_cache_time_us);
@@ -130,7 +135,10 @@ bool ServiceMetricsCollector::Init() {
     // manager metrics
     REGISTER_GAUGE_METRICS_FOR_MANAGER(request_key_count);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(prefix_match_len);
+    REGISTER_COUNTER_METRICS_FOR_MANAGER(get_cache_location_query_block_counter);
+    REGISTER_COUNTER_METRICS_FOR_MANAGER(get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(prefix_match_time_us);
+    REGISTER_GAUGE_METRICS_FOR_MANAGER(batch_get_time_us);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(lock_write_location_retry_times);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(write_cache_io_cost_us);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(filter_write_cache_time_us);
@@ -176,6 +184,42 @@ bool ServiceMetricsCollector::Init() {
     return true;
 }
 
+/* ---------------- EventReportMetricsCollector -------------------- */
+
+#define DEFINE_METRICS_NAME_FOR_EVENT_REPORT(name) DEFINE_METRICS_NAME_(EventReportMetricsCollector, event_report, name)
+#define REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(name)                                                                \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, event_report, name, metrics_tags_)
+#define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(name)                                                                  \
+    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, event_report, name, metrics_tags_)
+
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT(request_counter);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT(request_rt_us);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT(error_code);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT(error_counter);
+
+EventReportMetricsCollector::EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                                         MetricsTags metrics_tags) noexcept
+    : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
+
+EventReportMetricsCollector::EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept
+    : MetricsCollector(shared_collector.metrics_registry_, shared_collector.metrics_tags_) {
+    event_report_request_counter_metrics_ = shared_collector.event_report_request_counter_metrics_;
+    event_report_request_rt_us_metrics_ = shared_collector.event_report_request_rt_us_metrics_;
+    event_report_error_code_metrics_ = shared_collector.event_report_error_code_metrics_;
+    event_report_error_counter_metrics_ = shared_collector.event_report_error_counter_metrics_;
+}
+
+bool EventReportMetricsCollector::Init() {
+    if (metrics_registry_ == nullptr) {
+        return false;
+    }
+    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(request_counter);
+    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(request_rt_us);
+    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(error_code);
+    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(error_counter);
+    return true;
+}
+
 /* ------------------ DataStorageMetricsCollector ------------------- */
 
 #define DEFINE_METRICS_NAME_FOR_DATA_STORAGE(name) DEFINE_METRICS_NAME_(DataStorageMetricsCollector, data_storage, name)
@@ -188,6 +232,8 @@ DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_counter);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_keys_qps);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_keys_counter);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_time_us);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE(copy_keys_qps);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE(copy_time_us);
 
 DataStorageMetricsCollector::DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
@@ -205,6 +251,8 @@ bool DataStorageMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(create_keys_qps);
     REGISTER_COUNTER_METRICS_FOR_DATA_STORAGE(create_keys_counter);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(create_time_us);
+    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_keys_qps);
+    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_time_us);
 
     return true;
 }

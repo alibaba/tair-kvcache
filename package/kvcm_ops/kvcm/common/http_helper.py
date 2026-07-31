@@ -1,5 +1,7 @@
-import requests
 import json
+from typing import Tuple
+
+import requests
 
 def http_post(host: str, api: str, data: dict, verbose = False) -> dict:
     host_url = host + api
@@ -31,5 +33,31 @@ def http_post(host: str, api: str, data: dict, verbose = False) -> dict:
     if response.status_code != 200:
         print(f"error status code : {response.status_code}")
         raise RuntimeError(f"error status code : {response.status_code}")
-    
+
     return json.loads(response.text)
+
+def http_post_text(host: str, api: str, body, timeout: float = 5.0,
+                   verbose: bool = False) -> Tuple[int, str]:
+    """POST and return (status_code, response_text); the caller decides success/failure.
+
+    body can be a dict/list (will be json.dumps'd) or an already-serialized str.
+    Unlike http_post, this does not force status==200 and does not parse JSON ——
+    suitable when the server returns non-JSON text or when error bodies need to be inspected.
+    """
+    host_url = host + api
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if isinstance(body, (dict, list)):
+        payload = json.dumps(body, ensure_ascii=False)
+    else:
+        payload = body
+    if verbose:
+        print("===========================================")
+        print(f"POST {host_url}")
+        print(payload)
+    response = requests.post(
+        host_url, data=payload.encode("utf-8"), headers=headers, timeout=timeout
+    )
+    return response.status_code, response.text

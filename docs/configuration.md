@@ -19,12 +19,26 @@ Example:
 /home/admin/kv_cache_manager/bin/kv_cache_manager_bin \
     -c '/home/admin/kv_cache_manager/etc/default_server_config.conf' \
     -l '/home/admin/kv_cache_manager/etc/default_logger_config.conf' \
-    -e 'kvcm.registry_storage.uri=redis://:foo@bar:6379?cluster_name=placeholder'
+    -e 'kvcm.registry_storage.uri=redis://your_auth_token@redis-host:6379/?db=1&cluster_name=placeholder'
 ```
+
+### Redis URI
+
+Registry、Meta 和 Coordination Redis 后端共用以下 URI 格式：
+
+```TEXT
+redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
+```
+
+- `auth_token` 会作为 Redis `AUTH` 命令的单个参数传入；`auth=...` query 参数不会用于认证。
+- `db` 必须放在 query 参数中；未配置时使用 DB 0。`redis://host:port/1` 中的 `/1` 是 path，不能用于选择 DB。
+- `db > 0` 依赖 Redis 服务端支持 `SELECT`。Redis Cluster 不支持多逻辑 DB，此时应使用 DB 0，并通过 `cluster_name` 和 key 前缀隔离，或使用独立 Redis 实例。
 
 ## KVCacheManager Server Config
 
-KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置：
+KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置。
+CacheReclaimer 异步删除相关参数的生命周期语义见
+[CacheReclaimer 异步删除与过度逐出优化设计](design/cache_reclaimer_async_delete.md)。
 
 ```TEXT
 ## 参数配置方式有3种，相同配置按照从前往后的覆盖关系（后覆盖前）
@@ -33,10 +47,11 @@ KVCM server可识别的配置参数列表如下。可通过配置文件、启动
 ## 3. 通过环境变量配置，set_env(kvcm.service.rpc_port, 6381)
 
 # 指定系统Registry自身数据存储位置
-# kvcm.registry_storage.uri=redis://127.0.0.1:6379?auth=123456
+# cluster_name必填；db必须通过query参数指定
+# kvcm.registry_storage.uri=redis://your_auth_token@127.0.0.1:6379/?db=1&cluster_name=kvcm_cluster
 
-# 指定协调后端服务的URI（用于多节点选主、节点信息存储等）
-# kvcm.coordination.uri=redis://127.0.0.1:6379?auth=123456
+# 指定协调后端服务的URI（用于多节点选主、节点信息存储等）。Redis选主key按cluster_name隔离。
+# kvcm.coordination.uri=redis://your_auth_token@127.0.0.1:6379/?db=2&cluster_name=kvcm_app_0
 # 旧配置 kvcm.distributed_lock.uri 仍可使用（向后兼容），但新配置优先
 
 # 指定选主时当前节点使用的node_id（如果不指定会自动生成）
@@ -77,8 +92,27 @@ kvcm.service.enable_debug_service=false
 # 指定KVCache Manager初始配置JSON文件路径
 kvcm.startup_config=package/etc/default_startup_config.json
 
-# 可选值有dummy，local，logging，kmonitor；若不配置，默认启用logging
-kvcm.metrics.reporter_type
+# 删除、系统任务与分层迁移共享的后台线程池总大小，必须大于 1
+kvcm.schedule_plan_executor_thread_count=8
+
+# 分层迁移 Prepare/Copy/cleanup 最多同时占用的共享线程池 worker 数；必须满足
+# 0 < migration_worker_budget < executor_thread_count
+kvcm.schedule_plan_migration_worker_budget=3
+
+# CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
+# 不取消底层删除。默认 60000ms。
+kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
+
+# 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
+kvcm.cache_reclaimer.pending_location_limit_per_group_type=100000
+kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
+
+# 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
+kvcm.cache_reclaimer.pending_delete_handler_limit=1024
+kvcm.cache_reclaimer.pending_bytes_limit=274877906944
+
+# 可选值有dummy，local，logging，kmonitor；若不配置或配置为空，默认使用local
+kvcm.metrics.reporter_type=local
 
 # 传递给metrics reporter的配置值
 kvcm.metrics.reporter_config
@@ -95,6 +129,34 @@ kvcm.metrics.prometheus_prefix=kvcm
 # log event publisher的初始化配置值，暂未启用
 kvcm.event.event_publishers_configs
 ```
+
+### SchedulePlanExecutor 线程与迁移预算
+
+`kvcm.schedule_plan_executor_thread_count` 是删除、系统任务和分层迁移共同使用的进程级线程池总大小；
+`kvcm.schedule_plan_migration_worker_budget` 是该线程池内同时运行的 Migration Prepare、Copy 和 cleanup
+任务上限，并不是额外创建的迁移线程数。随包提供的 `default_server_config.conf` 使用 `8/3`，未提供配置文件时
+代码级默认值为 `2/1`。
+
+两个参数必须满足：
+
+```TEXT
+executor_thread_count > 1
+0 < migration_worker_budget < executor_thread_count
+```
+
+迁移任务可能在 Backend Create、Copy 等存储操作中长时间占用 worker。任务优先级只能决定尚未运行任务的
+出队顺序，无法抢占已经运行的迁移任务，因此 Migration budget 必须小于线程池总大小，确保至少有一个 worker
+不会被迁移任务占用，可以继续处理水位回收和系统任务。这里不是把线程池静态切分为两部分：没有迁移任务时，
+回收和系统任务仍可使用全部 worker。
+
+该约束是进程级 Executor 的启动条件，与启动时是否已经配置 migration strategy 无关；instance group 可在运行期
+新增迁移策略，因此不能根据启动时的策略状态放宽校验。`2/1`、`8/3` 是合法配置，`1/1`、`8/8` 和 `8/0`
+会导致 `ServerConfig::Check` 或 `CacheManager::Init` 失败。已有单线程自定义配置需要至少调整为 `2/1`。
+
+同一个 `migration_config` 中，`strategies` 的 `(source_storage_name, target_storage_name)` 组合必须唯一。
+相同 source 迁移到不同 target、不同 source 迁移到相同 target，以及 `hot -> warm -> cold` 级联均可配置；只有
+完全相同的 source/target route 会被拒绝。重复 route 无法明确选择各自的 threshold、method、retention 和 Mark
+timeout，因此不会使用配置数组顺序作为隐式优先级。
 
 ## CacheManager Initial Config
 
@@ -158,6 +220,9 @@ kvcm.event.event_publishers_configs
                 "mutex_shard_num": 16,
                 "batch_key_size": 16,
                 "meta_storage_backend_config": { # 控制meta indexer的storage backend，可选local本地文件或者redis
+                    # Redis示例：
+                    # "storage_type": "redis",
+                    # "storage_uri": "redis://your_auth_token@redis-host:6379/?db=3&client_max_pool_size=16"
                     "storage_type": "local",
                     "storage_uri": ""
                 },

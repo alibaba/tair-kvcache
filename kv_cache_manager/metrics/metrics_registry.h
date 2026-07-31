@@ -6,6 +6,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -50,6 +52,12 @@ namespace kv_cache_manager {
 #define REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry, group, name, tags)                                            \
     do {                                                                                                               \
         METRICS_(group, name) = (metrics_registry)->GetGauge(METRICS_NAME_(group, name), tags);                        \
+    } while (0)
+
+#define REPORT_DYNAMIC_GAUGE_(metrics_registry, name, tags, value)                                                     \
+    do {                                                                                                               \
+        auto gauge = (metrics_registry)->GetGauge((name), (tags));                                                     \
+        gauge = (value);                                                                                               \
     } while (0)
 
 #define DEFINE_COPY_METRICS_COUNTER_(group, name)                                                                      \
@@ -201,6 +209,15 @@ public:
 
     Counter GetOrCreateCounter(const MetricsTags &tags);
     Gauge GetOrCreateGauge(const MetricsTags &tags);
+    std::optional<Gauge> GetGauge(const MetricsTags &tags);
+    bool RemoveByTags(const MetricsTags &tags);
+
+    // remove a specific entry by exact tags; returns true if erased
+    bool Remove(const MetricsTags &tags);
+
+    // remove all entries whose tags are a superset of filter;
+    // returns number of entries removed
+    std::size_t RemoveByTagFilter(const MetricsTags &filter);
 
 private:
     std::mutex mutex_;
@@ -227,12 +244,31 @@ public:
     Counter GetCounter(const std::string &name, const MetricsTags &tags = {});
     Gauge GetGauge(const std::string &name, const MetricsTags &tags = {});
 
+    // remove a specific metric by name + tags; returns true if erased
+    bool Remove(const std::string &name, const MetricsTags &tags);
+
+    // remove all metrics across all names whose tags match the filter;
+    // returns total number of entries removed
+    std::size_t RemoveByTagFilter(const MetricsTags &filter);
+
     [[nodiscard]] std::shared_ptr<MetricsData> GetMetricsData(const std::string &name) noexcept;
     [[nodiscard]] std::shared_ptr<MetricsData> GetOrCreateMetricsData(const std::string &name) noexcept;
 
+    // Histogram family metadata (thread-safe via mutex_).
+    // RegisterHistogramFamily: declare a histogram family name (idempotent).
+    // MapMetricToFamily: map a metric name to a histogram family (idempotent).
+    // GetMetricFamily: look up the family for a metric name (empty string if unmapped).
+    // GetHistogramFamilies: return a snapshot of all registered family names (copy).
+    void RegisterHistogramFamily(const std::string &family_name);
+    void MapMetricToFamily(const std::string &metric_name, const std::string &family_name);
+    [[nodiscard]] std::string GetMetricFamily(const std::string &metric_name) const;
+    [[nodiscard]] std::set<std::string> GetHistogramFamilies() const;
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<MetricsData>> metrics_data_map_;
+    std::set<std::string> histogram_families_;
+    std::map<std::string, std::string> metric_to_family_;
 };
 
 } // namespace kv_cache_manager

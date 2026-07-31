@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 default_check_msg() {
     msg=$1

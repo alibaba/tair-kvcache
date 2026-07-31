@@ -75,3 +75,51 @@ bundle_install(
         ":inner_package",
     ],
 )
+
+###############################################################
+# Online Optimizer Server Package
+###############################################################
+
+bundle_tar(
+    name = "online_optimizer_server",
+    srcs = [
+        ":optimizer_package",
+    ],
+    extension = "tar.gz",
+    visibility = ["//visibility:public"],
+)
+
+bundle_files(
+    name = "optimizer_pkg_bin",
+    srcs = [
+        "//kv_cache_manager/optimizer:online_optimizer_server_main",
+    ],
+    prefix = "bin",
+)
+
+bundle_files(
+    name = "optimizer_pkg_etc",
+    srcs = [
+        "//package/online_optimizer:default_optimizer_confs",
+    ],
+    prefix = "etc",
+)
+
+bundle_files(
+    name = "optimizer_pkg_script",
+    srcs = [
+        "//package/online_optimizer:start_optimizer_server_script",
+    ],
+    prefix = "bin",
+)
+
+bundle_files(
+    name = "optimizer_package",
+    srcs = [],
+    deps = [
+        ":optimizer_pkg_bin",
+        ":optimizer_pkg_etc",
+        ":optimizer_pkg_script",
+        "//package/git_commit:commit_version_file",
+    ],
+)

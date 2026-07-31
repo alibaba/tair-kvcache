@@ -17,8 +17,9 @@ namespace kv_cache_manager {
 
 MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
-                                 std::shared_ptr<RegistryManager> registry_manager)
-    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager)
+                                 std::shared_ptr<RegistryManager> registry_manager,
+                                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
+    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager, std::move(metrics_lifecycle))
     , meta_service_impl_(std::move(meta_service_impl)) {}
 
 void MetaServiceHttp::Init() { MetaServiceMetricsBase::InitMetrics(); }
@@ -30,12 +31,21 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post,
+                                           getCacheLocationsByBackend,
+                                           GetCacheLocationsByBackend,
+                                           GetCacheLocationsByBackend,
+                                           GetCacheLocationsByBackend);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, startWriteCache, StartWriteCache, StartWriteCache, StartWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, finishWriteCache, FinishWriteCache, Common, FinishWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, reportEvent, ReportEvent, ReportEvent, ReportEvent);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getHostCacheState, GetHostCacheState, GetHostCacheState, GetHostCacheState);
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -67,6 +77,20 @@ void MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_con
                                        proto::meta::GetCacheLocationResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocation, __NOTHING__);
     meta_service_impl_->GetCacheLocation(request_context, request, response);
+}
+
+void MetaServiceHttp::GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
+                                          proto::meta::GetCacheLocationLenRequest *request,
+                                          proto::meta::GetCacheLocationLenResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocationLen, __NOTHING__);
+    meta_service_impl_->GetCacheLocationLen(request_context, request, response);
+}
+
+void MetaServiceHttp::GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
+                                                 proto::meta::GetCacheLocationsByBackendRequest *request,
+                                                 proto::meta::GetCacheLocationsByBackendResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocationsByBackend, __NOTHING__);
+    meta_service_impl_->GetCacheLocationsByBackend(request_context, request, response);
 }
 
 void MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
@@ -154,30 +178,66 @@ void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
 void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
-    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(ReportEvent, __NOTHING__);
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+    std::string metrics_type;
+    std::shared_ptr<MetricsCollector> metrics_collector;
+    switch (request->storage_type()) {
+    case proto::meta::ST_EVENT_REPORT_L1P5:
+        metrics_type = kEventReportL1P5MetricsType;
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
+        break;
+    case proto::meta::ST_EVENT_REPORT_L2:
+        metrics_type = kEventReportL2MetricsType;
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
+        break;
+    default:
+        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
+        break;
+    }
+    if (metrics_collector == nullptr) {
+        KVCM_LOG_ERROR("get ReportEvent metrics collector failed");
+        auto *header = response->mutable_header();
+        auto *status = header->mutable_status();
+        status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        status->set_message("get ReportEvent metrics collector failed");
+        return;
+    }
+    API_CONTEXT_INIT(metrics_collector, GetHttpClientIp, http_conn)
+    std::string first_event_type = "N/A";
+    std::string first_block_key = "N/A";
+    if (request->events_size() > 0) {
+        const auto &first_event = request->events(0);
+        first_event_type = proto::meta::ReportEventType_Name(first_event.event_type());
+        if (first_event.has_block_add()) {
+            first_block_key = first_event.block_add().block_key();
+        } else if (first_event.has_block_delete()) {
+            first_block_key = first_event.block_delete().block_key();
+        } else if (first_event.has_block_snapshot()) {
+            if (first_event.block_snapshot().blocks_size() > 0) {
+                first_block_key = first_event.block_snapshot().blocks(0).block_key();
+            }
+        }
+    }
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d, "
+                  "first_event_type: %s, first_block_key: %s",
                   request->trace_id().c_str(),
                   request->instance_id().c_str(),
                   request->host_ip_port().c_str(),
-                  request->events_size());
-    bool has_block_add = false, has_block_delete = false;
-    for (int i = 0; i < request->events_size(); ++i) {
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
-            has_block_add = true;
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
-            has_block_delete = true;
-    }
-    if (has_block_add && !request->instance_id().empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockAdd(request->instance_id());
-        if (mc)
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-    }
-    if (has_block_delete && !request->instance_id().empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockDelete(request->instance_id());
-        if (mc)
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-    }
+                  request->events_size(),
+                  first_event_type.c_str(),
+                  first_block_key.c_str());
+    AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
+}
+
+void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,
+                                        proto::meta::GetHostCacheStateRequest *request,
+                                        proto::meta::GetHostCacheStateResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetHostCacheState, __NOTHING__);
+    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->block_cache_keys_size());
+    meta_service_impl_->GetHostCacheState(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

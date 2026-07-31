@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/crash_handler.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/server_config.h"
@@ -30,8 +31,8 @@ void CommandArgs::ParseCmdLine(int argc, char *const argv[]) {
             PrintUsage(argv[0]);
             exit(1);
         case 'v':
-            fprintf(stderr, "BUILD_TIME: %s\nGIT: %s\n", SYS_GLB_BUILD_TIME, SYS_GLB_GIT_INFO);
-            fprintf(stderr, "RPM VERSION: %s\n", SYS_GLB_VERSION);
+            fprintf(stderr, "BUILD_TIME: %s\nGIT: %s\n", kKvcmBuildTime, kKvcmGitCommit);
+            fprintf(stderr, "RPM VERSION: %s\n", kKvcmFullVersion);
             exit(1);
         case 'd':
             daemon_ = true;

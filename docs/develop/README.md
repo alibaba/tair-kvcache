@@ -11,6 +11,38 @@
 ```bash
 bazelisk run //kv_cache_manager:main
 ```
+
+### Bazel 缓存与多 worktree 开发
+
+Bazel 默认会按 workspace 路径生成独立的 `output_base`。因此从同一个仓库拉出新的 git worktree 后，新的 worktree 不能直接复用旧 worktree 的 `bazel-out`、analysis cache 和本地 action cache；首次构建仍需要重新完成 loading/analysis、内部 symlink/action bookkeeping，以及测试执行。
+
+为了让新 worktree 尽量复用已有编译产物，建议在个人 `~/.bazelrc` 中配置共享缓存：
+
+```bazelrc
+# 将 Bazel output root 放到稳定、空间充足、IO 较快的本地目录。
+# 这主要加速同一个 worktree 的后续增量构建；不同 worktree 仍会有不同 output_base。
+startup --output_user_root=/path/to/local/bazel-output
+
+# 共享 action output cache。不同 worktree 中 action key 相同的 C++ compile、link、proto、genrule 等动作可以直接命中。
+build --disk_cache=/path/to/local/bazel-disk-cache
+
+# 共享外部依赖下载缓存，避免每个新 output_base 重新下载 http_archive/http_file。
+common --repository_cache=/path/to/local/bazel-repository-cache
+```
+
+如果同一台机器上存在多套 Bazel、编译器、系统镜像或 CUDA/MUSA 工具链，建议按工具链维度拆分 `disk_cache` 目录，避免无效缓存占用空间，也避免不同工具链之间相互干扰。`repository_cache` 缓存的是下载文件，通常可以跨工具链共享。
+
+`bazelisk clean --expunge` 只清理当前 worktree 的 `output_base`，不会清理上面配置的共享 `disk_cache` 或 `repository_cache`。如果需要释放共享缓存占用的磁盘空间，需要手动删除对应目录；删除后首次构建会重新下载依赖或重新编译产物。
+
+排查缓存是否生效时，可先确认 Bazel 实际读取的 rc 配置和缓存路径：
+
+```bash
+bazelisk info --announce_rc output_base
+bazelisk info --announce_rc repository_cache
+```
+
+构建结束时关注 summary 中的 `disk cache hit` 和 `local` 数量。如果新 worktree 首次构建仍有大量 `local` C++ 编译，通常说明 cache 之前没有预热、构建参数/工具链发生变化、修改触发了相关 action key 变化，或启用 stamp 的目标受 stable status 变化影响。
+
 ## 测试
 - 单元测试： ```bazelisk test //kv_cache_manager/...```
 - 集成测试： ```bazelisk test //integration_test/...```
@@ -120,5 +152,10 @@ grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
 请参考[.clang-format](../../.clang-format)
 
 githooks中已经添加了C++等语言的格式化脚本，请确保开发环境安装了clang-format、autopep8、buildifier。（开发镜像均已预装）。
+
+## 提交要求
+
+提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。
+
 ## CI
 可参考```.github/workflows```目录下的配置。

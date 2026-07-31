@@ -11,7 +11,8 @@ bool ModelDeployment::operator==(const ModelDeployment &other) const {
     }
     return model_name_ == other.model_name_ && dtype_ == other.dtype_ && use_mla_ == other.use_mla_ &&
            tp_size_ == other.tp_size_ && dp_size_ == other.dp_size_ && lora_name_ == other.lora_name_ &&
-           pp_size_ == other.pp_size_ && extra_ == other.extra_ /* && user_data_ == other.user_data_*/;
+           pp_size_ == other.pp_size_ && extra_ == other.extra_ && use_eagle_pop_ == other.use_eagle_pop_
+        /* && user_data_ == other.user_data_*/;
 }
 bool ModelDeployment::operator!=(const ModelDeployment &other) const { return !((*this) == other); }
 
@@ -25,6 +26,7 @@ bool ModelDeployment::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "pp_size", pp_size_);
     KVCM_JSON_GET_MACRO(rapid_value, "extra", extra_);
     KVCM_JSON_GET_MACRO(rapid_value, "user_data", user_data_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "use_eagle_pop", use_eagle_pop_, use_eagle_pop_);
     return true;
 }
 
@@ -38,6 +40,7 @@ void ModelDeployment::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &
     Put(writer, "pp_size", pp_size_);
     Put(writer, "extra", extra_);
     Put(writer, "user_data", user_data_);
+    Put(writer, "use_eagle_pop", use_eagle_pop_);
 }
 bool ModelDeployment::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;

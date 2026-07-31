@@ -66,9 +66,9 @@ cc_test(
 )
 
 cc_test(
-    name = "VineyardBackendTest",
+    name = "EventReportBackendTest",
     srcs = [
-        "vineyard_backend_test.cc",
+        "event_report_backend_test.cc",
     ],
     copts = ["-fno-access-control"],
     data = [],

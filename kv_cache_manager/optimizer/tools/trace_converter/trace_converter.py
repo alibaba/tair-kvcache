@@ -16,6 +16,8 @@ import os
 import json
 import importlib.util
 import inspect
+import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Type, List, Optional
 
@@ -25,6 +27,55 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from converters.base import BaseConverter
 from utils.merge_utils import merge_jsonl_files, count_traces_in_file
+
+
+def _is_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    return parsed.scheme in {"http", "https"}
+
+
+def _load_json_object(path: Optional[str], raw_json: Optional[str]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    if path:
+        with open(path, "r", encoding="utf-8") as f_in:
+            loaded = json.load(f_in)
+        if not isinstance(loaded, dict):
+            raise ValueError("--converter-config-file must contain a JSON object")
+        result.update(loaded)
+
+    if raw_json:
+        loaded = json.loads(raw_json)
+        if not isinstance(loaded, dict):
+            raise ValueError("--converter-config-json must be a JSON object")
+        result.update(loaded)
+
+    return result
+
+
+def _has_custom_converter_method(converter: BaseConverter, method_name: str) -> bool:
+    return (
+        getattr(type(converter), method_name, None)
+        is not getattr(BaseConverter, method_name, None)
+    )
+
+
+def _resolve_generated_count(result: Any) -> int:
+    if isinstance(result, bool) or not isinstance(result, int):
+        raise TypeError("convert_to_trace_jsonl() must return a non-negative int trace count")
+    if result < 0:
+        raise ValueError("convert_to_trace_jsonl() returned a negative trace count")
+    return result
+
+
+def _create_temp_output_path(output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.tmp.",
+        suffix=output_path.suffix or ".tmp",
+        dir=output_path.parent,
+    )
+    os.close(fd)
+    return Path(tmp_name)
 
 
 def _camel_to_snake(name: str) -> str:
@@ -204,7 +255,7 @@ def main():
     )
 
     parser.add_argument('-i', '--input', required=True, nargs='+',
-                        help='Input trace file path(s) (supports multiple files)')
+                        help='Input trace file path(s), or one HTTP(S) URL when the converter supports it')
     parser.add_argument('-o', '--output', default=None,
                         help='Output file path (default: auto-generate based on input filename)')
     parser.add_argument('-f', '--format', required=True, choices=available_formats,
@@ -226,13 +277,28 @@ def main():
                         help='Ignore response when computing block IDs; write trace covers prompt only (useful when response is unavailable or irrelevant)')
     parser.add_argument('--no-truncate', action='store_true',
                         help='Disable truncation of tail tokens that do not fill a complete block (default: truncate enabled, matching engine write behavior)')
+    parser.add_argument('--converter-config-file', default=None,
+                        help='JSON file with extra configuration passed to the converter')
+    parser.add_argument('--converter-config-json', default=None,
+                        help='Inline JSON object with extra configuration passed to the converter')
 
     args = parser.parse_args()
 
-    # 验证所有输入文件是否存在
-    input_files = [Path(f) for f in args.input]
+    # 验证所有本地输入文件是否存在；HTTP(S) URL 由 converter 自己处理。
+    input_files = list(args.input)
+    url_inputs = [input_path for input_path in input_files if _is_url(input_path)]
+    if url_inputs:
+        if len(input_files) != 1:
+            print("❌ Error: HTTP(S) input only supports one URL; use an external runner for multiple URLs", file=sys.stderr)
+            return 1
+        if args.output is None:
+            print("❌ Error: --output is required when using HTTP(S) input", file=sys.stderr)
+            return 1
+
     for input_path in input_files:
-        if not input_path.exists():
+        if _is_url(input_path):
+            continue
+        if not Path(input_path).exists():
             print(f"❌ Error: Input file not found: {input_path}", file=sys.stderr)
             return 1
 
@@ -240,11 +306,11 @@ def main():
     if args.output is None:
         if len(input_files) == 1:
             # 单文件: 使用输入文件名
-            input_dir = input_files[0].parent
-            input_stem = input_files[0].stem
+            input_dir = Path(input_files[0]).parent
+            input_stem = Path(input_files[0]).stem
         else:
             # 多文件: 使用第一个文件的目录和 "merged" 前缀
-            input_dir = input_files[0].parent
+            input_dir = Path(input_files[0]).parent
             input_stem = "merged"
         
         suffix = '_optimizer'
@@ -278,24 +344,41 @@ def main():
             return 1
 
     try:
+        converter_config_provided = (
+            args.converter_config_file is not None
+            or args.converter_config_json is not None
+        )
+        converter_config = _load_json_object(
+            args.converter_config_file,
+            args.converter_config_json,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"❌ Error: Invalid converter config: {e}", file=sys.stderr)
+        return 1
+
+    try:
         converter_class = CONVERTERS.get(args.format)
         if not converter_class:
             print(f"❌ Error: Unsupported format: {args.format}", file=sys.stderr)
             return 1
         
-        converter = converter_class(
-            default_instance_id=args.instance_id,
-            instance_block_sizes=instance_block_sizes,
-            mode=args.mode,
-            tokenizer_path=args.tokenizer_path,
-            model_name=args.model_name,
-            model_mapping=model_mapping,
-            time_field=args.time_field,
-            content_field=args.content_field,
-            num_workers=args.num_workers,
-            ignore_response=args.ignore_response,
-            truncate=not args.no_truncate
-        )
+        converter_kwargs = {
+            "default_instance_id": args.instance_id,
+            "instance_block_sizes": instance_block_sizes,
+            "mode": args.mode,
+            "tokenizer_path": args.tokenizer_path,
+            "model_name": args.model_name,
+            "model_mapping": model_mapping,
+            "time_field": args.time_field,
+            "content_field": args.content_field,
+            "num_workers": args.num_workers,
+            "ignore_response": args.ignore_response,
+            "truncate": not args.no_truncate,
+        }
+        if converter_config_provided:
+            converter_kwargs["converter_config"] = converter_config
+
+        converter = converter_class(**converter_kwargs)
 
         # ============================================
         # 统一处理流程
@@ -306,6 +389,10 @@ def main():
             print(f"   ℹ️  --ignore-response: block IDs computed from prompt only")
         if args.no_truncate:
             print(f"   ℹ️  --no-truncate: tail tokens kept even if < block_size")
+        if args.converter_config_file:
+            print(f"   ℹ️  --converter-config-file: {args.converter_config_file}")
+        if args.converter_config_json:
+            print("   ℹ️  --converter-config-json: inline config enabled")
 
         # ---- 配置摘要 ----
         print()
@@ -344,8 +431,8 @@ def main():
                 individual_output = output_path
                 print(f"   Direct output to: {individual_output.name}")
             else:
-                input_path = Path(input_file)
                 suffix = '_optimizer'
+                input_path = Path(input_file)
                 individual_output = input_path.parent / f"{input_path.stem}{suffix}.jsonl"
             
             # 断点续传：检查是否已存在
@@ -356,23 +443,43 @@ def main():
                 total_traces += line_count
                 print(f"   Found {line_count} traces (cumulative: {total_traces})\n")
             else:
-                # 转换并保存
-                traces = converter.convert_to_traces(str(input_file))
-                
-                if traces:
-                    with open(individual_output, 'w', encoding='utf-8') as f_out:
-                        for trace in traces:
-                            f_out.write(json.dumps(trace, ensure_ascii=False) + '\n')
-                    
-                    converted_files.append(individual_output)
-                    total_traces += len(traces)
-                    print(f"   ✅ Saved {len(traces)} traces")
-                    print(f"   Cumulative: {total_traces} traces\n")
-                else:
-                    print(f"   ⚠️  No traces generated, skipping\n")
-                
-                # 立即释放内存
-                del traces
+                # 转换并保存。大文件 converter 可以实现 convert_to_trace_jsonl 以流式输出。
+                traces = None
+                tmp_output = _create_temp_output_path(individual_output)
+                try:
+                    if _has_custom_converter_method(converter, 'convert_to_trace_jsonl'):
+                        generated_count = _resolve_generated_count(
+                            converter.convert_to_trace_jsonl(str(input_file), str(tmp_output))
+                        )
+                    elif _has_custom_converter_method(converter, 'convert_to_traces'):
+                        traces = converter.convert_to_traces(str(input_file))
+                        generated_count = len(traces)
+
+                        if traces:
+                            with open(tmp_output, 'w', encoding='utf-8') as f_out:
+                                for trace in traces:
+                                    f_out.write(json.dumps(trace, ensure_ascii=False) + '\n')
+                    else:
+                        raise NotImplementedError(
+                            f"{converter.__class__.__name__} must implement convert_to_traces() "
+                            "or convert_to_trace_jsonl()"
+                        )
+
+                    if generated_count:
+                        tmp_output.replace(individual_output)
+                        converted_files.append(individual_output)
+                        total_traces += generated_count
+                        print(f"   ✅ Saved {generated_count} traces")
+                        print(f"   Cumulative: {total_traces} traces\n")
+                    else:
+                        tmp_output.unlink(missing_ok=True)
+                        print(f"   ⚠️  No traces generated, skipping\n")
+                except Exception:
+                    tmp_output.unlink(missing_ok=True)
+                    raise
+                finally:
+                    if traces is not None:
+                        del traces
         
         if total_traces == 0:
             print("❌ No traces generated from any file", file=sys.stderr)
@@ -397,12 +504,21 @@ def main():
             output_file=output_path,
             sort_by_timestamp=not args.no_sort
         )
+
+        if merged_count != total_traces:
+            print(
+                "❌ Error: Trace count mismatch: "
+                f"conversion stage reported {total_traces} traces, "
+                f"but final output contains {merged_count}",
+                file=sys.stderr
+            )
+            return 1
         
         print(f"\n✅ Success! Generated {merged_count} traces")
         
         if len(input_files) > 1:
             print(f"\n📁 Files generated:")
-            print(f"   Individual JSONL files: {input_files[0].parent}")
+            print(f"   Individual JSONL files: {Path(input_files[0]).parent}")
         print(f"   Final output: {output_path}")
         
         return 0

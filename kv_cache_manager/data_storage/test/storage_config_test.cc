@@ -51,15 +51,70 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     EXPECT_EQ(nfs_spec2.key_count_per_file(), nfs_spec.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings) {
+    EventReportStorageSpec spec;
+    spec.set_heartbeat_timeout_ms(1234);
+    spec.set_cleanup_grace_ms(5678);
+    spec.set_liveness_check_interval_ms(90);
+    spec.set_snapshot_min_interval_ms(4321);
+    spec.set_snapshot_delta_drain_timeout_ms(8765);
+
+    const std::string json = spec.ToJsonString();
+    EXPECT_NE(json.find("\"snapshot_min_interval_ms\":4321"), std::string::npos);
+    EXPECT_NE(json.find("\"snapshot_delta_drain_timeout_ms\":8765"), std::string::npos);
+
+    EventReportStorageSpec parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(1234, parsed.heartbeat_timeout_ms());
+    EXPECT_EQ(5678, parsed.cleanup_grace_ms());
+    EXPECT_EQ(90, parsed.liveness_check_interval_ms());
+    EXPECT_EQ(4321, parsed.snapshot_min_interval_ms());
+    EXPECT_EQ(8765, parsed.snapshot_delta_drain_timeout_ms());
+    std::string invalid_fields;
+    EXPECT_TRUE(parsed.ValidateRequiredFields(invalid_fields));
+    EXPECT_TRUE(invalid_fields.empty());
+}
+
+TEST_F(StorageConfigTest, TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation) {
+    EventReportStorageSpec default_spec;
+    ASSERT_TRUE(default_spec.FromJsonString(
+        R"({"heartbeat_timeout_ms":1000,"cleanup_grace_ms":2000,"liveness_check_interval_ms":100})"));
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs, default_spec.snapshot_min_interval_ms());
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs,
+              default_spec.snapshot_delta_drain_timeout_ms());
+
+    default_spec.set_snapshot_min_interval_ms(0);
+    std::string invalid_fields;
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs);
+    default_spec.set_snapshot_delta_drain_timeout_ms(0);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+
+    default_spec.set_snapshot_delta_drain_timeout_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+}
+
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-xx?cache_time=30"})";
+        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-xx?cache_time=30","media_type":5})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.domain(), "pace.meta");
     EXPECT_EQ(spec.timeout(), 5000);
     EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-xx?cache_time=30");
+    EXPECT_EQ(spec.media_type(), kTairMemPoolMediaTypeSsd);
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields) {
@@ -72,6 +127,23 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields
     EXPECT_EQ(spec.domain(), "pace.meta");
     EXPECT_EQ(spec.timeout(), 5000);
     EXPECT_EQ(spec.service_discovery_url(), "vipserver://pace.meta.vipserver");
+    EXPECT_EQ(spec.media_type(), kTairMemPoolMediaTypeUnspecified);
+}
+
+TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRejectsInvalidMediaType) {
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"media_type":7})";
+    TairMemPoolStorageSpec spec;
+    ASSERT_TRUE(spec.FromJsonString(json));
+
+    std::string invalid_fields;
+    EXPECT_FALSE(spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("media_type"), std::string::npos);
+}
+
+TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRejectsOverflowMediaType) {
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"media_type":65538})";
+    TairMemPoolStorageSpec spec;
+    EXPECT_FALSE(spec.FromJsonString(json));
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigrate) {
@@ -102,15 +174,17 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnabledButEmptyDomainN
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecToJsonOmitsLegacyFields) {
-    // ToJsonString 必须只输出新版字段（domain / timeout / service_discovery_url），
+    // ToJsonString 必须只输出新版字段（domain / timeout / service_discovery_url / media_type），
     // 不应再输出已废弃的 enable_vipserver / vipserver_domain，避免污染老 client 的解析路径。
     TairMemPoolStorageSpec spec;
     spec.set_domain("pace.meta");
     spec.set_timeout(5000);
     spec.set_service_discovery_url("spectrum://v-zz?cache_time=30");
+    spec.set_media_type(kTairMemPoolMediaTypeSsd);
     const std::string json = spec.ToJsonString();
     EXPECT_NE(json.find("\"domain\":\"pace.meta\""), std::string::npos);
     EXPECT_NE(json.find("\"service_discovery_url\":\"spectrum://v-zz?cache_time=30\""), std::string::npos);
+    EXPECT_NE(json.find("\"media_type\":5"), std::string::npos);
     EXPECT_EQ(json.find("enable_vipserver"), std::string::npos);
     EXPECT_EQ(json.find("vipserver_domain"), std::string::npos);
 }
@@ -121,6 +195,7 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     spec.set_domain("pace.meta");
     spec.set_timeout(5000);
     spec.set_service_discovery_url("static://10.0.0.1:8080,10.0.0.2:8080");
+    spec.set_media_type(kTairMemPoolMediaTypeDram);
     const std::string json = spec.ToJsonString();
 
     TairMemPoolStorageSpec parsed;
@@ -128,4 +203,5 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.domain(), spec.domain());
     EXPECT_EQ(parsed.timeout(), spec.timeout());
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
+    EXPECT_EQ(parsed.media_type(), spec.media_type());
 }

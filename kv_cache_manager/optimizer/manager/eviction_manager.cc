@@ -24,7 +24,7 @@ bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
 }
 
 TieredPolicyGroup *
-OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
+OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptimizerReplayInstanceConfig &instance_config,
                                                     const std::vector<OptTierConfig> &storage_configs,
                                                     bool hierarchical_eviction_enabled) {
     auto it = instance_tiered_policy_map_.find(instance_config.instance_id());
@@ -69,9 +69,10 @@ OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &ins
     return &inserted_it->second;
 }
 
-OptEvictionManager::EvictionResult OptEvictionManager::EvictByMode(const std::string &instance_id,
-                                                                   const OptInstanceGroupConfig &instance_group_config,
-                                                                   int64_t eviction_timestamp) {
+OptEvictionManager::EvictionResult
+OptEvictionManager::EvictByMode(const std::string &instance_id,
+                                const OptimizerReplayInstanceGroupConfig &instance_group_config,
+                                int64_t eviction_timestamp) {
     EvictionResult result;
 
     if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
@@ -194,7 +195,7 @@ void OptEvictionManager::DemoteToNextTier(const std::string &instance_id,
 
 OptEvictionManager::EvictedBlocks
 OptEvictionManager::DispatchEviction(const std::string &instance_id,
-                                     const OptInstanceGroupConfig &instance_group_config,
+                                     const OptimizerReplayInstanceGroupConfig &instance_group_config,
                                      std::optional<size_t> tier_idx,
                                      size_t excess) {
     switch (eviction_config_.eviction_mode()) {
@@ -210,7 +211,7 @@ OptEvictionManager::DispatchEviction(const std::string &instance_id,
 }
 
 OptEvictionManager::EvictedBlocks OptEvictionManager::EvictByGroupRough(
-    const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess) {
+    const OptimizerReplayInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess) {
     EvictedBlocks evict_blocks;
     auto group_name = instance_group_config.group_name();
 
@@ -284,7 +285,7 @@ OptEvictionManager::EvictedBlocks OptEvictionManager::EvictByGroupRough(
 
 OptEvictionManager::EvictedBlocks
 OptEvictionManager::EvictByInstance(const std::string &instance_id,
-                                    const OptInstanceGroupConfig &instance_group_config,
+                                    const OptimizerReplayInstanceGroupConfig &instance_group_config,
                                     std::optional<size_t> tier_idx,
                                     size_t excess,
                                     bool precise) {
@@ -361,7 +362,8 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
 }
 
 std::unordered_map<std::string, std::vector<BlockEntry *>>
-OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
+OptEvictionManager::ActiveEvictExpired(const OptimizerReplayInstanceGroupConfig &instance_group_config,
+                                       int64_t current_timestamp) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> result;
 
     // TTL 是 block 级属性，过期时从所有 tier 中清除。
@@ -405,7 +407,7 @@ OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_gr
     return result;
 }
 
-size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,
+size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptimizerReplayInstanceGroupConfig &instance_group_config,
                                                      std::optional<size_t> tier_idx) const {
     size_t total_bytes = 0;
     for (const auto &instance_config : instance_group_config.instances()) {
@@ -426,7 +428,7 @@ size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfi
     return total_bytes;
 }
 
-size_t OptEvictionManager::GetExcessUsage(const OptInstanceGroupConfig &instance_group_config,
+size_t OptEvictionManager::GetExcessUsage(const OptimizerReplayInstanceGroupConfig &instance_group_config,
                                           std::optional<size_t> tier_idx) const {
     // group_capacity and tier capacity are stored in bytes
     int64_t capacity = 0;

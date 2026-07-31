@@ -44,6 +44,9 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(EC_OK, data_storage_manager.DisableStorage("storage1"));
     EXPECT_FALSE(data_storage_backend->Available());
     ASSERT_EQ(EC_NOENT, data_storage_manager.DisableStorage("storage2"));
+    auto disabled_create = data_storage_manager.Create(&request_context, "storage1", {"disabled_key"}, 128, []() {});
+    ASSERT_EQ(1u, disabled_create.size());
+    EXPECT_EQ(EC_NOENT, disabled_create[0].first);
 
     // enable storage
     ASSERT_EQ(EC_OK, data_storage_manager.EnableStorage("storage1"));
@@ -67,4 +70,18 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(EC_NOENT, data_storage_manager.UnRegisterStorage("storage2"));
     data_storage_backends = data_storage_manager.GetAvailableStorages();
     ASSERT_EQ(0, data_storage_backends.size());
+}
+
+TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+    RequestContext request_context("test");
+    std::vector<DataStorageUri> src_uris = {DataStorageUri("file://storage1/data/src1?size=128"),
+                                            DataStorageUri("file://storage1/data/src2?size=128")};
+    std::vector<DataStorageUri> dst_uris = {DataStorageUri("file://storage1/data/dst1?size=128")};
+
+    const auto results = data_storage_manager.Copy(&request_context, "storage1", src_uris, dst_uris);
+    ASSERT_EQ(src_uris.size(), results.size());
+    for (const auto ec : results) {
+        ASSERT_EQ(EC_BADARGS, ec);
+    }
 }

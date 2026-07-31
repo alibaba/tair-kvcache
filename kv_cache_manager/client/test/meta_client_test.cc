@@ -35,7 +35,8 @@ public:
             },
             "location_spec_groups": {
                 "group0": ["tp0"]
-            }
+            },
+            "default_query_type": 4
         })";
         init_params_.role_type = RoleType::HYBRID;
     }
@@ -69,7 +70,8 @@ public:
                  int32_t block_size,
                  const LocationSpecInfoMap &location_spec_infos,
                  const ModelDeployment &model_deployment,
-                 const LocationSpecGroups &location_spec_groups),
+                 const LocationSpecGroups &location_spec_groups,
+                 QueryType default_query_type),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, InstanceInfo>),
@@ -153,8 +155,14 @@ TEST_F(MetaClientTest, TestCreateSimple) {
     EXPECT_CALL(*mock_stub, AddConnection("127.0.0.1:8080", ::testing::_)).Times(1).WillOnce(::testing::Return(ER_OK));
     // 期望 RegisterInstance 被调用一次，参数不逐个校验（使用 _），返回 (ER_OK, "session_id")
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 QueryType::QT_PREFIX_MATCH_WITH_MAMBA))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
     auto ec = client->Init(client_config_, init_params_);
@@ -172,13 +180,25 @@ TEST_F(MetaClientTest, TestCreateWithLeaderMode) {
     // 当向从节点RegisterInstance时，会返回非主错误
     ::testing::Sequence call_register_seq;
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .InSequence(call_register_seq)
         .WillOnce(::testing::Return(std::make_pair(ER_SERVICE_NOT_LEADER, std::string("{}"))));
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .InSequence(call_register_seq)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
     auto ec = client->Init(client_config_, init_params_);
@@ -198,8 +218,14 @@ TEST_F(MetaClientTest, TestCreateWithAllNotLeader) {
     // 期望每次RegisterInstance都返回非Leader错误
     EXPECT_CALL(*mock_stub, RemoveAllConnections()).Times(2).WillRepeatedly(::testing::Return());
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .Times(2)
         .WillRepeatedly(::testing::Return(std::make_pair(ER_SERVICE_NOT_LEADER, std::string("{}"))));
 
@@ -235,8 +261,14 @@ TEST_F(MetaClientTest, TestCreateWithRegisterError) {
 
     // RegisterInstance返回内部错误
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_SERVICE_INTERNAL_ERROR, std::string("{}"))));
 
@@ -280,8 +312,14 @@ TEST_F(MetaClientTest, TestCreateSingleAddress) {
 
     // 期望只调用一次RegisterInstance并返回成功
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
 
@@ -296,8 +334,14 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
 
     EXPECT_CALL(*mock_stub, AddConnection("127.0.0.1:8080", ::testing::_)).Times(1).WillOnce(::testing::Return(ER_OK));
     EXPECT_CALL(*mock_stub,
-                RegisterInstance(
-                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
 

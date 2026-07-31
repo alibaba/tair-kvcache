@@ -457,10 +457,25 @@ class MyConverter(BaseConverter):
     def __init__(self, default_instance_id='instance',
                  instance_block_sizes=None, mode='optimizer', **kwargs):
         super().__init__(default_instance_id, instance_block_sizes, mode)
+        self.converter_config = kwargs.get('converter_config', {})
     
-    def convert(self, input_file: str, output_file: str) -> int:
-        """转换逻辑实现"""
-        pass
+    def convert_to_traces(self, input_file: str) -> list:
+        """读取输入并返回标准 trace dict 列表"""
+        traces = []
+        with open(input_file, 'r', encoding='utf-8') as f_in:
+            for line in f_in:
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                traces.append({
+                    'type': 'get',
+                    'instance_id': raw.get('instance_id', self.default_instance_id),
+                    'trace_id': raw['trace_id'],
+                    'timestamp_ns': raw['timestamp_ns'],
+                    'keys': raw['keys'],
+                    'input_len': raw['input_len'],
+                })
+        return traces
 ```
 
 **命名约定**：
@@ -482,6 +497,51 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f my \
 cp my_converter.py converters/
 python3 trace_converter.py -i input.jsonl -o output.jsonl -f my
 ```
+
+### Converter 专属配置
+
+框架支持把 JSON object 解析为 `converter_config` dict 传给 converter,用于内部或自定义 converter 扩展。公共 CLI 不需要知道这些参数的具体含义。
+
+```bash
+python3 trace_converter.py \
+    -i input.jsonl \
+    -o output.jsonl \
+    -f my \
+    --converter-module /path/to/my_converter.py \
+    --converter-config-file /path/to/converter_config.json
+```
+
+也可以直接传 inline JSON:
+
+```bash
+python3 trace_converter.py \
+    -i input.jsonl \
+    -o output.jsonl \
+    -f my \
+    --converter-module /path/to/my_converter.py \
+    --converter-config-json '{"field_name":"value"}'
+```
+
+### Converter 输出接口
+
+自定义 converter 至少实现以下接口之一:
+
+```python
+def convert_to_traces(self, input_file: str) -> list:
+    """返回 trace dict 列表,由 trace_converter.py 负责写 JSONL。"""
+```
+
+```python
+def convert_to_trace_jsonl(self, input_file: str, output_file: str) -> int:
+    """直接写出 JSONL,每行一个 trace dict。"""
+```
+
+`convert_to_trace_jsonl()` 适合大文件流式转换。它的返回值 contract:
+
+- 必须返回非负 `int`,表示写出的 trace 条数。
+- 返回其他类型或负数会被视为 converter contract 错误。
+- `trace_converter.py` 不会对该接口写出的单文件内容做额外排序或顺序校验;如果需要特定顺序,由 converter 实现自行保证。
+- `output_file` 可能是 `trace_converter.py` 管理的临时路径,成功返回后再原子替换到最终输出路径;converter 只应写入传入的 `output_file`。
 
 ### BaseConverter 提供的辅助方法
 

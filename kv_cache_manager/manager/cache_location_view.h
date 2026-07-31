@@ -59,6 +59,8 @@ private:
     CacheLocationVector raw_cache_locations_;
 };
 
+using BatchLocationsView = std::vector<CacheLocationViewVecWrapper>;
+
 class CacheMetaVecWrapper {
 public:
     CacheMetaVecWrapper();

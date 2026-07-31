@@ -27,10 +27,10 @@ OptTierConfig BuildOptimizerTier(const std::string &name, double capacity) {
     return tier;
 }
 
-OptInstanceConfig BuildOptimizerInstance(const std::string &instance_id,
-                                         const std::string &group_name,
-                                         const HierarchicalModelConfig &model) {
-    OptInstanceConfig instance;
+OptimizerReplayInstanceConfig BuildOptimizerInstance(const std::string &instance_id,
+                                                     const std::string &group_name,
+                                                     const HierarchicalModelConfig &model) {
+    OptimizerReplayInstanceConfig instance;
     instance.set_instance_id(instance_id);
     instance.set_instance_group_name(group_name);
     instance.set_block_size(model.block_size());
@@ -316,7 +316,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     engine_config.set_eviction_params(infer_eviction_config_);
     engine_config.set_trace_replay_config(trace_replay_config_);
 
-    std::vector<OptInstanceGroupConfig> engine_groups;
+    std::vector<OptimizerReplayInstanceGroupConfig> engine_groups;
     engine_to_storage_pool_.clear();
     std::unordered_set<std::string> engine_ids;
     for (const auto &infer_group : infer_clusters_) {
@@ -365,7 +365,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
                 return false;
             }
 
-            OptInstanceGroupConfig group;
+            OptimizerReplayInstanceGroupConfig group;
             group.set_group_name(infer_id);
             group.set_quota_capacity(GbToBytes(total_capacity));
             group.set_used_percentage(1.0);

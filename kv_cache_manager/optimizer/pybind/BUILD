@@ -49,7 +49,7 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = python_abi(),
     stamp = 1,
-    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}",
+    version = "{STABLE_KVCM_VERSION}+{STABLE_BUILD_TIMESTAMP}.{STABLE_GIT_COMMIT}",
     deps = [
         ":kvcm_py_optimizer_lib_pkg",
     ],

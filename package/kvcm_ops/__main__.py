@@ -25,14 +25,18 @@ COMMANDS = {
 
     "trace_key": "kvcm_ops.trace.trace_key",
     "trace_uri": "kvcm_ops.trace.trace_uri",
+
+    "config_server": "kvcm_ops.config_server",
 }
 
 HELP_MODULE = [
     "kvcm_ops.kvcm.instance._help",
     "kvcm_ops.kvcm.instance_group._help",
     "kvcm_ops.kvcm.storage._help",
-    "kvcm_ops.trace._help"
+    "kvcm_ops.trace._help",
+    "kvcm_ops.config_server._help",
 ]
+
 
 def main():
     help_message_list = []
@@ -73,9 +77,17 @@ def main():
     disable_storage
     update_storage
     remove_storage
+  storage types (for add_storage/update_storage):
+    nfs / pace / 3fs / event_report_l1p5 / event_report_l2
   trace:
     trace_key
     trace_uri
+  config_server:           (use: python3 -m kvcm_ops config_server <sub> ...)
+    create-zone              create a new zone
+    delete-zone              delete an existing zone
+    list-zones               list all zones on the server
+    instance_pin            (instance_pin mode)
+    server_capability       (detect server routing mode)
         '''
     )
     parser.add_argument(

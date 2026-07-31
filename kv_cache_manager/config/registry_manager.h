@@ -62,7 +62,8 @@ public:
                                int32_t block_size,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
-                               const std::vector<LocationSpecGroup> &location_spec_groups = {});
+                               const std::vector<LocationSpecGroup> &location_spec_groups = {},
+                               int32_t default_query_type = 0);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -81,6 +82,7 @@ public:
     ErrorCode LoadConfigSnapshot(RequestContext *request_context, const std::string &config_snapshot);
 
     std::shared_ptr<const CacheConfig> GetCacheConfig(const std::string &instance_group);
+    std::shared_ptr<const InstanceGroup> GetInstanceGroupConfig(const std::string &instance_group_name) const;
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;

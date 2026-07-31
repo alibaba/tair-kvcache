@@ -8,15 +8,18 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -31,12 +34,18 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/migration_strategy.h"
+#include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/config/trigger_strategy.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -103,6 +112,15 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credit_timeout_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_submit_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_complete_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_fail_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(migration_copy_submitted_total);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(migration_mark_submitted_total);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -112,6 +130,12 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_delete_handler_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_location_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_delete_bytes);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credited_delete_bytes);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(predicted_deleted_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us);
@@ -198,6 +222,244 @@ void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &
     grp_storage_usage_by_type_.at(idx) += value;
 }
 
+std::uint64_t CacheReclaimer::SaturatingSub(const std::uint64_t lhs, const std::uint64_t rhs) noexcept {
+    return lhs > rhs ? lhs - rhs : 0;
+}
+
+std::uint64_t CacheReclaimer::SaturatingAdd(const std::uint64_t lhs, const std::uint64_t rhs) noexcept {
+    const auto max = std::numeric_limits<std::uint64_t>::max();
+    return rhs > max - lhs ? max : lhs + rhs;
+}
+
+std::uint64_t CacheReclaimer::GetLocationBytes(const CacheLocation &location) noexcept {
+    std::uint64_t total = 0;
+    for (const auto &location_spec : location.location_specs()) {
+        DataStorageUri uri(location_spec.uri());
+        if (!uri.Valid()) {
+            continue;
+        }
+        std::uint64_t size = 0;
+        uri.GetParamAs<std::uint64_t>("size", size);
+        total = SaturatingAdd(total, size);
+    }
+    return total;
+}
+
+CacheReclaimer::BytesByStorageType
+CacheReclaimer::GetCreditedDeleteBytes(const std::string &instance_group) const noexcept {
+    const auto it = credited_delete_bytes_by_group_.find(instance_group);
+    return it == credited_delete_bytes_by_group_.end() ? BytesByStorageType{} : it->second;
+}
+
+std::uint64_t CacheReclaimer::GetPredictedDeletedKeys(const std::string &instance_group) const noexcept {
+    const auto it = predicted_deleted_keys_by_group_.find(instance_group);
+    return it == predicted_deleted_keys_by_group_.end() ? 0 : it->second;
+}
+
+void CacheReclaimer::AddDeleteHandlerState(const DeleteHandler &handler) noexcept {
+    for (const auto &pending_location : handler.pending_locations_) {
+        const auto [_, inserted] = pending_locations_.insert(pending_location);
+        if (!inserted) {
+            KVCM_LOG_ERROR("duplicate pending location admitted, instance[%s] block[%ld] location[%s]",
+                           pending_location.instance_id.c_str(),
+                           pending_location.block_key,
+                           pending_location.location_id.c_str());
+        }
+    }
+
+    for (std::size_t idx = 0; idx < handler.bytes_by_type_.size(); ++idx) {
+        const auto type = static_cast<DataStorageType>(idx);
+        if (type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN &&
+            type != DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS && handler.bytes_by_type_[idx] != 0) {
+            auto &credited_bytes = credited_delete_bytes_by_group_[handler.ins_gr_];
+            credited_bytes[idx] = SaturatingAdd(credited_bytes[idx], handler.bytes_by_type_[idx]);
+        }
+        if (handler.location_counts_by_type_[idx] == 0 && handler.bytes_by_type_[idx] == 0) {
+            continue;
+        }
+        auto &pending_quota = pending_quota_by_group_type_[{handler.ins_gr_, type}];
+        pending_quota.location_count =
+            SaturatingAdd(pending_quota.location_count, handler.location_counts_by_type_[idx]);
+        pending_quota.bytes = SaturatingAdd(pending_quota.bytes, handler.bytes_by_type_[idx]);
+    }
+    if (handler.predicted_deleted_keys_ != 0) {
+        auto &predicted_keys = predicted_deleted_keys_by_group_[handler.ins_gr_];
+        predicted_keys = SaturatingAdd(predicted_keys, handler.predicted_deleted_keys_);
+    }
+    pending_delete_handler_count_ = SaturatingAdd(pending_delete_handler_count_, 1);
+    for (const auto bytes : handler.bytes_by_type_) {
+        pending_delete_bytes_ = SaturatingAdd(pending_delete_bytes_, bytes);
+    }
+}
+
+void CacheReclaimer::DisableCredit(DeleteHandler &handler, const char *reason) noexcept {
+    if (!handler.credit_enabled_) {
+        return;
+    }
+
+    auto credited_it = credited_delete_bytes_by_group_.find(handler.ins_gr_);
+    if (credited_it != credited_delete_bytes_by_group_.end()) {
+        bool all_zero = true;
+        for (std::size_t idx = 0; idx < credited_it->second.size(); ++idx) {
+            credited_it->second[idx] = SaturatingSub(credited_it->second[idx], handler.bytes_by_type_[idx]);
+            all_zero = all_zero && credited_it->second[idx] == 0;
+        }
+        if (all_zero) {
+            credited_delete_bytes_by_group_.erase(credited_it);
+        }
+    }
+
+    auto predicted_it = predicted_deleted_keys_by_group_.find(handler.ins_gr_);
+    if (predicted_it != predicted_deleted_keys_by_group_.end()) {
+        predicted_it->second = SaturatingSub(predicted_it->second, handler.predicted_deleted_keys_);
+        if (predicted_it->second == 0) {
+            predicted_deleted_keys_by_group_.erase(predicted_it);
+        }
+    }
+
+    handler.credit_enabled_ = false;
+    if (reason != nullptr) {
+        const auto &request_context = handler.req_ctx_;
+        const std::string &ins_id = handler.ins_id_;
+        const std::string &ins_gr = handler.ins_gr_;
+        LOG_WITH_ID(WARN,
+                    "disable in-flight delete credit, reason: [%s], block count: [%" PRIu64
+                    "], location count: [%" PRIu64 "]",
+                    reason,
+                    handler.blk_count_,
+                    handler.loc_count_);
+    }
+}
+
+void CacheReclaimer::ReleaseDeleteHandlerState(DeleteHandler &handler) noexcept {
+    DisableCredit(handler, nullptr);
+
+    for (const auto &pending_location : handler.pending_locations_) {
+        pending_locations_.erase(pending_location);
+    }
+    for (std::size_t idx = 0; idx < handler.location_counts_by_type_.size(); ++idx) {
+        if (handler.location_counts_by_type_[idx] == 0 && handler.bytes_by_type_[idx] == 0) {
+            continue;
+        }
+        const auto key = GroupStorageTypeKey{handler.ins_gr_, static_cast<DataStorageType>(idx)};
+        auto pending_it = pending_quota_by_group_type_.find(key);
+        if (pending_it == pending_quota_by_group_type_.end()) {
+            continue;
+        }
+        pending_it->second.location_count =
+            SaturatingSub(pending_it->second.location_count, handler.location_counts_by_type_[idx]);
+        pending_it->second.bytes = SaturatingSub(pending_it->second.bytes, handler.bytes_by_type_[idx]);
+        if (pending_it->second.location_count == 0 && pending_it->second.bytes == 0) {
+            pending_quota_by_group_type_.erase(pending_it);
+        }
+    }
+    pending_delete_handler_count_ = SaturatingSub(pending_delete_handler_count_, 1);
+    for (const auto bytes : handler.bytes_by_type_) {
+        pending_delete_bytes_ = SaturatingSub(pending_delete_bytes_, bytes);
+    }
+}
+
+void CacheReclaimer::RecordPendingLimitReject(const std::string &instance_group,
+                                              const std::string &storage_type_scope) noexcept {
+    METRICS_(cache_reclaimer, pending_limit_reject_count) += 1;
+    if (metrics_registry_ == nullptr) {
+        return;
+    }
+    try {
+        metrics_registry_->GetCounter(
+            METRICS_NAME_(cache_reclaimer, pending_limit_reject_count),
+            MetricsTags{{"instance_group", instance_group}, {"storage_type", storage_type_scope}}) += 1;
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("record tagged pending-limit metric failed: %s", e.what());
+    } catch (...) { KVCM_LOG_WARN("record tagged pending-limit metric failed with unknown exception"); }
+}
+
+void CacheReclaimer::UpdateAsyncDeleteMetrics() noexcept {
+    std::uint64_t credited_bytes = 0;
+    for (const auto &[_, by_type] : credited_delete_bytes_by_group_) {
+        for (const auto bytes : by_type) {
+            credited_bytes = SaturatingAdd(credited_bytes, bytes);
+        }
+    }
+    std::uint64_t predicted_keys = 0;
+    for (const auto &[_, keys] : predicted_deleted_keys_by_group_) {
+        predicted_keys = SaturatingAdd(predicted_keys, keys);
+    }
+
+    std::uint64_t oldest_age_ms = 0;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto &handler : delete_handlers_) {
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - handler.submitted_at_).count();
+        if (age > 0) {
+            oldest_age_ms = std::max(oldest_age_ms, static_cast<std::uint64_t>(age));
+        }
+    }
+
+    METRICS_(cache_reclaimer, pending_delete_handler_count) = static_cast<double>(pending_delete_handler_count_);
+    METRICS_(cache_reclaimer, pending_location_count) = static_cast<double>(pending_locations_.size());
+    METRICS_(cache_reclaimer, pending_delete_bytes) = static_cast<double>(pending_delete_bytes_);
+    METRICS_(cache_reclaimer, credited_delete_bytes) = static_cast<double>(credited_bytes);
+    METRICS_(cache_reclaimer, predicted_deleted_key_count) = static_cast<double>(predicted_keys);
+    METRICS_(cache_reclaimer, oldest_pending_request_age_ms) = static_cast<double>(oldest_age_ms);
+
+    if (metrics_registry_ == nullptr) {
+        return;
+    }
+
+    std::set<GroupStorageTypeKey> current_group_type_keys;
+    for (const auto &[instance_group, by_type] : credited_delete_bytes_by_group_) {
+        for (std::size_t idx = 0; idx < by_type.size(); ++idx) {
+            if (by_type[idx] != 0) {
+                current_group_type_keys.insert(GroupStorageTypeKey{instance_group, static_cast<DataStorageType>(idx)});
+            }
+        }
+    }
+    for (const auto &[key, quota] : pending_quota_by_group_type_) {
+        if (quota.location_count != 0 || quota.bytes != 0) {
+            current_group_type_keys.insert(key);
+        }
+    }
+
+    auto group_type_keys_to_report = reported_group_type_metric_keys_;
+    group_type_keys_to_report.insert(current_group_type_keys.begin(), current_group_type_keys.end());
+    for (const auto &key : group_type_keys_to_report) {
+        const auto credited_it = credited_delete_bytes_by_group_.find(key.instance_group);
+        const auto type_idx = ToIndex(key.storage_type);
+        const std::uint64_t group_type_credit =
+            credited_it != credited_delete_bytes_by_group_.end() && type_idx < credited_it->second.size()
+                ? credited_it->second[type_idx]
+                : 0;
+        const auto quota_it = pending_quota_by_group_type_.find(key);
+        const PendingQuota quota = quota_it == pending_quota_by_group_type_.end() ? PendingQuota{} : quota_it->second;
+        const MetricsTags tags{{"instance_group", key.instance_group}, {"storage_type", ToString(key.storage_type)}};
+        metrics_registry_->GetGauge(METRICS_NAME_(cache_reclaimer, credited_delete_bytes), tags) =
+            static_cast<double>(group_type_credit);
+        metrics_registry_->GetGauge(METRICS_NAME_(cache_reclaimer, pending_location_count), tags) =
+            static_cast<double>(quota.location_count);
+        metrics_registry_->GetGauge(METRICS_NAME_(cache_reclaimer, pending_delete_bytes), tags) =
+            static_cast<double>(quota.bytes);
+    }
+    reported_group_type_metric_keys_ = std::move(current_group_type_keys);
+
+    std::set<std::string> current_group_keys;
+    for (const auto &[instance_group, keys] : predicted_deleted_keys_by_group_) {
+        if (keys != 0) {
+            current_group_keys.insert(instance_group);
+        }
+    }
+    auto group_keys_to_report = reported_group_metric_keys_;
+    group_keys_to_report.insert(current_group_keys.begin(), current_group_keys.end());
+    for (const auto &instance_group : group_keys_to_report) {
+        const auto predicted_it = predicted_deleted_keys_by_group_.find(instance_group);
+        const std::uint64_t group_predicted_keys =
+            predicted_it == predicted_deleted_keys_by_group_.end() ? 0 : predicted_it->second;
+        metrics_registry_->GetGauge(METRICS_NAME_(cache_reclaimer, predicted_deleted_key_count),
+                                    MetricsTags{{"instance_group", instance_group}}) =
+            static_cast<double>(group_predicted_keys);
+    }
+    reported_group_metric_keys_ = std::move(current_group_keys);
+}
+
 CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
     : general_water_level_exceed_(false), water_level_exceed_by_type_{} {
     water_level_exceed_by_type_.fill(false);
@@ -262,7 +524,9 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                                std::shared_ptr<MetricsRegistry> metrics_registry,
                                std::shared_ptr<EventManager> event_manager,
-                               std::shared_ptr<WriteLocationManager> write_location_manager)
+                               std::shared_ptr<WriteLocationManager> write_location_manager,
+                               CacheReclaimerAsyncDeleteConfig async_delete_config,
+                               std::shared_ptr<MigrationManager> migration_manager)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
@@ -270,6 +534,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , metrics_registry_(std::move(metrics_registry))
     , event_manager_(std::move(event_manager))
     , write_location_manager_(std::move(write_location_manager))
+    , migration_manager_(std::move(migration_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
@@ -277,6 +542,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , batching_size_(batching_size)
     , sleep_interval_ms_(sleep_interval_ms)
     , future_timeout_ms_(kFutureTimeoutMs)
+    , async_delete_config_(std::move(async_delete_config))
     , worker_stop_(false) {
     if (worker_size == 0) {
         worker_size = 1;
@@ -335,6 +601,15 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_submit_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_del_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_fail_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_copy_submitted_total);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_mark_submitted_total);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -344,6 +619,12 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_delete_handler_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_location_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(pending_delete_bytes);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(credited_delete_bytes);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(predicted_deleted_key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us);
@@ -478,6 +759,16 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         return nullptr;
     }
 
+    const auto credited_bytes = GetCreditedDeleteBytes(ins_gr);
+    std::uint64_t total_credited_bytes = 0;
+    for (const auto bytes : credited_bytes) {
+        total_credited_bytes = SaturatingAdd(total_credited_bytes, bytes);
+    }
+    const std::uint64_t effective_group_bytes =
+        SaturatingSub(static_cast<std::uint64_t>(data->grp_used_byte_sz_), total_credited_bytes);
+    const std::uint64_t effective_group_keys =
+        SaturatingSub(static_cast<std::uint64_t>(data->grp_used_key_cnt_), GetPredictedDeletedKeys(ins_gr));
+
     // 2. generate the result water level exceeding array
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
 
@@ -486,6 +777,15 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         const auto &type = storage_quota.storage_spec();
         if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
             // skip vcns_hf3fs, because it is treated as hf3fs
+            continue;
+        }
+
+        const std::size_t type_idx = ToIndex(ToBaseType(type));
+        const std::uint64_t type_credit = type_idx < credited_bytes.size() ? credited_bytes[type_idx] : 0;
+        const std::uint64_t effective_type_bytes =
+            SaturatingSub(static_cast<std::uint64_t>(data->GetGroupUsageByType(type)), type_credit);
+
+        if (effective_type_bytes == 0) {
             continue;
         }
 
@@ -499,7 +799,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
             continue;
         }
         if (const double storage_type_wl =
-                static_cast<double>(data->GetGroupUsageByType(type)) / static_cast<double>(storage_quota.capacity());
+                static_cast<double>(effective_type_bytes) / static_cast<double>(storage_quota.capacity());
             storage_type_wl + kEpsilon > threshold_used_percentage) {
             LOG_WITH_GR(DEBUG,
                         "instance group storage type [%d] capacity quota used percentage [%f] "
@@ -511,53 +811,55 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         }
     }
 
-    // 2.2. result for the entire instance group
-    if (data->grp_used_key_cnt_ == 0 || data->grp_used_byte_sz_ == 0) {
-        water_level_exceed->SetGeneralWaterLevelExceed(false);
-        return water_level_exceed;
-    }
+    // 2.2. result for the entire instance group. Byte and key-count
+    // credits are independent: credit reducing one dimension to zero
+    // must not suppress the other dimension's water-level check.
 
     // 2.2.1. trigger_strategy:used_percent for instance group quota capacity
-    if (instance_group_quota.capacity() <= 0) {
-        // proceed as group quota capacity is 0
-        LOG_WITH_GR(DEBUG,
-                    "instance group capacity quota used percentage [inf] "
-                    "has reached or exceeded the threshold percentage [%f]",
-                    threshold_used_percentage);
-        water_level_exceed->SetGeneralWaterLevelExceed(true);
-        return water_level_exceed;
-    }
-    if (const double group_used_percentage =
-            static_cast<double>(data->grp_used_byte_sz_) / static_cast<double>(instance_group_quota.capacity());
-        group_used_percentage + kEpsilon > threshold_used_percentage) {
-        LOG_WITH_GR(DEBUG,
-                    "instance group capacity quota used percentage [%f] "
-                    "has reached or exceeded the threshold percentage [%f]",
-                    group_used_percentage,
-                    threshold_used_percentage);
-        water_level_exceed->SetGeneralWaterLevelExceed(true);
-        return water_level_exceed;
+    if (effective_group_bytes > 0) {
+        if (instance_group_quota.capacity() <= 0) {
+            // proceed as group quota capacity is 0
+            LOG_WITH_GR(DEBUG,
+                        "instance group capacity quota used percentage [inf] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        threshold_used_percentage);
+            water_level_exceed->SetGeneralWaterLevelExceed(true);
+            return water_level_exceed;
+        }
+        if (const double group_used_percentage =
+                static_cast<double>(effective_group_bytes) / static_cast<double>(instance_group_quota.capacity());
+            group_used_percentage + kEpsilon > threshold_used_percentage) {
+            LOG_WITH_GR(DEBUG,
+                        "instance group capacity quota used percentage [%f] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        group_used_percentage,
+                        threshold_used_percentage);
+            water_level_exceed->SetGeneralWaterLevelExceed(true);
+            return water_level_exceed;
+        }
     }
 
     // 2.2.2. trigger_strategy:used_percent for group key count
-    if (data->grp_max_key_cnt_ == 0) {
-        LOG_WITH_GR(DEBUG,
-                    "instance group total key count used percentage [inf] "
-                    "has reached or exceeded the threshold percentage [%f]",
-                    threshold_used_percentage);
-        water_level_exceed->SetGeneralWaterLevelExceed(true);
-        return water_level_exceed;
-    }
-    if (const double group_used_percentage =
-            static_cast<double>(data->grp_used_key_cnt_) / static_cast<double>(data->grp_max_key_cnt_);
-        group_used_percentage + kEpsilon > threshold_used_percentage) {
-        LOG_WITH_GR(DEBUG,
-                    "instance group total key count used percentage [%f] "
-                    "has reached or exceeded the threshold percentage [%f]",
-                    group_used_percentage,
-                    threshold_used_percentage);
-        water_level_exceed->SetGeneralWaterLevelExceed(true);
-        return water_level_exceed;
+    if (effective_group_keys > 0) {
+        if (data->grp_max_key_cnt_ == 0) {
+            LOG_WITH_GR(DEBUG,
+                        "instance group total key count used percentage [inf] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        threshold_used_percentage);
+            water_level_exceed->SetGeneralWaterLevelExceed(true);
+            return water_level_exceed;
+        }
+        if (const double group_used_percentage =
+                static_cast<double>(effective_group_keys) / static_cast<double>(data->grp_max_key_cnt_);
+            group_used_percentage + kEpsilon > threshold_used_percentage) {
+            LOG_WITH_GR(DEBUG,
+                        "instance group total key count used percentage [%f] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        group_used_percentage,
+                        threshold_used_percentage);
+            water_level_exceed->SetGeneralWaterLevelExceed(true);
+            return water_level_exceed;
+        }
     }
 
     // 2.2.3. instance group do not trigger reclaiming
@@ -572,18 +874,18 @@ bool CacheReclaimer::IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed>
     return true;
 }
 
-void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
+bool CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
-        return;
+        return false;
     }
 
     if (instance_info == nullptr) {
         LOG_WITH_TRACE(WARN, "instance is nullptr");
-        return;
+        return false;
     }
 
     const std::string &ins_id = instance_info->instance_id();
@@ -597,7 +899,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     const std::int64_t begin_tp_sample = TimestampUtil::GetSteadyTimeUs();
     if (!DoKeySampling(request_context, instance_info, keys, maps)) {
         LOG_WITH_ID(DEBUG, "key sampling failed");
-        return;
+        return false;
     }
     METRICS_(cache_reclaimer, reclaim_lru_sample_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_sample);
@@ -615,13 +917,13 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     AgeStats lru_age_stats;
     if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys, lru_age_stats)) {
         LOG_WITH_ID(DEBUG, "make batch failed");
-        return;
+        return false;
     }
     METRICS_(cache_reclaimer, reclaim_lru_batch_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_batch);
     LOG_WITH_ID(DEBUG, "batch is made with size [%zu]", request.block_keys.size());
     if (request.block_keys.empty()) {
-        return;
+        return false;
     }
     METRICS_(cache_reclaimer, reclaim_batch_lru_age_min_us) = static_cast<double>(lru_age_stats.min_us);
     METRICS_(cache_reclaimer, reclaim_batch_lru_age_max_us) = static_cast<double>(lru_age_stats.max_us);
@@ -633,14 +935,20 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     //    are submitted to be deleted
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
     AgeStats create_age_stats;
+    BytesByStorageType bytes_by_type{};
+    CountsByStorageType location_counts_by_type{};
+    std::uint64_t predicted_deleted_keys = 0;
     if (!FilterLocID(request_context.get(),
                      instance_info,
                      request.block_keys,
                      water_level_exceed,
                      request.location_ids,
+                     bytes_by_type,
+                     location_counts_by_type,
+                     predicted_deleted_keys,
                      create_age_stats)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
-        return;
+        return false;
     }
     METRICS_(cache_reclaimer, reclaim_lru_filter_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_filter);
@@ -650,39 +958,43 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
     // 4. submit the final deleting request to the executor
     const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
-    SubmitDelReq(request_context, instance_info, request);
+    const bool submitted = SubmitDelReq(
+        request_context, instance_info, request, bytes_by_type, location_counts_by_type, predicted_deleted_keys);
     METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_submit);
 
-    METRICS_(cache_reclaimer, reclaim_job_count) += 1;
+    if (submitted) {
+        METRICS_(cache_reclaimer, reclaim_job_count) += 1;
+    }
+    return submitted;
 }
 
-void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
+bool CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
-        return;
+        return false;
     }
 
     // TODO: impl LFU policy
     LOG_WITH_TRACE(WARN, "LFU reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    return ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
 }
 
-void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
+bool CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
-        return;
+        return false;
     }
 
     // TODO: impl TTL policy
     LOG_WITH_TRACE(WARN, "TTL reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    return ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
 }
 
 void CacheReclaimer::ReclaimCron() noexcept {
@@ -703,7 +1015,15 @@ void CacheReclaimer::ReclaimCron() noexcept {
             }
         }
 
+        {
+            const std::int64_t res_begin_tp = TimestampUtil::GetSteadyTimeUs();
+            HandleDelRes();
+            METRICS_(cache_reclaimer, reclaim_res_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - res_begin_tp);
+        }
+
         if (IsPaused()) {
+            sleep_interval_ms = sleep_interval_ms_.load();
             continue;
         }
 
@@ -712,27 +1032,31 @@ void CacheReclaimer::ReclaimCron() noexcept {
         const auto [ec, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
         if (ec != ErrorCode::EC_OK) {
             LOG_WITH_TRACE(WARN, "list instance group failed, error code: [%d]", static_cast<std::int32_t>(ec));
+            sleep_interval_ms = sleep_interval_ms_.load();
             continue;
         }
 
-        bool triggered = false;
+        bool made_progress = false;
+        bool needs_no_progress_backoff = false;
         for (const auto &instance_group : instance_groups) {
-            if (TryReclaimOnGroup(request_context, instance_group)) {
-                triggered = true;
-            }
+            const auto result = TryReclaimOnGroup(request_context, instance_group);
+            made_progress = made_progress || result.made_progress;
+            needs_no_progress_backoff =
+                needs_no_progress_backoff || (result.water_level_exceeded && !result.made_progress);
         }
 
-        {
-            const std::int64_t res_begin_tp = TimestampUtil::GetSteadyTimeUs();
-            HandleDelRes();
-            METRICS_(cache_reclaimer, reclaim_res_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - res_begin_tp);
-        }
-
-        if (triggered) {
+        if (made_progress) {
+            UpdateAsyncDeleteMetrics();
             sleep_interval_ms = 0;
         } else {
             sleep_interval_ms = sleep_interval_ms_.load();
+            if (needs_no_progress_backoff) {
+                sleep_interval_ms = std::max<std::uint32_t>(sleep_interval_ms, 1);
+                METRICS_(cache_reclaimer, reclaim_no_progress_backoff_count) += 1;
+                LOG_WITH_TRACE(DEBUG,
+                               "reclaiming water level exceeded without accepted delete request; back off for [%u] ms",
+                               sleep_interval_ms);
+            }
         }
 
         METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
@@ -1001,9 +1325,33 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const std::vector<std::int64_t> &batch,
                                  const WaterLevelExceed &water_level_exceed,
                                  std::vector<std::vector<std::string>> &out_loc_ids,
-                                 AgeStats &out_create_age_stats) const noexcept {
+                                 BytesByStorageType &out_bytes_by_type,
+                                 CountsByStorageType &out_location_counts_by_type,
+                                 std::uint64_t &out_predicted_deleted_keys,
+                                 AgeStats &out_create_age_stats) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
+
+    out_loc_ids.clear();
+    out_bytes_by_type.fill(0);
+    out_location_counts_by_type.fill(0);
+    out_predicted_deleted_keys = 0;
+    out_create_age_stats = AgeStats{};
+
+    if (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
+        pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit) {
+        RecordPendingLimitReject(ins_gr, "process");
+        LOG_WITH_ID(WARN,
+                    "process pending delete limit reached, handlers: [%" PRIu64 "/%" PRIu64 "], bytes: [%" PRIu64
+                    "/%" PRIu64 "]",
+                    pending_delete_handler_count_,
+                    async_delete_config_.pending_delete_handler_limit,
+                    pending_delete_bytes_,
+                    async_delete_config_.pending_bytes_limit);
+        out_loc_ids.resize(batch.size());
+        out_create_age_stats.Clear();
+        return true;
+    }
 
     const auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(ins_id);
     if (meta_searcher == nullptr) {
@@ -1031,44 +1379,200 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
 
     // inspect the cache location status of each block and get the
     // filtered location ID vecs
+    const bool in_storage_type_eviction_zone = water_level_exceed.CheckStorageTypeWaterLevelExceed();
     out_loc_ids.reserve(loc_maps.size());
+
+    // 多层存储 keep_both 配套：构建"冷层" storage 集合（迁移策略的 target_storage）。
+    // 在"总水位超限"分支下，对同时拥有冷/热副本的 block 优先淘汰热(源)副本、保留冷副本，
+    // 避免 LRU 不分层导致先淘汰冷副本而使 keep_both 失去读加速收益。类型超限(硬驱逐)分支不参与。
+    std::unordered_set<std::string> cold_storages;
+    if (!in_storage_type_eviction_zone && registry_manager_ != nullptr) {
+        if (auto [ig_ec, ig] = registry_manager_->GetInstanceGroup(request_context, ins_gr);
+            ig_ec == ErrorCode::EC_OK && ig != nullptr && ig->cache_config() != nullptr) {
+            for (const auto &s : ig->cache_config()->migration_strategies()) {
+                if (s != nullptr && !s->target_storage_name().empty()) {
+                    cold_storages.insert(s->target_storage_name());
+                }
+            }
+        }
+    }
+    const auto loc_on_cold_storage = [&cold_storages](const CacheLocation &loc) -> bool {
+        if (cold_storages.empty() || loc.location_specs().empty()) {
+            return false;
+        }
+        const DataStorageUri uri(loc.location_specs().front().uri());
+        return cold_storages.count(uri.GetHostName()) > 0;
+    };
+    const auto is_pending_location = [this, &ins_id](const std::int64_t block_key,
+                                                     const std::string &location_id) -> bool {
+        return pending_locations_.find(PendingLocationKey{ins_id, block_key, location_id}) != pending_locations_.end();
+    };
+    const auto cold_locations_cover_specs = [&is_pending_location, &loc_on_cold_storage](
+                                                 const std::int64_t block_key,
+                                                 const CacheLocationMap &loc_map,
+                                                 const CacheLocation &source_loc) -> bool {
+        if (source_loc.location_specs().empty()) {
+            return false;
+        }
+        for (const auto &source_spec : source_loc.location_specs()) {
+            const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
+                const auto &loc_ptr = entry.second;
+                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
+                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
+                    return false;
+                }
+                return std::any_of(loc_ptr->location_specs().begin(),
+                                   loc_ptr->location_specs().end(),
+                                   [&source_spec](const auto &cold_spec) {
+                                       return cold_spec.name() == source_spec.name();
+                                   });
+            });
+            if (!covered) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t create_age_sum = 0;
     int64_t create_age_count = 0;
-    for (const auto &loc_map : loc_maps) {
+    std::uint64_t selected_total_bytes = 0;
+    for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
+        const auto &loc_map = loc_maps[block_idx];
+        const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
+        std::size_t valid_location_count = 0;
+
+        // 总水位超限分支：若 block 同时有冷层与非冷层(热/源)副本，则只淘汰已被冷层覆盖的热副本、保留冷副本。
+        bool keep_cold_evict_hot = false;
+        if (!in_storage_type_eviction_zone && !cold_storages.empty()) {
+            bool has_cold = false;
+            bool has_hot = false;
+            for (const auto &[_, loc_ptr] : loc_map) {
+                if (!loc_ptr) {
+                    continue;
+                }
+                const auto &loc = *loc_ptr;
+                if (is_pending_location(block_key, loc.id())) {
+                    continue;
+                }
+                const bool is_active_copy_target =
+                    loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
+                    migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
+                const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
+                                                 write_location_manager_ != nullptr &&
+                                                 !write_location_manager_->HasLocationId(loc.id()) &&
+                                                 !is_active_copy_target;
+                if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
+                    continue;
+                }
+                if (loc.status() == CacheLocationStatus::CLS_SERVING && loc_on_cold_storage(loc)) {
+                    has_cold = true;
+                } else if (loc.status() == CacheLocationStatus::CLS_SERVING) {
+                    has_hot = true;
+                }
+            }
+            keep_cold_evict_hot = has_cold && has_hot;
+        }
+
         for (const auto &[_, loc_ptr] : loc_map) {
             if (!loc_ptr) {
                 continue;
             }
+            ++valid_location_count;
             const auto &loc = *loc_ptr;
+            if (is_pending_location(block_key, loc.id())) {
+                METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
+                continue;
+            }
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
-            //    no longer active (orphaned after a server restart)
+            //    no longer active (orphaned after a server restart) and
+            //    it is not an active migration copy target.
+            const bool is_active_copy_target =
+                loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
+                migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
             const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
                                              write_location_manager_ != nullptr &&
-                                             !write_location_manager_->HasLocationId(loc.id());
+                                             !write_location_manager_->HasLocationId(loc.id()) &&
+                                             !is_active_copy_target;
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
-                bool selected = false;
-                if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
-                    // some storage type water level exceeded; only
-                    // collect the location with matched type but
-                    // fairness is ignored
+                bool selected_by_water_level = false;
+                if (in_storage_type_eviction_zone) {
+                    // some storage type water level exceeded; only collect the
+                    // location with matched type but fairness is ignored
                     // TODO (rui): implement the fair eviction
                     if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
-                        loc_id_vec.emplace_back(loc.id());
-                        selected = true;
+                        selected_by_water_level = true;
                     }
+                } else if (keep_cold_evict_hot && loc.status() == CacheLocationStatus::CLS_SERVING &&
+                           loc_on_cold_storage(loc)) {
+                    // 多副本 keep_both：保留冷层副本，不淘汰（优先腾出热层空间）。
+                } else if (keep_cold_evict_hot && loc.status() == CacheLocationStatus::CLS_SERVING &&
+                           !cold_locations_cover_specs(block_key, loc_map, loc)) {
+                    // spec group 场景下，只有当该热 location 的 specs 已被冷层 SERVING location 覆盖时才删热。
                 } else {
                     // there's no storage type water level exceeded
                     // and since the reclaiming is triggered, the total
                     // usage water level must be exceeded; ignore the
                     // type detection
-                    loc_id_vec.emplace_back(loc.id());
-                    selected = true;
+                    selected_by_water_level = true;
                 }
-                if (selected && loc.create_time() > 0) {
+                if (!selected_by_water_level) {
+                    continue;
+                }
+
+                const DataStorageType base_type = ToBaseType(loc.type());
+                const std::size_t type_idx = ToIndex(base_type);
+                if (type_idx >= out_bytes_by_type.size()) {
+                    LOG_WITH_ID(WARN, "skip location with invalid storage type index: [%zu]", type_idx);
+                    continue;
+                }
+
+                const auto quota_it = pending_quota_by_group_type_.find({ins_gr, base_type});
+                const PendingQuota current_quota =
+                    quota_it == pending_quota_by_group_type_.end() ? PendingQuota{} : quota_it->second;
+                const std::uint64_t location_bytes = GetLocationBytes(loc);
+
+                const bool location_limit_reached =
+                    current_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
+                    out_location_counts_by_type[type_idx] >=
+                        async_delete_config_.pending_location_limit_per_group_type -
+                            std::min(current_quota.location_count,
+                                     async_delete_config_.pending_location_limit_per_group_type);
+                const std::uint64_t current_and_selected_type_bytes =
+                    SaturatingAdd(current_quota.bytes, out_bytes_by_type[type_idx]);
+                const bool type_bytes_limit_reached =
+                    current_and_selected_type_bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
+                    location_bytes > async_delete_config_.pending_bytes_limit_per_group_type -
+                                         std::min(current_and_selected_type_bytes,
+                                                  async_delete_config_.pending_bytes_limit_per_group_type);
+                const std::uint64_t current_and_selected_process_bytes =
+                    SaturatingAdd(pending_delete_bytes_, selected_total_bytes);
+                const bool process_bytes_limit_reached =
+                    current_and_selected_process_bytes >= async_delete_config_.pending_bytes_limit ||
+                    location_bytes >
+                        async_delete_config_.pending_bytes_limit -
+                            std::min(current_and_selected_process_bytes, async_delete_config_.pending_bytes_limit);
+                if (location_limit_reached || type_bytes_limit_reached || process_bytes_limit_reached) {
+                    RecordPendingLimitReject(ins_gr, ToString(base_type));
+                    LOG_WITH_ID(WARN,
+                                "skip pending-limit location, block: [%ld], location: [%s], storage type: [%d], "
+                                "bytes: [%" PRIu64 "]",
+                                batch[block_idx],
+                                loc.id().c_str(),
+                                static_cast<int>(base_type),
+                                location_bytes);
+                    continue;
+                }
+
+                loc_id_vec.emplace_back(loc.id());
+                out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);
+                out_bytes_by_type[type_idx] = SaturatingAdd(out_bytes_by_type[type_idx], location_bytes);
+                selected_total_bytes = SaturatingAdd(selected_total_bytes, location_bytes);
+                if (loc.create_time() > 0) {
                     const int64_t age = now_us - loc.create_time();
                     out_create_age_stats.min_us = std::min(out_create_age_stats.min_us, age);
                     out_create_age_stats.max_us = std::max(out_create_age_stats.max_us, age);
@@ -1076,6 +1580,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     ++create_age_count;
                 }
             }
+        }
+        if (!loc_id_vec.empty() && loc_id_vec.size() == valid_location_count) {
+            out_predicted_deleted_keys = SaturatingAdd(out_predicted_deleted_keys, 1);
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
@@ -1087,47 +1594,367 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     return true;
 }
 
-void CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
-                                  const std::shared_ptr<const InstanceInfo> &instance_info,
-                                  const CacheLocationDelRequest &req) noexcept {
+void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                                       const std::shared_ptr<const InstanceGroup> &instance_group,
+                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
-        // fast exiting in the middle of one job round
+        return;
+    }
+    if (instance_group == nullptr || migration_manager_ == nullptr || registry_manager_ == nullptr) {
+        return;
+    }
+    const std::string &ins_gr = instance_group->name();
+
+    const auto cache_config = instance_group->cache_config();
+    if (cache_config == nullptr) {
+        return;
+    }
+    const auto &strategies = cache_config->migration_strategies();
+    if (strategies.empty()) {
+        return;
+    }
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        LOG_WITH_GR(WARN, "data storage manager is nullptr; skip migration");
+        return;
+    }
+    const auto usage = GetGroupUsageData(request_context.get(), instance_infos);
+    if (usage == nullptr) {
+        LOG_WITH_GR(WARN, "group usage data is nullptr; skip migration");
         return;
     }
 
-    assert(req.block_keys.size() == req.location_ids.size());
+    const auto &quota = instance_group->quota();
+    struct CachedMigrationBatch {
+        bool built = false;
+        bool ok = false;
+        std::vector<std::int64_t> batch;
+    };
+    std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
+    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const std::size_t max_concurrent_copy =
+        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+    // active Copy 与已排队/运行的异步 Prepare 一起用于提前剪枝，避免慢 Create 期间每轮 cron
+    // 都继续给同一 group 堆积新 Job；最终硬限制仍在 BatchSubmit 内原子执行。
+    const std::size_t active_copy = migration_manager_->ActiveTaskCountForGroup(ins_gr);
+    const std::size_t pending_prepare = migration_manager_->PendingAsyncMigrationPrepareCountForGroup(ins_gr);
+    constexpr auto kMaxSize = std::numeric_limits<std::size_t>::max();
+    const std::size_t estimated_inflight =
+        active_copy > kMaxSize - pending_prepare ? kMaxSize : active_copy + pending_prepare;
+    std::size_t available_copy_slots =
+        max_concurrent_copy > estimated_inflight ? max_concurrent_copy - estimated_inflight : 0;
+
+    for (const auto &strategy : strategies) {
+        if (strategy == nullptr) {
+            continue;
+        }
+        const std::string &src_name = strategy->source_storage_name();
+        const auto backend = data_storage_manager->GetDataStorageBackend(src_name);
+        if (backend == nullptr) {
+            LOG_WITH_GR(WARN, "migration source storage [%s] not found; skip", src_name.c_str());
+            continue;
+        }
+        const DataStorageType src_type = ToBaseType(backend->GetType());
+
+        // NOTE: reclaimer 水位粒度仅到存储 type（per-storage 容量/用量暂不可得，见 GetWaterLevelExceed
+        // 的 TODO），故迁移触发水位用 source storage 对应 type 的 type 级近似。
+        std::int64_t capacity = 0;
+        for (const auto &storage_quota : quota.quota_config()) {
+            if (storage_quota.storage_spec() == src_type) {
+                capacity = storage_quota.capacity();
+                break;
+            }
+        }
+        if (capacity <= 0) {
+            LOG_WITH_GR(DEBUG, "no positive capacity for source type of [%s]; skip migration", src_name.c_str());
+            continue;
+        }
+
+        const double water_level =
+            static_cast<double>(usage->GetGroupUsageByType(src_type)) / static_cast<double>(capacity);
+        const double migration_threshold = strategy->trigger_threshold();
+        if (water_level + kEpsilon <= migration_threshold) {
+            continue; // 低于迁移区间下界
+        }
+
+        const bool copy_enabled = strategy->methods().copy().enabled();
+        const bool mark_enabled = strategy->methods().mark().enabled();
+        if (!copy_enabled && !mark_enabled) {
+            continue;
+        }
+        if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
+            continue;
+        }
+
+        LOG_WITH_GR(DEBUG,
+                    "migration triggered: src_storage [%s] type [%d] wl [%f] migration_thr [%f] "
+                    "group_copy_concurrency [%zu] active_copy [%zu] pending_prepare [%zu] "
+                    "available_copy_slots [%zu]",
+                    src_name.c_str(),
+                    static_cast<std::int32_t>(src_type),
+                    water_level,
+                    migration_threshold,
+                    max_concurrent_copy,
+                    active_copy,
+                    pending_prepare,
+                    available_copy_slots);
+
+        for (const auto &instance_info : instance_infos) {
+            if (instance_info == nullptr) {
+                continue;
+            }
+            // Copy-only route 没有 fallback Mark 可做。异步化后无法在本线程获知每个 Job
+            // 实际提交了几个 Copy，因此按剩余 block slot 至多放行同样数量的 Prepare Job，
+            // 防止 group limit 很小时仍为大量 instance 排队做无效的 fresh meta read。
+            if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
+                break;
+            }
+            auto &cached = migration_batch_cache[instance_info->instance_id()];
+            if (!cached.built) {
+                cached.built = true;
+                cached.ok = BuildMigrationCandidateBatch(request_context, instance_info, cached.batch);
+            }
+            if (!cached.ok || cached.batch.empty()) {
+                continue;
+            }
+            const bool submitted = SubmitMigrationPrepareJob(request_context, instance_info, *strategy, cached.batch);
+            if (submitted && copy_enabled && !mark_enabled) {
+                --available_copy_slots;
+            }
+        }
+    }
+}
+
+bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
+                                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  std::vector<std::int64_t> &out_batch) noexcept {
+    out_batch.clear();
+    if (instance_info == nullptr) {
+        return false;
+    }
+
+    // 采样 + LRU 取最冷 batch（复用回收侧的采样与排序）。
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+    if (!DoKeySampling(request_context, instance_info, keys, maps)) {
+        return false;
+    }
+    AgeStats lru_age_stats;
+    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats)) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::vector<std::string>>
+CacheReclaimer::SnapshotPendingLocations(const std::string &instance_id,
+                                         const std::vector<std::int64_t> &batch) const {
+    std::vector<std::vector<std::string>> snapshot(batch.size());
+    for (std::size_t block_idx = 0; block_idx < batch.size(); ++block_idx) {
+        const auto block_key = batch[block_idx];
+        auto it = pending_locations_.lower_bound(PendingLocationKey{instance_id, block_key, ""});
+        while (it != pending_locations_.end() && it->instance_id == instance_id && it->block_key == block_key) {
+            snapshot[block_idx].push_back(it->location_id);
+            ++it;
+        }
+    }
+    return snapshot;
+}
+
+bool CacheReclaimer::SubmitMigrationPrepareJob(const std::shared_ptr<RequestContext> &request_context,
+                                               const std::shared_ptr<const InstanceInfo> &instance_info,
+                                               const MigrationStrategy &strategy,
+                                               const std::vector<std::int64_t> &batch) noexcept {
+    if (!IsRunning() || IsPaused()) {
+        return false;
+    }
+    if (instance_info == nullptr || migration_manager_ == nullptr) {
+        return false;
+    }
+    if (batch.empty()) {
+        return false;
+    }
+
+    const bool copy_enabled = strategy.methods().copy().enabled();
+    const bool mark_enabled = strategy.methods().mark().enabled();
+    if (!copy_enabled && !mark_enabled) {
+        return false;
+    }
 
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
+    const std::string &src_name = strategy.source_storage_name();
+    const std::string &dst_name = strategy.target_storage_name();
+
+    auto copy_counter = METRICS_(cache_reclaimer, migration_copy_submitted_total);
+    auto mark_counter = METRICS_(cache_reclaimer, migration_mark_submitted_total);
+    MigrationManager::AsyncMigrationPrepareJob job;
+    job.trace_id = request_context->trace_id();
+    job.instance_group_name = ins_gr;
+    job.instance_id = ins_id;
+    job.source_storage_name = src_name;
+    job.target_storage_name = dst_name;
+    job.block_keys = batch;
+    // pending_locations_ 由 Reclaimer cron 单线程维护。这里只复制与本 batch 相关的前缀范围；
+    // executor worker 不得读取 CacheReclaimer 的任何可变状态。
+    job.pending_location_ids_by_block = SnapshotPendingLocations(ins_id, batch);
+    job.on_dispatched = [copy_counter, mark_counter, ins_id, src_name, dst_name](
+                            const MigrationManager::DispatchBatchResult &dispatch) mutable {
+        if (dispatch.copy_submitted > 0) {
+            copy_counter += dispatch.copy_submitted;
+        }
+        if (dispatch.mark_submitted > 0) {
+            mark_counter += dispatch.mark_submitted;
+        }
+        KVCM_LOG_DEBUG("async migration dispatched: instance [%s] src [%s] dst [%s] "
+                       "copy_submitted [%lld] mark_submitted [%lld]",
+                       ins_id.c_str(),
+                       src_name.c_str(),
+                       dst_name.c_str(),
+                       static_cast<long long>(dispatch.copy_submitted),
+                       static_cast<long long>(dispatch.mark_submitted));
+    };
+    return migration_manager_->SubmitAsyncMigrationPrepare(std::move(job));
+}
+
+bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
+                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                  const CacheLocationDelRequest &req,
+                                  const BytesByStorageType &bytes_by_type,
+                                  const CountsByStorageType &location_counts_by_type,
+                                  const std::uint64_t predicted_deleted_keys) noexcept {
+    if (!IsRunning() || IsPaused()) {
+        // fast exiting in the middle of one job round
+        return false;
+    }
+
+    const std::string &ins_id = instance_info->instance_id();
+    const std::string &ins_gr = instance_info->instance_group_name();
+    if (req.block_keys.size() != req.location_ids.size()) {
+        LOG_WITH_ID(WARN,
+                    "skip invalid reclaim request: block key count [%zu] != location vector count [%zu]",
+                    req.block_keys.size(),
+                    req.location_ids.size());
+        return false;
+    }
 
     std::uint64_t blk_count = 0;
     std::uint64_t loc_count = 0;
+    CacheLocationDelRequest final_req{ins_id, {}, {}, req.delay};
+    std::vector<PendingLocationKey> pending_locations;
+    std::set<PendingLocationKey> request_pending_locations;
     for (std::size_t i = 0; i != req.block_keys.size(); ++i) {
         if (!req.location_ids[i].empty()) {
-            ++blk_count;
-            loc_count += req.location_ids[i].size();
+            blk_count = SaturatingAdd(blk_count, 1);
+            loc_count = SaturatingAdd(loc_count, req.location_ids[i].size());
+            final_req.block_keys.emplace_back(req.block_keys[i]);
+            final_req.location_ids.emplace_back(req.location_ids[i]);
+            for (const auto &location_id : req.location_ids[i]) {
+                PendingLocationKey pending_location{ins_id, req.block_keys[i], location_id};
+                if (!request_pending_locations.insert(pending_location).second) {
+                    LOG_WITH_ID(WARN,
+                                "skip reclaim request containing duplicate location, block: [%ld], location: [%s]",
+                                req.block_keys[i],
+                                location_id.c_str());
+                    return false;
+                }
+                if (pending_locations_.find(pending_location) != pending_locations_.end()) {
+                    METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
+                    LOG_WITH_ID(WARN,
+                                "skip reclaim request containing pending location, block: [%ld], location: [%s]",
+                                req.block_keys[i],
+                                location_id.c_str());
+                    return false;
+                }
+                pending_locations.emplace_back(std::move(pending_location));
+            }
         }
     }
 
-    auto fut = sched_plan_executor_->Submit(req);
-    delete_handlers_.emplace_front(request_context, ins_id, ins_gr, blk_count, loc_count, std::move(fut));
+    if (blk_count == 0 || loc_count == 0) {
+        LOG_WITH_ID(DEBUG, "skip empty reclaim request");
+        return false;
+    }
+    if (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit) {
+        RecordPendingLimitReject(ins_gr, "process");
+        LOG_WITH_ID(WARN, "skip reclaim request: process pending handler limit reached");
+        return false;
+    }
+
+    std::uint64_t request_bytes = 0;
+    for (std::size_t idx = 0; idx < bytes_by_type.size(); ++idx) {
+        request_bytes = SaturatingAdd(request_bytes, bytes_by_type[idx]);
+        if (location_counts_by_type[idx] == 0 && bytes_by_type[idx] == 0) {
+            continue;
+        }
+        const auto type = static_cast<DataStorageType>(idx);
+        const auto pending_it = pending_quota_by_group_type_.find({ins_gr, type});
+        const PendingQuota pending_quota =
+            pending_it == pending_quota_by_group_type_.end() ? PendingQuota{} : pending_it->second;
+        if (pending_quota.location_count >= async_delete_config_.pending_location_limit_per_group_type ||
+            location_counts_by_type[idx] > async_delete_config_.pending_location_limit_per_group_type -
+                                               std::min(pending_quota.location_count,
+                                                        async_delete_config_.pending_location_limit_per_group_type) ||
+            pending_quota.bytes >= async_delete_config_.pending_bytes_limit_per_group_type ||
+            bytes_by_type[idx] >
+                async_delete_config_.pending_bytes_limit_per_group_type -
+                    std::min(pending_quota.bytes, async_delete_config_.pending_bytes_limit_per_group_type)) {
+            RecordPendingLimitReject(ins_gr, ToString(type));
+            LOG_WITH_ID(WARN, "skip reclaim request: group/type pending limit reached for type [%zu]", idx);
+            return false;
+        }
+    }
+    if (pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit ||
+        request_bytes > async_delete_config_.pending_bytes_limit -
+                            std::min(pending_delete_bytes_, async_delete_config_.pending_bytes_limit)) {
+        RecordPendingLimitReject(ins_gr, "process");
+        LOG_WITH_ID(WARN, "skip reclaim request: process pending bytes limit reached");
+        return false;
+    }
+
+    auto submit_result = sched_plan_executor_->SubmitAsync(final_req);
+    if (!submit_result.accepted) {
+        LOG_WITH_ID(WARN, "schedule plan executor rejected async reclaim request");
+        return false;
+    }
+
+    const auto submitted_at = std::chrono::steady_clock::now();
+    const auto non_negative_delay = std::max(final_req.delay, std::chrono::microseconds::zero());
+    const auto credit_deadline =
+        submitted_at + non_negative_delay + std::chrono::milliseconds(async_delete_config_.inflight_delete_timeout_ms);
+    delete_handlers_.emplace_front(request_context,
+                                   ins_id,
+                                   ins_gr,
+                                   blk_count,
+                                   loc_count,
+                                   std::move(pending_locations),
+                                   bytes_by_type,
+                                   location_counts_by_type,
+                                   predicted_deleted_keys,
+                                   submitted_at,
+                                   credit_deadline,
+                                   std::move(submit_result.future));
+    AddDeleteHandlerState(delete_handlers_.front());
 
     METRICS_(cache_reclaimer, block_submit_count) += blk_count;
     METRICS_(cache_reclaimer, location_submit_count) += loc_count;
+    METRICS_(cache_reclaimer, delete_submit_count) += 1;
 
-    if (event_manager_ != nullptr && blk_count != 0 && loc_count != 0) {
+    if (event_manager_ != nullptr) {
         auto reclaim_submit_event = std::make_shared<CacheReclaimSubmitEvent>(ins_id);
         reclaim_submit_event->SetEventTriggerTime();
-        reclaim_submit_event->SetAdditionalArgs(req.block_keys, req.location_ids, req.delay.count());
+        reclaim_submit_event->SetAdditionalArgs(final_req.block_keys, final_req.location_ids, final_req.delay.count());
         event_manager_->Publish(reclaim_submit_event);
     }
 
     LOG_WITH_ID(DEBUG,
                 "submit reclaim request to schedule plan executor OK, "
                 "with effective cache block count: [%" PRIu64 "], "
-                "cache location count: [%" PRIu64 "]",
+                "cache location count: [%" PRIu64 "], bytes: [%" PRIu64 "]",
                 blk_count,
-                loc_count);
+                loc_count,
+                request_bytes);
+    return true;
 }
 
 std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageData(
@@ -1158,16 +1985,13 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
         data->grp_max_key_cnt_ += ins_max_key_cnt;
         data->grp_used_byte_sz_ += ins_used_byte_size;
 
-        // calc the usage size of each storage type of this instance
-        auto calc_sz = [&meta_indexer, &data](const DataStorageType &type) -> void {
-            const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
-            data->AddGroupUsageByType(type, sz);
-        };
-        calc_sz(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
-        calc_sz(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
-        calc_sz(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
-        calc_sz(DataStorageType::DATA_STORAGE_TYPE_NFS);
-        // vcns_hf3fs is merged into hf3fs, no need to calc the size
+        for (std::size_t idx = 1; idx < static_cast<std::size_t>(DataStorageType::COUNT); ++idx) {
+            const auto type = static_cast<DataStorageType>(idx);
+            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+                continue;
+            }
+            data->AddGroupUsageByType(type, meta_indexer->GetStorageUsageByType(type));
+        }
     }
     return data;
 }
@@ -1181,11 +2005,26 @@ void CacheReclaimer::HandleDelRes() noexcept {
         const std::string &ins_gr = it->ins_gr_;
 
         if (!it->fut_.valid()) {
-            LOG_WITH_ID(WARN, "reclaim request got invalid future");
-            it = delete_handlers_.erase_after(it_pre);
-        } else if (const auto fs = it->fut_.wait_for(std::chrono::seconds::zero()); fs == std::future_status::ready) {
+            if (!it->outcome_unknown_reported_) {
+                LOG_WITH_ID(WARN,
+                            "reclaim request got invalid future; preserve pending locations and hard-limit quota");
+                it->outcome_unknown_reported_ = true;
+            }
+            DisableCredit(*it, "invalid future");
+            ++it_pre;
+            ++it;
+            continue;
+        }
+
+        const auto future_status = it->fut_.wait_for(std::chrono::seconds::zero());
+        if (future_status == std::future_status::ready) {
+            bool terminal = false;
+            ErrorCode result_code = ErrorCode::EC_ERROR;
             try {
-                if (const auto [ec, err_msg] = it->fut_.get(); ec != ErrorCode::EC_OK) {
+                const auto [ec, err_msg] = it->fut_.get();
+                terminal = true;
+                result_code = ec;
+                if (ec != ErrorCode::EC_OK) {
                     LOG_WITH_ID(WARN,
                                 "reclaim request execute failed, error_code: [%d], error message: [%s]",
                                 static_cast<std::int32_t>(ec),
@@ -1201,33 +2040,64 @@ void CacheReclaimer::HandleDelRes() noexcept {
                                 it->loc_count_);
                 }
             } catch (const std::exception &e) {
-                LOG_WITH_ID(WARN, "reclaim request finished with exception: [%s]", e.what());
+                if (!it->outcome_unknown_reported_) {
+                    LOG_WITH_ID(WARN,
+                                "reclaim request future outcome unknown: [%s]; preserve pending locations and quota",
+                                e.what());
+                    it->outcome_unknown_reported_ = true;
+                }
             } catch (...) {
-                // make sure no exception can possibly escape
+                if (!it->outcome_unknown_reported_) {
+                    LOG_WITH_ID(WARN, "reclaim request future outcome unknown; preserve pending locations and quota");
+                    it->outcome_unknown_reported_ = true;
+                }
             }
 
-            // eliminate this handler anyway, by erasing and updating
-            // the iterator ``it''; ``it_pre'' remains unchanged
+            if (!terminal) {
+                DisableCredit(*it, "broken or exceptional future");
+                ++it_pre;
+                ++it;
+                continue;
+            }
+
+            METRICS_(cache_reclaimer, delete_complete_count) += 1;
+            if (result_code != ErrorCode::EC_OK) {
+                METRICS_(cache_reclaimer, delete_fail_count) += 1;
+            }
+            ReleaseDeleteHandlerState(*it);
             it = delete_handlers_.erase_after(it_pre);
-        } else {
-            // handle other std::future_status possible:
-            // - std::future_status:deferred
-            // - std::future_status:timeout
-            ++it_pre, ++it;
+            continue;
         }
+
+        if (future_status == std::future_status::deferred) {
+            if (!it->outcome_unknown_reported_) {
+                LOG_WITH_ID(WARN,
+                            "reclaim request got deferred future; preserve pending locations and hard-limit quota");
+                it->outcome_unknown_reported_ = true;
+            }
+            DisableCredit(*it, "deferred future");
+        } else if (it->credit_enabled_ && std::chrono::steady_clock::now() >= it->credit_deadline_) {
+            METRICS_(cache_reclaimer, credit_timeout_count) += 1;
+            DisableCredit(*it, "credit deadline exceeded");
+        }
+        ++it_pre;
+        ++it;
     }
+    UpdateAsyncDeleteMetrics();
 }
 
-bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
-                                       const std::shared_ptr<const InstanceGroup> &instance_group) noexcept {
+CacheReclaimer::ReclaimResult
+CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                                  const std::shared_ptr<const InstanceGroup> &instance_group) noexcept {
+    ReclaimResult result;
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
-        return false;
+        return result;
     }
 
     if (instance_group == nullptr) {
         LOG_WITH_TRACE(WARN, "instance group is nullptr");
-        return false;
+        return result;
     }
 
     const std::string &ins_gr = instance_group->name();
@@ -1235,13 +2105,13 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     const auto cache_config = instance_group->cache_config();
     if (cache_config == nullptr) {
         LOG_WITH_GR(WARN, "cache config is nullptr");
-        return false;
+        return result;
     }
 
     const auto &reclaim_strategy = cache_config->reclaim_strategy();
     if (reclaim_strategy == nullptr) {
         LOG_WITH_GR(WARN, "reclaim strategy is nullptr");
-        return false;
+        return result;
     }
     const std::int32_t delay_before_delete_ms = reclaim_strategy->delay_before_delete_ms();
 
@@ -1249,74 +2119,55 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     const auto [ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), ins_gr);
     if (ec != ErrorCode::EC_OK) {
         LOG_WITH_GR(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec));
-        return false;
+        return result;
     }
 
-    // do we need to reclaim the storage for this instance group?
-    const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-    const auto water_level_exceed =
-        GetWaterLevelExceed(request_context.get(),
-                            ins_gr,
-                            instance_group->quota(), // TODO (rui): validate the quota is valid
-                            reclaim_strategy,
-                            instance_infos);
-    METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
-        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
+    for (const auto &instance_info : instance_infos) {
+        const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
+        const auto water_level_exceed = GetWaterLevelExceed(
+            request_context.get(), ins_gr, instance_group->quota(), reclaim_strategy, instance_infos);
+        METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
+            static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
+        if (!IsTriggerReclaiming(water_level_exceed)) {
+            if (!result.water_level_exceeded) {
+                LOG_WITH_GR(DEBUG, "instance group does not trigger reclaiming");
+            } else {
+                LOG_WITH_GR(DEBUG, "instance group water level satisfied by in-flight delete credit");
+            }
+            break;
+        }
 
-    if (!IsTriggerReclaiming(water_level_exceed)) {
-        LOG_WITH_GR(DEBUG, "instance group does not trigger reclaiming");
-        return false;
+        result.water_level_exceeded = true;
+        const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
+        bool submitted = false;
+        switch (reclaim_strategy->reclaim_policy()) {
+        case ReclaimPolicy::POLICY_LFU:
+            submitted = ReclaimByLFU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            break;
+        case ReclaimPolicy::POLICY_TTL:
+            submitted = ReclaimByTTL(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            break;
+        case ReclaimPolicy::POLICY_UNSPECIFIED:
+        case ReclaimPolicy::POLICY_LRU:
+        default:
+            submitted = ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            break;
+        }
+        METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+            static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
+        result.made_progress = result.made_progress || submitted;
     }
 
-    LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
-
-    // run the reclaiming algorithm with the chosen policy
-    switch (reclaim_strategy->reclaim_policy()) {
-    case ReclaimPolicy::POLICY_LRU:
-        LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
-        for (const auto &instance_info : instance_infos) {
-            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
-            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
-        }
-        break;
-
-    case ReclaimPolicy::POLICY_LFU:
-        LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
-        for (const auto &instance_info : instance_infos) {
-            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLFU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
-            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
-        }
-        break;
-
-    case ReclaimPolicy::POLICY_TTL:
-        LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
-        for (const auto &instance_info : instance_infos) {
-            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByTTL(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
-            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
-        }
-        break;
-
-    case ReclaimPolicy::POLICY_UNSPECIFIED: // default to LRU
-        LOG_WITH_GR(DEBUG, "reclaim policy not specified; default to LRU policy");
-        // break; skipped intentionally
-
-    default:
-        for (const auto &instance_info : instance_infos) {
-            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
-            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
-        }
-        break;
+    // Reclaim admission precedes migration preparation in the same cron round. An accepted
+    // delete is synchronously recorded in pending_locations_, so the migration job snapshot
+    // excludes that exact location before asynchronous Create/Copy starts. This only orders
+    // admission; it does not wait for physical deletion. Migration still runs independently
+    // when its lower watermark is reached before the reclaim threshold.
+    if (migration_manager_ != nullptr && !cache_config->migration_strategies().empty()) {
+        TryMigrateOnGroup(request_context, instance_group, instance_infos);
     }
 
-    return true;
+    return result;
 }
 
 CacheReclaimer::DeleteHandler::DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
@@ -1324,12 +2175,26 @@ CacheReclaimer::DeleteHandler::DeleteHandler(std::shared_ptr<RequestContext> req
                                              std::string ins_gr,
                                              const std::uint64_t blk_count,
                                              const std::uint64_t loc_count,
+                                             std::vector<PendingLocationKey> pending_locations,
+                                             BytesByStorageType bytes_by_type,
+                                             CountsByStorageType location_counts_by_type,
+                                             const std::uint64_t predicted_deleted_keys,
+                                             const std::chrono::steady_clock::time_point submitted_at,
+                                             const std::chrono::steady_clock::time_point credit_deadline,
                                              std::future<PlanExecuteResult> fut)
     : req_ctx_(std::move(req_ctx))
     , ins_id_(std::move(ins_id))
     , ins_gr_(std::move(ins_gr))
     , blk_count_(blk_count)
     , loc_count_(loc_count)
+    , pending_locations_(std::move(pending_locations))
+    , bytes_by_type_(std::move(bytes_by_type))
+    , location_counts_by_type_(std::move(location_counts_by_type))
+    , predicted_deleted_keys_(predicted_deleted_keys)
+    , submitted_at_(submitted_at)
+    , credit_deadline_(credit_deadline)
+    , credit_enabled_(true)
+    , outcome_unknown_reported_(false)
     , fut_(std::move(fut)) {}
 
 void CacheReclaimer::WorkerRoutine() {

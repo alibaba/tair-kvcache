@@ -132,6 +132,12 @@ public:
         ss << std::hex << value;
         return ss.str();
     }
+
+    // Parse a comma-separated string of bucket boundaries into a sorted vector of doubles.
+    // Validation: each token must be a fully-consumed, positive, finite number.
+    // Tokens must be in strictly ascending order. Empty tokens (e.g. "1,,5" or "1,5,") are rejected.
+    // Returns empty vector on any validation failure or empty input.
+    static std::vector<double> ParseBucketBoundaries(const std::string &buckets_str);
 };
 
 } // namespace kv_cache_manager

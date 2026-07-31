@@ -283,7 +283,13 @@ void DumpToFd(int fd, int sig, siginfo_t *info, void *const *frames, int depth) 
     WriteAll(fd, buf, n);
     WriteStr(fd, " ***\n");
 
-    WriteStr(fd, "version: " KVCM_FULL_VERSION " (commit " KVCM_GIT_COMMIT ", built " KVCM_BUILD_TIME ")\n");
+    WriteStr(fd, "version: ");
+    WriteStr(fd, kKvcmFullVersion);
+    WriteStr(fd, " (commit ");
+    WriteStr(fd, kKvcmGitCommit);
+    WriteStr(fd, ", built ");
+    WriteStr(fd, kKvcmBuildTime);
+    WriteStr(fd, ")\n");
 
     if (info) {
         WriteStr(fd, "si_code: ");

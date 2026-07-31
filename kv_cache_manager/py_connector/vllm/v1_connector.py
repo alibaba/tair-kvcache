@@ -36,7 +36,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer, TpCoordinatorServer, \
     TpCoordinatorClient, SendBlockStartEvent, CoordinateMessage, SaveContext
-from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
 from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
 from kv_cache_manager.py_connector.common.types import KVCacheInfo
@@ -126,7 +126,12 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
 
-        self._extra_config = TairKvCacheConnectorExtraConfig(vllm_config.kv_transfer_config.kv_connector_extra_config)
+        connector_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._extra_config = TairKvCacheConnectorExtraConfig(connector_extra_config)
+
+        # Apply log level with priority: env var > startup param > default
+        configure_log_level(self._extra_config.log_level)
+
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
         self._local_block_size = vllm_config.cache_config.block_size
 
@@ -160,14 +165,8 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         }
         logger.info(deployment)
 
-        self._manager_client = KvCacheManagerClient(
-            self._extra_config.manager_uri,
-            instance_id=self._extra_config.instance_id,
-            auto_discover_leader=self._extra_config.auto_discover_leader,
-            leader_retry_count=self._extra_config.leader_retry_count,
-            leader_retry_base_interval_seconds=self._extra_config.leader_retry_base_interval_seconds,
-            discovery_refresh_interval_seconds=self._extra_config.discovery_refresh_interval_seconds,
-            min_discover_interval_seconds=self._extra_config.min_discover_interval_seconds,
+        self._manager_client = KvCacheManagerClient.from_connector_config(
+            vars(self._extra_config)
         )
         self._manager_block_size = manager_block_size
 

@@ -27,6 +27,19 @@ cc_test(
 )
 
 cc_test(
+    name = "migration_strategy_test",
+    srcs = [
+        "migration_strategy_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+    ],
+)
+
+cc_test(
     name = "registry_manager_redis_backend_test",
     srcs = [
         "registry_manager_redis_backend_test.cc",
@@ -69,6 +82,21 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "instance_group_test",
+    srcs = [
+        "instance_group_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
+    ],
+)
+
 cc_library(
     name = "coordination_backend_test_base",
     testonly = True,
@@ -95,6 +123,22 @@ cc_test(
     ],
     deps = [
         ":coordination_backend_test_base",
+        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+    ],
+)
+
+cc_test(
+    name = "coordination_redis_backend_prefix_test",
+    srcs = [
+        "coordination_redis_backend_prefix_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
     ],

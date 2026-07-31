@@ -286,6 +286,19 @@ TEST_F(GrpcStubTest, TestRegisterInstance) {
     ASSERT_EQ(expected,
               stub_->RegisterInstance(
                   "trace2", "default", "instance2", 64, createLocationSpecInfos(4), createModelDeployment(4), {}));
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance("trace3",
+                                      "default",
+                                      "instance3",
+                                      64,
+                                      createLocationSpecInfos(),
+                                      createModelDeployment(),
+                                      {},
+                                      QueryType::QT_PREFIX_MATCH_WITH_MAMBA));
+
+    auto [ec, instance_info] = stub_->GetInstanceInfo("trace4", "instance3");
+    ASSERT_EQ(ER_OK, ec);
+    ASSERT_EQ(static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_MAMBA), instance_info.default_query_type());
 }
 
 TEST_F(GrpcStubTest, TestStartWriteCache) {

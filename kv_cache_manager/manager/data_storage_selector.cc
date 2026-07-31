@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -346,6 +347,128 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     result.type = chosen_backend->GetType();
     result.name = chosen_backend->GetStorageConfig().global_unique_name();
     return result;
+}
+
+std::vector<StorageTargetAdmissionResult>
+DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
+                                               const std::string &instance_group,
+                                               const std::vector<std::string> &target_storage_names) const noexcept {
+    std::vector<StorageTargetAdmissionResult> results(target_storage_names.size());
+    if (target_storage_names.empty()) {
+        return results;
+    }
+    if (request_context == nullptr || instance_group.empty() || meta_indexer_manager_ == nullptr ||
+        registry_manager_ == nullptr) {
+        return results;
+    }
+    const auto &trace_id = request_context->trace_id();
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        return results;
+    }
+
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec != EC_OK || group == nullptr) {
+        PREFIX_LOG(WARN, "explicit target admission failed to read instance group: %s", instance_group.c_str());
+        return results;
+    }
+    const auto [instances_ec, instance_infos] =
+        registry_manager_->ListInstanceInfo(request_context, instance_group);
+    if (instances_ec != EC_OK) {
+        PREFIX_LOG(WARN, "explicit target admission failed to list instances: %s", instance_group.c_str());
+        return results;
+    }
+
+    using UsageArray = std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
+    UsageArray usage_by_type{};
+    std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> quota_type_needed{};
+    const auto &quota = group->quota();
+    for (const auto &storage_quota : quota.quota_config()) {
+        const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
+        if (type_idx < quota_type_needed.size()) {
+            quota_type_needed[type_idx] = true;
+        }
+    }
+
+    auto saturating_add = [](std::uint64_t &sum, const std::uint64_t value) {
+        sum = value > std::numeric_limits<std::uint64_t>::max() - sum
+                  ? std::numeric_limits<std::uint64_t>::max()
+                  : sum + value;
+    };
+    std::uint64_t group_used_bytes = 0;
+    for (const auto &instance_info : instance_infos) {
+        if (instance_info == nullptr) {
+            PREFIX_LOG(WARN, "explicit target admission encountered a null instance");
+            return results;
+        }
+        const auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+        if (meta_indexer == nullptr) {
+            PREFIX_LOG(WARN,
+                       "explicit target admission found no meta indexer for instance: %s",
+                       instance_info->instance_id().c_str());
+            return results;
+        }
+        // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+        // from this admission path: persistence does not refresh these values and may add backend I/O.
+        saturating_add(group_used_bytes, meta_indexer->GetStorageUsage());
+        for (std::size_t type_idx = 0; type_idx < quota_type_needed.size(); ++type_idx) {
+            if (!quota_type_needed[type_idx]) {
+                continue;
+            }
+            saturating_add(usage_by_type[type_idx],
+                           meta_indexer->GetStorageUsageByType(static_cast<DataStorageType>(type_idx)));
+        }
+    }
+
+    const bool group_quota_exceeded =
+        quota.capacity() < 0 || group_used_bytes >= static_cast<std::uint64_t>(quota.capacity());
+    std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> type_quota_exceeded{};
+    for (const auto &storage_quota : quota.quota_config()) {
+        const auto type_idx = ToIndex(ToBaseType(storage_quota.storage_spec()));
+        if (type_idx >= type_quota_exceeded.size()) {
+            continue;
+        }
+        if (storage_quota.capacity() < 0 ||
+            usage_by_type[type_idx] >= static_cast<std::uint64_t>(storage_quota.capacity())) {
+            type_quota_exceeded[type_idx] = true;
+        }
+    }
+
+    for (std::size_t i = 0; i < target_storage_names.size(); ++i) {
+        auto &result = results[i];
+        const auto &target = target_storage_names[i];
+        const auto backend = data_storage_manager->GetDataStorageBackend(target);
+        if (backend == nullptr) {
+            result.status = StorageTargetAdmissionStatus::kNotFound;
+            result.ec = EC_NOENT;
+            continue;
+        }
+        result.type = backend->GetType();
+        if (!backend->Available()) {
+            result.status = StorageTargetAdmissionStatus::kUnavailable;
+            result.ec = EC_NOENT;
+            continue;
+        }
+        if (group_quota_exceeded) {
+            result.status = StorageTargetAdmissionStatus::kGroupQuotaExceeded;
+            result.ec = EC_NOSPC;
+            continue;
+        }
+        const auto type_idx = ToIndex(ToBaseType(result.type));
+        if (type_idx >= type_quota_exceeded.size()) {
+            result.status = StorageTargetAdmissionStatus::kReadError;
+            result.ec = EC_CONFIG_ERROR;
+            continue;
+        }
+        if (type_quota_exceeded[type_idx]) {
+            result.status = StorageTargetAdmissionStatus::kStorageTypeQuotaExceeded;
+            result.ec = EC_NOSPC;
+            continue;
+        }
+        result.status = StorageTargetAdmissionStatus::kAllowed;
+        result.ec = EC_OK;
+    }
+    return results;
 }
 
 std::size_t DataStorageSelector::CalcGroupUsedSize(

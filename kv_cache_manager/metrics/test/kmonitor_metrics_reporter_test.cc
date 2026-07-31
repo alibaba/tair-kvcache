@@ -50,6 +50,16 @@ TEST_F(KmonitorMetricsReporterTest, TestReportPerQuery) {
     }
 
     {
+        EventReportMetricsCollector collector(metrics_registry_, {{"event_type", "block_snapshot"}});
+        ASSERT_TRUE(collector.Init());
+        SET_METRICS_(&collector, event_report, request_rt_us, 123.);
+        SET_METRICS_(&collector, event_report, error_code, 1.);
+        EXPECT_NO_FATAL_FAILURE(reporter_->ReportPerQuery(&collector));
+        EXPECT_EQ(1, collector.get_event_report_request_counter_metrics());
+        EXPECT_EQ(1, collector.get_event_report_error_counter_metrics());
+    }
+
+    {
         // simulate the uninitialised case 1
         reporter_->cache_manager_ = nullptr;
         reporter_->metrics_registry_ = std::make_shared<MetricsRegistry>();

@@ -14,6 +14,8 @@
 
 - Instance 隔离仍是默认规则：KVCache 只在同一个 `instance_id` 内复用。
 - P2P 和 storage pool 是明确的 hierarchical replay 能力，不要把普通 optimizer instance 默默解释成共享 cache。
+- LiteHit 是 full-attention 专用的容量无关分析核：核心不接收容量，任何容量换算只能经过 `HitCurveProjector`；不支持 TTL、分层、admission 和 prefetch。
+- LiteHit facts 是全有或全无的对账账本：任何畸形行、乱序时间戳或长度违约都必须 fail-fast，不允许静默丢行。
 - 标准命中率是 token hit rate：`HitRate = HitTokens / InputTokens`。
 - 标准 `get` 和 `request` trace 必须包含 `input_len`。
 - `keys` 只包含完整 block key；不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `input_len`。
@@ -29,7 +31,7 @@
 - `block_size`
 - `bytes_per_token`
 - cache 容量和容量单位
-- 回放模式：KVCM/L3-only、engine-local-only 或 hierarchical replay
+- 回放模式：KVCM/L3-only、engine-local-only、hierarchical replay、LiteHit facts 或 LiteHit 在线
 - 路由语义：保留 trace 路由，还是模拟 scheduler
 - 查询语义：`prefix_match` 或 `batch_get`
 - tier 写入模式、touch/promote 行为

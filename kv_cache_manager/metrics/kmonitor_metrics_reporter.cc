@@ -50,10 +50,17 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(service, error_qps);
     DECLARE_METRICS(service, request_queue_size);
 
+    DECLARE_METRICS(event_report, qps);
+    DECLARE_METRICS(event_report, request_rt_us);
+    DECLARE_METRICS(event_report, error_qps);
+
     // manager metrics metrics
     DECLARE_METRICS(manager, request_key_count);
     DECLARE_METRICS(manager, prefix_match_len);
+    DECLARE_METRICS(manager, get_cache_location_query_block_counter);
+    DECLARE_METRICS(manager, get_cache_location_hit_block_counter);
     DECLARE_METRICS(manager, prefix_match_time_us);
+    DECLARE_METRICS(manager, batch_get_time_us);
     DECLARE_METRICS(manager, lock_write_location_retry_times);
     DECLARE_METRICS(manager, write_cache_io_cost_us);
     DECLARE_METRICS(manager, filter_write_cache_time_us);
@@ -123,6 +130,13 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, location_submit_count);
     DECLARE_METRICS(cache_reclaimer, block_del_count);
     DECLARE_METRICS(cache_reclaimer, location_del_count);
+    DECLARE_METRICS(cache_reclaimer, credit_timeout_count);
+    DECLARE_METRICS(cache_reclaimer, pending_limit_reject_count);
+    DECLARE_METRICS(cache_reclaimer, duplicate_pending_location_filtered_count);
+    DECLARE_METRICS(cache_reclaimer, reclaim_no_progress_backoff_count);
+    DECLARE_METRICS(cache_reclaimer, delete_submit_count);
+    DECLARE_METRICS(cache_reclaimer, delete_complete_count);
+    DECLARE_METRICS(cache_reclaimer, delete_fail_count);
 
     DECLARE_METRICS(cache_reclaimer, reclaim_cron_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_quota_duration_us);
@@ -132,6 +146,12 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us);
+    DECLARE_METRICS(cache_reclaimer, pending_delete_handler_count);
+    DECLARE_METRICS(cache_reclaimer, pending_location_count);
+    DECLARE_METRICS(cache_reclaimer, pending_delete_bytes);
+    DECLARE_METRICS(cache_reclaimer, credited_delete_bytes);
+    DECLARE_METRICS(cache_reclaimer, predicted_deleted_key_count);
+    DECLARE_METRICS(cache_reclaimer, oldest_pending_request_age_ms);
 
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us);
@@ -276,7 +296,6 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
         }                                                                                                              \
     } while (0)
 
-
 bool KmonitorMetricsReporter::InitMetrics() {
     ctx_->kmonitor = kmonitor::KMonitorFactory::GetKMonitor("kvcm_default");
     auto reporter = ctx_->kmonitor;
@@ -289,10 +308,20 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_QPS_METRIC(service, error_qps);
     REGISTER_GAUGE_METRIC(service, request_queue_size);
 
+    REGISTER_QPS_METRIC(event_report, qps);
+    REGISTER_GAUGE_METRIC(event_report, request_rt_us);
+    REGISTER_QPS_METRIC(event_report, error_qps);
+
     // manager metrics
     REGISTER_GAUGE_METRIC(manager, request_key_count);
     REGISTER_GAUGE_METRIC(manager, prefix_match_len);
+    // Workaround: KMonitor only supports QPS and GAUGE metric types (no COUNTER).
+    // These are semantically cumulative counters; registered as GAUGE to match
+    // existing codebase convention (e.g. cache_reclaimer counters).
+    REGISTER_GAUGE_METRIC(manager, get_cache_location_query_block_counter);
+    REGISTER_GAUGE_METRIC(manager, get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRIC(manager, prefix_match_time_us);
+    REGISTER_GAUGE_METRIC(manager, batch_get_time_us);
     REGISTER_GAUGE_METRIC(manager, lock_write_location_retry_times);
     REGISTER_GAUGE_METRIC(manager, write_cache_io_cost_us);
     REGISTER_GAUGE_METRIC(manager, filter_write_cache_time_us);
@@ -362,6 +391,13 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, location_submit_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, block_del_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, location_del_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, credit_timeout_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, pending_limit_reject_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, duplicate_pending_location_filtered_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_no_progress_backoff_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, delete_submit_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, delete_complete_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, delete_fail_count);
 
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_quota_duration_us);
@@ -371,6 +407,12 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_submit_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, pending_delete_handler_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, pending_location_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, pending_delete_bytes);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, credited_delete_bytes);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, predicted_deleted_key_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, oldest_pending_request_age_ms);
 
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_min_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_max_us);
@@ -460,7 +502,10 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         // manager metrics
         REPORT_COLLECTED_METRICS(manager, request_key_count);
         REPORT_COLLECTED_METRICS(manager, prefix_match_len);
+        REPORT_COLLECTED_METRICS(manager, get_cache_location_query_block_counter);
+        REPORT_COLLECTED_METRICS(manager, get_cache_location_hit_block_counter);
         REPORT_COLLECTED_METRICS(manager, prefix_match_time_us);
+        REPORT_COLLECTED_METRICS(manager, batch_get_time_us);
         REPORT_COLLECTED_METRICS(manager, lock_write_location_retry_times);
         REPORT_COLLECTED_METRICS(manager, write_cache_io_cost_us);
         REPORT_COLLECTED_METRICS(manager, filter_write_cache_time_us);
@@ -502,6 +547,14 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_upsert_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_delete_time_us);
+    } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
+        auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
+        const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
+        REPORT_METRICS(event_report, qps, 1.0);
+        REPORT_METRICS(event_report, request_rt_us, p->GetRequestRtUsSample());
+
+        const double error_code = p->GetErrorCodeSample();
+        REPORT_METRICS_WHEN(event_report, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
@@ -595,6 +648,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         std::uint64_t loc_submit_count_v;
         std::uint64_t blk_del_count_v;
         std::uint64_t loc_del_count_v;
+        std::uint64_t credit_timeout_count_v;
+        std::uint64_t pending_limit_reject_count_v;
+        std::uint64_t duplicate_pending_location_filtered_count_v;
+        std::uint64_t reclaim_no_progress_backoff_count_v;
+        std::uint64_t delete_submit_count_v;
+        std::uint64_t delete_complete_count_v;
+        std::uint64_t delete_fail_count_v;
 
         double reclaim_cron_duration_us_v;
         double reclaim_quota_duration_us_v;
@@ -604,6 +664,12 @@ void KmonitorMetricsReporter::ReportInterval() {
         double reclaim_lru_batch_duration_us_v;
         double reclaim_lru_filter_duration_us_v;
         double reclaim_lru_submit_duration_us_v;
+        double pending_delete_handler_count_v;
+        double pending_location_count_v;
+        double pending_delete_bytes_v;
+        double credited_delete_bytes_v;
+        double predicted_deleted_key_count_v;
+        double oldest_pending_request_age_ms_v;
 
         double reclaim_batch_lru_age_min_us_v;
         double reclaim_batch_lru_age_max_us_v;
@@ -618,6 +684,16 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, location_submit_count, loc_submit_count_v);
         GET_METRICS_(cr, cache_reclaimer, block_del_count, blk_del_count_v);
         GET_METRICS_(cr, cache_reclaimer, location_del_count, loc_del_count_v);
+        GET_METRICS_(cr, cache_reclaimer, credit_timeout_count, credit_timeout_count_v);
+        GET_METRICS_(cr, cache_reclaimer, pending_limit_reject_count, pending_limit_reject_count_v);
+        GET_METRICS_(cr,
+                     cache_reclaimer,
+                     duplicate_pending_location_filtered_count,
+                     duplicate_pending_location_filtered_count_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_no_progress_backoff_count, reclaim_no_progress_backoff_count_v);
+        GET_METRICS_(cr, cache_reclaimer, delete_submit_count, delete_submit_count_v);
+        GET_METRICS_(cr, cache_reclaimer, delete_complete_count, delete_complete_count_v);
+        GET_METRICS_(cr, cache_reclaimer, delete_fail_count, delete_fail_count_v);
 
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
@@ -627,6 +703,12 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, pending_delete_handler_count, pending_delete_handler_count_v);
+        GET_METRICS_(cr, cache_reclaimer, pending_location_count, pending_location_count_v);
+        GET_METRICS_(cr, cache_reclaimer, pending_delete_bytes, pending_delete_bytes_v);
+        GET_METRICS_(cr, cache_reclaimer, credited_delete_bytes, credited_delete_bytes_v);
+        GET_METRICS_(cr, cache_reclaimer, predicted_deleted_key_count, predicted_deleted_key_count_v);
+        GET_METRICS_(cr, cache_reclaimer, oldest_pending_request_age_ms, oldest_pending_request_age_ms_v);
 
         GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);
@@ -642,6 +724,17 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, location_submit_count, static_cast<double>(loc_submit_count_v));
         REPORT_METRICS(cache_reclaimer, block_del_count, static_cast<double>(blk_del_count_v));
         REPORT_METRICS(cache_reclaimer, location_del_count, static_cast<double>(loc_del_count_v));
+        REPORT_METRICS(cache_reclaimer, credit_timeout_count, static_cast<double>(credit_timeout_count_v));
+        REPORT_METRICS(cache_reclaimer, pending_limit_reject_count, static_cast<double>(pending_limit_reject_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       duplicate_pending_location_filtered_count,
+                       static_cast<double>(duplicate_pending_location_filtered_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       reclaim_no_progress_backoff_count,
+                       static_cast<double>(reclaim_no_progress_backoff_count_v));
+        REPORT_METRICS(cache_reclaimer, delete_submit_count, static_cast<double>(delete_submit_count_v));
+        REPORT_METRICS(cache_reclaimer, delete_complete_count, static_cast<double>(delete_complete_count_v));
+        REPORT_METRICS(cache_reclaimer, delete_fail_count, static_cast<double>(delete_fail_count_v));
 
         REPORT_METRICS(cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
@@ -651,6 +744,12 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, pending_delete_handler_count, pending_delete_handler_count_v);
+        REPORT_METRICS(cache_reclaimer, pending_location_count, pending_location_count_v);
+        REPORT_METRICS(cache_reclaimer, pending_delete_bytes, pending_delete_bytes_v);
+        REPORT_METRICS(cache_reclaimer, credited_delete_bytes, credited_delete_bytes_v);
+        REPORT_METRICS(cache_reclaimer, predicted_deleted_key_count, predicted_deleted_key_count_v);
+        REPORT_METRICS(cache_reclaimer, oldest_pending_request_age_ms, oldest_pending_request_age_ms_v);
 
         REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);

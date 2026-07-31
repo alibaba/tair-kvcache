@@ -227,3 +227,95 @@ TEST_F(TransferClientTest, TestBlockBufferUsage) {
 
     free(get_buffer);
 }
+
+// ============================================================================
+// Multi-storage TransferClient tests
+// ============================================================================
+class TransferClientMultiStorageTest : public TESTBASE {
+public:
+    void SetUp() override {
+        root_path_ = GetPrivateTestRuntimeDataPath();
+        client_config_ = R"({
+            "instance_group": "test_group",
+            "instance_id": "test_instance",
+            "block_size": 16,
+            "sdk_config": {
+                "thread_num": 4,
+                "queue_size": 1000,
+                "sdk_config": [],
+                "timeout_config": {
+                    "get_timeout_ms": 10000,
+                    "put_timeout_ms": 30000
+                }
+            },
+            "location_spec_infos": {
+                "tp0": 1024
+            }
+        })";
+
+        init_params_.role_type = RoleType::WORKER;
+        init_params_.regist_span = new RegistSpan();
+        auto buffer = malloc(1024 * 1024);
+        init_params_.regist_span->base = buffer;
+        init_params_.regist_span->size = 1024 * 1024;
+        init_params_.self_location_spec_name = "tp0";
+        init_params_.storage_configs = R"([
+            {
+                "type": "file",
+                "global_unique_name": "nfs_a",
+                "storage_spec": {
+                    "root_path": "/tmp/nfs_a/",
+                    "key_count_per_file": 5
+                }
+            },
+            {
+                "type": "file",
+                "global_unique_name": "nfs_b",
+                "storage_spec": {
+                    "root_path": "/tmp/nfs_b/",
+                    "key_count_per_file": 5
+                }
+            }
+        ])";
+    }
+
+    void TearDown() override {
+        free(init_params_.regist_span->base);
+        delete init_params_.regist_span;
+    }
+
+protected:
+    std::string root_path_;
+    std::string client_config_;
+    InitParams init_params_;
+};
+
+TEST_F(TransferClientMultiStorageTest, TestCreateWithMultiStorage) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+}
+
+TEST_F(TransferClientMultiStorageTest, TestSaveAndLoadMixedStorage) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+
+    // 混合 URI: nfs_a, nfs_b, nfs_a（同 path 不同 blkid 保证 SDK 内部不重排）
+    UriStrVec uri_str_vec = {
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/file1?blkid=0&size=1024",
+        "file://nfs_b/" + root_path_ + "tmp/nfs_b/file1?blkid=0&size=1024",
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/file1?blkid=1&size=1024",
+    };
+    BlockBuffers block_buffers = {BlockBuffer(), BlockBuffer(), BlockBuffer()};
+
+    // Save
+    auto [save_ec, actual_uris] = client->SaveKvCaches(uri_str_vec, block_buffers);
+    ASSERT_EQ(ER_OK, save_ec);
+    ASSERT_EQ(3, actual_uris.size());
+    // 验证返回 URI 顺序与输入一致
+    EXPECT_EQ(uri_str_vec[0], actual_uris[0]);
+    EXPECT_EQ(uri_str_vec[1], actual_uris[1]);
+    EXPECT_EQ(uri_str_vec[2], actual_uris[2]);
+
+    // Load
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, block_buffers));
+}

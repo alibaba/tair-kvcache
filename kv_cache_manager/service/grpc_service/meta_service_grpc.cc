@@ -15,8 +15,9 @@ namespace kv_cache_manager {
 
 MetaServiceGRpc::MetaServiceGRpc(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
-                                 std::shared_ptr<RegistryManager> registry_manager)
-    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager)
+                                 std::shared_ptr<RegistryManager> registry_manager,
+                                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
+    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager, std::move(metrics_lifecycle))
     , meta_service_impl_(std::move(meta_service_impl)) {}
 
 void MetaServiceGRpc::Init() { MetaServiceMetricsBase::InitMetrics(); }
@@ -50,6 +51,14 @@ grpc::Status MetaServiceGRpc::GetCacheLocation(grpc::ServerContext *context,
                                                proto::meta::GetCacheLocationResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetCacheLocation, grpc::Status::OK);
     meta_service_impl_->GetCacheLocation(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status MetaServiceGRpc::GetCacheLocationsByBackend(grpc::ServerContext *context,
+                                                         const proto::meta::GetCacheLocationsByBackendRequest *request,
+                                                         proto::meta::GetCacheLocationsByBackendResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetCacheLocationsByBackend, grpc::Status::OK);
+    meta_service_impl_->GetCacheLocationsByBackend(request_context, request, response);
     return grpc::Status::OK;
 }
 
@@ -106,25 +115,40 @@ grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
 grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
                                           const proto::meta::ReportEventRequest *request,
                                           proto::meta::ReportEventResponse *response) {
-    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(ReportEvent, grpc::Status::OK);
-    bool has_block_add = false, has_block_delete = false;
-    for (int i = 0; i < request->events_size(); ++i) {
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
-            has_block_add = true;
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
-            has_block_delete = true;
+    std::string metrics_type;
+    std::shared_ptr<MetricsCollector> metrics_collector;
+    switch (request->storage_type()) {
+    case proto::meta::ST_EVENT_REPORT_L1P5:
+        metrics_type = kEventReportL1P5MetricsType;
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
+        break;
+    case proto::meta::ST_EVENT_REPORT_L2:
+        metrics_type = kEventReportL2MetricsType;
+        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
+        break;
+    default:
+        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
+        break;
     }
-    if (has_block_add && !request->instance_id().empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockAdd(request->instance_id());
-        if (mc)
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
+    if (metrics_collector == nullptr) {
+        KVCM_LOG_ERROR("get ReportEvent metrics collector failed");
+        auto *header = response->mutable_header();
+        auto *status = header->mutable_status();
+        status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        status->set_message("get ReportEvent metrics collector failed");
+        return grpc::Status::OK;
     }
-    if (has_block_delete && !request->instance_id().empty()) {
-        auto mc = get_metrics_collector_from_map_for_EventBlockDelete(request->instance_id());
-        if (mc)
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-    }
+    API_CONTEXT_INIT(metrics_collector, ExtractIpFromPeer, context->peer())
+    AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status MetaServiceGRpc::GetHostCacheState(grpc::ServerContext *context,
+                                                const proto::meta::GetHostCacheStateRequest *request,
+                                                proto::meta::GetHostCacheStateResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetHostCacheState, grpc::Status::OK);
+    meta_service_impl_->GetHostCacheState(request_context, request, response);
     return grpc::Status::OK;
 }
 

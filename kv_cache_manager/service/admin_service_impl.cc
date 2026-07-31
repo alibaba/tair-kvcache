@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <variant>
@@ -10,10 +11,15 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -25,9 +31,11 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    {                                                                                                                  \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -176,6 +184,11 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
     if (request->storage_unique_name().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveStorage", "storage_unique_name", true);
     }
+    // hold the lifecycle lock as a writer so metric-registration sites
+    // (reporter interval loop) cannot re-create storage-tagged entries
+    // concurrently with the purge below
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
     ErrorCode ec_info = registry_manager_->RemoveStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -188,6 +201,11 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Storage removed successfully");
         KVCM_LOG_INFO("[traceId: %s] RemoveStorage succeeded", request->trace_id().c_str());
+
+        // purge storage-tagged metrics from the registry
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"unique_name", request->storage_unique_name()}});
+        }
     }
 };
 
@@ -324,6 +342,12 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
     if (request->name().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstanceGroup", "name", true);
     }
+    // hold the lifecycle lock as a writer so metric-registration sites
+    // (recorder publish, local reporter loops, MetaServiceMetricsBase
+    // slow path) cannot re-create group-tagged entries concurrently
+    // with the purge below
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
     ErrorCode ec_info = registry_manager_->RemoveInstanceGroup(request_context, request->name());
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -336,6 +360,23 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Instance group removed successfully");
         KVCM_LOG_INFO("[traceId: %s] RemoveInstanceGroup succeeded", request->trace_id().c_str());
+
+        // contract: caller must drain all instances via RemoveInstance
+        // before invoking this
+        //
+        // RemoveInstanceGroup scope is group config+group-tagged
+        // metrics only; per-instance cleanup is not retried here to
+        // avoid racing with concurrent group re-creates
+
+        // prune the recorder snapshot so the reporter cannot recreate
+        // group-tagged entries on its next cycle
+        if (const auto recorder = cache_manager_->metrics_recorder()) {
+            recorder->RemoveGroup(request->name());
+        }
+        // remove group-tagged metrics from the registry
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"instance_group", request->name()}});
+        }
     }
 };
 
@@ -487,6 +528,62 @@ void AdminServiceImpl::RemoveCache(RequestContext *request_context,
     }
 };
 
+void AdminServiceImpl::MigrateCache(RequestContext *request_context,
+                                    const proto::admin::MigrateCacheRequest *request,
+                                    proto::admin::MigrateCacheResponse *response) {
+    API_CALL_GUARD("MigrateCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "instance_id", true);
+    }
+    if (request->source_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "source_storage_name", true);
+    }
+    if (request->target_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "target_storage_name", true);
+    }
+    const auto method = request->method();
+    if (method != proto::admin::MIGRATION_METHOD_COPY && method != proto::admin::MIGRATION_METHOD_MARK &&
+        method != proto::admin::MIGRATION_METHOD_BOTH) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
+    }
+
+    const bool do_copy =
+        method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_mark =
+        method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
+
+    // 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
+    // 显式 block_keys 优先，否则由 facade 按 rule.sample_count 采样（<=0 用默认）。
+    const std::vector<int64_t> block_keys(request->block_keys().begin(), request->block_keys().end());
+    const auto result = cache_manager_->MigrateCache(request_context,
+                                                     request->trace_id(),
+                                                     request->instance_id(),
+                                                     request->source_storage_name(),
+                                                     request->target_storage_name(),
+                                                     do_copy,
+                                                     do_mark,
+                                                     block_keys,
+                                                     request->rule().sample_count());
+
+    response->set_accepted(result.accepted);
+    response->set_rejected(result.rejected);
+    status->set_code(result.ec == EC_OK ? proto::admin::OK : ToAdminPbError(result.ec));
+    status->set_message(result.message);
+    request_context->set_status_code(status->code());
+    KVCM_LOG_INFO("[traceId: %s] MigrateCache instance %s src %s dst %s method %d accepted %lld rejected %lld",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->source_storage_name().c_str(),
+                  request->target_storage_name().c_str(),
+                  static_cast<int>(method),
+                  static_cast<long long>(result.accepted),
+                  static_cast<long long>(result.rejected));
+}
+
 // Instance相关接口实现
 void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
                                         const proto::admin::RegisterInstanceRequest *request,
@@ -538,7 +635,9 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
                                                          request->block_size(),
                                                          location_spec_infos,
                                                          model_deployment_req,
-                                                         location_spec_groups);
+                                                         location_spec_groups,
+                                                         static_cast<CacheManager::QueryType>(
+                                                             request->default_query_type()));
     if (ec_info != EC_OK) {
         status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
@@ -572,6 +671,11 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstance", "instance_id", true);
     }
+    // exclude all metrics-registration sites for the duration of the
+    // removal so InvalidateInstanceMetrics' single tag-filter purge
+    // cannot race with concurrent producers; instance removal is low
+    // frequency, so the wide locking range is acceptable
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
     ErrorCode ec_info =
         cache_manager_->RemoveInstance(request_context, request->instance_group(), request->instance_id());
     if (ec_info != EC_OK) {

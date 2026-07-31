@@ -58,6 +58,15 @@ bool CoroHttpService::Start(int32_t port, size_t thread_num) {
     return true;
 }
 
+void CoroHttpService::MergeFrom(const CoroHttpService &other) {
+    for (const auto &[path, handler] : other.get_handlers_) {
+        get_handlers_[path] = handler;
+    }
+    for (const auto &[path, handler] : other.post_handlers_) {
+        post_handlers_[path] = handler;
+    }
+}
+
 void CoroHttpService::Stop() {
     if (server_) {
         server_->stop();

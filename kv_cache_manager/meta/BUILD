@@ -17,6 +17,7 @@ cc_library(
     ],
     deps = [
         ":meta_indexer",
+        "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
 
@@ -58,6 +59,7 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
 
@@ -85,6 +87,7 @@ cc_library(
         "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
         "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
 
@@ -125,6 +128,7 @@ cc_library(
         "cache_location.h",
     ],
     deps = [
+        ":common",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/data_storage:common_define",
@@ -215,6 +219,7 @@ cc_library(
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
 

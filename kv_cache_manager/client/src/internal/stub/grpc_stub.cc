@@ -250,12 +250,14 @@ std::pair<ClientErrorCode, std::string> GrpcStub::RegisterInstance(const std::st
                                                                    int32_t block_size,
                                                                    const LocationSpecInfoMap &location_spec_infos,
                                                                    const ModelDeployment &model_deployment,
-                                                                   const LocationSpecGroups &location_spec_groups) {
+                                                                   const LocationSpecGroups &location_spec_groups,
+                                                                   QueryType default_query_type) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::RegisterInstanceRequest request;
     SetCommonInfo(request, trace_id, instance_id);
     request.set_instance_group(instance_group);
     request.set_block_size(block_size);
+    request.set_default_query_type(static_cast<proto::meta::QueryType>(default_query_type));
     std::vector<LocationSpecInfo> info_vec;
     info_vec.reserve(location_spec_infos.size());
     std::for_each(location_spec_infos.begin(), location_spec_infos.end(), [&info_vec](const auto &info_pair) {
@@ -456,7 +458,7 @@ bool GrpcStub::TrimCache() {
 }
 
 std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::string &trace_id,
-                                                                  const std::string &instance_id) {
+                                                                 const std::string &instance_id) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetClusterInfoRequest request;
     SetCommonInfo(request, trace_id, instance_id);
@@ -476,9 +478,8 @@ std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::stri
         info.leader_endpoint.meta_http_port = ep.meta_http_port();
         info.leader_endpoint.custom_info = ep.custom_info();
     }
-    KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
-                   info.self_node_id.c_str(),
-                   info.leader_node_id.c_str());
+    KVCM_LOG_DEBUG(
+        "get cluster info success, self=%s, leader=%s", info.self_node_id.c_str(), info.leader_node_id.c_str());
     return {ER_OK, info};
 }
 

@@ -10,7 +10,7 @@ namespace kv_cache_manager {
 FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
     FieldMap field_map;
     for (const auto &[loc_id, loc_ptr] : locations) {
-        field_map[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
+        field_map[PROPERTY_LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
     }
     for (const auto &[key, value] : properties) {
         field_map[key] = value;
@@ -20,8 +20,8 @@ FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMa
 
 ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties) {
     for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-            std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+        if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+            std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
             auto location = std::make_shared<CacheLocation>();
             if (field_value.empty()) {
                 location->set_id(loc_id);
@@ -38,10 +38,10 @@ ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_l
 
 ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
     for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(LOCATION_PREFIX, 0) != 0) {
+        if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) != 0) {
             continue;
         }
-        std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+        std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
         auto location = std::make_shared<CacheLocation>();
         if (field_value.empty()) {
             location->set_id(loc_id);
@@ -55,8 +55,8 @@ ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_
 
 void ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids) {
     for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-            out_location_ids.push_back(field_name.substr(LOCATION_PREFIX.size()));
+        if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+            out_location_ids.push_back(field_name.substr(PROPERTY_LOCATION_PREFIX.size()));
         }
     }
 }

@@ -5,9 +5,9 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
 #include "kv_cache_manager/optimizer/config/hierarchical_replay_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/manager/hierarchical_replay_manager.h"
 #include "kv_cache_manager/optimizer/storage_pool/hash_storage_pool_manager.h"
@@ -107,7 +107,7 @@ protected:
         config.set_output_result_path(output_path);
         config.set_eviction_params(CreateEvictionConfig());
 
-        std::vector<OptInstanceGroupConfig> groups;
+        std::vector<OptimizerReplayInstanceGroupConfig> groups;
         groups.reserve(instance_ids.size());
         for (const auto &instance_id : instance_ids) {
             groups.push_back(
@@ -171,11 +171,11 @@ protected:
         return eviction_config;
     }
 
-    OptInstanceGroupConfig CreateInstanceGroup(const std::string &group_name,
-                                               const std::vector<std::string> &instance_ids,
-                                               const std::vector<std::string> &tier_names,
-                                               int64_t tier_capacity) {
-        OptInstanceGroupConfig group;
+    OptimizerReplayInstanceGroupConfig CreateInstanceGroup(const std::string &group_name,
+                                                           const std::vector<std::string> &instance_ids,
+                                                           const std::vector<std::string> &tier_names,
+                                                           int64_t tier_capacity) {
+        OptimizerReplayInstanceGroupConfig group;
         group.set_group_name(group_name);
         group.set_quota_capacity(1LL << 30);
         group.set_used_percentage(1.0);
@@ -192,9 +192,9 @@ protected:
         }
         group.set_storages(tiers);
 
-        std::vector<OptInstanceConfig> instances;
+        std::vector<OptimizerReplayInstanceConfig> instances;
         for (const auto &instance_id : instance_ids) {
-            OptInstanceConfig instance;
+            OptimizerReplayInstanceConfig instance;
             instance.set_instance_id(instance_id);
             instance.set_instance_group_name(group_name);
             instance.set_block_size(16);

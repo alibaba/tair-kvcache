@@ -23,8 +23,12 @@ scrape_configs:
 # 服务 QPS（1 分钟速率）
 rate(kvcm_service_query_counter[1m])
 
-# 缓存命中率
+# 搜索缓存命中率
 kvcm_meta_indexer_search_cache_hit_ratio
+
+# GetCacheLocation Block 级命中率（5 分钟窗口）
+rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
+  / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
 
 # 每个后端的存储使用率
 kvcm_data_storage_storage_usage_ratio
@@ -122,6 +126,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.request_queue_size` | gauge | 请求队列大小 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
+| `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
+| `manager.get_cache_location_hit_block_counter` | counter | GetCacheLocation 命中的 Block 总数（累计） |
 | `manager.prefix_match_time_us` | gauge | 前缀匹配延迟（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
@@ -156,12 +162,22 @@ KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `event_report.qps` | `rate(kvcm_event_report_request_counter[1m])` |
+| `event_report.error_qps` | `rate(kvcm_event_report_error_counter[1m])` |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
 | `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
 
 Prometheus 侧存储的是底层 *counter*（单调递增），KMonitor 的
 `*.qps` 值由 agent 在上报时计算。两种视图反映的是同一事件流，
 查询 Prometheus 时直接用 counter + `rate` 即可。
+
+`event_report.*` 按固定标签 `instance_group`、`instance_id`、`type` 和
+`event_type` 拆分。其中 `type` 为 `event_report_l1p5` 或
+`event_report_l2`，`event_type` 为协议定义的六种事件类型之一（未知值
+统一记为 `unknown`）。一个批量请求包含某事件类型时，该类型 QPS 计一次；
+同一请求内同类型的多个 event 不重复计数。`event_report.request_rt_us`
+记录整次 `ReportEvent` 请求的端到端耗时；请求失败时
+`event_report.error_qps` 按该请求包含的事件类型分别计一次。
 
 注：`data_storage.create_keys_qps` 在 Prom 侧也会以 gauge 形式
 导出"最近一次批次大小"（不是每秒速率）。每秒速率请使用

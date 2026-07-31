@@ -1,5 +1,6 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -229,6 +230,51 @@ Gauge MetricsData::GetOrCreateGauge(const MetricsTags &tags) {
     return Gauge{it->second};
 }
 
+namespace {
+
+// returns true if tags contains all key-value pairs in filter
+bool TagsMatch(const MetricsTags &tags, const MetricsTags &filter) {
+    return std::all_of(filter.begin(), filter.end(), [&tags](const auto &kv) {
+        auto it = tags.find(kv.first);
+        return it != tags.end() && it->second == kv.second;
+    });
+}
+
+} // anonymous namespace
+
+bool MetricsData::Remove(const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return metrics_data_.erase(tags) > 0;
+}
+
+std::size_t MetricsData::RemoveByTagFilter(const MetricsTags &filter) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::size_t removed = 0;
+    for (auto it = metrics_data_.begin(); it != metrics_data_.end();) {
+        if (TagsMatch(it->first, filter)) {
+            it = metrics_data_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+std::optional<Gauge> MetricsData::GetGauge(const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = metrics_data_.find(tags);
+    if (it == metrics_data_.end() || it->second == nullptr || !std::holds_alternative<GaugeValue>(it->second->value)) {
+        return std::nullopt;
+    }
+    return Gauge{it->second};
+}
+
+bool MetricsData::RemoveByTags(const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return metrics_data_.erase(tags) > 0;
+}
+
 /* ---------------------------- Registry ---------------------------- */
 
 std::size_t MetricsRegistry::GetSize() noexcept {
@@ -291,6 +337,26 @@ std::shared_ptr<MetricsData> MetricsRegistry::GetOrCreateMetricsData(const std::
     return it->second;
 }
 
+bool MetricsRegistry::Remove(const std::string &name, const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = metrics_data_map_.find(name);
+    if (it == metrics_data_map_.end() || it->second == nullptr) {
+        return false;
+    }
+    return it->second->Remove(tags);
+}
+
+std::size_t MetricsRegistry::RemoveByTagFilter(const MetricsTags &filter) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::size_t total = 0;
+    for (auto &[name, data] : metrics_data_map_) {
+        if (data != nullptr) {
+            total += data->RemoveByTagFilter(filter);
+        }
+    }
+    return total;
+}
+
 Counter MetricsRegistry::GetCounter(const std::string &name, const MetricsTags &tags) {
     const auto metrics_data = GetOrCreateMetricsData(name);
     assert(metrics_data);
@@ -301,6 +367,30 @@ Gauge MetricsRegistry::GetGauge(const std::string &name, const MetricsTags &tags
     const auto metrics_data = GetOrCreateMetricsData(name);
     assert(metrics_data);
     return metrics_data->GetOrCreateGauge(tags);
+}
+
+void MetricsRegistry::RegisterHistogramFamily(const std::string &family_name) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    histogram_families_.insert(family_name);
+}
+
+void MetricsRegistry::MapMetricToFamily(const std::string &metric_name, const std::string &family_name) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    metric_to_family_.emplace(metric_name, family_name);
+}
+
+std::string MetricsRegistry::GetMetricFamily(const std::string &metric_name) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = metric_to_family_.find(metric_name);
+    if (it == metric_to_family_.end()) {
+        return {};
+    }
+    return it->second;
+}
+
+std::set<std::string> MetricsRegistry::GetHistogramFamilies() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return histogram_families_;
 }
 
 } // namespace kv_cache_manager

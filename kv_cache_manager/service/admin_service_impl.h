@@ -65,6 +65,9 @@ public:
     void RemoveCache(RequestContext *request_context,
                      const proto::admin::RemoveCacheRequest *request,
                      proto::admin::CommonResponse *response);
+    void MigrateCache(RequestContext *request_context,
+                      const proto::admin::MigrateCacheRequest *request,
+                      proto::admin::MigrateCacheResponse *response);
 
     void RegisterInstance(RequestContext *request_context,
                           const proto::admin::RegisterInstanceRequest *request,

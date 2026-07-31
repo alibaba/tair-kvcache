@@ -58,6 +58,9 @@ public:
     grpc::Status RemoveCache(grpc::ServerContext *context,
                              const proto::admin::RemoveCacheRequest *request,
                              proto::admin::CommonResponse *response) override;
+    grpc::Status MigrateCache(grpc::ServerContext *context,
+                              const proto::admin::MigrateCacheRequest *request,
+                              proto::admin::MigrateCacheResponse *response) override;
     grpc::Status RegisterInstance(grpc::ServerContext *context,
                                   const proto::admin::RegisterInstanceRequest *request,
                                   proto::admin::CommonResponse *response) override;
@@ -131,6 +134,7 @@ private:
     // for cache APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_(MigrateCache);
 
     // for instance APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);

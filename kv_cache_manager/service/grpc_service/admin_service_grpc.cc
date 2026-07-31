@@ -35,6 +35,7 @@ void AdminServiceGRpc::Init() {
     // for cache APIs
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveCache);
+    MAKE_SERVICE_METRICS_COLLECTOR(MigrateCache);
 
     // for instance APIs
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
@@ -166,6 +167,14 @@ grpc::Status AdminServiceGRpc::RemoveCache(grpc::ServerContext *context,
                                            proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_GRPC(RemoveCache)
     admin_service_impl_->RemoveCache(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::MigrateCache(grpc::ServerContext *context,
+                                            const proto::admin::MigrateCacheRequest *request,
+                                            proto::admin::MigrateCacheResponse *response) {
+    API_CONTEXT_INIT_GRPC(MigrateCache)
+    admin_service_impl_->MigrateCache(request_context, request, response);
     return grpc::Status::OK;
 }
 

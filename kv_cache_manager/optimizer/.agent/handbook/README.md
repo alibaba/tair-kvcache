@@ -9,6 +9,7 @@
 | 跑一个 optimizer 配置并查看命中率 | [run-single-replay](../skills/run-single-replay/SKILL.md) | [external_usage.md](external_usage.md) |
 | 按 pod 或推理实例独立回放并聚合 | [run-multi-infer-replay](../skills/run-multi-infer-replay/SKILL.md) | [external_usage.md](external_usage.md) |
 | 联合模拟 engine 本地 cache、storage pool、P2P | [run-hierarchical-replay](../skills/run-hierarchical-replay/SKILL.md) | [../../docs/hierarchical_replay.md](../../docs/hierarchical_replay.md) |
+| full-attention 任意容量命中率、多 block size 扫描、在线实时查询 | [run-litehit-facts](../skills/run-litehit-facts/SKILL.md) | [../../liteHit/README.md](../../liteHit/README.md) |
 | 画容量与命中率的 Pareto 图 | [run-pareto-analysis](../skills/run-pareto-analysis/SKILL.md) | [external_usage.md](external_usage.md) |
 | 把外部 trace 转为 optimizer JSONL | [prepare-trace](../skills/prepare-trace/SKILL.md) | [trace_schema_and_conversion.md](trace_schema_and_conversion.md) |
 | 在其他代码中接入 Optimizer | [integrate-optimizer-api](../skills/integrate-optimizer-api/SKILL.md) | [internal_integration.md](internal_integration.md) |
@@ -19,15 +20,19 @@
 
 Optimizer 是离线 KV cache 仿真器。它回放标准 JSONL trace，按配置执行索引查询、tier 流动、驱逐、调度、P2P 或 storage pool 行为，并输出命中率、IO、lifecycle 等分析文件。
 
-标准回放分三类：
+回放分两大族：**标准回放**（真前缀树 + 驱逐/tier/调度仿真，每个容量假设都要重跑）与 **LiteHit**（full-attention 专用，一次回放产出容量无关事实账本 facts CSV，任意 LRU 容量事后投影；在线以 gRPC/HTTP 服务接收引擎实时 TraceQuery）。
+
+标准回放分三类，另有两条 LiteHit 路径：
 
 | 模式 | 入口 | 适用场景 | cache 归属 |
 |---|---|---|---|
 | KVCM/L3-only | `optimizer_main` 或 `optimizer_run` | 分析一个逻辑池或 KVCM/L3 回放 | 配置中的 optimizer `instance_id` |
 | engine-local-only | `multi_infer_replay` | trace 已经知道请求打到哪个 pod 或推理实例 | 每个 pod 独立 cache |
 | engine local + storage pool | `hierarchical_replay_main` | 需要本地多层 cache、storage pool、P2P、调度、active window 或 cache drop | engine instance 加显式 storage pool |
+| LiteHit 离线 facts | `lite_hit_main` + `lite_hit_facts_query_main` | full-attention、容量事后才定、要扫多个 block size | 按配置 instance 分 lane，支持 override / fanout |
+| LiteHit 在线 | `online_optimizer_server_main` + `client/` SDK | 引擎实时推流、按注册容量档投影 | 按注册 instance |
 
-完整字段语义以 [../../docs/strategy_config.md](../../docs/strategy_config.md) 为准。本手册只负责路由工作，并指出哪些参数不能凭经验猜。
+完整字段语义以 [../../docs/strategy_config.md](../../docs/strategy_config.md)（回放）与 [../../liteHit/README.md](../../liteHit/README.md)（LiteHit）为准。本手册只负责路由工作，并指出哪些参数不能凭经验猜。
 
 ## 第 2 层：文档地图
 
@@ -44,18 +49,19 @@ Optimizer 是离线 KV cache 仿真器。它回放标准 JSONL trace，按配置
 | [../../docs/strategy_config.md](../../docs/strategy_config.md) | 标准 config 和 trace 语义 |
 | [../../docs/hierarchical_replay.md](../../docs/hierarchical_replay.md) | hierarchical replay 语义 |
 | [../../docs/p2p_read.md](../../docs/p2p_read.md) | P2P read 设计 |
+| [../../liteHit/README.md](../../liteHit/README.md) | LiteHit 算法、facts 账本、投影语义 |
 | [../../analysis/script/README.md](../../analysis/script/README.md) | 分析脚本 CLI 细节 |
 
 ## 第 3 层：必须确认的参数
 
 运行或改动 Optimizer 前，从用户、部署配置或 trace 元数据中确认：
 
-- `block_size`：每个 block 的 token 数。它会改变 trace key 和命中率语义。
-- `bytes_per_token`：单 token KV cache 大小。容量换算必须依赖它。
-- 容量：HBM/DRAM/L3 容量、单位、是 per pod 还是 global、是否需要扣除非 KV 内存。
-- 回放模式：KVCM/L3-only、engine-local-only 或 hierarchical replay。
+- `block_size`：每个 block 的 token 数。它会改变 trace key 和命中率语义。LiteHit 离线还要区分 trace 原生粒度（config `block_size`，默认 256）与各 instance 的分析粒度（只允许整数倍变粗）。
+- `bytes_per_token`（回放）/ location spec size（LiteHit 注册）：单 block KV cache 大小。容量换算必须依赖它。
+- 容量：HBM/DRAM/L3 容量、单位、是 per pod 还是 global、是否需要扣除非 KV 内存。LiteHit 离线不需要预先给容量（facts 事后投影，负数 = 无限）；在线注册时容量档定格。
+- 回放模式：KVCM/L3-only、engine-local-only、hierarchical replay、LiteHit facts 或 LiteHit 在线。
 - 路由：保留 trace `instance_id`，还是模拟 scheduler 分配。
-- 查询语义：`prefix_match` 或 `batch_get`。
+- 查询语义：`prefix_match` 或 `batch_get`；LiteHit 固定 prefix hit 口径。
 - 写入和 touch 策略：`write_through`、`cascading`、`write_through_selective`、promote、下层 touch、selective threshold。
 - 在线拓扑：扩缩容 trace 的 active window 和 cache drop 事件。
 - 时间戳：原始 trace 是秒、微秒还是纳秒，转换到 ns 时不能经过 float。

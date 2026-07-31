@@ -350,10 +350,11 @@ TEST_F(MetaDummyBackendTest, TestDeleteLocations) {
 
     // Seed: key 1 has two locations + one property; key 2 has one location + one property.
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              PutWithFieldMaps(meta_storage_backend_.get(),
-                               {1, 2},
-                               {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}},
-                                {{LOCATION_PREFIX + "c", "lc"}, {"p0", "v0"}}}));
+              PutWithFieldMaps(
+                  meta_storage_backend_.get(),
+                  {1, 2},
+                  {{{PROPERTY_LOCATION_PREFIX + "a", "la"}, {PROPERTY_LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}},
+                   {{PROPERTY_LOCATION_PREFIX + "c", "lc"}, {"p0", "v0"}}}));
 
     // key 1: delete one of two locations; key 2: delete its only location;
     // key 3: does not exist -> EC_NOENT.
@@ -387,7 +388,7 @@ TEST_F(MetaDummyBackendTest, TestExistsLocation) {
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
               PutWithFieldMaps(meta_storage_backend_.get(),
                                {1, 2},
-                               {{{LOCATION_PREFIX + "a", "la"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
+                               {{{PROPERTY_LOCATION_PREFIX + "a", "la"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
 
     AssertExistsLocation(meta_storage_backend_.get(),
                          {1, 2, 3},

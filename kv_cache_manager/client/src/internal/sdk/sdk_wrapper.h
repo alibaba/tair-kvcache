@@ -34,11 +34,27 @@ private:
         GET = 0,
         PUT = 1,
     };
+
+    // 按 SDK 分组的 URI 和 buffer 组
+    struct SdkGroup {
+        std::shared_ptr<SdkInterface> sdk;
+        std::vector<size_t> indices; // 原始索引，用于结果重排
+        std::vector<DataStorageUri> uris;
+        BlockBuffers buffers;
+    };
+
     ClientErrorCode Valid(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers local_buffers);
     std::shared_ptr<SdkInterface> GetSdk(const DataStorageUri &remote_uri);
 
+    // 按 URI hostname 分组，每组关联对应 SDK；任一 hostname 无对应 SDK 时返回错误
+    ClientErrorCode GroupBySdk(const std::vector<DataStorageUri> &remote_uris,
+                               const BlockBuffers &local_buffers,
+                               std::vector<SdkGroup> &groups);
+
     std::string getOpTypeString(OpType op_type) const;
-    ClientErrorCode RunWithTimeout(OpType op_type, const std::function<ClientErrorCode()> &func, int timeout_ms) const;
+    ClientErrorCode RunWithTimeoutParallel(OpType op_type,
+                                           std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                           int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);

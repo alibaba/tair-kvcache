@@ -1,7 +1,9 @@
 import argparse
+import json
 from .util import *
 from ..common.http_helper import *
 from ...util.json_helper import *
+
 
 def get_current_instance_group(args):
     data = {
@@ -13,6 +15,7 @@ def get_current_instance_group(args):
         raise RuntimeError(f"getInstanceGroup failed, result:[{result}]")
     print(result)
     return InstanceGroup.from_json_data(result["instance_group"])
+
 
 def main():
     args = parse_instance_group_args(is_create=False)
@@ -48,18 +51,28 @@ def main():
         current._cache_config._meta_indexer_config._meta_cache_policy_config._capacity = args.search_cache_capacity
     if hasattr(args, "search_cache_shard_bits"):
         current._cache_config._meta_indexer_config._meta_cache_policy_config._cache_shard_bits = args.search_cache_shard_bits
+    if hasattr(args, "extra_info") and args.extra_info:
+        existing = {}
+        if current._extra_info:
+            existing = json.loads(current._extra_info)
+        incoming = json.loads(args.extra_info)
+        existing.update(incoming)
+        current._extra_info = json.dumps(existing, ensure_ascii=False)
+    if hasattr(args, "event_report_storage_candidates"):
+        current._event_report_storage_candidates = args.event_report_storage_candidates
     current.check()
     current_version = current._version
     current._version += 1
     print("new instance group:")
     print(current.to_json_data())
     data = {
-        "trace_id" : args.trace_id,
-        "instance_group" : current.to_json_data(),
-        "current_version" : current_version
+        "trace_id": args.trace_id,
+        "instance_group": current.to_json_data(),
+        "current_version": current_version
     }
     result = http_post(args.host, "/api/updateInstanceGroup", data, args.verbose)
     pretty_print_json(result)
+
 
 if __name__ == "__main__":
     main()

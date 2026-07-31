@@ -49,6 +49,11 @@ public:
                         const std::vector<std::string> &requested_spec_names,
                         CheckLocDataExistFunc check_loc_data_exist,
                         std::vector<std::string> &out_prune_loc_ids) const override;
+    bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                    int32_t min_count,
+                                    const std::vector<std::string> &requested_spec_names,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const;
 
 protected:
     virtual uint32_t GetWeight(CacheLocationMap::const_reference kv) const = 0;
@@ -74,7 +79,7 @@ protected:
         static constexpr uint32_t TAIR_MEMPOOL = 3;
         static constexpr uint32_t DEFAULT = 1;
         static constexpr uint32_t VCNS_HF3FS = THREEFS;
-        static constexpr uint32_t VINEYARD = 10;
+        static constexpr uint32_t EVENT_REPORT = 10;
     };
 
 protected:
@@ -87,7 +92,8 @@ protected:
         StorageTypeWeights::NFS,
         StorageTypeWeights::VCNS_HF3FS,
         StorageTypeWeights::DEFAULT,
-        StorageTypeWeights::VINEYARD,
+        StorageTypeWeights::EVENT_REPORT,
+        StorageTypeWeights::EVENT_REPORT,
     };
 
     WeightArray &storage_weights_ = default_storage_weights_;

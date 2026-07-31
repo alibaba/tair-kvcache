@@ -1,4 +1,5 @@
 """Unit tests for _batch_set return value: 1:1 positional mapping with input keys."""
+import json
 import sys
 import types
 import unittest
@@ -765,6 +766,61 @@ class TestSkipTransfer(unittest.TestCase):
 
         self.assertEqual(len(result), 3)
         self.assertEqual(result, [False, False, False])
+
+
+class TestParseHf3fsConfigs(unittest.TestCase):
+    def test_vcns_hf3fs_uses_storage_spec_and_keeps_type(self):
+        c = _build_connector()
+        c.read_iov_block_size = 0
+        c.write_iov_block_size = 1048576
+        c.iov_size = 4294967296
+
+        storage_configs = json.dumps([
+            {
+                "type": "vcns_hf3fs",
+                "is_available": True,
+                "global_unique_name": "vcns_3fs",
+                "storage_spec": {
+                    "cluster_name": "vcns_3fs",
+                    "mountpoint": "/data/",
+                    "root_dir": "instance-root/",
+                    "key_count_per_file": 8,
+                    "remote_host": "127.0.0.1",
+                    "remote_port": 9081,
+                    "meta_storage_uri": "redis://example",
+                },
+            }
+        ])
+
+        self.assertEqual(c.parse_hf3fs_configs(storage_configs), [{
+            "type": "vcns_hf3fs",
+            "mountpoint": "/data/",
+            "root_dir": "instance-root/",
+            "read_iov_block_size": 0,
+            "read_iov_size": 4294967296,
+            "write_iov_block_size": 1048576,
+            "write_iov_size": 4294967296,
+        }])
+
+    def test_unavailable_vcns_hf3fs_is_ignored(self):
+        c = _build_connector()
+        c.read_iov_block_size = 0
+        c.write_iov_block_size = 0
+        c.iov_size = 1024
+
+        storage_configs = json.dumps([
+            {
+                "type": "vcns_hf3fs",
+                "is_available": False,
+                "global_unique_name": "vcns_3fs",
+                "storage_spec": {
+                    "mountpoint": "/data/",
+                    "root_dir": "instance-root/",
+                },
+            }
+        ])
+
+        self.assertEqual(c.parse_hf3fs_configs(storage_configs), [])
 
 
 class TestMLASkipTPSync(unittest.TestCase):

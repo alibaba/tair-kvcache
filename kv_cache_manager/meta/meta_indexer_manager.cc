@@ -3,11 +3,19 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
 
+void MetaIndexerManager::SetRevisitHistogramConfig(std::shared_ptr<MetricsRegistry> registry,
+                                                   const std::vector<double> &boundaries) {
+    metrics_registry_ = std::move(registry);
+    revisit_boundaries_ = boundaries;
+}
+
 ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
-                                                const std::shared_ptr<MetaIndexerConfig> &config) {
+                                                const std::shared_ptr<MetaIndexerConfig> &config,
+                                                const std::vector<double> &boundaries) {
     auto indexer = GetMetaIndexer(instance_id);
     if (indexer) {
         return ErrorCode::EC_EXIST;
@@ -25,6 +33,23 @@ ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
             KVCM_LOG_ERROR("Init meta indexer failed, instance_id: %s", instance_id.c_str());
             return ec;
         }
+
+        // Resolve boundaries: per-instance override > global default
+        const std::vector<double> &resolved = boundaries.empty() ? revisit_boundaries_ : boundaries;
+
+        // Create and inject per-instance revisit interval histogram
+        if (metrics_registry_ && !resolved.empty()) {
+            auto histogram = std::make_shared<RevisitIntervalHistogram>();
+            if (histogram->Init(metrics_registry_, resolved, instance_id)) {
+                indexer->SetRevisitHistogram(histogram);
+                KVCM_LOG_INFO("Created revisit interval histogram for instance_id: %s with %zu boundaries",
+                              instance_id.c_str(),
+                              resolved.size());
+            } else {
+                KVCM_LOG_WARN("Failed to create revisit interval histogram for instance_id: %s", instance_id.c_str());
+            }
+        }
+
         meta_indexers_[instance_id] = indexer;
     }
     KVCM_LOG_INFO("Create meta indexer success, instance_id: %s", instance_id.c_str());

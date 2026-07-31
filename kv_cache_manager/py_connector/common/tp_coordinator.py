@@ -52,6 +52,7 @@ msg_type_mapping = {
     "LoadBlockFinishedEvent": LoadBlockFinishedEvent,
 }
 
+
 class CoordinateMsgSerializer:
     @staticmethod
     def dumps(obj: CoordinateMessage) -> bytes:
@@ -130,6 +131,19 @@ class TpCoordinatorServer:
 
         running_load: Dict[RunningId, LoadContext] = {}
         running_save: Dict[RunningId, SaveContext] = {}
+        # Buffer for SendBlockFinishedEvent that arrives before SendBlockStartEvent
+        pending_save_finishes: Dict[RunningId, List[SendBlockFinishedEvent]] = {}
+
+        def complete_save_if_ready(save_id: RunningId, write_session_id: str, request_id: str):
+            save_context = running_save.get(save_id)
+            if save_context is None:
+                return
+            if save_context.get_size() != self._tp_world_size:
+                return
+            save_context = running_save.pop(save_id)
+            self._on_finished_callback(write_session_id, save_context)
+            with self._finished_saving_lock:
+                self._finished_saving.append(request_id)
 
         while self._coordinator_running:
             raw_msg = socket.recv()
@@ -145,22 +159,26 @@ class TpCoordinatorServer:
                 save_id = RunningId(content.write_session_id, content.request_id)
                 if save_id not in running_save:
                     running_save[save_id] = SaveContext(content.locations)
+
+                # Merge any buffered finish events that arrived before this start
+                if save_id in pending_save_finishes:
+                    for finish_event in pending_save_finishes.pop(save_id):
+                        running_save[save_id].add_new_rank(finish_event.tp_rank, finish_event.is_success_list)
+
+                complete_save_if_ready(save_id, content.write_session_id, content.request_id)
+
             elif isinstance(msg.content, SendBlockFinishedEvent):
                 content: SendBlockFinishedEvent = msg.content
                 save_id = RunningId(content.write_session_id, content.request_id)
-                assert save_id in running_save
-                running_save[save_id].add_new_rank(content.tp_rank, content.is_success_list)
 
-                if running_save[save_id].get_size() == self._tp_world_size:
-                    # TODO: move out of this class
-                    # logger.warning("[coordinator] all rank finished save_blocks_finished %s", save_id)
-                    save_context = running_save.pop(save_id)
-                    # logger.warning("save_context:%r", save_context.blocks_per_rank)
-                    self._on_finished_callback(content.write_session_id, save_context)
-
-                    self._finished_saving_lock.acquire()
-                    self._finished_saving.append(content.request_id)
-                    self._finished_saving_lock.release()
+                if save_id not in running_save:
+                    # Start event hasn't arrived yet, buffer this finish
+                    if save_id not in pending_save_finishes:
+                        pending_save_finishes[save_id] = []
+                    pending_save_finishes[save_id].append(content)
+                else:
+                    running_save[save_id].add_new_rank(content.tp_rank, content.is_success_list)
+                    complete_save_if_ready(save_id, content.write_session_id, content.request_id)
             elif isinstance(msg.content, LoadBlockFinishedEvent):
                 content: LoadBlockFinishedEvent = msg.content
                 load_id = RunningId(str(content.epoch), content.request_id)

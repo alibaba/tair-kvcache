@@ -6,6 +6,7 @@ py_library(
         "__init__.py",
         "module_base.py",
         "ranged_port_util.py",
+        "redis_server.py",
         "test_base.py",
         "worker.py",
         "worker_manager.py",

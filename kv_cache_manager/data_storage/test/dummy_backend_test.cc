@@ -176,6 +176,31 @@ TEST_F(DummyBackendTest, TestExistAndMightExistOnNonExistentFiles) {
     EXPECT_FALSE(might_res[1]);
 }
 
+TEST_F(DummyBackendTest, TestMemoryOnlyModeSkipsFileSystemChecks) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig("memory://", 1);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+    ASSERT_TRUE(backend.Available());
+
+    auto create_res = backend.Create({"memory_key"}, 128, "trace_2", []() {});
+    ASSERT_EQ(create_res.size(), 1u);
+    ASSERT_EQ(create_res[0].first, EC_OK);
+    EXPECT_EQ(create_res[0].second.GetProtocol(), "dummy");
+    EXPECT_NE(std::string::npos, create_res[0].second.ToUriString().find("/memory/memory_key"));
+
+    DataStorageUri missing_uri;
+    missing_uri.SetProtocol("dummy");
+    missing_uri.SetPath("/definitely/not/on/disk");
+    EXPECT_TRUE(backend.Exist({missing_uri})[0]);
+    EXPECT_TRUE(backend.MightExist({missing_uri})[0]);
+
+    bool cb_called = false;
+    auto delete_res = backend.Delete({missing_uri}, "trace_3", [&cb_called]() { cb_called = true; });
+    ASSERT_TRUE(cb_called);
+    ASSERT_EQ(delete_res.size(), 1u);
+    EXPECT_EQ(delete_res[0], EC_OK);
+}
+
 TEST_F(DummyBackendTest, TestExistAndMightExistOnExistingFiles) {
     DummyBackend backend(metrics_registry_);
     auto config = MakeConfig(test_root_, 1);
@@ -341,4 +366,79 @@ TEST_F(DummyBackendTest, TestCreateThenExistRoundTrip) {
     auto might_res = backend.MightExist(uris);
     ASSERT_EQ(might_res.size(), 1u);
     EXPECT_FALSE(might_res[0]);
+}
+
+TEST_F(DummyBackendTest, TestCopySuccess) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig(test_root_, 1);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+
+    // prepare a source file with content; dst parent dir does not exist yet
+    std::string src = test_root_ + "copy_src";
+    std::string dst = test_root_ + "cold/copy_dst";
+    {
+        std::ofstream ofs(src);
+        ofs << "hello-kv";
+    }
+    ASSERT_TRUE(std::filesystem::exists(src));
+
+    DataStorageUri src_uri, dst_uri;
+    src_uri.SetProtocol("dummy");
+    src_uri.SetPath(src);
+    dst_uri.SetProtocol("dummy");
+    dst_uri.SetPath(dst);
+
+    auto res = backend.Copy({src_uri}, {dst_uri}, "trace_2");
+    ASSERT_EQ(res.size(), 1u);
+    EXPECT_EQ(res[0], EC_OK);
+    // dst created (incl. parent dir) with identical content size
+    ASSERT_TRUE(std::filesystem::exists(dst));
+    EXPECT_EQ(std::filesystem::file_size(src), std::filesystem::file_size(dst));
+}
+
+TEST_F(DummyBackendTest, TestCopySrcMissingReturnsNoent) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig(test_root_, 1);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+
+    DataStorageUri src_uri, dst_uri;
+    src_uri.SetProtocol("dummy");
+    src_uri.SetPath(test_root_ + "no_such_src");
+    dst_uri.SetProtocol("dummy");
+    dst_uri.SetPath(test_root_ + "dst_for_missing");
+
+    auto res = backend.Copy({src_uri}, {dst_uri}, "trace_2");
+    ASSERT_EQ(res.size(), 1u);
+    EXPECT_EQ(res[0], EC_NOENT); // 模拟源端已被驱逐 / source lost
+    EXPECT_FALSE(std::filesystem::exists(test_root_ + "dst_for_missing"));
+}
+
+TEST_F(DummyBackendTest, TestCopyMixedAndSizeMismatch) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig(test_root_, 1);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+
+    std::string present = test_root_ + "mixed_present";
+    std::ofstream(present).close();
+    DataStorageUri s0, s1, d0, d1;
+    s0.SetProtocol("dummy");
+    s0.SetPath(present);
+    s1.SetProtocol("dummy");
+    s1.SetPath(test_root_ + "mixed_absent");
+    d0.SetProtocol("dummy");
+    d0.SetPath(test_root_ + "mixed_dst0");
+    d1.SetProtocol("dummy");
+    d1.SetPath(test_root_ + "mixed_dst1");
+
+    // per-item results: present -> OK, absent -> NOENT
+    auto res = backend.Copy({s0, s1}, {d0, d1}, "trace_2");
+    ASSERT_EQ(res.size(), 2u);
+    EXPECT_EQ(res[0], EC_OK);
+    EXPECT_EQ(res[1], EC_NOENT);
+
+    // src/dst size mismatch -> all EC_BADARGS
+    auto bad = backend.Copy({s0, s1}, {d0}, "trace_2");
+    ASSERT_EQ(bad.size(), 2u);
+    EXPECT_EQ(bad[0], EC_BADARGS);
+    EXPECT_EQ(bad[1], EC_BADARGS);
 }

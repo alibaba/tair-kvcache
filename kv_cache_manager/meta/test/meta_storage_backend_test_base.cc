@@ -16,8 +16,8 @@ void MetaStorageBackendTestBase::SplitFieldMaps(const FieldMapVec &field_maps,
     out_properties.resize(field_maps.size());
     for (size_t i = 0; i < field_maps.size(); ++i) {
         for (const auto &[name, value] : field_maps[i]) {
-            if (name.rfind(LOCATION_PREFIX, 0) == 0) {
-                std::string loc_id = name.substr(LOCATION_PREFIX.size());
+            if (name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+                std::string loc_id = name.substr(PROPERTY_LOCATION_PREFIX.size());
                 auto loc = std::make_shared<CacheLocation>();
                 loc->set_id(loc_id);
                 // Store raw value in a location_spec uri so round-trip tests
@@ -112,7 +112,7 @@ void MetaStorageBackendTestBase::AssertGetAllFields(MetaStorageBackend *meta_sto
         const KeyType &key = keys[i];
         FieldMap merged;
         for (const auto &[loc_id, loc_ptr] : out_locations[i]) {
-            merged[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
+            merged[PROPERTY_LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
         }
         for (const auto &[prop_name, prop_value] : out_properties[i]) {
             merged[prop_name] = prop_value;

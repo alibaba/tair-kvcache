@@ -275,7 +275,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             int32_t block_size,
                                             const std::vector<LocationSpecInfo> &location_spec_infos,
                                             const ModelDeployment &model_deployment,
-                                            const std::vector<LocationSpecGroup> &location_spec_groups) {
+                                            const std::vector<LocationSpecGroup> &location_spec_groups,
+                                            int32_t default_query_type) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto instance_group_iter = instance_group_configs_.find(instance_group);
@@ -288,8 +289,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
     auto it = instance_infos_.find(instance_id);
     if (it != instance_infos_.end()) {
         const auto &existing = it->second;
-        auto mismatched =
-            existing->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
+        auto mismatched = existing->MismatchFields(
+            block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(
@@ -308,7 +309,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         block_size,
                                                         location_spec_infos,
                                                         model_deployment,
-                                                        location_spec_groups);
+                                                        location_spec_groups,
+                                                        default_query_type);
     // save the instance info to storage backend in such a way that one key corresponds to one instance
     auto ec = LoadAndSave(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {
@@ -439,6 +441,16 @@ CacheConfigConstPtr RegistryManager::GetCacheConfig(const std::string &instance_
     auto it = instance_group_configs_.find(instance_group);
     if (it != instance_group_configs_.end()) {
         return it->second->cache_config();
+    }
+    return nullptr;
+}
+
+std::shared_ptr<const InstanceGroup>
+RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = instance_group_configs_.find(instance_group_name);
+    if (it != instance_group_configs_.end()) {
+        return it->second;
     }
     return nullptr;
 }

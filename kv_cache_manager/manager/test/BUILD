@@ -11,6 +11,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
+        "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
     ],
 )
@@ -37,9 +38,27 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    linkstatic = True,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:schedule_plan_executor",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "MigrationManagerTest",
+    srcs = [
+        "migration_manager_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/manager:migration_manager",
+        "@cpp_stub",
     ],
 )
 
@@ -53,6 +72,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:meta_local_backend",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
     ],
@@ -82,10 +102,12 @@ cc_test(
         "-fno-access-control",
     ],
     data = [],
+    linkstatic = True,
     shard_count = 10,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
+        "@cpp_stub",
     ],
 )
 
@@ -155,6 +177,21 @@ cc_test(
 )
 
 cc_test(
+    name = "FilterWriteCacheTest",
+    srcs = [
+        "filter_write_cache_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/manager:select_location_policy",
+    ],
+)
+
+cc_test(
     name = "ReclaimerTaskSupervisorTest",
     srcs = [
         "reclaimer_task_supervisor_test.cc",
@@ -179,5 +216,20 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:write_location_manager",
+    ],
+)
+
+cc_test(
+    name = "CacheManagerMetricsRecorderTest",
+    srcs = [
+        "cache_manager_metrics_recorder_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:cache_manager_metrics_recorder",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )

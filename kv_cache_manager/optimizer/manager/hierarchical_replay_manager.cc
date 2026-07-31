@@ -15,8 +15,8 @@
 namespace kv_cache_manager {
 namespace {
 
-std::unordered_map<std::string, OptInstanceConfig> CollectInstances(const OptimizerConfig &config) {
-    std::unordered_map<std::string, OptInstanceConfig> instances;
+std::unordered_map<std::string, OptimizerReplayInstanceConfig> CollectInstances(const OptimizerConfig &config) {
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instances;
     for (const auto &group : config.instance_groups()) {
         for (auto instance : group.instances()) {
             instance.set_instance_group_name(group.group_name());
@@ -40,7 +40,7 @@ std::unordered_map<std::string, StoragePoolInfo> CollectStoragePools(const Hiera
     return pools;
 }
 
-size_t PositiveBlockSizeOrZero(const OptInstanceConfig &instance) {
+size_t PositiveBlockSizeOrZero(const OptimizerReplayInstanceConfig &instance) {
     return instance.block_size() > 0 ? static_cast<size_t>(instance.block_size()) : 0;
 }
 

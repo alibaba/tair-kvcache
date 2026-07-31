@@ -49,6 +49,8 @@ protected:
             ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
             ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
             ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
+                // Inject minimal delay to ensure batch_flush_time_us > 0 in stats
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
                 std::vector<ReplyUPtr> replies;
                 for (size_t i = 0; i < cmds.size(); ++i) {
                     redisReply *r = (redisReply *)malloc(sizeof(redisReply));

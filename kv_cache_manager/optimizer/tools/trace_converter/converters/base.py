@@ -1,6 +1,6 @@
 """Base converter interface for all trace converters"""
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Dict, Any, Set
 
 
@@ -42,20 +42,50 @@ class BaseConverter(ABC):
             raise ValueError(f"block_size must be positive for instance {instance_id}")
         return list(keys[:input_len // block_size])
 
-    @abstractmethod
     def convert_to_traces(self, input_file: str) -> list:
         """
-        转换trace文件为traces列表
-        
-        文件IO由trace_converter.py和merge_utils.py统一处理
-        
+        转换 trace 文件为 traces 列表。
+
+        Converter 需要实现 convert_to_traces() 或 convert_to_trace_jsonl()
+        之一。实现本方法时,文件写出由 trace_converter.py 和
+        merge_utils.py 统一处理。
+
         Args:
             input_file: 输入文件路径
-        
+
         Returns:
-            traces列表
+            traces 列表
         """
-        pass
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement convert_to_traces() "
+            "or convert_to_trace_jsonl()"
+        )
+
+    def convert_to_trace_jsonl(self, input_file: str, output_file: str) -> int:
+        """
+        流式转换 trace 文件并直接写出标准 trace JSONL。
+
+        Converter 需要实现 convert_to_traces() 或 convert_to_trace_jsonl()
+        之一。实现本方法时,converter 负责完整写出 output_file,每行一个
+        Optimizer trace JSON object。
+
+        trace_converter.py 不会对本方法写出的单文件内容做额外排序或顺序校验。
+        如果调用方需要特定顺序,由 converter 实现自行保证。
+        trace_converter.py 可能传入临时 output_file,并在本方法成功返回后
+        原子替换到最终输出路径;converter 只应写入传入的 output_file。
+
+        返回值 contract:
+        - 必须返回非负 int,表示写出的 trace 条数。
+        - 返回其他类型会被视为 converter contract 错误。
+
+        Args:
+            input_file: 输入文件路径或 URL
+            output_file: 输出 JSONL 文件路径
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement convert_to_traces() "
+            "or convert_to_trace_jsonl()"
+        )
 
     def _allocate_timestamp(self, instance_id: str, base_timestamp: int) -> int:
         """

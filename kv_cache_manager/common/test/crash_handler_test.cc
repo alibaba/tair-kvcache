@@ -283,8 +283,8 @@ TEST_F(CrashHandlerTest, OutputContainsBuildVersion) {
         _exit(0);
     });
     EXPECT_NE(std::string::npos, r.stderr_output.find("version:")) << "stderr:\n" << r.stderr_output;
-    EXPECT_NE(std::string::npos, r.stderr_output.find(KVCM_GIT_COMMIT))
-        << "no git commit in stderr (looking for " << KVCM_GIT_COMMIT << "):\n"
+    EXPECT_NE(std::string::npos, r.stderr_output.find(kKvcmGitCommit))
+        << "no git commit in stderr (looking for " << kKvcmGitCommit << "):\n"
         << r.stderr_output;
 }
 

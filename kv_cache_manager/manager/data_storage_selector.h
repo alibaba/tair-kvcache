@@ -33,6 +33,23 @@ struct DataStorageSelectResult {
     std::string name;
 };
 
+enum class StorageTargetAdmissionStatus {
+    kAllowed,
+    kNotFound,
+    kUnavailable,
+    kGroupQuotaExceeded,
+    kStorageTypeQuotaExceeded,
+    kReadError,
+};
+
+struct StorageTargetAdmissionResult {
+    StorageTargetAdmissionStatus status = StorageTargetAdmissionStatus::kReadError;
+    ErrorCode ec = EC_ERROR;
+    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+
+    [[nodiscard]] bool Allowed() const noexcept { return status == StorageTargetAdmissionStatus::kAllowed; }
+};
+
 /**
  * @brief Manages the selection of appropriate data storage backends for
  * cache operations
@@ -131,6 +148,21 @@ public:
     [[nodiscard]] DataStorageSelectResult
     SelectCacheWriteDataStorageBackend(RequestContext *request_context,
                                        const std::string &instance_group) const noexcept;
+
+    /**
+     * @brief Check whether explicitly named write targets may accept new
+     * allocations.
+     *
+     * Unlike normal backend selection, this method does not require targets
+     * to appear in storage_candidates and never falls back to another
+     * backend. It evaluates backend availability, group total quota, and
+     * configured storage-type quota once for the whole batch. Results are
+     * aligned with target_storage_names.
+     */
+    [[nodiscard]] std::vector<StorageTargetAdmissionResult>
+    CheckExplicitWriteTargets(RequestContext *request_context,
+                              const std::string &instance_group,
+                              const std::vector<std::string> &target_storage_names) const noexcept;
 
 private:
     std::size_t

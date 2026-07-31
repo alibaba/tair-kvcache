@@ -48,6 +48,7 @@ void AdminServiceHttp::Init() {
     // for cache APIs
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveCache);
+    MAKE_SERVICE_METRICS_COLLECTOR(MigrateCache);
 
     // for instance APIs
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
@@ -102,6 +103,7 @@ void AdminServiceHttp::RegisterHandler() {
     // Cache APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, migrateCache, MigrateCache, MigrateCache, MigrateCache);
 
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, registerInstance, RegisterInstance, Common, RegisterInstance);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, removeInstance, RemoveInstance, Common, RemoveInstance);
@@ -301,6 +303,17 @@ void AdminServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
                   request->instance_id().c_str());
 
     admin_service_impl_->RemoveCache(request_context, request, response);
+}
+
+void AdminServiceHttp::MigrateCache(coro_http::coro_http_connection *http_conn,
+                                    proto::admin::MigrateCacheRequest *request,
+                                    proto::admin::MigrateCacheResponse *response) {
+    API_CONTEXT_INIT_HTTP(MigrateCache)
+    KVCM_LOG_INFO("[traceId: %s] MigrateCache for instance [%s] called.",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str());
+
+    admin_service_impl_->MigrateCache(request_context, request, response);
 }
 
 void AdminServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,

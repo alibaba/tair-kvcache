@@ -65,6 +65,9 @@ public:
     void RemoveCache(coro_http::coro_http_connection *http_conn,
                      proto::admin::RemoveCacheRequest *request,
                      proto::admin::CommonResponse *response);
+    void MigrateCache(coro_http::coro_http_connection *http_conn,
+                      proto::admin::MigrateCacheRequest *request,
+                      proto::admin::MigrateCacheResponse *response);
 
     void RegisterInstance(coro_http::coro_http_connection *http_conn,
                           proto::admin::RegisterInstanceRequest *request,
@@ -144,6 +147,7 @@ private:
     // for cache APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_(MigrateCache);
 
     // for instance APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
