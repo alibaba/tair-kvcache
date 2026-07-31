@@ -170,6 +170,9 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
 
     ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     ASSERT_EQ(actual_remote_uris->size(), 2);
+    // 同序契约：actual_remote_uris[i] 与 remote_uris[i] 逐位置对应
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), uri2.ToUriString());
 
     free(put_buffer_1);
     free(put_buffer_2);

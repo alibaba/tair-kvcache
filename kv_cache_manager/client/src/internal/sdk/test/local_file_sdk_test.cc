@@ -92,6 +92,81 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     free(get_buffer);
 }
 
+// 同 backend（同一次 Put 调用）内多个不同 path 交错出现、且 payload 各不相同。
+// 修复前 SplitByPath 按 unordered_map 迭代顺序回填 actual_remote_uris，导致
+// 返回顺序与输入顺序不一致；本测试固定"同序契约"：actual_remote_uris[i] 必须
+// 对应 remote_uris[i]，且数据真正写入各自 path 对应的文件。
+TEST_F(LocalFileSdkTest, TestPutMultiPathInterleavedOrdering) {
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    // 交错输入：fileA(blk0), fileB(blk0), fileA(blk1)
+    DataStorageUri uri_a0("file://" + root_path_ + "/multi_path/fileA");
+    uri_a0.SetParam("blkid", "0");
+    uri_a0.SetParam("size", "1024");
+    DataStorageUri uri_b0("file://" + root_path_ + "/multi_path/fileB");
+    uri_b0.SetParam("blkid", "0");
+    uri_b0.SetParam("size", "1024");
+    DataStorageUri uri_a1("file://" + root_path_ + "/multi_path/fileA");
+    uri_a1.SetParam("blkid", "1");
+    uri_a1.SetParam("size", "1024");
+
+    const char *payload_a0 = "payload for fileA block0";
+    const char *payload_b0 = "payload for fileB block0";
+    const char *payload_a1 = "payload for fileA block1";
+    size_t len_a0 = strlen(payload_a0);
+    size_t len_b0 = strlen(payload_b0);
+    size_t len_a1 = strlen(payload_a1);
+
+    // 三个 block 使用相互独立、内容各异的 buffer
+    void *buf_a0 = malloc(1024);
+    void *buf_b0 = malloc(1024);
+    void *buf_a1 = malloc(1024);
+    std::memcpy(buf_a0, payload_a0, len_a0);
+    std::memcpy(buf_b0, payload_b0, len_b0);
+    std::memcpy(buf_a1, payload_a1, len_a1);
+
+    auto make_buffer = [](void *base, size_t size) {
+        BlockBuffer bb;
+        Iov iov;
+        iov.base = base;
+        iov.size = size;
+        iov.type = MemoryType::CPU;
+        iov.ignore = false;
+        bb.iovs.push_back(iov);
+        return bb;
+    };
+
+    std::vector<DataStorageUri> remote_uris = {uri_a0, uri_b0, uri_a1};
+    BlockBuffers local_buffers = {make_buffer(buf_a0, len_a0), make_buffer(buf_b0, len_b0), make_buffer(buf_a1, len_a1)};
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+
+    // 同序契约：返回顺序必须与输入一致
+    ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
+    EXPECT_EQ(actual_remote_uris->at(0).ToUriString(), uri_a0.ToUriString());
+    EXPECT_EQ(actual_remote_uris->at(1).ToUriString(), uri_b0.ToUriString());
+    EXPECT_EQ(actual_remote_uris->at(2).ToUriString(), uri_a1.ToUriString());
+
+    // 用全新的 buffer 读回，验证数据确实写入了各自 path 的文件
+    void *get_a0 = malloc(1024);
+    void *get_b0 = malloc(1024);
+    void *get_a1 = malloc(1024);
+    BlockBuffers get_buffers = {make_buffer(get_a0, len_a0), make_buffer(get_b0, len_b0), make_buffer(get_a1, len_a1)};
+    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, get_buffers));
+    EXPECT_EQ(std::memcmp(get_a0, payload_a0, len_a0), 0);
+    EXPECT_EQ(std::memcmp(get_b0, payload_b0, len_b0), 0);
+    EXPECT_EQ(std::memcmp(get_a1, payload_a1, len_a1), 0);
+
+    free(buf_a0);
+    free(buf_b0);
+    free(buf_a1);
+    free(get_a0);
+    free(get_b0);
+    free(get_a1);
+}
+
 TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
 #ifdef USING_CUDA
     LocalFileSdk sdk;

@@ -20,6 +20,9 @@ enum class SdkType : uint8_t {
 struct BlockGroup {
     std::vector<DataStorageUri> remote_uris;
     BlockBuffers local_buffers;
+    // remote_uris[k] / local_buffers[k] 在原始输入中的下标，用于把按 path 分组
+    // 处理后的结果按原始输入顺序回填（同序契约，见 SdkInterface::Put）
+    std::vector<size_t> indices;
 };
 
 struct Hf3fsRemoteItem {

@@ -236,23 +236,37 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 预分配并按原始下标回填，保证同序契约：actual_remote_uris[i] 对应 remote_uris[i]。
+    // SplitByPath 按 path 分组后迭代顺序是不确定的（unordered_map），不能按分组
+    // 顺序 append 结果，否则交错输入（同 backend 多 path）会乱序。
+    actual_remote_uris->resize(remote_uris.size());
     auto group_map = SplitByPath(remote_uris, local_buffers);
     for (const auto &group : group_map) {
         std::string file_path = group.first;
+        const BlockGroup &block_group = group.second;
+        std::vector<DataStorageUri> group_actual_uris;
         if (!std::filesystem::exists(file_path)) {
-            auto ec = Alloc(group.second.remote_uris, *actual_remote_uris);
+            auto ec = Alloc(block_group.remote_uris, group_actual_uris);
             if (ec != ER_OK) {
                 KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
                 return ER_SDKALLOC_ERROR;
             }
         } else {
-            actual_remote_uris->insert(
-                actual_remote_uris->end(), group.second.remote_uris.begin(), group.second.remote_uris.end());
+            group_actual_uris = block_group.remote_uris;
         }
-        auto ec = DoPut(group.second.remote_uris, group.second.local_buffers);
+        auto ec = DoPut(block_group.remote_uris, block_group.local_buffers);
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("Put failed, DoPut failed, errorcode: %d", ec);
             return ER_SDKWRITE_ERROR;
+        }
+        if (group_actual_uris.size() != block_group.indices.size()) {
+            KVCM_LOG_ERROR("Put failed, alloc uris size [%zu] not equal to group size [%zu]",
+                           group_actual_uris.size(),
+                           block_group.indices.size());
+            return ER_SDKWRITE_ERROR;
+        }
+        for (size_t k = 0; k < block_group.indices.size(); ++k) {
+            (*actual_remote_uris)[block_group.indices[k]] = group_actual_uris[k];
         }
     }
     return ER_OK;
