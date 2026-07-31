@@ -54,6 +54,21 @@ public:
         }
     }
 
+    // Keys whose age at now_ns is strictly below the TTL (0 = no TTL).
+    uint64_t AliveCount(int64_t now_ns, uint64_t ttl_ns) const {
+        if (ttl_ns == 0) {
+            return static_cast<uint64_t>(last_access_.size());
+        }
+        uint64_t alive = 0;
+        for (const auto &[key, last_ns] : last_access_) {
+            const uint64_t age = last_ns < now_ns ? static_cast<uint64_t>(now_ns - last_ns) : 0;
+            if (age < ttl_ns) {
+                ++alive;
+            }
+        }
+        return alive;
+    }
+
 private:
     std::vector<int64_t> recency_;
     std::unordered_map<int64_t, int64_t> last_access_;
@@ -183,6 +198,10 @@ TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
             }
         }
         oracle.Commit(keys, now);
+        for (std::size_t t = 0; t < ttls.size(); ++t) {
+            ASSERT_EQ(oracle.AliveCount(now, ttls[t]), cores[t]->current_unique_blocks())
+                << "step " << step << " ttl " << ttls[t];
+        }
     }
 }
 
