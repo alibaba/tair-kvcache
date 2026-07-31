@@ -47,9 +47,16 @@ logger = logging.getLogger("vllm_e2e")
 
 
 def get_block_files(manager_uri: str, instance_id: str, token_ids: list[int],
-                    spec_name: str = "tp0_g0") -> list[str]:
+                    spec_name: str | None = None) -> list[str]:
     """Per-manager-block storage file paths, in block order, from the manager's
-    getCacheLocation response."""
+    getCacheLocation response.
+
+    Defaults to the spec every block is guaranteed to have: hybrid models
+    publish per-block spec coverage, so a *state* group's spec is absent from
+    the blocks where vLLM materialized no recurrent state. The attention spec
+    is the one present on every published block -- and it is also the one whose
+    loss makes a load fail, which is what this scenario needs.
+    """
     r = requests.post(f"{manager_uri}/api/getCacheLocation", json={
         "trace_id": "e2e_block_files",
         "token_ids": token_ids,
@@ -58,8 +65,20 @@ def get_block_files(manager_uri: str, instance_id: str, token_ids: list[int],
         "block_mask": {"offset": 0},
     }, timeout=10)
     r.raise_for_status()
+    locations = r.json().get("locations", [])
+    if spec_name is None:
+        # The spec present in *every* location is the attention one; state specs
+        # are sparse. Intersect to find it without knowing the group layout.
+        common = None
+        for location in locations:
+            names = {s["name"] for s in location.get("location_specs", [])}
+            common = names if common is None else (common & names)
+        assert common, f"no spec is common to all {len(locations)} locations"
+        spec_name = sorted(common)[0]
+        logger.info("using spec %s (present on all %d blocks)", spec_name,
+                    len(locations))
     files = []
-    for location in r.json().get("locations", []):
+    for location in locations:
         for spec in location.get("location_specs", []):
             if spec["name"] == spec_name:
                 # uri: file://<path>?size=...
