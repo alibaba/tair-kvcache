@@ -44,9 +44,12 @@ class FakeRequest:
         return self.prompt_token_ids + self.output_token_ids
 
 
-def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None):
+def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None,
+                             num_groups=1, num_state_groups=0, tp_size=1):
     """Connector with the scheduler-side state build_connector_meta needs."""
-    conn = make_connector(manager_block_size=mbs, vllm_block_size=vllm_bs)
+    conn = make_connector(manager_block_size=mbs, vllm_block_size=vllm_bs,
+                          num_groups=num_groups,
+                          num_state_groups=num_state_groups, tp_size=tp_size)
     conn._epoch = 0
     conn._alive_requests = {}
     conn._waiting_to_load_requests = []
@@ -161,6 +164,192 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         state = conn._alive_requests["r0"]
         self.assertEqual(state.remote_matched_token_num, 0)
         self.assertEqual(state.has_saved_block_num, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Per-block spec coverage (hybrid sparse recurrent state)
+# --------------------------------------------------------------------------- #
+def hybrid_locations(coverage, tp_size=1, num_attn=1, num_state=1):
+    """Manager locations whose per-block spec set encodes ``coverage``:
+    True -> every group's spec (state included), False -> attention specs only.
+    """
+    locs = []
+    for complete in coverage:
+        names = [f"tp{r}_g{g}" for r in range(tp_size) for g in range(num_attn)]
+        if complete:
+            names += [f"tp{r}_g{num_attn + g}"
+                      for r in range(tp_size) for g in range(num_state)]
+        locs.append({"location_specs": [{"name": n, "uri": f"u_{n}"}
+                                        for n in names]})
+    return locs
+
+
+class TestSpecGroups(unittest.TestCase):
+    """Registration must advertise the two spec groups a hybrid model needs to
+    express per-block state sparsity -- and must stay silent for models that
+    have no sparsity (byte-identical requests, old-manager compatible)."""
+
+    def test_full_attention_declares_no_groups(self):
+        conn = make_connector(num_groups=1, tp_size=2)
+        self.assertEqual(conn._spec_groups, [])
+
+    def test_hybrid_declares_attn_and_full(self):
+        conn = make_connector(num_groups=1, num_state_groups=2, tp_size=2)
+        groups = {g["name"]: g["spec_names"] for g in conn._spec_groups}
+        self.assertEqual(sorted(groups), ["attn", "full"])
+        # attn: the attention spec of every rank; full: every group of every rank.
+        self.assertEqual(groups["attn"], ["tp0_g0", "tp1_g0"])
+        self.assertEqual(groups["full"],
+                         ["tp0_g0", "tp0_g1", "tp0_g2",
+                          "tp1_g0", "tp1_g1", "tp1_g2"])
+
+
+class TestStateCompleteMask(unittest.TestCase):
+    """Which manager blocks have a materialized recurrent state is read from
+    vLLM's block table: a state group pointing at the null block (id 0) has
+    none. This mask is what start_write_cache announces per key."""
+
+    def _req(self, tables):
+        return ReqState(req_id="r0", token_ids=[], block_ids_per_group=tables,
+                        has_saved_block_num=0, local_matched_token_num=0,
+                        remote_matched_token_num=0, vllm_request=None)
+
+    def test_full_attention_is_always_complete(self):
+        conn = make_connector(mbs := 16, num_groups=1)
+        req = self._req([[7, 0, 9]])
+        self.assertEqual(conn._state_complete_mask(req, range(3)),
+                         [True, True, True])
+
+    def test_null_state_blocks_are_incomplete(self):
+        conn = make_connector(manager_block_size=16, num_groups=1,
+                              num_state_groups=1)
+        # State table: blocks 0 and 2 are null (no state), block 1 is real.
+        req = self._req([[100, 101, 102], [0, 55, 0]])
+        self.assertEqual(conn._state_complete_mask(req, range(3)),
+                         [False, True, False])
+
+    def test_all_state_groups_must_have_state(self):
+        conn = make_connector(manager_block_size=16, num_groups=1,
+                              num_state_groups=2)
+        # Block 1 has a state in group 1 but not in group 2 -> incomplete.
+        req = self._req([[100, 101], [7, 8], [7, 0]])
+        self.assertEqual(conn._state_complete_mask(req, range(2)),
+                         [True, False])
+
+    def test_short_state_table_is_incomplete(self):
+        # A state table that does not reach the block cannot prove a state.
+        conn = make_connector(manager_block_size=16, num_groups=1,
+                              num_state_groups=1)
+        req = self._req([[100, 101], [55]])
+        self.assertEqual(conn._state_complete_mask(req, range(2)),
+                         [True, False])
+
+
+class TestExternalHitTruncation(unittest.TestCase):
+    """A hybrid request can only resume where the recurrent state ends, so an
+    external match must be cut back to the last state-complete block. The
+    attention KV of a longer prefix is worthless without that state."""
+
+    MBS = 16
+
+    def _matched(self, coverage, prompt_len=None, num_state_groups=1,
+                 tp_size=1):
+        conn = make_scheduler_connector(
+            mbs=self.MBS, num_state_groups=num_state_groups, tp_size=tp_size,
+            locations=hybrid_locations(coverage, tp_size=tp_size,
+                                       num_state=num_state_groups))
+        req = FakeRequest("r0", list(range(prompt_len or
+                                          (len(coverage) + 2) * self.MBS)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        return conn, matched
+
+    def test_truncates_to_last_state_complete_block(self):
+        conn, matched = self._matched([True, True, False, False])
+        self.assertEqual(matched, 2 * self.MBS)
+        self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes,
+                         [0, 1])
+
+    def test_interior_gap_is_kept(self):
+        # Only the *end* of the match must carry state; earlier state-less
+        # blocks are fine (their state is never read).
+        conn, matched = self._matched([True, False, True, False])
+        self.assertEqual(matched, 3 * self.MBS)
+        self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes,
+                         [0, 1, 2])
+
+    def test_no_state_anywhere_drops_the_match(self):
+        conn, matched = self._matched([False, False, False])
+        self.assertEqual(matched, 0)
+        self.assertEqual(conn._waiting_to_load_requests, [])
+
+    def test_all_complete_is_untouched(self):
+        conn, matched = self._matched([True, True, True])
+        self.assertEqual(matched, 3 * self.MBS)
+
+    def test_every_rank_must_have_the_state(self):
+        # tp2: block 1 has the state spec of rank 0 only -- rank 1 would read
+        # nothing, so the block cannot end the match.
+        conn = make_scheduler_connector(mbs=self.MBS, num_state_groups=1,
+                                        tp_size=2)
+        locs = hybrid_locations([True, True], tp_size=2, num_state=1)
+        locs[1]["location_specs"] = [
+            s for s in locs[1]["location_specs"] if s["name"] != "tp1_g1"]
+        conn._location_query_manager.get_locations_for_query.return_value = (
+            True, locs)
+        req = FakeRequest("r0", list(range(6 * self.MBS)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, self.MBS)
+
+    def test_full_attention_never_truncates(self):
+        # Single group: the state specs do not exist, so coverage is uniform
+        # and the match must be untouched (no hit-rate regression).
+        conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(3))
+        req = FakeRequest("r0", list(range(6 * self.MBS)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, 3 * self.MBS)
+
+    def test_truncation_runs_before_the_full_hit_cap(self):
+        # Prompt is exactly 3 blocks; coverage allows 3 but the last carries no
+        # state -> truncate to 2, and the full-hit cap then has nothing to drop.
+        conn, matched = self._matched([True, True, False],
+                                      prompt_len=3 * self.MBS)
+        self.assertEqual(matched, 2 * self.MBS)
+
+
+class TestStartWriteCacheSpecGroups(unittest.TestCase):
+    """start_write_cache must tell the manager, per key, which specs the block
+    will really hold -- that is how "no state here" becomes visible instead of
+    being encoded as a successful write."""
+
+    def _conn(self, num_state_groups):
+        conn = make_scheduler_connector(mbs=16, num_state_groups=num_state_groups)
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=30)
+        conn._manager_client = MagicMock()
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [], "write_session_id": "sess"}
+        return conn
+
+    def _request_sent(self, conn):
+        (req,), _ = conn._manager_client.start_write_cache.call_args
+        return req
+
+    def test_hybrid_sends_per_key_group_names(self):
+        conn = self._conn(num_state_groups=1)
+        conn.start_save_kvcache_async("r0", list(range(48)), 3,
+                                      [True, False, True])
+        self.assertEqual(self._request_sent(conn)["location_spec_group_names"],
+                         ["full", "attn", "full"])
+
+    def test_full_attention_omits_group_names(self):
+        conn = self._conn(num_state_groups=0)
+        conn.start_save_kvcache_async("r0", list(range(32)), 2, [True, True])
+        self.assertNotIn("location_spec_group_names", self._request_sent(conn))
+
+    def test_mask_length_is_checked(self):
+        conn = self._conn(num_state_groups=1)
+        with self.assertRaises(AssertionError):
+            conn.start_save_kvcache_async("r0", list(range(48)), 3, [True])
 
 
 # --------------------------------------------------------------------------- #
@@ -420,7 +609,10 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
-        self.assertEqual(args[1:], ("r0", list(range(32)), 2))
+        # The per-block state-completeness mask is computed here, in the
+        # scheduler loop, and handed to the http thread: it is read off vLLM's
+        # block table, which later steps mutate.
+        self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
         self.assertEqual(conn._alive_requests["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):

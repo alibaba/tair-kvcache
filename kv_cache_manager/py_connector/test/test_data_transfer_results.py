@@ -134,11 +134,17 @@ class TestLoadDoneCallback(unittest.TestCase):
 
 
 class TestNullStateBlocks(unittest.TestCase):
-    """Mamba 'align' mode: null (id 0) state targets carry no state by design
-    (vLLM materializes states only at segment boundaries), so save/load must
-    treat them as vacuous successes -- failing them would stride-AND whole
-    manager blocks out of the manager's prefix chain and kill multi-block
-    hybrid caching. The all-null path takes no GPU work, so it runs on CPU."""
+    """Mamba 'align' mode: vLLM materializes a recurrent state only at segment
+    boundaries, so a state group's null (id 0) target carries no state.
+
+    The connector must never turn that absence into a *success*: the block would
+    be published as fully cached and a later, shorter request would resume from
+    a state URI nobody ever wrote. Instead the state group abstains for such a
+    block (None = "no data of mine here"), and the block's verdict is decided by
+    the groups that did carry data -- the missing state is expressed to the
+    manager through the block's spec coverage (see
+    v1_connector._spec_groups). These paths do no GPU work, so they run on CPU.
+    """
 
     @staticmethod
     def _state_group():
@@ -148,26 +154,123 @@ class TestNullStateBlocks(unittest.TestCase):
             layer_names=["m0"], block_size=528, per_block_bytes=1024,
             kernel_block_size=528)
 
-    def test_save_all_null_blocks_vacuously_succeed(self):
-        dtm = _make_dtm()
-        results = {}
-        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
-        dtm.save_task(mr, 0, self._state_group(),
-                      remote_uris=["u0", "u1"],
-                      block_token_indices=None,
-                      block_ids=[0, 0],
-                      ready_event=None)
-        self.assertEqual(results["flat"], [True, True])
+    @staticmethod
+    def _attn_group():
+        from kv_cache_manager.py_connector.common.types import TransferGroup
+        return TransferGroup(
+            group_idx=1, spec_name="tp0_g1", is_attention=True,
+            layer_names=["a0"], block_size=528, per_block_bytes=1024,
+            kernel_block_size=528)
 
-    def test_load_all_null_blocks_vacuously_succeed(self):
+    def _run(self, method, **kwargs):
         dtm = _make_dtm()
         results = {}
         mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
-        dtm.load_task(mr, 0, self._state_group(),
-                      remote_uris=["u0", "u1", "u2"],
-                      block_token_indices=None,
-                      block_ids=[0, 0, 0])
-        self.assertEqual(results["flat"], [True, True, True])
+        getattr(dtm, method)(mr, 0, self._state_group(), **kwargs)
+        return results["flat"]
+
+    def test_save_null_state_blocks_abstain_not_succeed(self):
+        # No state and (consistently) no location for it: the group abstains.
+        flat = self._run("save_task",
+                         remote_uris=[None, None],
+                         block_token_indices=None,
+                         block_ids=[0, 0],
+                         ready_event=None)
+        self.assertEqual(flat, [None, None])
+
+    def test_save_null_state_with_location_fails(self):
+        # The manager allocated a state location but vLLM has no state to put
+        # there: publishing it would advertise unwritten bytes.
+        flat = self._run("save_task",
+                         remote_uris=["u0", None],
+                         block_token_indices=None,
+                         block_ids=[0, 0],
+                         ready_event=None)
+        self.assertEqual(flat, [False, None])
+
+    def test_save_real_state_without_location_fails(self):
+        # A state exists but was not announced: it cannot be published.
+        flat = self._run("save_task",
+                         remote_uris=[None],
+                         block_token_indices=None,
+                         block_ids=[7],
+                         ready_event=None)
+        self.assertEqual(flat, [False])
+
+    def test_load_null_state_targets_abstain(self):
+        # vLLM does not need a state for these blocks (only the block ending
+        # the reused prefix does), whatever the manager published.
+        flat = self._run("load_task",
+                         remote_uris=["u0", "u1", "u2"],
+                         block_token_indices=None,
+                         block_ids=[0, 0, 0])
+        self.assertEqual(flat, [None, None, None])
+
+    def test_load_real_target_without_location_fails(self):
+        # vLLM needs this state but nothing was published for it: the request
+        # must not run on an unwritten state.
+        flat = self._run("load_task",
+                         remote_uris=[None],
+                         block_token_indices=None,
+                         block_ids=[9])
+        self.assertEqual(flat, [False])
+
+    def test_attention_block_without_location_fails(self):
+        # Attention KV is never sparse: a missing location is a failure, and
+        # the block must be kept out of the staging batch so the remaining
+        # buffers stay aligned with the URI list.
+        dtm = _make_dtm()
+        skipped, failed = dtm._save_dispositions(
+            self._attn_group(), remote_uris=["u0", None, "u2"],
+            block_ids=None, n=3)
+        self.assertEqual((skipped, failed), (set(), {1}))
+
+    def test_save_dispositions_state_group(self):
+        dtm = _make_dtm()
+        # block0: no state, nothing published -> abstain
+        # block1: state + location      -> transfer
+        # block2: no state but published -> fail
+        # block3: state but unpublished  -> fail
+        skipped, failed = dtm._save_dispositions(
+            self._state_group(), remote_uris=[None, "u1", "u2", None],
+            block_ids=[0, 5, 0, 6], n=4)
+        self.assertEqual(skipped, {0})
+        self.assertEqual(failed, {2, 3})
+
+
+class TestAbstainedVerdicts(unittest.TestCase):
+    """A block's verdict is the AND over the groups that carried data for it.
+    A group that abstained (None) must neither pass nor fail the block, and a
+    block no group wrote at all must not be published."""
+
+    def test_save_abstain_does_not_mask_other_group(self):
+        dtm = _make_dtm()
+        cb = dtm.create_save_done_callback("req", 0, "sess", num_blocks=3)
+        cb([None, None, True,    # state group: only block 2 had a state
+            True, False, True])  # attention group
+        # Block 0 rides on attention alone, block 1 fails there, block 2 both.
+        self.assertEqual(_sent_event(dtm).is_success_list, [True, False, True])
+
+    def test_save_all_groups_abstain_is_not_published(self):
+        dtm = _make_dtm()
+        cb = dtm.create_save_done_callback("req", 0, "sess", num_blocks=2)
+        cb([None, None])
+        self.assertEqual(_sent_event(dtm).is_success_list, [False, False])
+
+    def test_load_abstain_does_not_mask_other_group(self):
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=3, block_ids=[10, 20, 30], num_blocks=3)
+        cb([None, None, False,   # state group: block 2 needed a state, failed
+            True, True, True])   # attention group
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [30])
+
+    def test_load_all_groups_abstain_counts_as_failure(self):
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11], num_blocks=1)
+        cb([None])
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
 
 
 class TestPinnedBudget(unittest.TestCase):

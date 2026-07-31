@@ -552,8 +552,8 @@ def compare_captures(capture_dir: str, tp_size: int) -> dict:
         # actually written by the connector and must match its reference.
         # Mamba "align" state layers can legitimately be absent on either side
         # (vLLM materializes states only at segment boundaries; interior blocks
-        # get the null block and the connector transfers them vacuously) -- but
-        # a loaded layer without a reference is a hard error.
+        # get the null block, which is neither saved nor loaded) -- but a
+        # loaded layer without a reference is a hard error.
         for layer_name, got_kv in got["kv"].items():
             assert layer_name in ref["kv"], (
                 f"loaded layer {layer_name} of {key} has no reference capture")

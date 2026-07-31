@@ -160,16 +160,31 @@ from kv_cache_manager.py_connector.vllm.v1_connector import (  # noqa: E402
 
 def make_connector(manager_block_size: int = 16,
                    vllm_block_size: Optional[int] = None,
-                   num_groups: int = 1) -> TairKvCacheConnector:
+                   num_groups: int = 1,
+                   num_state_groups: int = 0,
+                   tp_size: int = 1) -> TairKvCacheConnector:
     """Build a bare TairKvCacheConnector (no __init__) with the minimal state
-    used by the pure translation / scheduler-side logic under test."""
+    used by the pure translation / scheduler-side logic under test.
+
+    ``num_state_groups`` appends that many mamba-style (non-attention) groups
+    after the ``num_groups`` attention groups, which is what turns on the
+    hybrid-only logic (spec groups, per-block state completeness, hit
+    truncation)."""
     conn = TairKvCacheConnector.__new__(TairKvCacheConnector)
     conn._manager_block_size = manager_block_size
     conn._vllm_block_size = vllm_block_size or manager_block_size
-    conn._num_groups = num_groups
+    conn._tp_size = tp_size
     conn._group_metas = [
         GroupMeta(group_idx=i, is_attention=True, layer_names=[f"l{i}"],
                   block_size=conn._vllm_block_size, per_block_bytes=0)
         for i in range(num_groups)
+    ] + [
+        GroupMeta(group_idx=num_groups + i, is_attention=False,
+                  layer_names=[f"m{i}"], block_size=conn._vllm_block_size,
+                  per_block_bytes=0)
+        for i in range(num_state_groups)
     ]
+    conn._num_groups = len(conn._group_metas)
+    conn._state_group_idxs = [m.group_idx for m in conn._group_metas
+                              if not m.is_attention]
     return conn
