@@ -2031,6 +2031,36 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
 class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
 protected:
+    void AddSpecFilteredEventReportPeers() {
+        // full_peer has better raw coverage, but none of its locations match
+        // linear_1. linear_peer must therefore win after requested-spec
+        // filtering for both cross-key selection strategies.
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+            {
+                {"kvs#event_report_l2#mem#full_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("full_0", "event_report://full_peer:8080/mem")}},
+                {"kvs#event_report_l2#mem#linear_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("linear_1", "event_report://linear_peer:8080/mem")}},
+            },
+            {
+                {"kvs#event_report_l2#mem#full_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("full_0", "event_report://full_peer:8080/mem")}},
+            },
+        };
+        std::vector<ErrorCode> per_key_ec;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {81000, 81001}, upserts, per_key_ec));
+        ASSERT_EQ(2u, per_key_ec.size());
+        EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[0]);
+        EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[1]);
+    }
+
     void SetUp() override {
         MetaSearcherTest::SetUp();
 
@@ -2173,6 +2203,58 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageTieBreaksByPeerAddr
     for (const auto &locations : out) {
         ASSERT_EQ(1u, locations.size());
         EXPECT_NE(locations[0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixFiltersRequestedSpecBeforePeerSelection) {
+    AddSpecFilteredEventReportPeers();
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"linear_1"}));
+
+    ASSERT_EQ(2u, out.size());
+    ASSERT_EQ(1u, out[0].size());
+    ASSERT_EQ(1u, out[0][0]->location_specs().size());
+    EXPECT_EQ("linear_1", out[0][0]->location_specs()[0].name());
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("linear_peer"));
+    EXPECT_TRUE(out[1].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageFiltersRequestedSpecBeforePeerSelection) {
+    AddSpecFilteredEventReportPeers();
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"linear_1"}));
+
+    ASSERT_EQ(2u, out.size());
+    ASSERT_EQ(1u, out[0].size());
+    ASSERT_EQ(1u, out[0][0]->location_specs().size());
+    EXPECT_EQ("linear_1", out[0][0]->location_specs()[0].name());
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("linear_peer"));
+    EXPECT_TRUE(out[1].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportUnknownRequestedSpecReturnsNoCandidate) {
+    AddSpecFilteredEventReportPeers();
+    for (const auto strategy : {LocationSelectStrategy::LSS_V6D_PREFIX, LocationSelectStrategy::LSS_V6D_COVERAGE}) {
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy},
+        };
+        LocationsPerKey out;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchGetBestLocationByBackend(
+                      request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"missing_spec"}));
+        ASSERT_EQ(2u, out.size());
+        EXPECT_TRUE(out[0].empty());
+        EXPECT_TRUE(out[1].empty());
     }
 }
 

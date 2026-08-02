@@ -745,12 +745,15 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 - Backend UT：`kv_cache_manager/data_storage/test/event_report_backend_test.cc`
 - Manager UT：`kv_cache_manager/manager/test/cache_manager_test.cc`
 - Meta UT：`kv_cache_manager/manager/test/meta_searcher_test.cc`
+- PR HTTP 集成：`integration_test/meta_service/http_interface_test.py`
 - 基础集成：`integration_test/meta_service/test_report_event.py`
 - Snapshot 集成：`integration_test/meta_service/test_report_event_snapshot.py`
 - 重启集成：`integration_test/meta_service/test_report_event_restart.py`
 
-后两项对应的 Bazel target 带 `manual` 标签，不属于默认 GitHub CI。覆盖结论必须以显式执行结果为准；
-同样，普通 GitHub check 通过不代表已经执行 ASAN。
+PR HTTP 集成由 `//integration_test/meta_service:http_interface_test` 启动真实 KVCM 进程，属于默认
+`//integration_test/...` CI。基础 ReportEvent 脚本当前没有 Bazel target；Snapshot target 带
+`manual` 标签，重启脚本也需显式执行，因此三者不属于默认 GitHub CI。覆盖结论必须以显式执行
+结果为准；同样，普通 GitHub check 通过不代表已经执行 ASAN。
 
 | ID | 用户行为 | 自动化覆盖 |
 | --- | --- | --- |
@@ -798,7 +801,8 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | Q-07 | GetCacheLocationsByBackend 同样执行 reporter liveness 过滤 | `TestGetCacheLocationsByBackendWithBackendSelectors`；snapshot 集成 `test_16a` |
 | Q-08 | 三个查询入口在 timeout 隐藏和 HEARTBEAT 恢复时结果一致 | snapshot 集成 `test_16a_heartbeat_timeout_then_recovery` |
 | Q-09 | snapshot 成功后即使异步 cleanup 尚未运行，遗漏的旧 version block 也立即不可见 | `TestSuccessfulSnapshotImmediatelyFencesOmittedOldVersionBeforeCleanup`、`TestGetCacheLocationEnforcesReporterLifecycleAndBatchOrdering` |
-| Q-10 | backend 查询在 peer 选择前按 spec 过滤，并对同覆盖率 peer 确定性择优 | `TestGetCacheLocationsByBackendWithBackendSelectors`；`EventReportPrefixTieBreaksByPeerAddress`；`EventReportCoverageTieBreaksByPeerAddress` |
+| Q-10 | backend 查询在 peer 选择前按 spec 过滤，并对同覆盖率 peer 确定性择优 | `TestGetCacheLocationsByBackendWithBackendSelectors`；`EventReportPrefixFiltersRequestedSpecBeforePeerSelection`；`EventReportCoverageFiltersRequestedSpecBeforePeerSelection`；`EventReportPrefixTieBreaksByPeerAddress`；`EventReportCoverageTieBreaksByPeerAddress`；HTTP 集成 `test_event_report_requested_spec_filters_before_peer_selection` |
+| Q-11 | requested spec 不存在时 Prefix/Coverage 都返回与输入等长的空结果，不回退到其他 spec | `EventReportUnknownRequestedSpecReturnsNoCandidate`；HTTP 集成 `test_event_report_requested_spec_filters_before_peer_selection` |
 | L-01 | 自动 heartbeat timeout 隐藏、grace 内恢复原 generation | `MightExistFollowsAutomaticLivenessAndFullReporterLifecycle`；snapshot 集成 `test_16a` |
 | L-02 | unavailable 期间增量可写但保持不可见，HEARTBEAT 后恢复 | `TestReportEventLazilyRestoresReporterWithoutRegisterOrSnapshot`；snapshot 集成 `test_16a` |
 | L-03 | 超过 grace 后按 generation 原子 unregister，最终 metadata 删除持有 generation lease，旧 cleanup 不伤重新注册数据 | `HeartbeatRecoveryFencesCleanupAlreadySelectedByLivenessLoop`、`ConditionalUnregisterCannotRemoveNewGeneration`、`CleanupLeaseFencesReregisterThroughFinalDeleteStage`；snapshot 集成 `test_16b` |
