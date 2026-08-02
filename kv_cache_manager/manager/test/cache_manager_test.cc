@@ -5273,6 +5273,10 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->set_block_key("not-a-number");
          }},
+        {"add_signed_key_underflow",
+         [=](auto *event, int64_t key, const std::string &host) {
+             configure_valid_add(event, key, host)->set_block_key("-9223372036854775809");
+         }},
         {"add_empty_medium",
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->clear_medium();
@@ -5744,28 +5748,33 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
 
     const std::string host = "10.0.0.9:8080";
     const std::string snapshot_version = InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
+    auto report_specs_text = [&](const std::string &key,
+                                 const std::string &medium,
+                                 const std::vector<std::vector<LocationSpec>> &spec_groups) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+
+        for (const auto &specs : spec_groups) {
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *ba = ev->mutable_block_add();
+            ba->set_block_key(key);
+            ba->set_medium(medium);
+            for (const auto &input_spec : specs) {
+                auto *spec = ba->add_specs();
+                spec->set_name(input_spec.name());
+                spec->set_uri(input_spec.uri());
+            }
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
     auto report_specs =
         [&](int64_t key, const std::string &medium, const std::vector<std::vector<LocationSpec>> &spec_groups) {
-            proto::meta::ReportEventRequest req;
-            req.set_instance_id(instance_id);
-            req.set_host_ip_port(host);
-            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-
-            for (const auto &specs : spec_groups) {
-                auto *ev = req.add_events();
-                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-                auto *ba = ev->mutable_block_add();
-                ba->set_block_key(std::to_string(key));
-                ba->set_medium(medium);
-                for (const auto &input_spec : specs) {
-                    auto *spec = ba->add_specs();
-                    spec->set_name(input_spec.name());
-                    spec->set_uri(input_spec.uri());
-                }
-            }
-
-            proto::meta::ReportEventResponse resp;
-            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+            report_specs_text(std::to_string(key), medium, spec_groups);
         };
 
     auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
@@ -5878,6 +5887,21 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         ASSERT_EQ(1u, disk_specs.size());
         EXPECT_EQ(mem_uri, mem_specs["linear_0"]);
         EXPECT_EQ(disk_uri, disk_specs["linear_1"]);
+    }
+
+    // Case 5: signed int64 and legacy unsigned two's-complement spellings
+    // address the same logical key. Vineyard uses the signed spelling, while
+    // the unsigned form remains accepted for compatibility.
+    const int64_t signed_boundary_key = -1;
+    report_specs(signed_boundary_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs_text("18446744073709551615", "mem", {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(signed_boundary_key);
+        ASSERT_EQ(1u, location_map.size());
+        auto location = location_map.begin()->second;
+        ASSERT_TRUE(location);
+        EXPECT_EQ((std::map<std::string, std::string>{{"linear_0", mem_uri}, {"linear_1", mem_uri}}),
+                  get_spec_uris(location));
     }
 }
 
@@ -6127,9 +6151,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
             cache_manager_->StartWriteCache(request_context_.get(), instance_id, nfs_keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
         BlockMask bm = static_cast<size_t>(nfs_keys.size());
-        ASSERT_EQ(
-            EC_OK,
-            cache_manager_->FinishWriteCache(request_context_.get(), instance_id, swci.write_session_id(), bm));
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(), instance_id, swci.write_session_id(), bm));
     }
 
     // Set up EventReportBackend
@@ -6184,15 +6207,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     // --- Test 1: empty backend_selectors → returns EC_BADARGS ---
     {
         BlockMask bm = static_cast<size_t>(0);
-        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
-                                                                     instance_id,
-                                                                     CacheManager::QueryType::QT_BATCH_GET,
-                                                                     all_keys,
-                                                                     {},
-                                                                     bm,
-                                                                     0,
-                                                                     {},
-                                                                     {});
+        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, all_keys, {}, bm, 0, {}, {});
         ASSERT_EQ(EC_BADARGS, ec);
     }
 
@@ -6428,26 +6444,25 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     // The full-only peer covers two keys and would win an unfiltered prefix
     // selection. A linear_1 query must instead select the linear-only peer.
     {
-        auto report_spec = [&](const std::string &host,
-                               const std::vector<int64_t> &keys,
-                               const std::string &spec_name) {
-            proto::meta::ReportEventRequest req;
-            req.set_instance_id(instance_id);
-            req.set_host_ip_port(host);
-            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
-            for (int64_t key : keys) {
-                auto *ev = req.add_events();
-                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-                auto *ba = ev->mutable_block_add();
-                ba->set_block_key(std::to_string(key));
-                ba->set_medium("mem");
-                auto *spec = ba->add_specs();
-                spec->set_name(spec_name);
-                spec->set_uri("event_report://" + host + "/mem");
-            }
-            proto::meta::ReportEventResponse resp;
-            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-        };
+        auto report_spec =
+            [&](const std::string &host, const std::vector<int64_t> &keys, const std::string &spec_name) {
+                proto::meta::ReportEventRequest req;
+                req.set_instance_id(instance_id);
+                req.set_host_ip_port(host);
+                req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+                for (int64_t key : keys) {
+                    auto *ev = req.add_events();
+                    ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                    auto *ba = ev->mutable_block_add();
+                    ba->set_block_key(std::to_string(key));
+                    ba->set_medium("mem");
+                    auto *spec = ba->add_specs();
+                    spec->set_name(spec_name);
+                    spec->set_uri("event_report://" + host + "/mem");
+                }
+                proto::meta::ReportEventResponse resp;
+                ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+            };
 
         const std::string full_host = "192.168.2.1:8080";
         const std::string linear_host = "192.168.2.2:8080";
@@ -6474,8 +6489,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         ASSERT_EQ(1u, locs[0].cache_locations_view()[0].location_specs().size());
         EXPECT_EQ("linear_1", locs[0].cache_locations_view()[0].location_specs()[0].name());
-        EXPECT_NE(std::string::npos,
-                  locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
+        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
         EXPECT_TRUE(locs[1].cache_locations_view().empty());
     }
 

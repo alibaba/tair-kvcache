@@ -191,15 +191,29 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     return result;
 }
 
-std::string ExtractPeerAddrFromLocation(const CacheLocation &loc) {
-    if (loc.location_specs().empty()) {
-        return {};
+using RequestedSpecNameSet = std::unordered_set<std::string>;
+
+bool MatchesRequestedSpec(const CacheLocation &loc, const RequestedSpecNameSet &requested_spec_names) {
+    if (requested_spec_names.empty()) {
+        return true;
     }
-    StandardUri uri(loc.location_specs().front().uri());
-    if (!uri.Valid() || uri.GetHostName().empty()) {
-        return {};
+    return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&](const LocationSpec &spec) {
+        return requested_spec_names.count(spec.name()) > 0;
+    });
+}
+
+std::string ExtractPeerAddrFromLocation(const CacheLocation &loc,
+                                        const RequestedSpecNameSet &requested_spec_names = {}) {
+    for (const auto &spec : loc.location_specs()) {
+        if (!requested_spec_names.empty() && requested_spec_names.count(spec.name()) == 0) {
+            continue;
+        }
+        StandardUri uri(spec.uri());
+        if (uri.Valid() && !uri.GetHostName().empty()) {
+            return uri.GetHostName() + ":" + std::to_string(uri.GetPort());
+        }
     }
-    return uri.GetHostName() + ":" + std::to_string(uri.GetPort());
+    return {};
 }
 
 struct V6DPeerSelection {
@@ -232,7 +246,9 @@ V6DPeerSelection SelectV6DByPrefix(const std::vector<size_t> &candidate_indices,
             }
             prefix_covered.push_back(ci);
         }
-        if (prefix_covered.size() > best.covered_indices.size()) {
+        if (prefix_covered.size() > best.covered_indices.size() ||
+            (prefix_covered.size() == best.covered_indices.size() &&
+             (best.peer_addr.empty() || addr < best.peer_addr))) {
             best.peer_addr = addr;
             best.covered_indices = std::move(prefix_covered);
         }
@@ -258,7 +274,8 @@ SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
     }
     V6DPeerSelection best;
     for (auto &[addr, indices] : addr_to_indices) {
-        if (indices.size() > best.covered_indices.size()) {
+        if (indices.size() > best.covered_indices.size() ||
+            (indices.size() == best.covered_indices.size() && (best.peer_addr.empty() || addr < best.peer_addr))) {
             best.peer_addr = addr;
             best.covered_indices = indices;
         }
@@ -539,6 +556,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     SPAN_TRACER(request_context);
     out_locations.clear();
     out_locations.resize(keys.size());
+    const RequestedSpecNameSet requested_spec_name_set(requested_spec_names.begin(), requested_spec_names.end());
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     CacheLocationMapVector location_maps;
@@ -595,16 +613,12 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 for (const auto &[id, loc] : vmap) {
                     if (loc->type() != target_type)
                         continue;
-                    if (!requested_spec_names.empty() &&
-                        std::none_of(loc->location_specs().begin(),
-                                     loc->location_specs().end(),
-                                     [&requested_spec_names](const LocationSpec &spec) {
-                                         return std::find(requested_spec_names.begin(),
-                                                          requested_spec_names.end(),
-                                                          spec.name()) != requested_spec_names.end();
-                                     }))
+                    if (!MatchesRequestedSpec(*loc, requested_spec_name_set))
                         continue;
-                    std::string addr = ExtractPeerAddrFromLocation(*loc);
+                    // A ReportEvent location may contain multiple independently
+                    // addressable specs.  Select the peer from a requested spec,
+                    // not from an unrelated first spec in the stored location.
+                    std::string addr = ExtractPeerAddrFromLocation(*loc, requested_spec_name_set);
                     if (addr.empty())
                         continue;
                     // Dedup: only add if not already present
@@ -652,16 +666,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;
                 for (const auto &[id, loc] : vmap) {
-                    const bool matches_requested_spec =
-                        requested_spec_names.empty() ||
-                        std::any_of(loc->location_specs().begin(),
-                                    loc->location_specs().end(),
-                                    [&requested_spec_names](const LocationSpec &spec) {
-                                        return std::find(requested_spec_names.begin(),
-                                                         requested_spec_names.end(),
-                                                         spec.name()) != requested_spec_names.end();
-                                    });
-                    if (loc->type() == target_type && matches_requested_spec) {
+                    if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name_set)) {
                         filtered.try_emplace(id, loc);
                     }
                 }
