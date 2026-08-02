@@ -483,11 +483,12 @@ Vineyard 的 ReportEvent 集成不能继续使用不含 `event_report` protobuf 
 `addStorage` 会返回 `missing or invalid fields: {StorageConfig: {storage_spec}}`，后续用例全部是
 同一前置失败的连锁结果。
 
-需要验证 KVCM 分支时，手动运行 `.github/workflows/build-integration-image.yml`。工作流只构建
-CI 所需的 `linux/amd64` 生产镜像，并发布唯一的 `integration-<UTC time>-<short sha>` tag；把
-该精确 tag 写入 Vineyard 的 `.aoneci/v6d-pytest-integration.yaml`，禁止使用 `latest`。合并前
-至少确认 Vineyard 的 group-aware 三节点用例、green、KVCM fault 和 PACE fault 都实际执行，
-且从失败制品中的 pytest 汇总判断结果，不能根据 Aone 对自由脚本显示的 `NOT_RUN` 状态推断。
+需要验证 KVCM 分支时，手动运行 `.github/workflows/build-dev-image.yml` 并选择
+`flavor=integration`。该 flavor 只构建 CI 所需的 `linux/amd64` 生产镜像，并发布唯一的
+`integration-<UTC time>-<short sha>` tag；把该精确 tag 写入 Vineyard 的
+`.aoneci/v6d-pytest-integration.yaml`，禁止使用 `latest`。合并前至少确认 Vineyard 的
+group-aware 三节点用例、green、KVCM fault 和 PACE fault 都实际执行，且从失败制品中的
+pytest 汇总判断结果，不能根据 Aone 对自由脚本显示的 `NOT_RUN` 状态推断。
 
 ## 13. 接受的取舍
 
