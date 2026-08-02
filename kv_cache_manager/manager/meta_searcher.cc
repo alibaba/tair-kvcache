@@ -202,18 +202,15 @@ bool MatchesRequestedSpec(const CacheLocation &loc, const RequestedSpecNameSet &
     });
 }
 
-std::string ExtractPeerAddrFromLocation(const CacheLocation &loc,
-                                        const RequestedSpecNameSet &requested_spec_names = {}) {
-    for (const auto &spec : loc.location_specs()) {
-        if (!requested_spec_names.empty() && requested_spec_names.count(spec.name()) == 0) {
-            continue;
-        }
-        StandardUri uri(spec.uri());
-        if (uri.Valid() && !uri.GetHostName().empty()) {
-            return uri.GetHostName() + ":" + std::to_string(uri.GetPort());
-        }
+std::string ExtractPeerAddrFromLocation(const CacheLocation &loc) {
+    if (loc.location_specs().empty()) {
+        return {};
     }
-    return {};
+    StandardUri uri(loc.location_specs().front().uri());
+    if (!uri.Valid() || uri.GetHostName().empty()) {
+        return {};
+    }
+    return uri.GetHostName() + ":" + std::to_string(uri.GetPort());
 }
 
 struct V6DPeerSelection {
@@ -615,10 +612,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                         continue;
                     if (!MatchesRequestedSpec(*loc, requested_spec_name_set))
                         continue;
-                    // A ReportEvent location may contain multiple independently
-                    // addressable specs.  Select the peer from a requested spec,
-                    // not from an unrelated first spec in the stored location.
-                    std::string addr = ExtractPeerAddrFromLocation(*loc, requested_spec_name_set);
+                    std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())
                         continue;
                     // Dedup: only add if not already present

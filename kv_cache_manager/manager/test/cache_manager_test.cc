@@ -5273,10 +5273,6 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->set_block_key("not-a-number");
          }},
-        {"add_signed_key_underflow",
-         [=](auto *event, int64_t key, const std::string &host) {
-             configure_valid_add(event, key, host)->set_block_key("-9223372036854775809");
-         }},
         {"add_empty_medium",
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->clear_medium();
@@ -5748,33 +5744,28 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
 
     const std::string host = "10.0.0.9:8080";
     const std::string snapshot_version = InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
-    auto report_specs_text = [&](const std::string &key,
-                                 const std::string &medium,
-                                 const std::vector<std::vector<LocationSpec>> &spec_groups) {
-        proto::meta::ReportEventRequest req;
-        req.set_instance_id(instance_id);
-        req.set_host_ip_port(host);
-        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-
-        for (const auto &specs : spec_groups) {
-            auto *ev = req.add_events();
-            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-            auto *ba = ev->mutable_block_add();
-            ba->set_block_key(key);
-            ba->set_medium(medium);
-            for (const auto &input_spec : specs) {
-                auto *spec = ba->add_specs();
-                spec->set_name(input_spec.name());
-                spec->set_uri(input_spec.uri());
-            }
-        }
-
-        proto::meta::ReportEventResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-    };
     auto report_specs =
         [&](int64_t key, const std::string &medium, const std::vector<std::vector<LocationSpec>> &spec_groups) {
-            report_specs_text(std::to_string(key), medium, spec_groups);
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+
+            for (const auto &specs : spec_groups) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *ba = ev->mutable_block_add();
+                ba->set_block_key(std::to_string(key));
+                ba->set_medium(medium);
+                for (const auto &input_spec : specs) {
+                    auto *spec = ba->add_specs();
+                    spec->set_name(input_spec.name());
+                    spec->set_uri(input_spec.uri());
+                }
+            }
+
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         };
 
     auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
@@ -5887,21 +5878,6 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         ASSERT_EQ(1u, disk_specs.size());
         EXPECT_EQ(mem_uri, mem_specs["linear_0"]);
         EXPECT_EQ(disk_uri, disk_specs["linear_1"]);
-    }
-
-    // Case 5: signed int64 and legacy unsigned two's-complement spellings
-    // address the same logical key. Vineyard uses the signed spelling, while
-    // the unsigned form remains accepted for compatibility.
-    const int64_t signed_boundary_key = -1;
-    report_specs(signed_boundary_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
-    report_specs_text("18446744073709551615", "mem", {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")}});
-    {
-        auto location_map = get_location_map(signed_boundary_key);
-        ASSERT_EQ(1u, location_map.size());
-        auto location = location_map.begin()->second;
-        ASSERT_TRUE(location);
-        EXPECT_EQ((std::map<std::string, std::string>{{"linear_0", mem_uri}, {"linear_1", mem_uri}}),
-                  get_spec_uris(location));
     }
 }
 

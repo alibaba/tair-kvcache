@@ -254,8 +254,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 
 要求：
 
-- `block_key` 必须是可解析的十进制整数文本：推荐使用 signed int64（含 `-1`）；为兼容旧调用方，
-  非负的 uint64 二补码文本也会映射到相同 64 bit key。负数不得小于 `INT64_MIN`；
+- `block_key` 必须是可解析的十进制整数文本；
 - `medium` 非空，且不能包含 location id 分隔符 `#`；
 - `specs` 非空；
 - 每个 `spec.name` 非空，且同一事件内不能重复；
@@ -612,8 +611,8 @@ HTTP 接口为 `POST /api/getCacheLocation`：
 
 - 为空时，location 中任意合法 spec 都可使该 location 成为候选；
 - 非空时，location 至少包含一个请求的 spec name 才能成为候选；
-- `LSS_V6D_PREFIX` / `LSS_V6D_COVERAGE` 从命中的目标 spec URI 提取 peer endpoint，不能从
-  同一 location 中无关的第一个 spec 提取 endpoint；
+- 同一 EventReport location 由 `storage_type + medium + host_ip_port` 标识，其中各 spec 必须属于
+  同一个 reporter endpoint；location 命中过滤后，selector 从第一个合法 spec URI 提取 peer；
 - 多个 peer 的 prefix/coverage 相同时按 endpoint 字典序选择，保证调用方按 spec 分批查询时
   各批次不会因为容器遍历顺序选择不同 peer；
 - peer 选择完成后，响应仍只保留 `location_spec_names` 指定的 specs。
@@ -799,7 +798,7 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | Q-07 | GetCacheLocationsByBackend 同样执行 reporter liveness 过滤 | `TestGetCacheLocationsByBackendWithBackendSelectors`；snapshot 集成 `test_16a` |
 | Q-08 | 三个查询入口在 timeout 隐藏和 HEARTBEAT 恢复时结果一致 | snapshot 集成 `test_16a_heartbeat_timeout_then_recovery` |
 | Q-09 | snapshot 成功后即使异步 cleanup 尚未运行，遗漏的旧 version block 也立即不可见 | `TestSuccessfulSnapshotImmediatelyFencesOmittedOldVersionBeforeCleanup`、`TestGetCacheLocationEnforcesReporterLifecycleAndBatchOrdering` |
-| Q-10 | backend 查询在 peer 选择前按 spec 过滤、从命中 spec URI 提取 endpoint，并对同覆盖率 peer 确定性择优 | `TestGetCacheLocationsByBackendWithBackendSelectors`；`EventReportPeerAddressComesFromRequestedSpec`；`EventReportPrefixTieBreaksByPeerAddress`；`EventReportCoverageTieBreaksByPeerAddress` |
+| Q-10 | backend 查询在 peer 选择前按 spec 过滤，并对同覆盖率 peer 确定性择优 | `TestGetCacheLocationsByBackendWithBackendSelectors`；`EventReportPrefixTieBreaksByPeerAddress`；`EventReportCoverageTieBreaksByPeerAddress` |
 | L-01 | 自动 heartbeat timeout 隐藏、grace 内恢复原 generation | `MightExistFollowsAutomaticLivenessAndFullReporterLifecycle`；snapshot 集成 `test_16a` |
 | L-02 | unavailable 期间增量可写但保持不可见，HEARTBEAT 后恢复 | `TestReportEventLazilyRestoresReporterWithoutRegisterOrSnapshot`；snapshot 集成 `test_16a` |
 | L-03 | 超过 grace 后按 generation 原子 unregister，最终 metadata 删除持有 generation lease，旧 cleanup 不伤重新注册数据 | `HeartbeatRecoveryFencesCleanupAlreadySelectedByLivenessLoop`、`ConditionalUnregisterCannotRemoveNewGeneration`、`CleanupLeaseFencesReregisterThroughFinalDeleteStage`；snapshot 集成 `test_16b` |

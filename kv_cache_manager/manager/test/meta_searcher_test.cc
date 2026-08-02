@@ -2176,39 +2176,6 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageTieBreaksByPeerAddr
     }
 }
 
-TEST_F(BatchGetBestLocationByBackendTest, EventReportPeerAddressComesFromRequestedSpec) {
-    // A single reporter location may carry independently addressable specs.
-    // The first spec is deliberately unrelated to this query and points at a
-    // different endpoint.  Both queried keys should still form one prefix via
-    // the endpoint carried by the requested linear_1 spec.
-    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
-        {{"kvs#event_report_l2#mem#reporter_a:8080",
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
-          CLS_SERVING,
-          {LocationSpec("full_0", "vineyard://full_peer:8080/full"),
-           LocationSpec("linear_1", "vineyard://linear_peer:8080/linear")}}},
-        {{"kvs#event_report_l2#mem#reporter_b:8080",
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
-          CLS_SERVING,
-          {LocationSpec("linear_1", "vineyard://linear_peer:8080/linear")}}},
-    };
-    std::vector<ErrorCode> per_key_ec;
-    ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {81000, 81001}, upserts, per_key_ec));
-
-    const std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
-    };
-    LocationsPerKey out;
-    ASSERT_EQ(ErrorCode::EC_OK,
-              meta_searcher_->BatchGetBestLocationByBackend(
-                  request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"linear_1"}));
-
-    ASSERT_EQ(2u, out.size());
-    ASSERT_EQ(1u, out[0].size());
-    ASSERT_EQ(1u, out[1].size());
-}
-
 TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {
     // key 80002 has only peer_b, not peer_a.
     // If we query keys in order [80000, 80002, 80003]:

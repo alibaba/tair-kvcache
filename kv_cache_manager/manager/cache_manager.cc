@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <limits>
@@ -2211,21 +2210,8 @@ std::shared_ptr<DataStorageBackend> LookupEventReportBackend(const std::shared_p
 }
 
 bool ParseInt64(const std::string &s, int64_t &out) {
-    if (s.empty()) {
-        return false;
-    }
-    const bool negative = s.front() == '-';
-    const size_t digits_begin = negative ? 1 : 0;
-    if (digits_begin == s.size() ||
-        !std::all_of(s.begin() + digits_begin, s.end(), [](unsigned char ch) { return std::isdigit(ch); })) {
-        return false;
-    }
     try {
         size_t consumed = 0;
-        if (negative) {
-            out = std::stoll(s, &consumed);
-            return consumed == s.size();
-        }
         uint64_t v = std::stoull(s, &consumed);
         if (consumed != s.size()) {
             return false;
