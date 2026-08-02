@@ -473,6 +473,8 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - snapshot partial failure、完整重试；
 - snapshot commit 后立即到达的 delta 在异步 cleanup 后仍可查询；
 - reporter host 或 medium 含 `#` 时 fail closed 且无写入副作用；
+- Bazel `--runs_per_test` 并发重复时，每个 test action 的可变 worker 目录必须位于其私有
+  `TEST_TMPDIR`，不得在共享 runfiles/source tree 中清理或复制；至少用 20 路重复验证目录隔离；
 - ASAN/TSAN 或等价并发检测（仅记录实际执行结果，不能由普通 CI 结果推断）。
 
 Snapshot 与重启 HTTP 测试 target 带 `manual` 标签，不属于默认 GitHub CI；需要显式执行并单独记录结果。
