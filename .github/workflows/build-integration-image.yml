@@ -1,0 +1,58 @@
+name: Build KVCM integration image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Reuse the existing public package. Integration tags contain the production
+  # server package even though the historical package name ends in "-dev".
+  IMAGE_NAME: ${{ github.repository }}-kvcm-dev
+  BUILD_IMAGE: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build server package
+        run: |
+          docker run --rm --privileged \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${BUILD_IMAGE}" \
+            bash -lc 'git config --global --add safe.directory /workspace && bazelisk build //package:kv_cache_manager_server --config=ci_fast'
+
+      - name: Prepare image tag and context
+        id: image
+        run: |
+          VERSION="integration-$(date -u '+%Y_%m_%d_%H_%M')-${GITHUB_SHA::7}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/docker/
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "KVCM integration image: ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish production image
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: open_source/docker
+          file: open_source/docker/Dockerfile.prod
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          build-args: BINARY_PACKAGE_TAR=kv_cache_manager_server.tar.gz
+
