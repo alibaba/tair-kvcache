@@ -38,14 +38,20 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${BUILD_IMAGE}" \
-            bash -lc 'git config --global --add safe.directory /workspace && bazelisk build //package:kv_cache_manager_server --config=ci_fast'
+            bash -lc '
+              git config --global --add safe.directory /workspace &&
+              bazelisk build //package:kv_cache_manager_server --config=ci_fast &&
+              cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/docker/ &&
+              chown "$(stat -c %u /workspace):$(stat -c %g /workspace)" \
+                open_source/docker/kv_cache_manager_server.tar.gz
+            '
 
       - name: Prepare image tag and context
         id: integration_image
         run: |
           VERSION="integration-$(date -u '+%Y_%m_%d_%H_%M')-${GITHUB_SHA::7}"
           IMAGE="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
-          cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/docker/
+          test -r open_source/docker/kv_cache_manager_server.tar.gz
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "KVCM integration image: ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
 

@@ -490,6 +490,11 @@ Vineyard 的 ReportEvent 集成不能继续使用不含 `event_report` protobuf 
 group-aware 三节点用例、green、KVCM fault 和 PACE fault 都实际执行，且从失败制品中的
 pytest 汇总判断结果，不能根据 Aone 对自由脚本显示的 `NOT_RUN` 状态推断。
 
+该 workflow 在 dev 容器内完成 Bazel 构建后，也必须在容器仍存活时把 server tar 复制到
+Docker build context，并把文件 owner 改回 runner 用户。`bazel-bin` 可能指向容器内的
+`/root/.cache/bazel`；容器退出后再从宿主 runner 读取该 symlink 会得到 `Permission denied`
+或断链，不能据此误判为编译失败。
+
 ## 13. 接受的取舍
 
 本方案优先 cache availability，不提供原子 snapshot 查询视图：
