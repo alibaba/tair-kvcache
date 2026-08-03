@@ -158,4 +158,4 @@ githooks中已经添加了C++等语言的格式化脚本，请确保开发环境
 提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。
 
 ## CI
-可参考```.github/workflows```目录下的配置。
+可参考```.github/workflows```目录下的配置。```test-opensrc``` 包含普通测试和 ASAN 测试。
