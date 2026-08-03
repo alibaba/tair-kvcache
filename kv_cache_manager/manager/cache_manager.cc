@@ -1432,6 +1432,7 @@ void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
         // COW: copy, modify, replace
         auto new_loc = std::make_shared<CacheLocation>(*loc_ptr);
         new_loc->set_location_specs(std::move(new_specs));
+        new_loc->set_spec_size(new_loc->location_specs().size());
         loc_ptr = std::move(new_loc);
     }
 }

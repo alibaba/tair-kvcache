@@ -456,6 +456,8 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - snapshot commit 后 delta 刷新 mixed-generation location 时，旧 cleanup 不删除新写；
 - snapshot cleanup 只删除 metadata，不调用外部 URI backend；
 - 成功 snapshot 最终清理旧数据，失败 snapshot 不触发专用清理；
+- backend requested-spec 使用 any-of 语义，在 peer 选择前检查 location 的所有 specs；Prefix 在
+  spec gap 停止，Coverage 跳过 gap，最终响应投影保持 `spec_size == location_specs.size()`；
 - snapshot 限流、storage type 隔离和 liveness 竞态。
 
 ### 12.2 集成测试

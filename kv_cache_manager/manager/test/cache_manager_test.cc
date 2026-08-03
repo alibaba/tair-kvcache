@@ -6414,6 +6414,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         const auto &kl = locs[0].cache_locations_view();
         ASSERT_EQ(1u, kl.size());
         EXPECT_EQ(2u, kl[0].location_specs().size());
+        EXPECT_EQ(2u, kl[0].spec_size());
     }
 
     // --- Test 9: spec filtering happens before Vineyard peer selection ---
@@ -6464,6 +6465,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(2u, locs.size());
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         ASSERT_EQ(1u, locs[0].cache_locations_view()[0].location_specs().size());
+        EXPECT_EQ(1u, locs[0].cache_locations_view()[0].spec_size());
         EXPECT_EQ("linear_1", locs[0].cache_locations_view()[0].location_specs()[0].name());
         EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
         EXPECT_TRUE(locs[1].cache_locations_view().empty());
