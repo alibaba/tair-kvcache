@@ -318,13 +318,14 @@ TEST_F(EventReportBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.4:8080"));
     EXPECT_EQ(cleanup_calls.load(), 0);
 
-    for (int i = 0; i < 50 && cleanup_calls.load() == 0; ++i) {
-        std::this_thread::sleep_for(20ms);
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + 1s;
+    while (backend.IsNodeRegistered("test_inst", "10.0.0.4:8080") &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::yield();
     }
+    ASSERT_FALSE(backend.IsNodeRegistered("test_inst", "10.0.0.4:8080"));
     EXPECT_GE(cleanup_calls.load(), 1);
     EXPECT_EQ(cleanup_host, "10.0.0.4:8080");
-
-    EXPECT_EQ(backend.instance_nodes_["test_inst"].count("10.0.0.4:8080"), 0u);
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
