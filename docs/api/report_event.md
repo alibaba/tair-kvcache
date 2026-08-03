@@ -16,7 +16,8 @@
 5. 客户端不得在 URI 中填写 `s_version`；KVCM 会自动追加。
 6. `committed_snapshot_version` 是 32 位十六进制 opaque generation，不能按大小比较；成功完整
    snapshot 后它会成为该 reporter 的严格查询栅栏。
-7. `snapshot_required=true` 是“当前 KVCM 进程还没有该 reporter generation”的提示，不会阻止合法增量。
+7. `snapshot_required=true` 表示请求到达时当前进程还没有该 reporter generation；创建 generation
+   的首条 ADD/DELETE 自身仍返回 `true`，下一条事件才返回 `false`。该提示不会阻止合法增量。
 8. 当前进程尚未收到该 reporter 的任何合法事件，或节点 unavailable 时，查询不会返回该
    节点的数据；节点存活状态是硬门槛。
 9. snapshot 失败、进程重启或从未成功 snapshot 的 soft 模式可能返回 stale cache candidate；
@@ -140,7 +141,8 @@ Instance/InstanceGroup 和 cache metadata 会持久化；reporter 节点表、li
 2. 第一条 HEARTBEAT、ADD、DELETE 或 SNAPSHOT 会自动重建 reporter 节点状态，不要求再次 REGISTER；
 3. 如果第一条只是 HEARTBEAT，响应为 `snapshot_required=true`、
    `committed_snapshot_version=""`，格式合法的历史 metadata 可以重新成为 cache candidate；
-4. 如果第一条是 ADD/DELETE，它正常成功并建立新 generation；
+4. 如果第一条是 ADD/DELETE，它正常成功并建立新 generation；该次响应仍为
+   `snapshot_required=true`，后续事件复用 generation 时变为 `false`；
 5. 该增量只更新明确涉及的 spec，不删除其他历史 block/spec；
 6. snapshot-capable 调用方可以稍后补一次完整 snapshot；
 7. realtime-only 调用方可以继续只发增量。
@@ -496,14 +498,17 @@ SNAPSHOT_IN_PROGRESS  -> SNAPSHOT 失败时重发完整 snapshot
 
 ### 9.2 snapshot_required
 
-`snapshot_required` 等价于“当前进程还没有该 reporter generation”：
+`snapshot_required` 表示“本次请求到达时当前进程还没有该 reporter generation”。对于首条合法
+ADD/DELETE，KVCM 会在请求内创建 generation 并返回到 `committed_snapshot_version`，但本次响应
+仍保留 `snapshot_required=true`；下一条事件复用该 generation 时才返回 `false`：
 
 | 场景 | 值 |
 | --- | --- |
 | fresh REGISTER 后 | `true` |
 | KVCM 重启后的第一条 HEARTBEAT | `true` |
 | 只有 REGISTER/HEARTBEAT、还没有合法 mutation | `true` |
-| 第一条合法 ADD/DELETE 后 | `false` |
+| 创建 generation 的第一条合法 ADD/DELETE | `true` |
+| 后续复用已有 generation 的 ADD/DELETE | `false` |
 | 成功 SNAPSHOT 后 | `false` |
 | invalid-only 首批增量 | 仍为 `true` |
 | realtime-only reporter | 可忽略该提示，继续发合法增量 |
@@ -754,6 +759,23 @@ PR HTTP 集成由 `//integration_test/meta_service:http_interface_test` 启动�
 `//integration_test/...` CI。基础 ReportEvent 脚本当前没有 Bazel target；Snapshot target 带
 `manual` 标签，重启脚本也需显式执行，因此三者不属于默认 GitHub CI。覆盖结论必须以显式执行
 结果为准；同样，普通 GitHub check 通过不代表已经执行 ASAN。
+
+Snapshot target 是外部服务测试，单独执行 `bazel test` 不会替它启动 KVCM。先按脚本头部说明
+启动 meta/admin HTTP 服务，再显式传入端口。功能与容量入口分别为：
+
+```bash
+bazel run //integration_test/meta_service:test_report_event_snapshot -- \
+  --host localhost --http_port 56020 --admin_http_port 56040 \
+  --instance_id event_report_functional --skip-bench
+
+bazel run //integration_test/meta_service:test_report_event_snapshot -- \
+  --host localhost --http_port 56020 --admin_http_port 56040 \
+  --instance_id event_report_bench --only-bench
+```
+
+同一 KVCM 进程上重复执行时，fixture 会通过 `listStorage` 校验已有 storage 的 type 和 EventReport
+时序配置；配置不一致应立即失败，不能把任意 `addStorage` 错误当作“可能已存在”后继续测试。
+heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩短功能与容量用例的主 storage。
 
 | ID | 用户行为 | 自动化覆盖 |
 | --- | --- | --- |

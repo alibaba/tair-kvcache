@@ -33,8 +33,6 @@ ADMIN_URL = ""
 INSTANCE_ID = "event_report_cluster_0"
 SKIP_BENCH = False
 ONLY_BENCH = False
-# Requires small heartbeat_timeout_ms/cleanup_grace_ms in addStorage spec.
-ENABLE_LIVENESS_TIMING_TESTS = False
 HEARTBEAT_TIMEOUT_MS = 1000
 CLEANUP_GRACE_MS = 2000
 SNAPSHOT_MIN_INTERVAL_MS = 1000
@@ -80,6 +78,16 @@ class KVCMClient:
         code = body.get("header", {}).get("status", {}).get("code")
         if code not in ("OK", "DUPLICATE_ENTITY"):
             raise AssertionError(f"addStorage failed: {json.dumps(body)}")
+        return body
+
+    def list_storage(self, data):
+        url = f"{self.admin_url}/api/listStorage"
+        resp = self.session.post(url, json=data)
+        resp.raise_for_status()
+        body = resp.json()
+        code = body.get("header", {}).get("status", {}).get("code")
+        if code != "OK":
+            raise AssertionError(f"listStorage failed: {json.dumps(body)}")
         return body
 
     def create_instance_group(self, data):
@@ -391,32 +399,60 @@ class EventReportFunctionalTest(unittest.TestCase):
 
     @classmethod
     def _ensure_event_report_storage_registered(cls):
-        try:
-            cls.client.add_storage({
-                "trace_id": "setup_storage",
-                "storage": {
-                    "global_unique_name": cls.EVENT_REPORT_STORAGE_NAME,
-                    "storage_type": "ST_EVENT_REPORT_L2",
-                    "event_report": {
-                        "heartbeat_timeout_ms": (
-                            HEARTBEAT_TIMEOUT_MS
-                            if ENABLE_LIVENESS_TIMING_TESTS else 30000
-                        ),
-                        "cleanup_grace_ms": (
-                            CLEANUP_GRACE_MS
-                            if ENABLE_LIVENESS_TIMING_TESTS else 300000
-                        ),
-                        "liveness_check_interval_ms": (
-                            100 if ENABLE_LIVENESS_TIMING_TESTS else 5000
-                        ),
-                        "snapshot_min_interval_ms": SNAPSHOT_MIN_INTERVAL_MS,
-                    },
-                    "check_storage_available_when_open": False,
+        cls._ensure_storage_registered(
+            "setup_storage",
+            {
+                "global_unique_name": cls.EVENT_REPORT_STORAGE_NAME,
+                "storage_type": "ST_EVENT_REPORT_L2",
+                "event_report": {
+                    # Functional and capacity cases share this backend and
+                    # intentionally do not turn data events into implicit
+                    # heartbeats. Keep their lifecycle window independent
+                    # from the fast timing fixture below; otherwise a cleanup
+                    # test can pass and then lose its reporter while observing
+                    # asynchronous snapshot cleanup.
+                    "heartbeat_timeout_ms": 30000,
+                    "cleanup_grace_ms": 300000,
+                    "liveness_check_interval_ms": 5000,
+                    "snapshot_min_interval_ms": SNAPSHOT_MIN_INTERVAL_MS,
                 },
+                "check_storage_available_when_open": False,
+            },
+        )
+
+    @classmethod
+    def _ensure_storage_registered(cls, trace_id, expected_storage):
+        storage_name = expected_storage["global_unique_name"]
+        listed = cls.client.list_storage({"trace_id": f"{trace_id}_list"})
+        existing = next(
+            (
+                storage
+                for storage in listed.get("storage", [])
+                if storage.get("global_unique_name") == storage_name
+            ),
+            None,
+        )
+        if existing is None:
+            cls.client.add_storage({
+                "trace_id": trace_id,
+                "storage": expected_storage,
             })
-            print(f"[SETUP] Event report storage '{cls.EVENT_REPORT_STORAGE_NAME}' registered")
-        except Exception as e:
-            print(f"[WARN] addStorage failed (may already exist): {e}")
+            print(f"[SETUP] Event report storage '{storage_name}' registered")
+            return
+
+        if existing.get("storage_type") != expected_storage.get("storage_type"):
+            raise AssertionError(
+                f"Storage {storage_name!r} has unexpected type: {existing}"
+            )
+        actual_spec = existing.get("event_report", {})
+        for name, expected_value in expected_storage.get("event_report", {}).items():
+            actual_value = actual_spec.get(name)
+            if str(actual_value) != str(expected_value):
+                raise AssertionError(
+                    f"Storage {storage_name!r} has {name}={actual_value!r}; "
+                    f"expected {expected_value!r}"
+                )
+        print(f"[SETUP] Event report storage '{storage_name}' reused")
 
     @classmethod
     def _ensure_instance_group_created(cls):
@@ -516,9 +552,9 @@ class EventReportFunctionalTest(unittest.TestCase):
         Keeping the small timeout on a dedicated instance group prevents the
         long functional/benchmark cases from timing out their shared reporters.
         """
-        cls.client.add_storage({
-            "trace_id": "setup_liveness_storage",
-            "storage": {
+        cls._ensure_storage_registered(
+            "setup_liveness_storage",
+            {
                 "global_unique_name": cls.LIVENESS_STORAGE_NAME,
                 "storage_type": "ST_EVENT_REPORT_L2",
                 "event_report": {
@@ -529,7 +565,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 },
                 "check_storage_available_when_open": False,
             },
-        })
+        )
 
         existing = cls.client.get_instance_group({
             "trace_id": "setup_get_liveness_ig",
@@ -3923,6 +3959,14 @@ class EventReportBenchTest(unittest.TestCase):
     def setUpClass(cls):
         cls.client = KVCMClient(BASE_URL, ADMIN_URL)
         cls.instance_id = INSTANCE_ID
+        # --only-bench does not load EventReportFunctionalTest, so benchmark
+        # setup must not depend on that class having run first.
+        fixture = EventReportFunctionalTest
+        fixture.client = cls.client
+        fixture.instance_id = cls.instance_id
+        fixture._ensure_event_report_storage_registered()
+        fixture._ensure_instance_group_created()
+        fixture._ensure_instance_registered()
 
     @classmethod
     def tearDownClass(cls):
@@ -4186,8 +4230,10 @@ def main():
     parser.add_argument(
         "--enable-liveness-timing-tests",
         action="store_true",
-        help=("Run heartbeat/cleanup timing tests. Requires the Event report storage to be opened with "
-              "small heartbeat_timeout_ms / cleanup_grace_ms (defaults to 1000ms / 2000ms here)."),
+        help=(
+            "Compatibility flag. Heartbeat/cleanup timing tests use their own "
+            "isolated fast-liveness storage and always run."
+        ),
     )
     parser.add_argument("--heartbeat-timeout-ms", type=int, default=1000)
     parser.add_argument("--cleanup-grace-ms", type=int, default=2000)
@@ -4206,7 +4252,6 @@ def main():
     admin_port = args.admin_http_port or args.http_port
 
     global BASE_URL, ADMIN_URL, INSTANCE_ID, SKIP_BENCH, ONLY_BENCH
-    global ENABLE_LIVENESS_TIMING_TESTS
     global HEARTBEAT_TIMEOUT_MS, CLEANUP_GRACE_MS
     global SNAPSHOT_MIN_INTERVAL_MS, META_STORAGE_URI
     BASE_URL = f"http://{args.host}:{args.http_port}"
@@ -4214,7 +4259,6 @@ def main():
     INSTANCE_ID = args.instance_id
     SKIP_BENCH = args.skip_bench
     ONLY_BENCH = args.only_bench
-    ENABLE_LIVENESS_TIMING_TESTS = args.enable_liveness_timing_tests
     HEARTBEAT_TIMEOUT_MS = args.heartbeat_timeout_ms
     CLEANUP_GRACE_MS = args.cleanup_grace_ms
     SNAPSHOT_MIN_INTERVAL_MS = args.snapshot_min_interval_ms
