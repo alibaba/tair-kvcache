@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -32,6 +33,173 @@ namespace kv_cache_manager {
 namespace {
 constexpr auto kMonitorIdleSleep = std::chrono::milliseconds(50);
 constexpr auto kFutureWaitTime = std::chrono::microseconds(200);
+
+struct AddLocationRollbackItem {
+    int64_t block_key = 0;
+    std::string storage_name;
+    std::vector<DataStorageUri> uris;
+    ErrorCode ec = EC_UNKNOWN;
+    std::string location_id;
+};
+
+// BatchAddLocation 失败后的补偿规则与返回契约一致：
+// - 已知成功项走标准 Location 删除流水线，由流水线回收 usage；
+// - 失败但已生成 ID 的项先幂等删除元数据并 Sync，确认无引用后才删 URI；
+// - 未生成 ID 的项可直接删 URI。
+// 任一元数据状态无法确认时保留 URI，避免制造悬空引用。
+void RollbackAddedLocations(RequestContext *request_context,
+                            const std::string &trace_id,
+                            const std::string &instance_id,
+                            const std::shared_ptr<MetaIndexer> &indexer,
+                            const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                            const std::shared_ptr<SchedulePlanExecutor> &schedule_plan_executor,
+                            const std::vector<AddLocationRollbackItem> &items) {
+    CacheLocationDelRequest known_success_request;
+    known_success_request.instance_id = instance_id;
+
+    KeyVector uncertain_keys;
+    std::vector<std::string> uncertain_location_ids;
+    std::vector<const AddLocationRollbackItem *> uncertain_items;
+    std::unordered_map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
+    auto queue_uri_delete = [&direct_delete_uris](const AddLocationRollbackItem &item) {
+        if (item.uris.empty()) {
+            return;
+        }
+        auto &uris = direct_delete_uris[item.storage_name];
+        uris.insert(uris.end(), item.uris.begin(), item.uris.end());
+    };
+
+    for (const auto &item : items) {
+        if (item.ec == EC_OK && !item.location_id.empty()) {
+            known_success_request.block_keys.push_back(item.block_key);
+            known_success_request.location_ids.push_back({item.location_id});
+        } else if (!item.location_id.empty()) {
+            uncertain_keys.push_back(item.block_key);
+            uncertain_location_ids.push_back(item.location_id);
+            uncertain_items.push_back(&item);
+        } else {
+            queue_uri_delete(item);
+        }
+    }
+
+    if (!known_success_request.block_keys.empty() &&
+        (!schedule_plan_executor ||
+         !schedule_plan_executor->SubmitNonBlocking(
+             known_success_request, ScheduleTaskClass::kMigrationContinuation))) {
+        KVCM_LOG_WARN("[%s] rollback known successful migration locations failed to submit delete, instance %s, "
+                      "key_count %zu",
+                      trace_id.c_str(),
+                      instance_id.c_str(),
+                      known_success_request.block_keys.size());
+    }
+
+    if (!uncertain_keys.empty()) {
+        if (!indexer) {
+            KVCM_LOG_WARN("[%s] rollback uncertain migration locations retained URIs: meta indexer missing, "
+                          "instance %s, key_count %zu",
+                          trace_id.c_str(),
+                          instance_id.c_str(),
+                          uncertain_keys.size());
+        } else {
+            MetaSearcher meta_searcher(indexer);
+            LocationIdsPerKey location_ids_per_key;
+            location_ids_per_key.reserve(uncertain_location_ids.size());
+            for (const auto &location_id : uncertain_location_ids) {
+                location_ids_per_key.push_back({location_id});
+            }
+            std::vector<std::vector<ErrorCode>> delete_results;
+            const ErrorCode delete_ec =
+                meta_searcher.BatchDeleteLocations(request_context,
+                                                   uncertain_keys,
+                                                   location_ids_per_key,
+                                                   delete_results,
+                                                   {},
+                                                   false /* failed adds were never included in usage */,
+                                                   false /* failed adds were never counted as new keys */);
+            const size_t invalid_result_count =
+                std::count_if(delete_results.begin(), delete_results.end(), [](const auto &per_location_results) {
+                    return per_location_results.size() != 1;
+                });
+            if (delete_results.size() != uncertain_items.size() || invalid_result_count != 0) {
+                KVCM_LOG_WARN("[%s] rollback uncertain migration metadata returned unexpected result shape, "
+                              "instance %s, expected %zu, got %zu, invalid inner result count %zu, ec %d",
+                              trace_id.c_str(),
+                              instance_id.c_str(),
+                              uncertain_items.size(),
+                              delete_results.size(),
+                              invalid_result_count,
+                              delete_ec);
+            } else {
+                KeyVector sync_keys;
+                for (std::size_t i = 0; i < delete_results.size(); ++i) {
+                    if (delete_results[i].front() == EC_OK) {
+                        sync_keys.push_back(uncertain_keys[i]);
+                    }
+                }
+
+                bool metadata_synced = true;
+                if (!sync_keys.empty()) {
+                    metadata_synced = indexer->Sync(sync_keys);
+                    if (!metadata_synced) {
+                        KVCM_LOG_WARN("[%s] rollback uncertain migration locations failed to sync deleted metadata, "
+                                      "instance %s, key_count %zu",
+                                      trace_id.c_str(),
+                                      instance_id.c_str(),
+                                      sync_keys.size());
+                    }
+                }
+
+                for (std::size_t i = 0; i < delete_results.size(); ++i) {
+                    const ErrorCode per_location_ec = delete_results[i].front();
+                    if (per_location_ec == EC_NOENT || (per_location_ec == EC_OK && metadata_synced)) {
+                        queue_uri_delete(*uncertain_items[i]);
+                    } else if (per_location_ec != EC_OK) {
+                        KVCM_LOG_WARN("[%s] rollback uncertain migration metadata failed, instance %s, block_key %ld, "
+                                      "location_id %s, ec %d",
+                                      trace_id.c_str(),
+                                      instance_id.c_str(),
+                                      uncertain_keys[i],
+                                      uncertain_location_ids[i].c_str(),
+                                      per_location_ec);
+                    }
+                }
+            }
+        }
+    }
+
+    if (direct_delete_uris.empty()) {
+        return;
+    }
+    if (!data_storage_manager) {
+        KVCM_LOG_WARN("[%s] rollback migration URIs failed: data storage manager missing, instance %s",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        return;
+    }
+    for (const auto &[storage_name, uris] : direct_delete_uris) {
+        const auto delete_results = data_storage_manager->Delete(request_context, storage_name, uris, nullptr);
+        if (delete_results.size() != uris.size()) {
+            KVCM_LOG_WARN("[%s] rollback migration URI result count mismatch, instance %s, storage %s, expected %zu, "
+                          "got %zu",
+                          trace_id.c_str(),
+                          instance_id.c_str(),
+                          storage_name.c_str(),
+                          uris.size(),
+                          delete_results.size());
+        }
+        const std::size_t result_count = std::min(delete_results.size(), uris.size());
+        for (std::size_t i = 0; i < result_count; ++i) {
+            if (delete_results[i] != EC_OK && delete_results[i] != EC_NOENT) {
+                KVCM_LOG_WARN("[%s] rollback migration URI failed, instance %s, storage %s, uri %s, ec %d",
+                              trace_id.c_str(),
+                              instance_id.c_str(),
+                              storage_name.c_str(),
+                              uris[i].ToUriString().c_str(),
+                              delete_results[i]);
+            }
+        }
+    }
+}
 
 std::optional<int64_t> ParsePositiveInt64(const std::string &value) {
     if (value.empty()) {
@@ -402,15 +570,34 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     for (auto &spec : dst_specs) {
         dst_location->push_location_spec(std::move(spec));
     }
-    std::vector<std::string> out_location_ids;
-    ErrorCode ec =
-        meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, out_location_ids);
-    if (ec != EC_OK || out_location_ids.empty() || out_location_ids[0].empty()) {
-        KVCM_LOG_WARN("[%s] BatchAddLocation failed for block_key %ld, ec %d",
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    ErrorCode ec = meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results);
+    if (add_results.size() != 1) {
+        KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for block_key %ld: expected 1, got %zu; "
+                      "retaining allocated URIs",
                       trace_id.c_str(),
                       request.block_key,
-                      ec);
-        rollback();
+                      add_results.size());
+        return EC_ERROR;
+    }
+    const auto &add_result = add_results.front();
+    if (ec != EC_OK || add_result.ec != EC_OK || add_result.location_id.empty()) {
+        KVCM_LOG_WARN("[%s] BatchAddLocation failed for block_key %ld, aggregate ec %d, item ec %d",
+                      trace_id.c_str(),
+                      request.block_key,
+                      ec,
+                      add_result.ec);
+        RollbackAddedLocations(ctx.get(),
+                               trace_id,
+                               request.instance_id,
+                               indexer,
+                               data_storage_manager_,
+                               schedule_plan_executor_,
+                               {{request.block_key,
+                                 request.dst_storage_name,
+                                 allocated_for_rollback,
+                                 add_result.ec,
+                                 add_result.location_id}});
         return EC_ERROR;
     }
 
@@ -421,7 +608,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     out_ctx.src_create_time = src_create_time; // 记录源 location 的创建时间
     out_ctx.src_storage_name = request.src_storage_name;
     out_ctx.dst_storage_name = request.dst_storage_name;
-    out_ctx.dst_location_id = out_location_ids[0];
+    out_ctx.dst_location_id = add_result.location_id;
     out_ctx.retention = request.retention;
     out_ctx.total_bytes = total_bytes;
     return EC_OK;
@@ -490,8 +677,8 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     std::vector<DataStorageUri> dst_uris;
     ErrorCode prepare_ec = PrepareCopyTask(trace_id, request, ctx, src_uris, dst_uris);
     if (prepare_ec != EC_OK) {
-        // PrepareCopyTask 已回滚其成功分配的 URI；若 BatchAddLocation 部分成功留下 WRITING，
-        // 释放 reservation 后它会成为无 copy 在跑的真实 orphan，由 Reclaimer 安全清理。
+        // PrepareCopyTask 已按逐 key AddLocation 结果回滚目标元数据和 URI；补偿状态无法确认时
+        // 会保守保留 URI，由残留 WRITING 元数据的孤儿清理路径继续收敛。
         release_preparing();
         return prepare_ec;
     }
@@ -855,7 +1042,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     }
 
     // 收集成功 Create 的 block → batch AddLocation
-    // add_items[k] 显式对应 add_block_keys[k]/add_locations[k]，并用于接回 location_ids[k]。
+    // add_items[k] 显式对应 add_block_keys[k]/add_locations[k]，并用于接回 add_results[k]。
     std::vector<BatchCopyItem *> add_items;
     std::vector<int64_t> add_block_keys;
     CacheLocationVector add_locations;
@@ -886,41 +1073,47 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     // ---- phase 2+3: batch AddLocation + bind preparing reservations + executor Submit ----
     if (!add_block_keys.empty()) {
         MetaSearcher meta_searcher(indexer);
-        std::vector<std::string> location_ids;
+        std::vector<MetaSearcher::AddLocationResult> add_results;
         ErrorCode add_ec =
-            meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, location_ids);
-        if (add_ec != EC_OK) {
-            // FIXME: 与正常写路径（cache_manager.cc:858）相同的已知局限——BatchAddLocation 部分成功时
-            // 无法精确识别哪些 block 的 meta 已写入，可能留下孤儿 CLS_WRITING location，由 reclaimer
-            // 孤儿检测被动清理。Delete 所有已分配 URI 作为 best-effort 回滚。
+            meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, add_results);
+        if (add_results.size() != add_items.size()) {
+            KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for migration batch: expected %zu, "
+                          "got %zu, aggregate ec %d; retaining allocated URIs",
+                          trace_id.c_str(),
+                          add_items.size(),
+                          add_results.size(),
+                          add_ec);
             for (auto *item : add_items) {
-                if (!item->dst_uris.empty()) {
-                    data_storage_manager_->Delete(
-                        batch_ctx.get(), item->request.dst_storage_name, item->dst_uris, nullptr);
-                }
-                item->MarkFailed(EC_ERROR);
+                item->MarkFailed(EC_MISMATCH);
             }
-            // 部分成功但未返回 id 的 WRITING 会在释放后成为真实 orphan；此时没有 copy 被提交。
             release_all_preparing();
             return collect_results();
+        }
+        if (add_ec != EC_OK) {
+            KVCM_LOG_WARN("[%s] BatchAddLocation partially failed for migration batch, aggregate ec %d",
+                          trace_id.c_str(),
+                          add_ec);
         }
 
         // ---- phase 3a: 先为整个批次绑定 location_id，再做任何逐项 mark 查询/submit ----
         // BatchAddLocation 一次公开全部 WRITING；若仍在逐项循环里绑定，后半批会继续暴露宽泛窗口。
         std::vector<BatchCopyItem *> bind_items;
         bind_items.reserve(add_items.size());
+        std::vector<AddLocationRollbackItem> rollback_items;
+        std::vector<BatchCopyItem *> rollback_add_items;
         for (std::size_t k = 0; k < add_items.size(); ++k) {
             auto &item = *add_items[k];
-            if (!item.eligible || k >= location_ids.size() || location_ids[k].empty()) {
-                // 无法识别目标 location id，不能提交 copy。URI 先 best-effort 删除；若 meta 已部分写入，
-                // reservation 释放后由 Reclaimer 清理残留 WRITING metadata。
-                if (!item.dst_uris.empty()) {
-                    data_storage_manager_->Delete(
-                        batch_ctx.get(), item.request.dst_storage_name, item.dst_uris, nullptr);
-                    item.dst_uris.clear();
-                }
-                item.MarkFailed(EC_ERROR);
-                release_preparing(item);
+            const auto &add_result = add_results[k];
+            if (!item.eligible || add_result.ec != EC_OK || add_result.location_id.empty()) {
+                const ErrorCode item_ec = add_result.ec == EC_OK ? EC_MISMATCH : add_result.ec;
+                rollback_items.push_back({item.request.block_key,
+                                          item.request.dst_storage_name,
+                                          item.dst_uris,
+                                          item_ec,
+                                          add_result.location_id});
+                item.dst_uris.clear();
+                item.MarkFailed(item_ec);
+                rollback_add_items.push_back(&item);
                 continue;
             }
             auto &req = item.request;
@@ -932,10 +1125,22 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             ctx.src_create_time = req.src_create_time;
             ctx.src_storage_name = req.src_storage_name;
             ctx.dst_storage_name = req.dst_storage_name;
-            ctx.dst_location_id = location_ids[k];
+            ctx.dst_location_id = add_result.location_id;
             ctx.retention = req.retention;
             ctx.total_bytes = item.total_bytes;
             bind_items.push_back(&item);
+        }
+        if (!rollback_items.empty()) {
+            RollbackAddedLocations(batch_ctx.get(),
+                                   trace_id,
+                                   first_req.instance_id,
+                                   indexer,
+                                   data_storage_manager_,
+                                   schedule_plan_executor_,
+                                   rollback_items);
+            for (auto *item : rollback_add_items) {
+                release_preparing(*item);
+            }
         }
         {
             std::lock_guard<std::mutex> lock(task_mutex_);

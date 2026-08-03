@@ -267,6 +267,11 @@ private:
                                         const std::string &storage_name,
                                         DataStorageType storage_type,
                                         CacheLocationVector &out_locations);
+    void RollbackAddLocations(RequestContext *request_context,
+                              const std::string &instance_id,
+                              const KeyVector &keys,
+                              const CacheLocationVector &locations,
+                              const std::vector<MetaSearcher::AddLocationResult> &add_results);
     ErrorCode CreateInSingleBatch(RequestContext *request_context,
                                   const std::string &instance_id,
                                   const CacheManager::KeyVector &keys,

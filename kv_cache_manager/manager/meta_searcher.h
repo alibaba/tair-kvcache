@@ -93,10 +93,15 @@ public:
                                const KeyVector &keys,
                                const BlockMask &input_mask,
                                std::vector<CacheLocationMap> &out_location_maps);
+    struct AddLocationResult {
+        ErrorCode ec = EC_UNKNOWN;
+        // EC_OK 时是可供业务使用的 location id；失败时若非空，仅可作为回滚定位符。
+        std::string location_id;
+    };
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
-                               std::vector<std::string> &out_location_ids);
+                               std::vector<AddLocationResult> &out_results);
     struct ReplaceLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -167,7 +172,9 @@ public:
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec,
-                                   const std::vector<std::vector<std::string>> &expected_location_values = {});
+                                   const std::vector<std::vector<std::string>> &expected_location_values = {},
+                                   bool adjust_storage_usage = true,
+                                   bool adjust_reclaimed_key_count = true);
     using LocationVisitor =
         std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);
