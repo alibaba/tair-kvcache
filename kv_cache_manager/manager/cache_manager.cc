@@ -886,7 +886,7 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
 
     LocationsPerKey locations_per_key;
     ec = meta_searcher->BatchGetBestLocationByBackend(
-        request_context, query_keys, locations_per_key, policy.get(), backend_selectors);
+        request_context, query_keys, locations_per_key, policy.get(), backend_selectors, location_spec_names);
     query_scope = ChronoScopeGuard{};
     // prefix_match_len: count keys with at least one hit (non-empty id).
     // Miss keys have empty CacheLocation objects with no id.
@@ -1432,6 +1432,7 @@ void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
         // COW: copy, modify, replace
         auto new_loc = std::make_shared<CacheLocation>(*loc_ptr);
         new_loc->set_location_specs(std::move(new_specs));
+        new_loc->set_spec_size(new_loc->location_specs().size());
         loc_ptr = std::move(new_loc);
     }
 }
@@ -2453,6 +2454,37 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
     bool registration_applied = false;
     ErrorCode register_ec = EC_OK;
+    bool node_registration_ensured = false;
+    std::unordered_set<std::string> ensured_mediums;
+    auto ensure_node_medium = [&](const std::string &medium) {
+        if (node_registration_ensured && ensured_mediums.count(medium) > 0) {
+            return EC_OK;
+        }
+        const ErrorCode ec = event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {medium});
+        if (ec == EC_OK) {
+            node_registration_ensured = true;
+            ensured_mediums.insert(medium);
+        }
+        return ec;
+    };
+    auto ensure_node_mediums = [&](const std::vector<std::string> &mediums) {
+        std::vector<std::string> missing_mediums;
+        missing_mediums.reserve(mediums.size());
+        for (const auto &medium : mediums) {
+            if (ensured_mediums.count(medium) == 0) {
+                missing_mediums.push_back(medium);
+            }
+        }
+        if (node_registration_ensured && missing_mediums.empty()) {
+            return EC_OK;
+        }
+        const ErrorCode ec = event_backend->EnsureNodeRegistered(instance_id, host_ip_port, missing_mediums);
+        if (ec == EC_OK) {
+            node_registration_ensured = true;
+            ensured_mediums.insert(missing_mediums.begin(), missing_mediums.end());
+        }
+        return ec;
+    };
 
     struct BlockAddEntry {
         std::string location_id;
@@ -2509,6 +2541,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 register_ec = event_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
                 registration_applied = true;
                 if (register_ec == EC_OK) {
+                    node_registration_ensured = true;
+                    ensured_mediums.insert(register_mediums.begin(), register_mediums.end());
                     mutation_lifecycle_generation = event_backend->GetNodeGeneration(instance_id, host_ip_port);
                     delta_mutations.AdoptLifecycleGeneration(reporter_key, mutation_lifecycle_generation);
                 }
@@ -2563,8 +2597,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            const ErrorCode ensure_node_ec =
-                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {params.medium()});
+            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium());
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
                 break;
@@ -2629,8 +2662,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            const ErrorCode ensure_node_ec =
-                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {params.medium()});
+            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium());
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
                 break;
@@ -2713,8 +2745,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     snapshot_mediums.push_back(block.medium);
                 }
             }
-            const ErrorCode ensure_node_ec =
-                event_backend->EnsureNodeRegistered(instance_id, host_ip_port, snapshot_mediums);
+            const ErrorCode ensure_node_ec = ensure_node_mediums(snapshot_mediums);
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
                 break;
@@ -2796,6 +2827,17 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     }
 
+    // MetaSearcher calls this once per metadata RMW phase, after its read and
+    // before its first mutation. This removes the old per-key lock/allocation
+    // amplification while preserving the window in which HOST_DOWN can fence
+    // a request that is stalled in metadata I/O.
+    auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
+        EventReportBackend::LifecycleMutationLease lease;
+        const ErrorCode ec =
+            event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
+        return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
+    };
+
     if (!block_to_add.empty()) {
         KeyVector add_keys_aggr;
         std::vector<std::vector<BlockAddMergeEntry>> add_merged_entries_aggr;
@@ -2846,12 +2888,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<ErrorCode> per_key_ec;
-        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
-            EventReportBackend::LifecycleMutationLease lease;
-            const ErrorCode ec =
-                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
-            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
-        };
         meta_searcher->BatchMergeLocationSpecs(
             request_context, add_keys_aggr, merge_tasks, per_key_ec, acquire_write_lease);
 
@@ -2913,12 +2949,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             delete_target_count += delete_tasks[i].size();
         }
-        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
-            EventReportBackend::LifecycleMutationLease lease;
-            const ErrorCode ec =
-                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
-            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
-        };
         meta_searcher->BatchDeleteLocationSpecs(request_context,
                                                 del_keys_aggr,
                                                 delete_tasks,
@@ -2992,12 +3022,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
 
         std::vector<ErrorCode> per_key_ec;
-        auto acquire_write_lease = [event_backend, reporter_key, mutation_lifecycle_generation] {
-            EventReportBackend::LifecycleMutationLease lease;
-            const ErrorCode ec =
-                event_backend->AcquireLifecycleMutationLease(reporter_key, mutation_lifecycle_generation, lease);
-            return std::make_pair(ec, std::static_pointer_cast<void>(std::move(lease)));
-        };
         meta_searcher->BatchReplaceLocationSpecs(
             request_context, snapshot_keys, replace_tasks, per_key_ec, acquire_write_lease);
         for (size_t key_index = 0; key_index < snapshot_keys.size(); ++key_index) {

@@ -496,6 +496,35 @@ TEST_F(EventReportBackendTest, EnsureNodeRegisteredMergesNewMediums) {
     ASSERT_EQ(2u, backend.instance_nodes_["medium-merge"]["10.0.0.91:8080"]->mediums.size());
 }
 
+TEST_F(EventReportBackendTest, EnsureNodeRegisteredHandlesConcurrentKnownAndNewMediums) {
+    EventReportBackend backend(metrics_registry_);
+    const std::string instance_id = "medium-concurrency";
+    const std::string host = "10.0.0.95:8080";
+    ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered(instance_id, host, {"mem"}));
+    const uint64_t generation = backend.GetNodeGeneration(instance_id, host);
+
+    std::atomic<size_t> failures{0};
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < 12; ++worker) {
+        workers.emplace_back([&, worker] {
+            const std::string medium = worker % 2 == 0 ? "mem" : "disk";
+            for (size_t iteration = 0; iteration < 200; ++iteration) {
+                if (backend.EnsureNodeRegistered(instance_id, host, {medium}) != EC_OK) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(0u, failures.load(std::memory_order_relaxed));
+    EXPECT_EQ(generation, backend.GetNodeGeneration(instance_id, host));
+    const auto &mediums = backend.instance_nodes_[instance_id][host]->mediums;
+    EXPECT_EQ((std::set<std::string>{"disk", "mem"}), (std::set<std::string>(mediums.begin(), mediums.end())));
+}
+
 // (7) Re-registration after cleanup
 TEST_F(EventReportBackendTest, RegisterAfterCleanupCreatesNewEntry) {
     EventReportBackend backend(metrics_registry_);
@@ -510,12 +539,20 @@ TEST_F(EventReportBackendTest, RegisterAfterCleanupCreatesNewEntry) {
     }
     ASSERT_GE(cleanup_calls.load(), 1);
 
-    EXPECT_EQ(backend.instance_nodes_["test_inst"].count("10.0.0.6:8080"), 0u);
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + 1s;
+    while (backend.IsNodeRegistered("test_inst", "10.0.0.6:8080") &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::yield();
+    }
+    ASSERT_FALSE(backend.IsNodeRegistered("test_inst", "10.0.0.6:8080"));
 
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.6:8080", {"mem", "disk"}));
     ASSERT_TRUE(backend.IsNodeAvailable("test_inst", "10.0.0.6:8080"));
     {
-        auto &host_map = backend.instance_nodes_["test_inst"];
+        std::shared_lock<std::shared_mutex> lock(backend.nodes_mutex_);
+        auto instance_it = backend.instance_nodes_.find("test_inst");
+        ASSERT_NE(instance_it, backend.instance_nodes_.end());
+        auto &host_map = instance_it->second;
         auto it = host_map.find("10.0.0.6:8080");
         ASSERT_NE(it, host_map.end());
         EXPECT_EQ(it->second->mediums.size(), 2u);
@@ -1829,9 +1866,20 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         auto waiting_snapshot = std::async(std::launch::async, [&] {
             std::string candidate;
             uint64_t retry_ms = 0;
-            return BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_ms);
+            return backend.BeginSnapshot(reporter_key, candidate, retry_ms);
         });
-        ASSERT_EQ(std::future_status::timeout, waiting_snapshot.wait_for(20ms));
+        std::string observed_committed;
+        std::string observed_in_flight;
+        const auto in_flight_deadline = std::chrono::steady_clock::now() + 1s;
+        do {
+            backend.GetSnapshotVersionTokens(reporter_key, observed_committed, observed_in_flight);
+            if (!observed_in_flight.empty()) {
+                break;
+            }
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < in_flight_deadline);
+        ASSERT_FALSE(observed_in_flight.empty());
+        ASSERT_EQ(std::future_status::timeout, waiting_snapshot.wait_for(0ms));
         ASSERT_EQ(EC_OK, backend.Close());
         ASSERT_EQ(std::future_status::ready, waiting_snapshot.wait_for(1s));
         EXPECT_EQ(EC_SNAPSHOT_REQUIRED, waiting_snapshot.get());
@@ -1850,10 +1898,14 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         std::string second;
         ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, second, retry_after_ms));
 
+        std::promise<void> delta_call_started;
+        auto delta_call_started_future = delta_call_started.get_future();
         auto waiting_delta = std::async(std::launch::async, [&] {
+            delta_call_started.set_value();
             std::string committed;
             return backend.BeginDeltaMutation(reporter_key, committed);
         });
+        ASSERT_EQ(std::future_status::ready, delta_call_started_future.wait_for(1s));
         ASSERT_EQ(std::future_status::timeout, waiting_delta.wait_for(20ms));
         ASSERT_EQ(EC_OK, backend.Close());
         ASSERT_EQ(std::future_status::ready, waiting_delta.wait_for(1s));

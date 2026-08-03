@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -191,6 +192,17 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     return result;
 }
 
+using RequestedSpecNameSet = std::unordered_set<std::string>;
+
+bool MatchesRequestedSpec(const CacheLocation &loc, const RequestedSpecNameSet &requested_spec_names) {
+    if (requested_spec_names.empty()) {
+        return true;
+    }
+    return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&](const LocationSpec &spec) {
+        return requested_spec_names.count(spec.name()) > 0;
+    });
+}
+
 std::string ExtractPeerAddrFromLocation(const CacheLocation &loc) {
     if (loc.location_specs().empty()) {
         return {};
@@ -232,7 +244,9 @@ V6DPeerSelection SelectV6DByPrefix(const std::vector<size_t> &candidate_indices,
             }
             prefix_covered.push_back(ci);
         }
-        if (prefix_covered.size() > best.covered_indices.size()) {
+        if (prefix_covered.size() > best.covered_indices.size() ||
+            (prefix_covered.size() == best.covered_indices.size() &&
+             (best.peer_addr.empty() || addr < best.peer_addr))) {
             best.peer_addr = addr;
             best.covered_indices = std::move(prefix_covered);
         }
@@ -258,7 +272,8 @@ SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
     }
     V6DPeerSelection best;
     for (auto &[addr, indices] : addr_to_indices) {
-        if (indices.size() > best.covered_indices.size()) {
+        if (indices.size() > best.covered_indices.size() ||
+            (indices.size() == best.covered_indices.size() && (best.peer_addr.empty() || addr < best.peer_addr))) {
             best.peer_addr = addr;
             best.covered_indices = indices;
         }
@@ -533,11 +548,13 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                                                       const KeyVector &keys,
                                                       LocationsPerKey &out_locations,
                                                       SelectLocationPolicy *policy,
-                                                      const std::vector<BackendSelector> &selectors) const {
+                                                      const std::vector<BackendSelector> &selectors,
+                                                      const std::vector<std::string> &requested_spec_names) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
     out_locations.resize(keys.size());
+    const RequestedSpecNameSet requested_spec_name_set(requested_spec_names.begin(), requested_spec_names.end());
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     CacheLocationMapVector location_maps;
@@ -594,6 +611,8 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 for (const auto &[id, loc] : vmap) {
                     if (loc->type() != target_type)
                         continue;
+                    if (!MatchesRequestedSpec(*loc, requested_spec_name_set))
+                        continue;
                     std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())
                         continue;
@@ -642,7 +661,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() == target_type) {
+                    if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name_set)) {
                         filtered.try_emplace(id, loc);
                     }
                 }
@@ -1050,19 +1069,27 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
     }
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    std::vector<MetadataWriteLease> write_leases;
-    auto modifier = [&keys, &tasks_per_key, &usage_changes, &acquire_write_lease, &write_leases, batch_create_time](
-                        const std::vector<ErrorCode> &get_ecs,
-                        const LocationIdVector &location_ids,
-                        size_t key_index,
-                        CacheLocationVector &locations,
-                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
-        if (acquire_write_lease) {
-            auto [lease_ec, lease] = acquire_write_lease();
-            if (lease_ec != EC_OK) {
-                return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), lease_ec)};
-            }
-            write_leases.push_back(std::move(lease));
+    bool write_lease_attempted = false;
+    ErrorCode write_lease_ec = EC_OK;
+    MetadataWriteLease write_lease;
+    auto modifier = [&keys,
+                     &tasks_per_key,
+                     &usage_changes,
+                     &acquire_write_lease,
+                     &write_lease_attempted,
+                     &write_lease_ec,
+                     &write_lease,
+                     batch_create_time](const std::vector<ErrorCode> &get_ecs,
+                                        const LocationIdVector &location_ids,
+                                        size_t key_index,
+                                        CacheLocationVector &locations,
+                                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        if (acquire_write_lease && !write_lease_attempted) {
+            std::tie(write_lease_ec, write_lease) = acquire_write_lease();
+            write_lease_attempted = true;
+        }
+        if (write_lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), write_lease_ec)};
         }
         const auto &tasks = tasks_per_key[key_index];
         std::vector<ErrorCode> modifier_ecs(location_ids.size(), ErrorCode::EC_OK);
@@ -1168,29 +1195,36 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         return EC_BADARGS;
     }
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
+    if (keys.empty()) {
+        return EC_OK;
+    }
 
     std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> created_locs_sz(keys.size());
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
     std::vector<std::vector<MergeLocationSpecsTask>> merge_tasks_per_key(keys.size());
-    std::vector<MetadataWriteLease> write_leases;
+    bool create_write_lease_attempted = false;
+    ErrorCode create_write_lease_ec = EC_OK;
+    MetadataWriteLease create_write_lease;
 
     auto create_modifier = [&tasks_per_key,
                             &merge_tasks_per_key,
                             &keys,
                             &created_locs_sz,
                             &acquire_write_lease,
-                            &write_leases,
+                            &create_write_lease_attempted,
+                            &create_write_lease_ec,
+                            &create_write_lease,
                             batch_create_time](const LocationIdVector &existing_ids,
                                                ErrorCode get_ec,
                                                size_t index,
                                                PropertyMap & /*upsert_property_map*/,
                                                CacheLocationMap &out_new_locations) -> ModifierResult {
-        if (acquire_write_lease) {
-            auto [lease_ec, lease] = acquire_write_lease();
-            if (lease_ec != EC_OK) {
-                return {ModifierAction::MA_FAIL, lease_ec};
-            }
-            write_leases.push_back(std::move(lease));
+        if (acquire_write_lease && !create_write_lease_attempted) {
+            std::tie(create_write_lease_ec, create_write_lease) = acquire_write_lease();
+            create_write_lease_attempted = true;
+        }
+        if (create_write_lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, create_write_lease_ec};
         }
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location ids failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
@@ -1272,25 +1306,30 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
     for (size_t i = 0; i < keys.size(); ++i) {
         merge_usage_changes[i].resize(merge_tasks_per_key[i].size());
     }
-    write_leases.clear();
+    create_write_lease.reset();
+    bool merge_write_lease_attempted = false;
+    ErrorCode merge_write_lease_ec = EC_OK;
+    MetadataWriteLease merge_write_lease;
     auto merge_modifier = [&keys,
                            &merge_tasks_per_key,
                            &merge_key_indices,
                            &merge_usage_changes,
                            &acquire_write_lease,
-                           &write_leases,
+                           &merge_write_lease_attempted,
+                           &merge_write_lease_ec,
+                           &merge_write_lease,
                            batch_create_time](const std::vector<ErrorCode> &get_ecs,
                                               const LocationIdVector &loc_ids,
                                               size_t key_index,
                                               CacheLocationVector &locs,
                                               PropertyMap &upsert_property_map) -> LocationModifierResult {
         (void)upsert_property_map;
-        if (acquire_write_lease) {
-            auto [lease_ec, lease] = acquire_write_lease();
-            if (lease_ec != EC_OK) {
-                return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(loc_ids.size(), lease_ec)};
-            }
-            write_leases.push_back(std::move(lease));
+        if (acquire_write_lease && !merge_write_lease_attempted) {
+            std::tie(merge_write_lease_ec, merge_write_lease) = acquire_write_lease();
+            merge_write_lease_attempted = true;
+        }
+        if (merge_write_lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(loc_ids.size(), merge_write_lease_ec)};
         }
         const size_t original_key_index = merge_key_indices[key_index];
         const auto &tasks = merge_tasks_per_key[original_key_index];
@@ -1425,7 +1464,6 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
     std::vector<std::pair<size_t, size_t>> flat_to_original_task_indices;
     std::vector<std::pair<DataStorageType, std::uint64_t>> flat_deleted_specs_size;
     std::vector<std::uint8_t> flat_missing_targets;
-    std::vector<MetadataWriteLease> write_leases;
     for (size_t i = 0; i < keys.size(); ++i) {
         out_batch_results[i].assign(tasks_per_key[i].size(), ErrorCode::EC_OK);
         if (out_missing_targets) {
@@ -1445,24 +1483,29 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
 
     // 每条 flat task 独立处理：NOENT 视为幂等成功；spec_names 为空返回 BADARGS；
     // 删除后无剩余 specs 则删除整个 location，否则 COW 更新 location_specs。
+    bool write_lease_attempted = false;
+    ErrorCode write_lease_ec = EC_OK;
+    MetadataWriteLease write_lease;
     auto modifier = [&keys,
                      &tasks_per_key,
                      &flat_to_original_task_indices,
                      &flat_deleted_specs_size,
                      &flat_missing_targets,
                      &acquire_write_lease,
-                     &write_leases](const std::vector<ErrorCode> &get_ecs,
-                                    const LocationIdVector &loc_ids,
-                                    size_t key_index,
-                                    CacheLocationVector &locs,
-                                    PropertyMap &upsert_property_map) -> LocationModifierResult {
+                     &write_lease_attempted,
+                     &write_lease_ec,
+                     &write_lease](const std::vector<ErrorCode> &get_ecs,
+                                   const LocationIdVector &loc_ids,
+                                   size_t key_index,
+                                   CacheLocationVector &locs,
+                                   PropertyMap &upsert_property_map) -> LocationModifierResult {
         (void)upsert_property_map;
-        if (acquire_write_lease) {
-            auto [lease_ec, lease] = acquire_write_lease();
-            if (lease_ec != EC_OK) {
-                return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(loc_ids.size(), lease_ec)};
-            }
-            write_leases.push_back(std::move(lease));
+        if (acquire_write_lease && !write_lease_attempted) {
+            std::tie(write_lease_ec, write_lease) = acquire_write_lease();
+            write_lease_attempted = true;
+        }
+        if (write_lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(loc_ids.size(), write_lease_ec)};
         }
         std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         if (loc_ids.size() != 1 || key_index >= flat_to_original_task_indices.size()) {

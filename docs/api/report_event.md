@@ -16,7 +16,8 @@
 5. 客户端不得在 URI 中填写 `s_version`；KVCM 会自动追加。
 6. `committed_snapshot_version` 是 32 位十六进制 opaque generation，不能按大小比较；成功完整
    snapshot 后它会成为该 reporter 的严格查询栅栏。
-7. `snapshot_required=true` 是“当前 KVCM 进程还没有该 reporter generation”的提示，不会阻止合法增量。
+7. `snapshot_required=true` 表示请求到达时当前进程还没有该 reporter generation；创建 generation
+   的首条 ADD/DELETE 自身仍返回 `true`，下一条事件才返回 `false`。该提示不会阻止合法增量。
 8. 当前进程尚未收到该 reporter 的任何合法事件，或节点 unavailable 时，查询不会返回该
    节点的数据；节点存活状态是硬门槛。
 9. snapshot 失败、进程重启或从未成功 snapshot 的 soft 模式可能返回 stale cache candidate；
@@ -140,7 +141,8 @@ Instance/InstanceGroup 和 cache metadata 会持久化；reporter 节点表、li
 2. 第一条 HEARTBEAT、ADD、DELETE 或 SNAPSHOT 会自动重建 reporter 节点状态，不要求再次 REGISTER；
 3. 如果第一条只是 HEARTBEAT，响应为 `snapshot_required=true`、
    `committed_snapshot_version=""`，格式合法的历史 metadata 可以重新成为 cache candidate；
-4. 如果第一条是 ADD/DELETE，它正常成功并建立新 generation；
+4. 如果第一条是 ADD/DELETE，它正常成功并建立新 generation；该次响应仍为
+   `snapshot_required=true`，后续事件复用 generation 时变为 `false`；
 5. 该增量只更新明确涉及的 spec，不删除其他历史 block/spec；
 6. snapshot-capable 调用方可以稍后补一次完整 snapshot；
 7. realtime-only 调用方可以继续只发增量。
@@ -496,14 +498,17 @@ SNAPSHOT_IN_PROGRESS  -> SNAPSHOT 失败时重发完整 snapshot
 
 ### 9.2 snapshot_required
 
-`snapshot_required` 等价于“当前进程还没有该 reporter generation”：
+`snapshot_required` 表示“本次请求到达时当前进程还没有该 reporter generation”。对于首条合法
+ADD/DELETE，KVCM 会在请求内创建 generation 并返回到 `committed_snapshot_version`，但本次响应
+仍保留 `snapshot_required=true`；下一条事件复用该 generation 时才返回 `false`：
 
 | 场景 | 值 |
 | --- | --- |
 | fresh REGISTER 后 | `true` |
 | KVCM 重启后的第一条 HEARTBEAT | `true` |
 | 只有 REGISTER/HEARTBEAT、还没有合法 mutation | `true` |
-| 第一条合法 ADD/DELETE 后 | `false` |
+| 创建 generation 的第一条合法 ADD/DELETE | `true` |
+| 后续复用已有 generation 的 ADD/DELETE | `false` |
 | 成功 SNAPSHOT 后 | `false` |
 | invalid-only 首批增量 | 仍为 `true` |
 | realtime-only reporter | 可忽略该提示，继续发合法增量 |
@@ -606,6 +611,23 @@ HTTP 接口为 `POST /api/getCacheLocation`：
 该接口当前支持 `QT_BATCH_GET`，可通过 `backend_selectors` 明确选择
 `ST_EVENT_REPORT_L1P5`、`ST_EVENT_REPORT_L2` 等 backend，适合验证两种 EventReport storage 的
 隔离状态。
+
+`location_spec_names` 不只是返回结果的投影条件，也是 backend/peer 选择前的候选条件：
+
+- 为空时，location 中任意合法 spec 都可使该 location 成为候选；
+- 非空时，location 至少包含一个请求的 spec name 才能成为候选；
+- 同一 EventReport location 由 `storage_type + medium + host_ip_port` 标识，其中各 spec 必须属于
+  同一个 reporter endpoint；location 命中过滤后，selector 从第一个合法 spec URI 提取 peer；
+- 多个 peer 的 prefix/coverage 相同时按 endpoint 字典序选择，保证调用方按 spec 分批查询时
+  各批次不会因为容器遍历顺序选择不同 peer；
+- peer 选择完成后，响应仍只保留 `location_spec_names` 指定的 specs。
+
+因此 spec name 是 reporter 与查询方之间的稳定协议字段，不能用 object size 代替：不同 cache
+group 即使 byte size 相同，也必须使用不同且稳定的 spec name。调用方如果每个 key 需要的 spec
+不同，应先按 spec name 分组发起查询，再按原 object key 合并结果；`location_spec_names` 是一次
+请求级过滤条件，不是 per-key 数组。确定性 tie-break 只消除无序遍历造成的抖动；若各组候选
+peer 集合不同，分组请求无法保证得到全局最优公共 peer。该能力需要后续扩展 per-key spec filter
+或等价的联合选择接口。
 
 ### 11.4 GetHostCacheState
 
@@ -728,12 +750,39 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 - Backend UT：`kv_cache_manager/data_storage/test/event_report_backend_test.cc`
 - Manager UT：`kv_cache_manager/manager/test/cache_manager_test.cc`
 - Meta UT：`kv_cache_manager/manager/test/meta_searcher_test.cc`
+- PR HTTP 集成：`integration_test/meta_service/http_interface_test.py`
 - 基础集成：`integration_test/meta_service/test_report_event.py`
 - Snapshot 集成：`integration_test/meta_service/test_report_event_snapshot.py`
 - 重启集成：`integration_test/meta_service/test_report_event_restart.py`
 
-后两项对应的 Bazel target 带 `manual` 标签，不属于默认 GitHub CI。覆盖结论必须以显式执行结果为准；
-同样，普通 GitHub check 通过不代表已经执行 ASAN。
+PR HTTP 集成由 `//integration_test/meta_service:http_interface_test` 启动真实 KVCM 进程，属于默认
+`//integration_test/...` CI。基础 ReportEvent 脚本当前没有 Bazel target；Snapshot target 带
+`manual` 标签，重启脚本也需显式执行，因此三者不属于默认 GitHub CI。覆盖结论必须以显式执行
+结果为准；同样，普通 GitHub check 通过不代表已经执行 ASAN。
+
+Snapshot target 是外部服务测试，单独执行 `bazel test` 不会替它启动 KVCM。先按脚本头部说明
+启动 meta/admin HTTP 服务，再显式传入端口。功能与容量入口分别为：
+
+```bash
+bazel run //integration_test/meta_service:test_report_event_snapshot -- \
+  --host localhost --http_port 56020 --admin_http_port 56040 \
+  --instance_id event_report_functional --skip-bench
+
+bazel run //integration_test/meta_service:test_report_event_snapshot -- \
+  --host localhost --http_port 56020 --admin_http_port 56040 \
+  --instance_id event_report_bench --only-bench
+
+# 仅运行小 block / 大批量单请求基准；生产形态评估应显式传 Redis URI
+bazel run //integration_test/meta_service:test_report_event_snapshot -- \
+  --host localhost --http_port 56020 --admin_http_port 56040 \
+  --instance_id event_report_large_delta \
+  --meta-storage-uri redis://127.0.0.1:6379 \
+  --bench-test test_20_large_single_request_delta_scaling
+```
+
+同一 KVCM 进程上重复执行时，fixture 会通过 `listStorage` 校验已有 storage 的 type 和 EventReport
+时序配置；配置不一致应立即失败，不能把任意 `addStorage` 错误当作“可能已存在”后继续测试。
+heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩短功能与容量用例的主 storage。
 
 | ID | 用户行为 | 自动化覆盖 |
 | --- | --- | --- |
@@ -781,6 +830,10 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | Q-07 | GetCacheLocationsByBackend 同样执行 reporter liveness 过滤 | `TestGetCacheLocationsByBackendWithBackendSelectors`；snapshot 集成 `test_16a` |
 | Q-08 | 三个查询入口在 timeout 隐藏和 HEARTBEAT 恢复时结果一致 | snapshot 集成 `test_16a_heartbeat_timeout_then_recovery` |
 | Q-09 | snapshot 成功后即使异步 cleanup 尚未运行，遗漏的旧 version block 也立即不可见 | `TestSuccessfulSnapshotImmediatelyFencesOmittedOldVersionBeforeCleanup`、`TestGetCacheLocationEnforcesReporterLifecycleAndBatchOrdering` |
+| Q-10 | backend 查询在 peer 选择前按 spec 过滤，并对同覆盖率 peer 确定性择优 | `TestGetCacheLocationsByBackendWithBackendSelectors`；`EventReportPrefixFiltersRequestedSpecBeforePeerSelection`；`EventReportCoverageFiltersRequestedSpecBeforePeerSelection`；`EventReportPrefixTieBreaksByPeerAddress`；`EventReportCoverageTieBreaksByPeerAddress`；HTTP 集成 `test_event_report_requested_spec_filters_before_peer_selection` |
+| Q-11 | requested spec 不存在时 Prefix/Coverage 都返回与输入等长的空结果，不回退到其他 spec | `EventReportUnknownRequestedSpecReturnsNoCandidate`；HTTP 集成 `test_event_report_requested_spec_filters_before_peer_selection` |
+| Q-12 | requested spec 按 any-of 语义匹配，重复 name 不改变结果；匹配同一 location 的非首个 spec 时仍使用该 reporter endpoint | `EventReportRequestedSpecMatchesAnyNameIncludingNonFirstSpec` |
+| Q-13 | requested-spec gap 会终止 Prefix，但 Coverage 可跳过 gap 继续返回后续命中；响应投影后 `spec_size` 始终等于实际 specs 数量 | `EventReportRequestedSpecGapStopsPrefixButNotCoverage`；`TestGetCacheLocationsByBackendWithBackendSelectors` |
 | L-01 | 自动 heartbeat timeout 隐藏、grace 内恢复原 generation | `MightExistFollowsAutomaticLivenessAndFullReporterLifecycle`；snapshot 集成 `test_16a` |
 | L-02 | unavailable 期间增量可写但保持不可见，HEARTBEAT 后恢复 | `TestReportEventLazilyRestoresReporterWithoutRegisterOrSnapshot`；snapshot 集成 `test_16a` |
 | L-03 | 超过 grace 后按 generation 原子 unregister，最终 metadata 删除持有 generation lease，旧 cleanup 不伤重新注册数据 | `HeartbeatRecoveryFencesCleanupAlreadySelectedByLivenessLoop`、`ConditionalUnregisterCannotRemoveNewGeneration`、`CleanupLeaseFencesReregisterThroughFinalDeleteStage`；snapshot 集成 `test_16b` |
@@ -797,6 +850,7 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | C-04 | 已进入 metadata I/O 的旧 lifecycle 请求不能在 HOST_DOWN、REGISTER、新 snapshot 后恢复写入 | `TestOldDeltaCannotCrossReporterLifecycleAfterReregisterAndSnapshot` |
 | C-05 | snapshot 等待 active delta 超时后 abort candidate、保留 committed generation 并重新打开 delta 写门 | `SnapshotDrainTimeoutAbortsCandidateAndReopensWriteGate` |
 | C-06 | delta 等待 in-flight snapshot 超时后返回可重试错误，且不会中止 snapshot；节点校验不会在超时栅栏前无限等待 | `DeltaWaitTimeoutReturnsSnapshotInProgressWithoutAbortingSnapshot`、`TestReportEventDeltaGateTimeoutReturnsSnapshotInProgressAndCanRetry` |
+| C-07 | mutation lease 每个 RMW 阶段只获取一次，但阻塞在 metadata read 的旧请求仍可被 HOST_DOWN/新 lifecycle 抢占 | `TestBatchMutationWriteLeaseIsAcquiredOncePerRmwPhase`、`TestBatchMutationWriteLeaseFailurePreventsAllWrites`、`TestHostDownCancelsSnapshotAlreadyWritingMetadata`、`TestHostDownMakesAlreadyAdmittedDeltaInvisibleWithoutDeadlock`、`TestOldDeltaCannotCrossReporterLifecycleAfterReregisterAndSnapshot` |
 | V-01 | reporter host、ADD/DELETE/SNAPSHOT medium 含 `#` 时拒绝且无写入副作用 | `RegisterNodeWithMediums`、`TestReportEventRejectsInvalidRequestsAndMapsItemErrors`；snapshot 集成 `test_19_*` |
 | V-02 | instance/host/storage type/instance backend 的公共字段校验 | `TestReportEventRejectsInvalidRequestsAndMapsItemErrors`；snapshot 集成 `test_14_*` |
 | V-03 | event_type 与 oneof payload 缺失/错配时该 item fail closed；同批其他合法 mutation 可独立懒初始化并生效 | `TestReportEventRejectsMismatchedPayloadsWithoutSideEffects`；snapshot 集成 `test_13/33` |
@@ -807,6 +861,7 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 | CFG-01 | snapshot interval/drain timeout 默认值、正数校验、负数拒绝、JSON/proto round trip，并由 backend 加载 | `TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation`、`TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings`、`EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings`、`BasicAccessors` |
 | PERF-01 | 100 线程共 1 万 ADD、50 线程共 5000 混合批次均无错误 | `EventReportBenchTest.test_17/18` |
 | PERF-02 | 10 reporter × 每台 5000 blocks 完整 snapshot，并查询每台首/中/末 block | `EventReportBenchTest.test_19_ten_reporters_full_snapshot_capacity` |
+| PERF-03 | 单请求 512 个跨重复 medium 的增量正确落盘；手工容量测试记录 100/1000/5000 个 ADD 的总 RT 与单 event 开销 | `TestReportEventLargeDeltaBatchAcrossRepeatedMediums`、`EventReportBenchTest.test_20_large_single_request_delta_scaling` |
 
 上表中的参数解析、故障注入、CAS 竞态等内部边界使用 UT 验证；跨 HTTP 的正常流程、并发流程、
 节点生命周期和 Redis/KVCM 重启使用集成测试验证。

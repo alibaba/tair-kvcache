@@ -234,10 +234,33 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
         }
     };
 
-    // The common path only enriches an existing node. It must not wait for
-    // the lifecycle write lock: an in-flight metadata mutation intentionally
-    // holds a shared lifecycle lease, and new deltas still need to reach the
-    // bounded snapshot gate instead of blocking here indefinitely.
+    // Repeated reports normally carry a medium that is already known. Keep
+    // that path read-only so it does not serialize all reporters on the node
+    // table's exclusive lock. A missing medium is rechecked under the unique
+    // lock before it is merged (lock-based double check; the map itself must
+    // never be read without nodes_mutex_).
+    {
+        std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+        auto instance_it = instance_nodes_.find(instance_id);
+        if (instance_it != instance_nodes_.end()) {
+            auto node_it = instance_it->second.find(host_ip_port);
+            if (node_it != instance_it->second.end() && node_it->second) {
+                const auto &known_mediums = node_it->second->mediums;
+                const bool all_known =
+                    std::all_of(mediums.begin(), mediums.end(), [&known_mediums](const auto &medium) {
+                        return std::find(known_mediums.begin(), known_mediums.end(), medium) != known_mediums.end();
+                    });
+                if (all_known) {
+                    return EC_OK;
+                }
+            }
+        }
+    }
+
+    // Enriching an existing node must not wait for the lifecycle write lock:
+    // an in-flight metadata mutation intentionally holds a shared lifecycle
+    // lease, and new deltas still need to reach the bounded snapshot gate
+    // instead of blocking here indefinitely.
     {
         std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
         auto instance_it = instance_nodes_.find(instance_id);
