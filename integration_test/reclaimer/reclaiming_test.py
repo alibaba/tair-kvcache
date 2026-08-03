@@ -88,7 +88,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         time.sleep(2)
 
         # now the writing should success
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_reclaiming_01(self):
         """Test start-writing -> reclaiming -> finish-writing."""
@@ -153,13 +153,13 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # now finish write block 0~15
         for i in range(16):
             # no verify because the location could have been reclaimed
-            self._finish_write_with_verify(i, verify=False)
+            self._finish_write_with_verify(i, verify_readback=False)
 
         time.sleep(2)
         # at least one block in 0~15 should be reclaimed already
         # which give room to block 16
         # now the writing of key=16 should success
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_reclaiming_02(self):
         """Test that CLS_WRITING keys left over after a server restart
@@ -274,7 +274,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
 
         # the orphaned CLS_WRITING should not stop the evicting
         # new write should now be accepted
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_no_over_eviction_with_delay(self):
         """In-flight byte credit prevents repeated delayed batches."""
@@ -918,7 +918,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
 
         # write should succeed only if reclaiming happened, which
         # requires storage_usage_data to have survived the restart
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def _get_manager_client(self):
         self._admin_http_port = self.worker_manager.get_worker(
@@ -933,7 +933,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             MetaServiceHttpClient(self._http_url),
         )
 
-    def _write(self, blk_key):
+    def _write(self, blk_key, verify_readback=True):
         logging.info(f"write block key: {blk_key}")
         trace_id = f"{self._trace_id}_blk_key_{blk_key}"
 
@@ -941,7 +941,15 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         self._start_write(blk_key)
 
         # finish write cache
-        self._finish_write_with_verify(blk_key)
+        self._finish_write_with_verify(blk_key, verify_readback=verify_readback)
+
+    def _write_expect_accepted_after_reclaim(self, blk_key):
+        """Assert a write is accepted after reclaim opens capacity.
+
+        The reclaimer remains active in these scenarios, so the new location may
+        be evicted before an immediate get_cache_location readback.
+        """
+        self._write(blk_key, verify_readback=False)
 
     def _start_write_expect_fail(self, blk_key):
         logging.info(f"start write expecting failure, block key: {blk_key}")
@@ -1000,7 +1008,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         logging.info(
             f"block key: {blk_key} start write OK with write session id: {write_session_id}")
 
-    def _finish_write_with_verify(self, blk_key, verify=True):
+    def _finish_write_with_verify(self, blk_key, verify_readback=True):
         # finish write cache
         trace_id = f"{self._trace_id}_blk_key_{blk_key}"
         resp = self._resp_dict[blk_key]
@@ -1018,7 +1026,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             }
         }
         self._client.finish_write_cache(finish_write_req)
-        if not verify:
+        if not verify_readback:
             return
 
         # get cache location to verify it was added correctly
