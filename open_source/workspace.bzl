@@ -52,6 +52,20 @@ def kv_cache_manager_workspace():
     )
 
     http_archive(
+        name = "redis_plus_plus",
+        patch_args = ["-p1"],
+        patches = [
+            "//3rdparty/redis-plus-plus:expose_cluster_pipeline.patch",
+        ],
+        urls = [
+            "https://github.com/sewenew/redis-plus-plus/archive/refs/tags/1.3.15.tar.gz",
+        ],
+        strip_prefix = "redis-plus-plus-1.3.15",
+        sha256 = "e9288fda74f1501c62dd9ab7d6a8dc67de51aa4d5b7c71770baa51987a945941",
+        build_file = clean_dep("//3rdparty/redis-plus-plus:redis-plus-plus.BUILD"),
+    )
+
+    http_archive(
         # Hedron's Compile Commands Extractor for Bazel
         name = "hedron_compile_commands",
         patches = [

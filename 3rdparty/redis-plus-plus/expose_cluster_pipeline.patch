@@ -1,0 +1,42 @@
+diff --git a/src/sw/redis++/queued_redis.h b/src/sw/redis++/queued_redis.h
+index 80b3c79..714e634 100644
+--- a/src/sw/redis++/queued_redis.h
++++ b/src/sw/redis++/queued_redis.h
+@@ -1979,6 +1979,8 @@ public:
+ 
+     redisReply& get(std::size_t idx);
+ 
++    std::vector<ReplyUPtr> release() { return std::move(_replies); }
++
+     template <typename Result>
+     auto get(std::size_t idx)
+         -> typename std::enable_if<!std::is_same<Result, bool>::value, Result>::type {
+diff --git a/src/sw/redis++/redis_cluster.cpp b/src/sw/redis++/redis_cluster.cpp
+index 2668e3f..6df60cc 100644
+--- a/src/sw/redis++/redis_cluster.cpp
++++ b/src/sw/redis++/redis_cluster.cpp
+@@ -29,5 +29,11 @@ RedisCluster::RedisCluster(const Uri &uri) :
+     RedisCluster(uri.connection_options(), uri.connection_pool_options()) {}
+ 
++ConnectionOptions RedisCluster::connection_options(const StringView &hash_tag) {
++    assert(_pool);
++
++    return _pool->connection_options(hash_tag);
++}
++
+ Redis RedisCluster::redis(const StringView &hash_tag, bool new_connection) {
+     assert(_pool);
+ 
+diff --git a/src/sw/redis++/redis_cluster.h b/src/sw/redis++/redis_cluster.h
+index 6dbd54f..09a760d 100644
+--- a/src/sw/redis++/redis_cluster.h
++++ b/src/sw/redis++/redis_cluster.h
+@@ -61,6 +61,8 @@ public:
+     RedisCluster(RedisCluster &&) = default;
+     RedisCluster& operator=(RedisCluster &&) = default;
+ 
++    ConnectionOptions connection_options(const StringView &hash_tag);
++
+     Redis redis(const StringView &hash_tag, bool new_connection = true);
+ 
+     Pipeline pipeline(const StringView &hash_tag, bool new_connection = true);

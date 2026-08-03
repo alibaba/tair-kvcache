@@ -1,6 +1,6 @@
 #include <thread>
 
-#include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"

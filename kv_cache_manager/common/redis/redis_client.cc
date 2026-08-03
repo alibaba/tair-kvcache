@@ -1,54 +1,26 @@
-#include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 
 #include <cassert>
 #include <unordered_set>
+#include <utility>
 
 #include "kv_cache_manager/common/logger.h"
-#include "unistd.h"
 
 namespace kv_cache_manager {
 
-#define KVCM_REDIS_LOG_INFO(format, ...)                                                                               \
-    KVCM_LOG_INFO("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
-#define KVCM_REDIS_LOG_WARN(format, ...)                                                                               \
-    KVCM_LOG_WARN("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+#define KVCM_REDIS_LOG_WARN(format, ...) KVCM_LOG_WARN("redis client[%s] " format, description_.c_str(), ##__VA_ARGS__)
 #define KVCM_REDIS_LOG_ERROR(format, ...)                                                                              \
-    KVCM_LOG_ERROR(                                                                                                    \
-        "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+    KVCM_LOG_ERROR("redis client[%s] " format, description_.c_str(), ##__VA_ARGS__)
 
-RedisClient::RedisClient(const StandardUri &storage_uri)
-    : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
-    int64_t tmp_db = 0;
-    storage_uri.GetParamAs("db", tmp_db);
-    if (tmp_db >= 0) {
-        db_ = tmp_db;
-    }
-    int64_t tmp_timeout_ms = 0;
-    storage_uri.GetParamAs("timeout_ms", tmp_timeout_ms);
-    if (tmp_timeout_ms > 0) {
-        timeout_ms_ = tmp_timeout_ms;
-    }
-    int64_t tmp_retry_count = 0;
-    storage_uri.GetParamAs("retry_count", tmp_retry_count);
-    if (tmp_retry_count > 0) {
-        retry_count_ = tmp_retry_count;
-    }
+RedisClient::RedisClient(const StandardUri &storage_uri, std::shared_ptr<IRedisExecutor> executor)
+    : executor_(std::move(executor))
+    , description_(storage_uri.GetProtocol() + "://" + storage_uri.GetHostName() + ":" +
+                   std::to_string(storage_uri.GetPort())) {
     int64_t tmp_randomkey_batch_num = 0;
     storage_uri.GetParamAs("randomkey_batch_num", tmp_randomkey_batch_num);
     if (tmp_randomkey_batch_num > 0) {
         randomkey_batch_num_ = tmp_randomkey_batch_num;
     }
-}
-
-RedisClient::~RedisClient() { Close(); }
-
-bool RedisClient::IsContextOk() const {
-    if (!context_ || context_->err) {
-        std::string msg = (context_ ? context_->errstr : "Cannot allocate redis context");
-        KVCM_REDIS_LOG_WARN("redis context error[%s]", msg.c_str());
-        return false;
-    }
-    return true;
 }
 
 bool RedisClient::IsReplyOk(const redisReply *reply) const {
@@ -100,153 +72,28 @@ bool RedisClient::GetReplyStrOrNil(const redisReply *reply, std::string &out_str
     return true;
 }
 
-bool RedisClient::Connect() {
-    Disconnect();
-
-    struct timeval timeout;
-    timeout.tv_sec = timeout_ms_ / 1000;
-    timeout.tv_usec = (timeout_ms_ % 1000) * 1000;
-    context_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
-    if (!IsContextOk()) {
-        KVCM_REDIS_LOG_WARN("fail to connect to redis");
-        return false;
-    }
-
-    ReplyUPtr ping_reply_1((redisReply *)redisCommand(context_, "PING"), freeReplyObject);
-    if (!ping_reply_1) {
-        KVCM_REDIS_LOG_WARN("want to ping first to check if auth needed, but ping fail, get nullptr reply");
-        return false;
-    }
-    if (IsReplyOk(ping_reply_1.get())) {
-        // no need to auth, do nothing
-    } else {
-        assert(ping_reply_1->type == REDIS_REPLY_ERROR);
-        std::string error_str(ping_reply_1->str);
-        static const std::string auth_str = "NOAUTH";
-        if (error_str.size() >= auth_str.size() && error_str.compare(0, auth_str.size(), auth_str.c_str()) == 0) {
-            // do auth
-            ReplyUPtr auth_reply((redisReply *)redisCommand(context_, "AUTH %s", user_info_.c_str()), freeReplyObject);
-            if (!IsReplyOk(auth_reply.get())) {
-                KVCM_REDIS_LOG_WARN("auth fail");
-                return false;
-            }
-            ReplyUPtr ping_reply_2((redisReply *)redisCommand(context_, "PING"), freeReplyObject);
-            if (!IsReplyOk(ping_reply_2.get())) {
-                KVCM_REDIS_LOG_WARN("ping fail after auth");
-                return false;
-            }
-            KVCM_REDIS_LOG_INFO("connect to redis, auth successfully");
-        } else {
-            KVCM_REDIS_LOG_WARN("unexpected ping error str[%s]", error_str.c_str());
-            return false;
-        }
-    }
-
-    if (db_ > 0) {
-        ReplyUPtr select_reply((redisReply *)redisCommand(context_, "SELECT %ld", db_), freeReplyObject);
-        if (!IsReplyOk(select_reply.get())) {
-            KVCM_REDIS_LOG_WARN("fail to select redis db[%ld]", db_);
-            return false;
-        }
-    }
-
-    KVCM_REDIS_LOG_INFO("connect to redis db[%ld] timeout_ms[%ld] retry_count[%ld]", db_, timeout_ms_, retry_count_);
-    return true;
-}
-
-void RedisClient::Disconnect() {
-    if (context_) {
-        redisFree(context_);
-        context_ = nullptr;
-    }
-}
-
-bool RedisClient::Reconnect() {
-    for (int32_t count = 0; count < retry_count_; ++count) {
-        if (Connect()) {
-            return true;
-        }
-        usleep(50 * 1000);
-    }
-    KVCM_REDIS_LOG_ERROR("fail to reconnect redis after [%ld] times", retry_count_);
-    return false;
-}
-
-// return empty vector if failed
-std::vector<RedisClient::ReplyUPtr> RedisClient::TryExecPipeline(const std::vector<CmdArgs> &cmds) {
-    std::vector<ReplyUPtr> replies;
-    for (const CmdArgs &cmd : cmds) {
-        std::vector<const char *> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(cmd.size());
-        argvlen.reserve(cmd.size());
-        for (const auto &cmd_arg : cmd) {
-            argv.push_back(cmd_arg.data());
-            argvlen.push_back(cmd_arg.size());
-        }
-        if (redisAppendCommandArgv(context_, (int)argv.size(), argv.data(), argvlen.data()) != REDIS_OK) {
-            KVCM_REDIS_LOG_WARN("redisAppendCommandArgv failed: %s", context_->errstr);
-            return replies;
-        }
-    }
-
-    replies.reserve(cmds.size());
-    for (size_t i = 0; i < cmds.size(); ++i) {
-        redisReply *r = nullptr;
-        if (redisGetReply(context_, (void **)&r) != REDIS_OK) {
-            KVCM_REDIS_LOG_WARN("redisGetReply failed: %s", context_->errstr);
-            freeReplyObject(r);
-            replies.clear();
-            return replies;
-        }
-        replies.emplace_back(r, freeReplyObject);
-    }
-    return replies;
-}
-
 // return empty vector if failed
 std::vector<RedisClient::ReplyUPtr> RedisClient::CommandPipeline(const std::vector<CmdArgs> &cmds) {
-    std::vector<ReplyUPtr> replies;
     if (cmds.empty()) {
-        return replies;
+        return {};
     }
-    for (int32_t count = 0; count < retry_count_; ++count) {
-        if (!IsContextOk()) {
-            if (!Reconnect()) {
-                KVCM_REDIS_LOG_ERROR("fail to reconnect before pipeline, try count[%d]", count);
-                replies.clear();
-                return replies;
-            }
-        }
-        if (IsContextOk()) {
-            replies = TryExecPipeline(cmds);
-            if (!replies.empty()) {
-                return replies;
-            } else if (IsContextOk()) {
-                KVCM_REDIS_LOG_ERROR("pipeline fail but connection is ok, try count[%d]", count);
-                return replies;
-            } else {
-                KVCM_REDIS_LOG_WARN("pipeline fail, connection not ok, try count[%d]", count);
-            }
-        }
-        usleep(50 * 1000);
+    if (!executor_) {
+        KVCM_REDIS_LOG_ERROR("executor is closed");
+        return {};
     }
-
-    KVCM_REDIS_LOG_ERROR("pipeline all fail, try count[%ld]", retry_count_);
-    replies.clear();
-    return replies;
+    return executor_->ExecuteBatch(cmds);
 }
 
 std::vector<ErrorCode> RedisClient::BatchWrite(const std::vector<CmdArgs> &cmds, bool &out_all_ok) {
     out_all_ok = false;
-    auto replies = CommandPipeline(cmds);
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
     if (replies.size() != cmds.size()) {
         return std::vector<ErrorCode>(cmds.size(), EC_ERROR);
     }
     std::vector<ErrorCode> error_codes;
     error_codes.reserve(replies.size());
     bool has_error = false;
-    for (auto &reply : replies) {
+    for (ReplyUPtr &reply : replies) {
         if (!IsReplyOk(reply.get()) || !CheckReplyInteger(reply.get())) {
             error_codes.push_back(EC_ERROR);
             has_error = true;
@@ -259,14 +106,16 @@ std::vector<ErrorCode> RedisClient::BatchWrite(const std::vector<CmdArgs> &cmds,
 }
 
 bool RedisClient::Open() {
-    if (!Reconnect()) {
+    if (!executor_ || !executor_->Open()) {
         KVCM_REDIS_LOG_ERROR("fail to connect in open");
         return false;
     }
     return true;
 }
 
-void RedisClient::Close() { Disconnect(); }
+void RedisClient::Close() { executor_.reset(); }
+
+bool RedisClient::IsReady() const noexcept { return executor_ && executor_->IsReady(); }
 
 // --- Static command builders ---
 
@@ -281,9 +130,9 @@ void RedisClient::BuildSetCmds(const std::vector<std::string> &keys,
             hset_cmd.reserve(field_maps[i].size() * 2 + 2);
             hset_cmd.emplace_back("HSET");
             hset_cmd.emplace_back(keys[i]);
-            for (const auto &[field_name, field_value] : field_maps[i]) {
-                hset_cmd.emplace_back(field_name);
-                hset_cmd.emplace_back(field_value);
+            for (const std::pair<const std::string, std::string> &field : field_maps[i]) {
+                hset_cmd.emplace_back(field.first);
+                hset_cmd.emplace_back(field.second);
             }
             out_cmds.emplace_back(std::move(hset_cmd));
         }
@@ -301,16 +150,16 @@ void RedisClient::BuildHashSetCmds(const std::vector<std::string> &keys,
         hset_cmd.reserve(field_maps[i].size() * 2 + 2);
         hset_cmd.emplace_back("HSET");
         hset_cmd.emplace_back(keys[i]);
-        for (const auto &[field_name, field_value] : field_maps[i]) {
-            hset_cmd.emplace_back(field_name);
-            hset_cmd.emplace_back(field_value);
+        for (const std::pair<const std::string, std::string> &field : field_maps[i]) {
+            hset_cmd.emplace_back(field.first);
+            hset_cmd.emplace_back(field.second);
         }
         out_cmds.emplace_back(std::move(hset_cmd));
     }
 }
 
 void RedisClient::BuildDeleteCmds(const std::vector<std::string> &keys, std::vector<CmdArgs> &out_cmds) {
-    for (const auto &key : keys) {
+    for (const std::string &key : keys) {
         out_cmds.push_back({"DEL", key});
     }
 }
@@ -326,7 +175,7 @@ void RedisClient::BuildHashDeleteCmds(const std::vector<std::string> &keys,
         hdel_cmd.reserve(field_names_vec[i].size() + 2);
         hdel_cmd.emplace_back("HDEL");
         hdel_cmd.emplace_back(keys[i]);
-        for (const auto &field_name : field_names_vec[i]) {
+        for (const std::string &field_name : field_names_vec[i]) {
             hdel_cmd.emplace_back(field_name);
         }
         out_cmds.emplace_back(std::move(hdel_cmd));
@@ -404,9 +253,9 @@ std::vector<ErrorCode> RedisClient::Update(const std::vector<std::string> &keys,
             hset_cmd.reserve((field_map.size() + 1) * 2);
             hset_cmd.emplace_back("HSET");
             hset_cmd.emplace_back(keys[i]);
-            for (const auto &[field_name, field_value] : field_map) {
-                hset_cmd.emplace_back(field_name);
-                hset_cmd.emplace_back(field_value);
+            for (const std::pair<const std::string, std::string> &field : field_map) {
+                hset_cmd.emplace_back(field.first);
+                hset_cmd.emplace_back(field.second);
             }
             hset_cmds.emplace_back(std::move(hset_cmd));
             ++exist_count;
@@ -563,7 +412,7 @@ std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
         hmget_cmd.reserve(field_names.size() + 2);
         hmget_cmd.emplace_back("HMGET");
         hmget_cmd.emplace_back(keys[i]);
-        for (const auto &field_name : field_names) {
+        for (const std::string &field_name : field_names) {
             hmget_cmd.emplace_back(field_name);
         }
         hmget_cmds.emplace_back(std::move(hmget_cmd));
@@ -646,7 +495,7 @@ std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
         hmget_cmd.reserve(field_names.size() + 2);
         hmget_cmd.emplace_back("HMGET");
         hmget_cmd.emplace_back(keys[i]);
-        for (const auto &field_name : field_names) {
+        for (const std::string &field_name : field_names) {
             hmget_cmd.emplace_back(field_name);
         }
         hmget_cmds.emplace_back(std::move(hmget_cmd));
@@ -836,7 +685,7 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
     while (!pending.empty()) {
         std::vector<CmdArgs> hscan_cmds;
         hscan_cmds.reserve(pending.size());
-        for (const auto &entry : pending) {
+        for (const PendingKey &entry : pending) {
             hscan_cmds.push_back(
                 {"HSCAN", keys[entry.original_index], entry.cursor, "MATCH", pattern, "COUNT", count_hint});
         }
@@ -847,7 +696,7 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
                 "redis exists field with prefix fail, pipeline hscan_cmds.size[%lu] != replies.size[%lu]",
                 hscan_cmds.size(),
                 replies.size());
-            for (auto &entry : pending) {
+            for (PendingKey &entry : pending) {
                 ec_per_key[entry.original_index] = EC_ERROR;
             }
             break;
@@ -931,7 +780,7 @@ RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
     while (!pending.empty()) {
         std::vector<CmdArgs> hscan_cmds;
         hscan_cmds.reserve(pending.size());
-        for (const auto &entry : pending) {
+        for (const PendingKey &entry : pending) {
             hscan_cmds.push_back(
                 {"HSCAN", keys[entry.original_index], entry.cursor, "MATCH", pattern, "COUNT", count_hint});
         }
@@ -942,7 +791,7 @@ RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
                 "redis list field names with prefix fail, pipeline hscan_cmds.size[%lu] != replies.size[%lu]",
                 hscan_cmds.size(),
                 replies.size());
-            for (auto &entry : pending) {
+            for (PendingKey &entry : pending) {
                 ec_per_key[entry.original_index] = EC_ERROR;
             }
             break;
@@ -1089,7 +938,449 @@ RedisClient::Rand(const std::string &matching_prefix, const int64_t count, std::
     return EC_OK;
 }
 
-#undef KVCM_REDIS_LOG_INFO
+ErrorCode RedisClient::Eval(const std::string &script,
+                            const std::vector<std::string> &keys,
+                            const std::vector<std::string> &args,
+                            std::string &out_result) {
+    out_result.clear();
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for EVAL");
+        return EC_IO_ERROR;
+    }
+
+    // 构建EVAL命令
+    std::vector<std::string> cmd_args;
+    cmd_args.reserve(3 + keys.size() + args.size());
+    cmd_args.emplace_back("EVAL");
+    cmd_args.emplace_back(script);
+    cmd_args.emplace_back(std::to_string(keys.size()));
+
+    // 添加KEYS
+    for (const std::string &key : keys) {
+        cmd_args.emplace_back(key);
+    }
+
+    // 添加ARGV
+    for (const std::string &arg : args) {
+        cmd_args.emplace_back(arg);
+    }
+
+    // 执行命令
+    std::vector<CmdArgs> cmds = {cmd_args};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("EVAL command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("EVAL command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    // 处理不同类型的回复
+    switch (reply->type) {
+    case REDIS_REPLY_STRING:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_INTEGER:
+        out_result = std::to_string(reply->integer);
+        return EC_OK;
+    case REDIS_REPLY_NIL:
+        // Lua脚本返回nil
+        return EC_OK;
+    case REDIS_REPLY_STATUS:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_ERROR:
+        KVCM_LOG_ERROR("EVAL command error: %s", reply->str);
+        return EC_ERROR;
+    default:
+        KVCM_LOG_ERROR("EVAL command unexpected reply type: %d", reply->type);
+        return EC_ERROR;
+    }
+}
+
+ErrorCode RedisClient::EvalSha(const std::string &sha1,
+                               const std::vector<std::string> &keys,
+                               const std::vector<std::string> &args,
+                               std::string &out_result) {
+    out_result.clear();
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for EVALSHA");
+        return EC_IO_ERROR;
+    }
+
+    // 构建EVALSHA命令
+    std::vector<std::string> cmd_args;
+    cmd_args.reserve(3 + keys.size() + args.size());
+    cmd_args.emplace_back("EVALSHA");
+    cmd_args.emplace_back(sha1);
+    cmd_args.emplace_back(std::to_string(keys.size()));
+
+    // 添加KEYS
+    for (const std::string &key : keys) {
+        cmd_args.emplace_back(key);
+    }
+
+    // 添加ARGV
+    for (const std::string &arg : args) {
+        cmd_args.emplace_back(arg);
+    }
+
+    // 执行命令
+    std::vector<CmdArgs> cmds = {cmd_args};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("EVALSHA command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (reply && reply->type == REDIS_REPLY_ERROR && reply->str &&
+        std::string(reply->str, reply->len).find("NOSCRIPT") != std::string::npos) {
+        KVCM_LOG_WARN("EVALSHA NOSCRIPT error for sha1: %s", sha1.c_str());
+        return EC_NOSCRIPT;
+    }
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("EVALSHA command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    // 处理不同类型的回复
+    switch (reply->type) {
+    case REDIS_REPLY_STRING:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_INTEGER:
+        out_result = std::to_string(reply->integer);
+        return EC_OK;
+    case REDIS_REPLY_NIL:
+        // Lua脚本返回nil
+        return EC_OK;
+    case REDIS_REPLY_STATUS:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    default:
+        KVCM_LOG_ERROR("EVALSHA command unexpected reply type: %d", reply->type);
+        return EC_ERROR;
+    }
+}
+
+ErrorCode RedisClient::ScriptLoad(const std::string &script, std::string &out_sha1) {
+    out_sha1.clear();
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for SCRIPT LOAD");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"SCRIPT", "LOAD", script}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("SCRIPT LOAD command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("SCRIPT LOAD command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_STRING) {
+        out_sha1 = std::string(reply->str, reply->len);
+        return EC_OK;
+    }
+
+    KVCM_LOG_ERROR("SCRIPT LOAD command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::ScriptExists(const std::string &sha1, bool &out_exists) {
+    out_exists = false;
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for SCRIPT EXISTS");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"SCRIPT", "EXISTS", sha1}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("SCRIPT EXISTS command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("SCRIPT EXISTS command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 1) {
+        const redisReply *element = reply->element[0];
+        if (element->type == REDIS_REPLY_INTEGER) {
+            out_exists = (element->integer == 1);
+            return EC_OK;
+        }
+    }
+
+    KVCM_LOG_ERROR("SCRIPT EXISTS command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::Get(const std::string &key, std::string &out_value) {
+    out_value.clear();
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for GET");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"GET", key}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("GET command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("GET command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_NIL) {
+        // 键不存在
+        return EC_NOENT;
+    }
+
+    if (reply->type == REDIS_REPLY_STRING) {
+        out_value = std::string(reply->str, reply->len);
+        return EC_OK;
+    }
+
+    KVCM_LOG_ERROR("GET command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::Set(const std::string &key, const std::string &value, int64_t ttl_ms) {
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for SET");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds;
+    if (ttl_ms > 0) {
+        cmds = {{"SET", key, value, "PX", std::to_string(ttl_ms)}};
+    } else {
+        cmds = {{"SET", key, value}};
+    }
+
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("SET command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("SET command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    // SET命令成功返回"OK"
+    if (reply->type == REDIS_REPLY_STATUS && std::string(reply->str, reply->len) == "OK") {
+        return EC_OK;
+    }
+
+    KVCM_LOG_ERROR("SET command unexpected reply");
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::Pttl(const std::string &key, int64_t &out_ttl_ms) {
+    out_ttl_ms = -2; // Redis中-2表示键不存在
+
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for PTTL");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"PTTL", key}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("PTTL command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("PTTL command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        out_ttl_ms = reply->integer;
+        return EC_OK;
+    }
+
+    KVCM_LOG_ERROR("PTTL command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::Del(const std::string &key) {
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for DEL");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"DEL", key}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("DEL command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("DEL command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        // 返回删除的键数量
+        return EC_OK;
+    }
+
+    KVCM_LOG_ERROR("DEL command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::Pexpire(const std::string &key, int64_t ttl_ms) {
+    if (!IsReady()) {
+        KVCM_LOG_ERROR("Redis context not ok for PEXPIRE");
+        return EC_IO_ERROR;
+    }
+
+    if (ttl_ms <= 0) {
+        KVCM_LOG_ERROR("Invalid TTL for PEXPIRE: %ld", ttl_ms);
+        return EC_BADARGS;
+    }
+
+    std::vector<CmdArgs> cmds = {{"PEXPIRE", key, std::to_string(ttl_ms)}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_LOG_ERROR("PEXPIRE command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_LOG_ERROR("PEXPIRE command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        // 1表示成功设置过期时间，0表示键不存在或设置失败
+        if (reply->integer == 1) {
+            return EC_OK;
+        } else {
+            return EC_NOENT;
+        }
+    }
+
+    KVCM_LOG_ERROR("PEXPIRE command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+ErrorCode RedisClient::FlushAll() {
+    CmdArgs flushall_cmd{"FLUSHALL"};
+    std::vector<ReplyUPtr> flushall_replies = CommandPipeline({flushall_cmd});
+    if (1 != flushall_replies.size()) {
+        KVCM_LOG_ERROR("redis flushall fail, pipeline [1] != flushall_replies.size[%zu]", flushall_replies.size());
+        return EC_ERROR;
+    }
+
+    const ReplyUPtr &flushall_reply = flushall_replies[0];
+    if (!IsReplyOk(flushall_reply.get())) {
+        KVCM_LOG_ERROR("redis flushall fail");
+        return EC_ERROR;
+    }
+
+    // FLUSHALL 命令返回 "OK" 字符串
+    if (flushall_reply->type != REDIS_REPLY_STATUS) {
+        KVCM_LOG_ERROR("redis flushall fail, unexpected reply type[%d]", flushall_reply->type);
+        return EC_ERROR;
+    }
+
+    static const std::string ok_str = "OK";
+    if (!flushall_reply->str || std::string(flushall_reply->str) != ok_str) {
+        KVCM_LOG_ERROR("redis flushall fail, reply str[%s] is not OK",
+                       flushall_reply->str ? flushall_reply->str : "nullptr");
+        return EC_ERROR;
+    }
+
+    return EC_OK;
+}
+
+ErrorCode RedisClient::LoadScript(const std::string &script, std::string &out_sha1) {
+    ErrorCode ec = ScriptLoad(script, out_sha1);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("Failed to load Lua script: ec=%d", ec);
+        return ec;
+    }
+
+    KVCM_LOG_DEBUG("Loaded Lua script with SHA1: %s", out_sha1.c_str());
+    return EC_OK;
+}
+
+ErrorCode RedisClient::ExecuteScriptWithFallback(const std::string &script,
+                                                 const std::vector<std::string> &keys,
+                                                 const std::vector<std::string> &args,
+                                                 std::string &in_out_cached_sha1,
+                                                 std::string &out_result) {
+    // 首先尝试使用evalsha
+    ErrorCode ec = EvalSha(in_out_cached_sha1, keys, args, out_result);
+    if (ec == EC_OK) {
+        // evalsha成功
+        return EC_OK;
+    } else if (ec == EC_NOSCRIPT) {
+        // 脚本未加载，重新加载脚本
+        KVCM_LOG_WARN("Script not loaded in Redis, reloading: %s", in_out_cached_sha1.c_str());
+
+        std::string new_sha1;
+        ec = ScriptLoad(script, new_sha1);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("Failed to reload Lua script: ec=%d", ec);
+            return ec;
+        }
+
+        // 重新尝试evalsha
+        ec = EvalSha(new_sha1, keys, args, out_result);
+        if (ec == EC_OK) {
+            // 更新缓存
+            in_out_cached_sha1 = new_sha1;
+            return EC_OK;
+        }
+    }
+
+    // 如果evalsha失败且不是NOSCRIPT错误，或者重新加载后仍然失败，回退到eval
+    KVCM_LOG_WARN("Fallback to EVAL for script: %s", in_out_cached_sha1.c_str());
+    return Eval(script, keys, args, out_result);
+}
+
 #undef KVCM_REDIS_LOG_WARN
 #undef KVCM_REDIS_LOG_ERROR
 

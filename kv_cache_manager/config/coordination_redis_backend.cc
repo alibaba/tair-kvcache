@@ -6,7 +6,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/common/redis_client_ext.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
 #include "kv_cache_manager/common/standard_uri.h"
 
 namespace kv_cache_manager {
@@ -15,8 +15,8 @@ CoordinationRedisBackend::CoordinationRedisBackend() = default;
 
 CoordinationRedisBackend::~CoordinationRedisBackend() = default;
 
-std::shared_ptr<RedisClientExt> CoordinationRedisBackend::CreateRedisClient(const StandardUri &storage_uri) const {
-    return std::make_shared<RedisClientExt>(storage_uri);
+std::shared_ptr<RedisClient> CoordinationRedisBackend::CreateRedisClient(const StandardUri &storage_uri) const {
+    return std::shared_ptr<RedisClient>(RedisClientFactory::Create(storage_uri));
 }
 
 ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexcept {
@@ -24,7 +24,7 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
     constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 1;
 
     // 验证URI协议
-    if (standard_uri.GetProtocol() != "redis") {
+    if (standard_uri.GetProtocol() != "redis" && standard_uri.GetProtocol() != "redis_cluster") {
         KVCM_LOG_ERROR("Invalid protocol for Redis lock backend: %s", standard_uri.GetProtocol().c_str());
         return EC_BADARGS;
     }
@@ -69,7 +69,7 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
     }
 
     auto client_pool = std::make_shared<RedisClientPool>(
-        [this]() -> std::shared_ptr<RedisClientExt> {
+        [this]() -> std::shared_ptr<RedisClient> {
             auto client = CreateRedisClient(storage_uri_);
             if (!client || !client->Open()) {
                 return nullptr;
@@ -134,8 +134,11 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
 
     KVCM_LOG_INFO("Redis coordination backend initialized, cluster_name[%s], lock_prefix[%s], kv_prefix[%s], "
                   "client pool min[%d], max[%d]",
-                  cluster_name.c_str(), lock_key_prefix_.c_str(), kv_key_prefix_.c_str(),
-                  client_min_pool_size, client_max_pool_size);
+                  cluster_name.c_str(),
+                  lock_key_prefix_.c_str(),
+                  kv_key_prefix_.c_str(),
+                  client_min_pool_size,
+                  client_max_pool_size);
     return EC_OK;
 }
 
@@ -382,7 +385,7 @@ ErrorCode CoordinationRedisBackend::SetValue(const std::string &key, const std::
         return EC_TIMEOUT;
     }
 
-    ErrorCode ec = handle->Set(redis_key, value);
+    ErrorCode ec = handle->Set(redis_key, value, 0);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Failed to set value for key %s: ec=%d", key.c_str(), ec);
         return ec;

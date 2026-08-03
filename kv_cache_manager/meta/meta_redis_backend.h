@@ -6,7 +6,7 @@
 #include <queue>
 
 #include "kv_cache_manager/common/client_pool.h"
-#include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
 namespace kv_cache_manager {

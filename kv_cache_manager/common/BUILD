@@ -239,35 +239,6 @@ cc_library(
 )
 
 cc_library(
-    name = "redis_client",
-    srcs = [
-        "redis_client.cc",
-    ],
-    hdrs = [
-        "redis_client.h",
-    ],
-    deps = [
-        ":common",
-        ":standard_uri",
-        "@hiredis",
-    ],
-)
-
-cc_library(
-    name = "redis_client_ext",
-    srcs = [
-        "redis_client_ext.cc",
-    ],
-    hdrs = [
-        "redis_client_ext.h",
-    ],
-    deps = [
-        ":redis_client",
-        "@hiredis",
-    ],
-)
-
-cc_library(
     name = "tracer",
     srcs = [
     ],

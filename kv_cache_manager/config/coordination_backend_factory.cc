@@ -8,6 +8,7 @@
 
 namespace kv_cache_manager {
 static const std::string COORDINATION_REDIS_BACKEND_TYPE_STR = "redis";
+static const std::string COORDINATION_REDIS_CLUSTER_BACKEND_TYPE_STR = "redis_cluster";
 static const std::string COORDINATION_FILE_BACKEND_TYPE_STR = "file";
 static const std::string COORDINATION_MEMORY_BACKEND_TYPE_STR = "memory";
 
@@ -15,7 +16,8 @@ std::unique_ptr<CoordinationBackend>
 CoordinationBackendFactory::CreateAndInitCoordinationBackend(const std::string &coordination_backend_uri) {
     auto standard_uri = StandardUri::FromUri(coordination_backend_uri);
     std::unique_ptr<CoordinationBackend> backend;
-    if (standard_uri.GetProtocol() == COORDINATION_REDIS_BACKEND_TYPE_STR) {
+    if (standard_uri.GetProtocol() == COORDINATION_REDIS_BACKEND_TYPE_STR ||
+        standard_uri.GetProtocol() == COORDINATION_REDIS_CLUSTER_BACKEND_TYPE_STR) {
         backend = std::make_unique<CoordinationRedisBackend>();
     } else if (standard_uri.GetProtocol() == COORDINATION_FILE_BACKEND_TYPE_STR) {
         backend = std::make_unique<CoordinationFileBackend>();

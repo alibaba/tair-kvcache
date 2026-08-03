@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -27,7 +28,7 @@ std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<RedisClient> MetaAsyncRedisBackend::CreateRedisClient() const {
-    return std::make_shared<RedisClient>(storage_uri_);
+    return std::shared_ptr<RedisClient>(RedisClientFactory::Create(storage_uri_));
 }
 
 ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,

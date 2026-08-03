@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -15,7 +16,7 @@ MetaRedisBackend::~MetaRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); 
 std::string MetaRedisBackend::GetStorageType() noexcept { return META_REDIS_BACKEND_TYPE_STR; }
 
 std::shared_ptr<RedisClient> MetaRedisBackend::CreateRedisClient() const {
-    return std::make_shared<RedisClient>(storage_uri_);
+    return std::shared_ptr<RedisClient>(RedisClientFactory::Create(storage_uri_));
 }
 
 ErrorCode MetaRedisBackend::Init(const std::string &instance_id,

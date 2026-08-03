@@ -121,7 +121,7 @@ cc_test(
     deps = [
         ":meta_storage_backend_testlib",
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/common/test:redis_client_testlib",
+        "//kv_cache_manager/common/redis/test:redis_client_testlib",
         "//kv_cache_manager/meta:meta_redis_backend",
     ],
 )
@@ -202,7 +202,7 @@ cc_test(
     deps = [
         ":meta_storage_backend_testlib",
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/common/test:redis_client_testlib",
+        "//kv_cache_manager/common/redis/test:redis_client_testlib",
         "//kv_cache_manager/meta:meta_async_redis_backend",
         "//kv_cache_manager/meta:utils",
     ],

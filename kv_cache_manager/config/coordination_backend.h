@@ -25,6 +25,7 @@ public:
      * @param standard_uri Standardized URI for configuring backend connection parameters
      *                     For local backend: file:///path/to/lock/dir
      *                     For Redis backend: redis://[auth_token@]host:port/?db=<index>[&param=value...]
+     *                     For Redis Cluster: redis_cluster://[auth_token@]host:port/?db=0[&param=value...]
      * @return ErrorCode error code
      *         - EC_OK: Initialization successful
      *         - EC_BADARGS: Invalid arguments (e.g., unsupported URI protocol)

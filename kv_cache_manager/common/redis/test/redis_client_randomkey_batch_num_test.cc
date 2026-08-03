@@ -1,6 +1,6 @@
-#include "kv_cache_manager/common/redis_client.h"
-#include "kv_cache_manager/common/test/mock_redis_client.h"
-#include "kv_cache_manager/common/test/redis_test_base.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
+#include "kv_cache_manager/common/redis/test/mock_redis_client.h"
+#include "kv_cache_manager/common/redis/test/redis_test_base.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
@@ -21,7 +21,7 @@ public:
             storage_uri.SetParam(param.first, param.second);
         }
 
-        return std::make_unique<RedisClient>(storage_uri);
+        return RedisClientFactory::Create(storage_uri);
     }
 };
 

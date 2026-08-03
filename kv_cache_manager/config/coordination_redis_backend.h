@@ -7,7 +7,7 @@
 
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/error_code.h"
-#include "kv_cache_manager/common/redis_client_ext.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 
@@ -35,10 +35,10 @@ public:
     ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 protected:
-    virtual std::shared_ptr<RedisClientExt> CreateRedisClient(const StandardUri &storage_uri) const;
+    virtual std::shared_ptr<RedisClient> CreateRedisClient(const StandardUri &storage_uri) const;
 
 private:
-    using RedisClientPool = DynamicClientPool<RedisClientExt>;
+    using RedisClientPool = DynamicClientPool<RedisClient>;
     using RedisClientHandle = RedisClientPool::ClientHandle;
 
     // 生成Redis锁键名
