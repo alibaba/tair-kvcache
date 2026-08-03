@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "kv_cache_manager/common/redis_client_ext.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/coordination_redis_backend.h"
@@ -20,16 +20,14 @@ struct RedisClientConcurrencyState {
     std::atomic<int32_t> concurrent_pipeline_count{0};
 };
 
-class TrackingRedisClient : public RedisClientExt {
+class TrackingRedisExecutor : public IRedisExecutor {
 public:
-    TrackingRedisClient(const StandardUri &storage_uri, std::shared_ptr<RedisClientConcurrencyState> state)
-        : RedisClientExt(storage_uri), state_(std::move(state)) {}
+    explicit TrackingRedisExecutor(std::shared_ptr<RedisClientConcurrencyState> state) : state_(std::move(state)) {}
 
-protected:
-    bool IsContextOk() const override { return true; }
-    bool Reconnect() override { return true; }
+    bool Open() override { return true; }
+    bool IsReady() const noexcept override { return true; }
 
-    std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds) override {
+    std::vector<RedisReplyUPtr> ExecuteBatch(const std::vector<RedisCmdArgs> &cmds) override {
         int32_t active_count = active_pipeline_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (active_count > 1) {
             state_->concurrent_pipeline_count.fetch_add(1, std::memory_order_relaxed);
@@ -37,9 +35,9 @@ protected:
 
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-        std::vector<ReplyUPtr> replies;
+        std::vector<RedisReplyUPtr> replies;
         replies.reserve(cmds.size());
-        for (const auto &cmd : cmds) {
+        for (const RedisCmdArgs &cmd : cmds) {
             replies.emplace_back(MakeReply(cmd));
         }
 
@@ -48,7 +46,7 @@ protected:
     }
 
 private:
-    static ReplyUPtr MakeFakeReply(int type, const std::string &str) {
+    static RedisReplyUPtr MakeFakeReply(int type, const std::string &str) {
         redisReply *r = (redisReply *)malloc(sizeof(redisReply));
         memset(r, 0, sizeof(redisReply));
         r->type = type;
@@ -56,18 +54,18 @@ private:
             r->str = strdup(str.c_str());
             r->len = str.size();
         }
-        return ReplyUPtr(r, freeReplyObject);
+        return RedisReplyUPtr(r);
     }
 
-    static ReplyUPtr MakeFakeReplyInteger(const int64_t integer) {
+    static RedisReplyUPtr MakeFakeReplyInteger(const int64_t integer) {
         redisReply *r = (redisReply *)malloc(sizeof(redisReply));
         memset(r, 0, sizeof(redisReply));
         r->type = REDIS_REPLY_INTEGER;
         r->integer = integer;
-        return ReplyUPtr(r, freeReplyObject);
+        return RedisReplyUPtr(r);
     }
 
-    ReplyUPtr MakeReply(const CmdArgs &cmd) {
+    RedisReplyUPtr MakeReply(const RedisCmdArgs &cmd) {
         if (cmd.empty()) {
             return MakeFakeReply(REDIS_REPLY_ERROR, "empty command");
         }
@@ -100,8 +98,8 @@ public:
         : state_(std::move(state)) {}
 
 protected:
-    std::shared_ptr<RedisClientExt> CreateRedisClient(const StandardUri &storage_uri) const override {
-        return std::make_shared<TrackingRedisClient>(storage_uri, state_);
+    std::shared_ptr<RedisClient> CreateRedisClient(const StandardUri &storage_uri) const override {
+        return std::make_shared<RedisClient>(storage_uri, std::make_shared<TrackingRedisExecutor>(state_));
     }
 
 private:

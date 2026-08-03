@@ -2,7 +2,7 @@
 
 #include <optional>
 
-#include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 
 namespace kv_cache_manager {
 class RedisTestBase {

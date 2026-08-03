@@ -28,11 +28,21 @@ Registry、Meta 和 Coordination Redis 后端共用以下 URI 格式：
 
 ```TEXT
 redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
+redis_cluster://[username:token@]discovery-host:port/?db=0[&param=value...]
 ```
 
 - `auth_token` 会作为 Redis `AUTH` 命令的单个参数传入；`auth=...` query 参数不会用于认证。
 - `db` 必须放在 query 参数中；未配置时使用 DB 0。`redis://host:port/1` 中的 `/1` 是 path，不能用于选择 DB。
-- `db > 0` 依赖 Redis 服务端支持 `SELECT`。Redis Cluster 不支持多逻辑 DB，此时应使用 DB 0，并通过 `cluster_name` 和 key 前缀隔离，或使用独立 Redis 实例。
+- `db > 0` 依赖 Redis 服务端支持 `SELECT`；`redis_cluster://` 只允许 DB 0。
+- Cluster 模式将 userinfo 解析为 `username:token`，并通过双参数 `AUTH` 发送；另外支持
+  `connect_timeout_ms`、`socket_timeout_ms`、`cluster_pool_size_per_node`、
+  `cluster_pipeline_worker_count` 和 `cluster_topology_refresh_ms` 参数。每节点连接池和 pipeline worker
+  默认分别为 32 和 8。
+- TLS 通过 `tls=true` 开启，并至少配置 `ca_file` 或 `ca_dir`；客户端证书和 SNI 可分别通过
+  `client_cert_file`、`client_key_file`、`sni` 配置。`ca_file` 是 KVCM 运行环境中的本地路径，部署时需
+  挂载 CA 证书或证书包。
+- 同一进程内连接参数相同的 `redis_cluster://` 客户端共享一套 Cluster 拓扑和每节点连接池；
+  `client_max_pool_size` 仍控制上层同时借出的逻辑客户端数量。
 
 ## KVCacheManager Server Config
 

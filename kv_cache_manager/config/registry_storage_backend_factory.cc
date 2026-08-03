@@ -7,13 +7,15 @@
 
 namespace kv_cache_manager {
 static const std::string REGISTRY_REDIS_BACKEND_TYPE_STR = "redis";
+static const std::string REGISTRY_REDIS_CLUSTER_BACKEND_TYPE_STR = "redis_cluster";
 static const std::string REGISTRY_LOCAL_BACKEND_TYPE_STR = "local";
 
 std::unique_ptr<RegistryStorageBackend>
 RegistryStorageBackendFactory::CreateAndInitStorageBackend(const std::string &registry_storage_uri) {
     auto standard_uri = StandardUri::FromUri(registry_storage_uri);
     std::unique_ptr<RegistryStorageBackend> storage_backend;
-    if (standard_uri.GetProtocol() == REGISTRY_REDIS_BACKEND_TYPE_STR) {
+    if (standard_uri.GetProtocol() == REGISTRY_REDIS_BACKEND_TYPE_STR ||
+        standard_uri.GetProtocol() == REGISTRY_REDIS_CLUSTER_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<RegistryRedisBackend>();
     } else if (standard_uri.GetProtocol() == REGISTRY_LOCAL_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<RegistryLocalBackend>();

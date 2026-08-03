@@ -4,9 +4,9 @@
 #include <thread>
 #include <utility>
 
-#include "kv_cache_manager/common/redis_client.h"
-#include "kv_cache_manager/common/test/mock_redis_client.h"
-#include "kv_cache_manager/common/test/redis_test_base.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
+#include "kv_cache_manager/common/redis/test/mock_redis_client.h"
+#include "kv_cache_manager/common/redis/test/redis_test_base.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -87,9 +87,8 @@ protected:
         EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([this]() {
             StandardUri empty_uri;
             auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-            ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-            ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-            ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
+            ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+            ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
                 // Inject minimal delay to ensure batch_flush_time_us > 0 in stats
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
                 std::vector<ReplyUPtr> replies;
@@ -98,7 +97,7 @@ protected:
                     memset(r, 0, sizeof(redisReply));
                     r->type = REDIS_REPLY_INTEGER;
                     r->integer = 1;
-                    replies.emplace_back(r, freeReplyObject);
+                    replies.emplace_back(r);
                 }
                 return replies;
             }));
@@ -210,7 +209,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestOpenFailsOnClientCreation) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        EXPECT_CALL(*mock, Reconnect()).WillRepeatedly(Return(false));
+        EXPECT_CALL(mock->Executor(), Open()).WillRepeatedly(Return(false));
         return mock;
     }));
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
@@ -465,9 +464,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwned
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             if (pipeline_call_count.fetch_add(1, std::memory_order_relaxed) == 0) {
                 std::unique_lock<std::mutex> lock(pipeline_mutex);
                 pipeline_entered = true;
@@ -484,7 +482,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwned
                 memset(reply, 0, sizeof(redisReply));
                 reply->type = REDIS_REPLY_INTEGER;
                 reply->integer = 1;
-                replies.emplace_back(reply, freeReplyObject);
+                replies.emplace_back(reply);
             }
             return replies;
         }));
@@ -659,9 +657,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             pipeline_entered.store(true, std::memory_order_release);
             while (!can_proceed.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -672,7 +669,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
                 memset(r, 0, sizeof(redisReply));
                 r->type = REDIS_REPLY_INTEGER;
                 r->integer = 1;
-                replies.emplace_back(r, freeReplyObject);
+                replies.emplace_back(r);
             }
             return replies;
         }));
@@ -747,9 +744,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             pipeline_entered.store(true, std::memory_order_release);
             while (!can_proceed.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -760,7 +756,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
                 memset(r, 0, sizeof(redisReply));
                 r->type = REDIS_REPLY_INTEGER;
                 r->integer = 1;
-                replies.emplace_back(r, freeReplyObject);
+                replies.emplace_back(r);
             }
             return replies;
         }));
@@ -848,9 +844,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             timeout_pipeline_entered.store(true, std::memory_order_release);
             while (!timeout_can_proceed.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -861,7 +856,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
                 memset(r, 0, sizeof(redisReply));
                 r->type = REDIS_REPLY_INTEGER;
                 r->integer = 1;
-                replies.emplace_back(r, freeReplyObject);
+                replies.emplace_back(r);
             }
             return replies;
         }));
@@ -909,9 +904,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &) {
             int n = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
             if (n == 0) {
                 first_pipeline_entered.store(true, std::memory_order_release);
@@ -969,9 +963,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             int n = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
             if (n == 0) {
                 first_pipeline_entered.store(true, std::memory_order_release);
@@ -984,7 +977,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
                     memset(r, 0, sizeof(redisReply));
                     r->type = REDIS_REPLY_INTEGER;
                     r->integer = 1;
-                    replies.emplace_back(r, freeReplyObject);
+                    replies.emplace_back(r);
                 }
                 return replies;
             }
@@ -1000,7 +993,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
                     r->type = REDIS_REPLY_INTEGER;
                     r->integer = 1;
                 }
-                replies.emplace_back(r, freeReplyObject);
+                replies.emplace_back(r);
             }
             return replies;
         }));
@@ -1054,9 +1047,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
-        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
-        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+        ON_CALL(mock->Executor(), Open()).WillByDefault(Return(true));
+        ON_CALL(mock->Executor(), ExecuteBatch(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
             int call_num = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
 
             if (call_num == 0) {
@@ -1070,7 +1062,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
                     memset(r, 0, sizeof(redisReply));
                     r->type = REDIS_REPLY_INTEGER;
                     r->integer = 1;
-                    replies.emplace_back(r, freeReplyObject);
+                    replies.emplace_back(r);
                 }
                 return replies;
             }
@@ -1088,7 +1080,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
                     r->type = REDIS_REPLY_INTEGER;
                     r->integer = 1;
                 }
-                replies.emplace_back(r, freeReplyObject);
+                replies.emplace_back(r);
             }
             return replies;
         }));

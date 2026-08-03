@@ -123,7 +123,7 @@ cc_test(
     ],
     deps = [
         ":coordination_backend_test_base",
-        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common/redis:redis_client_factory",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
@@ -138,6 +138,7 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
+        "//kv_cache_manager/common/redis:redis_client",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
@@ -152,7 +153,7 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common/redis:redis_client",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",

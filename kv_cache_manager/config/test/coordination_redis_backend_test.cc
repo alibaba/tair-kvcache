@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 
-#include "kv_cache_manager/common/redis_client_ext.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
 #include "kv_cache_manager/config/test/coordination_backend_test_base.h"
 
 namespace kv_cache_manager {
@@ -13,43 +13,25 @@ const std::string kRedisUriWithClusterName = "redis://test_redis_user:test_redis
                                              "?timeout_ms=1000&retry_count=3&client_max_pool_size=2"
                                              "&cluster_name=test_cluster";
 
+void FlushRedis(const std::string &uri) {
+    std::unique_ptr<RedisClient> client = RedisClientFactory::Create(StandardUri::FromUri(uri));
+    ASSERT_NE(nullptr, client);
+    ASSERT_TRUE(client->Open());
+    ASSERT_EQ(EC_OK, client->FlushAll());
+    client->Close();
+}
+
 CoordinationBackendTestConfig redis_backend_config{
     .get_test_uri = [](CoordinationBackendTest *test_base) { return kRedisUri; },
-    .set_up_ =
-        [](CoordinationBackendTest *test_base) {
-            RedisClientExt client(StandardUri::FromUri(kRedisUri));
-            client.Open();
-            client.FlushAll();
-            client.Close();
-        },
-    .tear_down_ =
-        [](CoordinationBackendTest *test_base) {
-            RedisClientExt client(StandardUri::FromUri(kRedisUri));
-            client.Open();
-            client.FlushAll();
-            client.Close();
-        }};
+    .set_up_ = [](CoordinationBackendTest *test_base) { FlushRedis(kRedisUri); },
+    .tear_down_ = [](CoordinationBackendTest *test_base) { FlushRedis(kRedisUri); }};
 
 CoordinationBackendTestConfig redis_backend_with_cluster_name_config{
     .get_test_uri = [](CoordinationBackendTest *test_base) { return kRedisUriWithClusterName; },
-    .set_up_ =
-        [](CoordinationBackendTest *test_base) {
-            RedisClientExt client(StandardUri::FromUri(kRedisUriWithClusterName));
-            client.Open();
-            client.FlushAll();
-            client.Close();
-        },
-    .tear_down_ =
-        [](CoordinationBackendTest *test_base) {
-            RedisClientExt client(StandardUri::FromUri(kRedisUriWithClusterName));
-            client.Open();
-            client.FlushAll();
-            client.Close();
-        }};
+    .set_up_ = [](CoordinationBackendTest *test_base) { FlushRedis(kRedisUriWithClusterName); },
+    .tear_down_ = [](CoordinationBackendTest *test_base) { FlushRedis(kRedisUriWithClusterName); }};
 
-INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisTest,
-                         CoordinationBackendTest,
-                         testing::Values(redis_backend_config));
+INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisTest, CoordinationBackendTest, testing::Values(redis_backend_config));
 
 INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisWithClusterNameTest,
                          CoordinationBackendTest,
@@ -72,10 +54,7 @@ const std::string kRedisUriWithClusterNameB = "redis://test_redis_user:test_redi
 class CoordinationRedisClusterNameIsolationTest : public TESTBASE {
 protected:
     void SetUp() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
+        FlushRedis(kRedisUri);
 
         backend_no_cluster_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUri);
         ASSERT_NE(backend_no_cluster_, nullptr);
@@ -84,12 +63,7 @@ protected:
         ASSERT_NE(backend_with_cluster_, nullptr);
     }
 
-    void TearDown() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
-    }
+    void TearDown() override { FlushRedis(kRedisUri); }
 
     std::unique_ptr<CoordinationBackend> backend_no_cluster_;
     std::unique_ptr<CoordinationBackend> backend_with_cluster_;
@@ -124,10 +98,7 @@ TEST_F(CoordinationRedisClusterNameIsolationTest, TestKVIsolation) {
 class CoordinationRedisBothEmptyClusterTest : public TESTBASE {
 protected:
     void SetUp() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
+        FlushRedis(kRedisUri);
 
         backend_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUri);
         ASSERT_NE(backend_a_, nullptr);
@@ -136,12 +107,7 @@ protected:
         ASSERT_NE(backend_b_, nullptr);
     }
 
-    void TearDown() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
-    }
+    void TearDown() override { FlushRedis(kRedisUri); }
 
     std::unique_ptr<CoordinationBackend> backend_a_;
     std::unique_ptr<CoordinationBackend> backend_b_;
@@ -177,10 +143,7 @@ TEST_F(CoordinationRedisBothEmptyClusterTest, TestKVConflict) {
 class CoordinationRedisSameClusterNameTest : public TESTBASE {
 protected:
     void SetUp() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
+        FlushRedis(kRedisUri);
 
         backend_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUriWithClusterName);
         ASSERT_NE(backend_a_, nullptr);
@@ -189,12 +152,7 @@ protected:
         ASSERT_NE(backend_b_, nullptr);
     }
 
-    void TearDown() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
-    }
+    void TearDown() override { FlushRedis(kRedisUri); }
 
     std::unique_ptr<CoordinationBackend> backend_a_;
     std::unique_ptr<CoordinationBackend> backend_b_;
@@ -230,10 +188,7 @@ TEST_F(CoordinationRedisSameClusterNameTest, TestKVConflict) {
 class CoordinationRedisDiffClusterNameTest : public TESTBASE {
 protected:
     void SetUp() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
+        FlushRedis(kRedisUri);
 
         backend_cluster_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUriWithClusterName);
         ASSERT_NE(backend_cluster_a_, nullptr);
@@ -242,12 +197,7 @@ protected:
         ASSERT_NE(backend_cluster_b_, nullptr);
     }
 
-    void TearDown() override {
-        RedisClientExt client(StandardUri::FromUri(kRedisUri));
-        client.Open();
-        client.FlushAll();
-        client.Close();
-    }
+    void TearDown() override { FlushRedis(kRedisUri); }
 
     std::unique_ptr<CoordinationBackend> backend_cluster_a_;
     std::unique_ptr<CoordinationBackend> backend_cluster_b_;
@@ -309,16 +259,22 @@ TEST(CoordinationRedisDbIsolationTest, SameKeysAreIsolatedByDb) {
     const std::string key = "same_key";
     const std::string lock_key = "same_lock";
 
-    RedisClientExt cleanup_db0(StandardUri::FromUri(uri_db0));
-    RedisClientExt cleanup_db1(StandardUri::FromUri(uri_db1));
-    ASSERT_TRUE(cleanup_db0.Open());
-    ASSERT_TRUE(cleanup_db1.Open());
+    std::unique_ptr<RedisClient> cleanup_db0 = RedisClientFactory::Create(StandardUri::FromUri(uri_db0));
+    std::unique_ptr<RedisClient> cleanup_db1 = RedisClientFactory::Create(StandardUri::FromUri(uri_db1));
+    ASSERT_NE(nullptr, cleanup_db0);
+    ASSERT_NE(nullptr, cleanup_db1);
+    ASSERT_TRUE(cleanup_db0->Open());
+    ASSERT_TRUE(cleanup_db1->Open());
     const std::string redis_key = "kvcm_" + cluster_name + "_kv:" + key;
     const std::string redis_lock_key = "kvcm_" + cluster_name + "_lock:" + lock_key;
-    cleanup_db0.Del(redis_key);
-    cleanup_db1.Del(redis_key);
-    cleanup_db0.Del(redis_lock_key);
-    cleanup_db1.Del(redis_lock_key);
+    ErrorCode cleanup_ec = cleanup_db0->Del(redis_key);
+    ASSERT_TRUE(cleanup_ec == EC_OK || cleanup_ec == EC_NOENT);
+    cleanup_ec = cleanup_db1->Del(redis_key);
+    ASSERT_TRUE(cleanup_ec == EC_OK || cleanup_ec == EC_NOENT);
+    cleanup_ec = cleanup_db0->Del(redis_lock_key);
+    ASSERT_TRUE(cleanup_ec == EC_OK || cleanup_ec == EC_NOENT);
+    cleanup_ec = cleanup_db1->Del(redis_lock_key);
+    ASSERT_TRUE(cleanup_ec == EC_OK || cleanup_ec == EC_NOENT);
 
     auto backend_db0 = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri_db0);
     auto backend_db1 = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri_db1);
@@ -340,8 +296,8 @@ TEST(CoordinationRedisDbIsolationTest, SameKeysAreIsolatedByDb) {
     ASSERT_EQ(EC_OK, backend_db0->Unlock(lock_key, "holder_db0"));
     ASSERT_EQ(EC_OK, backend_db1->Unlock(lock_key, "holder_db1"));
 
-    cleanup_db0.Del(redis_key);
-    cleanup_db1.Del(redis_key);
+    EXPECT_EQ(EC_OK, cleanup_db0->Del(redis_key));
+    EXPECT_EQ(EC_OK, cleanup_db1->Del(redis_key));
 }
 
 } // namespace kv_cache_manager

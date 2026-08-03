@@ -3,7 +3,7 @@
 #include <mutex>
 #include <string>
 
-#include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/redis/redis_client.h"
 #include "kv_cache_manager/config/registry_storage_backend.h"
 
 namespace kv_cache_manager {

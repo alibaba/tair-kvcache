@@ -47,7 +47,8 @@ cc_library(
     deps = [
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:concurrent_hash_map",
-        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common/redis:redis_client",
+        "//kv_cache_manager/common/redis:redis_client_factory",
     ],
 )
 
@@ -87,7 +88,7 @@ cc_library(
         ":registry_backend",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:concurrent_hash_map",
-        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common/redis:redis_client",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],
@@ -120,7 +121,8 @@ cc_library(
     deps = [
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:client_pool",
-        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common/redis:redis_client",
+        "//kv_cache_manager/common/redis:redis_client_factory",
         "//kv_cache_manager/common:standard_uri",
     ],
 )

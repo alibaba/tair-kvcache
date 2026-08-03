@@ -1,4 +1,4 @@
-#include "kv_cache_manager/common/test/redis_test_base.h"
+#include "kv_cache_manager/common/redis/test/redis_test_base.h"
 
 #include <cstring>
 
@@ -14,7 +14,7 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReply(int type, const std::strin
         r->str = strdup(str.c_str());
         r->len = str.size();
     }
-    return ReplyUPtr(r, freeReplyObject);
+    return ReplyUPtr(r);
 }
 
 RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyInteger(const int64_t &integer) {
@@ -22,7 +22,7 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyInteger(const int64_t &inte
     memset(r, 0, sizeof(redisReply));
     r->type = REDIS_REPLY_INTEGER;
     r->integer = integer;
-    return ReplyUPtr(r, freeReplyObject);
+    return ReplyUPtr(r);
 }
 
 RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyArrayString(const std::vector<std::optional<std::string>> &strs) {
@@ -40,7 +40,7 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyArrayString(const std::vect
             r->element[i] = sub.release();
         }
     }
-    return ReplyUPtr(r, freeReplyObject);
+    return ReplyUPtr(r);
 }
 
 RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyScan(const std::string &next_cursor,
@@ -54,6 +54,6 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReplyScan(const std::string &nex
     r->element[0] = MakeFakeReply(REDIS_REPLY_STRING, next_cursor).release();
     // keys
     r->element[1] = MakeFakeReplyArrayString(keys).release();
-    return ReplyUPtr(r, freeReplyObject);
+    return ReplyUPtr(r);
 }
 } // namespace kv_cache_manager

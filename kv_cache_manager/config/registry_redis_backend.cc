@@ -3,12 +3,13 @@
 #include <cassert>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/redis/redis_client_factory.h"
 
 namespace kv_cache_manager {
 
 RegistryRedisBackend::~RegistryRedisBackend() { client_.reset(); }
 ErrorCode RegistryRedisBackend::Init(const StandardUri &standard_uri) noexcept {
-    client_ = std::make_unique<RedisClient>(standard_uri);
+    client_ = RedisClientFactory::Create(standard_uri);
     if (!client_ || !client_->Open()) {
         KVCM_LOG_ERROR("registry redis backend fail to open redis client");
         return EC_ERROR;
