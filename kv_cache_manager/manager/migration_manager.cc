@@ -89,9 +89,8 @@ void RollbackAddedLocations(RequestContext *request_context,
         for (const auto &location_id : plan.pipeline_location_ids) {
             known_success_request.location_ids.push_back({location_id});
         }
-        if (!schedule_plan_executor ||
-            !schedule_plan_executor->SubmitNonBlocking(
-                known_success_request, ScheduleTaskClass::kMigrationContinuation)) {
+        if (!schedule_plan_executor || !schedule_plan_executor->SubmitNonBlocking(
+                                           known_success_request, ScheduleTaskClass::kMigrationContinuation)) {
             KVCM_LOG_WARN("[%s] rollback known successful migration locations failed to submit delete, instance %s, "
                           "key_count %zu",
                           trace_id.c_str(),
