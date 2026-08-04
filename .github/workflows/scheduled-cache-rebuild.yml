@@ -19,7 +19,7 @@ jobs:
           gh workflow run test-opensrc.yml \
             --repo ${{ github.repository }} \
             --ref main \
-            -f runs-on=ubuntu-latest \
+            -f runs-on=aliyun-ecs-x64 \
             -f rebuildDiskCache=true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

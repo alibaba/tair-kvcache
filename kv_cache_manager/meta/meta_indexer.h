@@ -77,7 +77,8 @@ public:
     LocationResult ReadModifyWriteLocation(RequestContext *request_context,
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
-                                           const LocationModifierFunc &modifier) noexcept;
+                                           const LocationModifierFunc &modifier,
+                                           bool adjust_reclaimed_key_count = true) noexcept;
 
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;

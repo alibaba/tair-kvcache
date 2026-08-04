@@ -410,6 +410,19 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         std::vector<ErrorCode> get_ecs =
             backend_manager_->GetLocationIds(ephemeral_request_context.get(), batch_keys, batch_location_ids);
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+        if (get_ecs.size() != batch_keys.size() || batch_location_ids.size() != batch_keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "ReadModifyWrite GetLocationIds result size mismatch, keys[%lu], ecs[%lu], ids[%lu]",
+                               batch_keys.size(),
+                               get_ecs.size(),
+                               batch_location_ids.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                result.error_codes[global_idx] = EC_MISMATCH;
+            }
+            error_count += static_cast<int32_t>(batch.batch_indexs.size());
+            result.ec = EC_MISMATCH;
+            continue;
+        }
 
         // 2. Modify -> bucket each key into upsert_batch / delete_batch.
         BatchMetaData upsert_batch;
@@ -467,7 +480,8 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext *request_context,
                                                                  const KeyVector &keys,
                                                                  const LocationIdsPerKey &location_ids,
-                                                                 const LocationModifierFunc &modifier) noexcept {
+                                                                 const LocationModifierFunc &modifier,
+                                                                 bool adjust_reclaimed_key_count) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -597,7 +611,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
             }
         }
         error_count += upsert_errs + delete_errs;
-        AdjustKeyCountMeta(put_success_count - delete_success_count);
+        AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));
     }
 
     EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
@@ -1029,12 +1043,48 @@ int32_t MetaIndexer::ProcessErrorCodes(const std::string &trace_id,
                                        const KeyVector &keys,
                                        const std::string &op_name,
                                        Result &result) const noexcept {
-    assert(indexs.size() == error_codes.size() || indexs.empty());
+    const size_t expected_count = indexs.empty() ? keys.size() : indexs.size();
+    if (error_codes.size() != expected_count) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "meta indexer %s result size mismatch, expect[%lu], actual[%lu]",
+                           op_name.c_str(),
+                           expected_count,
+                           error_codes.size());
+        int32_t mismatch_count = 0;
+        for (size_t i = 0; i < expected_count; ++i) {
+            const int32_t index = indexs.empty() ? static_cast<int32_t>(i) : indexs[i];
+            if (index < 0 || static_cast<size_t>(index) >= result.error_codes.size()) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "meta indexer %s result index out of range, index[%d], result size[%lu]",
+                                   op_name.c_str(),
+                                   index,
+                                   result.error_codes.size());
+                continue;
+            }
+            result.error_codes[index] = EC_MISMATCH;
+            ++mismatch_count;
+        }
+        result.ec = EC_MISMATCH;
+        return mismatch_count;
+    }
+
     int32_t error_count = 0;
-    for (int32_t i = 0; i < error_codes.size(); ++i) {
-        int32_t index = i;
+    for (size_t i = 0; i < error_codes.size(); ++i) {
+        int32_t index = static_cast<int32_t>(i);
         if (!indexs.empty()) {
             index = indexs[i];
+        }
+        if (index < 0 || static_cast<size_t>(index) >= result.error_codes.size() ||
+            static_cast<size_t>(index) >= keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "meta indexer %s result index out of range, index[%d], keys[%lu], result[%lu]",
+                               op_name.c_str(),
+                               index,
+                               keys.size(),
+                               result.error_codes.size());
+            result.ec = EC_MISMATCH;
+            ++error_count;
+            continue;
         }
         if (error_codes[i] != EC_OK) {
             if (error_codes[i] != EC_NOENT) {
@@ -1053,6 +1103,9 @@ void MetaIndexer::ProcessErrorResult(const std::string &trace_id,
                                      const int32_t error_count,
                                      const int32_t key_count,
                                      Result &result) const noexcept {
+    if (result.ec != EC_OK) {
+        return;
+    }
     if (error_count == key_count) {
         result.ec = EC_ERROR;
         PREFIX_INDEXER_LOG(DEBUG, "all keys %s failed, key count[%d]", op_name.c_str(), key_count);
