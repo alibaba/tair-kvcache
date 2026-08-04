@@ -1,8 +1,11 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 
+#include <algorithm>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
@@ -11,6 +14,32 @@ void MetaIndexerManager::SetRevisitHistogramConfig(std::shared_ptr<MetricsRegist
                                                    const std::vector<double> &boundaries) {
     metrics_registry_ = std::move(registry);
     revisit_boundaries_ = boundaries;
+}
+
+bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
+                                                std::size_t parallel_threshold,
+                                                std::size_t chunk_size) {
+    if (worker_count == 0 || worker_count > 64 || parallel_threshold == 0 || chunk_size == 0 ||
+        chunk_size > parallel_threshold) {
+        KVCM_LOG_ERROR("invalid query executor config: workers[%zu] threshold[%zu] chunk_size[%zu]",
+                       worker_count,
+                       parallel_threshold,
+                       chunk_size);
+        return false;
+    }
+    std::scoped_lock write_guard(mutex_);
+    if (!meta_indexers_.empty()) {
+        KVCM_LOG_ERROR("query executor must be configured before creating meta indexers");
+        return false;
+    }
+    constexpr std::size_t kQueueSlotsPerWorker = 64;
+    query_executor_ = std::make_shared<QueryExecutor>(
+        worker_count, parallel_threshold, chunk_size, std::max<std::size_t>(64, worker_count * kQueueSlotsPerWorker));
+    KVCM_LOG_INFO("configured query executor: workers[%zu] threshold[%zu] chunk_size[%zu]",
+                  worker_count,
+                  parallel_threshold,
+                  chunk_size);
+    return true;
 }
 
 ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
@@ -28,6 +57,7 @@ ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
             return ErrorCode::EC_EXIST;
         }
         indexer = std::make_shared<MetaIndexer>();
+        indexer->SetQueryExecutor(query_executor_);
         auto ec = indexer->Init(instance_id, config);
         if (ec != ErrorCode::EC_OK) {
             KVCM_LOG_ERROR("Init meta indexer failed, instance_id: %s", instance_id.c_str());

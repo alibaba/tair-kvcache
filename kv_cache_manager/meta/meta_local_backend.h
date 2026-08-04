@@ -135,6 +135,9 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,

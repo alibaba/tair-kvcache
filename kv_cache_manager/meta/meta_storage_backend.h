@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -135,6 +136,30 @@ public:
     virtual std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                                 const KeyTypeVec &keys,
                                                 CacheLocationMapVector &out_locations) noexcept = 0;
+
+    // Lightweight all-location read for consumers that only need immutable
+    // CacheLocation values and do not need to look them up again by id. The
+    // default implementation preserves every backend's existing behavior by
+    // flattening GetLocations. Local memory overrides it to avoid cloning an
+    // unordered_map (including every location-id string and hash node) per key.
+    virtual std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     LocationsPerKey &out_locations) noexcept {
+        CacheLocationMapVector location_maps;
+        auto results = GetLocations(request_context, keys, location_maps);
+        out_locations.clear();
+        out_locations.resize(keys.size());
+        const std::size_t count = std::min(keys.size(), location_maps.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            auto &values = out_locations[i];
+            values.reserve(location_maps[i].size());
+            for (const auto &[location_id, location] : location_maps[i]) {
+                (void)location_id;
+                values.push_back(location);
+            }
+        }
+        return results;
+    }
 
     // 读取指定 location id 对应的 CacheLocation。
     // @param request_context  请求上下文；可为 nullptr

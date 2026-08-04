@@ -72,6 +72,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta searcher metrics
     DECLARE_METRICS(meta_searcher, indexer_get_time_us);
+    DECLARE_METRICS(meta_searcher, host_projection_time_us);
+    DECLARE_METRICS(meta_searcher, host_prefix_reduce_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
     DECLARE_METRICS(meta_searcher, index_serialize_time_us);
@@ -333,6 +335,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_get_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_projection_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_prefix_reduce_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_block_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_serialize_time_us);
@@ -517,6 +521,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta searcher metrics
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_get_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_projection_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_prefix_reduce_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
         REPORT_STEAL_METRICS(meta_searcher, index_serialize_time_us);

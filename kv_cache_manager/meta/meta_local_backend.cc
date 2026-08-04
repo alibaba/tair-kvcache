@@ -462,6 +462,40 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocations(RequestContext * /*request
     return results;
 }
 
+std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*request_context*/,
+                                                           const KeyTypeVec &keys,
+                                                           LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_locations.clear();
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string_view key_sv = KeyToView(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_sv);
+        if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        const int64_t stored_time = item->GetLastAccessTime();
+        if (revisit_histogram_ && stored_time > 0) {
+            revisit_histogram_->Observe(TimestampUtil::GetCurrentTimeUs() - stored_time);
+        }
+        item->TouchAccessTime();
+        {
+            std::shared_lock lock(item->GetMutex());
+            const auto &locations = item->GetLocations();
+            auto &values = out_locations[i];
+            values.reserve(locations.size());
+            for (const auto &[location_id, location] : locations) {
+                (void)location_id;
+                values.push_back(location);
+            }
+        }
+        cache_->Release(handle);
+    }
+    return results;
+}
+
 std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
                                                                    const KeyTypeVec &keys,
                                                                    const LocationIdsPerKey &location_ids,

@@ -34,6 +34,9 @@ public:
     const std::string &startup_config() { return startup_config_; }
     int32_t GetSchedulePlanExecutorThreadCount() { return schedule_plan_executor_thread_count_; }
     uint32_t GetSchedulePlanMigrationWorkerBudget() const { return schedule_plan_migration_worker_budget_; }
+    uint32_t GetMetaQueryWorkerCount() const { return meta_query_worker_count_; }
+    uint32_t GetMetaQueryParallelThreshold() const { return meta_query_parallel_threshold_; }
+    uint32_t GetMetaQueryChunkSize() const { return meta_query_chunk_size_; }
     uint64_t GetCacheReclaimerKeySamplingSizeTotal() { return cache_reclaimer_key_sampling_size_total_; }
     uint64_t GetCacheReclaimerKeySamplingSizePerTask() { return cache_reclaimer_key_sampling_size_per_task_; }
     uint64_t GetCacheReclaimerDelBatchSize() { return cache_reclaimer_del_batch_size_; }
@@ -91,6 +94,9 @@ private:
     std::string startup_config_;
     int32_t schedule_plan_executor_thread_count_ = 0;
     uint32_t schedule_plan_migration_worker_budget_ = 0;
+    uint32_t meta_query_worker_count_ = 0;
+    uint32_t meta_query_parallel_threshold_ = 0;
+    uint32_t meta_query_chunk_size_ = 0;
     uint64_t cache_reclaimer_key_sampling_size_total_ = 0;
     uint64_t cache_reclaimer_key_sampling_size_per_task_ = 0;
     uint64_t cache_reclaimer_del_batch_size_ = 0;

@@ -61,6 +61,8 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyVector &keys,
                                         CacheLocationMapVector &out_location_maps) noexcept;
+    std::vector<ErrorCode>
+    GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
@@ -99,6 +101,11 @@ public:
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
+
+    // Only the single local backend is safe and useful to fan out: its cache
+    // and items are independently sharded/locked and it ignores RequestContext.
+    // Redis and cached modes retain their existing batched request semantics.
+    bool SupportsConcurrentLocationValueReads() const noexcept;
 
 private:
     void AsyncRecoverTask() noexcept;
