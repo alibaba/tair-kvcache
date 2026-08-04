@@ -146,6 +146,21 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestConcurrentLocationValueReadsAreLocalOnly) {
+    MetaStorageBackendManager mgr;
+    EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+
+    mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
+    EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
+
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+
+    mgr.cache_backend_.reset();
+    mgr.persistent_backend_ = std::make_unique<MetaDummyBackend>();
+    EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+}
+
 // --- Put/Get: CacheLocation serialization round-trip --------------------------
 
 TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
@@ -183,6 +198,16 @@ TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
         ASSERT_TRUE(it != out_locations[i].end());
         ASSERT_EQ("uri_" + std::to_string(keys[i]), it->second->location_specs().front().uri());
     }
+
+    LocationsPerKey location_values;
+    auto get_value_ecs = mgr.GetLocationValues(request_context_.get(), {1, 404, 3}, location_values);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_OK}), get_value_ecs);
+    ASSERT_EQ(3u, location_values.size());
+    ASSERT_EQ(1u, location_values[0].size());
+    EXPECT_EQ("loc_1", location_values[0].front()->id());
+    EXPECT_TRUE(location_values[1].empty());
+    ASSERT_EQ(1u, location_values[2].size());
+    EXPECT_EQ("loc_3", location_values[2].front()->id());
 
     // Block-level properties should be preserved alongside the location fields.
     PropertyMapVector field_maps;

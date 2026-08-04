@@ -131,7 +131,11 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
 | `manager.get_cache_location_hit_block_counter` | counter | Total blocks hit via GetCacheLocation (cumulative) |
-| `manager.prefix_match_time_us` | gauge | Prefix match latency (us) |
+| `manager.prefix_match_time_us` | gauge | Outer total latency for GetHostCacheState-style prefix matching (us) |
+| `meta_searcher.indexer_get_time_us` | gauge | Wall time spent reading metadata through MetaIndexer (us) |
+| `meta_indexer.get_io_time_us` | gauge | Metadata-backend wall time; local mode includes LRU/locks/copies and does not imply Redis I/O |
+| `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState visibility checks and host/spec projection time (us) |
+| `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
 | `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
 
@@ -150,6 +154,12 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
+
+The GetHostCacheState phase metrics above are nested:
+`meta_indexer.get_io_time_us` is inside `meta_searcher.indexer_get_time_us`, and
+the indexer/projection/reduction phases are inside `manager.prefix_match_time_us`.
+Do not add them together. `get_io_time_us` is a historical name; with
+`storage_type=local` it contains no Redis network operation.
 
 ## Mapping to KMonitor Metrics
 

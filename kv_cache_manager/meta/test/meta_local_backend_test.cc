@@ -891,6 +891,48 @@ TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
 // ---------------------------------------------------------------------------
 // Concurrent read-write stress test for MetaMemCacheItem fields_ mutex
 // ---------------------------------------------------------------------------
+TEST_F(MetaLocalBackendTest, TestGetLocationValuesPreservesKeyOrderAndSharedValues) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_location_values", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto make_location = [](const std::string &id) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        location->set_status(CacheLocationStatus::CLS_SERVING);
+        location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        location->set_location_specs({LocationSpec("tp0", "event_report://host/mem")});
+        return location;
+    };
+    auto location_a = make_location("location-a");
+    auto location_b = make_location("location-b");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace(location_a->id(), location_a);
+    locations[0].emplace(location_b->id(), location_b);
+    PropertyMapVector properties(2);
+    properties[1][PROPERTY_URI] = "property-only-key";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {11, 22}, locations, properties));
+
+    LocationsPerKey values;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_OK, EC_OK}),
+              meta_storage_backend_->GetLocationValues(nullptr, {11, 33, 22, 11}, values));
+    ASSERT_EQ(4u, values.size());
+    EXPECT_TRUE(values[1].empty());
+    EXPECT_TRUE(values[2].empty());
+    for (const std::size_t index : {std::size_t{0}, std::size_t{3}}) {
+        ASSERT_EQ(2u, values[index].size());
+        std::set<std::string> ids;
+        for (const auto &location : values[index]) {
+            ASSERT_TRUE(location);
+            ids.insert(location->id());
+            EXPECT_TRUE(location == location_a || location == location_b);
+        }
+        EXPECT_EQ((std::set<std::string>{"location-a", "location-b"}), ids);
+    }
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_concurrent", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -954,6 +996,17 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
             auto get_loc_ids_ec = meta_storage_backend_->GetLocationIds(nullptr, {kTestKey}, loc_ids);
             ASSERT_EQ(1u, get_loc_ids_ec.size());
             ASSERT_EQ(EC_OK, get_loc_ids_ec[0]);
+
+            // Lightweight host-query projection must be safe while location
+            // entries are concurrently inserted and removed.
+            LocationsPerKey location_values;
+            auto get_values_ec = meta_storage_backend_->GetLocationValues(nullptr, {kTestKey}, location_values);
+            ASSERT_EQ(1u, get_values_ec.size());
+            ASSERT_EQ(EC_OK, get_values_ec[0]);
+            ASSERT_EQ(1u, location_values.size());
+            for (const auto &location : location_values[0]) {
+                ASSERT_TRUE(location);
+            }
         }
     };
 

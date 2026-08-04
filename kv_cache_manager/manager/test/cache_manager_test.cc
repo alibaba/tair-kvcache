@@ -233,6 +233,13 @@ public:
         return MetaLocalBackend::GetLocations(request_context, keys, location_ids, out_locations);
     }
 
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override {
+        MaybeBlockLocationRead();
+        return MetaLocalBackend::GetLocationValues(request_context, keys, out_locations);
+    }
+
     bool Sync(const KeyTypeVec &keys) noexcept override {
         {
             std::lock_guard<std::mutex> lock(control_mutex_);
@@ -6576,6 +6583,137 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
 //   host_B: 100→200→300→400→(miss 500) → prefix=4
 //   host_C: 100→(miss 200) → prefix=1
 //
+TEST_F(CacheManagerTest, TestGetHostCacheStateSnapshotsHostLivenessAfterMetadataRead) {
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_TRUE(event_backend);
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_TRUE(meta_backend);
+
+    const std::string instance_id = "test_instance";
+    const std::string host = "10.0.9.1:8080";
+    InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
+    proto::meta::ReportEventRequest report;
+    report.set_instance_id(instance_id);
+    report.set_host_ip_port(host);
+    report.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *event = report.add_events();
+    event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+    event->mutable_block_add()->set_block_key("9001");
+    event->mutable_block_add()->set_medium("mem");
+    auto *spec = event->mutable_block_add()->add_specs();
+    spec->set_name("tp0");
+    spec->set_uri("event_report://" + host + "/mem");
+    proto::meta::ReportEventResponse report_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &report, &report_response));
+
+    meta_backend->BlockNextLocationRead();
+    auto query = std::async(std::launch::async, [&] {
+        RequestContext context("host_liveness_after_meta_read");
+        return cache_manager_->GetHostCacheState(
+            &context, instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {9001});
+    });
+    const bool read_entered = meta_backend->WaitUntilLocationReadEntered(std::chrono::seconds(2));
+    if (!read_entered) {
+        meta_backend->ReleaseLocationRead();
+        (void)query.get();
+        FAIL() << "GetHostCacheState did not enter the controlled metadata read";
+    }
+
+    event_backend->SetNodeUnavailable(instance_id, host);
+    meta_backend->ReleaseLocationRead();
+    auto [ec, hosts] = query.get();
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_TRUE(hosts.empty());
+}
+
+TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDown) {
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_TRUE(event_backend);
+    const std::string instance_id = "test_instance";
+    const std::string host = "10.0.9.2:8080";
+    constexpr std::size_t kBlockCount = 384;
+    InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
+
+    auto make_add_request = [&](std::size_t round) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance_id);
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        for (std::size_t i = 0; i < kBlockCount; ++i) {
+            auto *event = request.add_events();
+            event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *add = event->mutable_block_add();
+            add->set_block_key(std::to_string(10000 + i));
+            add->set_medium("mem");
+            auto *spec = add->add_specs();
+            spec->set_name("tp0");
+            spec->set_uri("event_report://" + host + "/mem?round=" + std::to_string(round));
+        }
+        return request;
+    };
+
+    auto setup_request = make_add_request(0);
+    proto::meta::ReportEventResponse setup_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &setup_request, &setup_response));
+    CacheManager::KeyVector keys;
+    keys.reserve(kBlockCount);
+    for (std::size_t i = 0; i < kBlockCount; ++i) {
+        keys.push_back(10000 + i);
+    }
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> writer_done{false};
+    std::atomic<std::size_t> failures{0};
+    std::thread writer([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (std::size_t round = 1; round <= 12; ++round) {
+            auto request = make_add_request(round);
+            proto::meta::ReportEventResponse response;
+            RequestContext context("concurrent_report_" + std::to_string(round));
+            if (cache_manager_->ReportEvent(&context, &request, &response) != EC_OK) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+    std::thread reader([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::size_t query_count = 0;
+        while (!writer_done.load(std::memory_order_acquire) || query_count < 24) {
+            RequestContext context("concurrent_host_query_" + std::to_string(query_count));
+            auto [ec, hosts] = cache_manager_->GetHostCacheState(
+                &context, instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"mem"});
+            if (ec != EC_OK || hosts.size() != 1 || hosts.front().host_ip_port != host ||
+                hosts.front().prefix_match_blocks != static_cast<int64_t>(kBlockCount)) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            ++query_count;
+        }
+    });
+    start.store(true, std::memory_order_release);
+    writer.join();
+    reader.join();
+    EXPECT_EQ(0u, failures.load(std::memory_order_relaxed));
+
+    proto::meta::ReportEventRequest host_down;
+    host_down.set_instance_id(instance_id);
+    host_down.set_host_ip_port(host);
+    host_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *host_down_event = host_down.add_events();
+    host_down_event->set_event_type(proto::meta::EVENT_HOST_DOWN);
+    host_down_event->mutable_host_down();
+    proto::meta::ReportEventResponse host_down_response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &host_down, &host_down_response));
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_TRUE(hosts.empty());
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheState) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_host_cache_state_prefix";
@@ -6767,7 +6905,28 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
     }
 
-    // --- Test 9: unavailable host is filtered even before metadata cleanup ---
+    // --- Test 9: requests above the parallel threshold preserve ordering and
+    // prefix semantics. Repeated keys also stress concurrent reads of the same
+    // local-cache item rather than only independent LRU shards. ---
+    {
+        CacheManager::KeyVector keys;
+        keys.reserve(384);
+        for (std::size_t i = 0; i < 96; ++i) {
+            keys.insert(keys.end(), {100, 200, 300, 400});
+        }
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3u, hosts.size());
+        EXPECT_EQ("10.0.0.1:8080", hosts[0].host_ip_port);
+        EXPECT_EQ("10.0.0.2:8080", hosts[1].host_ip_port);
+        EXPECT_EQ("10.0.0.3:8080", hosts[2].host_ip_port);
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(384, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 10: unavailable host is filtered even before metadata cleanup ---
     {
         event_backend->SetNodeUnavailable(instance_id, "10.0.0.2:8080");
         CacheManager::KeyVector keys = {100, 200, 300, 400};
@@ -6956,6 +7115,22 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
         EXPECT_EQ(-1, find_prefix(absent_hosts, host_c));
         EXPECT_EQ(-1, find_prefix(absent_hosts, host_d));
         EXPECT_EQ(2, find_prefix(absent_hosts, host_e));
+    }
+
+    {
+        CacheManager::KeyVector large_keys;
+        large_keys.reserve(384);
+        for (std::size_t i = 0; i < 128; ++i) {
+            large_keys.insert(large_keys.end(), {100, 200, 300});
+        }
+        auto [large_ec, large_hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, large_keys);
+        ASSERT_EQ(EC_OK, large_ec);
+        EXPECT_EQ(382, find_prefix(large_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(large_hosts, host_b));
+        EXPECT_EQ(-1, find_prefix(large_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(large_hosts, host_d));
+        EXPECT_EQ(383, find_prefix(large_hosts, host_e));
     }
 
     dsm->storage_map_.erase("event_backend_mamba");

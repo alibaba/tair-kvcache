@@ -1,5 +1,14 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_test(
+    name = "query_executor_test",
+    srcs = ["query_executor_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:query_executor",
+    ],
+)
+
 cc_library(
     name = "meta_indexer_testlib",
     srcs = [
@@ -23,8 +32,8 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        "//kv_cache_manager/common:unittest",
         ":meta_indexer_testlib",
+        "//kv_cache_manager/common:unittest",
     ],
 )
 
@@ -66,8 +75,8 @@ cc_library(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/meta:meta_cache_base_backend",
-        "//kv_cache_manager/meta:meta_storage_backend",
         "//kv_cache_manager/meta:meta_redis_backend",
+        "//kv_cache_manager/meta:meta_storage_backend",
         "@com_google_googletest//:gtest",
     ],
 )
@@ -122,13 +131,13 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/meta:meta_redis_backend",
-    ],
     tags = [
         "manual",
         "redis",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:meta_redis_backend",
     ],
 )
 
@@ -139,13 +148,13 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        ":meta_indexer_testlib",
-    ],
     tags = [
         "manual",
         "redis",
+    ],
+    deps = [
+        ":meta_indexer_testlib",
+        "//kv_cache_manager/common:unittest",
     ],
 )
 
@@ -204,6 +213,10 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    tags = [
+        "manual",
+        "redis",
+    ],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
@@ -211,9 +224,5 @@ cc_test(
         "//kv_cache_manager/meta:meta_storage_backend",
         "//kv_cache_manager/meta:meta_storage_backend_manager",
         "//kv_cache_manager/meta:types",
-    ],
-    tags = [
-        "manual",
-        "redis",
     ],
 )

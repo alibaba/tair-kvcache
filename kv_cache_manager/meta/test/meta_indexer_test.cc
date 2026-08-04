@@ -16,6 +16,7 @@
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/meta/utils.h"
@@ -98,6 +99,59 @@ TEST_F(MetaIndexerTest, TestInit) {
         "meta_cache_policy_config" : {}
     })";
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
+}
+
+TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErrors) {
+    constexpr std::size_t kKeyCount = 1024;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 32));
+    const std::string config_str = R"({
+        "max_key_count" : 2048,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    KeyVector query_keys = data.keys;
+    constexpr std::size_t kMissingIndex = 333;
+    query_keys[kMissingIndex] = 100000;
+    LocationsPerKey parallel_values;
+    const auto parallel_result = meta_indexer_->GetLocationValues(request_context_.get(), query_keys, parallel_values);
+    ASSERT_EQ(EC_PARTIAL_OK, parallel_result.ec);
+    ASSERT_EQ(kKeyCount, parallel_result.error_codes.size());
+    ASSERT_EQ(kKeyCount, parallel_values.size());
+    for (std::size_t i = 0; i < kKeyCount; ++i) {
+        if (i == kMissingIndex) {
+            EXPECT_EQ(EC_NOENT, parallel_result.error_codes[i]);
+            EXPECT_TRUE(parallel_values[i].empty());
+            continue;
+        }
+        EXPECT_EQ(EC_OK, parallel_result.error_codes[i]) << "index=" << i;
+        ASSERT_EQ(1u, parallel_values[i].size()) << "index=" << i;
+        ASSERT_TRUE(parallel_values[i].front());
+        EXPECT_EQ("loc_" + std::to_string(query_keys[i]), parallel_values[i].front()->id());
+    }
+
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+    LocationsPerKey serial_values;
+    const auto serial_result = meta_indexer_->GetLocationValues(request_context_.get(), query_keys, serial_values);
+    EXPECT_EQ(parallel_result.ec, serial_result.ec);
+    EXPECT_EQ(parallel_result.error_codes, serial_result.error_codes);
+    ASSERT_EQ(parallel_values.size(), serial_values.size());
+    for (std::size_t i = 0; i < parallel_values.size(); ++i) {
+        ASSERT_EQ(parallel_values[i].size(), serial_values[i].size()) << "index=" << i;
+        for (std::size_t j = 0; j < parallel_values[i].size(); ++j) {
+            ASSERT_TRUE(serial_values[i][j]);
+            EXPECT_EQ(parallel_values[i][j]->id(), serial_values[i][j]->id()) << "index=" << i;
+        }
+    }
 }
 
 // Verifies the invariants of MakeBatches() that callers rely on, regardless
