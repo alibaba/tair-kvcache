@@ -7,6 +7,8 @@
 [`report_event.md`](../api/report_event.md) 和
 [`report_event_snapshot_uri_version.md`](report_event_snapshot_uri_version.md)
 中的接口与生命周期契约为准，并为并发问题优先补充可控阻塞点的确定性测试。
+小 block / 大批量性能问题的已完成优化、禁止破坏的 HOST_DOWN 抢占窗口和后续目标化 Redis
+读取方案记录在 [`report_event_performance.md`](report_event_performance.md)。
 
 ## P1：生命周期与重试语义
 

@@ -17,3 +17,10 @@ py_library(
     imports = [".."],
     deps = [],
 )
+
+py_test(
+    name = "TestBaseTest",
+    srcs = ["test_base_test.py"],
+    main = "test_base_test.py",
+    deps = [":test_base"],
+)

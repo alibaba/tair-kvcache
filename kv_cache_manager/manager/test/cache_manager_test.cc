@@ -3233,6 +3233,46 @@ TEST_F(CacheManagerTest, TestReportEventMissingBlockDeletesRemainSuccessfulAsOne
     EXPECT_TRUE(QueryEventReportUris({94'437, 94'438, 94'439}).empty());
 }
 
+TEST_F(CacheManagerTest, TestReportEventLargeDeltaBatchAcrossRepeatedMediums) {
+    const std::string host = "192.168.10.56:8080";
+    constexpr int64_t first_key = 95'000;
+    constexpr size_t event_count = 512;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    auto request = MakeAddRequest(host, first_key, "batch_0");
+    for (size_t i = 1; i < event_count; ++i) {
+        auto event_request = MakeAddRequest(host, first_key + static_cast<int64_t>(i), "batch_" + std::to_string(i));
+        if (i % 2 != 0) {
+            event_request.mutable_events(0)->mutable_block_add()->set_medium("disk");
+            event_request.mutable_events(0)->mutable_block_add()->mutable_specs(0)->set_uri(
+                "event_report://" + host + "/disk?source=batch_" + std::to_string(i));
+        }
+        *request.add_events() = event_request.events(0);
+    }
+
+    const auto [ec, response] = CallReportEvent(request, "large_repeated_medium_delta_batch");
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_EQ(proto::meta::OK, response.header().status().code());
+    EXPECT_EQ(0, response.item_results_size());
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(response.committed_snapshot_version()));
+    EXPECT_TRUE(response.snapshot_required());
+
+    const auto visible = QueryEventReportUris({first_key,
+                                               first_key + static_cast<int64_t>(event_count / 2),
+                                               first_key + static_cast<int64_t>(event_count - 1)});
+    ASSERT_EQ(3u, visible.size());
+    EXPECT_TRUE(std::any_of(visible.begin(), visible.end(), [](const auto &uri) {
+        return uri.find("source=batch_0") != std::string::npos;
+    }));
+    EXPECT_TRUE(std::any_of(visible.begin(), visible.end(), [](const auto &uri) {
+        return uri.find("source=batch_256") != std::string::npos;
+    }));
+    EXPECT_TRUE(std::any_of(visible.begin(), visible.end(), [](const auto &uri) {
+        return uri.find("source=batch_511") != std::string::npos;
+    }));
+}
+
 TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDeltaWithoutSnapshot) {
     const std::string host = "192.168.10.47:8080";
     const int64_t historical_key = 94'431;
@@ -6127,9 +6167,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
             cache_manager_->StartWriteCache(request_context_.get(), instance_id, nfs_keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
         BlockMask bm = static_cast<size_t>(nfs_keys.size());
-        ASSERT_EQ(
-            EC_OK,
-            cache_manager_->FinishWriteCache(request_context_.get(), instance_id, swci.write_session_id(), bm));
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(), instance_id, swci.write_session_id(), bm));
     }
 
     // Set up EventReportBackend
@@ -6184,15 +6223,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     // --- Test 1: empty backend_selectors → returns EC_BADARGS ---
     {
         BlockMask bm = static_cast<size_t>(0);
-        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
-                                                                     instance_id,
-                                                                     CacheManager::QueryType::QT_BATCH_GET,
-                                                                     all_keys,
-                                                                     {},
-                                                                     bm,
-                                                                     0,
-                                                                     {},
-                                                                     {});
+        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_BATCH_GET, all_keys, {}, bm, 0, {}, {});
         ASSERT_EQ(EC_BADARGS, ec);
     }
 
@@ -6422,32 +6454,32 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         const auto &kl = locs[0].cache_locations_view();
         ASSERT_EQ(1u, kl.size());
         EXPECT_EQ(2u, kl[0].location_specs().size());
+        EXPECT_EQ(2u, kl[0].spec_size());
     }
 
     // --- Test 9: spec filtering happens before Vineyard peer selection ---
     // The full-only peer covers two keys and would win an unfiltered prefix
     // selection. A linear_1 query must instead select the linear-only peer.
     {
-        auto report_spec = [&](const std::string &host,
-                               const std::vector<int64_t> &keys,
-                               const std::string &spec_name) {
-            proto::meta::ReportEventRequest req;
-            req.set_instance_id(instance_id);
-            req.set_host_ip_port(host);
-            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
-            for (int64_t key : keys) {
-                auto *ev = req.add_events();
-                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-                auto *ba = ev->mutable_block_add();
-                ba->set_block_key(std::to_string(key));
-                ba->set_medium("mem");
-                auto *spec = ba->add_specs();
-                spec->set_name(spec_name);
-                spec->set_uri("event_report://" + host + "/mem");
-            }
-            proto::meta::ReportEventResponse resp;
-            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-        };
+        auto report_spec =
+            [&](const std::string &host, const std::vector<int64_t> &keys, const std::string &spec_name) {
+                proto::meta::ReportEventRequest req;
+                req.set_instance_id(instance_id);
+                req.set_host_ip_port(host);
+                req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+                for (int64_t key : keys) {
+                    auto *ev = req.add_events();
+                    ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                    auto *ba = ev->mutable_block_add();
+                    ba->set_block_key(std::to_string(key));
+                    ba->set_medium("mem");
+                    auto *spec = ba->add_specs();
+                    spec->set_name(spec_name);
+                    spec->set_uri("event_report://" + host + "/mem");
+                }
+                proto::meta::ReportEventResponse resp;
+                ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+            };
 
         const std::string full_host = "192.168.2.1:8080";
         const std::string linear_host = "192.168.2.2:8080";
@@ -6473,9 +6505,9 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(2u, locs.size());
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         ASSERT_EQ(1u, locs[0].cache_locations_view()[0].location_specs().size());
+        EXPECT_EQ(1u, locs[0].cache_locations_view()[0].spec_size());
         EXPECT_EQ("linear_1", locs[0].cache_locations_view()[0].location_specs()[0].name());
-        EXPECT_NE(std::string::npos,
-                  locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
+        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
         EXPECT_TRUE(locs[1].cache_locations_view().empty());
     }
 
