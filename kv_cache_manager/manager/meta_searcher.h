@@ -110,7 +110,9 @@ public:
         std::vector<LocationSpec> specs;
     };
     // Replaces existing specs or creates the stable location in one metadata
-    // read-modify-write operation per batch.
+    // read-modify-write operation per batch. When supplied, the write-lease
+    // callback is invoked once after the metadata read and before the first
+    // mutation; the returned lease is retained until the operation returns.
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
@@ -122,6 +124,10 @@ public:
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
+    // The optional write lease is acquired once per RMW phase, after that
+    // phase's metadata read. Releasing it between the block-create and
+    // location-merge phases lets a concurrent lifecycle writer fence stale
+    // work before the next phase mutates metadata.
     ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
@@ -133,7 +139,9 @@ public:
     };
     // Missing block/location targets are idempotent EC_OK. When requested,
     // out_missing_targets mirrors tasks_per_key and marks those no-op targets;
-    // an existing location with only missing spec_names is not marked.
+    // an existing location with only missing spec_names is not marked. The
+    // optional write lease is acquired once after the metadata read and before
+    // the first mutation.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,

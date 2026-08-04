@@ -63,6 +63,13 @@ class TestBase(object):
         return range_from, range_to
 
     def get_workdir(self):
+        # Bazel gives every test action (including each --runs_per_test
+        # repetition) a private TEST_TMPDIR. Keep mutable test state there so
+        # concurrently executing copies cannot delete or overwrite each
+        # other's worker tree under the shared runfiles directory.
+        test_tmpdir = os.environ.get('TEST_TMPDIR')
+        if test_tmpdir:
+            return os.path.join(os.path.abspath(test_tmpdir), self._testMethodName)
         return os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')), self._testMethodName)
 
     def clean_workdir(self):
@@ -72,7 +79,10 @@ class TestBase(object):
 
     def _init_dirs(self, work_dir):
         self.workdir = work_dir if work_dir is not None else self.get_workdir()
-        self.path_root = os.path.abspath(os.path.join(self.workdir, '../'))
+        # The packaged binary is a read-only runfile. It must not be resolved
+        # relative to TEST_TMPDIR now that the per-test worker tree lives
+        # there.
+        self.path_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../'))
         self.global_install_root = os.path.join(self.path_root, 'install_root')
         self.worker_install_root = os.path.join(self.workdir, 'install_root')
 

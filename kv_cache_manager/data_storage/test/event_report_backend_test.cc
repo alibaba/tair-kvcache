@@ -497,6 +497,35 @@ TEST_F(EventReportBackendTest, EnsureNodeRegisteredMergesNewMediums) {
     ASSERT_EQ(2u, backend.instance_nodes_["medium-merge"]["10.0.0.91:8080"]->mediums.size());
 }
 
+TEST_F(EventReportBackendTest, EnsureNodeRegisteredHandlesConcurrentKnownAndNewMediums) {
+    EventReportBackend backend(metrics_registry_);
+    const std::string instance_id = "medium-concurrency";
+    const std::string host = "10.0.0.95:8080";
+    ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered(instance_id, host, {"mem"}));
+    const uint64_t generation = backend.GetNodeGeneration(instance_id, host);
+
+    std::atomic<size_t> failures{0};
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < 12; ++worker) {
+        workers.emplace_back([&, worker] {
+            const std::string medium = worker % 2 == 0 ? "mem" : "disk";
+            for (size_t iteration = 0; iteration < 200; ++iteration) {
+                if (backend.EnsureNodeRegistered(instance_id, host, {medium}) != EC_OK) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(0u, failures.load(std::memory_order_relaxed));
+    EXPECT_EQ(generation, backend.GetNodeGeneration(instance_id, host));
+    const auto &mediums = backend.instance_nodes_[instance_id][host]->mediums;
+    EXPECT_EQ((std::set<std::string>{"disk", "mem"}), (std::set<std::string>(mediums.begin(), mediums.end())));
+}
+
 // (7) Re-registration after cleanup
 TEST_F(EventReportBackendTest, RegisterAfterCleanupCreatesNewEntry) {
     EventReportBackend backend(metrics_registry_);
