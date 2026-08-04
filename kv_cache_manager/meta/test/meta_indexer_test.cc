@@ -154,6 +154,22 @@ TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErr
     }
 }
 
+TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
+    const KeyVector keys = {11, 22, 33};
+
+    MetaIndexer::Result short_result(keys.size());
+    EXPECT_EQ(3, meta_indexer_->ProcessErrorCodes("trace", {EC_OK}, {}, keys, "test_short_result", short_result));
+    EXPECT_EQ(EC_MISMATCH, short_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH, EC_MISMATCH}), short_result.error_codes);
+
+    MetaIndexer::Result long_result(keys.size());
+    EXPECT_EQ(3,
+              meta_indexer_->ProcessErrorCodes(
+                  "trace", {EC_OK, EC_OK, EC_OK, EC_OK}, {}, keys, "test_long_result", long_result));
+    EXPECT_EQ(EC_MISMATCH, long_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH, EC_MISMATCH}), long_result.error_codes);
+}
+
 // Verifies the invariants of MakeBatches() that callers rely on, regardless
 // of the exact shard distribution (which is now hash-driven and therefore
 // not deterministic across keys):
