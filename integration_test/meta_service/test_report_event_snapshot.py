@@ -1688,6 +1688,28 @@ class EventReportFunctionalTest(unittest.TestCase):
                 f"host {host}: expected prefix={prefix}, got {actual[host]}",
             )
 
+        # Cross the default parallel threshold and verify that chunked local
+        # reads plus parallel projection preserve prefix and output ordering.
+        large_keys = [10000, 10001, 10002, 10003] * 96
+        large_resp = self.client.get_host_cache_state({
+            "trace_id": "t16_large_query",
+            "instance_id": instance_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_cache_keys": large_keys,
+        })
+        large_hosts = large_resp.get("hosts", [])
+        self.assertEqual(
+            [item["host_ip_port"] for item in large_hosts],
+            ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"],
+        )
+        large_actual = {
+            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            for item in large_hosts
+        }
+        self.assertEqual(large_actual["10.0.0.1:8080"], 2)
+        self.assertEqual(large_actual["10.0.0.2:8080"], len(large_keys))
+        self.assertEqual(large_actual["10.0.0.3:8080"], 1)
+
     # 17. Snapshot is a complete reconciliation barrier and supports empty clear.
     def test_17_snapshot_reconciliation_contract(self):
         host = "192.168.1.240:8080"
@@ -4219,8 +4241,9 @@ class EventReportBenchTest(unittest.TestCase):
         self._ensure_host_registered(self.client, self.instance_id, host)
         measurements = []
 
-        for batch_index, event_count in enumerate((100, 1000, 5000)):
-            base_key = 40_000_000 + batch_index * 10_000
+        for batch_index, event_count in enumerate((100, 1000, 5000, 20_000)):
+            # Keep every scale isolated even when larger cases are appended.
+            base_key = 40_000_000 + batch_index * 100_000
             create_events = [
                 _ev_block_add(
                     base_key + offset,
@@ -4324,6 +4347,127 @@ class EventReportBenchTest(unittest.TestCase):
                 f"({create_elapsed_ms / event_count:.4f}ms/event), "
                 f"update: {update_elapsed_ms:9.2f}ms "
                 f"({update_elapsed_ms / event_count:.4f}ms/event)"
+            )
+
+    # 21. GetHostCacheState scaling for the pure local metadata path. There is
+    # no latency assertion because debug/release builds and test hosts differ;
+    # correctness is checked on every measured response and the output is a
+    # reproducible before/after baseline.
+    def test_21_get_host_cache_state_local_scaling(self):
+        host = "192.168.2.210:8080"
+        self._ensure_host_registered(self.client, self.instance_id, host)
+        measurements = []
+
+        for batch_index, block_count in enumerate((100, 1000, 5000, 20_000)):
+            # Keep every scale isolated even when larger cases are appended.
+            base_key = 50_000_000 + batch_index * 100_000
+            block_keys = [base_key + offset for offset in range(block_count)]
+            events = [
+                _ev_block_add(
+                    block_key,
+                    "mem",
+                    _make_single_spec(
+                        "spec_4096",
+                        _build_event_report_uri(
+                            host, "mem", {"block": str(block_key)}
+                        ),
+                    ),
+                )
+                for block_key in block_keys
+            ]
+            self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    events,
+                    trace_id=f"bench_host_state_setup_{block_count}",
+                )
+            )
+            query_keys = block_keys + [base_key + block_count + 1]
+            payload = {
+                "trace_id": f"bench_host_state_{block_count}",
+                "instance_id": self.instance_id,
+                "query_type": "QT_PREFIX_MATCH",
+                "block_cache_keys": query_keys,
+                "medium": ["mem"],
+            }
+
+            def assert_response(response):
+                prefixes = {
+                    item["host_ip_port"]: int(item["prefix_match_blocks"])
+                    for item in response.get("hosts", [])
+                }
+                self.assertEqual(prefixes.get(host), block_count)
+
+            for _ in range(3):
+                assert_response(self.client.get_host_cache_state(payload))
+
+            latencies = []
+            for _ in range(20):
+                start = time.monotonic()
+                response = self.client.get_host_cache_state(payload)
+                latencies.append((time.monotonic() - start) * 1000)
+                assert_response(response)
+
+            concurrent_latencies = []
+            errors = []
+
+            def query_worker(worker_index):
+                session = requests.Session()
+                session.headers.update({
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                })
+                started = time.monotonic()
+                try:
+                    response = session.post(
+                        f"{BASE_URL}/api/getHostCacheState", json=payload
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    code = body.get("header", {}).get("status", {}).get("code")
+                    if code != "OK":
+                        raise AssertionError(
+                            f"worker {worker_index}: status={code}, body={body}"
+                        )
+                    prefixes = {
+                        item["host_ip_port"]: int(item["prefix_match_blocks"])
+                        for item in body.get("hosts", [])
+                    }
+                    if prefixes.get(host) != block_count:
+                        raise AssertionError(
+                            f"worker {worker_index}: prefixes={prefixes}"
+                        )
+                    return (time.monotonic() - started) * 1000
+                except Exception as error:
+                    errors.append(str(error))
+                    return None
+                finally:
+                    session.close()
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                futures = [pool.submit(query_worker, index) for index in range(32)]
+                for future in as_completed(futures):
+                    latency = future.result()
+                    if latency is not None:
+                        concurrent_latencies.append(latency)
+            self.assertEqual(errors, [])
+            self.assertEqual(32, len(concurrent_latencies))
+            measurements.append(
+                (block_count, sorted(latencies), sorted(concurrent_latencies))
+            )
+
+        print("\n[BENCH] GetHostCacheState local metadata scaling:")
+        for block_count, serial, concurrent in measurements:
+            print(
+                f"  Blocks: {block_count:5d}, "
+                f"serial p50/p99/avg: "
+                f"{self._percentile(serial, 50):8.2f}/"
+                f"{self._percentile(serial, 99):8.2f}/"
+                f"{statistics.mean(serial):8.2f}ms, "
+                f"16-way p50/p99: "
+                f"{self._percentile(concurrent, 50):8.2f}/"
+                f"{self._percentile(concurrent, 99):8.2f}ms"
             )
 
 

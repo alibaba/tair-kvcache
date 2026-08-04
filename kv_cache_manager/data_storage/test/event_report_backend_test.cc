@@ -941,6 +941,44 @@ TEST(EventReportBackendSnapshotTest, QueryVisibilityIsStrictOnlyAfterSuccessfulS
     EXPECT_EQ(recovered, committed);
 }
 
+TEST(EventReportBackendSnapshotTest, QueryVisibilitySnapshotIsInstanceScopedAndExcludesUnavailableReporters) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey soft_reporter{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey strict_reporter{"instance-a", "10.0.0.2:8080"};
+    const ReporterSnapshotKey other_instance{"instance-b", "10.0.0.3:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(soft_reporter.instance_id, soft_reporter.host_ip_port, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(strict_reporter.instance_id, strict_reporter.host_ip_port, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(other_instance.instance_id, other_instance.host_ip_port, {"mem"}));
+
+    std::string soft_version;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(soft_reporter, soft_version));
+    backend.EndDeltaMutation(soft_reporter);
+    std::string strict_version;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(strict_reporter, strict_version, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(strict_reporter, strict_version));
+
+    EventReportBackend::QueryVisibilitySnapshot snapshot;
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    ASSERT_EQ(2u, snapshot.size());
+    EXPECT_FALSE(snapshot.at(soft_reporter.host_ip_port).strict);
+    EXPECT_EQ(soft_version, snapshot.at(soft_reporter.host_ip_port).committed_version);
+    EXPECT_TRUE(snapshot.at(strict_reporter.host_ip_port).strict);
+    EXPECT_EQ(strict_version, snapshot.at(strict_reporter.host_ip_port).committed_version);
+    EXPECT_EQ(0u, snapshot.count(other_instance.host_ip_port));
+
+    backend.SetNodeUnavailable(soft_reporter.instance_id, soft_reporter.host_ip_port);
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    ASSERT_EQ(1u, snapshot.size());
+    EXPECT_EQ(0u, snapshot.count(soft_reporter.host_ip_port));
+    EXPECT_EQ(1u, snapshot.count(strict_reporter.host_ip_port));
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(strict_reporter.instance_id, strict_reporter.host_ip_port));
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    EXPECT_TRUE(snapshot.empty());
+}
+
 TEST(EventReportBackendSnapshotTest, SnapshotTokensAreNeverReusedAcrossAttempts) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);

@@ -860,7 +860,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | CFG-01 | snapshot interval/drain timeout 默认值、正数校验、负数拒绝、JSON/proto round trip，并由 backend 加载 | `TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation`、`TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings`、`EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings`、`BasicAccessors` |
 | PERF-01 | 100 线程共 1 万 ADD、50 线程共 5000 混合批次均无错误 | `EventReportBenchTest.test_17/18` |
 | PERF-02 | 10 reporter × 每台 5000 blocks 完整 snapshot，并查询每台首/中/末 block | `EventReportBenchTest.test_19_ten_reporters_full_snapshot_capacity` |
-| PERF-03 | 单请求 512 个跨重复 medium 的增量正确落盘；手工容量测试记录 100/1000/5000 个 ADD 的总 RT 与单 event 开销 | `TestReportEventLargeDeltaBatchAcrossRepeatedMediums`、`EventReportBenchTest.test_20_large_single_request_delta_scaling` |
+| PERF-03 | 单请求 512 个跨重复 medium 的增量正确落盘；手工容量测试记录 100/1000/5000/20000 个 ADD 的总 RT 与单 event 开销 | `TestReportEventLargeDeltaBatchAcrossRepeatedMediums`、`EventReportBenchTest.test_20_large_single_request_delta_scaling` |
 
 上表中的参数解析、故障注入、CAS 竞态等内部边界使用 UT 验证；跨 HTTP 的正常流程、并发流程、
 节点生命周期和 Redis/KVCM 重启使用集成测试验证。
