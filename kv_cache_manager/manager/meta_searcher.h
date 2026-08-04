@@ -102,6 +102,26 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<AddLocationResult> &out_results);
+    struct AddLocationRollbackPlan {
+        // Confirmed-successful items (EC_OK + non-empty location id). The
+        // caller submits these to the standard location delete pipeline.
+        KeyVector pipeline_keys;
+        std::vector<std::string> pipeline_location_ids;
+        // Indices into the original batch whose metadata is confirmed to hold
+        // no reference (or was never written). The caller may delete their
+        // allocated URIs directly.
+        std::vector<size_t> direct_delete_indices;
+    };
+    // Reconciles a failed BatchAddLocation batch into a rollback plan.
+    // Confirmed-successful items are routed to the standard delete pipeline;
+    // uncertain items (location id generated but write result failed/unknown)
+    // are idempotently deleted from metadata and synced before their URIs may
+    // be released. Whenever an item's metadata state cannot be confirmed, its
+    // URI is retained (not added to direct_delete_indices).
+    ErrorCode ReconcileAddLocationRollback(RequestContext *request_context,
+                                           const KeyVector &keys,
+                                           const std::vector<AddLocationResult> &add_results,
+                                           AddLocationRollbackPlan &out_plan);
     struct ReplaceLocationSpecsTask {
         std::string location_id;
         DataStorageType type;

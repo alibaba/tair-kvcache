@@ -42,7 +42,8 @@ struct AddLocationRollbackItem {
     std::string location_id;
 };
 
-// BatchAddLocation 失败后的补偿规则与返回契约一致：
+// BatchAddLocation 失败后的补偿规则与返回契约一致，统一收敛在
+// MetaSearcher::ReconcileAddLocationRollback：
 // - 已知成功项走标准 Location 删除流水线，由流水线回收 usage；
 // - 失败但已生成 ID 的项先幂等删除元数据并 Sync，确认无引用后才删 URI；
 // - 未生成 ID 的项可直接删 URI。
@@ -54,119 +55,59 @@ void RollbackAddedLocations(RequestContext *request_context,
                             const std::shared_ptr<DataStorageManager> &data_storage_manager,
                             const std::shared_ptr<SchedulePlanExecutor> &schedule_plan_executor,
                             const std::vector<AddLocationRollbackItem> &items) {
-    CacheLocationDelRequest known_success_request;
-    known_success_request.instance_id = instance_id;
-
-    KeyVector uncertain_keys;
-    std::vector<std::string> uncertain_location_ids;
-    std::vector<const AddLocationRollbackItem *> uncertain_items;
-    std::unordered_map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
-    auto queue_uri_delete = [&direct_delete_uris](const AddLocationRollbackItem &item) {
-        if (item.uris.empty()) {
-            return;
-        }
-        auto &uris = direct_delete_uris[item.storage_name];
-        uris.insert(uris.end(), item.uris.begin(), item.uris.end());
-    };
-
-    for (const auto &item : items) {
-        if (item.ec == EC_OK && !item.location_id.empty()) {
-            known_success_request.block_keys.push_back(item.block_key);
-            known_success_request.location_ids.push_back({item.location_id});
-        } else if (!item.location_id.empty()) {
-            uncertain_keys.push_back(item.block_key);
-            uncertain_location_ids.push_back(item.location_id);
-            uncertain_items.push_back(&item);
-        } else {
-            queue_uri_delete(item);
-        }
-    }
-
-    if (!known_success_request.block_keys.empty() &&
-        (!schedule_plan_executor ||
-         !schedule_plan_executor->SubmitNonBlocking(
-             known_success_request, ScheduleTaskClass::kMigrationContinuation))) {
-        KVCM_LOG_WARN("[%s] rollback known successful migration locations failed to submit delete, instance %s, "
+    MetaSearcher::AddLocationRollbackPlan plan;
+    if (!indexer) {
+        KVCM_LOG_WARN("[%s] rollback migration locations retained URIs: meta indexer missing, instance %s, "
                       "key_count %zu",
                       trace_id.c_str(),
                       instance_id.c_str(),
-                      known_success_request.block_keys.size());
-    }
-
-    if (!uncertain_keys.empty()) {
-        if (!indexer) {
-            KVCM_LOG_WARN("[%s] rollback uncertain migration locations retained URIs: meta indexer missing, "
-                          "instance %s, key_count %zu",
+                      items.size());
+    } else {
+        KeyVector keys;
+        std::vector<MetaSearcher::AddLocationResult> add_results;
+        keys.reserve(items.size());
+        add_results.reserve(items.size());
+        for (const auto &item : items) {
+            keys.push_back(item.block_key);
+            add_results.push_back({item.ec, item.location_id});
+        }
+        MetaSearcher meta_searcher(indexer);
+        if (meta_searcher.ReconcileAddLocationRollback(request_context, keys, add_results, plan) != EC_OK) {
+            KVCM_LOG_WARN("[%s] rollback migration locations reconcile failed, instance %s, key_count %zu",
                           trace_id.c_str(),
                           instance_id.c_str(),
-                          uncertain_keys.size());
-        } else {
-            MetaSearcher meta_searcher(indexer);
-            LocationIdsPerKey location_ids_per_key;
-            location_ids_per_key.reserve(uncertain_location_ids.size());
-            for (const auto &location_id : uncertain_location_ids) {
-                location_ids_per_key.push_back({location_id});
-            }
-            std::vector<std::vector<ErrorCode>> delete_results;
-            const ErrorCode delete_ec =
-                meta_searcher.BatchDeleteLocations(request_context,
-                                                   uncertain_keys,
-                                                   location_ids_per_key,
-                                                   delete_results,
-                                                   {},
-                                                   false /* failed adds were never included in usage */,
-                                                   false /* failed adds were never counted as new keys */);
-            const size_t invalid_result_count =
-                std::count_if(delete_results.begin(), delete_results.end(), [](const auto &per_location_results) {
-                    return per_location_results.size() != 1;
-                });
-            if (delete_results.size() != uncertain_items.size() || invalid_result_count != 0) {
-                KVCM_LOG_WARN("[%s] rollback uncertain migration metadata returned unexpected result shape, "
-                              "instance %s, expected %zu, got %zu, invalid inner result count %zu, ec %d",
-                              trace_id.c_str(),
-                              instance_id.c_str(),
-                              uncertain_items.size(),
-                              delete_results.size(),
-                              invalid_result_count,
-                              delete_ec);
-            } else {
-                KeyVector sync_keys;
-                for (std::size_t i = 0; i < delete_results.size(); ++i) {
-                    if (delete_results[i].front() == EC_OK) {
-                        sync_keys.push_back(uncertain_keys[i]);
-                    }
-                }
-
-                bool metadata_synced = true;
-                if (!sync_keys.empty()) {
-                    metadata_synced = indexer->Sync(sync_keys);
-                    if (!metadata_synced) {
-                        KVCM_LOG_WARN("[%s] rollback uncertain migration locations failed to sync deleted metadata, "
-                                      "instance %s, key_count %zu",
-                                      trace_id.c_str(),
-                                      instance_id.c_str(),
-                                      sync_keys.size());
-                    }
-                }
-
-                for (std::size_t i = 0; i < delete_results.size(); ++i) {
-                    const ErrorCode per_location_ec = delete_results[i].front();
-                    if (per_location_ec == EC_NOENT || (per_location_ec == EC_OK && metadata_synced)) {
-                        queue_uri_delete(*uncertain_items[i]);
-                    } else if (per_location_ec != EC_OK) {
-                        KVCM_LOG_WARN("[%s] rollback uncertain migration metadata failed, instance %s, block_key %ld, "
-                                      "location_id %s, ec %d",
-                                      trace_id.c_str(),
-                                      instance_id.c_str(),
-                                      uncertain_keys[i],
-                                      uncertain_location_ids[i].c_str(),
-                                      per_location_ec);
-                    }
-                }
-            }
+                          items.size());
+            return;
         }
     }
 
+    if (!plan.pipeline_keys.empty()) {
+        CacheLocationDelRequest known_success_request;
+        known_success_request.instance_id = instance_id;
+        known_success_request.block_keys = plan.pipeline_keys;
+        known_success_request.location_ids.reserve(plan.pipeline_location_ids.size());
+        for (const auto &location_id : plan.pipeline_location_ids) {
+            known_success_request.location_ids.push_back({location_id});
+        }
+        if (!schedule_plan_executor || !schedule_plan_executor->SubmitNonBlocking(
+                                           known_success_request, ScheduleTaskClass::kMigrationContinuation)) {
+            KVCM_LOG_WARN("[%s] rollback known successful migration locations failed to submit delete, instance %s, "
+                          "key_count %zu",
+                          trace_id.c_str(),
+                          instance_id.c_str(),
+                          known_success_request.block_keys.size());
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
+    for (const size_t index : plan.direct_delete_indices) {
+        const auto &item = items[index];
+        if (item.uris.empty()) {
+            continue;
+        }
+        auto &uris = direct_delete_uris[item.storage_name];
+        uris.insert(uris.end(), item.uris.begin(), item.uris.end());
+    }
     if (direct_delete_uris.empty()) {
         return;
     }
