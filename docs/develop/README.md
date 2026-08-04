@@ -60,7 +60,7 @@ bazelisk info --announce_rc repository_cache
   - Bazel 6.4 默认不向 gcov 传 ```-b```；当前开发镜像的 GCC 10 支持通过 ```COVERAGE_GCOV_OPTIONS=-b``` 生成 ```BRDA/BRF/BRH``` 分支覆盖率记录。
   - CI 会上传 ```coverage/lcov.info```、```coverage/coverage-summary.md```、```coverage/coverage-summary.json``` 和 ```coverage/html/```。
   - PR 触发的 coverage 会更新同一条固定评论；评论 job 仅下载 coverage artifact，不检出或执行 PR 代码。
-  - ```coverage``` workflow 使用 setup-bazel 的 Bazelisk cache、repository cache 和独立 disk cache。PR 只读 cache，main push 或手动 ```rebuildDiskCache``` 会保存并替换旧 disk cache。
+  - ```coverage``` workflow 使用 setup-bazel 的 Bazelisk cache、repository cache 和独立 disk cache。PR 只读 cache；仅 nightly cache rebuild 或手动以 ```rebuildDiskCache=true``` 触发时保存并替换 main 分支的旧 disk cache。
   - 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```COVERAGE_RUNS_ON``` 选择 ```ubuntu-latest```、```ubuntu-24.04-arm``` 或 ```aliyun-ecs-x64```。
 ### 测试资源清理
 
