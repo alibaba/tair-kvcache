@@ -73,7 +73,9 @@ public:
 
     struct HostCacheMatch {
         std::string host_ip_port;
-        int64_t prefix_match_blocks;
+        int64_t local;
+        int64_t p2p_1_fetch;
+        int64_t p2p_1_total_match;
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,

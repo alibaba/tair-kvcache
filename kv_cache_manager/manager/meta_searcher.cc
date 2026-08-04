@@ -348,6 +348,111 @@ void BuildHostSpecNamesForOneKey(const CacheLocationMap &location_map,
     }
 }
 
+void BuildVineyardHostSpecNamesForOneKey(const CacheLocationMap &location_map,
+                                         CheckLocDataExistFunc check_loc_data_exist,
+                                         const std::unordered_set<std::string> &medium_set,
+                                         HostToSpecNames &host_specs) {
+    for (const auto &[location_id, loc] : location_map) {
+        if (!loc || loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ||
+            loc->location_specs().empty()) {
+            continue;
+        }
+        if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
+            continue;
+        }
+        std::string event_medium;
+        std::string reporter_host;
+        if (!SnapshotUriUtils::ParseEventReportLocationId(location_id, event_medium, reporter_host) ||
+            reporter_host.empty() || (!medium_set.empty() && medium_set.count(event_medium) == 0)) {
+            continue;
+        }
+        for (const auto &spec : loc->location_specs()) {
+            if (StandardUri(spec.uri()).Valid()) {
+                host_specs[reporter_host].insert(spec.name());
+            }
+        }
+    }
+}
+
+bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
+                              const std::vector<const LocationSpecGroup *> &groups);
+
+V6DPeerSelection SelectP2PByPrefix(const std::string &target_host,
+                                   const KeyToHostSpecNames &local_specs,
+                                   const KeyToHostSpecNames &vineyard_specs,
+                                   const std::vector<const LocationSpecGroup *> &required_groups = {}) {
+    assert(local_specs.size() == vineyard_specs.size());
+    std::vector<size_t> candidate_indices;
+    std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
+    for (size_t i = 0; i < local_specs.size(); ++i) {
+        auto local_it = local_specs[i].find(target_host);
+        const bool has_local_block = local_it != local_specs[i].end();
+        const bool local_hit = required_groups.empty()
+                                   ? has_local_block
+                                   : has_local_block && HasAllLocationSpecGroups(local_it->second, required_groups);
+        if (local_hit) {
+            continue;
+        }
+
+        std::vector<std::string> candidates;
+        for (const auto &[peer, specs] : vineyard_specs[i]) {
+            if (peer == target_host || specs.empty()) {
+                continue;
+            }
+            if (!required_groups.empty()) {
+                std::set<std::string> merged_specs = specs;
+                if (has_local_block) {
+                    merged_specs.insert(local_it->second.begin(), local_it->second.end());
+                }
+                if (!HasAllLocationSpecGroups(merged_specs, required_groups)) {
+                    continue;
+                }
+            }
+            candidates.push_back(peer);
+        }
+        if (candidates.empty()) {
+            break;
+        }
+        candidate_indices.push_back(i);
+        remote_peer_candidates.emplace(i, std::move(candidates));
+    }
+    return SelectV6DByPrefix(candidate_indices, remote_peer_candidates);
+}
+
+std::vector<std::set<std::string>> MergeHostAndP2PSpecs(const std::string &target_host,
+                                                        const KeyToHostSpecNames &local_specs,
+                                                        const KeyToHostSpecNames &vineyard_specs,
+                                                        const V6DPeerSelection &selection) {
+    assert(local_specs.size() == vineyard_specs.size());
+    std::vector<std::set<std::string>> merged_specs(local_specs.size());
+    for (size_t i = 0; i < local_specs.size(); ++i) {
+        if (auto local_it = local_specs[i].find(target_host); local_it != local_specs[i].end()) {
+            merged_specs[i] = local_it->second;
+        }
+    }
+    for (size_t i : selection.covered_indices) {
+        auto peer_it = vineyard_specs[i].find(selection.peer_addr);
+        if (peer_it != vineyard_specs[i].end()) {
+            merged_specs[i].insert(peer_it->second.begin(), peer_it->second.end());
+        }
+    }
+    return merged_specs;
+}
+
+int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key, bool use_eagle_pop) {
+    int64_t prefix_len = 0;
+    for (const auto &specs : specs_by_key) {
+        if (specs.empty()) {
+            break;
+        }
+        ++prefix_len;
+    }
+    if (use_eagle_pop) {
+        prefix_len = std::max<int64_t>(prefix_len - 1, 0);
+    }
+    return prefix_len;
+}
+
 bool IsFullLocationSpecGroup(const LocationSpecGroup &group) {
     const auto &name = group.name();
     return name.rfind("full", 0) == 0 || name.rfind("FULL", 0) == 0;
@@ -363,6 +468,28 @@ bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
         }
     }
     return true;
+}
+
+int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key,
+                                      bool use_eagle_pop,
+                                      const std::vector<const LocationSpecGroup *> &full_groups,
+                                      const std::vector<const LocationSpecGroup *> &mamba_state_groups) {
+    size_t full_prefix_len = 0;
+    for (; full_prefix_len < specs_by_key.size(); ++full_prefix_len) {
+        if (!HasAllLocationSpecGroups(specs_by_key[full_prefix_len], full_groups)) {
+            break;
+        }
+    }
+    if (use_eagle_pop && full_prefix_len > 0) {
+        --full_prefix_len;
+    }
+    for (size_t offset = full_prefix_len; offset > 0; --offset) {
+        const size_t index = offset - 1;
+        if (HasAllLocationSpecGroups(specs_by_key[index], mamba_state_groups)) {
+            return static_cast<int64_t>(index + 1);
+        }
+    }
+    return 0;
 }
 
 } // namespace
@@ -801,7 +928,9 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
     assert(keys.size() == location_maps.size());
 
     KeyToHostSpecNames key_to_host_spec_names;
+    KeyToHostSpecNames key_to_vineyard_spec_names;
     key_to_host_spec_names.reserve(keys.size());
+    key_to_vineyard_spec_names.reserve(keys.size());
     const std::unordered_set<std::string> medium_set(medium_filter.begin(), medium_filter.end());
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
@@ -810,9 +939,13 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
             break;
         }
         HostToSpecNames host_to_spec_names;
+        HostToSpecNames vineyard_spec_names;
         BuildHostSpecNamesForOneKey(location_maps[i], check_loc_data_exist_func_, medium_set, host_to_spec_names);
+        BuildVineyardHostSpecNamesForOneKey(
+            location_maps[i], check_loc_data_exist_func_, medium_set, vineyard_spec_names);
         // 只保留可参与前缀匹配的连续 key 前缀。
         key_to_host_spec_names.push_back(std::move(host_to_spec_names));
+        key_to_vineyard_spec_names.push_back(std::move(vineyard_spec_names));
     }
 
     if (key_to_host_spec_names.empty() || key_to_host_spec_names.front().empty()) {
@@ -822,19 +955,22 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
     out_matches.reserve(key_to_host_spec_names.front().size());
     // 只有命中第一个 key 的 host 才可能有大于 0 的前缀长度。
     for (const auto &[host, _] : key_to_host_spec_names.front()) {
-        int64_t prefix_len = 1;
-        for (size_t i = 1; i < key_to_host_spec_names.size(); ++i) {
-            if (key_to_host_spec_names[i].find(host) == key_to_host_spec_names[i].end()) {
-                break;
-            }
-            ++prefix_len;
+        const V6DPeerSelection no_p2p;
+        auto local_specs = MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
+        const int64_t local = ComputePrefixMatchBlocks(local_specs, use_eagle_pop);
+        if (local == 0) {
+            continue;
         }
-        if (use_eagle_pop) {
-            prefix_len = std::max<int64_t>(prefix_len - 1, 0);
+
+        auto p2p_selection = SelectP2PByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names);
+        int64_t p2p_1_total_match = local;
+        if (!p2p_selection.covered_indices.empty()) {
+            auto p2p_specs =
+                MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, p2p_selection);
+            p2p_1_total_match = ComputePrefixMatchBlocks(p2p_specs, use_eagle_pop);
         }
-        if (prefix_len > 0) {
-            out_matches.push_back(HostCacheMatch{host, prefix_len});
-        }
+        out_matches.push_back(
+            HostCacheMatch{host, local, static_cast<int64_t>(p2p_selection.covered_indices.size()), p2p_1_total_match});
     }
     return EC_OK;
 }
@@ -869,6 +1005,8 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
         KVCM_LOG_WARN("%s", error_msg.c_str());
         return EC_BADARGS;
     }
+    std::vector<const LocationSpecGroup *> required_groups = full_groups;
+    required_groups.insert(required_groups.end(), mamba_state_groups.begin(), mamba_state_groups.end());
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
@@ -879,6 +1017,7 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
     assert(keys.size() == location_maps.size());
 
     KeyToHostSpecNames key_to_host_spec_names(keys.size());
+    KeyToHostSpecNames key_to_vineyard_spec_names(keys.size());
     const std::unordered_set<std::string> medium_set(medium_filter.begin(), medium_filter.end());
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
@@ -890,41 +1029,33 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
         }
         BuildHostSpecNamesForOneKey(
             location_maps[i], check_loc_data_exist_func_, medium_set, key_to_host_spec_names[i]);
+        BuildVineyardHostSpecNamesForOneKey(
+            location_maps[i], check_loc_data_exist_func_, medium_set, key_to_vineyard_spec_names[i]);
     }
 
     out_matches.reserve(key_to_host_spec_names.front().size());
     // 只有命中第一个 key 的 host 才可能有大于 0 的前缀长度。
     for (const auto &kv : key_to_host_spec_names.front()) {
         const auto &host = kv.first;
-        size_t full_prefix_len = 0;
-        for (; full_prefix_len < key_to_host_spec_names.size(); ++full_prefix_len) {
-            auto host_it = key_to_host_spec_names[full_prefix_len].find(host);
-            if (host_it == key_to_host_spec_names[full_prefix_len].end() ||
-                !HasAllLocationSpecGroups(host_it->second, full_groups)) {
-                break;
-            }
-        }
-        if (use_eagle_pop && full_prefix_len > 0) {
-            --full_prefix_len;
-        }
-        if (full_prefix_len == 0) {
+        const V6DPeerSelection no_p2p;
+        auto local_specs = MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
+        const int64_t local =
+            ComputeMambaPrefixMatchBlocks(local_specs, use_eagle_pop, full_groups, mamba_state_groups);
+        if (local == 0) {
             continue;
         }
 
-        int64_t prefix_len = 0;
-        // Mamba 模式要求 full 前缀范围内最后一个可用 block 同时具备 mamba state。
-        for (size_t offset = full_prefix_len; offset > 0; --offset) {
-            const size_t index = offset - 1;
-            auto host_it = key_to_host_spec_names[index].find(host);
-            if (host_it != key_to_host_spec_names[index].end() &&
-                HasAllLocationSpecGroups(host_it->second, mamba_state_groups)) {
-                prefix_len = static_cast<int64_t>(index + 1);
-                break;
-            }
+        auto p2p_selection =
+            SelectP2PByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names, required_groups);
+        int64_t p2p_1_total_match = local;
+        if (!p2p_selection.covered_indices.empty()) {
+            auto p2p_specs =
+                MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, p2p_selection);
+            p2p_1_total_match =
+                ComputeMambaPrefixMatchBlocks(p2p_specs, use_eagle_pop, full_groups, mamba_state_groups);
         }
-        if (prefix_len > 0) {
-            out_matches.push_back(HostCacheMatch{host, prefix_len});
-        }
+        out_matches.push_back(
+            HostCacheMatch{host, local, static_cast<int64_t>(p2p_selection.covered_indices.size()), p2p_1_total_match});
     }
     return EC_OK;
 }

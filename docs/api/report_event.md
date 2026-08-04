@@ -655,7 +655,9 @@ HTTP 接口为 `POST /api/getHostCacheState`：
   "hosts": [
     {
       "host_ip_port": "10.0.0.8:8080",
-      "prefix_match_blocks": "3"
+      "local": "3",
+      "p2p_1_fetch": "0",
+      "p2p_1_total_match": "3"
     }
   ]
 }
@@ -671,11 +673,15 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
 - 支持 `QT_PREFIX_MATCH` 和 `QT_PREFIX_MATCH_WITH_MAMBA`，其他类型返回参数错误；
 - 同一个 host 在多个 backend 的有效 cache 会按 host 汇总参与匹配；
+- `local` 包含同一 host 的 subscriber 与 Vineyard 上报；
+- `p2p_1_fetch` 表示默认 Prefix 策略选择一个远端 Vineyard 后可补齐的 local-miss 逻辑 block 数；
+- `p2p_1_total_match` 表示本地 cache 与该单一远端 Vineyard 合并后的最终前缀；
+- 远端 P2P 候选只使用 `ST_EVENT_REPORT_L2`，且不会让 `local` 为 0 的 host 出现在响应中；
 - reporter unavailable 时，该 host 对应的 event-report location 不参与匹配。
 
 成功完整 snapshot 后，`GetHostCacheState` 会立即忽略完全属于旧 generation 的 location。
 snapshot 失败、KVCM 重启恢复或 realtime-only reporter 仍使用 soft metadata，因此
-`prefix_match_blocks` 在这些模式下仍可能是 false positive。
+`local` 在这些模式下仍可能是 false positive。
 
 ## 12. 节点生命周期与查询
 

@@ -524,7 +524,9 @@ message GetHostCacheStateRequest {
 
 message HostCacheMatch {
     string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
-    int64 prefix_match_blocks = 2;         // 连续命中的 block 数（调用方自己 ×block_size 算 tokens）
+    int64 local = 2;           // 本地前缀匹配的 block 数
+    int64 p2p_1_fetch = 3;     // 选择一个远端 p2p 拉取的 local-miss block数
+    int64 p2p_1_total_match = 4;   // p2p 后最终的前缀匹配的block数
 }
 
 message GetHostCacheStateResponse {

@@ -1015,7 +1015,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         matches = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in host_state.get("hosts", [])
         }
         self.assertEqual(matches.get(host), 1)
@@ -1167,7 +1167,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         target_prefixes = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in target_host_state.get("hosts", [])
         }
         self.assertEqual(target_prefixes.get(host), 1)
@@ -1284,7 +1284,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         hidden_prefixes = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in hidden_host_state.get("hosts", [])
         }
         self.assertEqual(
@@ -1388,7 +1388,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         recovered_prefixes = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in recovered_host_state.get("hosts", [])
         }
         self.assertEqual(recovered_prefixes.get(host), 1)
@@ -1671,14 +1671,14 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [10000, 10001, 10002, 10003, 10004],
         })
 
-        # 3. Verify prefix_match_blocks per host
+        # 3. Verify local per host
         expected = {
             "10.0.0.1:8080": 2,
             "10.0.0.2:8080": 4,
             "10.0.0.3:8080": 1,
         }
         actual = {
-            h["host_ip_port"]: int(h["prefix_match_blocks"])
+            h["host_ip_port"]: int(h["local"])
             for h in resp.get("hosts", [])
         }
         for host, prefix in expected.items():
@@ -3209,7 +3209,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [25_000_250],
         })
         matches = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in host_state.get("hosts", [])
         }
         self.assertEqual(matches.get(host), 1)
@@ -3400,7 +3400,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             ],
         })
         matches = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in host_state.get("hosts", [])
         }
         self.assertEqual(matches.get(host), writer_count)
@@ -3514,7 +3514,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         empty_matches = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in empty_host_state.get("hosts", [])
         }
         self.assertNotIn(host, empty_matches)
@@ -3560,7 +3560,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             "block_cache_keys": [block_key],
         })
         visible_matches = {
-            item["host_ip_port"]: int(item["prefix_match_blocks"])
+            item["host_ip_port"]: int(item["local"])
             for item in visible_host_state.get("hosts", [])
         }
         self.assertEqual(visible_matches.get(host), 1)

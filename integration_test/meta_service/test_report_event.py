@@ -1014,9 +1014,13 @@ class EventReportFunctionalTest(unittest.TestCase):
             "10.0.0.3:8080": 1,
         }
         actual = {
-            h["host_ip_port"]: int(h["prefix_match_blocks"])
+            h["host_ip_port"]: int(h["local"])
             for h in resp.get("hosts", [])
         }
+        self.assertNotIn("p2p_1_hit_count", resp)
+        for host_match in resp.get("hosts", []):
+            self.assertIn("p2p_1_fetch", host_match)
+            self.assertIn("p2p_1_total_match", host_match)
         for host, prefix in expected.items():
             self.assertIn(host, actual, f"host {host} not found in response")
             self.assertEqual(actual[host], prefix, f"host {host}: expected prefix={prefix}, got {actual[host]}")
