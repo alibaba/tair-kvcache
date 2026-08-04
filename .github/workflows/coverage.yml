@@ -3,8 +3,6 @@ permissions:
   contents: read
   actions: write
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -61,7 +59,7 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ runner.os }}-${{ github.workflow }}
           repository-cache: true
-          cache-save: ${{ github.event_name == 'push' || (inputs.rebuildDiskCache || false) }}
+          cache-save: ${{ inputs.rebuildDiskCache || false }}
 
       - &clean_disk_cache_step
         name: clean_disk_cache
@@ -90,7 +88,7 @@ jobs:
       - &bazel_coverage_step
         name: bazel_coverage
         env:
-          COVERAGE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          COVERAGE_BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/main' }}
           COVERAGE_XTRACE: "1"
         run: |
           set -e
@@ -110,7 +108,7 @@ jobs:
 
       - &delete_old_disk_cache_step
         name: delete_old_disk_cache
-        if: ${{ github.event_name == 'push' || (inputs.rebuildDiskCache || false) }}
+        if: ${{ inputs.rebuildDiskCache || false }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
