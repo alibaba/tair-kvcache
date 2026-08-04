@@ -435,12 +435,25 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint32_t cache_reclaimer_idle_interval_ms,
                         uint32_t cache_reclaimer_worker_size,
                         CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config,
-                        uint32_t schedule_plan_migration_worker_budget) {
+                        uint32_t schedule_plan_migration_worker_budget,
+                        uint32_t meta_query_worker_count,
+                        std::size_t meta_query_parallel_threshold,
+                        std::size_t meta_query_chunk_size) {
     if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
         schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
         KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
                        schedule_plan_executor_thread_count,
                        schedule_plan_migration_worker_budget);
+        return false;
+    }
+    if (meta_query_worker_count == 0 || meta_query_worker_count > 64 || meta_query_parallel_threshold == 0 ||
+        meta_query_chunk_size == 0 || meta_query_chunk_size > meta_query_parallel_threshold ||
+        !meta_indexer_manager_->ConfigureQueryExecutor(
+            meta_query_worker_count, meta_query_parallel_threshold, meta_query_chunk_size)) {
+        KVCM_LOG_ERROR("invalid meta query executor config: workers=%u threshold=%zu chunk_size=%zu",
+                       meta_query_worker_count,
+                       meta_query_parallel_threshold,
+                       meta_query_chunk_size);
         return false;
     }
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
@@ -3692,6 +3705,72 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
     };
 }
 
+CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
+    auto fallback = GetCheckLocDataExistFunc(instance_id);
+    struct EventVisibilitySnapshot {
+        std::shared_ptr<EventReportBackend> backend;
+        EventReportBackend::QueryVisibilitySnapshot reporters;
+    };
+    struct EventVisibilitySnapshots {
+        std::once_flag initialize_once;
+        std::map<DataStorageType, EventVisibilitySnapshot> by_storage_type;
+    };
+    auto event_snapshots = std::make_shared<EventVisibilitySnapshots>();
+    auto initialize_event_snapshots = [registry_manager = registry_manager_, instance_id, event_snapshots] {
+        if (!registry_manager || !registry_manager->data_storage_manager()) {
+            return;
+        }
+        const std::string group_name = registry_manager->GetInstanceGroupName(instance_id);
+        const auto instance_group = registry_manager->GetInstanceGroupConfig(group_name);
+        const auto storage_manager = registry_manager->data_storage_manager();
+        if (!instance_group || !storage_manager) {
+            return;
+        }
+        for (const auto &candidate_name : instance_group->event_report_storage_candidates()) {
+            auto event_backend =
+                std::dynamic_pointer_cast<EventReportBackend>(storage_manager->GetDataStorageBackend(candidate_name));
+            if (!event_backend) {
+                continue;
+            }
+            const DataStorageType storage_type = event_backend->GetStorageType();
+            if (event_snapshots->by_storage_type.find(storage_type) != event_snapshots->by_storage_type.end()) {
+                continue;
+            }
+            EventVisibilitySnapshot snapshot;
+            snapshot.backend = std::move(event_backend);
+            snapshot.backend->GetQueryVisibilitySnapshot(instance_id, snapshot.reporters);
+            event_snapshots->by_storage_type.emplace(storage_type, std::move(snapshot));
+        }
+    };
+
+    return [fallback = std::move(fallback),
+            event_snapshots = std::move(event_snapshots),
+            initialize_event_snapshots = std::move(initialize_event_snapshots)](const CacheLocation &location) -> bool {
+        if (!IsEventReportStorageType(location.type())) {
+            return fallback ? fallback(location) : true;
+        }
+        // Initialization is intentionally lazy: MetaSearcher reads metadata
+        // before invoking this callback, so the request-level liveness/version
+        // snapshot is taken after the potentially expensive metadata I/O.
+        std::call_once(event_snapshots->initialize_once, initialize_event_snapshots);
+        const auto snapshot_it = event_snapshots->by_storage_type.find(location.type());
+        if (snapshot_it == event_snapshots->by_storage_type.end() || !snapshot_it->second.backend) {
+            return false;
+        }
+        std::string reporter_medium;
+        std::string reporter_host;
+        if (!snapshot_it->second.backend->ParseLocationId(location.id(), reporter_medium, reporter_host)) {
+            return false;
+        }
+        const auto reporter_it = snapshot_it->second.reporters.find(reporter_host);
+        if (reporter_it == snapshot_it->second.reporters.end()) {
+            return false;
+        }
+        return IsEventReportLocationReadable(
+            location, reporter_it->second.strict, reporter_it->second.committed_version);
+    };
+}
+
 SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_id) const {
     return [this, instance_id](const std::vector<std::int64_t> &blk_keys,
                                const std::vector<std::vector<std::string>> &loc_ids,
@@ -3757,12 +3836,17 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
+    const auto request_check_loc_data_exist = GetHostCacheStateCheckLocDataExistFunc(instance_id);
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatchByHost(
-            request_context, block_cache_keys, use_eagle_pop, medium_filter, host_matches);
+        ec = meta_searcher->PrefixMatchByHost(request_context,
+                                              block_cache_keys,
+                                              use_eagle_pop,
+                                              medium_filter,
+                                              host_matches,
+                                              &request_check_loc_data_exist);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -3771,7 +3855,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        use_eagle_pop,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
-                                                       host_matches);
+                                                       host_matches,
+                                                       &request_check_loc_data_exist);
         break;
     }
     default:

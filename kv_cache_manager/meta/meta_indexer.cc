@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <set>
 #include <string>
 #include <vector>
@@ -669,6 +670,76 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
     return result;
 }
 
+MetaIndexer::Result MetaIndexer::GetLocationValues(RequestContext *request_context,
+                                                   const KeyVector &keys,
+                                                   LocationsPerKey &out_locations) noexcept {
+    if (keys.empty()) {
+        out_locations.clear();
+        return Result(EC_OK);
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    std::vector<ErrorCode> error_codes;
+    const bool use_parallel_local_read = query_executor_ && query_executor_->worker_count() > 1 &&
+                                         keys.size() >= query_executor_->parallel_threshold() &&
+                                         backend_manager_->SupportsConcurrentLocationValueReads();
+    if (use_parallel_local_read) {
+        error_codes.assign(keys.size(), EC_ERROR);
+        out_locations.clear();
+        out_locations.resize(keys.size());
+        const bool completed = query_executor_->ParallelFor(
+            keys.size(), [this, &keys, &error_codes, &out_locations](std::size_t begin, std::size_t end) {
+                KeyVector chunk_keys(keys.begin() + begin, keys.begin() + end);
+                LocationsPerKey chunk_locations;
+                auto chunk_errors = backend_manager_->GetLocationValues(nullptr, chunk_keys, chunk_locations);
+                const std::size_t expected = end - begin;
+                if (chunk_errors.size() != expected || chunk_locations.size() != expected) {
+                    KVCM_LOG_ERROR(
+                        "parallel local location read size mismatch: errors[%zu] locations[%zu] expected[%zu]",
+                        chunk_errors.size(),
+                        chunk_locations.size(),
+                        expected);
+                    return;
+                }
+                for (std::size_t i = 0; i < expected; ++i) {
+                    error_codes[begin + i] = chunk_errors[i];
+                    out_locations[begin + i] = std::move(chunk_locations[i]);
+                }
+            });
+        if (!completed) {
+            KVCM_LOG_ERROR("trace_id[%s] instance[%s] | parallel local location read callback failed",
+                           trace_id.c_str(),
+                           instance_id_.c_str());
+        }
+    } else {
+        error_codes = backend_manager_->GetLocationValues(request_context, keys, out_locations);
+    }
+    if (error_codes.size() != keys.size() || out_locations.size() != keys.size()) {
+        KVCM_LOG_ERROR("trace_id[%s] instance[%s] | location value result size mismatch: errors[%zu] "
+                       "locations[%zu] keys[%zu]",
+                       trace_id.c_str(),
+                       instance_id_.c_str(),
+                       error_codes.size(),
+                       out_locations.size(),
+                       keys.size());
+        std::vector<ErrorCode> normalized_errors(keys.size(), EC_ERROR);
+        const std::size_t error_count = std::min(keys.size(), error_codes.size());
+        std::copy_n(error_codes.begin(), error_count, normalized_errors.begin());
+        error_codes = std::move(normalized_errors);
+        out_locations.resize(keys.size());
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+
+    Result result(keys.size());
+    int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
+    return result;
+}
+
 MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       const LocationIdsPerKey &location_ids,
@@ -714,6 +785,22 @@ MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_co
         result.ec = EC_PARTIAL_OK;
     }
     return result;
+}
+
+bool MetaIndexer::ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept {
+    if (query_executor_) {
+        return query_executor_->ParallelFor(count, fn);
+    }
+    if (count == 0) {
+        return true;
+    }
+    try {
+        fn(0, count);
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("serial query callback threw exception: %s", e.what());
+    } catch (...) { KVCM_LOG_ERROR("serial query callback threw unknown exception"); }
+    return false;
 }
 
 MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,

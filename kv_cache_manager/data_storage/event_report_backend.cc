@@ -1022,6 +1022,29 @@ bool EventReportBackend::GetQueryVisibilityState(const ReporterSnapshotKey &repo
     return true;
 }
 
+void EventReportBackend::GetQueryVisibilitySnapshot(const std::string &instance_id,
+                                                    QueryVisibilitySnapshot &out_snapshot) const {
+    out_snapshot.clear();
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    const auto instance_it = instance_nodes_.find(instance_id);
+    if (instance_it == instance_nodes_.end()) {
+        return;
+    }
+    out_snapshot.reserve(instance_it->second.size());
+    for (const auto &[host_ip_port, node] : instance_it->second) {
+        if (!node || !node->available.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        QueryVisibilityState state;
+        const auto version_it = snapshot_versions_.find({instance_id, host_ip_port});
+        if (version_it != snapshot_versions_.end()) {
+            state.strict = version_it->second.strict_query_visibility;
+            state.committed_version = version_it->second.committed;
+        }
+        out_snapshot.emplace(host_ip_port, std::move(state));
+    }
+}
+
 uint64_t EventReportBackend::GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     const auto it = snapshot_versions_.find(reporter_key);

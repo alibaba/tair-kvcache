@@ -83,13 +83,15 @@ public:
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
                                 const std::vector<std::string> &medium_filter,
-                                std::vector<HostCacheMatch> &out_matches) const;
+                                std::vector<HostCacheMatch> &out_matches,
+                                const CheckLocDataExistFunc *request_check_loc_data_exist = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
                                          const std::vector<std::string> &medium_filter,
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
-                                         std::vector<HostCacheMatch> &out_matches) const;
+                                         std::vector<HostCacheMatch> &out_matches,
+                                         const CheckLocDataExistFunc *request_check_loc_data_exist = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,

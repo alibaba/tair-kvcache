@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,9 @@ struct MetricsLifecycle;
 class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
+constexpr unsigned int DEFAULT_META_QUERY_WORKER_COUNT = 4;
+constexpr std::size_t DEFAULT_META_QUERY_PARALLEL_THRESHOLD = 256;
+constexpr std::size_t DEFAULT_META_QUERY_CHUNK_SIZE = 128;
 
 class CacheManager {
     // TODO should not public
@@ -88,7 +92,10 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
               CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
-              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET,
+              uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
+              std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
+              std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE);
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -335,6 +342,7 @@ private:
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
+    CheckLocDataExistFunc GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
 

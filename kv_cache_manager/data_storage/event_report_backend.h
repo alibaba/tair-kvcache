@@ -25,6 +25,11 @@ class EventReportBackend : public DataStorageBackend {
 public:
     using CleanupCallback =
         std::function<void(const std::string &instance_id, const std::string &host_ip_port, uint64_t generation)>;
+    struct QueryVisibilityState {
+        bool strict = false;
+        std::string committed_version;
+    };
+    using QueryVisibilitySnapshot = std::unordered_map<std::string, QueryVisibilityState>;
 
     EventReportBackend() = delete;
     explicit EventReportBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
@@ -119,6 +124,11 @@ public:
     bool GetQueryVisibilityState(const ReporterSnapshotKey &reporter_key,
                                  bool &out_strict,
                                  std::string &out_committed) const;
+    // Captures every currently queryable reporter for one instance under one
+    // node-table read lock. GetHostCacheState uses this request-level snapshot
+    // instead of repeating registry/backend lookups and nodes_mutex_ acquisition
+    // for every (block, location).
+    void GetQueryVisibilitySnapshot(const std::string &instance_id, QueryVisibilitySnapshot &out_snapshot) const;
     uint64_t GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const;
     void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
     void SetSnapshotDeltaDrainTimeoutMsForTest(int64_t timeout_ms);

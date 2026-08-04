@@ -15,6 +15,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
@@ -59,6 +60,8 @@ public:
 
     // Set revisit interval histogram for tracking cache access patterns.
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
+    // Injected once by MetaIndexerManager before Init/traffic begins.
+    void SetQueryExecutor(std::shared_ptr<QueryExecutor> executor) { query_executor_ = std::move(executor); }
 
     // ---------- WRITE ----------
     Result Put(RequestContext *request_context,
@@ -85,6 +88,11 @@ public:
     Result GetLocations(RequestContext *request_context,
                         const KeyVector &keys,
                         CacheLocationMapVector &out_location_maps) noexcept;
+    // Lightweight all-location view used by GetHostCacheState. For a single
+    // local backend, large requests are read concurrently through the shared
+    // bounded query executor. Other backend modes remain one batched call.
+    Result
+    GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
@@ -101,6 +109,11 @@ public:
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
+
+    // Reuses the same bounded executor for CPU-only query projection/reduction.
+    // Directly constructed test/indexer instances without an executor retain
+    // serial behavior.
+    bool ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
@@ -182,6 +195,7 @@ private:
 private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
+    std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;
