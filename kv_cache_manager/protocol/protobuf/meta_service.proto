@@ -80,7 +80,9 @@ message NodeRegisterEventParams {
 }
 
 message BlockAddEventParams {
-    string block_key = 1; // int64 as string
+    // Signed int64 decimal, or unsigned uint64 decimal mapped to the same
+    // internal 64-bit key (e.g. UINT64_MAX is equivalent to -1).
+    string block_key = 1;
     string uri = 2;       // deprecated, use specs instead
     string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;

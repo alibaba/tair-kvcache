@@ -291,6 +291,9 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
         const auto &existing = it->second;
         auto mismatched = existing->MismatchFields(
             block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
+        if (existing->instance_group_name() != instance_group) {
+            mismatched.insert(mismatched.begin(), "instance_group_name");
+        }
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(

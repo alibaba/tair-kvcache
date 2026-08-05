@@ -510,7 +510,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
 
     LocationResult location_result(location_ids);
     Result rmw_result(keys.size());
-    int32_t error_count = 0;
+    // The aggregate result reports whether the RMW machinery completed for
+    // each key. Per-location semantic outcomes (for example, a CAS mismatch
+    // or a rejected task in an otherwise valid batch) remain in
+    // per_location_error_codes and do not fail the whole operation. Track
+    // structural/read/modifier/write failures separately so malformed backend
+    // responses still fail closed without changing that established contract.
+    std::vector<bool> key_level_failures(keys.size(), false);
     RmwStats stats;
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
@@ -530,6 +536,20 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         stats.index_deserialize_time_us += v;
         stats.has_index_deserialize = true;
 
+        if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu]",
+                               batch_keys.size(),
+                               get_ecs_per_key.size(),
+                               batch_locations_per_key.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(),
+                                                                            EC_MISMATCH);
+                key_level_failures[global_idx] = true;
+            }
+            continue;
+        }
+
         // 2. Per-key modifier dispatch -> bucket each key into the upsert sub-batch or the delete sub-batch.
         BatchMetaData upsert_batch;
         BatchMetaData delete_batch;
@@ -539,15 +559,58 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
             const int32_t global_idx = batch.batch_indexs[i];
             const KeyType key = batch_keys[i];
 
-            const std::vector<ErrorCode> &get_ecs = get_ecs_per_key[i];
+            std::vector<ErrorCode> &get_ecs = get_ecs_per_key[i];
             const LocationIdVector &loc_ids = batch.batch_location_ids[i];
             CacheLocationVector &loc_values = batch_locations_per_key[i];
+            if (get_ecs.size() != loc_ids.size() || loc_values.size() != loc_ids.size()) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "ReadModifyWriteLocation per-key result size mismatch, key[%ld], ids[%lu], "
+                                   "ecs[%lu], locations[%lu]",
+                                   key,
+                                   loc_ids.size(),
+                                   get_ecs.size(),
+                                   loc_values.size());
+                location_result.per_location_error_codes[global_idx].assign(loc_ids.size(), EC_MISMATCH);
+                key_level_failures[global_idx] = true;
+                continue;
+            }
+            // EC_OK promises a usable value for the requested id. Treat a
+            // null or mis-keyed value as corruption and never let a modifier
+            // turn it into a write based on fabricated state.
+            for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+                if (get_ecs[loc_index] == EC_OK &&
+                    (!loc_values[loc_index] || loc_values[loc_index]->id() != loc_ids[loc_index])) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "ReadModifyWriteLocation invalid EC_OK value, key[%ld], requested id[%s]",
+                                       key,
+                                       loc_ids[loc_index].c_str());
+                    get_ecs[loc_index] = EC_MISMATCH;
+                    loc_values[loc_index].reset();
+                }
+                if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
+                    key_level_failures[global_idx] = true;
+                }
+            }
             PropertyMap upsert_property_map;
             auto [action, modifier_ecs] =
                 modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
             if (modifier_ecs.size() != loc_ids.size()) {
                 modifier_ecs.assign(loc_ids.size(), EC_ERROR);
                 action = MA_FAIL;
+                key_level_failures[global_idx] = true;
+            }
+            // A read error other than NOENT is not a valid basis for an RMW.
+            // Force it back into the corresponding result slot even if a
+            // buggy modifier accidentally returned EC_OK.
+            for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+                if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
+                    modifier_ecs[loc_index] = get_ecs[loc_index];
+                }
+            }
+            if (action == MA_FAIL &&
+                std::all_of(modifier_ecs.begin(), modifier_ecs.end(), [](ErrorCode ec) { return ec == EC_OK; })) {
+                modifier_ecs.assign(loc_ids.size(), EC_ERROR);
+                key_level_failures[global_idx] = true;
             }
             if (action == MA_OK) {
                 CacheLocationMap upsert_loc_map;
@@ -558,7 +621,11 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                     }
                     const LocationId &loc_id = loc_ids[loc_index];
                     const CacheLocationConstPtr &working_loc = loc_values[loc_index];
-                    assert(working_loc && loc_id == working_loc->id());
+                    if (!working_loc || loc_id != working_loc->id()) {
+                        location_result.per_location_error_codes[global_idx][loc_index] = EC_MISMATCH;
+                        key_level_failures[global_idx] = true;
+                        continue;
+                    }
                     upsert_loc_map.emplace(loc_id, working_loc);
                     upsert_location_indexs[global_idx].emplace_back(loc_index);
                 }
@@ -586,7 +653,10 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
             } else {
                 // MA_FAIL / MA_SKIP / unknown: surface modifier_ec if any.
                 if (action == MA_FAIL) {
-                    ++error_count;
+                    key_level_failures[global_idx] = true;
+                } else if (action != MA_SKIP) {
+                    modifier_ecs.assign(loc_ids.size(), EC_ERROR);
+                    key_level_failures[global_idx] = true;
                 }
                 location_result.per_location_error_codes[global_idx] = std::move(modifier_ecs);
             }
@@ -596,7 +666,11 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         static std::vector<int32_t> empty_put_global_indexs;
         const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(
             trace_id, ephemeral_request_context.get(), upsert_batch, empty_put_global_indexs, keys, stats, rmw_result);
+        (void)upsert_errs;
         for (const auto &global_index : upsert_batch.batch_indexs) {
+            if (rmw_result.error_codes[global_index] != EC_OK) {
+                key_level_failures[global_index] = true;
+            }
             for (const auto &location_index : upsert_location_indexs[global_index]) {
                 location_result.per_location_error_codes[global_index][location_index] =
                     rmw_result.error_codes[global_index];
@@ -604,24 +678,29 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         }
         const auto [delete_errs, delete_success_count] =
             ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
+        (void)delete_errs;
         for (const auto &global_index : delete_batch.batch_indexs) {
+            if (rmw_result.error_codes[global_index] != EC_OK) {
+                key_level_failures[global_index] = true;
+            }
             for (const auto &location_index : delete_location_indexs[global_index]) {
                 location_result.per_location_error_codes[global_index][location_index] =
                     rmw_result.error_codes[global_index];
             }
         }
-        error_count += upsert_errs + delete_errs;
         AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));
     }
 
     EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
-    if (error_count == keys.size()) {
+    const size_t failed_key_count =
+        static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
+    if (failed_key_count == keys.size()) {
         location_result.ec = EC_ERROR;
-        PREFIX_INDEXER_LOG(DEBUG, "all locations rmw failed, error count[%d]", error_count);
-    } else if (error_count > 0) {
+        PREFIX_INDEXER_LOG(DEBUG, "all locations rmw failed, error count[%lu]", failed_key_count);
+    } else if (failed_key_count > 0) {
         location_result.ec = EC_PARTIAL_OK;
         PREFIX_INDEXER_LOG(
-            DEBUG, "partial locations rmw failed, keys count[%lu] failed count[%d]", keys.size(), error_count);
+            DEBUG, "partial locations rmw failed, keys count[%lu] failed count[%lu]", keys.size(), failed_key_count);
     }
     return location_result;
 }
@@ -675,6 +754,15 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
 
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
     auto error_codes = backend_manager_->GetLocations(request_context, keys, out_location_maps);
+    if (error_codes.size() != keys.size() || out_location_maps.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetLocations result size mismatch, keys[%lu], ecs[%lu], locations[%lu]",
+                           keys.size(),
+                           error_codes.size(),
+                           out_location_maps.size());
+        error_codes.assign(keys.size(), EC_MISMATCH);
+        out_location_maps.assign(keys.size(), CacheLocationMap{});
+    }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
@@ -739,11 +827,11 @@ MetaIndexer::Result MetaIndexer::GetLocationValues(RequestContext *request_conte
                        error_codes.size(),
                        out_locations.size(),
                        keys.size());
-        std::vector<ErrorCode> normalized_errors(keys.size(), EC_ERROR);
-        const std::size_t error_count = std::min(keys.size(), error_codes.size());
-        std::copy_n(error_codes.begin(), error_count, normalized_errors.begin());
-        error_codes = std::move(normalized_errors);
-        out_locations.resize(keys.size());
+        // Errors and values are one positional response. If either outer
+        // shape is malformed, no apparent in-range EC_OK/value pair can be
+        // trusted to refer to the requested key.
+        error_codes.assign(keys.size(), EC_MISMATCH);
+        out_locations.assign(keys.size(), CacheLocationVector{});
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
@@ -758,7 +846,14 @@ MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_co
                                                       const KeyVector &keys,
                                                       const LocationIdsPerKey &location_ids,
                                                       LocationsPerKey &out_locations) noexcept {
-    assert(keys.size() == location_ids.size());
+    if (keys.size() != location_ids.size()) {
+        out_locations.clear();
+        KVCM_LOG_ERROR("instance[%s] | GetLocations keys size[%lu] != location_ids size[%lu]",
+                       instance_id_.c_str(),
+                       keys.size(),
+                       location_ids.size());
+        return LocationResult(EC_BADARGS);
+    }
     if (keys.empty()) {
         out_locations.clear();
         return LocationResult(EC_OK);
@@ -773,7 +868,46 @@ MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_co
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
     LocationResult result(location_ids);
-    result.per_location_error_codes = std::move(per_location_ecs);
+    if (per_location_ecs.size() != keys.size() || out_locations.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetLocations result size mismatch, keys[%lu], ecs[%lu], locations[%lu]",
+                           keys.size(),
+                           per_location_ecs.size(),
+                           out_locations.size());
+        out_locations.assign(keys.size(), CacheLocationVector{});
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out_locations[i].resize(location_ids[i].size());
+            result.per_location_error_codes[i].assign(location_ids[i].size(), EC_MISMATCH);
+        }
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const size_t expected = location_ids[i].size();
+            if (per_location_ecs[i].size() != expected || out_locations[i].size() != expected) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "GetLocations per-key result size mismatch, key[%ld], ids[%lu], ecs[%lu], "
+                                   "locations[%lu]",
+                                   keys[i],
+                                   expected,
+                                   per_location_ecs[i].size(),
+                                   out_locations[i].size());
+                out_locations[i].assign(expected, CacheLocationConstPtr{});
+                result.per_location_error_codes[i].assign(expected, EC_MISMATCH);
+                continue;
+            }
+            result.per_location_error_codes[i] = std::move(per_location_ecs[i]);
+            for (size_t j = 0; j < expected; ++j) {
+                if (result.per_location_error_codes[i][j] == EC_OK &&
+                    (!out_locations[i][j] || out_locations[i][j]->id() != location_ids[i][j])) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "GetLocations invalid EC_OK value, key[%ld], requested id[%s]",
+                                       keys[i],
+                                       location_ids[i][j].c_str());
+                    out_locations[i][j].reset();
+                    result.per_location_error_codes[i][j] = EC_MISMATCH;
+                }
+            }
+        }
+    }
 
     int64_t total_slots = 0;
     int64_t error_slots = 0;

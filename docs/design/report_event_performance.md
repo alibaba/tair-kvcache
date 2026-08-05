@@ -68,7 +68,10 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
    `cached`、`redis`、dummy 等模式仍执行一次原有 batch 调用，避免放大远端请求或破坏 recovery 语义；
 3. 全进程所有 MetaIndexer 共享一个有界 `QueryExecutor`。配置的 worker 数包含 RPC caller，默认 4
    表示 caller + 3 个后台线程，不为每个请求创建线程。队列满时 caller 自己完成剩余 chunk；若 caller
-   已完成全部工作，尚未启动的 helper 会取消，不能为了一个排队中的空任务制造队头阻塞；
+   已完成全部工作，尚未启动的 helper 会取消，不能为了一个排队中的空任务制造队头阻塞。线程池部分
+   构造失败时会停止并 join 已创建线程；`ParallelFor` 的分配/入队失败会先阻止 queued helper 再进入
+   callback、等待 active helper 退出并返回失败，不能因 `noexcept` 直接终止进程，也不能让 helper 在
+   请求返回后继续访问 request-local 引用；
 4. metadata read 完成后，第一次处理 event-report location 时用 `std::call_once` 为该请求抓取 reporter
    liveness 与 committed-version 快照。每个 backend 只持有一次 `nodes_mutex_` shared lock，后续
    `(block, location)` 只读不可变快照；
@@ -149,7 +152,7 @@ GetHostCacheState 的新增分段指标：
 
 UT 覆盖单线程/4-worker 结果对照、缺失 key 和重复 key、普通/Mamba 大于阈值、medium filter、Eagle pop、
 HOST_DOWN 发生在 metadata read 期间、快照 instance 隔离、并发读写 local item、executor 队列饱和、
-callback 异常与嵌套调用。可选 HTTP benchmark：
+callback 异常、嵌套调用与线程池异常清理。可选 HTTP benchmark：
 
 ```bash
 python integration_test/meta_service/test_report_event_snapshot.py \

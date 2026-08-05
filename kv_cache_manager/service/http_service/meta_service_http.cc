@@ -179,28 +179,7 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     std::string metrics_type;
-    std::shared_ptr<MetricsCollector> metrics_collector;
-    switch (request->storage_type()) {
-    case proto::meta::ST_EVENT_REPORT_L1P5:
-        metrics_type = kEventReportL1P5MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    case proto::meta::ST_EVENT_REPORT_L2:
-        metrics_type = kEventReportL2MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    default:
-        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
-        break;
-    }
-    if (metrics_collector == nullptr) {
-        KVCM_LOG_ERROR("get ReportEvent metrics collector failed");
-        auto *header = response->mutable_header();
-        auto *status = header->mutable_status();
-        status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        status->set_message("get ReportEvent metrics collector failed");
-        return;
-    }
+    auto metrics_collector = ResolveReportEventMetricsCollector(*request, metrics_type);
     API_CONTEXT_INIT(metrics_collector, GetHttpClientIp, http_conn)
     std::string first_event_type = "N/A";
     std::string first_block_key = "N/A";
@@ -217,14 +196,14 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
             }
         }
     }
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d, "
-                  "first_event_type: %s, first_block_key: %s",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->host_ip_port().c_str(),
-                  request->events_size(),
-                  first_event_type.c_str(),
-                  first_block_key.c_str());
+    KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d, "
+                   "first_event_type: %s, first_block_key: %s",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->host_ip_port().c_str(),
+                   request->events_size(),
+                   first_event_type.c_str(),
+                   first_block_key.c_str());
     AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
 }
@@ -233,10 +212,10 @@ void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_co
                                         proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetHostCacheState, __NOTHING__);
-    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->block_cache_keys_size());
+    KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->block_cache_keys_size());
     meta_service_impl_->GetHostCacheState(request_context, request, response);
 }
 

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 
 #include <algorithm>
+#include <exception>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -33,8 +34,21 @@ bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
         return false;
     }
     constexpr std::size_t kQueueSlotsPerWorker = 64;
-    query_executor_ = std::make_shared<QueryExecutor>(
-        worker_count, parallel_threshold, chunk_size, std::max<std::size_t>(64, worker_count * kQueueSlotsPerWorker));
+    try {
+        query_executor_ =
+            std::make_shared<QueryExecutor>(worker_count,
+                                            parallel_threshold,
+                                            chunk_size,
+                                            std::max<std::size_t>(64, worker_count * kQueueSlotsPerWorker));
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("failed to create query executor: %s", e.what());
+        query_executor_.reset();
+        return false;
+    } catch (...) {
+        KVCM_LOG_ERROR("failed to create query executor with unknown exception");
+        query_executor_.reset();
+        return false;
+    }
     KVCM_LOG_INFO("configured query executor: workers[%zu] threshold[%zu] chunk_size[%zu]",
                   worker_count,
                   parallel_threshold,

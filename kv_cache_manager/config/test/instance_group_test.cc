@@ -228,6 +228,31 @@ TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotS
     EXPECT_EQ(90, restored_spec->liveness_check_interval_ms());
     EXPECT_EQ(4321, restored_spec->snapshot_min_interval_ms());
     EXPECT_EQ(8765, restored_spec->snapshot_delta_drain_timeout_ms());
+
+    proto::admin::StorageConfig invalid_proto_config;
+    invalid_proto_config.set_global_unique_name("invalid_event_report");
+    invalid_proto_config.set_storage_type(proto::admin::ST_EVENT_REPORT_L2);
+    invalid_proto_config.mutable_event_report()->set_snapshot_delta_drain_timeout_ms(-1);
+    StorageConfig invalid_restored;
+    ProtoConvert::StorageFromProto(&invalid_proto_config, invalid_restored);
+    auto invalid_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(invalid_restored.storage_spec());
+    ASSERT_NE(nullptr, invalid_spec);
+    EXPECT_EQ(-1, invalid_spec->snapshot_delta_drain_timeout_ms());
+    std::string invalid_fields;
+    EXPECT_FALSE(invalid_restored.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+}
+
+TEST_F(InstanceGroupTest, UnknownProtoStorageTypeFailsClosed) {
+    DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    ProtoConvert::DataStorageTypeFromProto(static_cast<proto::admin::StorageType>(263), storage_type);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, storage_type);
+
+    proto::admin::CacheLocation proto_location;
+    proto_location.set_type(static_cast<proto::admin::StorageType>(263));
+    CacheLocation location;
+    ProtoConvert::CacheLocationFromProto(&proto_location, location);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, location.type());
 }
 
 } // namespace kv_cache_manager

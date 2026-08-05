@@ -81,6 +81,11 @@ protected:
     std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEventType(const std::string &instance_id,
                                                                                  const std::string &type,
                                                                                  const std::string &event_type);
+    // Metrics lookup must never become a functional precondition for the API:
+    // malformed or unknown-instance requests still need to reach ReportEvent's
+    // canonical validation path and return its status.
+    std::shared_ptr<MetricsCollector> ResolveReportEventMetricsCollector(const proto::meta::ReportEventRequest &request,
+                                                                         std::string &out_metrics_type);
     void AttachReportEventTypeMetricsCollectors(const proto::meta::ReportEventRequest &request,
                                                 const std::string &type,
                                                 RequestContext *request_context);
@@ -91,6 +96,7 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetInstanceInfo);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetClusterInfo);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheMeta);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheLocation);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheLocationsByBackend);
