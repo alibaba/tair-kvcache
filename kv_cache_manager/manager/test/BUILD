@@ -71,10 +71,11 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/meta:cache_location",
-        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/config:instance_info",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:meta_local_backend",
     ],
 )
 
@@ -141,9 +142,9 @@ cc_test(
     ],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
     ],
 )
 

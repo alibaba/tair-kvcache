@@ -91,7 +91,10 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
 9. local metadata read 不再让每个 query worker 对每个 block 直接更新共享 revisit histogram counters。
    每个 128-key chunk 先在本地累计 bucket/count/sum，再按非零 bucket 提交原子增量。Prometheus 最终值与
    逐 key `Observe` 完全一致，但避免十万级原子 RMW 争抢同一组 cache line；这段时间属于
-   `meta_indexer.get_io_time_us`。
+   `meta_indexer.get_io_time_us`；
+10. prefix 只把首个 `EC_NOENT` 当作正常终止。首个 miss 之后的 speculative read 结果不影响已经确定的
+    前缀；但 miss 之前的 `EC_ERROR`、`EC_MISMATCH` 等硬错误必须原样返回，不能伪装成较短的 cache miss。
+    普通 prefix 与 Mamba 路径遵循相同规则。
 
 可见性快照在 metadata read 之后开始采集。采集前已经可见的 HOST_DOWN 会被当前请求过滤；与采集并发
 的 HOST_DOWN 允许当前请求看到前或后的状态，但采集完成后本请求不再变化，下一请求会重新采集。由于

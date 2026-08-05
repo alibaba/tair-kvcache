@@ -12,6 +12,7 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -93,6 +94,34 @@ public:
 
 private:
     std::optional<KeyType> failed_key_;
+};
+
+class FaultyGetLocationValuesBackend : public MetaLocalBackend {
+public:
+    void SetFailedKey(KeyType key, ErrorCode error = EC_ERROR) {
+        failed_key_ = key;
+        error_ = error;
+    }
+
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override {
+        auto results = MetaLocalBackend::GetLocationValues(request_context, keys, out_locations);
+        if (!failed_key_.has_value()) {
+            return results;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == failed_key_.value()) {
+                results[i] = error_;
+                out_locations[i].clear();
+            }
+        }
+        return results;
+    }
+
+private:
+    std::optional<KeyType> failed_key_;
+    ErrorCode error_ = EC_ERROR;
 };
 
 class CommitThenFailUpsertBackend : public MetaLocalBackend {
@@ -204,6 +233,18 @@ public:
     FaultyGetLocationIdsBackend *ReplaceWithFaultyBackend() {
         auto backend_config = ConstructMetaStorageBackendConfig();
         auto faulty_backend = std::make_unique<FaultyGetLocationIdsBackend>();
+        EXPECT_EQ(EC_OK, faulty_backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, faulty_backend->Open());
+        auto backend_raw = faulty_backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(faulty_backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    FaultyGetLocationValuesBackend *ReplaceWithFaultyGetLocationValuesBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto faulty_backend = std::make_unique<FaultyGetLocationValuesBackend>();
         EXPECT_EQ(EC_OK, faulty_backend->Init("test", backend_config));
         EXPECT_EQ(EC_OK, faulty_backend->Open());
         auto backend_raw = faulty_backend.get();
@@ -497,6 +538,65 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostIgnoresNonServingLocations) {
     ASSERT_EQ(1u, matches.size());
     EXPECT_EQ("serving:8080", matches[0].host_ip_port);
     EXPECT_EQ(1, matches[0].prefix_match_blocks);
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostPropagatesHardReadFailureBeforeFirstMiss) {
+    auto *backend = ReplaceWithFaultyGetLocationValuesBackend();
+    const MetaSearcher::KeyVector keys = {10016, 10017};
+    const MetaSearcher::MergeLocationSpecsTask task{
+        "kvs#event_report_l2#mem#serving:8080",
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        CacheLocationStatus::CLS_SERVING,
+        {LocationSpec("tp0", "event_report://serving:8080/mem")},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, {{task}, {task}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key_ec);
+
+    for (const ErrorCode hard_error : {EC_ERROR, EC_MISMATCH}) {
+        backend->SetFailedKey(keys[1], hard_error);
+        std::vector<MetaSearcher::HostCacheMatch> matches = {{"stale:8080", 99}};
+        EXPECT_EQ(hard_error, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+        EXPECT_TRUE(matches.empty());
+    }
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostIgnoresSpeculativeFailureAfterFirstMiss) {
+    auto *backend = ReplaceWithFaultyGetLocationValuesBackend();
+    const MetaSearcher::KeyVector keys = {10018, 10019, 10020};
+    const MetaSearcher::MergeLocationSpecsTask task{
+        "kvs#event_report_l2#mem#serving:8080",
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        CacheLocationStatus::CLS_SERVING,
+        {LocationSpec("tp0", "event_report://serving:8080/mem")},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {keys[0]}, {{task}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    backend->SetFailedKey(keys[2]);
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ("serving:8080", matches[0].host_ip_port);
+    EXPECT_EQ(1, matches[0].prefix_match_blocks);
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostPropagatesHardReadFailure) {
+    auto *backend = ReplaceWithFaultyGetLocationValuesBackend();
+    const int64_t key = 10021;
+    backend->SetFailedKey(key, EC_ERROR);
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("full_0", {"full_0"}),
+        LocationSpecGroup("linear_0", {"linear_0"}),
+    };
+
+    std::vector<MetaSearcher::HostCacheMatch> matches = {{"stale:8080", 99}};
+    EXPECT_EQ(
+        EC_ERROR,
+        meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), {key}, false, {"mem"}, groups, matches));
+    EXPECT_TRUE(matches.empty());
 }
 
 TEST_F(MetaSearcherTest, TestPrefixMatchByHostSupportsMoreThanOnePresenceWord) {
