@@ -435,3 +435,32 @@ limit 主要改善写写公平性，必须用混合写 p99 验证，不能把它
 混合压力。上线后仍需用同一压测流量重点比较 `meta_indexer.get_io_time_us`、
 `meta_searcher.host_projection_time_us` 和 Get p99；若混合负载仍远高于该基线，再依据分段指标检查 local
 LRU/item lock，而不是重新增加无界 worker。
+
+### 5.9 2026-08-05 混合压力复核与并行位图组合回归
+
+在当前 Release/O2、纯 local metadata、真实 HTTP 服务上继续做两组隔离验证。第一组持续 75 秒，使用
+4 个 reporter 混合 20 QPS ADD（100 blocks/request）、10 QPS DELETE（50 blocks/request）、2 QPS
+10k-key Get、5 秒 heartbeat，并在 35 秒周期 snapshot 中主动遗漏 10% 当前数据验证 authoritative cleanup。
+最终 1503 ADD、752 DELETE、8 snapshot、151 Get 和 60 heartbeat 全部成功，影子状态逐事件校验无误；
+10k Get 客户端 p50/p95/p99 为 5.43/20.35/25.18ms，最大 101.20ms 出现在大 snapshot 并发窗口。
+
+第二组按线上复现参数发送约 15 QPS、约 10k blocks/request 的 L2 ADD，持续 45 秒。单个 Python 进程
+同时承担大 JSON 构包、writer、逐 ADD 的 10k-key 正确性查询和独立 reader 时，客户端统计出现约 2.7s
+的 Get p99；但三种小请求的延迟同时抬升，说明该值包含本地 GIL/worker 排队。以服务端 access log 作为
+业务处理边界重新统计，同一阶段结果为：
+
+| 服务端请求 | count | avg | p95 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GetHostCacheState（全部） | 753 | 7.43ms | 11.35ms | 12.83ms | 26.00ms |
+| GetHostCacheState（独立 10k reader） | 46 | 7.11ms | 10.16ms | 10.28ms | 10.47ms |
+| ReportEvent | 707 | 73.77ms | 96.97ms | 117.87ms | 143.41ms |
+
+因此同进程压测器的 HTTP wall time 不能直接当作服务端 Get RT。大写入结束后立即重新运行连续命中
+benchmark，20k Get 串行 p50/p99 为 8.84/8.95ms，16-way p50/p99 为 23.39/35.07ms，未观察到
+allocator/LRU 经高分配压力后的持续退化。
+
+另外补充一个确定性参考模型 UT，将此前分别覆盖的两个维度叠加：70 个 candidate host 横跨两个
+64-bit presence word，384 个 key 触发 metadata query executor 并行路径，每个 host 使用不同的预期
+prefix，并同时检查 Eagle-pop 和 medium filter。该用例完成 Release 100 轮、ASAN 20 轮以及完整
+MetaSearcher Release/ASAN 回归，结果一致。它主要防止 packed presence 的跨 word 索引、并行 slice 写入
+或 prefix reduction 在后续优化中发生静默错位。
