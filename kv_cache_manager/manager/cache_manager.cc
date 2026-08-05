@@ -919,6 +919,18 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
             WARN, EC_BADARGS, BatchLocationsView, "block_mask must match the number of query keys");
     }
 
+    if (!location_spec_names.empty()) {
+        if (location_spec_names.size() != query_keys.size() ||
+            std::any_of(location_spec_names.begin(), location_spec_names.end(), [](const std::string &name) {
+                return name.empty();
+            })) {
+            request_context->error_tracer()->AddErrorMsg(
+                "location_spec_names must be empty or contain one non-empty name per query key");
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+                WARN, EC_BADARGS, BatchLocationsView, "invalid per-key location_spec_names");
+        }
+    }
+
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, query_keys.size());
 
@@ -989,8 +1001,10 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
     for (auto &key_locs : locations_per_key) {
         FillEmptyLocationSpecs(instance_info->location_spec_infos(), key_locs);
     }
-    for (auto &key_locs : locations_per_key) {
-        FilterLocationSpecByName(key_locs, location_spec_names);
+    if (!location_spec_names.empty()) {
+        for (size_t i = 0; i < locations_per_key.size(); ++i) {
+            FilterLocationSpecByName(locations_per_key[i], {location_spec_names[i]});
+        }
     }
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
@@ -4167,8 +4181,7 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
     };
 }
 
-MetaSearcher::CheckHostCacheLocationFunc
-CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
+CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
     auto fallback = GetCheckLocDataExistFunc(instance_id);
     struct EventVisibilitySnapshot {
         std::shared_ptr<EventReportBackend> backend;
@@ -4192,7 +4205,7 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         for (const auto &candidate_name : instance_group->event_report_storage_candidates()) {
             auto event_backend =
                 std::dynamic_pointer_cast<EventReportBackend>(storage_manager->GetDataStorageBackend(candidate_name));
-            if (!event_backend || !event_backend->Available()) {
+            if (!event_backend) {
                 continue;
             }
             const DataStorageType storage_type = event_backend->GetStorageType();
@@ -4208,41 +4221,29 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
 
     return [fallback = std::move(fallback),
             event_snapshots = std::move(event_snapshots),
-            initialize_event_snapshots = std::move(initialize_event_snapshots)](
-               const CacheLocation &location, MetaSearcher::HostCacheLocationInfo &out_info) -> bool {
-        out_info = {};
+            initialize_event_snapshots = std::move(initialize_event_snapshots)](const CacheLocation &location) -> bool {
         if (!IsEventReportStorageType(location.type())) {
             return fallback ? fallback(location) : true;
         }
-        // Initialization is intentionally lazy: MetaSearcher completes its
-        // first bounded metadata range before invoking this callback. The
-        // resulting liveness/version view stays stable while later ranges are
-        // streamed and projected concurrently.
+        // Initialization is intentionally lazy: MetaSearcher reads metadata
+        // before invoking this callback, so the request-level liveness/version
+        // snapshot is taken after the potentially expensive metadata I/O.
         std::call_once(event_snapshots->initialize_once, initialize_event_snapshots);
         const auto snapshot_it = event_snapshots->by_storage_type.find(location.type());
         if (snapshot_it == event_snapshots->by_storage_type.end() || !snapshot_it->second.backend) {
             return false;
         }
-        std::string_view reporter_medium;
-        std::string_view reporter_host;
-        if (!snapshot_it->second.backend->ParseLocationIdView(location.id(), reporter_medium, reporter_host)) {
+        std::string reporter_medium;
+        std::string reporter_host;
+        if (!snapshot_it->second.backend->ParseLocationId(location.id(), reporter_medium, reporter_host)) {
             return false;
         }
         const auto reporter_it = snapshot_it->second.reporters.find(reporter_host);
         if (reporter_it == snapshot_it->second.reporters.end()) {
             return false;
         }
-        if (!IsEventReportLocationReadable(
-                location, reporter_it->second.strict, reporter_it->second.committed_version)) {
-            return false;
-        }
-        // Return the identity parsed during visibility validation so host
-        // projection does not split the same location id again. URI validity
-        // was also checked above for every EventReport spec.
-        out_info.has_reporter_identity = true;
-        out_info.reporter_medium = reporter_medium;
-        out_info.reporter_host = reporter_host;
-        return true;
+        return IsEventReportLocationReadable(
+            location, reporter_it->second.strict, reporter_it->second.committed_version);
     };
 }
 
@@ -4311,13 +4312,17 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
-    const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
+    const auto request_check_loc_data_exist = GetHostCacheStateCheckLocDataExistFunc(instance_id);
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatchByHost(
-            request_context, block_cache_keys, use_eagle_pop, medium_filter, host_matches, &request_check_location);
+        ec = meta_searcher->PrefixMatchByHost(request_context,
+                                              block_cache_keys,
+                                              use_eagle_pop,
+                                              medium_filter,
+                                              host_matches,
+                                              &request_check_loc_data_exist);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -4327,7 +4332,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
-                                                       &request_check_location);
+                                                       &request_check_loc_data_exist);
         break;
     }
     default:
@@ -4340,7 +4345,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     std::vector<HostCacheMatch> result;
     result.reserve(host_matches.size());
     for (const auto &match : host_matches) {
-        result.push_back(HostCacheMatch{match.host_ip_port, match.prefix_match_blocks});
+        result.push_back(HostCacheMatch{match.host_ip_port, match.local, match.p2p_1_fetch, match.p2p_1_total_match});
     }
 
     return {EC_OK, std::move(result)};
