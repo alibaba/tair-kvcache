@@ -979,6 +979,10 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                        valid_key_count,
                        keys[valid_key_count],
                        result.error_codes[valid_key_count]);
+        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("prefix match metadata read failed");
+            return result.error_codes[valid_key_count];
+        }
     }
     if (valid_key_count == 0) {
         return EC_OK;
@@ -1117,6 +1121,10 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                        valid_key_count,
                        keys[valid_key_count],
                        result.error_codes[valid_key_count]);
+        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
+            return result.error_codes[valid_key_count];
+        }
     }
     if (valid_key_count == 0) {
         return EC_OK;
