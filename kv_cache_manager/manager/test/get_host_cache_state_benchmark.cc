@@ -91,22 +91,22 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     ASSERT_EQ(EC_OK, indexer->Put(request_context.get(), extra_keys, extra_locations, extra_properties).ec);
 
     MetaSearcher searcher(indexer, [](const CacheLocation &) { return true; }, {});
-    const MetaSearcher::CheckHostCacheLocationFunc visibility_check =
-        [](const CacheLocation &candidate, MetaSearcher::HostCacheLocationInfo &out_info) {
-            std::string_view storage_type;
-            if (!SnapshotUriUtils::ParseEventReportLocationIdView(
-                    candidate.id(), storage_type, out_info.reporter_medium, out_info.reporter_host)) {
+    const CheckLocDataExistFunc visibility_check = [](const CacheLocation &candidate) {
+        std::string_view storage_type;
+        std::string_view reporter_medium;
+        std::string_view reporter_host;
+        if (!SnapshotUriUtils::ParseEventReportLocationIdView(
+                candidate.id(), storage_type, reporter_medium, reporter_host)) {
+            return false;
+        }
+        for (const auto &spec : candidate.location_specs()) {
+            std::string_view version;
+            if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version)) {
                 return false;
             }
-            for (const auto &spec : candidate.location_specs()) {
-                std::string_view version;
-                if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version)) {
-                    return false;
-                }
-            }
-            out_info.has_reporter_identity = true;
-            return true;
-        };
+        }
+        return true;
+    };
 
     auto run_case = [&](const char *name, const KeyVector &query_keys, int64_t expected_prefix, int iterations) {
         std::vector<double> elapsed_ms;
