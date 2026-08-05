@@ -5,6 +5,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -192,22 +193,27 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     return result;
 }
 
-using RequestedSpecNameSet = std::unordered_set<std::string>;
-
-bool MatchesRequestedSpec(const CacheLocation &loc, const RequestedSpecNameSet &requested_spec_names) {
-    if (requested_spec_names.empty()) {
-        return true;
+const LocationSpec *FindRequestedSpec(const CacheLocation &loc, std::string_view requested_spec_name) {
+    if (requested_spec_name.empty()) {
+        return loc.location_specs().empty() ? nullptr : &loc.location_specs().front();
     }
-    return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&](const LocationSpec &spec) {
-        return requested_spec_names.count(spec.name()) > 0;
-    });
+    const auto it =
+        std::find_if(loc.location_specs().begin(),
+                     loc.location_specs().end(),
+                     [requested_spec_name](const LocationSpec &spec) { return spec.name() == requested_spec_name; });
+    return it == loc.location_specs().end() ? nullptr : &*it;
 }
 
-std::string ExtractPeerAddrFromLocation(const CacheLocation &loc) {
-    if (loc.location_specs().empty()) {
+bool MatchesRequestedSpec(const CacheLocation &loc, std::string_view requested_spec_name) {
+    return requested_spec_name.empty() || FindRequestedSpec(loc, requested_spec_name) != nullptr;
+}
+
+std::string ExtractPeerAddrFromLocation(const CacheLocation &loc, std::string_view requested_spec_name) {
+    const auto *spec = FindRequestedSpec(loc, requested_spec_name);
+    if (spec == nullptr) {
         return {};
     }
-    StandardUri uri(loc.location_specs().front().uri());
+    StandardUri uri(spec->uri());
     if (!uri.Valid() || uri.GetHostName().empty()) {
         return {};
     }
@@ -553,7 +559,15 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     SPAN_TRACER(request_context);
     out_locations.clear();
     out_locations.resize(keys.size());
-    const RequestedSpecNameSet requested_spec_name_set(requested_spec_names.begin(), requested_spec_names.end());
+    if (!requested_spec_names.empty() &&
+        (requested_spec_names.size() != keys.size() ||
+         std::any_of(requested_spec_names.begin(), requested_spec_names.end(), [](const std::string &name) {
+             return name.empty();
+         }))) {
+        request_context->error_tracer()->AddErrorMsg(
+            "requested_spec_names must be empty or contain one non-empty name per key");
+        return EC_BADARGS;
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     CacheLocationMapVector location_maps;
@@ -605,14 +619,16 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                     break;
 
                 const auto &vmap = valid_maps[i];
+                const std::string_view requested_spec_name =
+                    requested_spec_names.empty() ? std::string_view{} : requested_spec_names[i];
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
                     if (loc->type() != target_type)
                         continue;
-                    if (!MatchesRequestedSpec(*loc, requested_spec_name_set))
+                    if (!MatchesRequestedSpec(*loc, requested_spec_name))
                         continue;
-                    std::string addr = ExtractPeerAddrFromLocation(*loc);
+                    std::string addr = ExtractPeerAddrFromLocation(*loc, requested_spec_name);
                     if (addr.empty())
                         continue;
                     // Dedup: only add if not already present
@@ -657,10 +673,12 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
         } else {
             // --- Per-key independent selection (WEIGHTED_RANDOM or other non-event-report) ---
             for (size_t i = 0; i < keys.size(); ++i) {
+                const std::string_view requested_spec_name =
+                    requested_spec_names.empty() ? std::string_view{} : requested_spec_names[i];
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name_set)) {
+                    if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name)) {
                         filtered.try_emplace(id, loc);
                     }
                 }

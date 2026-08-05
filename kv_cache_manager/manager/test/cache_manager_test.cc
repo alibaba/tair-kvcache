@@ -6150,12 +6150,14 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
     }
 }
 
-TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
+TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_backend_selectors";
     auto location_spec_infos = createLocationSpecInfos();
     location_spec_infos.emplace_back("full_0", 512);
     location_spec_infos.emplace_back("linear_1", 512);
+    location_spec_infos.emplace_back("linear_2", 512);
+    location_spec_infos.emplace_back("linear_3", 512);
     ASSERT_EQ(expected_reg,
               cache_manager_->RegisterInstance(request_context_.get(),
                                                "default",
@@ -6441,59 +6443,66 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         EXPECT_TRUE(locs[1].cache_locations_view().empty());
     }
 
-    // --- Test 8: location_spec_names filter still works with backend_selectors ---
+    // --- Test 8: non-empty location_spec_names must align one-to-one with query keys ---
     {
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
         };
         BlockMask bm = static_cast<size_t>(0);
-        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
-                                                                     instance_id,
-                                                                     CacheManager::QueryType::QT_BATCH_GET,
-                                                                     {300},
-                                                                     {},
-                                                                     bm,
-                                                                     0,
-                                                                     {"tp0", "tp2"},
-                                                                     selectors);
-        ASSERT_EQ(EC_OK, ec);
-        ASSERT_EQ(1u, locs.size());
-        const auto &kl = locs[0].cache_locations_view();
-        ASSERT_EQ(1u, kl.size());
-        EXPECT_EQ(2u, kl[0].location_specs().size());
-        EXPECT_EQ(2u, kl[0].spec_size());
+        auto [size_ec, size_locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                               instance_id,
+                                                                               CacheManager::QueryType::QT_BATCH_GET,
+                                                                               {300, 400, 300},
+                                                                               {},
+                                                                               bm,
+                                                                               0,
+                                                                               {"full_0", "linear_1"},
+                                                                               selectors);
+        EXPECT_EQ(EC_BADARGS, size_ec);
+        EXPECT_TRUE(size_locs.empty());
+
+        auto [empty_ec, empty_locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                                 instance_id,
+                                                                                 CacheManager::QueryType::QT_BATCH_GET,
+                                                                                 {300, 400, 300},
+                                                                                 {},
+                                                                                 bm,
+                                                                                 0,
+                                                                                 {"full_0", "", "linear_1"},
+                                                                                 selectors);
+        EXPECT_EQ(EC_BADARGS, empty_ec);
+        EXPECT_TRUE(empty_locs.empty());
     }
 
-    // --- Test 9: spec filtering happens before Vineyard peer selection ---
-    // The full-only peer covers two keys and would win an unfiltered prefix
-    // selection. A linear_1 query must instead select the linear-only peer.
+    // --- Test 9: non-hybrid attention sends one full spec per key and uses prefix selection ---
+    // Current group-aware Vineyard represents each FullAttention object as
+    // (block key, full_0), preserving the original query order.
     {
-        auto report_spec =
-            [&](const std::string &host, const std::vector<int64_t> &keys, const std::string &spec_name) {
-                proto::meta::ReportEventRequest req;
-                req.set_instance_id(instance_id);
-                req.set_host_ip_port(host);
-                req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
-                for (int64_t key : keys) {
-                    auto *ev = req.add_events();
-                    ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-                    auto *ba = ev->mutable_block_add();
-                    ba->set_block_key(std::to_string(key));
-                    ba->set_medium("mem");
-                    auto *spec = ba->add_specs();
-                    spec->set_name(spec_name);
-                    spec->set_uri("event_report://" + host + "/mem");
-                }
-                proto::meta::ReportEventResponse resp;
-                ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
-            };
+        auto report_full_keys = [&](const std::string &host, const std::vector<int64_t> &keys) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+            for (int64_t key : keys) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *ba = ev->mutable_block_add();
+                ba->set_block_key(std::to_string(key));
+                ba->set_medium("mem");
+                auto *spec = ba->add_specs();
+                spec->set_name("full_0");
+                spec->set_uri("event_report://" + host + "/mem");
+            }
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
 
-        const std::string full_host = "192.168.2.1:8080";
-        const std::string linear_host = "192.168.2.2:8080";
-        InitializeEventReporter(instance_id, full_host, proto::meta::ST_EVENT_REPORT_L2);
-        InitializeEventReporter(instance_id, linear_host, proto::meta::ST_EVENT_REPORT_L2);
-        report_spec(full_host, {800, 801}, "full_0");
-        report_spec(linear_host, {800}, "linear_1");
+        const std::string full_prefix_host = "192.168.2.3:8080";
+        const std::string short_full_host = "192.168.2.4:8080";
+        InitializeEventReporter(instance_id, full_prefix_host, proto::meta::ST_EVENT_REPORT_L2);
+        InitializeEventReporter(instance_id, short_full_host, proto::meta::ST_EVENT_REPORT_L2);
+        report_full_keys(full_prefix_host, {900, 901});
+        report_full_keys(short_full_host, {900});
 
         const std::vector<BackendSelector> selectors = {
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
@@ -6502,23 +6511,91 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
                                                                      instance_id,
                                                                      CacheManager::QueryType::QT_BATCH_GET,
-                                                                     {800, 801},
+                                                                     {900, 901, 902},
                                                                      {},
                                                                      block_mask,
                                                                      0,
-                                                                     {"linear_1"},
+                                                                     {"full_0", "full_0", "full_0"},
                                                                      selectors);
         ASSERT_EQ(EC_OK, ec);
-        ASSERT_EQ(2u, locs.size());
-        ASSERT_EQ(1u, locs[0].cache_locations_view().size());
-        ASSERT_EQ(1u, locs[0].cache_locations_view()[0].location_specs().size());
-        EXPECT_EQ(1u, locs[0].cache_locations_view()[0].spec_size());
-        EXPECT_EQ("linear_1", locs[0].cache_locations_view()[0].location_specs()[0].name());
-        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find(linear_host));
-        EXPECT_TRUE(locs[1].cache_locations_view().empty());
+        ASSERT_EQ(3u, locs.size());
+        for (size_t i = 0; i < 2; ++i) {
+            const auto &key_locations = locs[i].cache_locations_view();
+            ASSERT_EQ(1u, key_locations.size()) << "query index=" << i;
+            ASSERT_EQ(1u, key_locations[0].location_specs().size()) << "query index=" << i;
+            EXPECT_EQ(1u, key_locations[0].spec_size()) << "query index=" << i;
+            EXPECT_EQ("full_0", key_locations[0].location_specs()[0].name()) << "query index=" << i;
+            EXPECT_NE(std::string::npos, key_locations[0].location_specs()[0].uri().find(full_prefix_host))
+                << "query index=" << i;
+        }
+        EXPECT_TRUE(locs[2].cache_locations_view().empty());
     }
 
-    // --- Test 10: backend-selected queries enforce reporter liveness ---
+    // --- Test 10: mixed-attention Mamba groups share one ordered best-effort query ---
+    // Current Vineyard sends all group-aware objects from one lookup in their
+    // original order. Different Mamba groups can therefore repeat the same block
+    // key and are distinguished only by per-position location_spec_names.
+    {
+        auto report_specs = [&](const std::string &host, int64_t key, const std::vector<std::string> &spec_names) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *ba = ev->mutable_block_add();
+            ba->set_block_key(std::to_string(key));
+            ba->set_medium("mem");
+            for (const auto &spec_name : spec_names) {
+                auto *spec = ba->add_specs();
+                spec->set_name(spec_name);
+                spec->set_uri("event_report://" + host + "/mem");
+            }
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
+
+        const std::string linear_1_host = "192.168.2.1:8080";
+        const std::string remaining_groups_host = "192.168.2.2:8080";
+        InitializeEventReporter(instance_id, linear_1_host, proto::meta::ST_EVENT_REPORT_L2);
+        InitializeEventReporter(instance_id, remaining_groups_host, proto::meta::ST_EVENT_REPORT_L2);
+        report_specs(linear_1_host, 800, {"linear_1"});
+        report_specs(linear_1_host, 801, {"linear_1"});
+        report_specs(remaining_groups_host, 800, {"linear_2", "linear_3"});
+        report_specs(remaining_groups_host, 801, {"linear_3"});
+
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        };
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, locs] =
+            cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                       instance_id,
+                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                       {800, 801, 800, 800, 801},
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {"linear_1", "linear_1", "linear_2", "linear_3", "linear_3"},
+                                                       selectors);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(5u, locs.size());
+        EXPECT_TRUE(locs[0].cache_locations_view().empty());
+        EXPECT_TRUE(locs[1].cache_locations_view().empty());
+
+        const std::vector<std::string> expected_specs = {"linear_2", "linear_3", "linear_3"};
+        for (size_t i = 0; i < expected_specs.size(); ++i) {
+            const auto &key_locations = locs[i + 2].cache_locations_view();
+            ASSERT_EQ(1u, key_locations.size()) << "query index=" << i + 2;
+            ASSERT_EQ(1u, key_locations[0].location_specs().size()) << "query index=" << i + 2;
+            EXPECT_EQ(1u, key_locations[0].spec_size()) << "query index=" << i + 2;
+            EXPECT_EQ(expected_specs[i], key_locations[0].location_specs()[0].name()) << "query index=" << i + 2;
+            EXPECT_NE(std::string::npos, key_locations[0].location_specs()[0].uri().find(remaining_groups_host))
+                << "query index=" << i + 2;
+        }
+    }
+
+    // --- Test 11: backend-selected queries enforce reporter liveness ---
     {
         for (const auto &peer : peer_data) {
             event_report_backend->SetNodeUnavailable(instance_id, peer.host);
