@@ -47,6 +47,13 @@ public:
     // Thread-safe: uses only atomic operations.
     void Observe(int64_t interval_us);
 
+    // Records a batch with the same histogram semantics as repeated Observe()
+    // calls, but aggregates bucket deltas locally before touching the shared
+    // counters. Large GetHostCacheState reads otherwise make every worker
+    // update the same counters for every block, creating avoidable cache-line
+    // contention inside the metadata I/O timer.
+    void ObserveBatch(const std::vector<int64_t> &intervals_us);
+
     // Get bucket boundaries (for testing/debugging).
     const std::vector<double> &GetBoundaries() const { return boundaries_; }
 

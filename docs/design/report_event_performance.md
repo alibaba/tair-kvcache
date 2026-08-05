@@ -81,11 +81,17 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
    不再为每个 key 构造 `map<string, set<string>>`，也不保存普通 prefix 根本不需要的 spec name。
    Mamba 仍需 spec 完整性信息，但改用排序的小 vector，避免每个 key 的红黑树 node 分配；
 7. GetHostCacheState 专用可见性 checker 在校验 EventReport reporter 状态和 URI 时一并返回已经解析的
-   medium/host。host 投影复用该结果，不再对同一 location id 做第二次 split，也不再对已经验证的 URI
-   做第二次完整 parse；普通 prefix 对一个 EventReport location 只做一次候选 host 标记；
+   medium/host。host 投影复用该结果，不再对同一 location id 做第二次 split。EventReport URI 的查询侧
+   校验直接在不可变字符串上单次扫描，用 `string_view` 比较 generation；不再为每个 spec 拆分
+   protocol/host/path、构造 query-param `std::map` 或复制 token。普通 prefix 对一个 EventReport location
+   只做一次候选 host 标记；
 8. service access log 默认只记录 key count、首末 key、query type、medium count、返回 host 数和最大
    prefix，不再把数千 key 的 protobuf 完整转 JSON 后再 parse 成 DOM。诊断时可临时设置
-   `KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG=true` 恢复完整 request/response，压测时应保持关闭。
+   `KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG=true` 恢复完整 request/response，压测时应保持关闭；
+9. local metadata read 不再让每个 query worker 对每个 block 直接更新共享 revisit histogram counters。
+   每个 128-key chunk 先在本地累计 bucket/count/sum，再按非零 bucket 提交原子增量。Prometheus 最终值与
+   逐 key `Observe` 完全一致，但避免十万级原子 RMW 争抢同一组 cache line；这段时间属于
+   `meta_indexer.get_io_time_us`。
 
 可见性快照在 metadata read 之后开始采集。采集前已经可见的 HOST_DOWN 会被当前请求过滤；与采集并发
 的 HOST_DOWN 允许当前请求看到前或后的状态，但采集完成后本请求不再变化，下一请求会重新采集。由于
@@ -381,3 +387,48 @@ limit 主要改善写写公平性，必须用混合写 p99 验证，不能把它
 再快约 16%，符合“CPU 有余量、Get QPS 很低”的部署条件；但 16-way 20k p99 反而增加约 32%。因此代码
 默认值继续保持 4。若线上 Get 约 0.1 QPS 且 CPU 确有余量，可显式配置 worker=8 做小流量 A/B，必须
 同时观察 L2 ReportEvent 压力下的 Get p99 和 executor queue；不能仅凭单请求数据修改全局默认值。
+
+### 5.8 2026-08-05 Get 查询 URI 零分配扫描与 histogram 批量提交
+
+在 5.7 的 worker=4 版本上继续检查发现两个与 block 数线性相关、且都位于 GetHostCacheState 的热点：
+
+1. `IsEventReportLocationReadable` 对每个 spec 构造 `DataStorageUri`。解析会复制 URI 的多个 substring，并为
+   每个 query param 分配 `std::map` node；随后 `GetParam` 和 `SnapshotUriInfo` 又复制 32-byte token。查询
+   实际只需要确认 URI 有合法 scheme、`s_version` 不重复且为 32 位十六进制，并与 request snapshot 中的
+   committed token 比较。因此改为一次 `string_view` 扫描，malformed/重复 token 仍然 fail closed；
+2. `MetaLocalBackend::GetLocationValues` 对每个命中 key 调用 revisit histogram `Observe`。默认 13 个 bucket
+   下，一次 10k-key 查询会产生十万级共享 counter 原子 RMW；4 个 query worker 会争抢同一组 cache line。
+   现在每个 executor chunk 先本地聚合，再一次性提交 bucket/count/sum，最终指标值不变。
+
+用当前源码、Release/O2、4096 条变化的典型 EventReport URI、100 万次循环做隔离微基准：
+
+| URI 可见性检查 | 每 spec 分配次数 | 每 spec 累计分配 | 每 spec CPU |
+| --- | ---: | ---: | ---: |
+| 原完整 `DataStorageUri` parse | 10 | 605.7B | 约 497ns |
+| 新 `string_view` 单次扫描 | 0 | 0B | 约 51ns |
+
+新扫描约快 9.7 倍。按 20k specs 估算，仅这一步减少约 12.1MB 短生命周期 allocator 流量和 8.9ms
+单核 CPU；这里的 MB 是累计分配流量，不是常驻 RSS。另一个 4-thread、默认 13 buckets、128-key chunk、
+每轮 10240 observations 的隔离基准中，逐 key 原子更新每轮约 3.9~4.1ms，chunk 聚合约
+0.039~0.041ms，count/sum/buckets 完全一致。该数字只衡量 histogram 自身，不应外推成完整 API 倍数。
+
+随后使用与 5.7 相同的 Release/O2 二进制、纯 local metadata、真实 HTTP benchmark，连续运行三次并取
+各项中位数：
+
+| blocks | 本轮 worker=4 串行 p50/p99 | 5.7 串行 p50/p99 | 本轮 worker=4 16-way p50/p99 | 5.7 16-way p50/p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.51/0.54ms | 0.56/0.59ms | 6.26/13.51ms | 8.47/17.51ms |
+| 1000 | 1.12/1.15ms | 1.32/1.35ms | 5.91/10.48ms | 6.47/10.87ms |
+| 5000 | 3.10/3.17ms | 4.54/4.72ms | 10.32/23.56ms | 21.12/40.57ms |
+| 20000 | 10.28/10.47ms | 16.07/16.18ms | 23.95/34.25ms | 77.87/101.60ms |
+
+20k 串行 p50/p99 下降约 36%/35%，16-way p50/p99 下降约 69%/66%；三次 20k 串行 p50 为
+10.26/10.30/10.28ms，结果稳定。最后一批 20k 并发请求的 gauges 随单请求调度不同落在：
+`get_io_time_us=4.7~8.4ms`、`host_projection_time_us=2.2~3.3ms`、外层
+`prefix_match_time_us=8.7~12.9ms`。这证明两项分别降低了 metadata read 内共享原子竞争和 read 后 URI
+投影；它不改变 ReportEvent 写入语义，也不缓存每 block 的解析对象。
+
+该 benchmark 是空闲服务的 local 对照，不含线上 15 QPS、约 10k blocks/request 的 L2 ReportEvent
+混合压力。上线后仍需用同一压测流量重点比较 `meta_indexer.get_io_time_us`、
+`meta_searcher.host_projection_time_us` 和 Get p99；若混合负载仍远高于该基线，再依据分段指标检查 local
+LRU/item lock，而不是重新增加无界 worker。
