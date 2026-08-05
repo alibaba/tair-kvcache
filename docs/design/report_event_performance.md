@@ -76,7 +76,16 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
    liveness 与 committed-version 快照。每个 backend 只持有一次 `nodes_mutex_` shared lock，后续
    `(block, location)` 只读不可变快照；
 5. host/spec 投影和候选 host 前缀归约复用同一个有界 executor，输出仍按 host 字典序构造，普通 prefix、
-   Mamba、Eagle pop 和 medium filter 的结果语义不变。
+   Mamba、Eagle pop 和 medium filter 的结果语义不变；
+6. 普通 prefix 只为首 key 建立排序后的候选 host，后续 key 直接写入按候选编号组织的 packed bitset，
+   不再为每个 key 构造 `map<string, set<string>>`，也不保存普通 prefix 根本不需要的 spec name。
+   Mamba 仍需 spec 完整性信息，但改用排序的小 vector，避免每个 key 的红黑树 node 分配；
+7. GetHostCacheState 专用可见性 checker 在校验 EventReport reporter 状态和 URI 时一并返回已经解析的
+   medium/host。host 投影复用该结果，不再对同一 location id 做第二次 split，也不再对已经验证的 URI
+   做第二次完整 parse；普通 prefix 对一个 EventReport location 只做一次候选 host 标记；
+8. service access log 默认只记录 key count、首末 key、query type、medium count、返回 host 数和最大
+   prefix，不再把数千 key 的 protobuf 完整转 JSON 后再 parse 成 DOM。诊断时可临时设置
+   `KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG=true` 恢复完整 request/response，压测时应保持关闭。
 
 可见性快照在 metadata read 之后开始采集。采集前已经可见的 HOST_DOWN 会被当前请求过滤；与采集并发
 的 HOST_DOWN 允许当前请求看到前或后的状态，但采集完成后本请求不再变化，下一请求会重新采集。由于
@@ -345,12 +354,30 @@ RT 为 224/841/924ms；Get 为 0.099 QPS、平均 8,984 keys/request，平均/p9
 这轮数据发生在 5.5 的本地性能 patch 推送之前；当时该远端开发分支 head 仍为 `637d3e0`，所以不能把
 它当作 5.5 优化后的线上结果。应在包含 5.5 commit 的新 head 上用相同流量重跑 before/after，再判断
 剩余差距。预期 20%~25% 的 RMW/折叠收益仍不足以完全消除 800ms p99；若 after 仍呈相同斜率，下一项
-结构性工作应是一次 shard lock 内同时返回“key 是否存在 + 目标 location value”的 fused targeted RMW，
-而不是继续扩大 Get 查询线程数。
+若本轮只优化 GetHostCacheState，应先上线 2.3 的紧凑投影、摘要 access log，并在 CPU 有余量的环境用
+worker 4/8 做 A/B；fused targeted RMW 会改变 ReportEvent 写入原语和 key-count 语义，不应混入这次
+低风险查询优化。
 
-代码复核还确认两个次级问题：`GetHostCacheState` 的默认 access log 会先完整 protobuf-to-JSON，再由
-access-log builder parse 为 DOM；`MakeBatches` 的 `batch_key_size` 是 shard-boundary soft limit，同一
-shard 的 keys 不会被硬切。这两点都值得单独收敛和补指标，但前者在本轮 0.099 Get QPS 下不足以解释
-共享压力，后者的 writer shard lock 也不阻塞纯 local Get。若线上 `mutex_shard_num=16`，10k keys 的
-均匀请求约为 625 keys/shard；增加 128/256 的 lock-hold hard limit 主要改善写写公平性，必须用混合写
-p99 验证，不能把它误报成 Get 尾延迟根因。
+`GetHostCacheState` 的完整 access-log JSON 问题已按 2.3 收敛。`MakeBatches` 的 `batch_key_size` 仍是
+shard-boundary soft limit，同一 shard 的 keys 不会被硬切；但 writer shard lock 不阻塞纯 local Get。
+若线上 `mutex_shard_num=16`，10k keys 的均匀请求约为 625 keys/shard；增加 128/256 的 lock-hold hard
+limit 主要改善写写公平性，必须用混合写 p99 验证，不能把它误报成 Get 尾延迟根因。
+
+### 5.7 2026-08-05 GetHostCacheState 紧凑投影与 worker 4/8 A/B
+
+在 2.3 的 packed presence、EventReport 解析复用和摘要 access log 完成后，使用同一 Release/O2
+二进制、纯 local metadata、真实 HTTP 接口运行 `test_21_get_host_cache_state_local_scaling`。每档都先
+构造连续命中 block，再追加一个尾部 miss；20 次串行与 16-way 请求逐次校验 prefix。结果如下：
+
+| blocks | worker=4 串行 p50/p99 | worker=8 串行 p50/p99 | worker=4 16-way p50/p99 | worker=8 16-way p50/p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.56/0.59ms | 0.56/0.59ms | 8.47/17.51ms | 10.84/28.22ms |
+| 1000 | 1.32/1.35ms | 1.20/1.23ms | 6.47/10.87ms | 6.49/11.22ms |
+| 5000 | 4.54/4.72ms | 3.86/3.89ms | 21.12/40.57ms | 20.18/39.99ms |
+| 20000 | 16.07/16.18ms | 13.56/13.63ms | 77.87/101.60ms | 103.57/134.09ms |
+
+对比 5.5 中改动前同一分支的 20k worker=4 基线（串行 25.52ms、16-way 95.65/125.41ms），新实现的
+串行 p50 下降约 37%，16-way p50/p99 下降约 19%/19%。worker=8 在低并发 20k 单请求上比 worker=4
+再快约 16%，符合“CPU 有余量、Get QPS 很低”的部署条件；但 16-way 20k p99 反而增加约 32%。因此代码
+默认值继续保持 4。若线上 Get 约 0.1 QPS 且 CPU 确有余量，可显式配置 worker=8 做小流量 A/B，必须
+同时观察 L2 ReportEvent 压力下的 Get p99 和 executor queue；不能仅凭单请求数据修改全局默认值。

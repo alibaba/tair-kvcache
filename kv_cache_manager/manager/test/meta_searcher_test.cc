@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <future>
 #include <map>
@@ -496,6 +497,47 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostIgnoresNonServingLocations) {
     ASSERT_EQ(1u, matches.size());
     EXPECT_EQ("serving:8080", matches[0].host_ip_port);
     EXPECT_EQ(1, matches[0].prefix_match_blocks);
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostSupportsMoreThanOnePresenceWord) {
+    const MetaSearcher::KeyVector keys = {10020, 10021, 10022};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    auto host_name = [](std::size_t index) {
+        return std::string("host-") + (index < 10 ? "0" : "") + std::to_string(index) + ":8080";
+    };
+    for (std::size_t host_index = 0; host_index < 70; ++host_index) {
+        const std::string host = host_name(host_index);
+        const MetaSearcher::MergeLocationSpecsTask task{
+            "kvs#event_report_l2#mem#" + host,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://" + host + "/mem")},
+        };
+        tasks[0].push_back(task);
+        if (host_index != 64) {
+            tasks[1].push_back(task);
+        }
+        if (host_index != 63 && host_index != 64) {
+            tasks[2].push_back(task);
+        }
+    }
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), per_key_ec);
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(70u, matches.size());
+    auto prefix_for = [&matches](const std::string &host) {
+        const auto it = std::find_if(
+            matches.begin(), matches.end(), [&host](const auto &match) { return match.host_ip_port == host; });
+        return it == matches.end() ? int64_t{-1} : it->prefix_match_blocks;
+    };
+    EXPECT_EQ(3, prefix_for(host_name(0)));
+    EXPECT_EQ(2, prefix_for(host_name(63)));
+    EXPECT_EQ(1, prefix_for(host_name(64)));
+    EXPECT_EQ(3, prefix_for(host_name(69)));
 }
 
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcrossGenerationChange) {

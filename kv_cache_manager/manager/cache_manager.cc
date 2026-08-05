@@ -4174,7 +4174,8 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
     };
 }
 
-CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
+MetaSearcher::CheckHostCacheLocationFunc
+CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
     auto fallback = GetCheckLocDataExistFunc(instance_id);
     struct EventVisibilitySnapshot {
         std::shared_ptr<EventReportBackend> backend;
@@ -4214,7 +4215,9 @@ CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const
 
     return [fallback = std::move(fallback),
             event_snapshots = std::move(event_snapshots),
-            initialize_event_snapshots = std::move(initialize_event_snapshots)](const CacheLocation &location) -> bool {
+            initialize_event_snapshots = std::move(initialize_event_snapshots)](
+               const CacheLocation &location, MetaSearcher::HostCacheLocationInfo &out_info) -> bool {
+        out_info = {};
         if (!IsEventReportStorageType(location.type())) {
             return fallback ? fallback(location) : true;
         }
@@ -4235,8 +4238,17 @@ CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const
         if (reporter_it == snapshot_it->second.reporters.end()) {
             return false;
         }
-        return IsEventReportLocationReadable(
-            location, reporter_it->second.strict, reporter_it->second.committed_version);
+        if (!IsEventReportLocationReadable(
+                location, reporter_it->second.strict, reporter_it->second.committed_version)) {
+            return false;
+        }
+        // Return the identity parsed during visibility validation so host
+        // projection does not split the same location id again. URI validity
+        // was also checked above for every EventReport spec.
+        out_info.has_reporter_identity = true;
+        out_info.reporter_medium = std::move(reporter_medium);
+        out_info.reporter_host = std::move(reporter_host);
+        return true;
     };
 }
 
@@ -4305,17 +4317,13 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
-    const auto request_check_loc_data_exist = GetHostCacheStateCheckLocDataExistFunc(instance_id);
+    const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatchByHost(request_context,
-                                              block_cache_keys,
-                                              use_eagle_pop,
-                                              medium_filter,
-                                              host_matches,
-                                              &request_check_loc_data_exist);
+        ec = meta_searcher->PrefixMatchByHost(
+            request_context, block_cache_keys, use_eagle_pop, medium_filter, host_matches, &request_check_location);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -4325,7 +4333,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
-                                                       &request_check_loc_data_exist);
+                                                       &request_check_location);
         break;
     }
     default:
