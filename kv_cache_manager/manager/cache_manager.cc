@@ -2522,26 +2522,13 @@ bool IsEventReportLocationReadable(const CacheLocation &location,
     }
     bool contains_readable_version = !strict_query_visibility;
     for (const auto &spec : location.location_specs()) {
-        const DataStorageUri uri(spec.uri());
-        if (!uri.Valid()) {
+        std::string_view snapshot_version;
+        if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), snapshot_version)) {
             return false;
         }
-        const size_t version_param_count =
-            SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
-        if (version_param_count > 1) {
-            return false;
-        }
-        if (version_param_count == 1) {
-            SnapshotUriInfo info;
-            // Count on the raw text first so duplicate parameters remain
-            // observable, then reuse the parsed URI instead of parsing it a
-            // second time on every query.
-            if (!SnapshotUriUtils::ParseSnapshotUriInfo(uri, info)) {
-                return false;
-            }
-            if (strict_query_visibility && info.version == committed_version) {
-                contains_readable_version = true;
-            }
+        if (!snapshot_version.empty() && strict_query_visibility &&
+            snapshot_version == std::string_view(committed_version)) {
+            contains_readable_version = true;
         }
     }
     // Delta merge is spec-granular. A post-snapshot ADD may refresh one spec

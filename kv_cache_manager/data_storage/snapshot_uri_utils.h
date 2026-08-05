@@ -3,6 +3,7 @@
 #include <cctype>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
@@ -74,6 +75,75 @@ public:
         }
         for (const unsigned char ch : version) {
             if (!std::isxdigit(ch)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // GetHostCacheState only needs to know whether an EventReport URI is
+    // structurally usable and which snapshot generation it belongs to. A full
+    // DataStorageUri parse would copy every URI component and allocate one
+    // std::map node per query parameter for every (key, spec) visited. Scan the
+    // immutable URI in place instead. An empty out_version means legacy
+    // metadata without s_version; malformed or duplicate s_version parameters
+    // fail closed.
+    //
+    // The returned view borrows uri_text and must not outlive it.
+    static bool InspectSnapshotUriForVisibility(std::string_view uri_text, std::string_view &out_version) noexcept {
+        out_version = {};
+
+        // This is the observable validity condition used by StandardUri::Valid
+        // for a freshly constructed URI: it must have a non-empty protocol
+        // before "://". ReportEvent performs the full parse before persisting
+        // metadata; this read-side check additionally protects recovered or
+        // otherwise malformed metadata without rebuilding the parsed object.
+        const size_t protocol_end = uri_text.find("://");
+        if (protocol_end == std::string_view::npos || protocol_end == 0) {
+            return false;
+        }
+
+        const size_t query_begin = uri_text.find('?');
+        if (query_begin == std::string_view::npos) {
+            return true;
+        }
+        if (query_begin < protocol_end + 3) {
+            return false;
+        }
+
+        bool found_version = false;
+        size_t begin = query_begin + 1;
+        while (begin <= uri_text.size()) {
+            size_t end = uri_text.find('&', begin);
+            if (end == std::string_view::npos) {
+                end = uri_text.size();
+            }
+            const size_t equals = uri_text.find('=', begin);
+            const size_t key_end = equals != std::string_view::npos && equals < end ? equals : end;
+            constexpr std::string_view version_key{kSnapshotVersionParam};
+            if (key_end - begin == version_key.size() &&
+                uri_text.compare(begin, version_key.size(), version_key) == 0) {
+                if (found_version || equals == std::string_view::npos || equals >= end) {
+                    return false;
+                }
+                found_version = true;
+                out_version = uri_text.substr(equals + 1, end - equals - 1);
+            }
+            if (end == uri_text.size()) {
+                break;
+            }
+            begin = end + 1;
+        }
+
+        if (!found_version) {
+            return true;
+        }
+        if (out_version.size() != 32) {
+            return false;
+        }
+        for (const unsigned char ch : out_version) {
+            const bool is_hex_digit = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+            if (!is_hex_digit) {
                 return false;
             }
         }

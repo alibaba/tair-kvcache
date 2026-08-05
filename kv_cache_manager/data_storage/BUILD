@@ -18,7 +18,6 @@ cc_library(
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",
-        "snapshot_uri_utils.h",
     ],
     deps = [
         # 不一定用
@@ -26,9 +25,20 @@ cc_library(
         "//3rdparty/mooncake:mooncake_client_c",
         "//kv_cache_manager/common/hash",  # for xxph3
         ":common_define",
+        ":snapshot_uri_utils",
         # Internal implementations
         "//stub_source/kv_cache_manager/data_storage:vcns_hf3fs",
         "//stub_source/kv_cache_manager/data_storage:tair_mempool",
+    ],
+)
+
+cc_library(
+    name = "snapshot_uri_utils",
+    hdrs = [
+        "snapshot_uri_utils.h",
+    ],
+    deps = [
+        ":common_define",
     ],
 )
 
