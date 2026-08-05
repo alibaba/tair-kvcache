@@ -12,6 +12,21 @@
 bazelisk run //kv_cache_manager:main
 ```
 
+Mooncake 和 VCNS 后端默认不参与编译，需要时通过 Bazel 配置显式启用：
+
+```bash
+# Mooncake（包含 CUDA、HTTP 和 TCP 支持）
+bazelisk run //kv_cache_manager:main --config=mooncake
+
+# Mooncake（不启用 CUDA）
+bazelisk run //kv_cache_manager:main --config=mooncake_common
+
+# VCNS（仅内源模式提供真实实现）
+bazelisk run //kv_cache_manager:main --config=vcns
+```
+
+两个后端可通过同时传入 `--config=mooncake` 和 `--config=vcns` 一起启用。`--config=client` 会继续启用客户端所需的 Mooncake 支持。
+
 ### Bazel 缓存与多 worktree 开发
 
 Bazel 默认会按 workspace 路径生成独立的 `output_base`。因此从同一个仓库拉出新的 git worktree 后，新的 worktree 不能直接复用旧 worktree 的 `bazel-out`、analysis cache 和本地 action cache；首次构建仍需要重新完成 loading/analysis、内部 symlink/action bookkeeping，以及测试执行。
