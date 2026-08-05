@@ -487,8 +487,13 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
     std::vector<BackendSelector> backend_selectors;
     backend_selectors.reserve(request->backend_selectors_size());
     for (const auto &sel : request->backend_selectors()) {
+        DataStorageType backend_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        // StorageType is an open protobuf enum while DataStorageType uses an
+        // uint8_t underlying type. Explicit conversion prevents an unknown
+        // wire value such as 263 from truncating to L1P5 (7).
+        ProtoConvert::DataStorageTypeFromProto(sel.backend_type(), backend_type);
         backend_selectors.push_back({
-            static_cast<DataStorageType>(sel.backend_type()),
+            backend_type,
             static_cast<LocationSelectStrategy>(sel.strategy()),
         });
     }
@@ -877,11 +882,11 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                               BuildReportEventResponseAccessLogSummary(response));
     auto *header = response->mutable_header();
 
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->host_ip_port().c_str(),
-                  request->events_size());
+    KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->host_ip_port().c_str(),
+                   request->events_size());
 
     auto ec = cache_manager_->ReportEvent(request_context, request, response);
     // Partial failures are logged once with bounded per-type/error counts by
@@ -920,10 +925,10 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
     CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
     std::vector<std::string> mediums(request->medium().begin(), request->medium().end());
 
-    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->block_cache_keys_size());
+    KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->block_cache_keys_size());
 
     auto [ec, host_matches] =
         cache_manager_->GetHostCacheState(request_context,
@@ -945,9 +950,9 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Host cache state retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
-                      request->trace_id().c_str(),
-                      response->hosts_size());
+        KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
+                       request->trace_id().c_str(),
+                       response->hosts_size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }

@@ -55,8 +55,25 @@ QueryExecutor::QueryExecutor(std::size_t worker_count,
     , chunk_size_(std::max<std::size_t>(1, chunk_size))
     , queue_capacity_(std::max<std::size_t>(1, queue_capacity)) {
     workers_.reserve(worker_count_ - 1);
-    for (std::size_t i = 1; i < worker_count_; ++i) {
-        workers_.emplace_back([this] { WorkerLoop(); });
+    try {
+        for (std::size_t i = 1; i < worker_count_; ++i) {
+            workers_.emplace_back([this] { WorkerLoop(); });
+        }
+    } catch (...) {
+        // A partially constructed vector of joinable std::threads would call
+        // std::terminate during stack unwinding. Stop and join every worker
+        // that was created before propagating the construction failure.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        throw;
     }
 }
 
@@ -129,48 +146,66 @@ bool QueryExecutor::ParallelFor(std::size_t count, const RangeFunction &fn) cons
         return false;
     }
 
-    auto state = std::make_shared<ParallelState>();
-    auto fn_holder = std::make_shared<RangeFunction>(fn);
-    auto run_ranges = [state, fn_holder, count, chunk_size = chunk_size_]() noexcept {
-        while (true) {
-            const std::size_t begin = state->next.fetch_add(chunk_size, std::memory_order_relaxed);
-            if (begin >= count) {
-                return;
-            }
-            const std::size_t end = std::min(count, begin + chunk_size);
-            try {
-                (*fn_holder)(begin, end);
-            } catch (const std::exception &e) {
-                state->failed.store(true, std::memory_order_relaxed);
-                KVCM_LOG_ERROR("query executor parallel callback threw exception: %s", e.what());
-            } catch (...) {
-                state->failed.store(true, std::memory_order_relaxed);
-                KVCM_LOG_ERROR("query executor parallel callback threw unknown exception");
-            }
-        }
-    };
-
-    for (std::size_t i = 1; i < parallelism; ++i) {
-        if (!TrySubmit([state, run_ranges] {
-                // The caller may have consumed every range while this task was
-                // waiting behind another request. In that case it cancels the
-                // queued helper and returns without waiting for a no-op task to
-                // reach the head of the global queue.
-                if (!state->TryStartWorker()) {
+    std::shared_ptr<ParallelState> state;
+    try {
+        state = std::make_shared<ParallelState>();
+        auto fn_holder = std::make_shared<RangeFunction>(fn);
+        auto run_ranges = [state, fn_holder, count, chunk_size = chunk_size_]() noexcept {
+            while (true) {
+                const std::size_t begin = state->next.fetch_add(chunk_size, std::memory_order_relaxed);
+                if (begin >= count) {
                     return;
                 }
-                run_ranges();
-                state->CompleteWorker();
-            })) {
-            // The caller and any admitted workers consume every range via the
-            // shared atomic cursor when the bounded queue is full.
-            break;
-        }
-    }
+                const std::size_t end = std::min(count, begin + chunk_size);
+                try {
+                    (*fn_holder)(begin, end);
+                } catch (const std::exception &e) {
+                    state->failed.store(true, std::memory_order_relaxed);
+                    KVCM_LOG_ERROR("query executor parallel callback threw exception: %s", e.what());
+                } catch (...) {
+                    state->failed.store(true, std::memory_order_relaxed);
+                    KVCM_LOG_ERROR("query executor parallel callback threw unknown exception");
+                }
+            }
+        };
 
-    run_ranges();
-    state->StopWorkersAndWait();
-    return !state->failed.load(std::memory_order_relaxed);
+        for (std::size_t i = 1; i < parallelism; ++i) {
+            if (!TrySubmit([state, run_ranges] {
+                    // The caller may have consumed every range while this task was
+                    // waiting behind another request. In that case it cancels the
+                    // queued helper and returns without waiting for a no-op task to
+                    // reach the head of the global queue.
+                    if (!state->TryStartWorker()) {
+                        return;
+                    }
+                    run_ranges();
+                    state->CompleteWorker();
+                })) {
+                // The caller and any admitted workers consume every range via the
+                // shared atomic cursor when the bounded queue is full.
+                break;
+            }
+        }
+
+        run_ranges();
+        state->StopWorkersAndWait();
+        return !state->failed.load(std::memory_order_relaxed);
+    } catch (const std::exception &e) {
+        // ParallelFor is noexcept. Allocation or queue growth failure must be
+        // reported as a failed query instead of terminating the server. Tasks
+        // admitted before the exception may capture request-local references,
+        // so drain active helpers before returning.
+        if (state) {
+            state->StopWorkersAndWait();
+        }
+        KVCM_LOG_ERROR("query executor failed to schedule parallel query: %s", e.what());
+    } catch (...) {
+        if (state) {
+            state->StopWorkersAndWait();
+        }
+        KVCM_LOG_ERROR("query executor failed to schedule parallel query with unknown exception");
+    }
+    return false;
 }
 
 } // namespace kv_cache_manager

@@ -116,28 +116,7 @@ grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
                                           const proto::meta::ReportEventRequest *request,
                                           proto::meta::ReportEventResponse *response) {
     std::string metrics_type;
-    std::shared_ptr<MetricsCollector> metrics_collector;
-    switch (request->storage_type()) {
-    case proto::meta::ST_EVENT_REPORT_L1P5:
-        metrics_type = kEventReportL1P5MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    case proto::meta::ST_EVENT_REPORT_L2:
-        metrics_type = kEventReportL2MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    default:
-        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
-        break;
-    }
-    if (metrics_collector == nullptr) {
-        KVCM_LOG_ERROR("get ReportEvent metrics collector failed");
-        auto *header = response->mutable_header();
-        auto *status = header->mutable_status();
-        status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        status->set_message("get ReportEvent metrics collector failed");
-        return grpc::Status::OK;
-    }
+    auto metrics_collector = ResolveReportEventMetricsCollector(*request, metrics_type);
     API_CONTEXT_INIT(metrics_collector, ExtractIpFromPeer, context->peer())
     AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);

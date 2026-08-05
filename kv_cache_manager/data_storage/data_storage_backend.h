@@ -25,7 +25,7 @@ public:
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
-    inline void SetAvailable(bool available) { is_available_.store(available, std::memory_order_relaxed); }
+    virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }
     std::shared_ptr<DataStorageMetricsCollector> GetMetricsCollector() { return metrics_collector_; }
     virtual const StorageConfig &GetStorageConfig() { return config_; }
 
@@ -72,7 +72,7 @@ public:
     }
 
 protected:
-    inline bool IsAvailable() const { return is_available_.load(std::memory_order_relaxed); }
+    inline bool IsAvailable() const { return is_available_.load(std::memory_order_acquire); }
 
 protected:
     StorageConfig config_;

@@ -33,8 +33,10 @@ ADD 或 DELETE 直接建立一个进程内 version，然后执行写入。不要
 进程内发生 HOST_DOWN 或 grace cleanup 后会留下 tombstone，必须由 REGISTER 明确清除，
 防止迟到数据事件复活已下线节点。KVCM 重启会清空该进程内 tombstone。
 
-每次成功 REGISTER 同时开启一个新的 lifecycle generation：重复请求会合并 medium 并返回
-成功，但会取消更早 lifecycle 中尚未进入最终 metadata 写入阶段的 mutation/cleanup。因此
+每次至少包含一个合法 REGISTER 的成功请求至多开启一个新的 lifecycle generation：同一请求
+中的多个合法 REGISTER 会先分别校验，再合并 medium，只执行一次实际注册，并给每个合法 item
+返回相同的注册结果；非法 REGISTER 只影响自身 item。跨请求的重复 REGISTER 会再次开启新
+generation，并取消更早 lifecycle 中尚未进入最终 metadata 写入阶段的 mutation/cleanup。因此
 REGISTER 是启动/重建边界，不是 HEARTBEAT 的替代品；调用方不应高频发送或与普通数据请求
 无序并发。
 

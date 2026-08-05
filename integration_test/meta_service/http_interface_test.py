@@ -276,6 +276,25 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             unknown_response,
         )
 
+        # Protobuf enums are open on the wire. 263 would truncate to the
+        # internal uint8 value 7 (L1P5) if the service used a direct cast.
+        invalid_selector = self._client.get_cache_locations_by_backend({
+            "trace_id": "event_report_query_unknown_backend",
+            "instance_id": instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": block_keys,
+            "block_mask": {"offset": 0},
+            "backend_selectors": [{
+                "backend_type": 263,
+                "strategy": "LSS_WEIGHTED_RANDOM",
+            }],
+        }, check_response=False)
+        self.assertEqual(
+            "INVALID_ARGUMENT",
+            invalid_selector.get("header", {}).get("status", {}).get("code"),
+            invalid_selector,
+        )
+
 
 if __name__ == "__main__":
     import unittest
