@@ -3,6 +3,7 @@
 #include <cctype>
 #include <functional>
 #include <string>
+#include <utility>
 
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -113,6 +114,17 @@ public:
         DataStorageUri uri(raw_uri);
         if (!uri.Valid() || !IsValidSnapshotVersionToken(version) ||
             CountUriParam(raw_uri, kSnapshotVersionParam) != 0) {
+            return false;
+        }
+        return AddSnapshotVersionToUri(std::move(uri), version, out_uri);
+    }
+
+    // ReportEvent validates and parses every URI before it acquires the
+    // snapshot/delta fence. Reusing that parsed value avoids parsing the same
+    // URI again merely to append KVCM's internal generation token.
+    static bool AddSnapshotVersionToUri(DataStorageUri uri, const std::string &version, std::string &out_uri) {
+        out_uri.clear();
+        if (!uri.Valid() || !IsValidSnapshotVersionToken(version) || HasEventReportInternalUriMetadata(uri)) {
             return false;
         }
         uri.SetParam(kSnapshotVersionParam, version);
