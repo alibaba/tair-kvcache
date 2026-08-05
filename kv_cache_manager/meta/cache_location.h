@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -18,6 +19,11 @@ public:
 
     LocationSpec(const std::string &name, const std::string &uri) : name_(name), uri_(uri) {}
 
+    LocationSpec(const LocationSpec &) = default;
+    LocationSpec &operator=(const LocationSpec &) = default;
+    LocationSpec(LocationSpec &&) noexcept = default;
+    LocationSpec &operator=(LocationSpec &&) noexcept = default;
+
     ~LocationSpec() override;
 
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
@@ -32,7 +38,9 @@ public:
     }
 
     void set_name(const std::string &name) { name_ = name; }
+    void set_name(std::string &&name) noexcept { name_ = std::move(name); }
     void set_uri(const std::string &uri) { uri_ = uri; }
+    void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
@@ -75,6 +83,10 @@ PutBlockMask(rapidjson::Writer<rapidjson::StringBuffer> &writer, const std::stri
 class CacheLocation : public Jsonizable {
 public:
     CacheLocation();
+    CacheLocation(const CacheLocation &) = default;
+    CacheLocation &operator=(const CacheLocation &) = default;
+    CacheLocation(CacheLocation &&) noexcept = default;
+    CacheLocation &operator=(CacheLocation &&) noexcept = default;
     CacheLocation(DataStorageType type, size_t spec_size, const std::vector<LocationSpec> &location_specs);
     CacheLocation(const std::string &id,
                   CacheLocationStatus status,
@@ -125,9 +137,10 @@ public:
     void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
-    void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
+    void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = std::move(location_specs); }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
+    [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() { return location_specs_; }
     [[nodiscard]] const std::string &id() const { return id_; }
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }

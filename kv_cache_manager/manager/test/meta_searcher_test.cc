@@ -7,6 +7,7 @@
 #include <set>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -18,6 +19,29 @@
 #include "kv_cache_manager/meta/utils.h"
 
 using namespace kv_cache_manager;
+
+static_assert(std::is_nothrow_move_constructible_v<LocationSpec>);
+static_assert(std::is_nothrow_move_assignable_v<LocationSpec>);
+static_assert(std::is_nothrow_move_constructible_v<CacheLocation>);
+static_assert(std::is_nothrow_move_assignable_v<CacheLocation>);
+
+TEST(CacheLocationMoveTest, SetAndMoveLocationSpecsTransferVectorStorage) {
+    std::vector<LocationSpec> specs;
+    specs.reserve(2);
+    specs.emplace_back("tp0", "event_report://move-test:8080/mem?payload=" + std::string(128, 'a'));
+    specs.emplace_back("tp1", "event_report://move-test:8080/mem?payload=" + std::string(128, 'b'));
+    const LocationSpec *const original_storage = specs.data();
+
+    CacheLocation location;
+    location.set_location_specs(std::move(specs));
+    ASSERT_EQ(original_storage, location.location_specs().data());
+    ASSERT_EQ(2u, location.location_specs().size());
+
+    CacheLocation moved(std::move(location));
+    EXPECT_EQ(original_storage, moved.location_specs().data());
+    EXPECT_EQ("tp0", moved.location_specs()[0].name());
+    EXPECT_EQ("tp1", moved.location_specs()[1].name());
+}
 
 namespace {
 // Helper class to create test data
@@ -408,6 +432,43 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_0"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_1"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["full_3"]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsNormalizesLegacyDuplicateNamesInPlace) {
+    const MetaSearcher::KeyVector keys = {10015};
+    const auto seed =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                        3,
+                                        std::vector<LocationSpec>{
+                                            LocationSpec("z", "event_report://legacy:8080/mem?source=first"),
+                                            LocationSpec("a", "event_report://legacy:8080/mem?source=untouched"),
+                                            LocationSpec("z", "event_report://legacy:8080/mem?source=last"),
+                                        });
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchAddLocation(request_context_.get(), keys, CacheLocationVector{seed}, add_results));
+    ASSERT_EQ(1u, add_results.size());
+    ASSERT_EQ(EC_OK, add_results[0].ec);
+
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {add_results[0].location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("b", "event_report://legacy:8080/mem?source=new")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    const auto &specs = location_maps[0].at(add_results[0].location_id)->location_specs();
+    ASSERT_EQ(3u, specs.size());
+    EXPECT_EQ("a", specs[0].name());
+    EXPECT_EQ("b", specs[1].name());
+    EXPECT_EQ("z", specs[2].name());
+    EXPECT_EQ("event_report://legacy:8080/mem?source=last", specs[2].uri());
 }
 
 TEST_F(MetaSearcherTest, TestPrefixMatchByHostIgnoresNonServingLocations) {

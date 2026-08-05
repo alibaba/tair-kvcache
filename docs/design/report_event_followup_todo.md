@@ -51,6 +51,10 @@
 - 同一请求内多个 REGISTER 逐 item 校验，合法 item 的 mediums 合并并只执行一次实际注册，因此
   每个请求至多推进一次 lifecycle；非法 sibling 只影响自身结果。
 - HTTP 与 ServiceImpl 的 ReportEvent 成功入口日志已降为 DEBUG；错误日志仍保留诊断字段。
+- ReportEvent delta 热路径已压平为 block 哈希表和 location/spec 小向量，并直接生成最终 metadata task；
+  `LocationSpec`/`CacheLocation` 的失效 move、重复 URI parse、BatchMerge task 深拷贝和 ordered-map spec
+  merge 已修正。同机 Release/O2、纯 local 的 20k create/update 相对直接父提交下降约 21%/25%；具体
+  A/B、语义约束与剩余并行边界见 `report_event_performance.md` 2.4 和 5.5。
 - `snapshot_delta_drain_timeout_ms` 已进入 Admin proto/config 转换和运行时验证，非正值会被配置
   校验拒绝；仓库内 round-trip 和非法边界测试已覆盖。
 - 查询有界线程池对部分线程创建失败和 `ParallelFor` 分配/入队异常执行显式清理；`noexcept` 热路径

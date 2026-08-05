@@ -100,6 +100,33 @@ lifecycle generation、strict flag 与 committed token 必须在同一个受保�
 默认值是保守起点，不是固定 SLA。调参必须同时看单请求 p50/p99、并发查询 p99、CPU、RPC worker 排队和
 ReportEvent RT；worker 并非越多越好。
 
+### 2.4 ReportEvent 折叠、URI 与 Location 拷贝收敛
+
+2026-08-05 的进一步分段和同机 A/B 表明，纯 local 模式下两阶段 RMW 的真实 backend I/O 只占少数，
+主要成本是请求内聚合以及 modifier 在 metadata shard 锁内做的 Location/spec 深拷贝。当前实现做了以下
+不改变持久化语义的收敛：
+
+1. `LocationSpec` 和 `CacheLocation` 因显式析构函数而没有隐式 move，原来多处看似
+   `std::move` 的代码实际退化为深拷贝；`set_location_specs(vector&&)` 也错误地执行了拷贝赋值。现在显式
+   提供 `noexcept` move，并真正移动 vector。该修复同时覆盖新建 Location、spec merge、迁移等已有调用点；
+2. delta 请求从“三层 `map` + 每个 mutation 的 event vector”改为 block 哈希表以及通常很小的
+   location/spec 连续 vector。每个稳定 `(block, location, spec name)` 仍按请求顺序原地覆盖，最后按
+   block/location/spec 排序后直接生成 ADD/DELETE task；删除了
+   `delta_spec_mutations -> block_to_add/del -> merged_entries -> tasks` 的重复聚合和拷贝链；
+3. 重试依赖保留为每个稳定 block/location 的有序 event 引用。只有已经 materialize 且参与最终 ADD 或
+   DELETE phase 的事件先接收该 phase 的写错误，随后再按原有规则闭包传播。因此 last-operation-wins、
+   admission failure、两 phase 不同错误以及逐 item 返回语义均未因扁平化改变；
+4. 协议 URI 在入口完整校验时保存已经解析的 `DataStorageUri`，追加 `s_version` 时复用，不再为同一 URI
+   重复 parse；BatchMerge 的版本一致性校验也复用本轮已解析对象，同时仍在 API 边界保留 raw 参数计数，
+   duplicate `s_version` 仍会 fail closed；
+5. `BatchMergeLocationSpecs` 的第二阶段只保存原 task 下标，不再复制 location id 和整组 spec/URI。
+   existing Location 仍做一次必要的 copy-on-write，之后在其小 vector 内按 name 原地覆盖、兼容 legacy
+   重名并恢复字典序；不再构造每 key 的 ordered map 和第二份完整 spec vector。
+
+这些优化没有合并两阶段 RMW，也没有改变 lifecycle lease、shard lock 或 HOST_DOWN 的锁序。收益来自减少
+进入和持有 metadata shard 锁期间的 CPU/分配工作，因此既降低单请求 RT，也缩短并发请求的锁占用窗口；
+不能把它解释成“把锁换成原子变量”。
+
 ## 3. 当前明确不做的事情
 
 暂不并行执行 ReportEvent 内的 metadata batch。原因不是并行永远无效，而是当前主要指标已经指向
@@ -244,6 +271,86 @@ Release/O2、纯 local 下，当前版本单请求 20k BLOCK_ADD 的 create/upda
 1. HTTP/JSON/protobuf 请求解析与响应边界约 89ms；
 2. 两阶段 RMW 内逐 key 的 CPU、拷贝和 modifier 约 95ms，其中真实 backend I/O 约 13ms。
 
-若线上 10k~20k 单批 ReportEvent 仍需显著低于 100ms，下一轮应单独设计 local RMW shard 并行或减少
-block-create/targeted-location 两阶段数据变换，并增加 parse/fold 指标。该改动会触及写入原子性、
-lifecycle fence 和锁序，不能作为本轮查询优化的顺手补丁；上线前可先限制单请求 event 数或分批上报。
+这组数据是 5.5 拷贝收敛前的基线；本轮先减少 block-create/targeted-location 两阶段的数据变换，并保持
+串行 RMW。若线上 10k~20k 单批 ReportEvent 在 5.5 的收益后仍需显著低于 100ms，再单独评估 local RMW
+shard 并行并增加 parse/fold 指标。并行会触及写入原子性、lifecycle fence 和锁序，不能仅凭单请求 RT
+开启；上线前仍可通过限制单请求 event 数或分批上报控制尾延迟。
+
+### 5.5 2026-08-05 ReportEvent 拷贝收敛同机 A/B
+
+使用本节 2.4 的性能改动直接父提交 `8f7d5bc` 和当前工作树分别构建 Release/O2 二进制；两个进程使用
+独立端口、独立纯 local instance，在同一台机器连续运行
+`test_20_large_single_request_delta_scaling` 两轮。下表是两轮平均值，所有请求均校验 committed token 以及
+首/中/末 block 的最终 URI：
+
+| events/request | 父提交 create/update | 当前 create/update | create/update 降幅 |
+| ---: | ---: | ---: | ---: |
+| 100 | 1.84/1.89ms | 1.55/1.56ms | 15.8%/17.7% |
+| 1000 | 11.78/13.16ms | 9.41/10.16ms | 20.1%/22.8% |
+| 5000 | 54.23/63.01ms | 43.88/48.14ms | 19.1%/23.6% |
+| 20000 | 217.19/269.40ms | 171.52/202.26ms | 21.0%/24.9% |
+
+20k 单次请求的两轮原始区间分别为：父提交 create 216.86~217.51ms、update
+267.44~271.36ms；当前 create 170.27~172.77ms、update 201.97~202.54ms。趋势随规模增大而扩大，
+符合“减少每 event/node 分配与深拷贝”的预期，不是固定开销或单次快样本。
+
+同一当前二进制随后运行 GetHostCacheState local benchmark，100/1000/5000/20000 block 串行 p50 为
+0.67/1.78/6.71/25.52ms；20k 的 16-way p50/p99 为 95.65/125.41ms，与 5.3 的优化后基线基本一致，
+未观察到通用 move 修复带来的查询回归。以上仍是单机趋势而非 SLA；线上 rollout 应同时观察
+ReportEvent key-count 分桶、RMW 两阶段、lock wait、CPU 与 GetHost p99。
+
+### 5.6 2026-08-05 线上 L2 大批次反馈与后续判别
+
+一轮按目标 QPS 持续发送的线上压测中，客户端全程 `fail/drop/skipped=0`，工作队列通常为 0~1；
+RSS 峰值约 159.4MB、payload budget 峰值约 129.2MB。停止边界丢弃的一个任务不计入稳态失败。
+客户端 L2 构包平均约 3.84ms，而 HTTP 约 217ms；Get 构包约 1.28ms，而 HTTP 约 118ms。因此本轮
+瓶颈不在客户端构包、排队或内存预算，HTTP 往返与服务端处理占绝大多数。
+
+L2 延迟随单批 block 数近似线性：batch p50 约 7k 时 RT p50 约 158ms，batch p95 约 34.5k 时
+RT p95 约 795ms，两点折算的处理速度都约为 44k blocks/s。大批次期间 Get 出现 200~400ms 尾延迟，
+很小的 Heartbeat 也达到约 164ms p99。这些数据足以判断“大 L2 请求的服务端线性工作正在拖慢共享
+资源”，但仅凭客户端 HTTP 时间仍不能区分以下来源各占多少：
+
+1. meta HTTP 端口上的所有 API 共用同一组 `coro_http_server` I/O worker，业务 handler 又同步进入
+   `MetaServiceImpl`/`CacheManager`；长请求可能造成 worker 占用或 CPU 调度排队；
+2. `MetaIndexer` 的 RMW 对每个 batch 在 writer shard lock 内依次完成 backend read、modifier、可选的
+   persistent-backend 序列化和 upsert/delete；同 shard 的其他写入会等待。纯 local 的 Get 不获取这把
+   writer shard lock，但会和 upsert 争用对应 `MetaMemCacheItem` 的 shared/unique mutex；跨 shard 请求
+   仍可能争用 CPU、allocator 和 cache；
+3. HTTP body 解析、protobuf/JSON 转换以及响应序列化不在现有 RMW 分段指标内，大 payload 会继续带来
+   线性 CPU 和内存带宽成本。
+
+下一轮线上观测应把客户端 HTTP RT 与服务端 `ReportEvent` service timer 对齐，并同时按 batch-size
+分桶采集 request parse/fold、block/location RMW、`get_io_time_us`、deserialize/serialize、
+`lock_wait_time_us`、upsert 和 HTTP worker queue/active 数。现有 `lock_wait_time_us` 只覆盖 writer shard
+mutex，不覆盖 local item mutex；若要验证 Get 被 upsert 阻塞，需另加 item-lock wait 指标。若 HTTP RT
+显著大于 service timer，优先查 HTTP worker 排队与 body 编解码；若 service timer 本身接近 HTTP RT，
+再依据 RMW/lock/CPU 分段决定是继续减少 Location 处理成本，还是做 shard-aware 并行。不要从 Heartbeat
+p99 单独反推出某一把锁有问题。
+
+本节 5.5 的拷贝收敛可把 20k create/update 降低约 21%/25%，属于应先上线验证的常数优化；按本轮
+34.5k p95 批次估算，它不足以单独消除 700ms 级尾延迟。发布侧最直接的保护是限制单次 L2 block 数并
+拆成较小批次（可先以 2k~5k 做压测起点），同时给 Get/Heartbeat 保留独立的并发或队列预算。若拆批后
+服务端总吞吐仍稳定且尾延迟显著下降，再决定是否需要把 ReportEvent 放到独立有界 executor，或按互斥
+metadata shard 做 2~4 路有界并行。两种结构性改动都必须保留 request 内 last-operation-wins、两阶段
+key-count、lifecycle fence 和逐 item 错误语义，并设置过载回退，不能用无限并行掩盖单批过大。
+
+随后另一轮混合压测得到：L1P5 ADD 为 1.999 QPS、平均/p99/max RT 为
+7.56/42/146ms；L2 ADD 为 14.998 QPS、149,969 blocks/s，即平均约 10k blocks/request，平均/p99/max
+RT 为 224/841/924ms；Get 为 0.099 QPS、平均 8,984 keys/request，平均/p99 RT 为 119/418ms。L2 的
+单请求处理速度约为 44.6k blocks/s，与前一轮约 44k blocks/s 基本相同，进一步确认瓶颈随 block 数线性
+增长，而不是压测器吞吐不足；约 3.36 个 L2 请求的平均并发也解释了为何 aggregate blocks/s 高于单请求
+速度。
+
+这轮数据发生在 5.5 的本地性能 patch 推送之前；当时该远端开发分支 head 仍为 `637d3e0`，所以不能把
+它当作 5.5 优化后的线上结果。应在包含 5.5 commit 的新 head 上用相同流量重跑 before/after，再判断
+剩余差距。预期 20%~25% 的 RMW/折叠收益仍不足以完全消除 800ms p99；若 after 仍呈相同斜率，下一项
+结构性工作应是一次 shard lock 内同时返回“key 是否存在 + 目标 location value”的 fused targeted RMW，
+而不是继续扩大 Get 查询线程数。
+
+代码复核还确认两个次级问题：`GetHostCacheState` 的默认 access log 会先完整 protobuf-to-JSON，再由
+access-log builder parse 为 DOM；`MakeBatches` 的 `batch_key_size` 是 shard-boundary soft limit，同一
+shard 的 keys 不会被硬切。这两点都值得单独收敛和补指标，但前者在本轮 0.099 Get QPS 下不足以解释
+共享压力，后者的 writer shard lock 也不阻塞纯 local Get。若线上 `mutex_shard_num=16`，10k keys 的
+均匀请求约为 625 keys/shard；增加 128/256 的 lock-hold hard limit 主要改善写写公平性，必须用混合写
+p99 验证，不能把它误报成 Get 尾延迟根因。
