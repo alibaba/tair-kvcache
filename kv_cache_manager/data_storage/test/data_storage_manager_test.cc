@@ -85,3 +85,19 @@ TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
         ASSERT_EQ(EC_BADARGS, ec);
     }
 }
+
+TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+
+#ifdef ENABLE_MOONCAKE
+    EXPECT_NE(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+#else
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+#endif
+
+#ifdef ENABLE_VCNS
+    EXPECT_NE(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+#else
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+#endif
+}

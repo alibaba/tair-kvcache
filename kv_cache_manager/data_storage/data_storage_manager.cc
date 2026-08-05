@@ -8,13 +8,17 @@
 #include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
+#ifdef ENABLE_MOONCAKE
 #include "kv_cache_manager/data_storage/mooncake_backend.h"
+#endif
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
+#ifdef ENABLE_VCNS
 #include "stub_source/kv_cache_manager/data_storage/vcns_hf3fs_backend.h"
+#endif
 
 namespace kv_cache_manager {
 
@@ -163,10 +167,14 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
     switch (type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
         return std::make_shared<Hf3fsBackend>(metrics_registry_);
+#ifdef ENABLE_VCNS
     case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
         return std::make_shared<VcnsHf3fsBackend>(metrics_registry_);
+#endif
+#ifdef ENABLE_MOONCAKE
     case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
         return std::make_shared<MooncakeBackend>(metrics_registry_);
+#endif
     case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
         return std::make_shared<TairMempoolBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
