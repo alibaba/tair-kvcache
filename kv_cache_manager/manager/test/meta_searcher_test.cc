@@ -640,6 +640,77 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostSupportsMoreThanOnePresenceWord) {
     EXPECT_EQ(3, prefix_for(host_name(69)));
 }
 
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostParallelPresenceMatrixMatchesReference) {
+    constexpr std::size_t kHostCount = 70;
+    constexpr std::size_t kKeyCount = 384;
+    MetaSearcher::KeyVector keys;
+    keys.reserve(kKeyCount);
+    for (std::size_t key_index = 0; key_index < kKeyCount; ++key_index) {
+        keys.push_back(11000 + key_index);
+    }
+
+    auto host_name = [](std::size_t index) {
+        return std::string("parallel-host-") + (index < 10 ? "0" : "") + std::to_string(index) + ":8080";
+    };
+    std::vector<std::size_t> expected_prefixes(kHostCount);
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(kKeyCount);
+    for (std::size_t host_index = 0; host_index < kHostCount; ++host_index) {
+        std::size_t prefix = 1 + (host_index * 83) % kKeyCount;
+        if (host_index == 63) {
+            prefix = 257;
+        } else if (host_index == 64) {
+            prefix = 1;
+        } else if (host_index == 69) {
+            prefix = kKeyCount;
+        }
+        expected_prefixes[host_index] = prefix;
+
+        const std::string host = host_name(host_index);
+        const MetaSearcher::MergeLocationSpecsTask task{
+            "kvs#event_report_l2#mem#" + host,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://" + host + "/mem")},
+        };
+        for (std::size_t key_index = 0; key_index < prefix; ++key_index) {
+            tasks[key_index].push_back(task);
+        }
+    }
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ(kKeyCount, per_key_ec.size());
+    EXPECT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    auto verify_matches = [&](const std::vector<MetaSearcher::HostCacheMatch> &matches, bool use_eagle_pop) {
+        std::map<std::string, int64_t> actual;
+        for (const auto &match : matches) {
+            ASSERT_TRUE(actual.emplace(match.host_ip_port, match.prefix_match_blocks).second);
+        }
+        for (std::size_t host_index = 0; host_index < kHostCount; ++host_index) {
+            const int64_t expected = static_cast<int64_t>(expected_prefixes[host_index]) - (use_eagle_pop ? 1 : 0);
+            const auto it = actual.find(host_name(host_index));
+            if (expected == 0) {
+                EXPECT_EQ(actual.end(), it) << "host_index=" << host_index;
+            } else {
+                ASSERT_NE(actual.end(), it) << "host_index=" << host_index;
+                EXPECT_EQ(expected, it->second) << "host_index=" << host_index;
+            }
+        }
+    };
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(kHostCount, matches.size());
+    verify_matches(matches, false);
+
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, true, {"mem"}, matches));
+    verify_matches(matches, true);
+
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"disk"}, matches));
+    EXPECT_TRUE(matches.empty());
+}
+
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcrossGenerationChange) {
     const MetaSearcher::KeyVector keys = {10007};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
