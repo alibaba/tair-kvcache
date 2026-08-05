@@ -468,6 +468,10 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*re
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_locations.clear();
     out_locations.resize(keys.size());
+    std::vector<int64_t> revisit_intervals;
+    if (revisit_histogram_) {
+        revisit_intervals.reserve(keys.size());
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string_view key_sv = KeyToView(keys[i]);
         Cache::Handle *handle = cache_->Lookup(key_sv);
@@ -478,7 +482,7 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*re
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         const int64_t stored_time = item->GetLastAccessTime();
         if (revisit_histogram_ && stored_time > 0) {
-            revisit_histogram_->Observe(TimestampUtil::GetCurrentTimeUs() - stored_time);
+            revisit_intervals.push_back(TimestampUtil::GetCurrentTimeUs() - stored_time);
         }
         item->TouchAccessTime();
         {
@@ -492,6 +496,9 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*re
             }
         }
         cache_->Release(handle);
+    }
+    if (revisit_histogram_) {
+        revisit_histogram_->ObserveBatch(revisit_intervals);
     }
     return results;
 }
