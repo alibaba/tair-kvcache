@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/meta_service_impl.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -111,6 +112,7 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
+constexpr const char *kGetHostCacheStateFullAccessLogEnv = "KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG";
 
 std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
     std::string debug_json;
@@ -119,6 +121,8 @@ std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message)
 }
 
 bool IsReportEventFullAccessLogEnabled() { return EnvUtil::GetEnv(kReportEventFullAccessLogEnv, false); }
+
+bool IsGetHostCacheStateFullAccessLogEnabled() { return EnvUtil::GetEnv(kGetHostCacheStateFullAccessLogEnv, false); }
 
 const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
     if (event.has_block_add()) {
@@ -244,6 +248,59 @@ std::string BuildReportEventResponseAccessLogSummary(const proto::meta::ReportEv
     writer.Int(failed_item_count);
     writer.Key("extra_info_size");
     writer.Uint64(response->extra_info().size());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+std::string BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheStateRequest *request) {
+    if (IsGetHostCacheStateFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(request);
+    }
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("trace_id");
+    writer.String(request->trace_id().c_str());
+    writer.Key("instance_id");
+    writer.String(request->instance_id().c_str());
+    writer.Key("query_type");
+    writer.String(proto::meta::QueryType_Name(request->query_type()).c_str());
+    writer.Key("key_count");
+    writer.Int(request->block_cache_keys_size());
+    if (request->block_cache_keys_size() > 0) {
+        writer.Key("first_key");
+        writer.Int64(request->block_cache_keys(0));
+        writer.Key("last_key");
+        writer.Int64(request->block_cache_keys(request->block_cache_keys_size() - 1));
+    }
+    writer.Key("medium_count");
+    writer.Int(request->medium_size());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+std::string BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheStateResponse *response) {
+    if (IsGetHostCacheStateFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(response);
+    }
+
+    int64_t max_prefix_match_blocks = 0;
+    for (const auto &host : response->hosts()) {
+        max_prefix_match_blocks = std::max(max_prefix_match_blocks, host.prefix_match_blocks());
+    }
+    const auto &status = response->header().status();
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("status_code");
+    writer.String(proto::meta::ErrorCode_Name(status.code()).c_str());
+    writer.Key("status_message");
+    writer.String(status.message().c_str());
+    writer.Key("returned_host_count");
+    writer.Int(response->hosts_size());
+    writer.Key("max_prefix_match_blocks");
+    writer.Int64(max_prefix_match_blocks);
     writer.EndObject();
     return sb.GetString();
 }
@@ -907,7 +964,10 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                         const proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     SPAN_TRACER(request_context);
-    API_CALL_GUARD("GetHostCacheState", true);
+    API_CALL_GUARD_WITH_DEBUG("GetHostCacheState",
+                              true,
+                              BuildGetHostCacheStateRequestAccessLogSummary(request),
+                              BuildGetHostCacheStateResponseAccessLogSummary(response));
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
     std::string invalid_fields = "missing or invalid fields: ";
