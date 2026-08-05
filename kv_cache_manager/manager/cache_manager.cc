@@ -3883,7 +3883,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     std::vector<HostCacheMatch> result;
     result.reserve(host_matches.size());
     for (const auto &match : host_matches) {
-        result.push_back(HostCacheMatch{match.host_ip_port, match.prefix_match_blocks});
+        result.push_back(HostCacheMatch{match.host_ip_port, match.local, match.p2p_1_fetch, match.p2p_1_total_match});
     }
 
     return {EC_OK, std::move(result)};

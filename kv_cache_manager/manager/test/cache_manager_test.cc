@@ -6765,7 +6765,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDo
             auto [ec, hosts] = cache_manager_->GetHostCacheState(
                 &context, instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"mem"});
             if (ec != EC_OK || hosts.size() != 1 || hosts.front().host_ip_port != host ||
-                hosts.front().prefix_match_blocks != static_cast<int64_t>(kBlockCount)) {
+                hosts.front().local != static_cast<int64_t>(kBlockCount)) {
                 failures.fetch_add(1, std::memory_order_relaxed);
             }
             ++query_count;
@@ -6852,11 +6852,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
     }
 
-    // Helper: find a host's prefix_match_blocks in the result
+    // Helper: find a host's local in the result
     auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
         for (const auto &h : hosts) {
             if (h.host_ip_port == host) {
-                return h.prefix_match_blocks;
+                return h.local;
             }
         }
         return -1; // not found
@@ -7020,6 +7020,238 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     dsm->storage_map_.erase("event_backend_default");
 }
 
+TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_host_cache_state_single_p2p";
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>(),
+                                               CacheManager::QueryType::QT_PREFIX_MATCH));
+
+    auto make_backend = [&](const std::string &name, DataStorageType type) {
+        auto backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+        StorageConfig cfg;
+        cfg.set_global_unique_name(name);
+        cfg.set_type(type);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        return std::make_pair(backend, backend->Open(cfg, "test_trace"));
+    };
+    auto subscriber_backend_result =
+        make_backend("host_state_subscriber", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    auto vineyard_backend_result =
+        make_backend("host_state_vineyard", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    ASSERT_EQ(EC_OK, subscriber_backend_result.second);
+    ASSERT_EQ(EC_OK, vineyard_backend_result.second);
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["host_state_subscriber"] = subscriber_backend_result.first;
+    dsm->storage_map_["host_state_vineyard"] = vineyard_backend_result.first;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"host_state_subscriber", "host_state_vineyard"});
+
+    auto report_keys = [&](proto::meta::StorageType type, const std::string &host, const std::vector<int64_t> &keys) {
+        InitializeEventReporter(instance_id, host, type);
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(type);
+        for (int64_t key : keys) {
+            auto *event = req.add_events();
+            event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *block_add = event->mutable_block_add();
+            block_add->set_block_key(std::to_string(key));
+            block_add->set_medium("mem");
+            auto *spec = block_add->add_specs();
+            spec->set_name("tp0");
+            spec->set_uri("event_report://" + host + "/mem");
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    const std::string host_a = "10.0.2.1:8080";
+    const std::string host_b = "10.0.2.2:8080";
+    const std::string host_c = "10.0.2.3:8080";
+    report_keys(proto::meta::ST_EVENT_REPORT_L1P5, host_a, {100, 300});
+    report_keys(proto::meta::ST_EVENT_REPORT_L2, host_b, {100, 200, 400});
+    report_keys(proto::meta::ST_EVENT_REPORT_L2, host_c, {100, 200, 300});
+
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200, 300, 400, 500});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(3u, hosts.size());
+
+    // host A selects B for local-miss keys {200, 400}; host B selects C for {300};
+    // host C selects B for {400}. All three stop at the uncached key 500.
+    auto expect_match = [&](const std::string &host, int64_t local, int64_t p2p_1_fetch, int64_t p2p_1_total_match) {
+        auto it =
+            std::find_if(hosts.begin(), hosts.end(), [&](const auto &match) { return match.host_ip_port == host; });
+        ASSERT_NE(hosts.end(), it);
+        EXPECT_EQ(local, it->local);
+        EXPECT_EQ(p2p_1_fetch, it->p2p_1_fetch);
+        EXPECT_EQ(p2p_1_total_match, it->p2p_1_total_match);
+    };
+    expect_match(host_a, 1, 2, 4);
+    expect_match(host_b, 2, 1, 4);
+    expect_match(host_c, 3, 1, 4);
+
+    // Prefix match with Mamba: local and P2P specs jointly complete the blocks,
+    // then the merged prefix is evaluated with the Mamba state and Eagle POP rules.
+    const std::string mamba_instance_id = "test_host_cache_state_mamba_p2p";
+    std::vector<LocationSpecInfo> mamba_location_spec_infos = {
+        LocationSpecInfo("full_0", 512),
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+    };
+    std::vector<LocationSpecGroup> mamba_location_spec_groups = {
+        LocationSpecGroup("full_0", {"full_0"}),
+        LocationSpecGroup("linear_0", {"linear_0"}),
+        LocationSpecGroup("linear_1", {"linear_1"}),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               mamba_instance_id,
+                                               64,
+                                               mamba_location_spec_infos,
+                                               createModelDeploymentWithEaglePop(),
+                                               mamba_location_spec_groups,
+                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA));
+
+    const std::string mamba_host = "10.0.3.1:8080";
+    const std::string mamba_p2p_host = "10.0.3.2:8080";
+    InitializeEventReporter(mamba_instance_id, mamba_host, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(mamba_instance_id, mamba_p2p_host, proto::meta::ST_EVENT_REPORT_L2);
+
+    auto report_mamba_specs = [&](proto::meta::StorageType type,
+                                  const std::string &host,
+                                  int64_t key,
+                                  const std::vector<std::string> &spec_names) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(mamba_instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(type);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block_add = event->mutable_block_add();
+        block_add->set_block_key(std::to_string(key));
+        block_add->set_medium("mem");
+        for (const auto &spec_name : spec_names) {
+            auto *spec = block_add->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/mem");
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 100, {"full_0", "linear_0", "linear_1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 200, {"full_0"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 300, {"full_0", "linear_0", "linear_1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 400, {"full_0", "linear_0"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 200, {"linear_0", "linear_1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 400, {"linear_1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 500, {"full_0", "linear_0", "linear_1"});
+
+    auto [mamba_ec, mamba_hosts] =
+        cache_manager_->GetHostCacheState(request_context_.get(),
+                                          mamba_instance_id,
+                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                          {100, 200, 300, 400, 500});
+    ASSERT_EQ(EC_OK, mamba_ec);
+    ASSERT_EQ(1u, mamba_hosts.size());
+    EXPECT_EQ(mamba_host, mamba_hosts[0].host_ip_port);
+    EXPECT_EQ(3, mamba_hosts[0].local);
+    EXPECT_EQ(3, mamba_hosts[0].p2p_1_fetch);
+    EXPECT_EQ(4, mamba_hosts[0].p2p_1_total_match);
+
+    // Hybrid P2P uses coverage across missing spec positions. Peer A owns the
+    // first two linear_1 positions, while peer B owns four later positions on
+    // only three distinct block keys. Coverage must select B and fetch=3.
+    const std::string coverage_instance_id = "test_host_cache_state_mamba_coverage";
+    std::vector<LocationSpecInfo> coverage_spec_infos = {
+        LocationSpecInfo("full_0", 512),
+        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("linear_2", 512),
+        LocationSpecInfo("linear_3", 512),
+    };
+    std::vector<LocationSpecGroup> coverage_spec_groups = {
+        LocationSpecGroup("full_0", {"full_0"}),
+        LocationSpecGroup("linear_1", {"linear_1"}),
+        LocationSpecGroup("linear_2", {"linear_2"}),
+        LocationSpecGroup("linear_3", {"linear_3"}),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               coverage_instance_id,
+                                               64,
+                                               coverage_spec_infos,
+                                               createModelDeployment(),
+                                               coverage_spec_groups,
+                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA));
+
+    const std::string coverage_host = "10.0.4.1:8080";
+    const std::string prefix_peer = "10.0.4.2:8080";
+    const std::string coverage_peer = "10.0.4.3:8080";
+    InitializeEventReporter(coverage_instance_id, coverage_host, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(coverage_instance_id, prefix_peer, proto::meta::ST_EVENT_REPORT_L2);
+    InitializeEventReporter(coverage_instance_id, coverage_peer, proto::meta::ST_EVENT_REPORT_L2);
+
+    auto report_coverage_specs = [&](proto::meta::StorageType type,
+                                     const std::string &host,
+                                     int64_t key,
+                                     const std::vector<std::string> &spec_names) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(coverage_instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(type);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block_add = event->mutable_block_add();
+        block_add->set_block_key(std::to_string(key));
+        block_add->set_medium("mem");
+        for (const auto &spec_name : spec_names) {
+            auto *spec = block_add->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/mem");
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    report_coverage_specs(
+        proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 100, {"full_0", "linear_1", "linear_2", "linear_3"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 200, {"full_0"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 300, {"full_0"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 400, {"full_0", "linear_1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 200, {"linear_1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 300, {"linear_1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 200, {"linear_2"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 300, {"linear_2"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 400, {"linear_2", "linear_3"});
+
+    auto [coverage_ec, coverage_hosts] =
+        cache_manager_->GetHostCacheState(request_context_.get(),
+                                          coverage_instance_id,
+                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                          {100, 200, 300, 400});
+    ASSERT_EQ(EC_OK, coverage_ec);
+    ASSERT_EQ(1u, coverage_hosts.size());
+    EXPECT_EQ(coverage_host, coverage_hosts[0].host_ip_port);
+    EXPECT_EQ(1, coverage_hosts[0].local);
+    EXPECT_EQ(3, coverage_hosts[0].p2p_1_fetch);
+    EXPECT_EQ(4, coverage_hosts[0].p2p_1_total_match);
+
+    dsm->storage_map_.erase("host_state_subscriber");
+    dsm->storage_map_.erase("host_state_vineyard");
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheStateUnspecifiedWithoutRegisteredQueryType) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_host_cache_state_no_query_type";
@@ -7132,7 +7364,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
         for (const auto &h : hosts) {
             if (h.host_ip_port == host) {
-                return h.prefix_match_blocks;
+                return h.local;
             }
         }
         return -1;

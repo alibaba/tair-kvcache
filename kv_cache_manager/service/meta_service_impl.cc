@@ -940,7 +940,9 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         for (const auto &match : host_matches) {
             auto *host_match = response->add_hosts();
             host_match->set_host_ip_port(match.host_ip_port);
-            host_match->set_prefix_match_blocks(match.prefix_match_blocks);
+            host_match->set_local(match.local);
+            host_match->set_p2p_1_fetch(match.p2p_1_fetch);
+            host_match->set_p2p_1_total_match(match.p2p_1_total_match);
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
