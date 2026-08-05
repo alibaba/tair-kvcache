@@ -889,6 +889,18 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
         query_keys = GenKeyVector(tokens, block_size);
     }
 
+    if (!location_spec_names.empty()) {
+        if (location_spec_names.size() != query_keys.size() ||
+            std::any_of(location_spec_names.begin(), location_spec_names.end(), [](const std::string &name) {
+                return name.empty();
+            })) {
+            request_context->error_tracer()->AddErrorMsg(
+                "location_spec_names must be empty or contain one non-empty name per query key");
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+                WARN, EC_BADARGS, BatchLocationsView, "invalid per-key location_spec_names");
+        }
+    }
+
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, query_keys.size());
 
@@ -925,8 +937,10 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
     for (auto &key_locs : locations_per_key) {
         FillEmptyLocationSpecs(instance_info->location_spec_infos(), key_locs);
     }
-    for (auto &key_locs : locations_per_key) {
-        FilterLocationSpecByName(key_locs, location_spec_names);
+    if (!location_spec_names.empty()) {
+        for (size_t i = 0; i < locations_per_key.size(); ++i) {
+            FilterLocationSpecByName(locations_per_key[i], {location_spec_names[i]});
+        }
     }
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
