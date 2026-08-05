@@ -32,9 +32,10 @@ public:
     QueryExecutor &operator=(const QueryExecutor &) = delete;
 
     // Runs fn over disjoint half-open ranges that cover [0, count). Returns
-    // false only if a callback throws. Calls made recursively from this
-    // executor's own worker thread deliberately fall back to serial execution
-    // so a task can never wait for the pool that is currently running it.
+    // false if a callback throws or the parallel work cannot be allocated or
+    // scheduled. Calls made recursively from this executor's own worker thread
+    // deliberately fall back to serial execution so a task can never wait for
+    // the pool that is currently running it.
     bool ParallelFor(std::size_t count, const RangeFunction &fn) const noexcept;
 
     [[nodiscard]] std::size_t worker_count() const noexcept { return worker_count_; }

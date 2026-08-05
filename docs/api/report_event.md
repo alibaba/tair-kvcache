@@ -56,6 +56,11 @@ KVCM 更新的最小逻辑身份是：
 block_key + medium + spec.name
 ```
 
+HTTP/protobuf 中 `block_key` 使用十进制字符串。调用方既可以发送 signed int64，也可以发送
+unsigned uint64；KVCM 按相同的 64-bit bit pattern 归一化，例如
+`"18446744073709551615"` 与 `"-1"` 指向同一个内部 block key。这与 vLLM 外部 block hash
+使用 uint64 的约定兼容；超出 uint64 或 int64 表示范围、带正号或空白的字符串会被拒绝。
+
 - `medium` 是 block 级属性，例如 `gpu`、`hbm`、`memory`、`disk`；
 - `spec.name` 区分一个 block 内的多个物理组成部分，例如不同 TP、full attention 或 mamba state；
 - 同一 `block_key` 可以同时存在于多个 medium；
@@ -198,9 +203,11 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 行为：
 
 - 建立或刷新该 reporter 的节点状态；
-- 重复 REGISTER 可安全重试，medium 列表会合并；但每次成功 REGISTER 都是新的 reporter
-  lifecycle 栅栏，会使更早生命周期中尚未落盘的 mutation/cleanup 失效，因此不能把
-  REGISTER 当作 HEARTBEAT 高频发送，也不应与普通数据请求无序并发；
+- 重复 REGISTER 可安全重试，medium 列表会合并；同一请求中的多个合法 REGISTER 分别校验、
+  合并后只执行一次实际注册，因此至多推进一次 lifecycle，所有合法 REGISTER item 获得相同
+  注册结果，非法 REGISTER 只影响自身 item；跨请求的每次成功 REGISTER 都会建立新的 reporter
+  lifecycle 栅栏，使更早生命周期中尚未落盘的 mutation/cleanup 失效，因此不能把 REGISTER
+  当作 HEARTBEAT 高频发送，也不应与普通数据请求无序并发；
 - REGISTER 本身不创建 `committed_snapshot_version`；
 - REGISTER 后可以直接发 ADD/DELETE；
 - KVCM 重启后不必重新 REGISTER；

@@ -38,7 +38,12 @@ public:
     // --- DataStorageBackend interface ---
     DataStorageType GetType() override;
     bool Available() override;
+    // Dynamic disable is also an admission cancellation event. Wake snapshot
+    // and delta waiters so they fail immediately instead of waiting for the
+    // configured drain timeout before observing the unavailable state.
+    void SetAvailable(bool available) override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
+    ErrorCode Open(const StorageConfig &config, const std::string &trace_id) override;
     ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override;
     ErrorCode Close() override;
 
@@ -98,7 +103,9 @@ public:
                                  std::string &out_committed_version,
                                  uint64_t *out_lifecycle_generation = nullptr,
                                  bool *out_created_generation = nullptr);
-    void EndDeltaMutation(const ReporterSnapshotKey &reporter_key, uint64_t lifecycle_generation = 0);
+    void EndDeltaMutation(const ReporterSnapshotKey &reporter_key,
+                          uint64_t lifecycle_generation = 0,
+                          const std::string &expected_snapshot_version = {});
     ErrorCode BeginSnapshot(const ReporterSnapshotKey &reporter_key,
                             std::string &out_candidate_version,
                             uint64_t &out_retry_after_ms,
@@ -110,6 +117,19 @@ public:
     ErrorCode AcquireLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
                                            uint64_t expected_generation,
                                            LifecycleMutationLease &out_lease) const;
+    // Atomically fences a stale-snapshot cleanup against both reporter
+    // lifecycle changes and the start of a later snapshot attempt. The lease
+    // must be retained through the metadata compare-and-delete.
+    ErrorCode AcquireSnapshotCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                          uint64_t expected_generation,
+                                          const std::string &expected_snapshot_version,
+                                          uint64_t expected_attempt_epoch,
+                                          LifecycleMutationLease &out_lease) const;
+    // Retains a lifecycle read lease through candidate validation and commit,
+    // so REGISTER/HOST_DOWN cannot cross the final publication boundary.
+    ErrorCode CommitSnapshotVersionIfGeneration(const ReporterSnapshotKey &reporter_key,
+                                                const std::string &version,
+                                                uint64_t expected_generation);
     bool CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     void AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     std::string GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const;
@@ -135,6 +155,12 @@ public:
     DataStorageType GetStorageType() const;
 
 private:
+    // Unit-level state-machine tests also exercise a never-opened backend.
+    // Treat that state as usable, while permanently fencing operations after
+    // Close and respecting DataStorageManager disablement for opened storage.
+    bool AcceptingReports() const { return !retired_.load(std::memory_order_acquire) && (!IsOpen() || IsAvailable()); }
+    bool Retired() const { return retired_.load(std::memory_order_acquire); }
+
     struct LifecycleFence {
         mutable std::shared_mutex mutex;
         uint64_t generation = 0;
@@ -208,6 +234,9 @@ private:
 
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};
+    std::atomic<bool> retired_{false};
+    std::mutex liveness_wait_mutex_;
+    std::condition_variable liveness_wait_cv_;
 
     int64_t heartbeat_timeout_ms_ = EventReportStorageSpec::kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = EventReportStorageSpec::kDefaultCleanupGraceMs;
