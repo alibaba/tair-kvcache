@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <random>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -149,13 +150,10 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(std::string_view key_sv,
     return ret;
 }
 
-ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
-                                          const CacheLocationMap &locations,
-                                          const PropertyMap &properties) {
-    Cache::Handle *handle = cache_->Lookup(key_sv);
-    if (!handle) {
-        return EC_NOENT;
-    }
+ErrorCode MetaLocalBackend::UpdateHandleInPlace(Cache::Handle *handle,
+                                                const CacheLocationMap &locations,
+                                                const PropertyMap &properties) {
+    assert(handle != nullptr);
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     existing->TouchAccessTime();
     ssize_t charge_delta = 0;
@@ -190,8 +188,19 @@ ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
     }
-    cache_->Release(handle);
     return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
+                                          const CacheLocationMap &locations,
+                                          const PropertyMap &properties) {
+    Cache::Handle *handle = cache_->Lookup(key_sv);
+    if (!handle) {
+        return EC_NOENT;
+    }
+    const ErrorCode ec = UpdateHandleInPlace(handle, locations, properties);
+    cache_->Release(handle);
+    return ec;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,8 +287,74 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
                                                 const CacheLocationMapVector &locations,
                                                 const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
+    bool has_duplicate_keys = false;
+    bool keys_are_sorted = true;
+    for (size_t i = 1; i < keys.size(); ++i) {
+        has_duplicate_keys = has_duplicate_keys || keys[i] == keys[i - 1];
+        keys_are_sorted = keys_are_sorted && keys[i - 1] <= keys[i];
+    }
+    if (!has_duplicate_keys && !keys_are_sorted) {
+        std::unordered_set<KeyType> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const KeyType key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
+        }
+    }
+    if (has_duplicate_keys) {
+        // Preserve the historical request-order merge semantics for the
+        // general backend API. ReportEvent supplies sorted unique keys and
+        // therefore stays on the batched-LRU fast path below.
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
+        }
+        return results;
+    }
+
+    std::vector<std::string_view> key_views(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+    const size_t missing_count = static_cast<size_t>(std::count(handles.begin(), handles.end(), nullptr));
+    if (missing_count > 0 && missing_count < handles.size()) {
+        // Updating every hit before inserting every miss reorders a mixed
+        // request. Besides partial-field merge semantics, order is observable
+        // under strict capacity because in-place charge growth is admitted
+        // differently from a new insertion. Preserve the original per-key
+        // behavior for this uncommon shape. Existing handles were already
+        // acquired in one batch, but are updated/released at their original
+        // position so a preceding insert still observes the preceding cache
+        // charge. All-hit updates and all-miss creates retain the fully
+        // batched-LRU fast paths below.
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (handles[i]) {
+                results[i] = UpdateHandleInPlace(handles[i], locations[i], properties[i]);
+                cache_->Release(handles[i]);
+            } else {
+                results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+            }
+        }
+        return results;
+    }
+
+    if (missing_count == 0) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpdateHandleInPlace(handles[i], locations[i], properties[i]);
+        }
+        cache_->ReleaseBatch(handles.data(), handles.size());
+        return results;
+    }
+
+    // The mixed shape returned above, so every handle is null here. Avoid a
+    // pointless ReleaseBatch shard-group allocation and retain ordered insert
+    // semantics for the all-new-key path.
+    assert(missing_count == handles.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
     }
     return results;
 }
@@ -578,18 +653,29 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
     out_key_error_codes.assign(keys.size(), EC_OK);
     out_locations.assign(keys.size(), CacheLocationVector{});
 
+    // Targeted RMW commonly reads thousands of one-location keys at once.
+    // Group the LRU lookups/releases by cache shard instead of taking the same
+    // shard mutex once per key. Handles remain pinned while the immutable
+    // CacheLocation pointers are projected below, matching the compact query
+    // path's lifetime contract.
+    std::vector<std::string_view> key_views(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+    const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
 
-        std::string_view key_sv = KeyToView(keys[i]);
-        Cache::Handle *handle = cache_->Lookup(key_sv);
+        Cache::Handle *handle = handles[i];
         if (!handle) {
             out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
         }
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        item->TouchAccessTime();
+        item->TouchAccessTime(access_time_us);
         results[i].resize(location_ids[i].size());
         {
             std::shared_lock lock(item->GetMutex());
@@ -604,8 +690,8 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
                 }
             }
         }
-        cache_->Release(handle);
     }
+    cache_->ReleaseBatch(handles.data(), handles.size());
     return results;
 }
 

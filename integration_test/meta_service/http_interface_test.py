@@ -243,7 +243,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
                 "query_type": "QT_BATCH_GET",
                 "block_keys": block_keys,
                 "block_mask": {"offset": 0},
-                "location_spec_names": ["linear_1"],
+                "location_spec_names": ["linear_1"] * len(block_keys),
                 "backend_selectors": [{
                     "backend_type": "ST_EVENT_REPORT_L2",
                     "strategy": strategy,
@@ -264,7 +264,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             "query_type": "QT_BATCH_GET",
             "block_keys": block_keys,
             "block_mask": {"offset": 0},
-            "location_spec_names": ["unknown_spec"],
+            "location_spec_names": ["unknown_spec"] * len(block_keys),
             "backend_selectors": [{
                 "backend_type": "ST_EVENT_REPORT_L2",
                 "strategy": "LSS_V6D_PREFIX",

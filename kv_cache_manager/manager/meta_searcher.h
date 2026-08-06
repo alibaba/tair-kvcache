@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,7 @@ using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk
 
 class MetaIndexer;
 class LocationSpecGroup;
+class CacheManager;
 
 enum class LocationSelectStrategy : int32_t {
     LSS_UNSPECIFIED = 0,
@@ -153,11 +155,27 @@ public:
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    class PrevalidatedTotalSize {
+    public:
+        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
+
+    private:
+        friend class CacheManager;
+        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
+
+        std::uint64_t value_ = 0;
+    };
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
+        // ReportEvent fully validates and parses every input URI before it
+        // acquires the reporter mutation fence. Supplying this value lets its
+        // internal merge path reuse the already computed aggregate size
+        // instead of parsing every versioned URI a second time. Other callers
+        // must leave it empty and receive the normal strict validation.
+        std::optional<PrevalidatedTotalSize> prevalidated_total_size;
     };
     // Keys and location ids within a key must be unique. Every task requires
     // non-empty, uniquely named specs with valid URIs and cannot mix

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <string_view>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
@@ -273,6 +274,21 @@ TEST_F(ProtoMessageJsonUtilTest, TestFromJsonError) {
         std::string json = "{\"int32Value\":\"not_int\"}";
         ASSERT_FALSE(ProtoMessageJsonUtil::FromJson(json, &msg));
     }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFromJsonHonorsNonNullTerminatedViewBounds) {
+    const std::string json = R"({"int32Value":123,"stringValue":"bounded"})";
+    const std::string prefix = "ignored-prefix";
+    const std::string backing = prefix + json + "!invalid-trailing-bytes";
+    const std::string_view bounded(backing.data() + prefix.size(), json.size());
+
+    SimpleMessage msg;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(bounded, &msg));
+    EXPECT_EQ(123, msg.int32value());
+    EXPECT_EQ("bounded", msg.stringvalue());
+
+    EXPECT_FALSE(ProtoMessageJsonUtil::FromJson(std::string_view(), &msg));
+    EXPECT_FALSE(ProtoMessageJsonUtil::FromJson(bounded, nullptr));
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFromJsonEnum) {

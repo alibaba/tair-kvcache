@@ -209,6 +209,8 @@ private:
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
     CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode
+    UpdateHandleInPlace(Cache::Handle *handle, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);

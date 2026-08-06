@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -894,6 +895,11 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
                          "event_report://127.0.0.1:8080/mem?source=duplicate&s_version=" + version_b +
                              "&s_version=" + version_b),
         },
+        {
+            LocationSpec("max_size",
+                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_version=" + version_b),
+            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_version=" + version_b),
+        },
     };
 
     for (const auto &specs : invalid_specs) {
@@ -936,7 +942,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         {{location_id,
           DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
           CacheLocationStatus::CLS_SERVING,
-          invalid_specs.front()}},
+          invalid_specs.back()}},
     };
     EXPECT_EQ(
         EC_BADARGS,
@@ -946,6 +952,44 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_TRUE(location_maps[0].empty());
     EXPECT_TRUE(location_maps[1].empty());
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsOverflowAgainstExistingSpecs) {
+    const MetaSearcher::KeyVector keys = {10016};
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
+    const std::string version = "00112233445566778899aabbccddeeff";
+    auto uri = [&version](const std::string &source, const std::string &size) {
+        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_version=" + version;
+    };
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("baseline", uri("baseline", "18446744073709551615"))}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    // Both requests are independently valid. The second one must still be
+    // rejected because the final merged location would overflow uint64_t.
+    tasks[0][0].specs = {LocationSpec("new_spec", uri("new_spec", "1"))};
+    meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    const auto &stored_specs = location_maps[0].at(location_id)->location_specs();
+    ASSERT_EQ(1u, stored_specs.size());
+    EXPECT_EQ("baseline", stored_specs[0].name());
+    EXPECT_EQ(uri("baseline", "18446744073709551615"), stored_specs[0].uri());
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltasDoNotLoseUpdates) {
