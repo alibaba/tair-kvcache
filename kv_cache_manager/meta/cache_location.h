@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -18,6 +20,11 @@ public:
 
     LocationSpec(const std::string &name, const std::string &uri) : name_(name), uri_(uri) {}
 
+    LocationSpec(const LocationSpec &) = default;
+    LocationSpec &operator=(const LocationSpec &) = default;
+    LocationSpec(LocationSpec &&) noexcept = default;
+    LocationSpec &operator=(LocationSpec &&) noexcept = default;
+
     ~LocationSpec() override;
 
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
@@ -32,7 +39,9 @@ public:
     }
 
     void set_name(const std::string &name) { name_ = name; }
+    void set_name(std::string &&name) noexcept { name_ = std::move(name); }
     void set_uri(const std::string &uri) { uri_ = uri; }
+    void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
@@ -75,6 +84,10 @@ PutBlockMask(rapidjson::Writer<rapidjson::StringBuffer> &writer, const std::stri
 class CacheLocation : public Jsonizable {
 public:
     CacheLocation();
+    CacheLocation(const CacheLocation &) = default;
+    CacheLocation &operator=(const CacheLocation &) = default;
+    CacheLocation(CacheLocation &&) noexcept = default;
+    CacheLocation &operator=(CacheLocation &&) noexcept = default;
     CacheLocation(DataStorageType type, size_t spec_size, const std::vector<LocationSpec> &location_specs);
     CacheLocation(const std::string &id,
                   CacheLocationStatus status,
@@ -125,9 +138,10 @@ public:
     void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
-    void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
+    void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = std::move(location_specs); }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
+    [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() { return location_specs_; }
     [[nodiscard]] const std::string &id() const { return id_; }
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }
@@ -154,5 +168,63 @@ using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;
 using CacheLocationVector = std::vector<CacheLocationConstPtr>;
 using CacheLocationMap = std::unordered_map<std::string, CacheLocationConstPtr>;
 using CacheLocationMapVector = std::vector<CacheLocationMap>;
+
+// Compact positional representation for large all-location reads. Keeping one
+// vector object per key is disproportionately expensive for GetHostCacheState:
+// a million-key request otherwise constructs a million small vectors and, for
+// the common one-location case, performs a million heap allocations. Offsets
+// keep the same positional contract while all shared_ptr values live in one
+// contiguous allocation per backend chunk.
+class CacheLocationValueView {
+public:
+    using const_iterator = CacheLocationVector::const_iterator;
+
+    CacheLocationValueView() = default;
+    CacheLocationValueView(const_iterator begin, const_iterator end) : begin_(begin), end_(end) {}
+
+    [[nodiscard]] const_iterator begin() const { return begin_; }
+    [[nodiscard]] const_iterator end() const { return end_; }
+    [[nodiscard]] bool empty() const { return begin_ == end_; }
+    [[nodiscard]] size_t size() const { return static_cast<size_t>(end_ - begin_); }
+
+private:
+    const_iterator begin_{};
+    const_iterator end_{};
+};
+
+struct CompactLocationsPerKey {
+    std::vector<size_t> offsets{0};
+    CacheLocationVector values;
+
+    void Clear(size_t key_capacity = 0, size_t location_capacity = 0) {
+        offsets.clear();
+        offsets.reserve(key_capacity + 1);
+        offsets.push_back(0);
+        values.clear();
+        values.reserve(location_capacity);
+    }
+
+    [[nodiscard]] size_t size() const { return offsets.empty() ? 0 : offsets.size() - 1; }
+    [[nodiscard]] bool empty() const { return size() == 0; }
+    [[nodiscard]] bool IsValid(size_t expected_key_count) const {
+        if (offsets.size() != expected_key_count + 1 || offsets.empty() || offsets.front() != 0 ||
+            offsets.back() != values.size()) {
+            return false;
+        }
+        for (size_t i = 1; i < offsets.size(); ++i) {
+            if (offsets[i] < offsets[i - 1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] CacheLocationValueView operator[](size_t index) const {
+        return CacheLocationValueView(values.begin() + static_cast<ptrdiff_t>(offsets[index]),
+                                      values.begin() + static_cast<ptrdiff_t>(offsets[index + 1]));
+    }
+
+    void FinishKey() { offsets.push_back(values.size()); }
+};
 
 } // namespace kv_cache_manager

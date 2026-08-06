@@ -78,6 +78,41 @@ void RevisitIntervalHistogram::Observe(int64_t interval_us) {
     ++count_counter_;
 }
 
+void RevisitIntervalHistogram::ObserveBatch(const std::vector<int64_t> &intervals_us) {
+    if (intervals_us.empty()) {
+        return;
+    }
+
+    std::vector<uint64_t> bucket_deltas(boundaries_.size() + 1, 0);
+    uint64_t sum_delta = 0;
+    uint64_t count_delta = 0;
+    for (const int64_t interval_us : intervals_us) {
+        if (interval_us <= 0) {
+            continue;
+        }
+        const double interval_s = static_cast<double>(interval_us) / 1e6;
+        for (size_t i = 0; i < boundaries_.size(); ++i) {
+            if (boundaries_[i] >= interval_s) {
+                ++bucket_deltas[i];
+            }
+        }
+        ++bucket_deltas.back();
+        sum_delta += static_cast<uint64_t>(interval_us);
+        ++count_delta;
+    }
+
+    if (count_delta == 0) {
+        return;
+    }
+    for (size_t i = 0; i < bucket_deltas.size(); ++i) {
+        if (bucket_deltas[i] != 0) {
+            bucket_counters_[i] += bucket_deltas[i];
+        }
+    }
+    sum_counter_ += sum_delta;
+    count_counter_ += count_delta;
+}
+
 std::vector<uint64_t> RevisitIntervalHistogram::GetBucketCounts() const {
     std::vector<uint64_t> counts;
     counts.reserve(bucket_counters_.size());

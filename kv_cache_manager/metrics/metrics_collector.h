@@ -277,6 +277,8 @@ class ServiceMetricsCollector final : public MetricsCollector {
 
     // meta searcher metrics
     KVCM_CHRONO_METRICS(meta_searcher, indexer_get_time_us, MetaSearcherIndexerGet)
+    KVCM_CHRONO_METRICS(meta_searcher, host_projection_time_us, MetaSearcherHostProjection)
+    KVCM_CHRONO_METRICS(meta_searcher, host_prefix_reduce_time_us, MetaSearcherHostPrefixReduce)
     KVCM_CHRONO_METRICS(meta_searcher, indexer_read_modify_write_block_time_us, MetaSearcherIndexerReadModifyWriteBlock)
     KVCM_CHRONO_METRICS(meta_searcher,
                         indexer_read_modify_write_location_time_us,

@@ -160,6 +160,50 @@ TEST_F(LRUCacheTest, BasicLRU) {
     ValidateLRUList({"e", "z", "d", "u", "v"}, 0, 5);
 }
 
+TEST_F(LRUCacheTest, BatchLookupAndReleasePreserveReferencesAndLruOrder) {
+    NewCache(5);
+    Insert("a");
+    Insert("b");
+    Insert("c");
+
+    const std::string_view keys[] = {"c", "missing", "a", "c"};
+    const uint32_t hashes[] = {0, 0, 0, 0};
+    const size_t indices[] = {0, 1, 2, 3};
+    Cache::Handle *handles[4] = {};
+    cache_->LookupBatch(keys, hashes, indices, 4, handles);
+    ASSERT_NE(nullptr, handles[0]);
+    EXPECT_EQ(nullptr, handles[1]);
+    ASSERT_NE(nullptr, handles[2]);
+    EXPECT_EQ(handles[0], handles[3]);
+    // Referenced entries are temporarily absent from the eviction list.
+    ValidateLRUList({"b"}, 0, 1);
+
+    cache_->ReleaseBatch(handles, indices, 4);
+    // Release order is the request order. The duplicate c handle is inserted
+    // only when its final reference is released.
+    ValidateLRUList({"b", "a", "c"}, 0, 3);
+}
+
+TEST_F(LRUCacheTest, BatchReleaseFreesEntryErasedWhilePinned) {
+    NewCache(5);
+    Insert("a");
+    Insert("b");
+
+    const std::string_view keys[] = {"a", "b"};
+    const uint32_t hashes[] = {0, 0};
+    const size_t indices[] = {0, 1};
+    Cache::Handle *handles[2] = {};
+    cache_->LookupBatch(keys, hashes, indices, 2, handles);
+    ASSERT_NE(nullptr, handles[0]);
+    ASSERT_NE(nullptr, handles[1]);
+    cache_->Erase("a", 0);
+    cache_->ReleaseBatch(handles, indices, 2);
+
+    EXPECT_FALSE(Lookup("a"));
+    EXPECT_TRUE(Lookup("b"));
+    ValidateLRUList({"b"}, 0, 1);
+}
+
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
     // Allocate 2 cache entries to high-pri pool and 3 to low-pri pool.
     NewCache(5, /* high_pri_pool_ratio */ 0.40, /* low_pri_pool_ratio */ 0.60);

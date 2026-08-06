@@ -246,6 +246,25 @@ TEST_F(RegistryManagerLocalBackendTest, TestInstanceRegistration) {
     ASSERT_EQ(1, instance_infos_after_remove.size());
 }
 
+TEST_F(RegistryManagerLocalBackendTest, DuplicateInstanceCannotMoveToAnotherGroup) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_group_mismatch";
+    ASSERT_TRUE(InitRegistryManager("local://" + local_path + "?cluster_name=test"));
+    AddNfsStorage("storage1", 1);
+    CreateInstanceGroup("group1");
+    CreateInstanceGroup("group2");
+    RegisterInstance("group1", "shared_instance");
+
+    LocationSpecInfo info;
+    ModelDeployment model_deployment;
+    EXPECT_EQ(EC_DUPLICATE_ENTITY,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "group2", "shared_instance", 1024, {info}, model_deployment));
+    const auto existing = registry_manager_->GetInstanceInfo(request_context_.get(), "shared_instance");
+    ASSERT_NE(nullptr, existing);
+    EXPECT_EQ("group1", existing->instance_group_name());
+    EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("instance_group_name"));
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestAccountManagement) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_account_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";

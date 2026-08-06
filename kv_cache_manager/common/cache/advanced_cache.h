@@ -300,6 +300,16 @@ public: // functions
                            Priority priority = Priority::LOW,
                            Statistics *stats = nullptr) = 0;
 
+    // Batch form of a basic primary-cache lookup. Every non-null output handle
+    // has the same lifetime contract as Lookup() and must be released exactly
+    // once. Implementations may group keys by internal shard; the default
+    // preserves behavior by issuing independent lookups.
+    virtual void LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) {
+        for (size_t i = 0; i < count; ++i) {
+            out_handles[i] = Lookup(keys[i]);
+        }
+    }
+
     // Convenience wrapper when secondary cache not supported
     inline Handle *BasicLookup(const std::string_view &key, Statistics *stats) {
         return Lookup(key, nullptr, nullptr, Priority::LOW, stats);
@@ -323,6 +333,16 @@ public: // functions
     // REQUIRES: handle must not have been released yet.
     // REQUIRES: handle must have been returned by a method on *this.
     virtual bool Release(Handle *handle, bool erase_if_last_ref = false) = 0;
+
+    // Releases handles returned by LookupBatch(). Null entries are ignored.
+    // The default implementation preserves the ordinary Release semantics.
+    virtual void ReleaseBatch(Handle *const *handles, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            if (handles[i] != nullptr) {
+                Release(handles[i]);
+            }
+        }
+    }
 
     // Return the object assiciated with a handle returned by a successful
     // Lookup(). For historical reasons, this is also known at the "value"
@@ -640,12 +660,18 @@ public:
         return target_->Lookup(key, helper, create_context, priority, stats);
     }
 
+    void LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) override {
+        target_->LookupBatch(keys, count, out_handles);
+    }
+
     bool Ref(Handle *handle) override { return target_->Ref(handle); }
 
     using Cache::Release;
     bool Release(Handle *handle, bool erase_if_last_ref = false) override {
         return target_->Release(handle, erase_if_last_ref);
     }
+
+    void ReleaseBatch(Handle *const *handles, size_t count) override { target_->ReleaseBatch(handles, count); }
 
     ObjectPtr Value(Handle *handle) override { return target_->Value(handle); }
 

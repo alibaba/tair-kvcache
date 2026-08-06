@@ -22,6 +22,9 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_TRUE(config.Check());
         ASSERT_EQ(2, config.GetSchedulePlanExecutorThreadCount());
         ASSERT_EQ(1u, config.GetSchedulePlanMigrationWorkerBudget());
+        ASSERT_EQ(4u, config.GetMetaQueryWorkerCount());
+        ASSERT_EQ(256u, config.GetMetaQueryParallelThreshold());
+        ASSERT_EQ(128u, config.GetMetaQueryChunkSize());
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
         ASSERT_EQ(100000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(64ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
@@ -167,6 +170,42 @@ TEST_F(ServerConfigTest, TestSchedulePlanMigrationWorkerBudget) {
             {"kvcm.schedule_plan_migration_worker_budget", "invalid"},
         };
         EXPECT_FALSE(config.Parse("", environ));
+    }
+}
+
+TEST_F(ServerConfigTest, TestMetaQueryExecutorConfig) {
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.meta_query.worker_count", "8"},
+            {"kvcm.meta_query.parallel_threshold", "512"},
+            {"kvcm.meta_query.chunk_size", "64"},
+        };
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(8u, config.GetMetaQueryWorkerCount());
+        EXPECT_EQ(512u, config.GetMetaQueryParallelThreshold());
+        EXPECT_EQ(64u, config.GetMetaQueryChunkSize());
+    }
+    for (const auto &invalid : std::vector<std::pair<std::string, std::string>>{
+             {"kvcm.meta_query.worker_count", "0"},
+             {"kvcm.meta_query.worker_count", "65"},
+             {"kvcm.meta_query.parallel_threshold", "0"},
+             {"kvcm.meta_query.chunk_size", "0"},
+         }) {
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{invalid.first, invalid.second}}));
+        EXPECT_FALSE(config.Check()) << invalid.first << "=" << invalid.second;
+    }
+    {
+        ServerConfig config;
+        ASSERT_TRUE(
+            config.Parse("", {{"kvcm.meta_query.parallel_threshold", "128"}, {"kvcm.meta_query.chunk_size", "129"}}));
+        EXPECT_FALSE(config.Check());
+    }
+    for (const auto &invalid_value : {"invalid", "12x", "-1", "4294967296"}) {
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.meta_query.worker_count", invalid_value}})) << invalid_value;
     }
 }
 
