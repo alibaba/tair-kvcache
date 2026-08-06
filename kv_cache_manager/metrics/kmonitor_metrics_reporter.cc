@@ -585,6 +585,9 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         const double error_code = p->GetErrorCodeSample();
         REPORT_METRICS_WHEN(event_report, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
+        if (p->HasRequestKeyCountSample()) {
+            REPORT_METRICS(manager, request_key_count, p->GetRequestKeyCountSample());
+        }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());

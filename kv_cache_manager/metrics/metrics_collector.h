@@ -322,13 +322,14 @@ public:
 };
 
 // Lightweight per-event observability for ReportEvent. This intentionally
-// avoids registering the manager/meta metric families carried by a full
-// ServiceMetricsCollector.
+// carries only the request key count from the manager metric family, rather
+// than registering every manager/meta metric from ServiceMetricsCollector.
 class EventReportMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(event_report, request_counter)
     KVCM_GAUGE_METRICS(event_report, request_rt_us)
     KVCM_GAUGE_METRICS(event_report, error_code)
     KVCM_COUNTER_METRICS(event_report, error_counter)
+    KVCM_GAUGE_METRICS(manager, request_key_count)
 
 public:
     EventReportMetricsCollector() = delete;
@@ -341,7 +342,7 @@ public:
     // Collector objects are request-local, while registry gauges with the
     // same event_type tag are shared. Synchronous reporters must consume this
     // local sample so concurrent requests cannot attribute one another's
-    // latency or error.
+    // latency, error, or request key count.
     void SetRequestSample(double request_rt_us, double error_code) noexcept {
         request_rt_us_sample_ = request_rt_us;
         error_code_sample_ = error_code;
@@ -353,11 +354,21 @@ public:
     [[nodiscard]] double GetErrorCodeSample() const noexcept {
         return has_request_sample_ ? error_code_sample_ : get_event_report_error_code_metrics();
     }
+    void SetRequestKeyCountSample(double request_key_count) noexcept {
+        request_key_count_sample_ = request_key_count;
+        has_request_key_count_sample_ = true;
+    }
+    [[nodiscard]] bool HasRequestKeyCountSample() const noexcept { return has_request_key_count_sample_; }
+    [[nodiscard]] double GetRequestKeyCountSample() const noexcept {
+        return has_request_key_count_sample_ ? request_key_count_sample_ : get_manager_request_key_count_metrics();
+    }
 
 private:
     double request_rt_us_sample_ = 0.0;
     double error_code_sample_ = 0.0;
+    double request_key_count_sample_ = 0.0;
     bool has_request_sample_ = false;
+    bool has_request_key_count_sample_ = false;
 };
 
 /* ------------------ DataStorageMetricsCollector ------------------- */
