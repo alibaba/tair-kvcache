@@ -14,6 +14,7 @@ namespace kv_cache_manager {
 class MetaIndexerConfig;
 class MetaIndexer;
 class MetricsRegistry;
+class QueryExecutor;
 
 class MetaIndexerManager {
 public:
@@ -24,6 +25,11 @@ public:
     // Set histogram configuration for revisit interval tracking.
     // Must be called before CreateMetaIndexer.
     void SetRevisitHistogramConfig(std::shared_ptr<MetricsRegistry> registry, const std::vector<double> &boundaries);
+
+    // Configures the single process-level executor shared by every indexer.
+    // Must be called before CreateMetaIndexer. worker_count == 1 keeps the
+    // exact serial behavior while preserving the same code path.
+    bool ConfigureQueryExecutor(std::size_t worker_count, std::size_t parallel_threshold, std::size_t chunk_size);
 
     ErrorCode CreateMetaIndexer(const std::string &instance_id,
                                 const std::shared_ptr<MetaIndexerConfig> &config,
@@ -50,6 +56,7 @@ private:
     // Histogram configuration (shared across all indexers)
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::vector<double> revisit_boundaries_;
+    std::shared_ptr<QueryExecutor> query_executor_;
 };
 
 } // namespace kv_cache_manager

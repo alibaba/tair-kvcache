@@ -319,6 +319,10 @@ template <typename T>
 void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, DataStorageType &data_storage_type_info) {
     static_assert(std::is_same_v<T, proto::meta::StorageType> || std::is_same_v<T, proto::admin::StorageType>,
                   "T must be either proto::meta::DataStorage or proto::admin::DataStorage");
+    // Protobuf enums are open on the wire. Always initialize the output so an
+    // unknown numeric value fails closed instead of leaving callers with an
+    // indeterminate DataStorageType.
+    data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     switch (proto_data_storage_type) {
     case T::ST_UNSPECIFIED: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;

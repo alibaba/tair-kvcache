@@ -46,6 +46,12 @@ struct MetaMemCacheItem {
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
+    void TouchAccessTime(int64_t access_time_us) {
+        int64_t current = last_access_time_.load(std::memory_order_relaxed);
+        while (current < access_time_us &&
+               !last_access_time_.compare_exchange_weak(
+                   current, access_time_us, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    }
 
     static MetaMemCacheItem *Create(const CacheLocationMap &locations, const PropertyMap &properties) {
         auto *item = new MetaMemCacheItem();
@@ -135,10 +141,23 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                    const KeyType *keys,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept override;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept override;

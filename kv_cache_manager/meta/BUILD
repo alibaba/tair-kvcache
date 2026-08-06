@@ -8,6 +8,15 @@ cc_library(
 )
 
 cc_library(
+    name = "query_executor",
+    srcs = ["query_executor.cc"],
+    hdrs = ["query_executor.h"],
+    deps = [
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
     name = "meta_indexer_manager",
     srcs = [
         "meta_indexer_manager.cc",
@@ -17,6 +26,7 @@ cc_library(
     ],
     deps = [
         ":meta_indexer",
+        ":query_executor",
         "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
@@ -53,6 +63,7 @@ cc_library(
         ":common",
         ":meta_search_cache",
         ":meta_storage_backend_manager",
+        ":query_executor",
         ":storage_usage_data",
         ":types",
         ":utils",
@@ -274,4 +285,3 @@ cc_library(
         "//kv_cache_manager/config",
     ],
 )
-

@@ -33,8 +33,10 @@ ADD 或 DELETE 直接建立一个进程内 version，然后执行写入。不要
 进程内发生 HOST_DOWN 或 grace cleanup 后会留下 tombstone，必须由 REGISTER 明确清除，
 防止迟到数据事件复活已下线节点。KVCM 重启会清空该进程内 tombstone。
 
-每次成功 REGISTER 同时开启一个新的 lifecycle generation：重复请求会合并 medium 并返回
-成功，但会取消更早 lifecycle 中尚未进入最终 metadata 写入阶段的 mutation/cleanup。因此
+每次至少包含一个合法 REGISTER 的成功请求至多开启一个新的 lifecycle generation：同一请求
+中的多个合法 REGISTER 会先分别校验，再合并 medium，只执行一次实际注册，并给每个合法 item
+返回相同的注册结果；非法 REGISTER 只影响自身 item。跨请求的重复 REGISTER 会再次开启新
+generation，并取消更早 lifecycle 中尚未进入最终 metadata 写入阶段的 mutation/cleanup。因此
 REGISTER 是启动/重建边界，不是 HEARTBEAT 的替代品；调用方不应高频发送或与普通数据请求
 无序并发。
 
@@ -374,12 +376,16 @@ snapshot replace + commit/abort
 - commit 后等待 delta 使用新 generation；
 - abort 后等待 delta 使用旧 generation；若此前没有旧 generation，则创建一个新 generation；
 - Close、Unregister、HOST_DOWN 唤醒 waiter；等待 active delta 另有可配置超时，不会无界阻塞；
-- metadata read-modify-write 在最终写阶段持有 lifecycle generation lease；旧请求不能在
-  HOST_DOWN、重新 REGISTER 和新 snapshot 后恢复写入；
-- mutation 在已经持有 metadata 锁时只做非阻塞的 per-reporter lifecycle lease 获取；若同一
-  reporter 的 HOST_DOWN/REGISTER lifecycle writer 已经开始等待，则旧 mutation 立即失败，
-  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转；不同 reporter 使用独立
-  fence，不会因其他 host 的 HEARTBEAT/REGISTER 产生假失败；
+- metadata read-modify-write 在每个 RMW 阶段完成读、准备进入最终写时，只获取一次
+  lifecycle generation lease，并持有到该阶段结束；同一阶段不再按 key 重复查 fence 或分配
+  shared lock；
+- lease 不能提前到 metadata read 之前获取。这样旧请求阻塞在 metadata I/O 时，HOST_DOWN/
+  REGISTER 仍可先取得 lifecycle writer；旧请求恢复后使用非阻塞获取立即失败，不能跨越新
+  lifecycle 写入；BatchMerge 的 block-create 与 targeted-location 两个 RMW 阶段之间同样释放并
+  重新获取 lease；
+- mutation 在已经持有 metadata 锁时只做上述非阻塞的 per-reporter lifecycle lease 获取，
+  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转；不同 reporter 使用独立 fence，
+  不会因其他 host 的 HEARTBEAT/REGISTER 产生假失败；
 - liveness unregister 的 generation 比较与节点删除在同一把锁内完成；
 - 显式 HOST_DOWN 的 generation 捕获与节点删除同样在同一把锁内完成，Heartbeat/REGISTER
   只能在线性化的 HOST_DOWN 之前或之后生效，不能在中间恢复后又被旧请求删除；
@@ -456,6 +462,8 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - snapshot commit 后 delta 刷新 mixed-generation location 时，旧 cleanup 不删除新写；
 - snapshot cleanup 只删除 metadata，不调用外部 URI backend；
 - 成功 snapshot 最终清理旧数据，失败 snapshot 不触发专用清理；
+- backend requested-spec 使用 any-of 语义，在 peer 选择前检查 location 的所有 specs；Prefix 在
+  spec gap 停止，Coverage 跳过 gap，最终响应投影保持 `spec_size == location_specs.size()`；
 - snapshot 限流、storage type 隔离和 liveness 竞态。
 
 ### 12.2 集成测试
@@ -473,9 +481,31 @@ reporter -> location 反向索引，而不是继续提高全量频率。
 - snapshot partial failure、完整重试；
 - snapshot commit 后立即到达的 delta 在异步 cleanup 后仍可查询；
 - reporter host 或 medium 含 `#` 时 fail closed 且无写入副作用；
+- Bazel `--runs_per_test` 并发重复时，每个 test action 的可变 worker 目录必须位于其私有
+  `TEST_TMPDIR`，不得在共享 runfiles/source tree 中清理或复制；至少用 20 路重复验证目录隔离；
+- heartbeat/grace 计时用例必须使用独立的短超时 storage/instance group，不能缩短功能与容量
+  用例共享 storage 的生命周期窗口，否则异步 cleanup 验证会被 liveness cleanup 交叉干扰；
 - ASAN/TSAN 或等价并发检测（仅记录实际执行结果，不能由普通 CI 结果推断）。
 
 Snapshot 与重启 HTTP 测试 target 带 `manual` 标签，不属于默认 GitHub CI；需要显式执行并单独记录结果。
+
+### 12.3 Vineyard 跨仓集成镜像
+
+Vineyard 的 ReportEvent 集成不能继续使用不含 `event_report` protobuf 的旧 KVCM 镜像；否则
+`addStorage` 会返回 `missing or invalid fields: {StorageConfig: {storage_spec}}`，后续用例全部是
+同一前置失败的连锁结果。
+
+需要验证 KVCM 分支时，手动运行 `.github/workflows/build-dev-image.yml` 并选择
+`flavor=integration`。该 flavor 只构建 CI 所需的 `linux/amd64` 生产镜像，并发布唯一的
+`integration-<UTC time>-<short sha>` tag；把该精确 tag 写入 Vineyard 的
+`.aoneci/v6d-pytest-integration.yaml`，禁止使用 `latest`。合并前至少确认 Vineyard 的
+group-aware 三节点用例、green、KVCM fault 和 PACE fault 都实际执行，且从失败制品中的
+pytest 汇总判断结果，不能根据 Aone 对自由脚本显示的 `NOT_RUN` 状态推断。
+
+该 workflow 在 dev 容器内完成 Bazel 构建后，也必须在容器仍存活时把 server tar 复制到
+Docker build context，并把文件 owner 改回 runner 用户。`bazel-bin` 可能指向容器内的
+`/root/.cache/bazel`；容器退出后再从宿主 runner 读取该 symlink 会得到 `Permission denied`
+或断链，不能据此误判为编译失败。
 
 ## 13. 接受的取舍
 

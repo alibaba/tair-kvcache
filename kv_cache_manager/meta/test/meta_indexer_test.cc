@@ -13,9 +13,11 @@
 #include "kv_cache_manager/meta//test/meta_indexer_test_base.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/meta/utils.h"
@@ -29,6 +31,74 @@ namespace {
 std::string GetPersistentStorageType(const MetaIndexer &indexer) {
     return indexer.backend_manager_->persistent_backend_->GetStorageType();
 }
+
+class MalformedLocationReadBackend : public MetaLocalBackend {
+public:
+    enum class Shape {
+        kShortOuter,
+        kShortInner,
+        kNullValueWithOk,
+    };
+
+    void SetShape(Shape shape) { shape_ = shape; }
+
+    std::vector<ErrorCode> GetLocations(RequestContext * /*request_context*/,
+                                        const KeyTypeVec & /*keys*/,
+                                        CacheLocationMapVector &out_locations) noexcept override {
+        out_locations.clear();
+        return {EC_OK};
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext * /*request_context*/,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations) noexcept override {
+        if (shape_ == Shape::kShortOuter) {
+            out_locations.clear();
+            return {};
+        }
+        if (shape_ == Shape::kShortInner) {
+            out_locations.assign(keys.size(), CacheLocationVector{});
+            return std::vector<std::vector<ErrorCode>>(keys.size());
+        }
+        out_locations.resize(keys.size());
+        std::vector<std::vector<ErrorCode>> result(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
+            result[i].assign(location_ids[i].size(), EC_OK);
+        }
+        return result;
+    }
+
+    std::vector<ErrorCode> GetLocationValues(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override {
+        if (shape_ == Shape::kShortOuter) {
+            out_locations.clear();
+            return {EC_OK};
+        }
+        out_locations.assign(keys.size(), CacheLocationVector{});
+        return std::vector<ErrorCode>(keys.size(), EC_OK);
+    }
+
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext * /*request_context*/,
+                                                    const KeyType * /*keys*/,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept override {
+        if (shape_ == Shape::kShortOuter) {
+            out_locations.Clear();
+            return {EC_OK};
+        }
+        out_locations.Clear(key_count);
+        for (size_t i = 0; i < key_count; ++i) {
+            out_locations.FinishKey();
+        }
+        return std::vector<ErrorCode>(key_count, EC_OK);
+    }
+
+private:
+    Shape shape_ = Shape::kShortOuter;
+};
 } // namespace
 
 class MetaIndexerTest : public MetaIndexerTestBase, public TESTBASE {
@@ -114,6 +184,328 @@ TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
                   "trace", {EC_OK, EC_OK, EC_OK, EC_OK}, {}, keys, "test_long_result", long_result));
     EXPECT_EQ(EC_MISMATCH, long_result.ec);
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH, EC_MISMATCH}), long_result.error_codes);
+}
+
+TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErrors) {
+    constexpr std::size_t kKeyCount = 1024;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 32));
+    const std::string config_str = R"({
+        "max_key_count" : 2048,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    KeyVector query_keys = data.keys;
+    constexpr std::size_t kMissingIndex = 333;
+    query_keys[kMissingIndex] = 100000;
+    LocationsPerKey parallel_values;
+    const auto parallel_result = meta_indexer_->GetLocationValues(request_context_.get(), query_keys, parallel_values);
+    ASSERT_EQ(EC_PARTIAL_OK, parallel_result.ec);
+    ASSERT_EQ(kKeyCount, parallel_result.error_codes.size());
+    ASSERT_EQ(kKeyCount, parallel_values.size());
+    for (std::size_t i = 0; i < kKeyCount; ++i) {
+        if (i == kMissingIndex) {
+            EXPECT_EQ(EC_NOENT, parallel_result.error_codes[i]);
+            EXPECT_TRUE(parallel_values[i].empty());
+            continue;
+        }
+        EXPECT_EQ(EC_OK, parallel_result.error_codes[i]) << "index=" << i;
+        ASSERT_EQ(1u, parallel_values[i].size()) << "index=" << i;
+        ASSERT_TRUE(parallel_values[i].front());
+        EXPECT_EQ("loc_" + std::to_string(query_keys[i]), parallel_values[i].front()->id());
+    }
+
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+    LocationsPerKey serial_values;
+    const auto serial_result = meta_indexer_->GetLocationValues(request_context_.get(), query_keys, serial_values);
+    EXPECT_EQ(parallel_result.ec, serial_result.ec);
+    EXPECT_EQ(parallel_result.error_codes, serial_result.error_codes);
+    ASSERT_EQ(parallel_values.size(), serial_values.size());
+    for (std::size_t i = 0; i < parallel_values.size(); ++i) {
+        ASSERT_EQ(parallel_values[i].size(), serial_values[i].size()) << "index=" << i;
+        for (std::size_t j = 0; j < parallel_values[i].size(); ++j) {
+            ASSERT_TRUE(serial_values[i][j]);
+            EXPECT_EQ(parallel_values[i][j]->id(), serial_values[i][j]->id()) << "index=" << i;
+        }
+    }
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesStopsAtFirstMissingChunk) {
+    constexpr std::size_t kKeyCount = 16384;
+    constexpr std::size_t kChunkSize = 32;
+    // Pure-local scans deliberately use a larger bounded metadata-read window
+    // than the CPU projection chunk so LRU shard locks are amortized.
+    constexpr std::size_t kLocalReadWindow = 4096;
+    constexpr std::size_t kMissingIndex = 97;
+    // A single worker makes the amount of speculative work deterministic. The
+    // parallel case uses the same range callback and can read at most a bounded
+    // number of already-claimed chunks beyond the first miss.
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, kChunkSize, /*queue_capacity*/ 1));
+    const std::string config_str = R"({
+        "max_key_count" : 32768,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    KeyVector query_keys = data.keys;
+    query_keys[kMissingIndex] = 100000;
+    std::vector<CacheLocationConstPtr> observed(kKeyCount);
+    const auto visitor = [&query_keys,
+                          &observed](size_t begin, const CompactLocationsPerKey &locations, size_t valid_count) {
+        for (size_t i = 0; i < valid_count; ++i) {
+            if (locations[i].size() == 1) {
+                observed[begin + i] = *locations[i].begin();
+            }
+        }
+        return query_keys.size();
+    };
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(request_context_.get(), query_keys, visitor);
+    EXPECT_EQ(EC_NOENT, prefix.terminal_ec);
+    EXPECT_EQ(kMissingIndex, prefix.valid_key_count);
+    EXPECT_EQ(kLocalReadWindow, prefix.read_key_count);
+    EXPECT_FALSE(prefix.stopped_by_visitor);
+    for (std::size_t i = 0; i < kMissingIndex; ++i) {
+        ASSERT_TRUE(observed[i]) << "index=" << i;
+        EXPECT_EQ("loc_" + std::to_string(query_keys[i]), observed[i]->id()) << "index=" << i;
+    }
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesHonorsVisitorStop) {
+    constexpr std::size_t kKeyCount = 16384;
+    constexpr std::size_t kChunkSize = 32;
+    constexpr std::size_t kLocalReadWindow = 4096;
+    constexpr std::size_t kVisitorStop = 97;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, kChunkSize, /*queue_capacity*/ 1));
+    const std::string config_str = R"({
+        "max_key_count" : 32768,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    std::atomic<size_t> visited_key_count(0);
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(
+        request_context_.get(),
+        data.keys,
+        [&data, &visited_key_count](size_t begin, const CompactLocationsPerKey &, size_t valid_count) {
+            visited_key_count.fetch_add(valid_count, std::memory_order_relaxed);
+            return begin <= kVisitorStop && kVisitorStop < begin + valid_count ? kVisitorStop : data.keys.size();
+        });
+    EXPECT_EQ(EC_OK, prefix.terminal_ec);
+    EXPECT_EQ(kVisitorStop, prefix.valid_key_count);
+    EXPECT_TRUE(prefix.stopped_by_visitor);
+    EXPECT_EQ(kLocalReadWindow, prefix.read_key_count);
+    EXPECT_EQ(prefix.read_key_count, visited_key_count.load(std::memory_order_relaxed));
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesReturnsEveryAllHitKey) {
+    constexpr std::size_t kKeyCount = 1024;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 32));
+    const std::string config_str = R"({
+        "max_key_count" : 2048,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    std::vector<CacheLocationConstPtr> observed(kKeyCount);
+    const auto visitor = [&data, &observed](size_t begin, const CompactLocationsPerKey &locations, size_t valid_count) {
+        for (size_t i = 0; i < valid_count; ++i) {
+            if (locations[i].size() == 1) {
+                observed[begin + i] = *locations[i].begin();
+            }
+        }
+        return data.keys.size();
+    };
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(request_context_.get(), data.keys, visitor);
+    EXPECT_EQ(EC_OK, prefix.terminal_ec);
+    EXPECT_EQ(kKeyCount, prefix.valid_key_count);
+    EXPECT_EQ(kKeyCount, prefix.read_key_count);
+    EXPECT_FALSE(prefix.stopped_by_visitor);
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        ASSERT_TRUE(observed[i]) << "index=" << i;
+        EXPECT_EQ("loc_" + std::to_string(data.keys[i]), observed[i]->id()) << "index=" << i;
+    }
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesRejectsMalformedShape) {
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 2, /*chunk_size*/ 2, /*queue_capacity*/ 4));
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    auto malformed = std::make_unique<MalformedLocationReadBackend>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    ASSERT_EQ(EC_OK, malformed->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, malformed->Open());
+    malformed->SetShape(MalformedLocationReadBackend::Shape::kShortOuter);
+    ASSERT_EQ(EC_OK, meta_indexer_->backend_manager_->persistent_backend_->Close());
+    meta_indexer_->backend_manager_->persistent_backend_ = std::move(malformed);
+    meta_indexer_->backend_manager_->cache_backend_.reset();
+
+    const KeyVector keys{1, 2, 3, 4};
+    std::atomic<size_t> visitor_calls(0);
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(
+        request_context_.get(), keys, [&visitor_calls, &keys](size_t, const CompactLocationsPerKey &, size_t) {
+            visitor_calls.fetch_add(1, std::memory_order_relaxed);
+            return keys.size();
+        });
+    EXPECT_EQ(EC_MISMATCH, prefix.terminal_ec);
+    EXPECT_EQ(0u, prefix.valid_key_count);
+    EXPECT_EQ(0u, visitor_calls.load(std::memory_order_relaxed));
+}
+
+TEST_F(MetaIndexerTest, TestReadModifyWriteLocationRejectsMalformedBackendResultShapes) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    auto malformed = std::make_unique<MalformedLocationReadBackend>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    ASSERT_EQ(EC_OK, malformed->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, malformed->Open());
+    auto *malformed_raw = malformed.get();
+    ASSERT_EQ(EC_OK, meta_indexer_->backend_manager_->persistent_backend_->Close());
+    meta_indexer_->backend_manager_->persistent_backend_ = std::move(malformed);
+    meta_indexer_->backend_manager_->cache_backend_.reset();
+
+    const KeyVector keys{123};
+    const LocationIdsPerKey location_ids{{"loc"}};
+    size_t modifier_calls = 0;
+    const auto modifier =
+        [&modifier_calls](
+            const std::vector<ErrorCode> &, const LocationIdVector &ids, size_t, CacheLocationVector &, PropertyMap &) {
+            ++modifier_calls;
+            return LocationModifierResult{ModifierAction::MA_SKIP, std::vector<ErrorCode>(ids.size(), EC_OK)};
+        };
+
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    EXPECT_EQ(EC_ERROR, result.ec);
+    ASSERT_EQ(1u, result.per_location_error_codes.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
+    EXPECT_EQ(0u, modifier_calls);
+
+    malformed_raw->SetShape(MalformedLocationReadBackend::Shape::kShortInner);
+    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    EXPECT_EQ(EC_ERROR, result.ec);
+    ASSERT_EQ(1u, result.per_location_error_codes.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
+    EXPECT_EQ(0u, modifier_calls);
+
+    malformed_raw->SetShape(MalformedLocationReadBackend::Shape::kNullValueWithOk);
+    result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    EXPECT_EQ(EC_ERROR, result.ec);
+    ASSERT_EQ(1u, result.per_location_error_codes.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), result.per_location_error_codes[0]);
+    EXPECT_EQ(1u, modifier_calls);
+
+    LocationsPerKey locations;
+    auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, location_ids, locations);
+    EXPECT_EQ(EC_ERROR, get_result.ec);
+    ASSERT_EQ(1u, get_result.per_location_error_codes.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), get_result.per_location_error_codes[0]);
+    ASSERT_EQ(1u, locations.size());
+    ASSERT_EQ(1u, locations[0].size());
+    EXPECT_FALSE(locations[0][0]);
+
+    CacheLocationMapVector location_maps;
+    const auto get_all_result = meta_indexer_->GetLocations(request_context_.get(), keys, location_maps);
+    EXPECT_EQ(EC_ERROR, get_all_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), get_all_result.error_codes);
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+
+    malformed_raw->SetShape(MalformedLocationReadBackend::Shape::kShortOuter);
+    LocationsPerKey location_values;
+    const KeyVector two_keys{123, 124};
+    const auto get_values_result = meta_indexer_->GetLocationValues(request_context_.get(), two_keys, location_values);
+    EXPECT_EQ(EC_ERROR, get_values_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH}), get_values_result.error_codes);
+    ASSERT_EQ(2u, location_values.size());
+    EXPECT_TRUE(location_values[0].empty());
+    EXPECT_TRUE(location_values[1].empty());
+}
+
+TEST_F(MetaIndexerTest, TestReadModifyWriteLocationPreservesPartialModifierResult) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    const KeyVector keys{124};
+    const LocationIdsPerKey location_ids{{"good", "bad"}};
+    const auto modifier = [](const std::vector<ErrorCode> &get_ecs,
+                             const LocationIdVector &ids,
+                             size_t,
+                             CacheLocationVector &locations,
+                             PropertyMap &) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT}), get_ecs);
+        auto good = std::make_shared<CacheLocation>();
+        good->set_id(ids[0]);
+        good->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        good->set_status(CLS_SERVING);
+        locations[0] = std::move(good);
+        return LocationModifierResult{MA_OK, {EC_OK, EC_BADARGS}};
+    };
+
+    const auto result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, location_ids, modifier);
+    // The RMW itself succeeded. A per-location validation failure is surfaced
+    // in the aligned result without turning the whole batch into an
+    // infrastructure failure.
+    EXPECT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1u, result.per_location_error_codes.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_BADARGS}), result.per_location_error_codes[0]);
+
+    LocationsPerKey stored_locations;
+    const auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, location_ids, stored_locations);
+    EXPECT_EQ(EC_PARTIAL_OK, get_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), get_result.per_location_error_codes[0]);
+    ASSERT_TRUE(stored_locations[0][0]);
+    EXPECT_EQ("good", stored_locations[0][0]->id());
+    EXPECT_FALSE(stored_locations[0][1]);
 }
 
 // Verifies the invariants of MakeBatches() that callers rely on, regardless

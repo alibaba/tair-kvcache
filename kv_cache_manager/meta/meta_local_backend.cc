@@ -462,13 +462,121 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocations(RequestContext * /*request
     return results;
 }
 
-std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*request_context*/,
+                                                           const KeyTypeVec &keys,
+                                                           LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_locations.clear();
+    out_locations.resize(keys.size());
+    std::vector<int64_t> revisit_intervals;
+    if (revisit_histogram_) {
+        revisit_intervals.reserve(keys.size());
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string_view key_sv = KeyToView(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_sv);
+        if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        const int64_t stored_time = item->GetLastAccessTime();
+        if (revisit_histogram_ && stored_time > 0) {
+            revisit_intervals.push_back(TimestampUtil::GetCurrentTimeUs() - stored_time);
+        }
+        item->TouchAccessTime();
+        {
+            std::shared_lock lock(item->GetMutex());
+            const auto &locations = item->GetLocations();
+            auto &values = out_locations[i];
+            values.reserve(locations.size());
+            for (const auto &[location_id, location] : locations) {
+                (void)location_id;
+                values.push_back(location);
+            }
+        }
+        cache_->Release(handle);
+    }
+    if (revisit_histogram_) {
+        revisit_histogram_->ObserveBatch(revisit_intervals);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext * /*request_context*/,
+                                                                  const KeyType *keys,
+                                                                  size_t key_count,
+                                                                  CompactLocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> results(key_count, EC_OK);
+    out_locations.Clear(key_count, key_count);
+    if (key_count != 0 && keys == nullptr) {
+        results.assign(key_count, EC_BADARGS);
+        for (size_t i = 0; i < key_count; ++i) {
+            out_locations.FinishKey();
+        }
+        return results;
+    }
+
+    std::vector<int64_t> revisit_intervals;
+    if (revisit_histogram_) {
+        revisit_intervals.reserve(key_count);
+    }
+    std::vector<std::string_view> key_views(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(key_count, nullptr);
+    cache_->LookupBatch(key_views.data(), key_count, handles.data());
+
+    const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
+    for (size_t i = 0; i < key_count; ++i) {
+        Cache::Handle *handle = handles[i];
+        if (!handle) {
+            results[i] = EC_NOENT;
+            out_locations.FinishKey();
+            continue;
+        }
+
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        const int64_t stored_time = item->GetLastAccessTime();
+        if (revisit_histogram_ && stored_time > 0 && stored_time <= access_time_us) {
+            revisit_intervals.push_back(access_time_us - stored_time);
+        }
+        item->TouchAccessTime(access_time_us);
+        {
+            std::shared_lock lock(item->GetMutex());
+            for (const auto &[location_id, location] : item->GetLocations()) {
+                (void)location_id;
+                out_locations.values.push_back(location);
+            }
+        }
+        out_locations.FinishKey();
+    }
+    cache_->ReleaseBatch(handles.data(), handles.size());
+    if (revisit_histogram_) {
+        revisit_histogram_->ObserveBatch(revisit_intervals);
+    }
+    return results;
+}
+
+std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext *request_context,
                                                                    const KeyTypeVec &keys,
                                                                    const LocationIdsPerKey &location_ids,
                                                                    LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> ignored_key_error_codes;
+    return GetLocationsWithKeyStatus(request_context, keys, location_ids, out_locations, ignored_key_error_codes);
+}
+
+std::vector<std::vector<ErrorCode>>
+MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/,
+                                            const KeyTypeVec &keys,
+                                            const LocationIdsPerKey &location_ids,
+                                            LocationsPerKey &out_locations,
+                                            std::vector<ErrorCode> &out_key_error_codes) noexcept {
     assert(keys.size() == location_ids.size());
     std::vector<std::vector<ErrorCode>> results(keys.size());
-    out_locations.resize(keys.size());
+    out_key_error_codes.assign(keys.size(), EC_OK);
+    out_locations.assign(keys.size(), CacheLocationVector{});
 
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
@@ -476,6 +584,7 @@ std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContex
         std::string_view key_sv = KeyToView(keys[i]);
         Cache::Handle *handle = cache_->Lookup(key_sv);
         if (!handle) {
+            out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
         }

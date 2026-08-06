@@ -96,6 +96,24 @@ TEST_F(MetaServiceMetricsBaseTest, TypedReportEventCollectorUsesTypeTagAndStable
     ASSERT_EQ(l1p5, l1p5_cached);
 }
 
+TEST_F(MetaServiceMetricsBaseTest, ReportEventMetricsFallbackDoesNotGateRequestValidation) {
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("unknown-instance");
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+
+    std::string metrics_type;
+    auto collector = base_->ResolveReportEventMetricsCollector(request, metrics_type);
+    ASSERT_NE(nullptr, collector);
+    EXPECT_EQ("event_report_l2", metrics_type);
+    EXPECT_EQ((MetricsTags{{"api_name", "ReportEvent"}}), collector->GetMetricsTags());
+
+    request.clear_instance_id();
+    request.set_storage_type(proto::meta::ST_UNSPECIFIED);
+    auto invalid_request_collector = base_->ResolveReportEventMetricsCollector(request, metrics_type);
+    EXPECT_EQ(collector, invalid_request_collector);
+    EXPECT_TRUE(metrics_type.empty());
+}
+
 TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheRemovesTypedReportEventEntries) {
     SeedInstance("inst1", "grp1");
 
