@@ -3,6 +3,7 @@
 #include <charconv>
 #include <map>
 #include <string>
+#include <string_view>
 
 namespace kv_cache_manager {
 
@@ -14,6 +15,10 @@ public:
 public:
     bool Parse(const std::string &Uri);
     std::string ToUriString() const;
+    // Serialize the URI as if one new query parameter had been inserted,
+    // without cloning/mutating the parameter map. The output keeps the same
+    // sorted canonical form as SetParam() followed by ToUriString().
+    std::string ToUriStringWithExtraParam(const std::string &key, const std::string &value) const;
 
     bool Valid() const { return !protocol_.empty(); }
     const std::string &GetProtocol() const { return protocol_; }
@@ -39,10 +44,11 @@ public:
     std::string GetParam(const std::string &key) const;
     template <typename T>
     void GetParamAs(const std::string &key, T &t) const {
-        std::string val = GetParam(key);
-        if (val.empty()) {
+        const auto it = params_.find(key);
+        if (it == params_.end() || it->second.empty()) {
             return;
         }
+        const std::string &val = it->second;
         T result;
         auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), result);
         if (ec == std::errc{} && ptr == val.data() + val.size()) {
@@ -62,7 +68,7 @@ public:
     static std::string ToUri(const StandardUri &source);
 
 private:
-    bool ParseParams(const std::string &Uri_params);
+    bool ParseParams(std::string_view Uri_params);
 
 private:
     std::string protocol_;

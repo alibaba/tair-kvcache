@@ -84,6 +84,18 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsVersionAtPara
     }
 }
 
+TEST_F(SnapshotUriUtilsTest, AddSnapshotVersionRejectsInvalidPortWithoutCanonicalizingItAway) {
+    constexpr const char *token = "0123456789abcdef0123456789abcdef";
+    for (const std::string &invalid_uri : {
+             "event_report://physical-cache:not-a-port/mem?size=1",
+             "event_report://physical-cache:-1/mem?size=1",
+         }) {
+        std::string out_uri = "stale";
+        EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(invalid_uri, token, out_uri));
+        EXPECT_TRUE(out_uri.empty());
+    }
+}
+
 TEST_F(SnapshotUriUtilsTest, ParseEventReportLocationIdViewBorrowsComponents) {
     const std::string location_id = "kvs#event_report_l2#hbm-cache#10.0.0.1:8080";
     std::string_view storage_type;

@@ -619,22 +619,22 @@ HTTP 接口为 `POST /api/getCacheLocation`：
 `ST_EVENT_REPORT_L1P5`、`ST_EVENT_REPORT_L2` 等 backend，适合验证两种 EventReport storage 的
 隔离状态。
 
-`location_spec_names` 不只是返回结果的投影条件，也是 backend/peer 选择前的候选条件：
+`location_spec_names` 不只是返回结果的投影条件，也是 backend/peer 选择前按 query key 生效的候选条件：
 
 - 为空时，location 中任意合法 spec 都可使该 location 成为候选；
-- 非空时，location 至少包含一个请求的 spec name 才能成为候选；
+- 非空时，数组长度必须等于 query key 数量，且每个 name 都不能为空；第 i 个 name 只过滤第 i 个 key；
+- 第 i 个 key 的 location 必须包含对应的 spec name 才能成为候选，selector 也从该 spec URI 提取 peer；
 - 同一 EventReport location 由 `storage_type + medium + host_ip_port` 标识，其中各 spec 必须属于
-  同一个 reporter endpoint；location 命中过滤后，selector 从第一个合法 spec URI 提取 peer；
-- 多个 peer 的 prefix/coverage 相同时按 endpoint 字典序选择，保证调用方按 spec 分批查询时
-  各批次不会因为容器遍历顺序选择不同 peer；
-- peer 选择完成后，响应仍只保留 `location_spec_names` 指定的 specs。
+  同一个 reporter endpoint；
+- 多个 peer 的 prefix/coverage 相同时按 endpoint 字典序选择，避免容器遍历顺序引起选择抖动；
+- peer 选择完成后，第 i 个 key 的响应仍只保留其对应 name 指定的 spec。
 
 因此 spec name 是 reporter 与查询方之间的稳定协议字段，不能用 object size 代替：不同 cache
-group 即使 byte size 相同，也必须使用不同且稳定的 spec name。调用方如果每个 key 需要的 spec
-不同，应先按 spec name 分组发起查询，再按原 object key 合并结果；`location_spec_names` 是一次
-请求级过滤条件，不是 per-key 数组。确定性 tie-break 只消除无序遍历造成的抖动；若各组候选
-peer 集合不同，分组请求无法保证得到全局最优公共 peer。该能力需要后续扩展 per-key spec filter
-或等价的联合选择接口。
+group 即使 byte size 相同，也必须使用不同且稳定的 spec name。调用方必须让
+`location_spec_names` 与 `block_keys`（或由 token 生成的 query keys）同序对齐。同一个 block key
+可以在不同位置重复并请求不同 spec，用于 mixed-attention/Mamba groups。长度不匹配或包含空
+name 会返回 `INVALID_ARGUMENT`。确定性 tie-break 只消除无序遍历造成的抖动；各 key 经过
+spec 过滤后的候选 peer 集合仍可能不同。
 
 ### 11.4 GetHostCacheState
 

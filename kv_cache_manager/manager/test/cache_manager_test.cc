@@ -1,8 +1,11 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <future>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -3169,6 +3172,229 @@ TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPe
     EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
 }
 
+TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMediaAndSpecs) {
+    const std::string host = "192.168.10.81:8080";
+    constexpr int64_t first_key = 96'000;
+    constexpr size_t key_count = 48;
+    constexpr size_t event_count = 768;
+    std::vector<std::string> mediums;
+    for (size_t i = 0; i < 17; ++i) {
+        mediums.push_back("medium_" + std::to_string(i));
+    }
+    const std::array<std::string, 4> spec_names{"tp0", "tp1", "tp2", "tp3"};
+
+    struct ExpectedSpec {
+        std::string raw_uri;
+        std::uint64_t size = 0;
+    };
+    std::map<int64_t, std::map<std::string, std::map<std::string, ExpectedSpec>>> expected;
+
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, mediums));
+
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("test_instance");
+    request.set_host_ip_port(host);
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+
+    std::uint64_t random_state = 0x9e3779b97f4a7c15ULL;
+    auto next_random = [&random_state] {
+        random_state = random_state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return random_state;
+    };
+    for (size_t event_index = 0; event_index < event_count; ++event_index) {
+        const int64_t key = first_key + static_cast<int64_t>(next_random() % key_count);
+        const std::string &medium = mediums[next_random() % mediums.size()];
+        const size_t first_spec_index = next_random() % spec_names.size();
+        const bool is_add = next_random() % 4 != 0;
+        auto *event = request.add_events();
+        if (is_add) {
+            event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *params = event->mutable_block_add();
+            params->set_block_key(std::to_string(key));
+            params->set_medium(medium);
+            auto add_spec = [&](size_t spec_index) {
+                const std::string &name = spec_names[spec_index];
+                const std::uint64_t size = next_random() % 97 + 1;
+                const std::string raw_uri = "event_report://" + host + "/" + medium + "?source=model_" +
+                                            std::to_string(event_index) + "_" + name + "&size=" + std::to_string(size);
+                auto *spec = params->add_specs();
+                spec->set_name(name);
+                spec->set_uri(raw_uri);
+                expected[key][medium][name] = ExpectedSpec{raw_uri, size};
+            };
+            add_spec(first_spec_index);
+            if (next_random() % 7 == 0) {
+                add_spec((first_spec_index + 1) % spec_names.size());
+            }
+        } else {
+            event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+            auto *params = event->mutable_block_delete();
+            params->set_block_key(std::to_string(key));
+            params->set_medium(medium);
+            params->add_spec_names(spec_names[first_spec_index]);
+            expected[key][medium].erase(spec_names[first_spec_index]);
+            if (next_random() % 7 == 0) {
+                const std::string &second_name = spec_names[(first_spec_index + 1) % spec_names.size()];
+                params->add_spec_names(second_name);
+                expected[key][medium].erase(second_name);
+            }
+        }
+    }
+
+    const auto [ec, response] = CallReportEvent(request, "flat_fold_reference_model");
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_EQ(proto::meta::OK, response.header().status().code());
+    EXPECT_EQ(0, response.item_results_size());
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(response.committed_snapshot_version()));
+
+    std::vector<int64_t> keys;
+    keys.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        keys.push_back(first_key + static_cast<int64_t>(i));
+    }
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(keys.size(), location_maps.size());
+
+    std::uint64_t expected_total_size = 0;
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        using FlattenedSpecs = std::map<std::pair<std::string, std::string>, std::string>;
+        FlattenedSpecs expected_specs;
+        FlattenedSpecs actual_specs;
+        size_t expected_location_count = 0;
+        for (const auto &medium : mediums) {
+            const auto expected_medium = expected[keys[key_index]].find(medium);
+            if (expected_medium != expected[keys[key_index]].end()) {
+                expected_location_count += static_cast<size_t>(!expected_medium->second.empty());
+                for (const auto &[name, expected_spec] : expected_medium->second) {
+                    std::string versioned_uri;
+                    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+                        expected_spec.raw_uri, response.committed_snapshot_version(), versioned_uri));
+                    expected_specs[{medium, name}] = std::move(versioned_uri);
+                    expected_total_size += expected_spec.size;
+                }
+            }
+
+            const auto location_it = location_maps[key_index].find(event_backend->BuildLocationId(medium, host));
+            if (location_it == location_maps[key_index].end()) {
+                continue;
+            }
+            ASSERT_TRUE(location_it->second);
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, location_it->second->type());
+            EXPECT_EQ(location_it->second->location_specs().size(), location_it->second->spec_size());
+            EXPECT_TRUE(std::is_sorted(location_it->second->location_specs().begin(),
+                                       location_it->second->location_specs().end(),
+                                       [](const auto &lhs, const auto &rhs) { return lhs.name() < rhs.name(); }));
+            for (const auto &spec : location_it->second->location_specs()) {
+                actual_specs[{medium, spec.name()}] = spec.uri();
+            }
+        }
+        EXPECT_EQ(expected_location_count, location_maps[key_index].size()) << "block key " << keys[key_index];
+        EXPECT_EQ(expected_specs, actual_specs) << "block key " << keys[key_index];
+    }
+
+    auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, meta_indexer);
+    EXPECT_EQ(expected_total_size,
+              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(CacheManagerTest, TestReportEventFoldedTotalSizeOverflowFailsWithoutMetadata) {
+    const std::string host = "192.168.10.82:8080";
+    constexpr int64_t key = 96'100;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("test_instance");
+    request.set_host_ip_port(host);
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto add_event = [&](const std::string &name, const std::string &size) {
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *params = event->mutable_block_add();
+        params->set_block_key(std::to_string(key));
+        params->set_medium("mem");
+        auto *spec = params->add_specs();
+        spec->set_name(name);
+        spec->set_uri("event_report://" + host + "/mem?size=" + size);
+    };
+    add_event("tp0", "18446744073709551615");
+    add_event("tp1", "1");
+
+    const auto [ec, response] = CallReportEvent(request, "folded_total_size_overflow");
+    EXPECT_EQ(EC_PARTIAL_OK, ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    ASSERT_EQ(2, response.item_results_size());
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(0));
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(1));
+    EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(response.committed_snapshot_version()));
+    EXPECT_TRUE(response.snapshot_required());
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+
+    auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, meta_indexer);
+    EXPECT_EQ(0u, meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(CacheManagerTest, TestReportEventRejectsMergeThatOverflowsExistingLocation) {
+    const std::string host = "192.168.10.83:8080";
+    constexpr int64_t key = 96'101;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto make_add = [&](const std::string &name, const std::string &size) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(host);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *params = event->mutable_block_add();
+        params->set_block_key(std::to_string(key));
+        params->set_medium("mem");
+        auto *spec = params->add_specs();
+        spec->set_name(name);
+        spec->set_uri("event_report://" + host + "/mem?size=" + size);
+        return request;
+    };
+
+    const auto [initial_ec, initial_response] =
+        CallReportEvent(make_add("tp0", "18446744073709551615"), "existing_size_max");
+    ASSERT_EQ(EC_OK, initial_ec);
+    ASSERT_EQ(proto::meta::OK, initial_response.header().status().code());
+
+    const auto [overflow_ec, overflow_response] =
+        CallReportEvent(make_add("tp1", "1"), "existing_plus_new_size_overflow");
+    EXPECT_EQ(EC_PARTIAL_OK, overflow_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, overflow_response.header().status().code());
+    ASSERT_EQ(1, overflow_response.item_results_size());
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, overflow_response.item_results(0));
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    const auto &stored_specs = location_maps[0].begin()->second->location_specs();
+    ASSERT_EQ(1u, stored_specs.size());
+    EXPECT_EQ("tp0", stored_specs[0].name());
+
+    auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, meta_indexer);
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
+              meta_indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(CacheManagerTest, TestReportEventFoldedDeltaEventsShareFinalWriteFailure) {
     const std::string host = "192.168.10.52:8080";
     const int64_t key = 94'440;
@@ -6002,6 +6228,20 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->mutable_specs(0)->set_uri("not-a-uri");
          }},
+        {"add_invalid_uri_port",
+         [=](auto *event, int64_t key, const std::string &host) {
+             configure_valid_add(event, key, host)
+                 ->mutable_specs(0)
+                 ->set_uri("event_report://cache-node:not-a-port/mem");
+         }},
+        {"add_total_size_overflow",
+         [=](auto *event, int64_t key, const std::string &host) {
+             auto *params = configure_valid_add(event, key, host);
+             params->mutable_specs(0)->set_uri("event_report://" + host + "/mem?size=18446744073709551615");
+             auto *second = params->add_specs();
+             second->set_name("tp1");
+             second->set_uri("event_report://" + host + "/mem?size=1");
+         }},
         {"add_client_snapshot_version",
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)
@@ -6058,6 +6298,20 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
         {"snapshot_invalid_uri",
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_snapshot(event, key, host)->mutable_specs(0)->set_uri("not-a-uri");
+         }},
+        {"snapshot_invalid_uri_port",
+         [=](auto *event, int64_t key, const std::string &host) {
+             configure_valid_snapshot(event, key, host)
+                 ->mutable_specs(0)
+                 ->set_uri("event_report://cache-node:not-a-port/mem");
+         }},
+        {"snapshot_total_size_overflow",
+         [=](auto *event, int64_t key, const std::string &host) {
+             auto *block = configure_valid_snapshot(event, key, host);
+             block->mutable_specs(0)->set_uri("event_report://" + host + "/mem?size=18446744073709551615");
+             auto *second = block->add_specs();
+             second->set_name("tp1");
+             second->set_uri("event_report://" + host + "/mem?size=1");
          }},
         {"snapshot_client_snapshot_version",
          [=](auto *event, int64_t key, const std::string &host) {
