@@ -233,6 +233,155 @@ TEST_F(MetaLocalBackendTest, TestUpsert) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestUpsertPreservesRequestOrderForDuplicateKeys) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_duplicate_upsert", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    // The public backend API historically applies duplicate keys in request
+    // order. In particular, a later partial update to a key first created by
+    // the same batch must merge with, rather than replace, its earlier fields.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              UpsertWithFieldMaps(meta_storage_backend_.get(),
+                                  {7, 8, 7},
+                                  {{{PROPERTY_URI, "uri7"}}, {{PROPERTY_URI, "uri8"}}, {{PROPERTY_HIT_COUNT, "700"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {7, 8},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri7"}, {PROPERTY_HIT_COUNT, "700"}}, {{PROPERTY_URI, "uri8"}}});
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestUpsertPreservesRequestOrderForMixedCapacityBatch) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_mixed_capacity_upsert", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {2}, {{{PROPERTY_URI, "existing"}}}));
+
+    // UpdateInPlace historically does not reject charge growth. Therefore the
+    // request order below first admits key 1 while the cache has room, then
+    // expands existing key 2. Reordering all existing updates ahead of all
+    // missing inserts would incorrectly reject the earlier key 1.
+    const std::string large_insert(600 * 1024, 'i');
+    const std::string large_update(600 * 1024, 'u');
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              UpsertWithFieldMaps(
+                  backend.get(), {1, 2}, {{{PROPERTY_URI, large_insert}}, {{PROPERTY_HIT_COUNT, large_update}}}));
+
+    AssertGetProperties(
+        backend.get(),
+        {1, 2},
+        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+        {EC_OK, EC_OK},
+        {{{PROPERTY_URI, large_insert}}, {{PROPERTY_URI, "existing"}, {PROPERTY_HIT_COUNT, large_update}}});
+    ASSERT_EQ(EC_OK, backend->Close());
+
+    auto reverse_backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, reverse_backend->Init("test_reverse_mixed_capacity_upsert", config));
+    ASSERT_EQ(EC_OK, reverse_backend->Open());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(reverse_backend.get(), {2}, {{{PROPERTY_URI, "existing"}}}));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              UpsertWithFieldMaps(reverse_backend.get(),
+                                  {2, 1},
+                                  {{{PROPERTY_HIT_COUNT, large_update}}, {{PROPERTY_URI, large_insert}}}));
+    AssertGetProperties(reverse_backend.get(),
+                        {1, 2},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_NOENT, EC_OK},
+                        {{}, {{PROPERTY_URI, "existing"}, {PROPERTY_HIT_COUNT, large_update}}});
+    ASSERT_EQ(EC_OK, reverse_backend->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestBatchedUpsertShapesMatchSequentialReference) {
+    auto make_backend = [](const std::string &instance_id) {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_shared<MetaLocalBackend>();
+        EXPECT_EQ(EC_OK, backend->Init(instance_id, config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        return backend;
+    };
+    auto optimized = make_backend("test_batched_upsert_reference_optimized");
+    auto reference = make_backend("test_batched_upsert_reference_sequential");
+
+    KeyTypeVec seed_keys;
+    FieldMapVec seed_fields;
+    for (KeyType key = 0; key < 12; ++key) {
+        seed_keys.push_back(key);
+        seed_fields.push_back({{PROPERTY_URI, "seed_" + std::to_string(key)}});
+    }
+    ASSERT_EQ(PutWithFieldMaps(reference.get(), seed_keys, seed_fields),
+              PutWithFieldMaps(optimized.get(), seed_keys, seed_fields));
+
+    std::set<KeyType> observed_keys(seed_keys.begin(), seed_keys.end());
+    auto apply_and_compare = [&](const KeyTypeVec &keys, const FieldMapVec &fields) {
+        SCOPED_TRACE(::testing::PrintToString(keys));
+        CacheLocationMapVector reference_locations;
+        PropertyMapVector reference_properties;
+        SplitFieldMaps(fields, reference_locations, reference_properties);
+        std::vector<ErrorCode> reference_results(keys.size(), EC_OK);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            reference_results[i] = reference->UpsertForOneKey(keys[i], reference_locations[i], reference_properties[i]);
+        }
+        EXPECT_EQ(reference_results, UpsertWithFieldMaps(optimized.get(), keys, fields));
+        observed_keys.insert(keys.begin(), keys.end());
+
+        const KeyTypeVec all_keys(observed_keys.begin(), observed_keys.end());
+        CacheLocationMapVector optimized_locations;
+        CacheLocationMapVector sequential_locations;
+        PropertyMapVector optimized_properties;
+        PropertyMapVector sequential_properties;
+        const auto optimized_ec = optimized->Get(nullptr, all_keys, optimized_locations, optimized_properties);
+        const auto sequential_ec = reference->Get(nullptr, all_keys, sequential_locations, sequential_properties);
+        EXPECT_EQ(sequential_ec, optimized_ec);
+        EXPECT_EQ(sequential_locations, optimized_locations);
+        for (auto &properties : optimized_properties) {
+            properties.erase(PROPERTY_LRU_TIME);
+        }
+        for (auto &properties : sequential_properties) {
+            properties.erase(PROPERTY_LRU_TIME);
+        }
+        EXPECT_EQ(sequential_properties, optimized_properties);
+        EXPECT_EQ(reference->GetMemUsage(), optimized->GetMemUsage());
+    };
+
+    KeyTypeVec all_hit_keys;
+    FieldMapVec all_hit_fields;
+    for (KeyType key = 0; key < 12; ++key) {
+        all_hit_keys.push_back(key);
+        all_hit_fields.push_back({{"hit_" + std::to_string(key), "value"}});
+    }
+    apply_and_compare(all_hit_keys, all_hit_fields);
+
+    KeyTypeVec all_miss_keys;
+    FieldMapVec all_miss_fields;
+    for (KeyType key = 100; key < 112; ++key) {
+        all_miss_keys.push_back(key);
+        all_miss_fields.push_back({{PROPERTY_URI, "new_" + std::to_string(key)}});
+    }
+    apply_and_compare(all_miss_keys, all_miss_fields);
+
+    apply_and_compare({200, 0, 201, 1, 202, 2},
+                      {{{PROPERTY_URI, "mixed_200"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_0"}},
+                       {{PROPERTY_URI, "mixed_201"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_1"}},
+                       {{PROPERTY_URI, "mixed_202"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_2"}}});
+    apply_and_compare({300, 300, 3, 300},
+                      {{{PROPERTY_URI, "duplicate_first"}},
+                       {{PROPERTY_HIT_COUNT, "duplicate_second"}},
+                       {{PROPERTY_HIT_COUNT, "existing"}},
+                       {{"final_field", "duplicate_final"}}});
+
+    EXPECT_EQ(EC_OK, optimized->Close());
+    EXPECT_EQ(EC_OK, reference->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestDelete) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());

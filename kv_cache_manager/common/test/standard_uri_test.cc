@@ -369,6 +369,42 @@ TEST_F(StandardUriTest, TestFileUri) {
     }
 }
 
+TEST_F(StandardUriTest, TestSerializeWithExtraParamMatchesCanonicalMutation) {
+    for (const std::string &raw_uri : {
+             "event_report://host:8080/mem",
+             "event_report://host:8080/mem?block=7&phase=add",
+             "event_report://user@host:8080/mem?z=last&a=first",
+             "file://host/path?empty=&flag",
+         }) {
+        StandardUri uri = StandardUri::FromUri(raw_uri);
+        ASSERT_TRUE(uri.Valid());
+        StandardUri expected = uri;
+        expected.SetParam("s_version", "0123456789abcdef0123456789abcdef");
+        EXPECT_EQ(expected.ToUriString(),
+                  uri.ToUriStringWithExtraParam("s_version", "0123456789abcdef0123456789abcdef"));
+    }
+
+    StandardUri uri = StandardUri::FromUri("event_report://host:8080/mem?s_version=existing");
+    ASSERT_TRUE(uri.Valid());
+    EXPECT_TRUE(uri.ToUriStringWithExtraParam("s_version", "replacement").empty());
+    EXPECT_TRUE(uri.ToUriStringWithExtraParam("", "value").empty());
+    EXPECT_TRUE(StandardUri().ToUriStringWithExtraParam("key", "value").empty());
+}
+
+TEST_F(StandardUriTest, TestQueryDelimitersDoNotChangeAuthorityOrPath) {
+    const std::string raw_uri = "event_report://cache-host?callback=http://peer/path&owner=user@example.com";
+    StandardUri uri(raw_uri);
+    ASSERT_TRUE(uri.Valid());
+    EXPECT_TRUE(uri.GetUserInfo().empty());
+    EXPECT_EQ("cache-host", uri.GetHostName());
+    EXPECT_TRUE(uri.GetPath().empty());
+    EXPECT_EQ("http://peer/path", uri.GetParam("callback"));
+    EXPECT_EQ("user@example.com", uri.GetParam("owner"));
+    EXPECT_EQ(raw_uri, uri.ToUriString());
+    EXPECT_EQ("event_report://cache-host?callback=http://peer/path&owner=user@example.com&s_version=token",
+              uri.ToUriStringWithExtraParam("s_version", "token"));
+}
+
 TEST_F(StandardUriTest, TestInvalidPort) {
     {
         std::string redis_uri_str = "redis://user:pw@127.0.0.1";
@@ -378,10 +414,21 @@ TEST_F(StandardUriTest, TestInvalidPort) {
         ASSERT_EQ("127.0.0.1", redis_uri.GetHostName());
         ASSERT_EQ(0, redis_uri.GetPort()); // default 0
     }
-    {
-        std::string redis_uri_str = "redis://user:pw@127.0.0.1:abcd/";
-        StandardUri redis_uri = StandardUri::FromUri(redis_uri_str);
+    for (const std::string &invalid_uri : {
+             "redis://user:pw@127.0.0.1:abcd/",
+             "redis://user:pw@127.0.0.1:-1/",
+             "redis://user:pw@127.0.0.1:-0/",
+             "redis://user:pw@127.0.0.1:+6379/",
+             "redis://user:pw@127.0.0.1: 6379/",
+             "redis://user:pw@127.0.0.1:/",
+         }) {
+        StandardUri redis_uri = StandardUri::FromUri(invalid_uri);
         ASSERT_FALSE(redis_uri.Valid());
+
+        StandardUri directly_constructed(invalid_uri);
+        EXPECT_FALSE(directly_constructed.Valid());
+        EXPECT_TRUE(directly_constructed.ToUriString().empty());
+        EXPECT_TRUE(directly_constructed.ToUriStringWithExtraParam("key", "value").empty());
     }
 }
 } // namespace kv_cache_manager

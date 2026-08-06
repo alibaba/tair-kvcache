@@ -61,7 +61,7 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(
 
         std::string json_res;
 
-        if (!ProtoMessageJsonUtil::FromJson(std::string(req.get_body()), &pb_req)) {
+        if (!ProtoMessageJsonUtil::FromJson(req.get_body(), &pb_req)) {
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::bad_request, json_res);
             co_return;

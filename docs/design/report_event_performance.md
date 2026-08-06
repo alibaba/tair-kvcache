@@ -653,3 +653,257 @@ Bazel 二进制不会自动启用。控制项和降级规则如下：
 这项改动只选择 allocator，不构成性能 SLA。上线应同时比较 Get/ReportEvent p50/p99、RSS、CPU 与 allocator
 相关崩溃；回滚可设置 `KVCM_USE_JEMALLOC=0`，无需重新打包。最低提交门禁包括 `bash -n`，以及禁用、默认
 探测、自定义路径、已有 preload、缺库/未知架构降级的隔离函数测试。
+
+### 5.13 2026-08-06 ReportEvent 请求内热路径收敛
+
+本轮位于独立分支 `codex/report-event-hotpath-optimization`，直接基于
+`codex/gethost-million-key-performance@6c44b5025f5aeefbfa663cf94c39c915f4966314` 创建；查询优化分支未被
+修改。本节只讨论纯 local metadata、Release/O2、直接运行 Bazel 二进制（未预加载 jemalloc）的结果，
+before/after 使用相同进程形态，因此 allocator 条件一致。
+
+#### 设计与实现
+
+1. delta fold 使用三个 request-wide 连续数组保存稳定 `(block, location)`、最终 spec mutation 和事件重试
+   依赖，并用一个哈希索引定位 location。常见的一 event/一 spec/一 location block 不再创建三组小 vector；
+   最后只排序 location 索引并直接构造 ADD/DELETE task。last-operation-wins、ADD 先于 DELETE 的持久化阶段、
+   admission failure 和整组重试闭包语义保持不变；
+2. 同一请求的 `medium -> location_id` 只构造一次。location 索引中的指针只指向这个 request-owned intern
+   map 的 mapped string；`unordered_map` rehash 不会使元素引用失效，且 map 在整个 fold/task 构造阶段都
+   存活。后续不能把该指针改为指向临时字符串或可能搬迁元素的 vector；
+3. `DeltaMutationGuard` 缓存并返回 request-owned lease，后续事件只读其 snapshot token/generation，不再为
+   每个 event 复制 32-byte token。lease 仍由 guard 析构时成对结束，generation-pinned lifecycle fence
+   窗口不变；
+4. 入口完整解析 URI 时同时保存 `size` 和已经验证的 parsed URI；追加 `s_version` 使用
+   `ToUriStringWithExtraParam` 直接生成与 `SetParam + ToUriString` 完全相同的 canonical sorted URI，不再
+   clone/mutate 参数 map 或使用 `ostringstream`。`StandardUri` 的 query 解析改用 `string_view`，host/port
+   也不再先复制一份中间字符串；
+5. ReportEvent 内部 task 把已验证 spec 的总 size 传给 `BatchMergeLocationSpecs`，避免在 shard RMW 前再次
+   parse 新 URI。只有该内部路径允许设置 `prevalidated_total_size`；普通 caller 留空后仍执行完整的 URI、
+   spec name、duplicate name 和 snapshot-version 一致性校验。这个 hint 不能扩展为对外部输入跳过验证；
+6. pure-local targeted read 使用 LRU batch lookup/release，把同 shard 的数千次 lookup mutex 获取合并。
+   unconditional Upsert 对唯一 key 同样 batch lookup、原地更新、统一 release，再插入 miss；release 必须在
+   插入 miss 前完成，以保留 strict-capacity eviction。公共 backend API 若出现重复 key，会自动退回原逐项
+   Upsert，保持“同一 batch 内先创建、后续 partial update 继续 merge”的请求顺序语义；
+7. HTTP handler 直接把 request body 的 `string_view` 交给 protobuf JSON parser，删除整份大 body copy。
+   parser 在 handler 栈内同步完成，view 不会越过 request body 生命周期。
+
+这些改动没有新增 writer 线程、没有把 manager callback 放进 backend item lock，也没有修改协议或 metadata
+schema。Local batch lookup 会同时 pin 一批 handle，但只在本次同步投影/更新期间持有；所有 handle 均通过
+`ReleaseBatch` 一次释放。新增 `StandardUri` serializer 用精确输出对照测试锁定 canonical 兼容性，不能仅以
+“URI 语义等价”为由改变输出顺序。
+
+#### 纯 local 单请求 before/after
+
+真实 HTTP benchmark 使用 `test_20_large_single_request_delta_scaling`，每档先创建 block，再对相同 location
+执行 update，并检查 committed token 和首/中/末 key。before 为本分支创建后立即记录的基线；after 为最终
+Release 链接产物三个全新 instance 的串行复测中位数：
+
+| events/request | before create/update | after create/update | create/update 降幅 |
+| ---: | ---: | ---: | ---: |
+| 100 | 1.53/1.38ms | 1.47/1.34ms | 3.9%/2.9% |
+| 1000 | 9.47/9.00ms | 8.21/7.80ms | 13.3%/13.3% |
+| 5000 | 43.54/42.57ms | 37.33/35.14ms | 14.3%/17.5% |
+| 20000 | 173.87/175.00ms | 145.85/145.87ms | 16.1%/16.6% |
+
+最后一次安全审查和重新链接后的三轮 20k create 为 `145.27~147.59ms`，update 为
+`145.32~146.53ms`。
+结果仍近似 O(events)，本轮降低了每 event 常数，没有把大 JSON API 变为固定耗时，也不能据此承诺线上
+混合负载 p99。
+
+最后一轮 20k existing-location update 的服务端指标为：
+
+| 指标 | 数值 |
+| --- | ---: |
+| `service.query_rt_us` | 58,473us |
+| `meta_searcher.indexer_read_modify_write_location_time_us` | 35,602us |
+| `meta_indexer.rmw_get_io_time_us` | 7,061us |
+| `meta_indexer.upsert_io_time_us` | 6,715us |
+| `meta_indexer.lock_wait_time_us` | 1us |
+| `meta_searcher.index_deserialize_time_us` / `index_serialize_time_us` | 0/0us |
+
+同一次请求的 Python 客户端 HTTP wall time 为 145.32ms。两者之间约 87ms 包含客户端 JSON 编码、loopback
+HTTP、服务端 protobuf JSON parse/response serialization 及统计边界差异，不能全部归到某一个环节；但可以
+确定纯 local 下不是 Redis、location deserialize/serialize 或 metadata shard lock wait 主导。下一项有望
+立竿见影的优化应先补 `http_parse_us/http_serialize_us` 并做同 payload 的 gRPC A/B，而不是继续增加
+ReportEvent writer 并行度。
+
+#### 本轮验证矩阵与后续门禁
+
+- HTTP 纯内存功能集成 36/36 通过，覆盖 ADD/DELETE/SNAPSHOT、同请求 last-op-wins、部分失败重试闭包、
+  snapshot/delta 并发、HostDown/重注册、首次 delta、异常 URI/payload 无副作用；
+- Release/O2 的 StandardUri、MetaLocalBackend 和完整 CacheManager 分片测试通过；重复且非相邻 key 的
+  Upsert 专项测试验证请求顺序 merge；
+- ASAN 下 `StandardUriTest`、`meta_local_backend_test`、`CacheManagerTest`、`SnapshotUriUtilsTest`、
+  `MetaSearcherTest`、`ProtoMessageJsonUtilTest` 全部通过；
+- 100/1k/5k/20k create/update 三次性能复测全部通过数据校验，没有错误返回或规模拐点。
+
+后续若修改连续数组索引、location-id intern、prevalidated size、batch handle 生命周期或 HTTP body view，
+至少重跑上述六个 ASAN 目标和 36 项 HTTP 功能套件。当前没有真实 Redis 验证，不能把本节数据外推到
+cached/redis backend；也不要在没有混合 ReportEvent/Get/heartbeat p99 对照前增加内部 writer 并行。
+
+### 5.14 2026-08-06 热路径优化后的第二轮正确性审计
+
+本节记录 `codex/report-event-hotpath-optimization` 在 5.13 提交后的继续审查结果。它不是另一轮并行化，
+而是针对批处理顺序、可信输入边界、整数上溢和借用内存生命周期逐层构造反例。后续 AI 不应只重跑 happy
+path benchmark 后删除这些保护。
+
+#### 审计中发现并修复的问题
+
+1. `MetaLocalBackend::Upsert` 的初版 batch lookup 会先更新所有 hit，再插入所有 miss。在 strict-capacity
+   local cache 中这会改变可观察的请求顺序：`[new key, existing key]` 原本可以先接纳新 key、再原地扩展旧
+   key，重排后却可能让新 key 返回 `EC_NOSPC`。最终实现对重复 key 继续逐项处理；全 hit 和全 miss 保留
+   batch fast path；混合 hit/miss 按原下标更新/插入并逐个释放已有 handle。全 miss 不再调用只包含空
+   handle 的 `ReleaseBatch`，避免一次无意义的 shard 分桶分配；
+2. `MergeLocationSpecsTask::prevalidated_total_size` 最初是公开的 `optional<uint64_t>`，任何 caller 都能伪造
+   值并绕过 URI/spec/version 校验。现在它是只能由 `CacheManager` 构造的 capability token；普通
+   `MetaSearcher` caller 无法创建 token，必须走严格验证。不要为了测试方便重新开放它的构造函数；
+3. `StandardUri(const string&)` 忽略 `Parse()` 返回值。旧 parser 遇到非数字端口时会保留 protocol，导致
+   `Valid()==true`，随后追加 snapshot version 又把非法端口静默丢掉。现在端口直接在原字符区间上用
+   `from_chars` 严格解析，非数字、负数（包括数值等于 0 的 `-0`）、空端口、前导空白和 `+` 均
+   fail-closed；保留仓库已有的 `:0`
+   兼容语义。authority 中的 `@`/`:` 只在 path/query 之前解释，query value 中的 callback URL、`/` 和邮箱
+   地址不再污染 user-info/path；
+4. 多 spec 的 `size` 以前直接做 `uint64_t` 加法，恶意或损坏输入可以回绕并破坏 storage usage。单个 ADD
+   event 和完整 SNAPSHOT 在获取 reporter generation/write gate 前按整个输入做 checked sum；跨多个 ADD
+   event 折叠后若才发生上溢，则不信任预计算 hint，退回 `MetaSearcher` 严格校验并按既有“首次 metadata
+   写失败仍复用 generation”的语义返回失败。通用 merge/replace 校验也拒绝上溢，Replace 复用校验得到的
+   total，删除一次写阶段重复 URI size 解析。第二轮反例还覆盖“已有 location 的 size 合法、当前 ADD 的
+   size 也合法，但两者合并后才上溢”：target-location modifier 在写入前计算 retained + incoming 的 checked
+   sum，返回 `EC_BADARGS` 并保持原 metadata/usage 不变；
+5. HTTP body 的 `string_view` 解析新增非 NUL 结尾、带前后垃圾 backing string 的边界测试，证明 protobuf
+   parser 严格使用 view 长度且不读取尾部。`req.get_body()` 的 view 仍只在同步 handler/parser 栈内使用，
+   不能缓存到异步任务或 response 生命周期之后。
+
+#### 新增的模型与反例
+
+- 768 个确定性伪随机 ADD/DELETE event、48 个 block、17 个 medium、4 个 spec name，与独立 map 参考模型
+  比较最终 canonical URI、last-op-wins、spec 排序、location 数量、`spec_size` 和总 storage usage。17 个
+  medium 会强制 request-owned intern `unordered_map` rehash，用来验证 location-id 指针在 rehash 后仍有效；
+- optimized batch Upsert 与逐项 `UpsertForOneKey` 做差分，覆盖全 hit、全 miss、混合、非相邻重复 key，比较
+  每项错误码、location、除动态 `BP#lru_time` 外的全部 properties 及内存计数；另用 1 MiB strict capacity
+  分别锁定 `[new, existing] -> [OK, OK]` 和 `[existing, new] -> [OK, NOSPC]`；
+- 非法端口、单 event size 上溢、跨 event fold 后 size 上溢、已有 spec 与新 spec 合并后上溢、
+  snapshot/Replace size 上溢均验证无错误 metadata 写入。跨 event 上溢还验证失败响应保留可复用
+  generation，这与已有
+  `TestReportEventFirstDeltaMetadataFailureReportsFailureAndReusesGeneration` 契约一致，不应误改成失败即删除
+  generation；
+- `PrevalidatedTotalSize` 的私有构造保证 ReportEvent 之外的测试和生产 caller 仍走完整校验，而不是仅依赖
+  注释约定。
+
+#### 验证结果和环境限制
+
+- Release/O2 完整通过 10 个纯内存目标：`StandardUriTest`、`LruCacheTest`、
+  `SnapshotUriUtilsTest`、`EventReportBackendTest`、`meta_local_backend_test`、`meta_indexer_test`、
+  `meta_storage_backend_manager_test`、`MetaSearcherTest`、`CacheManagerTest`、
+  `ProtoMessageJsonUtilTest`；
+- 相同 10 个目标 ASAN 全绿。UBSAN 下 URI、snapshot URI、local backend、MetaSearcher、JSON 边界及定向
+  ReportEvent 用例全绿；完整 `CacheManagerTest` 中依赖第三方 `cpp_stub` 改写函数机器码的 3 个测试因
+  `external/cpp_stub/stub.h:456` 非对齐写入被 UBSAN 阻止，这发生在 mock 安装阶段，不在本轮生产路径。
+  TSAN 在链接 gRPC 时因环境缺失 `/usr/lib64/libtsan.so.0.0.0` 无法启动，不能记录为通过；
+- Release 下并发读写、ReportEvent/HostDown 并发、flat fold、容量顺序、折叠/最终合并上溢和写失败传播的
+  关键组合重复 50 轮；`CacheManagerTest` 分片合计执行 500 次，另对并发可见性和失败依赖闭包合计执行
+  200 次，全部通过；
+- 最终源码重新构建的新进程上，真实 HTTP、纯 local metadata 的双类型基础套件 20/20、
+  snapshot/并发/失败套件 36/36 全绿。随后 10 秒影子状态混合压力完成 401 次 100-block ADD、198 次最多
+  50-block DELETE、201 次 1000-key Get、40 次 heartbeat，所有请求和写后抽样校验零失败；ADD
+  p50/p99 `2.50/4.69ms`，Get p50/p99 `2.27/10.24ms`；
+- 最终源码无并行编译负载时三轮 20k 单请求 create/update 为 `147.26/145.87ms`、`147.27/146.39ms`、
+  `145.51/145.16ms`。一次与两个大 Bazel build 重叠的 `315.50/344.60ms` 已明确标记为环境噪声，不用于
+  before/after 结论。性能复测前必须确认没有编译器/linker/其他 benchmark 占用 CPU。
+
+本轮仍只验证 pure local metadata；按用户部署前提没有启动 Redis。local 结果不能证明 cached/redis 语义，
+但本轮也没有修改 Redis 专属实现。若以后改变 mixed Upsert 分支、capability token、checked size、URI parser
+或 borrowed HTTP body，必须至少重复本节的差分模型、sanitizer 定向用例和 36 项 HTTP 套件。
+
+### 5.15 2026-08-06 TSAN 关闭期审计与写读混合 A/B
+
+本节是在 5.14 之后继续检查 `codex/report-event-hotpath-optimization` 的结果。测试仍只使用 pure local
+metadata。系统补装 `libtsan-10.2.1-3.3.alios7.x86_64` 后，5.14 记录的 TSAN 环境限制已经解除；这只是
+本机测试依赖，不是仓库或发布包改动。
+
+#### TSAN 发现的两个关闭期问题
+
+1. `EventReportBackend::Close()` 先收集 `LifecycleFence::mutex` 的 `unique_lock`，再清空
+   `lifecycle_fences_`。`unique_lock` 不拥有 mutex 对象，原实现可能先析构最后一个 fence，再由 lock vector
+   解锁已经释放的 `shared_mutex`。TSAN 在
+   `LivenessUnregistersBeforeCleanupAndHeartbeatCannotReviveOldSnapshot` 中稳定报 heap-use-after-free；
+2. 仅增加 fence 的强引用仍不够。原 `Close()` 在持有 `lifecycle_fences_mutex_` 时阻塞等待每个 fence 的
+   writer lock，能形成真实三线程环：host cleanup 持有 lifecycle read lease 后等待 metadata；已进入的
+   metadata RMW 持有 metadata 后查找 lifecycle fence；`Close()` 持有 fence table mutex 后等待 cleanup
+   的 lifecycle lease。delta modifier 使用 `try_lock` 只能切断直接的 metadata/lifecycle 两锁环，不能切断
+   `Close()` 引入的第三条边；
+3. 最终实现只在 `lifecycle_fences_mutex_` 下复制 `shared_ptr<LifecycleFence>`，释放 table mutex 后才等待
+   每个 fence，清空节点状态后再短暂获取 table mutex 清表；显式先销毁 lock vector，再销毁强引用。
+   `Close()` 在任何阻塞等待期间都不持有 table mutex；
+4. 所有可能在 `Close()` 设置 `retired_` 后才返回或新建 fence 的入口均已逐个审计。它们在获得 fence 后、
+   修改 node/snapshot 状态前再次检查 `Retired()` 或 `AcceptingReports()`。因此 table snapshot 之后创建的
+   fence 只会得到关闭错误，不会越过关闭边界写状态。以后若新增 `GetOrCreateLifecycleFence()` caller，必须
+   保留这次二次检查；不能用一次函数入口检查替代。
+
+以后修改这里必须同时保持三个不变量：不在持有 fence table mutex 时等待 reporter fence；保留 fence 的
+强引用直到对应 lock 已释放；可能跨过 `Close()` 的 caller 在 fence 内再次检查 retired/available 状态。
+
+#### Sanitizer 与 Release 验证
+
+- TSAN：完整 `EventReportBackendTest`、8 个 ReportEvent/snapshot/HostDown/Get 跨层并发用例、MetaLocal
+  batch Upsert/compact read 及 MetaIndexer 多线程/提前终止用例全绿。最初触发 UAF/锁环的 4 个用例最后各
+  重复 20 次；EventReportBackend 20/20，分片后的 CacheManager 合计 200/200，无 data race、UAF 或
+  lock-order-inversion；
+- ASAN+UBSAN：`LruCacheTest`、`StandardUriTest`、`EventReportBackendTest`、`SnapshotUriUtilsTest`、
+  `query_executor_test`、`meta_local_backend_test`、`meta_indexer_test`、`MetaSearcherTest`、
+  `ProtoMessageJsonUtilTest` 全量通过；`CacheManagerTest` 10 个 shard 全量通过。当前构建会把同一个
+  generated protobuf 常量从两个 DSO 注册给 ASAN，因此使用 ASAN 建议的
+  `detect_odr_violation=0`；UBSAN 只 suppress `external/cpp_stub/stub.h` 的 alignment 检查，因为该测试库
+  本来就通过非对齐机器码写入安装函数 stub，仓库自身路径仍为 `halt_on_error=1`；
+- Release/O2：上述 9 个目标加完整 `CacheManagerTest`，共 10 个目标全绿；最终重新链接的真实 HTTP
+  进程上，snapshot/并发/失败套件 36/36 全绿；
+- 本轮 ASAN 首次运行若不关闭 protobuf ODR 检查，会在测试 main 之前退出；完整 CacheManager UBSAN
+  若不 suppress `cpp_stub`，会在 mock 安装阶段退出。这两种已知测试基础设施诊断不能当作生产代码失败，
+  也不能直接忽略后宣称 sanitizer 通过，必须按上面的精确范围重跑。
+
+#### ReportEvent 优化对 Get 的 2×2 A/B
+
+为了验证写侧优化不会挤压用户更关心的 Get，使用同一台机器、Release/O2、全新 pure-local instance，比较
+父提交 `6c44b5025f5aeefbfa663cf94c39c915f4966314` 与当前实现。每轮 30 秒、8 reporter、15 QPS × 10k
+BLOCK_ADD、2 QPS × 10k-key standalone Get、5 秒心跳，所有请求和 shadow-state 校验均零失败。
+
+注意 `report_event_load.py` 会在每个 ADD 后用同一批 10k key 再调用一次 Get 并校验完整 prefix，且 `add`
+统计从 ReportEvent 开始一直覆盖到该校验结束。因此这里的 `add` 不是纯 ReportEvent HTTP RT；实际查询
+压力约为 15 QPS 的写后 10k-key Get 加 2 QPS standalone Get。这个模型故意比线上 0.1 QPS Get 更苛刻，
+适合观察写优化是否伤害查询，但不能用 `add` 数字替代独立 ReportEvent benchmark。
+
+| 版本 | ADD 实际 QPS | ADD avg | ADD p50 | Get 实际 QPS | Get avg | Get p50 | Get p95 | Get p99 | Get max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| before round 1 | 12.60 | 1157.91ms | 489.22ms | 1.70 | 605.96ms | 144.49ms | 1993.64ms | 6175.34ms | 7163.79ms |
+| before round 2 | 13.07 | 982.79ms | 406.74ms | 1.74 | 828.08ms | 120.25ms | 3645.72ms | 4322.02ms | 4510.07ms |
+| current round 1 | 13.19 | 906.85ms | 314.52ms | 1.78 | 458.93ms | 78.01ms | 2037.09ms | 2939.51ms | 3223.37ms |
+| current round 2 | 13.41 | 770.95ms | 343.81ms | 1.81 | 470.10ms | 89.03ms | 1961.27ms | 3176.85ms | 3855.16ms |
+
+按请求数加权，ADD+写后校验平均从 `1071.20ms` 降到 `838.30ms`，下降 21.7%；standalone Get 平均从
+`715.23ms` 降到 `464.56ms`，下降 35.0%。两轮 current 的 Get p50 都低于两轮 before，p99 也从
+`4.32~6.18s` 收敛到 `2.94~3.18s`。第一组配对的 Get p95 有约 2.2% 反向波动，第二组明显改善；不能从
+约 60 个 Get 样本推导精确 percentile SLA，但 2×2 的平均、p50、p99 和完成吞吐一致表明：在固定目标写
+负载下，当前 ReportEvent 优化对查询是正向的，没有发现以增加 writer 并行度换吞吐、反而抢占 Get 的情况。
+
+绝对尾延迟仍不合格：10k 大批次加每写一次完整 10k-key 校验会把服务推入排队区。当前结果支持“优化没有
+伤害查询”，不支持“150k blocks/s 下 Get 已满足 100ms SLA”。线上仍应优先把 ReportEvent 外部分成
+2k/5k block 批次，并按固定 blocks/s 重测 Get p99。
+
+#### 最终混合正确性与日志边界
+
+最终源码另跑 45 秒混合压力：1357 次 100-block ADD、673 次最多 50-block DELETE、24 次周期 SNAPSHOT
+（每次主动遗漏 10% 当前 key 验证权威对账）、227 次 5k-key Get、72 次 heartbeat，全部请求和写后
+shadow-state 校验零失败。Get avg/p50/p95/p99/max 为
+`5.24/3.67/11.70/12.72/86.03ms`；ADD 为 `4.16/2.54/4.33/54.37/237.09ms`，snapshot 平均
+`191.59ms`。
+
+压测停止心跳并等待 liveness 清理时，多个 host 会并行扫描同一个 local index。一个 cleanup 的 `Scan`
+返回 key 后，另一个 cleanup 可能先删除该 key，使前者的 `GetLocations` 返回包含 `EC_NOENT` 的
+`EC_PARTIAL_OK`。当前 `CleanupLocationsByHost` 会立即把任何 `EC_PARTIAL_OK` 记为 failure，所以外层可能
+记录 `finished with partial failures`，即使后续逐 location 已把 `EC_NOENT/EC_MISMATCH` 当作幂等成功且没有
+底层 delete error。这是并发清理的保守/偏噪声日志，不能仅凭该汇总 warning 判断 metadata 丢失；后续若
+收敛日志，应只把非 `EC_NOENT` 的 per-key read error 计为真实 failure，并补 Scan/Get 竞态测试，不要改变
+cleanup 的 generation lease 或 conditional-delete 语义。
+
+本节没有启动 Redis，也没有把 local 结果外推到 cached/Redis backend。后续 AI 至少应保留：36 项 HTTP
+功能套件、固定 blocks/s 的写读混合 A/B、TSAN 关闭期复现，以及 sanitizer 对第三方 ODR/stub 的精确处理。

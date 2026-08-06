@@ -90,11 +90,12 @@ ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &spe
             !uri.Valid()) {
             return EC_BADARGS;
         }
-        if (out_total_size) {
-            std::uint64_t spec_size = 0;
-            uri.GetParamAs<std::uint64_t>("size", spec_size);
-            total_size += spec_size;
+        std::uint64_t spec_size = 0;
+        uri.GetParamAs<std::uint64_t>("size", spec_size);
+        if (spec_size > std::numeric_limits<std::uint64_t>::max() - total_size) {
+            return EC_BADARGS;
         }
+        total_size += spec_size;
         const size_t version_param_count =
             SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
         if (version_param_count == 0) {
@@ -1702,13 +1703,16 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
         location_ids.reserve(tasks_per_key[key_index].size());
         key_usage_changes.resize(tasks_per_key[key_index].size());
         std::unordered_set<std::string> seen_location_ids;
-        for (const auto &task : tasks_per_key[key_index]) {
+        for (size_t task_index = 0; task_index < tasks_per_key[key_index].size(); ++task_index) {
+            const auto &task = tasks_per_key[key_index][task_index];
+            std::uint64_t incoming_size = 0;
             if (task.location_id.empty() || !seen_location_ids.insert(task.location_id).second ||
-                ValidateConsistentSnapshotVersion(task.specs) != EC_OK) {
+                ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
             location_ids.push_back(task.location_id);
+            key_usage_changes[task_index].new_size = incoming_size;
         }
     }
 
@@ -1781,7 +1785,6 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
             new_location->set_status(task.status);
             new_location->set_spec_size(new_location->location_specs().size());
             new_location->set_create_time(batch_create_time);
-            usage.new_size = GetLocationSpecsSize(task.specs);
             locations[location_index] = std::move(new_location);
             updated = true;
         }
@@ -1883,10 +1886,16 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         location_ids.reserve(tasks_per_key[key_index].size());
         for (const auto &task : tasks_per_key[key_index]) {
             std::uint64_t incoming_size = 0;
+            const ErrorCode validation_ec = task.prevalidated_total_size.has_value()
+                                                ? (task.specs.empty() ? EC_BADARGS : EC_OK)
+                                                : ValidateConsistentSnapshotVersion(task.specs, &incoming_size);
+            if (task.prevalidated_total_size.has_value()) {
+                incoming_size = task.prevalidated_total_size->value();
+            }
             if (task.location_id.empty() ||
                 (tasks_per_key[key_index].size() > 1 &&
                  !seen_location_ids.insert(std::string_view(task.location_id)).second) ||
-                ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK) {
+                validation_ec != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
@@ -1963,16 +1972,25 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                 std::uint64_t replaced_old_size = 0;
                 bool has_legacy_duplicate_names = false;
                 const auto &old_specs = locations[location_index]->location_specs();
+                bool old_size_overflow = false;
                 for (size_t old_index = 0; old_index < old_specs.size(); ++old_index) {
                     const auto &old_spec = old_specs[old_index];
                     std::uint64_t old_spec_size = 0;
                     if (DataStorageUri old_uri(old_spec.uri()); old_uri.Valid()) {
                         old_uri.GetParamAs<std::uint64_t>("size", old_spec_size);
                     }
+                    if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.old_size) {
+                        old_size_overflow = true;
+                        break;
+                    }
                     usage.old_size += old_spec_size;
                     if (std::any_of(task.specs.begin(), task.specs.end(), [&old_spec](const auto &new_spec) {
                             return new_spec.name() == old_spec.name();
                         })) {
+                        if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - replaced_old_size) {
+                            old_size_overflow = true;
+                            break;
+                        }
                         replaced_old_size += old_spec_size;
                     }
                     has_legacy_duplicate_names =
@@ -1981,11 +1999,37 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                             return prior.name() == old_spec.name();
                         });
                 }
+                if (old_size_overflow) {
+                    modifier_ecs[location_index] = EC_BADARGS;
+                    continue;
+                }
                 usage.has_old = true;
                 new_location = std::make_shared<CacheLocation>(*locations[location_index]);
                 MergeLocationSpecsByName(new_location->mutable_location_specs(), task.specs);
-                usage.new_size = has_legacy_duplicate_names ? GetLocationSpecsSize(new_location->location_specs())
-                                                            : usage.old_size - replaced_old_size + incoming_size;
+                if (has_legacy_duplicate_names) {
+                    usage.new_size = 0;
+                    for (const auto &merged_spec : new_location->location_specs()) {
+                        std::uint64_t merged_spec_size = 0;
+                        if (DataStorageUri merged_uri(merged_spec.uri()); merged_uri.Valid()) {
+                            merged_uri.GetParamAs<std::uint64_t>("size", merged_spec_size);
+                        }
+                        if (merged_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.new_size) {
+                            modifier_ecs[location_index] = EC_BADARGS;
+                            break;
+                        }
+                        usage.new_size += merged_spec_size;
+                    }
+                    if (modifier_ecs[location_index] != EC_OK) {
+                        continue;
+                    }
+                } else {
+                    const std::uint64_t retained_size = usage.old_size - replaced_old_size;
+                    if (incoming_size > std::numeric_limits<std::uint64_t>::max() - retained_size) {
+                        modifier_ecs[location_index] = EC_BADARGS;
+                        continue;
+                    }
+                    usage.new_size = retained_size + incoming_size;
+                }
             } else {
                 new_location = std::make_shared<CacheLocation>();
                 new_location->set_id(task.location_id);
