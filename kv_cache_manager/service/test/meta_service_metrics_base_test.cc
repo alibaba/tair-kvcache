@@ -155,7 +155,10 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBo
     SeedInstance("inst1", "grp1");
     proto::meta::ReportEventRequest request;
     request.set_instance_id("inst1");
-    request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *snapshot_event = request.add_events();
+    snapshot_event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    snapshot_event->mutable_block_snapshot()->add_blocks()->set_block_key("1");
+    snapshot_event->mutable_block_snapshot()->add_blocks()->set_block_key("2");
     request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
     request.add_events()->set_event_type(proto::meta::EVENT_HEARTBEAT);
     request.add_events()->set_event_type(static_cast<proto::meta::ReportEventType>(99));
@@ -167,8 +170,14 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBo
     ASSERT_EQ(3, collectors.size());
     std::set<std::string> event_types;
     for (const auto &collector : collectors) {
-        ASSERT_NE(nullptr, dynamic_cast<EventReportMetricsCollector *>(collector.get()));
-        event_types.insert(collector->GetMetricsTags().at("event_type"));
+        auto *event_collector = dynamic_cast<EventReportMetricsCollector *>(collector.get());
+        ASSERT_NE(nullptr, event_collector);
+        const auto &event_type = collector->GetMetricsTags().at("event_type");
+        event_types.insert(event_type);
+        if (event_type == "block_snapshot") {
+            EXPECT_TRUE(event_collector->HasRequestKeyCountSample());
+            EXPECT_DOUBLE_EQ(2., event_collector->GetRequestKeyCountSample());
+        }
     }
     EXPECT_EQ((std::set<std::string>{"block_snapshot", "heartbeat", "unknown"}), event_types);
 }
