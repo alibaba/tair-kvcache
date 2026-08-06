@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -39,6 +41,9 @@ struct MetricsLifecycle;
 class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
+constexpr unsigned int DEFAULT_META_QUERY_WORKER_COUNT = 4;
+constexpr std::size_t DEFAULT_META_QUERY_PARALLEL_THRESHOLD = 256;
+constexpr std::size_t DEFAULT_META_QUERY_CHUNK_SIZE = 128;
 
 class CacheManager {
     // TODO should not public
@@ -88,7 +93,10 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
               CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
-              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET,
+              uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
+              std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
+              std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE);
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -230,6 +238,15 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    struct EventCleanupCallbackState {
+        std::shared_mutex mutex;
+        bool accepting = true;
+        // Advances whenever cleanup is deactivated. A task admitted before a
+        // leader cleanup must stay stale even if the same CacheManager is later
+        // activated again during recovery.
+        uint64_t epoch = 1;
+    };
+
     ErrorCode FilterWriteCache(RequestContext *request_context,
                                const std::string &instance_id,
                                MetaSearcher *meta_searcher,
@@ -312,12 +329,14 @@ private:
     void CleanupHostLocations(const std::string &instance_id,
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
-                              DataStorageType storage_type);
+                              DataStorageType storage_type,
+                              const std::shared_ptr<EventReportBackend> &expected_backend);
     ErrorCode CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
                                             const std::string &snapshot_version,
                                             DataStorageType storage_type,
                                             const std::shared_ptr<EventReportBackend> &event_backend,
-                                            uint64_t snapshot_attempt_epoch = 0);
+                                            uint64_t snapshot_attempt_epoch = 0,
+                                            uint64_t lifecycle_generation = 0);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -340,8 +359,12 @@ private:
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
+    MetaSearcher::CheckHostCacheLocationFunc
+    GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
+    void DeactivateEventCleanupCallbacks();
+    void ActivateEventCleanupCallbacks();
 
     // purge metrics registry entries and invoke the removal callback
     // for a given instance_id
@@ -380,6 +403,11 @@ private:
     std::shared_ptr<EventManager> event_manager_;
     // 无需清理
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
+    // EventReportBackend owns a callback that cannot retain CacheManager.
+    // This separate gate lets destruction drain a callback copy that was
+    // already taken by the liveness thread and reject copies invoked later.
+    std::shared_ptr<EventCleanupCallbackState> event_cleanup_callback_state_ =
+        std::make_shared<EventCleanupCallbackState>();
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理

@@ -504,6 +504,18 @@ extra config 中透传这些 Manager Client 参数，包括
 `request_timeout_seconds`；未配置时普通 API 请求默认超时为 `1.0` 秒。
 Leader 查询使用独立的 5 秒超时，不受该参数影响。
 
+Manager Client 的构造和关闭是资源事务：服务发现 factory、初始 endpoint 解析、discovery
+type 读取以及 route-refresh 线程构造/启动中的任意一步失败时，已创建的 HTTP session 与服务
+发现 client 都会回滚；`close()` 等待刷新线程最多 5 秒。若线程仍在 Leader/Spectrum
+请求中，HTTP session 可以立即关闭，但服务发现 client 必须由刷新线程退出时延迟关闭，不能与
+正在进行的 endpoint refresh 并发释放。重复 `close()` 对两类资源都只执行一次。
+
+响应异常按以下契约分类，供上层熔断器稳定判断：连接、超时和 JSON 解码沿用
+`requests.RequestException`；HTTP 非 200 抛 `KvCacheManagerHTTPError`；HTTP 200 但缺少合法
+`header.status.code` 抛 `KvCacheManagerProtocolError`。后两者同时兼容旧的 `AssertionError`
+捕获方式。Manager 明确返回非 `OK` 的业务状态仍抛原有 `AssertionError`。即使调用方传入
+`check_response=False`，也只跳过业务状态检查，不能跳过 HTTP 与公共 envelope 校验。
+
 开源构建可直接使用 `static://`；需要内部实现的 scheme 仍由对应的
 `stub_source` 实现提供，通用 Client 不依赖具体服务发现类型。
 

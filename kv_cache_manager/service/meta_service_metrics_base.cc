@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <utility>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -46,6 +47,7 @@ void MetaServiceMetricsBase::InitMetrics() {
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceInfo);
     MAKE_SERVICE_METRICS_COLLECTOR(GetClusterInfo);
+    MAKE_SERVICE_METRICS_COLLECTOR(ReportEvent);
     // GetClusterInfo 的全局 collector 也预置到 MAP 中，以空 instance_id 为 key
     KVCM_METRICS_COLLECTOR_MAP_(GetClusterInfo)[""] = KVCM_METRICS_COLLECTOR_(GetClusterInfo);
 }
@@ -173,6 +175,27 @@ std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetEventTypeMetricsCol
 std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetTypedMetricsCollectorForReportEventType(
     const std::string &instance_id, const std::string &type, const std::string &event_type) {
     return GetEventTypeMetricsCollectorFromMap(instance_id, type, event_type);
+}
+
+std::shared_ptr<MetricsCollector>
+MetaServiceMetricsBase::ResolveReportEventMetricsCollector(const proto::meta::ReportEventRequest &request,
+                                                           std::string &out_metrics_type) {
+    out_metrics_type.clear();
+    std::shared_ptr<MetricsCollector> collector;
+    switch (request.storage_type()) {
+    case proto::meta::ST_EVENT_REPORT_L1P5:
+        out_metrics_type = kEventReportL1P5MetricsType;
+        collector = GetTypedMetricsCollectorForReportEvent(request.instance_id(), out_metrics_type);
+        break;
+    case proto::meta::ST_EVENT_REPORT_L2:
+        out_metrics_type = kEventReportL2MetricsType;
+        collector = GetTypedMetricsCollectorForReportEvent(request.instance_id(), out_metrics_type);
+        break;
+    default:
+        collector = get_metrics_collector_from_map_for_ReportEvent(request.instance_id());
+        break;
+    }
+    return collector ? std::move(collector) : KVCM_METRICS_COLLECTOR_(ReportEvent);
 }
 
 void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto::meta::ReportEventRequest &request,

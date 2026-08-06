@@ -3,6 +3,8 @@
 #include <cctype>
 #include <functional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -79,6 +81,75 @@ public:
         return true;
     }
 
+    // GetHostCacheState only needs to know whether an EventReport URI is
+    // structurally usable and which snapshot generation it belongs to. A full
+    // DataStorageUri parse would copy every URI component and allocate one
+    // std::map node per query parameter for every (key, spec) visited. Scan the
+    // immutable URI in place instead. An empty out_version means legacy
+    // metadata without s_version; malformed or duplicate s_version parameters
+    // fail closed.
+    //
+    // The returned view borrows uri_text and must not outlive it.
+    static bool InspectSnapshotUriForVisibility(std::string_view uri_text, std::string_view &out_version) noexcept {
+        out_version = {};
+
+        // This is the observable validity condition used by StandardUri::Valid
+        // for a freshly constructed URI: it must have a non-empty protocol
+        // before "://". ReportEvent performs the full parse before persisting
+        // metadata; this read-side check additionally protects recovered or
+        // otherwise malformed metadata without rebuilding the parsed object.
+        const size_t protocol_end = uri_text.find("://");
+        if (protocol_end == std::string_view::npos || protocol_end == 0) {
+            return false;
+        }
+
+        const size_t query_begin = uri_text.find('?');
+        if (query_begin == std::string_view::npos) {
+            return true;
+        }
+        if (query_begin < protocol_end + 3) {
+            return false;
+        }
+
+        bool found_version = false;
+        size_t begin = query_begin + 1;
+        while (begin <= uri_text.size()) {
+            size_t end = uri_text.find('&', begin);
+            if (end == std::string_view::npos) {
+                end = uri_text.size();
+            }
+            const size_t equals = uri_text.find('=', begin);
+            const size_t key_end = equals != std::string_view::npos && equals < end ? equals : end;
+            constexpr std::string_view version_key{kSnapshotVersionParam};
+            if (key_end - begin == version_key.size() &&
+                uri_text.compare(begin, version_key.size(), version_key) == 0) {
+                if (found_version || equals == std::string_view::npos || equals >= end) {
+                    return false;
+                }
+                found_version = true;
+                out_version = uri_text.substr(equals + 1, end - equals - 1);
+            }
+            if (end == uri_text.size()) {
+                break;
+            }
+            begin = end + 1;
+        }
+
+        if (!found_version) {
+            return true;
+        }
+        if (out_version.size() != 32) {
+            return false;
+        }
+        for (const unsigned char ch : out_version) {
+            const bool is_hex_digit = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+            if (!is_hex_digit) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static bool HasEventReportInternalUriMetadata(const DataStorageUri &uri) {
         return uri.HasParam(kSnapshotVersionParam);
     }
@@ -115,20 +186,33 @@ public:
             CountUriParam(raw_uri, kSnapshotVersionParam) != 0) {
             return false;
         }
+        return AddSnapshotVersionToUri(std::move(uri), version, out_uri);
+    }
+
+    // ReportEvent validates and parses every URI before it acquires the
+    // snapshot/delta fence. Reusing that parsed value avoids parsing the same
+    // URI again merely to append KVCM's internal generation token.
+    static bool AddSnapshotVersionToUri(DataStorageUri uri, const std::string &version, std::string &out_uri) {
+        out_uri.clear();
+        if (!uri.Valid() || !IsValidSnapshotVersionToken(version) || HasEventReportInternalUriMetadata(uri)) {
+            return false;
+        }
         uri.SetParam(kSnapshotVersionParam, version);
         out_uri = uri.ToUriString();
         return !out_uri.empty();
     }
 
-    static bool ParseEventReportLocationId(const std::string &location_id,
-                                           std::string &out_storage_type,
-                                           std::string &out_medium,
-                                           std::string &out_host_ip_port) {
-        out_storage_type.clear();
-        out_medium.clear();
-        out_host_ip_port.clear();
-        constexpr const char *root_prefix = "kvs#";
-        constexpr size_t root_prefix_size = 4;
+    // Zero-copy parser for the per-block EventReport location id hot path.
+    // Returned views borrow location_id and must not outlive it.
+    static bool ParseEventReportLocationIdView(std::string_view location_id,
+                                               std::string_view &out_storage_type,
+                                               std::string_view &out_medium,
+                                               std::string_view &out_host_ip_port) noexcept {
+        out_storage_type = {};
+        out_medium = {};
+        out_host_ip_port = {};
+        constexpr std::string_view root_prefix{"kvs#"};
+        constexpr size_t root_prefix_size = root_prefix.size();
         if (location_id.size() <= root_prefix_size || location_id.compare(0, root_prefix_size, root_prefix) != 0) {
             return false;
         }
@@ -136,7 +220,7 @@ public:
         if (type_end == std::string::npos || type_end == root_prefix_size) {
             return false;
         }
-        const std::string storage_type = location_id.substr(root_prefix_size, type_end - root_prefix_size);
+        const std::string_view storage_type = location_id.substr(root_prefix_size, type_end - root_prefix_size);
         if (storage_type != "event_report_l1p5" && storage_type != "event_report_l2") {
             return false;
         }
@@ -145,14 +229,33 @@ public:
         if (separator == std::string::npos || separator == medium_begin || separator + 1 >= location_id.size()) {
             return false;
         }
-        const std::string medium = location_id.substr(medium_begin, separator - medium_begin);
-        const std::string host_ip_port = location_id.substr(separator + 1);
+        const std::string_view medium = location_id.substr(medium_begin, separator - medium_begin);
+        const std::string_view host_ip_port = location_id.substr(separator + 1);
         if (host_ip_port.empty() || host_ip_port.find('#') != std::string::npos) {
             return false;
         }
         out_storage_type = storage_type;
         out_medium = medium;
         out_host_ip_port = host_ip_port;
+        return true;
+    }
+
+    static bool ParseEventReportLocationId(const std::string &location_id,
+                                           std::string &out_storage_type,
+                                           std::string &out_medium,
+                                           std::string &out_host_ip_port) {
+        std::string_view storage_type;
+        std::string_view medium;
+        std::string_view host_ip_port;
+        if (!ParseEventReportLocationIdView(location_id, storage_type, medium, host_ip_port)) {
+            out_storage_type.clear();
+            out_medium.clear();
+            out_host_ip_port.clear();
+            return false;
+        }
+        out_storage_type.assign(storage_type.data(), storage_type.size());
+        out_medium.assign(medium.data(), medium.size());
+        out_host_ip_port.assign(host_ip_port.data(), host_ip_port.size());
         return true;
     }
 

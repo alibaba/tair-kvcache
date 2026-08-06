@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <set>
 #include <string>
 #include <vector>
@@ -32,6 +33,11 @@ static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete
 static constexpr const char *kDeleteMetaOperation = "delete";
 static constexpr const char *kExistMetaOperation = "exist";
 static constexpr const char *kGetMetaOperation = "get";
+// Pure-local prefix scans group enough keys to amortize the 1024-shard LRU's
+// lookup/release locks. This is independent from the smaller CPU-projection
+// chunk configured on QueryExecutor. The first range remains bounded so a
+// short prefix still cancels a million-key suffix promptly.
+static constexpr size_t kLocalPrefixReadChunkSize = 4096;
 } // namespace
 
 class MetaIndexer::ScopedBatchLock {
@@ -229,7 +235,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                                                           const std::vector<int32_t> &put_global_indexs,
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
-                                                          Result &result) noexcept {
+                                                          Result &result,
+                                                          bool preserve_existing_updates_when_full) noexcept {
     if (upsert_batch.batch_keys.empty()) {
         return {0, 0};
     }
@@ -238,17 +245,64 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
     stats.update_key_count += static_cast<int64_t>(upsert_batch.batch_keys.size() - put_global_indexs.size());
 
     std::vector<ErrorCode> upsert_ecs;
-    if (put_global_indexs.size() + GetKeyCount() > max_key_count_) {
+    BatchMetaData existing_update_batch;
+    std::vector<size_t> existing_update_positions;
+    BatchMetaData *backend_batch = &upsert_batch;
+    const bool capacity_exceeded = put_global_indexs.size() + GetKeyCount() > max_key_count_;
+    if (capacity_exceeded) {
         PREFIX_INDEXER_LOG(ERROR,
                            "ReadModifyWrite put keys count[%lu] + current key count[%lu] > max key count[%lu]",
                            put_global_indexs.size(),
                            GetKeyCount(),
                            max_key_count_);
-        upsert_ecs.assign(upsert_batch.batch_keys.size(), EC_NOSPC);
-    } else {
+        if (!preserve_existing_updates_when_full) {
+            upsert_ecs.assign(upsert_batch.batch_keys.size(), EC_NOSPC);
+        } else {
+            // Fused targeted RMW can mix brand-new keys and updates to keys
+            // that already count toward capacity. Reject only the former;
+            // the old two-phase merge still admitted the latter at capacity.
+            std::vector<bool> is_new_key(all_keys.size(), false);
+            for (const int32_t global_index : put_global_indexs) {
+                if (global_index >= 0 && static_cast<size_t>(global_index) < is_new_key.size()) {
+                    is_new_key[global_index] = true;
+                }
+            }
+            upsert_ecs.assign(upsert_batch.batch_keys.size(), EC_NOSPC);
+            existing_update_positions.reserve(upsert_batch.batch_keys.size());
+            for (size_t i = 0; i < upsert_batch.batch_keys.size(); ++i) {
+                const int32_t global_index = upsert_batch.batch_indexs[i];
+                if (global_index < 0 || static_cast<size_t>(global_index) >= is_new_key.size() ||
+                    is_new_key[global_index]) {
+                    continue;
+                }
+                existing_update_positions.push_back(i);
+                existing_update_batch.batch_keys.push_back(upsert_batch.batch_keys[i]);
+                existing_update_batch.batch_indexs.push_back(global_index);
+                existing_update_batch.batch_locations.push_back(upsert_batch.batch_locations[i]);
+                existing_update_batch.batch_properties.push_back(upsert_batch.batch_properties[i]);
+            }
+            backend_batch = &existing_update_batch;
+        }
+    }
+    if (upsert_ecs.empty() || !existing_update_positions.empty()) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
-        upsert_ecs = backend_manager_->Upsert(request_context, upsert_batch);
+        std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch);
         stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
+        if (existing_update_positions.empty()) {
+            upsert_ecs = std::move(backend_ecs);
+        } else if (backend_ecs.size() != existing_update_positions.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "ReadModifyWrite existing update results[%lu] mismatch keys[%lu]",
+                               backend_ecs.size(),
+                               existing_update_positions.size());
+            for (const size_t original_position : existing_update_positions) {
+                upsert_ecs[original_position] = EC_MISMATCH;
+            }
+        } else {
+            for (size_t i = 0; i < backend_ecs.size(); ++i) {
+                upsert_ecs[existing_update_positions[i]] = backend_ecs[i];
+            }
+        }
         int64_t v = 0;
         auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, v);
@@ -481,6 +535,23 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationIdsPerKey &location_ids,
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count) noexcept {
+    return ReadModifyWriteLocationImpl(
+        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false);
+}
+
+MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
+                                                                        const KeyVector &keys,
+                                                                        const LocationIdsPerKey &location_ids,
+                                                                        const LocationModifierFunc &modifier) noexcept {
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true);
+}
+
+MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
+                                                                     const KeyVector &keys,
+                                                                     const LocationIdsPerKey &location_ids,
+                                                                     const LocationModifierFunc &modifier,
+                                                                     bool adjust_reclaimed_key_count,
+                                                                     bool track_created_key_count) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -499,8 +570,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     std::shared_ptr<MetricsCollector> ephemeral_metrics_collector =
         std::make_shared<ServiceMetricsCollector>(ephemeral_metrics_registry);
     ephemeral_metrics_collector->Init();
-    auto ephemeral_request_context =
-        std::make_shared<RequestContext>("read_modify_write_location", ephemeral_metrics_collector);
+    auto ephemeral_request_context = std::make_shared<RequestContext>(
+        track_created_key_count ? "read_modify_write_target_locations" : "read_modify_write_location",
+        ephemeral_metrics_collector);
 
     static CacheLocationMapVector empty_locations;
     static PropertyMapVector empty_properties;
@@ -509,7 +581,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
 
     LocationResult location_result(location_ids);
     Result rmw_result(keys.size());
-    int32_t error_count = 0;
+    // The aggregate result reports whether the RMW machinery completed for
+    // each key. Per-location semantic outcomes (for example, a CAS mismatch
+    // or a rejected task in an otherwise valid batch) remain in
+    // per_location_error_codes and do not fail the whole operation. Track
+    // structural/read/modifier/write failures separately so malformed backend
+    // responses still fail closed without changing that established contract.
+    std::vector<bool> key_level_failures(keys.size(), false);
     RmwStats stats;
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
@@ -517,9 +595,19 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
         const auto &batch_keys = batch.batch_keys;
         LocationsPerKey batch_locations_per_key;
+        std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<std::vector<ErrorCode>> get_ecs_per_key = backend_manager_->GetLocations(
-            ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
+        std::vector<std::vector<ErrorCode>> get_ecs_per_key;
+        if (track_created_key_count) {
+            get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
+                                                                          batch_keys,
+                                                                          batch.batch_location_ids,
+                                                                          batch_locations_per_key,
+                                                                          batch_key_get_ecs);
+        } else {
+            get_ecs_per_key = backend_manager_->GetLocations(
+                ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
+        }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
         auto *ephemeral_service_metrics_collector =
@@ -529,24 +617,99 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         stats.index_deserialize_time_us += v;
         stats.has_index_deserialize = true;
 
+        if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
+            (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size())) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
+                               "key_ecs[%lu]",
+                               batch_keys.size(),
+                               get_ecs_per_key.size(),
+                               batch_locations_per_key.size(),
+                               batch_key_get_ecs.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(),
+                                                                            EC_MISMATCH);
+                key_level_failures[global_idx] = true;
+            }
+            continue;
+        }
+
         // 2. Per-key modifier dispatch -> bucket each key into the upsert sub-batch or the delete sub-batch.
         BatchMetaData upsert_batch;
         BatchMetaData delete_batch;
-        std::vector<std::vector<int32_t>> upsert_location_indexs(keys.size());
-        std::vector<std::vector<int32_t>> delete_location_indexs(keys.size());
+        std::vector<int32_t> put_global_indexs;
         for (size_t i = 0; i < batch_keys.size(); ++i) {
             const int32_t global_idx = batch.batch_indexs[i];
             const KeyType key = batch_keys[i];
 
-            const std::vector<ErrorCode> &get_ecs = get_ecs_per_key[i];
+            std::vector<ErrorCode> &get_ecs = get_ecs_per_key[i];
             const LocationIdVector &loc_ids = batch.batch_location_ids[i];
             CacheLocationVector &loc_values = batch_locations_per_key[i];
+            if (get_ecs.size() != loc_ids.size() || loc_values.size() != loc_ids.size()) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "ReadModifyWriteLocation per-key result size mismatch, key[%ld], ids[%lu], "
+                                   "ecs[%lu], locations[%lu]",
+                                   key,
+                                   loc_ids.size(),
+                                   get_ecs.size(),
+                                   loc_values.size());
+                location_result.per_location_error_codes[global_idx].assign(loc_ids.size(), EC_MISMATCH);
+                key_level_failures[global_idx] = true;
+                continue;
+            }
+            const ErrorCode key_get_ec = track_created_key_count ? batch_key_get_ecs[i] : EC_OK;
+            if (key_get_ec != EC_OK && key_get_ec != EC_NOENT) {
+                location_result.per_location_error_codes[global_idx].assign(loc_ids.size(), key_get_ec);
+                key_level_failures[global_idx] = true;
+                continue;
+            }
+            // EC_OK promises a usable value for the requested id. Treat a
+            // null or mis-keyed value as corruption and never let a modifier
+            // turn it into a write based on fabricated state.
+            for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+                if (get_ecs[loc_index] == EC_OK &&
+                    (!loc_values[loc_index] || loc_values[loc_index]->id() != loc_ids[loc_index])) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "ReadModifyWriteLocation invalid EC_OK value, key[%ld], requested id[%s]",
+                                       key,
+                                       loc_ids[loc_index].c_str());
+                    get_ecs[loc_index] = EC_MISMATCH;
+                    loc_values[loc_index].reset();
+                }
+                if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
+                    key_level_failures[global_idx] = true;
+                }
+            }
+            if (track_created_key_count && key_get_ec == EC_NOENT &&
+                std::any_of(get_ecs.begin(), get_ecs.end(), [](ErrorCode ec) { return ec == EC_OK; })) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "ReadModifyWriteTargetLocations key[%ld] reported missing with an existing "
+                                   "target location",
+                                   key);
+                location_result.per_location_error_codes[global_idx].assign(loc_ids.size(), EC_MISMATCH);
+                key_level_failures[global_idx] = true;
+                continue;
+            }
             PropertyMap upsert_property_map;
             auto [action, modifier_ecs] =
                 modifier(get_ecs, loc_ids, static_cast<size_t>(global_idx), loc_values, upsert_property_map);
             if (modifier_ecs.size() != loc_ids.size()) {
                 modifier_ecs.assign(loc_ids.size(), EC_ERROR);
                 action = MA_FAIL;
+                key_level_failures[global_idx] = true;
+            }
+            // A read error other than NOENT is not a valid basis for an RMW.
+            // Force it back into the corresponding result slot even if a
+            // buggy modifier accidentally returned EC_OK.
+            for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+                if (get_ecs[loc_index] != EC_OK && get_ecs[loc_index] != EC_NOENT) {
+                    modifier_ecs[loc_index] = get_ecs[loc_index];
+                }
+            }
+            if (action == MA_FAIL &&
+                std::all_of(modifier_ecs.begin(), modifier_ecs.end(), [](ErrorCode ec) { return ec == EC_OK; })) {
+                modifier_ecs.assign(loc_ids.size(), EC_ERROR);
+                key_level_failures[global_idx] = true;
             }
             if (action == MA_OK) {
                 CacheLocationMap upsert_loc_map;
@@ -557,15 +720,21 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                     }
                     const LocationId &loc_id = loc_ids[loc_index];
                     const CacheLocationConstPtr &working_loc = loc_values[loc_index];
-                    assert(working_loc && loc_id == working_loc->id());
+                    if (!working_loc || loc_id != working_loc->id()) {
+                        location_result.per_location_error_codes[global_idx][loc_index] = EC_MISMATCH;
+                        key_level_failures[global_idx] = true;
+                        continue;
+                    }
                     upsert_loc_map.emplace(loc_id, working_loc);
-                    upsert_location_indexs[global_idx].emplace_back(loc_index);
                 }
                 if (!upsert_loc_map.empty() || !upsert_property_map.empty()) {
                     upsert_batch.batch_keys.emplace_back(key);
                     upsert_batch.batch_indexs.emplace_back(global_idx);
                     upsert_batch.batch_locations.emplace_back(std::move(upsert_loc_map));
                     upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
+                    if (track_created_key_count && key_get_ec == EC_NOENT) {
+                        put_global_indexs.emplace_back(global_idx);
+                    }
                 }
             } else if (action == MA_DELETE) {
                 LocationIdVector alive_ids;
@@ -575,7 +744,6 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                         continue;
                     }
                     alive_ids.emplace_back(loc_ids[loc_index]);
-                    delete_location_indexs[global_idx].emplace_back(loc_index);
                 }
                 if (!alive_ids.empty()) {
                     delete_batch.batch_keys.emplace_back(key);
@@ -585,42 +753,61 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
             } else {
                 // MA_FAIL / MA_SKIP / unknown: surface modifier_ec if any.
                 if (action == MA_FAIL) {
-                    ++error_count;
+                    key_level_failures[global_idx] = true;
+                } else if (action != MA_SKIP) {
+                    modifier_ecs.assign(loc_ids.size(), EC_ERROR);
+                    key_level_failures[global_idx] = true;
                 }
                 location_result.per_location_error_codes[global_idx] = std::move(modifier_ecs);
             }
         }
 
         // 3. Dispatch upsert and delete sub-batches.
-        static std::vector<int32_t> empty_put_global_indexs;
-        const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(
-            trace_id, ephemeral_request_context.get(), upsert_batch, empty_put_global_indexs, keys, stats, rmw_result);
+        const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(trace_id,
+                                                                       ephemeral_request_context.get(),
+                                                                       upsert_batch,
+                                                                       put_global_indexs,
+                                                                       keys,
+                                                                       stats,
+                                                                       rmw_result,
+                                                                       track_created_key_count);
+        (void)upsert_errs;
         for (const auto &global_index : upsert_batch.batch_indexs) {
-            for (const auto &location_index : upsert_location_indexs[global_index]) {
-                location_result.per_location_error_codes[global_index][location_index] =
-                    rmw_result.error_codes[global_index];
+            if (rmw_result.error_codes[global_index] != EC_OK) {
+                key_level_failures[global_index] = true;
+            }
+            for (auto &location_ec : location_result.per_location_error_codes[global_index]) {
+                if (location_ec == EC_OK) {
+                    location_ec = rmw_result.error_codes[global_index];
+                }
             }
         }
         const auto [delete_errs, delete_success_count] =
             ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
+        (void)delete_errs;
         for (const auto &global_index : delete_batch.batch_indexs) {
-            for (const auto &location_index : delete_location_indexs[global_index]) {
-                location_result.per_location_error_codes[global_index][location_index] =
-                    rmw_result.error_codes[global_index];
+            if (rmw_result.error_codes[global_index] != EC_OK) {
+                key_level_failures[global_index] = true;
+            }
+            for (auto &location_ec : location_result.per_location_error_codes[global_index]) {
+                if (location_ec == EC_OK) {
+                    location_ec = rmw_result.error_codes[global_index];
+                }
             }
         }
-        error_count += upsert_errs + delete_errs;
         AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));
     }
 
     EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
-    if (error_count == keys.size()) {
+    const size_t failed_key_count =
+        static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
+    if (failed_key_count == keys.size()) {
         location_result.ec = EC_ERROR;
-        PREFIX_INDEXER_LOG(DEBUG, "all locations rmw failed, error count[%d]", error_count);
-    } else if (error_count > 0) {
+        PREFIX_INDEXER_LOG(DEBUG, "all locations rmw failed, error count[%lu]", failed_key_count);
+    } else if (failed_key_count > 0) {
         location_result.ec = EC_PARTIAL_OK;
         PREFIX_INDEXER_LOG(
-            DEBUG, "partial locations rmw failed, keys count[%lu] failed count[%d]", keys.size(), error_count);
+            DEBUG, "partial locations rmw failed, keys count[%lu] failed count[%lu]", keys.size(), failed_key_count);
     }
     return location_result;
 }
@@ -674,6 +861,15 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
 
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
     auto error_codes = backend_manager_->GetLocations(request_context, keys, out_location_maps);
+    if (error_codes.size() != keys.size() || out_location_maps.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetLocations result size mismatch, keys[%lu], ecs[%lu], locations[%lu]",
+                           keys.size(),
+                           error_codes.size(),
+                           out_location_maps.size());
+        error_codes.assign(keys.size(), EC_MISMATCH);
+        out_location_maps.assign(keys.size(), CacheLocationMap{});
+    }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
@@ -683,11 +879,292 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
     return result;
 }
 
+MetaIndexer::Result MetaIndexer::GetLocationValues(RequestContext *request_context,
+                                                   const KeyVector &keys,
+                                                   LocationsPerKey &out_locations) noexcept {
+    if (keys.empty()) {
+        out_locations.clear();
+        return Result(EC_OK);
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    std::vector<ErrorCode> error_codes;
+    const bool use_parallel_local_read = query_executor_ && query_executor_->worker_count() > 1 &&
+                                         keys.size() >= query_executor_->parallel_threshold() &&
+                                         backend_manager_->SupportsConcurrentLocationValueReads();
+    if (use_parallel_local_read) {
+        error_codes.assign(keys.size(), EC_ERROR);
+        out_locations.clear();
+        out_locations.resize(keys.size());
+        const bool completed = query_executor_->ParallelFor(
+            keys.size(), [this, &keys, &error_codes, &out_locations](std::size_t begin, std::size_t end) {
+                KeyVector chunk_keys(keys.begin() + begin, keys.begin() + end);
+                LocationsPerKey chunk_locations;
+                auto chunk_errors = backend_manager_->GetLocationValues(nullptr, chunk_keys, chunk_locations);
+                const std::size_t expected = end - begin;
+                if (chunk_errors.size() != expected || chunk_locations.size() != expected) {
+                    KVCM_LOG_ERROR(
+                        "parallel local location read size mismatch: errors[%zu] locations[%zu] expected[%zu]",
+                        chunk_errors.size(),
+                        chunk_locations.size(),
+                        expected);
+                    return;
+                }
+                for (std::size_t i = 0; i < expected; ++i) {
+                    error_codes[begin + i] = chunk_errors[i];
+                    out_locations[begin + i] = std::move(chunk_locations[i]);
+                }
+            });
+        if (!completed) {
+            KVCM_LOG_ERROR("trace_id[%s] instance[%s] | parallel local location read callback failed",
+                           trace_id.c_str(),
+                           instance_id_.c_str());
+        }
+    } else {
+        error_codes = backend_manager_->GetLocationValues(request_context, keys, out_locations);
+    }
+    if (error_codes.size() != keys.size() || out_locations.size() != keys.size()) {
+        KVCM_LOG_ERROR("trace_id[%s] instance[%s] | location value result size mismatch: errors[%zu] "
+                       "locations[%zu] keys[%zu]",
+                       trace_id.c_str(),
+                       instance_id_.c_str(),
+                       error_codes.size(),
+                       out_locations.size(),
+                       keys.size());
+        // Errors and values are one positional response. If either outer
+        // shape is malformed, no apparent in-range EC_OK/value pair can be
+        // trusted to refer to the requested key.
+        error_codes.assign(keys.size(), EC_MISMATCH);
+        out_locations.assign(keys.size(), CacheLocationVector{});
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+
+    Result result(keys.size());
+    int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
+    return result;
+}
+
+MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
+    RequestContext *request_context, const KeyVector &keys, const PrefixLocationVisitor &visitor) noexcept {
+    PrefixLocationResult prefix_result;
+    if (keys.empty()) {
+        return prefix_result;
+    }
+
+    // Preserve every non-local backend's existing batching/recovery behavior.
+    // Only the pure-local path below performs progressive concurrent reads.
+    if (!backend_manager_->SupportsConcurrentLocationValueReads()) {
+        LocationsPerKey locations;
+        auto result = GetLocationValues(request_context, keys, locations);
+        prefix_result.read_key_count = keys.size();
+        if (result.error_codes.size() != keys.size() || locations.size() != keys.size()) {
+            prefix_result.terminal_ec = EC_MISMATCH;
+            return prefix_result;
+        }
+
+        size_t metadata_stop = 0;
+        while (metadata_stop < keys.size() && result.error_codes[metadata_stop] == EC_OK) {
+            ++metadata_stop;
+        }
+        size_t location_count = 0;
+        for (size_t i = 0; i < metadata_stop; ++i) {
+            location_count += locations[i].size();
+        }
+        CompactLocationsPerKey compact;
+        compact.Clear(metadata_stop, location_count);
+        for (size_t i = 0; i < metadata_stop; ++i) {
+            compact.values.insert(compact.values.end(), locations[i].begin(), locations[i].end());
+            compact.FinishKey();
+        }
+
+        size_t requested_stop = keys.size();
+        if (metadata_stop != 0 && visitor) {
+            try {
+                requested_stop = std::min(keys.size(), visitor(0, compact, metadata_stop));
+            } catch (const std::exception &e) {
+                KVCM_LOG_ERROR("location prefix visitor failed: %s", e.what());
+                prefix_result.terminal_ec = EC_ERROR;
+                return prefix_result;
+            } catch (...) {
+                KVCM_LOG_ERROR("location prefix visitor failed with unknown exception");
+                prefix_result.terminal_ec = EC_ERROR;
+                return prefix_result;
+            }
+        }
+        prefix_result.valid_key_count = std::min(metadata_stop, requested_stop);
+        prefix_result.stopped_by_visitor = requested_stop <= metadata_stop && requested_stop < keys.size();
+        if (metadata_stop < requested_stop && metadata_stop < keys.size()) {
+            prefix_result.terminal_ec = result.error_codes[metadata_stop];
+        }
+        return prefix_result;
+    }
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    const size_t chunk_size =
+        std::max(kLocalPrefixReadChunkSize, query_executor_ ? query_executor_->chunk_size() : size_t{256});
+    const size_t chunk_count = 1 + (keys.size() - 1) / chunk_size;
+
+    struct ChunkTerminal {
+        size_t index = 0;
+        ErrorCode ec = EC_OK;
+        bool present = false;
+    };
+    std::vector<ChunkTerminal> terminals(chunk_count);
+    std::atomic<size_t> metadata_stop(keys.size());
+    std::atomic<size_t> visitor_stop(keys.size());
+    std::atomic<size_t> read_key_count(0);
+
+    auto reduce_stop_index = [](std::atomic<size_t> &target, size_t candidate) {
+        size_t current = target.load(std::memory_order_relaxed);
+        while (candidate < current && !target.compare_exchange_weak(
+                                          current, candidate, std::memory_order_release, std::memory_order_relaxed)) {}
+    };
+    auto current_stop = [&metadata_stop, &visitor_stop]() {
+        return std::min(metadata_stop.load(std::memory_order_acquire), visitor_stop.load(std::memory_order_acquire));
+    };
+    auto read_one_chunk = [this,
+                           &keys,
+                           &visitor,
+                           &terminals,
+                           &metadata_stop,
+                           &visitor_stop,
+                           &read_key_count,
+                           &reduce_stop_index,
+                           &current_stop,
+                           chunk_size](size_t chunk_begin, size_t count) {
+        if (chunk_begin >= current_stop()) {
+            return;
+        }
+
+        CompactLocationsPerKey locations;
+        auto errors = backend_manager_->GetLocationValuesCompact(nullptr, keys.data() + chunk_begin, count, locations);
+        read_key_count.fetch_add(count, std::memory_order_relaxed);
+
+        size_t successful_count = 0;
+        ErrorCode terminal_ec = EC_OK;
+        if (errors.size() != count || !locations.IsValid(count)) {
+            KVCM_LOG_ERROR("compact local location read size mismatch: errors[%zu] locations[%zu] expected[%zu]",
+                           errors.size(),
+                           locations.size(),
+                           count);
+            terminal_ec = EC_MISMATCH;
+        } else {
+            while (successful_count < count && errors[successful_count] == EC_OK) {
+                ++successful_count;
+            }
+            if (successful_count < count) {
+                terminal_ec = errors[successful_count];
+            }
+        }
+
+        if (successful_count != 0 && visitor) {
+            const size_t requested_stop = std::min(keys.size(), visitor(chunk_begin, locations, successful_count));
+            reduce_stop_index(visitor_stop, requested_stop);
+        }
+        if (terminal_ec != EC_OK) {
+            auto &terminal = terminals[chunk_begin / chunk_size];
+            terminal.index = chunk_begin + successful_count;
+            terminal.ec = terminal_ec;
+            terminal.present = true;
+            reduce_stop_index(metadata_stop, terminal.index);
+        }
+    };
+    auto read_ranges = [&read_one_chunk, &current_stop, &keys, chunk_size](size_t begin, size_t end) {
+        for (size_t chunk_begin = begin; chunk_begin < end; chunk_begin += chunk_size) {
+            if (chunk_begin >= current_stop()) {
+                return;
+            }
+            const size_t chunk_end = std::min(end, std::min(keys.size(), chunk_begin + chunk_size));
+            read_one_chunk(chunk_begin, chunk_end - chunk_begin);
+        }
+    };
+
+    bool completed = true;
+    const size_t first_chunk_size = std::min(chunk_size, keys.size());
+    try {
+        // Candidate hosts are derived from key zero. Visiting this chunk before
+        // scheduling the suffix makes every later callback independent and
+        // allows an early host miss to cancel all suffix metadata reads.
+        read_one_chunk(0, first_chunk_size);
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("first compact local location read failed: %s", e.what());
+        completed = false;
+    } catch (...) {
+        KVCM_LOG_ERROR("first compact local location read failed with unknown exception");
+        completed = false;
+    }
+
+    if (completed && first_chunk_size < keys.size() && first_chunk_size < current_stop()) {
+        const size_t remaining_count = keys.size() - first_chunk_size;
+        auto read_remaining_ranges = [&read_ranges, first_chunk_size](size_t begin, size_t end) {
+            read_ranges(first_chunk_size + begin, first_chunk_size + end);
+        };
+        if (query_executor_) {
+            completed = query_executor_->ParallelForWithChunkSize(remaining_count, chunk_size, read_remaining_ranges);
+        } else {
+            try {
+                read_remaining_ranges(0, remaining_count);
+            } catch (const std::exception &e) {
+                KVCM_LOG_ERROR("serial compact local location read failed: %s", e.what());
+                completed = false;
+            } catch (...) {
+                KVCM_LOG_ERROR("serial compact local location read failed with unknown exception");
+                completed = false;
+            }
+        }
+    }
+
+    prefix_result.read_key_count = read_key_count.load(std::memory_order_relaxed);
+    if (!completed) {
+        prefix_result.terminal_ec = EC_ERROR;
+    } else {
+        const size_t first_metadata_error = metadata_stop.load(std::memory_order_acquire);
+        const size_t first_visitor_stop = visitor_stop.load(std::memory_order_acquire);
+        prefix_result.valid_key_count = std::min(first_metadata_error, first_visitor_stop);
+        prefix_result.stopped_by_visitor =
+            first_visitor_stop <= first_metadata_error && first_visitor_stop < keys.size();
+        if (first_metadata_error < first_visitor_stop && first_metadata_error < keys.size()) {
+            const auto &terminal = terminals[first_metadata_error / chunk_size];
+            if (!terminal.present || terminal.index != first_metadata_error) {
+                prefix_result.terminal_ec = EC_MISMATCH;
+                prefix_result.valid_key_count = 0;
+            } else {
+                prefix_result.terminal_ec = terminal.ec;
+                if (prefix_result.terminal_ec != EC_NOENT) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "meta indexer prefix get failed, key[%lu] ec[%d]",
+                                       keys[first_metadata_error],
+                                       prefix_result.terminal_ec);
+                }
+            }
+        }
+    }
+
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+    return prefix_result;
+}
+
 MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       const LocationIdsPerKey &location_ids,
                                                       LocationsPerKey &out_locations) noexcept {
-    assert(keys.size() == location_ids.size());
+    if (keys.size() != location_ids.size()) {
+        out_locations.clear();
+        KVCM_LOG_ERROR("instance[%s] | GetLocations keys size[%lu] != location_ids size[%lu]",
+                       instance_id_.c_str(),
+                       keys.size(),
+                       location_ids.size());
+        return LocationResult(EC_BADARGS);
+    }
     if (keys.empty()) {
         out_locations.clear();
         return LocationResult(EC_OK);
@@ -702,7 +1179,46 @@ MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_co
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
     LocationResult result(location_ids);
-    result.per_location_error_codes = std::move(per_location_ecs);
+    if (per_location_ecs.size() != keys.size() || out_locations.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetLocations result size mismatch, keys[%lu], ecs[%lu], locations[%lu]",
+                           keys.size(),
+                           per_location_ecs.size(),
+                           out_locations.size());
+        out_locations.assign(keys.size(), CacheLocationVector{});
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out_locations[i].resize(location_ids[i].size());
+            result.per_location_error_codes[i].assign(location_ids[i].size(), EC_MISMATCH);
+        }
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const size_t expected = location_ids[i].size();
+            if (per_location_ecs[i].size() != expected || out_locations[i].size() != expected) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "GetLocations per-key result size mismatch, key[%ld], ids[%lu], ecs[%lu], "
+                                   "locations[%lu]",
+                                   keys[i],
+                                   expected,
+                                   per_location_ecs[i].size(),
+                                   out_locations[i].size());
+                out_locations[i].assign(expected, CacheLocationConstPtr{});
+                result.per_location_error_codes[i].assign(expected, EC_MISMATCH);
+                continue;
+            }
+            result.per_location_error_codes[i] = std::move(per_location_ecs[i]);
+            for (size_t j = 0; j < expected; ++j) {
+                if (result.per_location_error_codes[i][j] == EC_OK &&
+                    (!out_locations[i][j] || out_locations[i][j]->id() != location_ids[i][j])) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "GetLocations invalid EC_OK value, key[%ld], requested id[%s]",
+                                       keys[i],
+                                       location_ids[i][j].c_str());
+                    out_locations[i][j].reset();
+                    result.per_location_error_codes[i][j] = EC_MISMATCH;
+                }
+            }
+        }
+    }
 
     int64_t total_slots = 0;
     int64_t error_slots = 0;
@@ -728,6 +1244,22 @@ MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_co
         result.ec = EC_PARTIAL_OK;
     }
     return result;
+}
+
+bool MetaIndexer::ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept {
+    if (query_executor_) {
+        return query_executor_->ParallelFor(count, fn);
+    }
+    if (count == 0) {
+        return true;
+    }
+    try {
+        fn(0, count);
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("serial query callback threw exception: %s", e.what());
+    } catch (...) { KVCM_LOG_ERROR("serial query callback threw unknown exception"); }
+    return false;
 }
 
 MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,

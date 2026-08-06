@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -51,6 +52,18 @@ public:
         int64_t prefix_match_blocks;
     };
 
+    struct HostCacheLocationInfo {
+        // When true, the checker has already parsed the EventReport location
+        // id and validated every spec URI while applying query visibility.
+        bool has_reporter_identity = false;
+        // Views borrow the immutable CacheLocation id and are consumed before
+        // the checker returns to its caller; they are never retained in output.
+        std::string_view reporter_medium;
+        std::string_view reporter_host;
+    };
+    using CheckHostCacheLocationFunc =
+        std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
+
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
                  CheckLocDataExistFunc check_loc_data_exist,
@@ -73,7 +86,8 @@ public:
                                             LocationsPerKey &out_locations,
                                             SelectLocationPolicy *policy,
                                             const std::vector<BackendSelector> &selectors,
-                                            const std::vector<std::string> &requested_spec_names = {}) const;
+                                            const std::vector<std::string> &requested_spec_names = {},
+                                            const BlockMask &input_mask = BlockMask{}) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,
@@ -83,13 +97,15 @@ public:
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
                                 const std::vector<std::string> &medium_filter,
-                                std::vector<HostCacheMatch> &out_matches) const;
+                                std::vector<HostCacheMatch> &out_matches,
+                                const CheckHostCacheLocationFunc *request_check_location = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
                                          const std::vector<std::string> &medium_filter,
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
-                                         std::vector<HostCacheMatch> &out_matches) const;
+                                         std::vector<HostCacheMatch> &out_matches,
+                                         const CheckHostCacheLocationFunc *request_check_location = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -110,7 +126,12 @@ public:
         std::vector<LocationSpec> specs;
     };
     // Replaces existing specs or creates the stable location in one metadata
-    // read-modify-write operation per batch.
+    // read-modify-write operation per batch. Keys and location ids within a
+    // key must be unique. Every task requires non-empty, uniquely named specs
+    // with valid URIs and cannot mix versioned/unversioned specs or multiple
+    // snapshot versions. When supplied, the write-lease callback is invoked
+    // once after the metadata read and before the first mutation; the returned
+    // lease is retained until the operation returns.
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
@@ -122,6 +143,14 @@ public:
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
+    // Keys and location ids within a key must be unique. Every task requires
+    // non-empty, uniquely named specs with valid URIs and cannot mix
+    // versioned/unversioned specs or multiple snapshot versions. The block
+    // existence state and every requested target location are read
+    // together, then merged in one targeted RMW phase. The optional write
+    // lease is acquired once after that read and before the first mutation;
+    // it is retained through the upsert so a concurrent lifecycle change can
+    // fence work that was admitted under an older reporter generation.
     ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
@@ -131,9 +160,13 @@ public:
         std::string location_id;
         std::vector<std::string> spec_names;
     };
-    // Missing block/location targets are idempotent EC_OK. When requested,
-    // out_missing_targets mirrors tasks_per_key and marks those no-op targets;
-    // an existing location with only missing spec_names is not marked.
+    // Missing block/location targets are idempotent EC_OK. Keys and location
+    // ids within a key must be unique, and every task must name at least one
+    // non-empty spec. When requested, out_missing_targets mirrors
+    // tasks_per_key and marks missing block/location no-ops; an existing
+    // location with only missing spec_names is not marked. The optional write
+    // lease is acquired once after the metadata read and before the first
+    // mutation.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
@@ -187,7 +220,8 @@ public:
                                           DataStorageType storage_type,
                                           size_t scan_batch_size,
                                           LocationCleanupPredicate should_delete,
-                                          std::function<bool()> should_abort = nullptr);
+                                          std::function<bool()> should_abort = nullptr,
+                                          AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
     ErrorCode CleanupLocationsByHost(RequestContext *request_context,
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,
