@@ -177,6 +177,68 @@ public:
                                                              const LocationIdsPerKey &location_ids,
                                                              LocationsPerKey &out_locations) noexcept = 0;
 
+    // Read selected locations and preserve the key-level existence result.
+    // A targeted read alone cannot distinguish a missing key from an existing
+    // key that does not contain any requested location. RMW callers need that
+    // distinction to update key_count correctly when an upsert creates a new
+    // block. Backends that can determine both states in one lookup should
+    // override this method. The generic fallback only probes key existence for
+    // ambiguous all-NOENT rows, so existing-location reads remain one request.
+    virtual std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept {
+        auto results = GetLocations(request_context, keys, location_ids, out_locations);
+        out_key_error_codes.assign(keys.size(), EC_MISMATCH);
+        if (results.size() != keys.size() || out_locations.size() != keys.size()) {
+            return results;
+        }
+
+        KeyTypeVec ambiguous_keys;
+        std::vector<size_t> ambiguous_indices;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i].size() != location_ids[i].size() || out_locations[i].size() != location_ids[i].size()) {
+                continue;
+            }
+            bool found_location = false;
+            ErrorCode hard_error = EC_OK;
+            for (const ErrorCode ec : results[i]) {
+                if (ec == EC_OK) {
+                    found_location = true;
+                    break;
+                }
+                if (ec != EC_NOENT && hard_error == EC_OK) {
+                    hard_error = ec;
+                }
+            }
+            if (found_location) {
+                out_key_error_codes[i] = EC_OK;
+            } else if (hard_error != EC_OK) {
+                out_key_error_codes[i] = hard_error;
+            } else {
+                ambiguous_keys.push_back(keys[i]);
+                ambiguous_indices.push_back(i);
+            }
+        }
+
+        if (ambiguous_keys.empty()) {
+            return results;
+        }
+        std::vector<bool> exists;
+        const auto exists_results = Exists(request_context, ambiguous_keys, exists);
+        if (exists_results.size() != ambiguous_keys.size() || exists.size() != ambiguous_keys.size()) {
+            return results;
+        }
+        for (size_t i = 0; i < ambiguous_keys.size(); ++i) {
+            const size_t original_index = ambiguous_indices[i];
+            out_key_error_codes[original_index] =
+                exists_results[i] == EC_OK ? (exists[i] ? EC_OK : EC_NOENT) : exists_results[i];
+        }
+        return results;
+    }
+
     // 仅获取 key 的 location id 列表（不读取 location body）。
     // @param request_context    请求上下文；可为 nullptr
     // @param keys               待查询的 key 列表

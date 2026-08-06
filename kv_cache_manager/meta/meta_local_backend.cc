@@ -503,13 +503,24 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*re
     return results;
 }
 
-std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
+std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext *request_context,
                                                                    const KeyTypeVec &keys,
                                                                    const LocationIdsPerKey &location_ids,
                                                                    LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> ignored_key_error_codes;
+    return GetLocationsWithKeyStatus(request_context, keys, location_ids, out_locations, ignored_key_error_codes);
+}
+
+std::vector<std::vector<ErrorCode>>
+MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/,
+                                            const KeyTypeVec &keys,
+                                            const LocationIdsPerKey &location_ids,
+                                            LocationsPerKey &out_locations,
+                                            std::vector<ErrorCode> &out_key_error_codes) noexcept {
     assert(keys.size() == location_ids.size());
     std::vector<std::vector<ErrorCode>> results(keys.size());
-    out_locations.resize(keys.size());
+    out_key_error_codes.assign(keys.size(), EC_OK);
+    out_locations.assign(keys.size(), CacheLocationVector{});
 
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
@@ -517,6 +528,7 @@ std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContex
         std::string_view key_sv = KeyToView(keys[i]);
         Cache::Handle *handle = cache_->Lookup(key_sv);
         if (!handle) {
+            out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
         }

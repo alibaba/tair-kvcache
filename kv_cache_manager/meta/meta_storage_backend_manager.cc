@@ -1016,6 +1016,106 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
     return results;
 }
 
+std::vector<std::vector<ErrorCode>>
+MetaStorageBackendManager::GetLocationsWithKeyStatus(RequestContext *request_context,
+                                                     const KeyVector &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations,
+                                                     std::vector<ErrorCode> &out_key_error_codes) noexcept {
+    if (keys.size() != location_ids.size()) {
+        out_locations.assign(keys.size(), CacheLocationVector{});
+        out_key_error_codes.assign(keys.size(), EC_BADARGS);
+        return std::vector<std::vector<ErrorCode>>(keys.size(), std::vector<ErrorCode>{EC_BADARGS});
+    }
+    if (!cache_backend_) {
+        return persistent_backend_->GetLocationsWithKeyStatus(
+            request_context, keys, location_ids, out_locations, out_key_error_codes);
+    }
+
+    std::vector<std::vector<ErrorCode>> results = cache_backend_->GetLocationsWithKeyStatus(
+        request_context, keys, location_ids, out_locations, out_key_error_codes);
+    auto response_shape_valid = [&keys, &location_ids](const std::vector<std::vector<ErrorCode>> &per_location_ecs,
+                                                       const LocationsPerKey &locations,
+                                                       const std::vector<ErrorCode> &per_key_ecs) {
+        if (per_location_ecs.size() != keys.size() || locations.size() != keys.size() ||
+            per_key_ecs.size() != keys.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (per_location_ecs[i].size() != location_ids[i].size() || locations[i].size() != location_ids[i].size()) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!response_shape_valid(results, out_locations, out_key_error_codes)) {
+        KVCM_LOG_ERROR("cache targeted GetLocationsWithKeyStatus response shape mismatch keys[%lu]", keys.size());
+        out_locations.resize(keys.size());
+        results.resize(keys.size());
+        out_key_error_codes.assign(keys.size(), EC_ERROR);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
+            results[i].assign(location_ids[i].size(), EC_ERROR);
+        }
+        return results;
+    }
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    KeyVector missing_keys;
+    std::vector<size_t> missing_indices;
+    LocationIdsPerKey missing_location_ids;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (out_key_error_codes[i] == EC_NOENT) {
+            missing_keys.push_back(keys[i]);
+            missing_indices.push_back(i);
+            missing_location_ids.push_back(location_ids[i]);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    LocationsPerKey persistent_locations;
+    std::vector<ErrorCode> persistent_key_error_codes;
+    std::vector<std::vector<ErrorCode>> persistent_results = persistent_backend_->GetLocationsWithKeyStatus(
+        request_context, missing_keys, missing_location_ids, persistent_locations, persistent_key_error_codes);
+    const auto persistent_shape_valid =
+        [&missing_keys, &missing_location_ids](const std::vector<std::vector<ErrorCode>> &per_location_ecs,
+                                               const LocationsPerKey &locations,
+                                               const std::vector<ErrorCode> &per_key_ecs) {
+            if (per_location_ecs.size() != missing_keys.size() || locations.size() != missing_keys.size() ||
+                per_key_ecs.size() != missing_keys.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < missing_keys.size(); ++i) {
+                if (per_location_ecs[i].size() != missing_location_ids[i].size() ||
+                    locations[i].size() != missing_location_ids[i].size()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+    if (!persistent_shape_valid(persistent_results, persistent_locations, persistent_key_error_codes)) {
+        KVCM_LOG_ERROR("persistent targeted GetLocationsWithKeyStatus response shape mismatch keys[%lu]",
+                       missing_keys.size());
+        for (const size_t original_index : missing_indices) {
+            results[original_index].assign(location_ids[original_index].size(), EC_ERROR);
+            out_locations[original_index].assign(location_ids[original_index].size(), CacheLocationConstPtr{});
+            out_key_error_codes[original_index] = EC_ERROR;
+        }
+        return results;
+    }
+    for (size_t i = 0; i < missing_keys.size(); ++i) {
+        const size_t original_index = missing_indices[i];
+        results[original_index] = std::move(persistent_results[i]);
+        out_locations[original_index] = std::move(persistent_locations[i]);
+        out_key_error_codes[original_index] = persistent_key_error_codes[i];
+    }
+    return results;
+}
+
 bool MetaStorageBackendManager::SupportsConcurrentLocationValueReads() const noexcept {
     return !cache_backend_ && persistent_backend_ &&
            persistent_backend_->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;

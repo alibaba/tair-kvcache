@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -69,18 +70,29 @@ struct StorageUsageChange {
     bool has_old = false;
 };
 
-ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &specs) {
+ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &specs,
+                                            std::uint64_t *out_total_size = nullptr) {
     if (specs.empty()) {
         return EC_BADARGS;
     }
     bool has_snapshot_version = false;
     std::string snapshot_version;
     bool has_unversioned_spec = false;
-    std::unordered_set<std::string> spec_names;
+    std::uint64_t total_size = 0;
+    std::unordered_set<std::string_view> spec_names;
+    if (specs.size() > 1) {
+        spec_names.reserve(specs.size());
+    }
     for (const auto &spec : specs) {
         const DataStorageUri uri(spec.uri());
-        if (spec.name().empty() || !spec_names.insert(spec.name()).second || !uri.Valid()) {
+        if (spec.name().empty() || (specs.size() > 1 && !spec_names.insert(std::string_view(spec.name())).second) ||
+            !uri.Valid()) {
             return EC_BADARGS;
+        }
+        if (out_total_size) {
+            std::uint64_t spec_size = 0;
+            uri.GetParamAs<std::uint64_t>("size", spec_size);
+            total_size += spec_size;
         }
         const size_t version_param_count =
             SnapshotUriUtils::CountUriParam(spec.uri(), SnapshotUriUtils::kSnapshotVersionParam);
@@ -101,6 +113,9 @@ ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &spe
         } else if (info.version != snapshot_version) {
             return EC_BADARGS;
         }
+    }
+    if (out_total_size) {
+        *out_total_size = total_size;
     }
     return EC_OK;
 }
@@ -1515,210 +1530,156 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         return EC_OK;
     }
 
-    std::unordered_set<int64_t> seen_keys;
-    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
-        if (!seen_keys.insert(keys[key_index]).second) {
-            std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
-            return EC_BADARGS;
+    bool has_duplicate_keys = false;
+    if (std::is_sorted(keys.begin(), keys.end())) {
+        has_duplicate_keys = std::adjacent_find(keys.begin(), keys.end()) != keys.end();
+    } else {
+        std::unordered_set<int64_t> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const int64_t key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
         }
-        std::unordered_set<std::string> seen_location_ids;
+    }
+    if (has_duplicate_keys) {
+        std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
+        return EC_BADARGS;
+    }
+
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    std::vector<size_t> usage_offsets(keys.size() + 1, 0);
+    std::vector<std::uint64_t> incoming_task_sizes;
+    incoming_task_sizes.reserve(keys.size());
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        std::unordered_set<std::string_view> seen_location_ids;
+        if (tasks_per_key[key_index].size() > 1) {
+            seen_location_ids.reserve(tasks_per_key[key_index].size());
+        }
+        auto &location_ids = location_ids_per_key[key_index];
+        location_ids.reserve(tasks_per_key[key_index].size());
         for (const auto &task : tasks_per_key[key_index]) {
-            if (task.location_id.empty() || !seen_location_ids.insert(task.location_id).second ||
-                ValidateConsistentSnapshotVersion(task.specs) != EC_OK) {
+            std::uint64_t incoming_size = 0;
+            if (task.location_id.empty() ||
+                (tasks_per_key[key_index].size() > 1 &&
+                 !seen_location_ids.insert(std::string_view(task.location_id)).second) ||
+                ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
+            location_ids.push_back(task.location_id);
+            incoming_task_sizes.push_back(incoming_size);
         }
+        usage_offsets[key_index + 1] = usage_offsets[key_index] + location_ids.size();
     }
+    std::vector<StorageUsageChange> usage_changes(usage_offsets.back());
 
-    std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> created_locs_sz(keys.size());
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    // Keep indices into the caller-owned task vectors. Copying each task here
-    // duplicated every location id, spec name and URI before the second RMW
-    // phase, which is especially expensive for large ReportEvent batches.
-    std::vector<std::vector<size_t>> merge_task_indices_per_key(keys.size());
-    bool create_write_lease_attempted = false;
-    ErrorCode create_write_lease_ec = EC_OK;
-    MetadataWriteLease create_write_lease;
+    bool write_lease_attempted = false;
+    ErrorCode write_lease_ec = EC_OK;
+    MetadataWriteLease write_lease;
+    auto modifier = [&keys,
+                     &tasks_per_key,
+                     &usage_offsets,
+                     &usage_changes,
+                     &incoming_task_sizes,
+                     &acquire_write_lease,
+                     &write_lease_attempted,
+                     &write_lease_ec,
+                     &write_lease,
+                     batch_create_time](const std::vector<ErrorCode> &get_ecs,
+                                        const LocationIdVector &location_ids,
+                                        size_t key_index,
+                                        CacheLocationVector &locations,
+                                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        if (location_ids.empty()) {
+            return {ModifierAction::MA_SKIP, {}};
+        }
+        if (acquire_write_lease && !write_lease_attempted) {
+            std::tie(write_lease_ec, write_lease) = acquire_write_lease();
+            write_lease_attempted = true;
+        }
+        if (write_lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), write_lease_ec)};
+        }
+        if (key_index >= tasks_per_key.size() || get_ecs.size() != location_ids.size() ||
+            locations.size() != location_ids.size() || tasks_per_key[key_index].size() != location_ids.size()) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), EC_MISMATCH)};
+        }
 
-    auto create_modifier = [&tasks_per_key,
-                            &merge_task_indices_per_key,
-                            &keys,
-                            &created_locs_sz,
-                            &acquire_write_lease,
-                            &create_write_lease_attempted,
-                            &create_write_lease_ec,
-                            &create_write_lease,
-                            batch_create_time](const LocationIdVector &existing_ids,
-                                               ErrorCode get_ec,
-                                               size_t index,
-                                               PropertyMap & /*upsert_property_map*/,
-                                               CacheLocationMap &out_new_locations) -> ModifierResult {
-        if (acquire_write_lease && !create_write_lease_attempted) {
-            std::tie(create_write_lease_ec, create_write_lease) = acquire_write_lease();
-            create_write_lease_attempted = true;
-        }
-        if (create_write_lease_ec != EC_OK) {
-            return {ModifierAction::MA_FAIL, create_write_lease_ec};
-        }
-        if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("load location ids failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
-            return {ModifierAction::MA_FAIL, get_ec};
-        }
-
-        bool created = false;
-        for (size_t task_index = 0; task_index < tasks_per_key[index].size(); ++task_index) {
-            const auto &entry = tasks_per_key[index][task_index];
-            if (get_ec == ErrorCode::EC_OK &&
-                std::find(existing_ids.begin(), existing_ids.end(), entry.location_id) != existing_ids.end()) {
-                merge_task_indices_per_key[index].push_back(task_index);
-                continue;
-            }
-
-            CacheLocation loc;
-            loc.set_id(entry.location_id);
-            loc.set_type(entry.type);
-            loc.set_status(entry.status);
-            loc.set_spec_size(entry.specs.size());
-            loc.set_create_time(batch_create_time);
-            for (const auto &ls : entry.specs) {
-                loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
-            }
-            out_new_locations[entry.location_id] = std::make_shared<const CacheLocation>(std::move(loc));
-            created_locs_sz[index].emplace_back(entry.type, GetLocationSpecsSize(entry.specs));
-            created = true;
-        }
-        if (!created) {
-            return {ModifierAction::MA_SKIP, ErrorCode::EC_OK};
-        }
-        return {ModifierAction::MA_OK, ErrorCode::EC_OK};
-    };
-
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
-    auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, create_modifier);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
-    ErrorCode final_ec = result.ec;
-
-    if (result.error_codes.size() != keys.size()) {
-        KVCM_LOG_ERROR("BatchMergeLocationSpecs create result size mismatch, keys[%zu], results[%zu]",
-                       keys.size(),
-                       result.error_codes.size());
-        std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), ErrorCode::EC_MISMATCH);
-        return ErrorCode::EC_MISMATCH;
-    }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        ErrorCode key_ec = result.error_codes[i];
-        out_per_key_ec[i] = key_ec;
-        if (key_ec == ErrorCode::EC_OK) {
-            for (const auto &[type, size] : created_locs_sz[i]) {
-                meta_indexer_->AddStorageUsageByType(type, size);
-            }
-        }
-    }
-
-    if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
-    }
-
-    KeyVector merge_keys;
-    std::vector<size_t> merge_key_indices;
-    LocationIdsPerKey merge_location_ids;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (out_per_key_ec[i] != ErrorCode::EC_OK || merge_task_indices_per_key[i].empty()) {
-            continue;
-        }
-        merge_keys.push_back(keys[i]);
-        merge_key_indices.push_back(i);
-        auto &ids = merge_location_ids.emplace_back();
-        ids.reserve(merge_task_indices_per_key[i].size());
-        for (const size_t task_index : merge_task_indices_per_key[i]) {
-            ids.push_back(tasks_per_key[i][task_index].location_id);
-        }
-    }
-
-    if (merge_keys.empty()) {
-        return final_ec;
-    }
-
-    std::vector<std::vector<StorageUsageChange>> merge_usage_changes(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        merge_usage_changes[i].resize(merge_task_indices_per_key[i].size());
-    }
-    create_write_lease.reset();
-    bool merge_write_lease_attempted = false;
-    ErrorCode merge_write_lease_ec = EC_OK;
-    MetadataWriteLease merge_write_lease;
-    auto merge_modifier = [&keys,
-                           &tasks_per_key,
-                           &merge_task_indices_per_key,
-                           &merge_key_indices,
-                           &merge_usage_changes,
-                           &acquire_write_lease,
-                           &merge_write_lease_attempted,
-                           &merge_write_lease_ec,
-                           &merge_write_lease,
-                           batch_create_time](const std::vector<ErrorCode> &get_ecs,
-                                              const LocationIdVector &loc_ids,
-                                              size_t key_index,
-                                              CacheLocationVector &locs,
-                                              PropertyMap &upsert_property_map) -> LocationModifierResult {
-        (void)upsert_property_map;
-        if (acquire_write_lease && !merge_write_lease_attempted) {
-            std::tie(merge_write_lease_ec, merge_write_lease) = acquire_write_lease();
-            merge_write_lease_attempted = true;
-        }
-        if (merge_write_lease_ec != EC_OK) {
-            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(loc_ids.size(), merge_write_lease_ec)};
-        }
-        const size_t original_key_index = merge_key_indices[key_index];
-        const auto &task_indices = merge_task_indices_per_key[original_key_index];
-        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        std::vector<ErrorCode> modifier_ecs(location_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
-        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
-            if (loc_index >= task_indices.size() || loc_index >= get_ecs.size() || loc_index >= locs.size()) {
-                modifier_ecs[loc_index] = ErrorCode::EC_ERROR;
-                continue;
-            }
-            const ErrorCode ec = get_ecs[loc_index];
-            const auto &task = tasks_per_key[original_key_index][task_indices[loc_index]];
-            if (ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT) {
-                modifier_ecs[loc_index] = ec;
-                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                              original_key_index,
-                              keys[original_key_index],
-                              task.location_id.c_str(),
-                              ec);
+        for (size_t location_index = 0; location_index < location_ids.size(); ++location_index) {
+            const auto &task = tasks_per_key[key_index][location_index];
+            if (location_ids[location_index] != task.location_id) {
+                modifier_ecs[location_index] = EC_MISMATCH;
                 continue;
             }
 
-            auto &usage = merge_usage_changes[original_key_index][loc_index];
-            std::shared_ptr<CacheLocation> new_loc;
-            if (ec == ErrorCode::EC_OK && locs[loc_index]) {
-                if (locs[loc_index]->type() != task.type) {
-                    modifier_ecs[loc_index] = ErrorCode::EC_BADARGS;
+            const ErrorCode get_ec = get_ecs[location_index];
+            if (get_ec != EC_OK && get_ec != EC_NOENT) {
+                modifier_ecs[location_index] = get_ec;
+                KVCM_LOG_WARN("load target location failed, key[%lu](%lu), location_id[%s], return[%d]",
+                              key_index,
+                              keys[key_index],
+                              task.location_id.c_str(),
+                              get_ec);
+                continue;
+            }
+
+            const size_t usage_index = usage_offsets[key_index] + location_index;
+            auto &usage = usage_changes[usage_index];
+            const std::uint64_t incoming_size = incoming_task_sizes[usage_index];
+            std::shared_ptr<CacheLocation> new_location;
+            if (get_ec == EC_OK) {
+                if (!locations[location_index] || locations[location_index]->type() != task.type) {
+                    modifier_ecs[location_index] =
+                        locations[location_index] ? ErrorCode::EC_BADARGS : ErrorCode::EC_MISMATCH;
                     continue;
                 }
-                usage.old_size = GetLocationSpecsSize(locs[loc_index]->location_specs());
+                std::uint64_t replaced_old_size = 0;
+                bool has_legacy_duplicate_names = false;
+                const auto &old_specs = locations[location_index]->location_specs();
+                for (size_t old_index = 0; old_index < old_specs.size(); ++old_index) {
+                    const auto &old_spec = old_specs[old_index];
+                    std::uint64_t old_spec_size = 0;
+                    if (DataStorageUri old_uri(old_spec.uri()); old_uri.Valid()) {
+                        old_uri.GetParamAs<std::uint64_t>("size", old_spec_size);
+                    }
+                    usage.old_size += old_spec_size;
+                    if (std::any_of(task.specs.begin(), task.specs.end(), [&old_spec](const auto &new_spec) {
+                            return new_spec.name() == old_spec.name();
+                        })) {
+                        replaced_old_size += old_spec_size;
+                    }
+                    has_legacy_duplicate_names =
+                        has_legacy_duplicate_names ||
+                        std::any_of(old_specs.begin(), old_specs.begin() + old_index, [&old_spec](const auto &prior) {
+                            return prior.name() == old_spec.name();
+                        });
+                }
                 usage.has_old = true;
-                new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
-                MergeLocationSpecsByName(new_loc->mutable_location_specs(), task.specs);
+                new_location = std::make_shared<CacheLocation>(*locations[location_index]);
+                MergeLocationSpecsByName(new_location->mutable_location_specs(), task.specs);
+                usage.new_size = has_legacy_duplicate_names ? GetLocationSpecsSize(new_location->location_specs())
+                                                            : usage.old_size - replaced_old_size + incoming_size;
             } else {
-                new_loc = std::make_shared<CacheLocation>();
-                new_loc->set_id(task.location_id);
+                new_location = std::make_shared<CacheLocation>();
+                new_location->set_id(task.location_id);
                 std::vector<LocationSpec> specs;
                 specs.reserve(task.specs.size());
                 for (const auto &spec : task.specs) {
                     specs.emplace_back(spec.name(), spec.uri());
                 }
-                new_loc->set_location_specs(std::move(specs));
+                new_location->set_location_specs(std::move(specs));
+                usage.new_size = incoming_size;
             }
-            new_loc->set_type(task.type);
-            new_loc->set_status(task.status);
-            new_loc->set_create_time(batch_create_time);
-            new_loc->set_spec_size(new_loc->location_specs().size());
-            usage.new_size = GetLocationSpecsSize(new_loc->location_specs());
-            locs[loc_index] = std::move(new_loc);
+            new_location->set_type(task.type);
+            new_location->set_status(task.status);
+            new_location->set_create_time(batch_create_time);
+            new_location->set_spec_size(new_location->location_specs().size());
+            locations[location_index] = std::move(new_location);
             updated = true;
         }
         if (!updated) {
@@ -1727,62 +1688,54 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto merge_result =
-        meta_indexer_->ReadModifyWriteLocation(request_context, merge_keys, merge_location_ids, merge_modifier);
+    auto result = meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
-    bool malformed_merge_result = merge_result.per_location_error_codes.size() != merge_key_indices.size();
-    if (malformed_merge_result) {
-        KVCM_LOG_ERROR("BatchMergeLocationSpecs merge result size mismatch, keys[%zu], results[%zu]",
-                       merge_key_indices.size(),
-                       merge_result.per_location_error_codes.size());
+    bool malformed_result = result.per_location_error_codes.size() != keys.size();
+    if (malformed_result) {
+        KVCM_LOG_ERROR("BatchMergeLocationSpecs fused result size mismatch, keys[%zu], results[%zu]",
+                       keys.size(),
+                       result.per_location_error_codes.size());
     }
-    for (size_t i = 0; i < merge_key_indices.size(); ++i) {
-        const size_t original_key_index = merge_key_indices[i];
-        ErrorCode key_ec = ErrorCode::EC_OK;
-        const auto &task_indices = merge_task_indices_per_key[original_key_index];
-        const size_t expected_location_count = task_indices.size();
-        if (i >= merge_result.per_location_error_codes.size() ||
-            merge_result.per_location_error_codes[i].size() != expected_location_count) {
-            key_ec = ErrorCode::EC_MISMATCH;
-            malformed_merge_result = true;
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        ErrorCode key_ec = EC_OK;
+        const size_t expected_location_count = tasks_per_key[key_index].size();
+        if (key_index >= result.per_location_error_codes.size() ||
+            result.per_location_error_codes[key_index].size() != expected_location_count) {
+            key_ec = EC_MISMATCH;
+            malformed_result = true;
         } else {
-            for (size_t loc_index = 0; loc_index < expected_location_count; ++loc_index) {
-                const auto loc_ec = merge_result.per_location_error_codes[i][loc_index];
-                if (loc_ec == ErrorCode::EC_OK) {
-                    const auto &usage = merge_usage_changes[original_key_index][loc_index];
-                    const auto &task = tasks_per_key[original_key_index][task_indices[loc_index]];
-                    if (usage.has_old) {
-                        ApplyStorageUsageChange(meta_indexer_.get(), task.type, usage.old_size, usage.new_size);
-                    } else {
-                        meta_indexer_->AddStorageUsageByType(task.type, usage.new_size);
+            for (size_t location_index = 0; location_index < expected_location_count; ++location_index) {
+                const ErrorCode location_ec = result.per_location_error_codes[key_index][location_index];
+                if (location_ec != EC_OK) {
+                    if (key_ec == EC_OK) {
+                        key_ec = location_ec;
                     }
                     continue;
                 }
-                if (key_ec == ErrorCode::EC_OK) {
-                    key_ec = loc_ec;
+                const auto &usage = usage_changes[usage_offsets[key_index] + location_index];
+                const auto &task = tasks_per_key[key_index][location_index];
+                if (usage.has_old) {
+                    ApplyStorageUsageChange(meta_indexer_.get(), task.type, usage.old_size, usage.new_size);
+                } else {
+                    meta_indexer_->AddStorageUsageByType(task.type, usage.new_size);
                 }
             }
         }
-        if (key_ec != ErrorCode::EC_OK) {
-            out_per_key_ec[original_key_index] = key_ec;
-        }
+        out_per_key_ec[key_index] = key_ec;
     }
 
-    if (merge_result.ec != ErrorCode::EC_OK) {
-        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", merge_result.ec);
-        if (final_ec == ErrorCode::EC_OK) {
-            final_ec = merge_result.ec;
-        } else if (merge_result.ec != final_ec) {
-            final_ec = ErrorCode::EC_PARTIAL_OK;
-        }
+    ErrorCode final_ec = result.ec;
+    if (result.ec != EC_OK) {
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteTargetLocations failed, ec: %d", result.ec);
     }
-    if (malformed_merge_result) {
-        if (final_ec == ErrorCode::EC_OK) {
-            final_ec = ErrorCode::EC_MISMATCH;
-        } else if (final_ec != ErrorCode::EC_MISMATCH) {
-            final_ec = ErrorCode::EC_PARTIAL_OK;
+    if (malformed_result) {
+        if (final_ec == EC_OK) {
+            final_ec = EC_MISMATCH;
+        } else if (final_ec != EC_MISMATCH) {
+            final_ec = EC_PARTIAL_OK;
         }
     }
     return final_ec;

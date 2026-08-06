@@ -142,10 +142,12 @@ public:
     };
     // Keys and location ids within a key must be unique. Every task requires
     // non-empty, uniquely named specs with valid URIs and cannot mix
-    // versioned/unversioned specs or multiple snapshot versions. The optional
-    // write lease is acquired once per RMW phase, after that phase's metadata
-    // read. Releasing it between the block-create and location-merge phases lets
-    // a concurrent lifecycle writer fence stale work before the next phase.
+    // versioned/unversioned specs or multiple snapshot versions. The block
+    // existence state and every requested target location are read
+    // together, then merged in one targeted RMW phase. The optional write
+    // lease is acquired once after that read and before the first mutation;
+    // it is retained through the upsert so a concurrent lifecycle change can
+    // fence work that was admitted under an older reporter generation.
     ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,

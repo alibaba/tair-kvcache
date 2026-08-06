@@ -79,6 +79,14 @@ public:
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true) noexcept;
+    // Targeted upsert RMW that also distinguishes a brand-new key from an
+    // existing key missing the requested location. This lets ReportEvent
+    // create or merge locations in one shard-lock/read/write pass while
+    // keeping max_key_count and key_count exact.
+    LocationResult ReadModifyWriteTargetLocations(RequestContext *request_context,
+                                                  const KeyVector &keys,
+                                                  const LocationIdsPerKey &location_ids,
+                                                  const LocationModifierFunc &modifier) noexcept;
 
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
@@ -138,6 +146,13 @@ public:
 private:
     class ScopedBatchLock;
 
+    LocationResult ReadModifyWriteLocationImpl(RequestContext *request_context,
+                                               const KeyVector &keys,
+                                               const LocationIdsPerKey &location_ids,
+                                               const LocationModifierFunc &modifier,
+                                               bool adjust_reclaimed_key_count,
+                                               bool track_created_key_count) noexcept;
+
 private:
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
@@ -182,7 +197,8 @@ private:
                                                  const std::vector<int32_t> &put_global_indexs,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
-                                                 Result &result) noexcept;
+                                                 Result &result,
+                                                 bool preserve_existing_updates_when_full = false) noexcept;
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
                                                  RequestContext *request_context,

@@ -1257,8 +1257,7 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
                                                 false /* failed adds were never counted as new keys */);
             KeyVector deleted_metadata_keys;
             for (size_t i = 0; i < uncertain_indices.size(); ++i) {
-                if (i < delete_results.size() && delete_results[i].size() == 1 &&
-                    delete_results[i].front() == EC_OK) {
+                if (i < delete_results.size() && delete_results[i].size() == 1 && delete_results[i].front() == EC_OK) {
                     deleted_metadata_keys.push_back(uncertain_keys[i]);
                 }
             }
@@ -2899,11 +2898,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
             std::vector<ValidatedLocationSpec> specs;
             specs.reserve(params.specs_size());
-            std::unordered_set<std::string> seen_spec_names;
+            std::unordered_set<std::string_view> seen_spec_names;
+            if (params.specs_size() > 1) {
+                seen_spec_names.reserve(params.specs_size());
+            }
             for (const auto &spec : params.specs()) {
                 DataStorageUri parsed_uri(spec.uri());
-                if (spec.name().empty() || !seen_spec_names.insert(spec.name()).second || !parsed_uri.Valid() ||
-                    SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
+                if (spec.name().empty() ||
+                    (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) ||
+                    !parsed_uri.Valid() || SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
@@ -2971,9 +2974,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
-            std::unordered_set<std::string> seen_spec_names;
+            std::unordered_set<std::string_view> seen_spec_names;
+            if (params.spec_names_size() > 1) {
+                seen_spec_names.reserve(params.spec_names_size());
+            }
             for (const auto &spec_name : params.spec_names()) {
-                if (spec_name.empty() || !seen_spec_names.insert(spec_name).second) {
+                if (spec_name.empty() ||
+                    (params.spec_names_size() > 1 && !seen_spec_names.insert(std::string_view(spec_name)).second)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
@@ -3035,11 +3042,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 }
                 std::vector<ValidatedLocationSpec> specs;
                 specs.reserve(block.specs_size());
-                std::unordered_set<std::string> seen_spec_names;
+                std::unordered_set<std::string_view> seen_spec_names;
+                if (block.specs_size() > 1) {
+                    seen_spec_names.reserve(block.specs_size());
+                }
                 for (const auto &spec : block.specs()) {
                     DataStorageUri parsed_uri(spec.uri());
-                    if (spec.name().empty() || !seen_spec_names.insert(spec.name()).second || !parsed_uri.Valid() ||
-                        SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
+                    if (spec.name().empty() ||
+                        (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) ||
+                        !parsed_uri.Valid() || SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
@@ -3239,7 +3250,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     }
 
-    // MetaSearcher calls this once per metadata RMW phase, after its read and
+    // MetaSearcher calls this once after the fused target-location read and
     // before its first mutation. This removes the old per-key lock/allocation
     // amplification while preserving the window in which HOST_DOWN can fence
     // a request that is stalled in metadata I/O.

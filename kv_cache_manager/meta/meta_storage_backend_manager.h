@@ -67,6 +67,11 @@ public:
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
+    std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
+                                                                  const KeyVector &keys,
+                                                                  const LocationIdsPerKey &location_ids,
+                                                                  LocationsPerKey &out_locations,
+                                                                  std::vector<ErrorCode> &out_key_error_codes) noexcept;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyVector &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept;
