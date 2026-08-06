@@ -7100,6 +7100,50 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     expect_match(host_b, 2, 1, 4);
     expect_match(host_c, 3, 1, 4);
 
+    // Only the five hosts with the largest local prefix compute P2P. Hosts
+    // after the cutoff are still returned in host order with local-only totals.
+    const std::vector<int64_t> top5_keys = {1000, 1001, 1002, 1003, 1004, 1005, 1006};
+    const std::vector<std::pair<std::string, size_t>> top5_hosts = {
+        {"10.0.5.1:8080", 7},
+        {"10.0.5.2:8080", 6},
+        {"10.0.5.3:8080", 5},
+        {"10.0.5.4:8080", 4},
+        {"10.0.5.5:8080", 3},
+        {"10.0.5.6:8080", 3},
+        {"10.0.5.7:8080", 1},
+    };
+    for (size_t i = 0; i < top5_hosts.size(); ++i) {
+        const auto &[host, prefix_len] = top5_hosts[i];
+        report_keys(i == 0 ? proto::meta::ST_EVENT_REPORT_L2 : proto::meta::ST_EVENT_REPORT_L1P5,
+                    host,
+                    std::vector<int64_t>(top5_keys.begin(), top5_keys.begin() + prefix_len));
+    }
+    const std::string zero_local_host = "10.0.5.8:8080";
+    report_keys(proto::meta::ST_EVENT_REPORT_L1P5, zero_local_host, {top5_keys[1]});
+
+    auto [top5_ec, top5_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys);
+    ASSERT_EQ(EC_OK, top5_ec);
+    ASSERT_EQ(top5_hosts.size(), top5_matches.size());
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> expected_top5_matches = {
+        {7, 0, 7},
+        {6, 1, 7},
+        {5, 2, 7},
+        {4, 3, 7},
+        {3, 4, 7},
+        {3, 0, 3},
+        {1, 0, 1},
+    };
+    for (size_t i = 0; i < top5_hosts.size(); ++i) {
+        EXPECT_EQ(top5_hosts[i].first, top5_matches[i].host_ip_port);
+        EXPECT_EQ(std::get<0>(expected_top5_matches[i]), top5_matches[i].local);
+        EXPECT_EQ(std::get<1>(expected_top5_matches[i]), top5_matches[i].p2p_1_fetch);
+        EXPECT_EQ(std::get<2>(expected_top5_matches[i]), top5_matches[i].p2p_1_total_match);
+    }
+    EXPECT_EQ(top5_matches.end(), std::find_if(top5_matches.begin(), top5_matches.end(), [&](const auto &match) {
+                  return match.host_ip_port == zero_local_host;
+              }));
+
     // Prefix match with Mamba: local and P2P specs jointly complete the blocks,
     // then the merged prefix is evaluated with the Mamba state and Eagle POP rules.
     const std::string mamba_instance_id = "test_host_cache_state_mamba_p2p";
@@ -7247,6 +7291,57 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     EXPECT_EQ(1, coverage_hosts[0].local);
     EXPECT_EQ(3, coverage_hosts[0].p2p_1_fetch);
     EXPECT_EQ(4, coverage_hosts[0].p2p_1_total_match);
+
+    const std::vector<int64_t> mamba_top5_keys = {2000, 2001, 2002, 2003, 2004, 2005, 2006};
+    const std::vector<std::pair<std::string, size_t>> mamba_top5_hosts = {
+        {"10.0.6.1:8080", 7},
+        {"10.0.6.2:8080", 6},
+        {"10.0.6.3:8080", 5},
+        {"10.0.6.4:8080", 4},
+        {"10.0.6.5:8080", 3},
+        {"10.0.6.6:8080", 3},
+        {"10.0.6.7:8080", 1},
+    };
+    const std::vector<std::string> all_coverage_specs = {"full_0", "linear_1", "linear_2", "linear_3"};
+    for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
+        const auto &[host, prefix_len] = mamba_top5_hosts[i];
+        const auto storage_type = i == 0 ? proto::meta::ST_EVENT_REPORT_L2 : proto::meta::ST_EVENT_REPORT_L1P5;
+        InitializeEventReporter(coverage_instance_id, host, storage_type);
+        for (size_t key_index = 0; key_index < prefix_len; ++key_index) {
+            report_coverage_specs(storage_type, host, mamba_top5_keys[key_index], all_coverage_specs);
+        }
+    }
+    const std::string mamba_zero_local_host = "10.0.6.8:8080";
+    InitializeEventReporter(coverage_instance_id, mamba_zero_local_host, proto::meta::ST_EVENT_REPORT_L1P5);
+    report_coverage_specs(
+        proto::meta::ST_EVENT_REPORT_L1P5, mamba_zero_local_host, mamba_top5_keys[1], all_coverage_specs);
+
+    auto [mamba_top5_ec, mamba_top5_matches] =
+        cache_manager_->GetHostCacheState(request_context_.get(),
+                                          coverage_instance_id,
+                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                          mamba_top5_keys);
+    ASSERT_EQ(EC_OK, mamba_top5_ec);
+    ASSERT_EQ(mamba_top5_hosts.size(), mamba_top5_matches.size());
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> expected_mamba_top5_matches = {
+        {7, 0, 7},
+        {6, 1, 7},
+        {5, 2, 7},
+        {4, 3, 7},
+        {3, 4, 7},
+        {3, 0, 3},
+        {1, 0, 1},
+    };
+    for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
+        EXPECT_EQ(mamba_top5_hosts[i].first, mamba_top5_matches[i].host_ip_port);
+        EXPECT_EQ(std::get<0>(expected_mamba_top5_matches[i]), mamba_top5_matches[i].local);
+        EXPECT_EQ(std::get<1>(expected_mamba_top5_matches[i]), mamba_top5_matches[i].p2p_1_fetch);
+        EXPECT_EQ(std::get<2>(expected_mamba_top5_matches[i]), mamba_top5_matches[i].p2p_1_total_match);
+    }
+    EXPECT_EQ(mamba_top5_matches.end(),
+              std::find_if(mamba_top5_matches.begin(), mamba_top5_matches.end(), [&](const auto &match) {
+                  return match.host_ip_port == mamba_zero_local_host;
+              }));
 
     dsm->storage_map_.erase("host_state_subscriber");
     dsm->storage_map_.erase("host_state_vineyard");
