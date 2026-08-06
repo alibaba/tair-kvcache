@@ -27,12 +27,13 @@ TEST_F(MetricsCollectorTest, EventReportMetricsTest) {
     auto collector = std::make_shared<EventReportMetricsCollector>(metrics_registry_, tags);
     ASSERT_TRUE(collector->Init());
     EXPECT_EQ(tags, collector->GetMetricsTags());
-    EXPECT_EQ(4, metrics_registry_->GetSize());
+    EXPECT_EQ(5, metrics_registry_->GetSize());
 
     EXPECT_EQ(0, GET(collector, event_report, request_counter));
     EXPECT_DOUBLE_EQ(0., GET(collector, event_report, request_rt_us));
     EXPECT_DOUBLE_EQ(0., GET(collector, event_report, error_code));
     EXPECT_EQ(0, GET(collector, event_report, error_counter));
+    EXPECT_DOUBLE_EQ(0., GET(collector, manager, request_key_count));
 
     SET_METRICS_(collector, event_report, request_rt_us, 123.);
     SET_METRICS_(collector, event_report, error_code, 10.);

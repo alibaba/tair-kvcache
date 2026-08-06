@@ -205,17 +205,36 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
         return;
     }
 
-    uint32_t event_type_mask = 0;
-    for (const auto &event : request.events()) {
-        const int event_type = static_cast<int>(event.event_type());
-        event_type_mask |=
-            1U << ((event_type >= proto::meta::EVENT_NODE_REGISTER && event_type <= proto::meta::EVENT_BLOCK_SNAPSHOT)
-                       ? event_type
-                       : 0);
-    }
-
     static constexpr std::array<const char *, 7> kEventTypeTags = {
         "unknown", "node_register", "block_add", "block_delete", "host_down", "heartbeat", "block_snapshot"};
+    uint32_t event_type_mask = 0;
+    std::array<size_t, kEventTypeTags.size()> request_key_counts{};
+    for (const auto &event : request.events()) {
+        const int event_type = static_cast<int>(event.event_type());
+        const int bounded_event_type =
+            (event_type >= proto::meta::EVENT_NODE_REGISTER && event_type <= proto::meta::EVENT_BLOCK_SNAPSHOT)
+                ? event_type
+                : 0;
+        event_type_mask |= 1U << bounded_event_type;
+        // Match request_key_count semantics used by the other manager APIs:
+        // count keys in the request payload, regardless of later validation,
+        // deduplication, or persistence outcomes.
+        switch (bounded_event_type) {
+        case proto::meta::EVENT_BLOCK_ADD:
+            request_key_counts[bounded_event_type] += event.has_block_add() ? 1 : 0;
+            break;
+        case proto::meta::EVENT_BLOCK_DELETE:
+            request_key_counts[bounded_event_type] += event.has_block_delete() ? 1 : 0;
+            break;
+        case proto::meta::EVENT_BLOCK_SNAPSHOT:
+            request_key_counts[bounded_event_type] +=
+                event.has_block_snapshot() ? static_cast<size_t>(event.block_snapshot().blocks_size()) : 0;
+            break;
+        default:
+            break;
+        }
+    }
+
     for (size_t event_type = 0; event_type < kEventTypeTags.size(); ++event_type) {
         if ((event_type_mask & (1U << event_type)) == 0) {
             continue;
@@ -227,8 +246,12 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
             // The cached object owns the registry handles. Each request gets a
             // lightweight view with the same handles but private sample state,
             // avoiding both registry re-registration and cross-request races.
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(
-                std::make_shared<EventReportMetricsCollector>(*event_collector));
+            auto request_collector = std::make_shared<EventReportMetricsCollector>(*event_collector);
+            if (event_type == proto::meta::EVENT_BLOCK_ADD || event_type == proto::meta::EVENT_BLOCK_DELETE ||
+                event_type == proto::meta::EVENT_BLOCK_SNAPSHOT) {
+                request_collector->SetRequestKeyCountSample(request_key_counts[event_type]);
+            }
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(std::move(request_collector));
         }
     }
 }
