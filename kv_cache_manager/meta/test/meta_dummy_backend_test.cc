@@ -103,6 +103,35 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestGenericTargetedLocationsPreserveKeyStatus) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("targeted_status", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("target");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("target", location);
+    PropertyMapVector properties(2);
+    properties[1].emplace("property_only", "value");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, locations, properties));
+
+    LocationsPerKey selected;
+    std::vector<ErrorCode> key_error_codes;
+    const auto per_location_ecs = meta_storage_backend_->GetLocationsWithKeyStatus(
+        nullptr, {1, 2, 3}, {{"target"}, {"target"}, {"target"}}, selected, key_error_codes);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_error_codes);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_NOENT}, {EC_NOENT}}), per_location_ecs);
+    ASSERT_EQ(3u, selected.size());
+    ASSERT_EQ(1u, selected[0].size());
+    ASSERT_TRUE(selected[0][0]);
+    EXPECT_EQ("target", selected[0][0]->id());
+    ASSERT_EQ(1u, selected[1].size());
+    EXPECT_FALSE(selected[1][0]);
+    ASSERT_EQ(1u, selected[2].size());
+    EXPECT_FALSE(selected[2][0]);
+}
+
 TEST_F(MetaDummyBackendTest, TestInit) {
     // invalid config
     ASSERT_NE(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));

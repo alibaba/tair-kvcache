@@ -72,21 +72,26 @@ SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &,
                                            bool) -> void {};
 
-class FaultyGetLocationIdsBackend : public MetaLocalBackend {
+class FaultyTargetedLocationBackend : public MetaLocalBackend {
 public:
     void SetFailedKey(KeyType key) { failed_key_ = key; }
 
-    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          LocationIdsPerKey &out_location_ids) noexcept override {
-        auto results = MetaLocalBackend::GetLocationIds(request_context, keys, out_location_ids);
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override {
+        auto results = MetaLocalBackend::GetLocationsWithKeyStatus(
+            request_context, keys, location_ids, out_locations, out_key_error_codes);
         if (!failed_key_.has_value()) {
             return results;
         }
         for (size_t i = 0; i < keys.size(); ++i) {
             if (keys[i] == failed_key_.value()) {
-                results[i] = EC_ERROR;
-                out_location_ids[i].clear();
+                out_key_error_codes[i] = EC_ERROR;
+                results[i].assign(location_ids[i].size(), EC_ERROR);
+                out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
             }
         }
         return results;
@@ -230,9 +235,9 @@ public:
         return indexer;
     }
 
-    FaultyGetLocationIdsBackend *ReplaceWithFaultyBackend() {
+    FaultyTargetedLocationBackend *ReplaceWithFaultyBackend() {
         auto backend_config = ConstructMetaStorageBackendConfig();
-        auto faulty_backend = std::make_unique<FaultyGetLocationIdsBackend>();
+        auto faulty_backend = std::make_unique<FaultyTargetedLocationBackend>();
         EXPECT_EQ(EC_OK, faulty_backend->Init("test", backend_config));
         EXPECT_EQ(EC_OK, faulty_backend->Open());
         auto backend_raw = faulty_backend.get();
@@ -474,6 +479,70 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_0"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_1"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["full_3"]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeFusedRmwTracksNewKeysAndCapacity) {
+    meta_indexer_->max_key_count_ = 1;
+    const KeyType existing_key = 10022;
+    const KeyType rejected_key = 10023;
+    const std::string location_a = "kvs#event_report_l2#mem#capacity-a:8080";
+    const std::string location_b = "kvs#event_report_l2#disk#capacity-a:8080";
+    auto make_task = [](const std::string &location_id, const std::string &name, const std::string &uri) {
+        return MetaSearcher::MergeLocationSpecsTask{location_id,
+                                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                                    CacheLocationStatus::CLS_SERVING,
+                                                    {LocationSpec(name, uri)}};
+    };
+
+    std::vector<ErrorCode> per_key_ec;
+    auto task_a = make_task(location_a, "tp0", "event_report://capacity-a:8080/mem?size=3");
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_a}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // A new target location under an existing key must not consume another
+    // key-count slot, even though the targeted read returns EC_NOENT for that
+    // location.
+    auto task_b = make_task(location_b, "tp1", "event_report://capacity-a:8080/disk?size=5");
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_b}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // Updating an existing target also remains admissible at capacity.
+    task_a.specs = {LocationSpec("tp0", "event_report://capacity-a:8080/mem?size=7")};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_a}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    EXPECT_NE(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {rejected_key}, {{task_a}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOSPC}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // A capacity failure for a new key must not reject an existing-key
+    // update that happens to share the same internal upsert batch. The old
+    // two-phase path admitted the existing update in its merge phase.
+    task_a.specs = {LocationSpec("tp0", "event_report://capacity-a:8080/mem?size=9")};
+    const auto rejected_task = make_task(location_a, "tp0", "event_report://capacity-rejected:8080/mem?size=4");
+    EXPECT_EQ(EC_PARTIAL_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {existing_key, rejected_key}, {{task_a}, {rejected_task}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    std::vector<CacheLocationMap> locations;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetLocation(request_context_.get(), {existing_key, rejected_key}, mask, locations));
+    ASSERT_EQ(2u, locations.size());
+    EXPECT_EQ(2u, locations[0].size());
+    ASSERT_TRUE(locations[0].at(location_a));
+    EXPECT_NE(std::string::npos, locations[0].at(location_a)->location_specs()[0].uri().find("size=9"));
+    EXPECT_TRUE(locations[1].empty());
+    EXPECT_EQ(14u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsNormalizesLegacyDuplicateNamesInPlace) {
@@ -1497,15 +1566,15 @@ TEST_F(MetaSearcherTest, TestBatchMutationWriteLeaseIsAcquiredOncePerRmwPhase) {
         return std::make_pair(EC_OK, std::static_pointer_cast<void>(std::make_shared<size_t>(acquire_count)));
     };
 
-    // Every key already has this location, so BatchMerge exercises both its
-    // block lookup and targeted location RMW phases with one lease per phase.
+    // Every key already has this location. The fused targeted RMW holds one
+    // lease from the post-read fence check through the single upsert phase.
     for (auto &tasks : merge_tasks) {
         tasks[0].specs = {LocationSpec("tp1", "event_report://lease-host:8080/mem?size=2")};
     }
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchMergeLocationSpecs(
                   request_context_.get(), keys, merge_tasks, per_key_ec, acquire_write_lease));
-    EXPECT_EQ(2u, acquire_count);
+    EXPECT_EQ(1u, acquire_count);
     EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
 
     acquire_count = 0;
@@ -1607,7 +1676,7 @@ TEST_F(MetaSearcherTest, TestBatchMutationWriteLeaseFailurePreventsAllWrites) {
     }
 }
 
-TEST_F(MetaSearcherTest, TestBatchMergeReacquiresWriteLeaseBetweenRmwPhases) {
+TEST_F(MetaSearcherTest, TestBatchMergeDoesNotReacquireLeaseInsideFusedRmw) {
     const MetaSearcher::KeyVector keys = {10086, 10087};
     const std::string location_id = "kvs#event_report_l2#mem#lease-race:8080";
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks;
@@ -1626,18 +1695,18 @@ TEST_F(MetaSearcherTest, TestBatchMergeReacquiresWriteLeaseBetweenRmwPhases) {
         per_key_tasks[0].specs = {LocationSpec("tp1", "event_report://lease-race:8080/mem?phase=stale")};
     }
     size_t acquire_count = 0;
-    MetaSearcher::AcquireMetadataWriteLeaseFunc fail_second_phase = [&] {
+    MetaSearcher::AcquireMetadataWriteLeaseFunc fail_if_reacquired = [&] {
         ++acquire_count;
         if (acquire_count == 1) {
             return std::make_pair(EC_OK, std::static_pointer_cast<void>(std::make_shared<size_t>(acquire_count)));
         }
         return std::make_pair(EC_NODE_NOT_REGISTERED, MetaSearcher::MetadataWriteLease{});
     };
-    EXPECT_NE(
+    EXPECT_EQ(
         EC_OK,
-        meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec, fail_second_phase));
-    EXPECT_EQ(2u, acquire_count);
-    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_NODE_NOT_REGISTERED), per_key_ec);
+        meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec, fail_if_reacquired));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
 
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
@@ -1646,9 +1715,10 @@ TEST_F(MetaSearcherTest, TestBatchMergeReacquiresWriteLeaseBetweenRmwPhases) {
     for (const auto &locations : location_maps) {
         ASSERT_EQ(1u, locations.size());
         const auto &specs = locations.at(location_id)->location_specs();
-        ASSERT_EQ(1u, specs.size());
+        ASSERT_EQ(2u, specs.size());
         EXPECT_EQ("tp0", specs[0].name());
-        EXPECT_EQ(std::string::npos, specs[0].uri().find("phase=stale"));
+        EXPECT_EQ("tp1", specs[1].name());
+        EXPECT_NE(std::string::npos, specs[1].uri().find("phase=stale"));
     }
 }
 

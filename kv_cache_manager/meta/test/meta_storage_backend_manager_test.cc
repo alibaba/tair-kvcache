@@ -50,6 +50,17 @@ public:
         return {};
     }
 
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *,
+                              const KeyTypeVec &,
+                              const LocationIdsPerKey &,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override {
+        out_locations.clear();
+        out_key_error_codes = {EC_OK};
+        return {};
+    }
+
     std::vector<ErrorCode>
     GetLocationIds(RequestContext *, const KeyTypeVec &, LocationIdsPerKey &out_location_ids) noexcept override {
         out_location_ids.clear();
@@ -579,6 +590,17 @@ TEST_F(MetaStorageBackendManagerTest, TestMalformedCacheReadShapesFailClosed) {
     EXPECT_EQ(1u, locations[0].size());
     EXPECT_EQ(2u, locations[1].size());
 
+    std::vector<ErrorCode> key_error_codes;
+    const auto with_key_status =
+        mgr.GetLocationsWithKeyStatus(request_context_.get(), keys, requested_ids, locations, key_error_codes);
+    ASSERT_EQ(2u, with_key_status.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}), with_key_status[0]);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), with_key_status[1]);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), key_error_codes);
+    ASSERT_EQ(2u, locations.size());
+    EXPECT_EQ(1u, locations[0].size());
+    EXPECT_EQ(2u, locations[1].size());
+
     LocationIdsPerKey location_ids;
     const auto per_key = mgr.GetLocationIds(request_context_.get(), keys, location_ids);
     EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), per_key);
@@ -767,6 +789,24 @@ TEST_F(MetaStorageBackendManagerTest, TestTargetedRecoveryReadDoesNotOverwriteCa
     ASSERT_EQ(1u, locations[1].size());
     ASSERT_TRUE(locations[1][0]);
     EXPECT_EQ("persistent_fallback", locations[1][0]->location_specs().front().uri());
+
+    locations.clear();
+    std::vector<ErrorCode> key_error_codes;
+    const KeyVector status_keys{77, 78, 79};
+    const LocationIdsPerKey status_ids{{"missing", "present"}, {"only_persistent"}, {"absent"}};
+    const auto status_results =
+        mgr.GetLocationsWithKeyStatus(request_context_.get(), status_keys, status_ids, locations, key_error_codes);
+    ASSERT_EQ(3u, status_results.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}), status_results[0]);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), status_results[1]);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}), status_results[2]);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_error_codes);
+    ASSERT_EQ(3u, locations.size());
+    ASSERT_TRUE(locations[0][1]);
+    EXPECT_EQ("cache_current", locations[0][1]->location_specs().front().uri());
+    ASSERT_TRUE(locations[1][0]);
+    EXPECT_EQ("persistent_fallback", locations[1][0]->location_specs().front().uri());
+    EXPECT_FALSE(locations[2][0]);
 
     ASSERT_EQ(EC_OK, mgr.cache_backend_->Close());
     ASSERT_EQ(EC_OK, mgr.persistent_backend_->Close());

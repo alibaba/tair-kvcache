@@ -253,6 +253,17 @@ public:
         return MetaLocalBackend::GetLocations(request_context, keys, location_ids, out_locations);
     }
 
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override {
+        MaybeBlockLocationRead();
+        return MetaLocalBackend::GetLocationsWithKeyStatus(
+            request_context, keys, location_ids, out_locations, out_key_error_codes);
+    }
+
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override {
@@ -8298,7 +8309,8 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
                                                            LocationSpec("tp3", "dummy://cold_01/blk2/tp3?size=1"),
                                                        });
     std::vector<std::string> ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), {1, 2}, {writing_loc, serving_loc}, ids));
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher, request_context_.get(), {1, 2}, {writing_loc, serving_loc}, ids));
     ASSERT_EQ(2u, ids.size());
     std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
         {MetaSearcher::LocationCASTask{ids[1], CLS_WRITING, CLS_SERVING}}};
@@ -8663,10 +8675,10 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
     ASSERT_TRUE(meta_searcher);
     std::vector<std::string> source_ids;
     {
-        auto loc = std::make_shared<CacheLocation>(
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+        auto loc =
+            std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
         ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), {1}, {loc}, source_ids));
     }
     ASSERT_EQ(1u, source_ids.size());
@@ -8843,7 +8855,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
         1,
         std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1/tp0?size=1")});
     std::vector<std::string> partial_ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), {1}, {partial_cold_loc}, partial_ids));
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher, request_context_.get(), {1}, {partial_cold_loc}, partial_ids));
     auto partial_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
     partial_info->keys = {1};
     partial_info->location_ids = {partial_ids[0]};
@@ -8864,7 +8877,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
                                             LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
                                         });
     std::vector<std::string> remaining_ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), {1}, {remaining_cold_loc}, remaining_ids));
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher, request_context_.get(), {1}, {remaining_cold_loc}, remaining_ids));
     auto remaining_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
     remaining_info->keys = {1};
     remaining_info->location_ids = {remaining_ids[0]};

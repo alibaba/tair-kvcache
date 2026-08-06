@@ -35,16 +35,16 @@
 只有缺少 medium 时才释放 shared lock、获取 unique lock 并二次检查。节点 map 和 mediums 仍始终
 受 `nodes_mutex_` 保护，不能改成无锁读取或用一个原子布尔值替代整个 map 的一致性。
 
-### 2.2 lifecycle lease 从每 key 收敛到每 RMW 阶段一次
+### 2.2 lifecycle lease 从每 key 收敛到每次 metadata mutation 一次
 
 原实现会在 modifier 的每个 key 上查 reporter fence、分配 `shared_lock`；已有 location 的 ADD
-经过 block-create 和 targeted-location 两阶段时还会重复一轮。现在每个 RMW 阶段第一次进入
-modifier 时获取一次，后续 key 复用同一个 lease：
+经过 block-create 和 targeted-location 两阶段时还会重复一轮。当前 `BatchMergeLocationSpecs` 已按
+2.5 合并为一次 targeted RMW，在该次 RMW 第一次进入 modifier 时获取一个 lease，后续 key 复用：
 
 ```text
 metadata read（可被 lifecycle writer 抢占）
         |
-non-blocking lifecycle lease（每阶段一次）
+non-blocking lifecycle lease（本次 fused RMW 一次）
         |
 本阶段全部 metadata mutation
         |
@@ -53,8 +53,9 @@ non-blocking lifecycle lease（每阶段一次）
 
 lease 不能在 metadata read 前获取，也不能无条件持有整个 ReportEvent。HOST_DOWN/REGISTER 的
 锁序是 `lifecycle -> metadata`；如果旧请求阻塞在 metadata I/O，lifecycle writer 必须能先完成。
-旧请求恢复后 `try_lock` 失败并放弃写入。BatchMerge 的两个 RMW 阶段之间释放并重新获取，保留同样
-的抢占窗口。确定性 HOST_DOWN/重注册竞态测试是这个优化的强制回归项。
+旧请求恢复后获取 generation-pinned lease 失败并放弃写入。fused RMW 从读取 key/目标 location 到
+upsert 始终处于同一个 metadata shard 临界区，lease 从 read 后持有到 upsert 返回。确定性
+HOST_DOWN/重注册竞态测试是这个优化的强制回归项。
 
 ### 2.3 GetHostCacheState 的 local 大查询路径
 
@@ -137,45 +138,88 @@ ReportEvent RT；worker 并非越多越好。
 4. 协议 URI 在入口完整校验时保存已经解析的 `DataStorageUri`，追加 `s_version` 时复用，不再为同一 URI
    重复 parse；BatchMerge 的版本一致性校验也复用本轮已解析对象，同时仍在 API 边界保留 raw 参数计数，
    duplicate `s_version` 仍会 fail closed；
-5. `BatchMergeLocationSpecs` 的第二阶段只保存原 task 下标，不再复制 location id 和整组 spec/URI。
-   existing Location 仍做一次必要的 copy-on-write，之后在其小 vector 内按 name 原地覆盖、兼容 legacy
-   重名并恢复字典序；不再构造每 key 的 ordered map 和第二份完整 spec vector。
+5. `BatchMergeLocationSpecs` 直接让 caller-owned task 与目标 location id 对齐，不再复制 location id 和
+   整组 spec/URI。existing Location 仍做一次必要的 copy-on-write，之后在其小 vector 内按 name 原地
+   覆盖、兼容 legacy 重名并恢复字典序；不再构造每 key 的 ordered map 和第二份完整 spec vector；
+6. 单 spec/task 的常见路径不创建去重 hash set，多 spec 时 set 保存 `string_view`；storage usage 使用
+   一段 flat vector + offsets，不再为每 key 分配 vector。入口 URI 校验时顺带累计新 spec 的 `size`，
+   merge 只解析旧 spec，避免写入成功后再次遍历、解析全部新 URI。
 
-这些优化没有合并两阶段 RMW，也没有改变 lifecycle lease、shard lock 或 HOST_DOWN 的锁序。收益来自减少
-进入和持有 metadata shard 锁期间的 CPU/分配工作，因此既降低单请求 RT，也缩短并发请求的锁占用窗口；
-不能把它解释成“把锁换成原子变量”。
+这些优化不改变 lifecycle lease、shard lock 或 HOST_DOWN 的锁序。收益来自减少进入和持有 metadata
+shard 锁期间的 CPU/分配工作，因此既降低单请求 RT，也缩短并发请求的锁占用窗口；不能把它解释成
+“把锁换成原子变量”。
+
+### 2.5 BLOCK_ADD fused targeted RMW
+
+2026-08-06 在独立分支落地了此前刻意延后的 fused 原语。旧的 existing-location ADD 先通过
+`ReadModifyWriteBlock(GetLocationIds)` 枚举 block 的全部 location id，再通过
+`ReadModifyWriteLocation` 读取目标 location 并 merge/upsert；纯 local 下至少产生两次 metadata read、
+一次 upsert 和两轮 RMW 容器。当前路径改为：
+
+```text
+GetLocationsWithKeyStatus(key, requested_location_ids)
+        |  同时返回 key 是否存在 + 各目标 location 的值/错误
+        v
+modifier：create 或 copy-on-write merge
+        |
+同一 shard-lock 临界区内一次 Upsert
+```
+
+必须保持以下不变量：
+
+1. `key missing` 与 `key exists but target location missing` 严格区分。只有前者进入
+   `put_global_indices`，参与 `max_key_count` 检查并在 upsert 成功后增加 `key_count`；已有 key 新增
+   location 不增加 key 数，容量已满时仍允许更新已有 key。若一个 internal upsert batch 同时包含已有
+   key 更新和超容量的新 key，只给新 key 返回 `EC_NOSPC`，不能把已有更新连带拒绝；
+2. local backend 在一次 LRU lookup/item shared-lock 中返回上述两个层次的状态。返回 `EC_OK` 的 location
+   必须非空且 id 与请求一致，否则 indexer fail closed；输出 vector 每次重新初始化，miss 不能泄漏 caller
+   复用缓冲区中的旧指针；
+3. `MetaStorageBackendManager` 在 cached recovery 模式仅对真正的 cache key miss 回源 persistent；cache
+   中已有 key 但缺目标 location 时，cache 状态仍是 authoritative。generic backend fallback 仅对
+   “所有目标均 NOENT”的歧义行补一次 `Exists`；纯 local 主路径不走该 fallback；
+4. generation-pinned lifecycle lease 在 targeted read 后、modifier 第一次 mutation 前获取一次，并持有到
+   upsert 返回；不能提前到 metadata read 前，也不能在 read 与 write 之间释放；
+5. 逐 location read/type/modifier/write 错误保持原位，部分成功只更新成功 location 的 storage usage。
+   legacy duplicate spec name 仍按原 last-value-wins 规则归一化；malformed backend shape、空/错 id、
+   `key missing + target EC_OK` 等矛盾状态全部拒绝写入；
+6. 当前实现只是把两个逻辑 RMW 合为一个 targeted read-modify-upsert；local backend 的 upsert 仍会再次
+   lookup 并获取 item unique-lock。没有把 backend item 指针或锁暴露给 modifier，也没有引入批内线程。
 
 ## 3. 当前明确不做的事情
 
-暂不并行执行 ReportEvent 内的 metadata batch。原因不是并行永远无效，而是当前主要指标已经指向
-backend I/O；直接并行可能把排队转移到 Redis、放大连接池竞争并拖高查询 p99，同时会引入
-key-count 容量、同 key mutation 顺序和 lifecycle fencing 的新并发面。
+暂不并行执行 ReportEvent 内的 metadata batch。原因不是并行永远无效，而是 5.10 的同吞吐 A/B 已证明
+把单次 L2 batch 控制在约 2k 能显著降低 ReportEvent、Get 和 Heartbeat 尾延迟；服务端再增加 writer
+会与优先级更高的查询争夺 CPU、allocator 和 local LRU/item lock，同时扩大 key-count、请求内顺序与
+lifecycle fencing 的并发面。若后续仍要并行，必须使用独立有界 executor、按互斥 shard 分组并保留串行
+回退，不能创建 request-local thread 或复用查询 executor。
 
-暂不把 `BatchMergeLocationSpecs` 的两阶段 RMW 简单合并。第一阶段通过“整个 block 是否存在”维护
-`key_count/max_key_count`，第二阶段按目标 location 做 merge。仅使用目标 HMGET 无法区分“key 不存在”
-和“key 存在但目标 location 不存在”；直接替换会造成容量计数错误。
+暂不把 local targeted read 与 upsert 进一步合成“持有一个 item unique-lock、在 backend 内执行
+modifier”的原语。那会让 manager callback 进入 backend 临界区、扩大锁序与异常安全边界；当前一次
+targeted read + 一次 upsert 已消除整轮 block-id 枚举，同时保持 backend API 分层。
 
 GetHostCacheState 也不并发 Redis/cached backend batch，不创建 request-local thread，不复用只有少量
 worker 且承载回收/迁移的 `SchedulePlanExecutor`。查询池独立且有界，避免长 metadata 请求饿死系统任务。
 
-## 4. 下一步最值得验证的 I/O 优化
+## 4. 非 local backend 的扩展边界
 
-Redis `GetLocationIds` 当前为每批 key 做 EXISTS，再用 HSCAN 枚举 location field；已有目标 location
-还要进入 targeted HMGET。若优化后线上 `get_io_time_us` 仍占主导，优先设计一个 backend/indexer
-原语，在保持 shard lock 的一次 RMW 中同时返回：
+当前部署和本轮交付门槛是纯 local metadata；真实 Redis 不在本轮验证范围。通用
+`GetLocationsWithKeyStatus` fallback 已保证正确性，但当所有目标 location 均不存在时会额外调用
+`Exists`。若未来启用 Redis，应实现原生 pipeline，在一个 round trip 中同时返回：
 
 1. key 是否存在（用于 `key_count/max_key_count`）；
 2. 请求指定 location id 的值与逐项错误；
 3. 不枚举、不传输无关 location value。
 
-Redis 实现应尽量把 EXISTS 与目标 HMGET 放进同一 pipeline round trip；Local/Dummy/Async Redis 和
-cached+recover 模式必须具有一致语义。只有补齐新 key、已有 key 缺 location、已有 location、
-properties-only key、tombstone、部分 I/O 失败和 max-key-count UT 后，才能替换现有两阶段逻辑。
+Redis 实现应把 EXISTS 与目标 HMGET 放进同一 pipeline round trip，并单独跑真实 Redis 的新 key、已有
+key 缺 location、已有 location、properties-only key、部分 I/O 失败与恢复测试。在完成这些验证前，
+不能把本轮纯 local 性能数据外推到 Redis，也不能删除 generic fallback。
 
 ## 5. 验证与观测清单
 
-- UT：请求内 512 个跨重复 medium 的 ADD；并发 EnsureNodeRegistered；每 RMW 阶段 lease 次数与失败
-  原子性；HOST_DOWN、REGISTER、新 snapshot 抢占阻塞 metadata read；同请求 ADD/DELETE 顺序。
+- UT：请求内 512 个跨重复 medium 的 ADD；并发 EnsureNodeRegistered；fused RMW 单 lease 与失败原子性；
+  HOST_DOWN、REGISTER、新 snapshot 抢占阻塞 metadata read；同请求 ADD/DELETE 顺序；新 key、已有 key
+  缺 location、已有 location、容量已满更新、部分 backend 错误、malformed response shape 与 storage
+  usage 精确性。
 - 手工容量：`EventReportBenchTest.test_20_large_single_request_delta_scaling` 分别记录 100/1000/5000/20000
   个新 block ADD 与相同 block 再次 ADD 的总 RT、单 event RT，并查询首/中/末 block，不能只看
   HTTP 成功码。
@@ -183,7 +227,8 @@ properties-only key、tombstone、部分 I/O 失败和 max-key-count UT 后，�
   部署保持默认 local metadata backend；只有明确验证 Redis 部署形态时才传 `--meta-storage-uri`。
 - 线上对比：至少拆分 request parse/fold、node ensure、lifecycle lease wait/fail、RMW lock wait、
   `get_io_time_us`、serialize、enqueue/upsert 和完整 ReportEvent RT；同时观察查询 p50/p99。
-- 若去重后 `get_io_time_us` 仍接近总 RT，下一步应做目标化 backend read，而不是先加线程。
+- local 路径已经使用目标化 backend read；若 `get_io_time_us` 仍接近总 RT，应先看 LRU/item-lock wait 与
+  request key-count 分桶，不能再归因于已删除的全 location-id 枚举。
 - 若 backend I/O 已显著下降但 CPU/锁等待仍主导，再评估按互斥 shard 分组的有界并行（建议先从
   2~4 并发开始），并对查询 p99、连接池等待和 Redis CPU 设置回退阈值。
 
@@ -277,6 +322,9 @@ worker 8；必须同时观察 ReportEvent p99、GetHost key-count 分桶、CPU �
 
 ### 5.4 ReportEvent 高基数结论
 
+本节与 5.5、5.6 保留的是 fused targeted RMW 落地前的历史基线和决策背景；当前实现状态以 2.5 和
+5.10 为准，不能再把“尚未合并两阶段”当作现状。
+
 Release/O2、纯 local 下，当前版本单请求 20k BLOCK_ADD 的 create/update 为
 196.55/239.51ms，约 9.8/12.0us 每 event，整体近似线性。对比 `feature/event_report_4@b776dd4`，
 5000-event 单请求及 100-thread ADD、50-thread mixed throughput 均只相差约 0~4%，属于噪声；当前改动
@@ -318,6 +366,9 @@ shard 并行并增加 parse/fold 指标。并行会触及写入原子性、lifec
 ReportEvent key-count 分桶、RMW 两阶段、lock wait、CPU 与 GetHost p99。
 
 ### 5.6 2026-08-05 线上 L2 大批次反馈与后续判别
+
+本节记录当时尚未落地 fused targeted RMW 的线上反馈。后文关于“下一步做 fused”的表述是历史判断，
+最终实现、风险控制与新数据见 2.5、5.10。
 
 一轮按目标 QPS 持续发送的线上压测中，客户端全程 `fail/drop/skipped=0`，工作队列通常为 0~1；
 RSS 峰值约 159.4MB、payload budget 峰值约 129.2MB。停止边界丢弃的一个任务不计入稳态失败。
@@ -464,3 +515,71 @@ allocator/LRU 经高分配压力后的持续退化。
 prefix，并同时检查 Eagle-pop 和 medium filter。该用例完成 Release 100 轮、ASAN 20 轮以及完整
 MetaSearcher Release/ASAN 回归，结果一致。它主要防止 packed presence 的跨 word 索引、并行 slice 写入
 或 prefix reduction 在后续优化中发生静默错位。
+
+### 5.10 2026-08-06 fused targeted RMW、纯 local 回归与同吞吐分批 A/B
+
+本轮工作位于 `codex/report-event-write-performance`，开始前已 fetch 并 rebase 到
+`origin/main@ae9cb0dfa593071be47e0a601af05d8159b383b7`；原查询优化分支未改动。部署明确使用纯 local
+metadata，因此本节的功能、ASAN 与性能结论只以 local 为交付门槛，不把真实 Redis 结果混入结论。
+
+#### 单请求 before/after
+
+在同一 Release/O2、真实 HTTP、全新 local instance 上运行
+`test_20_large_single_request_delta_scaling`。before 是 rebase 后、fused 改动前的基线；after 是最终链接
+产物三次独立串行复测的中位数。每档均校验 committed token 和首/中/末 block 的最终 URI：
+
+| events/request | before create/update | after create/update | update 降幅 |
+| ---: | ---: | ---: | ---: |
+| 100 | 1.57/1.59ms | 1.53/1.40ms | 11.9% |
+| 1000 | 9.41/10.16ms | 9.20/8.73ms | 14.1% |
+| 5000 | 43.75/48.26ms | 42.34/40.99ms | 15.1% |
+| 20000 | 172.00/202.12ms | 169.75/172.09ms | 14.9% |
+
+create 路径没有旧的第二阶段，after 基本持平，说明新 key-status 语义和 flat bookkeeping 没有引入明显
+回归；收益集中在已有 location。三轮 20k create/update 区间为 `166.81~191.29ms` /
+`170.75~189.44ms`，因此应看中位数和线上分桶，不能拿单次最好值当 SLA。20k 的 KVCM
+service/access-log timer 从 before create/update `81.642/113.413ms` 变为两轮 after 平均
+`79.28/85.60ms`，约下降 `2.9%/24.5%`。客户端 update 中位数下降约 14.9%，剩余差异主要在 HTTP
+JSON/protobuf 边界和 worker 排队，不能继续算作 metadata RMW 收益。
+
+#### 相同约 150k blocks/s 的 batch-size A/B
+
+使用 `tools/scripts/report_event_load.py`、16 reporter、纯 local、真实 HTTP，把总 blocks/s 保持接近，
+同时发送 9k-key Get 和 heartbeat。三轮 ADD、Get、heartbeat 均 `failed=0`，每个 ADD 还抽查一个最终 key；
+结果如下：
+
+| ADD 形态 | 成功数 / 实际 QPS | ADD avg/p95/p99 | 9k Get avg/p95/p99 | Heartbeat avg/p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 10k × 15QPS | 317 / 14.41 | 364.49/1268.12/1661.32ms | 271.45/1050.49/1254.13ms（n=5） | 54.66/489.21ms |
+| 5k × 30QPS | 457 / 29.60 | 98.84/197.97/313.58ms | 29.56/150.72/152.65ms（n=16） | 12.55/82.22ms |
+| 2k × 75QPS | 1149 / 74.62 | 50.04/123.93/174.86ms | 18.71/56.68/99.07ms（n=16） | 14.36/87.62ms |
+
+10k 轮的 Get 只有 5 个样本，不能把其 percentile 当成精确 SLA；但 ADD 样本数足够，三个 API 的尾延迟
+又同向变化，足以说明超大 HTTP 请求的长任务、瞬时分配和共享执行资源占用是主要放大器。相同吞吐下，
+2k batch 的 ADD p99 比 10k batch 低约 89%，本轮 9k Get p99 也降到约 99ms。当前推荐发布端先以
+`2k blocks/request` 为起点做线上 A/B；5k 可作为降低 QPS/请求数的折中。该建议不是服务端硬限制，也
+不是无条件的 SLA 保证，仍需按线上 CPU、HTTP worker 数和 URI 大小复测。
+
+这组数据同时否定了“先在 ReportEvent 内继续加线程”的必要性：外部分批已经在不改变写入语义的前提下
+显著改善公平性；服务端 writer 并行会抢占 Get 使用的 CPU、allocator 与 local LRU/item lock。若线上
+2k 分批后仍不满足，下一轮先补 HTTP parse/serialize/worker queue 和 item-lock wait 指标，再决定是否
+做独立有界 writer executor。
+
+#### 本轮验证矩阵
+
+- HTTP 功能：`test_report_event_snapshot.py --skip-bench`，36/36 通过，覆盖 ADD/DELETE/SNAPSHOT、
+  last-operation-wins、校验无副作用、部分失败/重试、并发 snapshot/delta、首次 delta 与清理；
+- Release UT：纯内存 meta/manager 全包 23/23 通过；`CacheManagerTest` 的 10 个 shard 全部通过；
+- 生命周期竞态：HOST_DOWN 拦截已 admission 的 delta、旧 lifecycle 不能跨重注册写入，两项连续 50 轮
+  通过。测试 backend 已显式拦截新的 `GetLocationsWithKeyStatus`，不能只 hook 旧 `GetLocations`；
+- 容量边界：新 key、已有 key 缺 location、已有 target update、max capacity，以及“已有更新 + 超容量新
+  key 位于同一个 internal batch”均通过；最后一种返回 `EC_OK/EC_NOSPC`，`key_count` 与 usage 不漂移；
+- ASAN：`meta_indexer_test`、`meta_local_backend_test`、`meta_dummy_backend_test`、
+  `meta_storage_backend_manager_test`、`MetaSearcherTest` 全部通过；ReportEvent/HOST_DOWN/并发相关
+  `CacheManagerTest` filter 通过；
+- 性能与数据正确性：100/1k/5k/20k create/update 单请求通过；10k/5k/2k 同吞吐持续压测全部零失败。
+
+新增原语不改变协议、URI 或持久化 schema，回滚可以整体 revert 本轮 ReportEvent commit，恢复原两阶段
+RMW。回滚/后续修改时必须一起处理 `MetaStorageBackend::GetLocationsWithKeyStatus`、manager recovery
+路由、`MetaIndexer::ReadModifyWriteTargetLocations` 和 `BatchMergeLocationSpecs`，不能只删除其中一层；
+否则最容易出现的是 `key_count` 漂移或 lifecycle fence 窗口被重新打开。
