@@ -34,12 +34,13 @@ bool ProtoMessageJsonUtil::ToJson(const ::google::protobuf::Message *message, st
     return status.ok();
 }
 
-bool ProtoMessageJsonUtil::FromJson(const std::string &json, ::google::protobuf::Message *message) {
+bool ProtoMessageJsonUtil::FromJson(std::string_view json, ::google::protobuf::Message *message) {
     if (!message) {
         return false;
     }
     static ::google::protobuf::util::JsonParseOptions option = CreateJsonParseOption();
-    auto status = google::protobuf::util::JsonStringToMessage(json, message, option);
+    const google::protobuf::StringPiece input(json.data(), static_cast<ptrdiff_t>(json.size()));
+    auto status = google::protobuf::util::JsonStringToMessage(input, message, option);
     if (!status.ok()) {
         // TODO: change to return in response
         KVCM_LOG_WARN("json parse error, message: %s", status.error_message().data());

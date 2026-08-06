@@ -197,8 +197,7 @@ public:
         if (!uri.Valid() || !IsValidSnapshotVersionToken(version) || HasEventReportInternalUriMetadata(uri)) {
             return false;
         }
-        uri.SetParam(kSnapshotVersionParam, version);
-        out_uri = uri.ToUriString();
+        out_uri = uri.ToUriStringWithExtraParam(kSnapshotVersionParam, version);
         return !out_uri.empty();
     }
 

@@ -166,14 +166,27 @@ ErrorCode EventReportBackend::Close() {
     if (liveness_checker_thread_.joinable()) {
         liveness_checker_thread_.join();
     }
-    std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
-    std::vector<std::unique_lock<std::shared_mutex>> fence_locks;
-    fence_locks.reserve(lifecycle_fences_.size());
-    for (const auto &entry : lifecycle_fences_) {
-        const auto &fence = entry.second;
-        if (fence) {
-            fence_locks.emplace_back(fence->mutex);
+    std::vector<std::shared_ptr<LifecycleFence>> fence_refs;
+    {
+        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
+        fence_refs.reserve(lifecycle_fences_.size());
+        for (const auto &entry : lifecycle_fences_) {
+            if (entry.second) {
+                fence_refs.push_back(entry.second);
+            }
         }
+    }
+
+    // Never wait for a lifecycle fence while holding lifecycle_fences_mutex_.
+    // Cleanup deliberately takes lifecycle -> metadata, while a metadata RMW
+    // may already hold metadata when it briefly looks up and try-locks its
+    // lifecycle fence. Close holding the table mutex while waiting for the
+    // cleanup lease would complete a three-lock cycle. The strong references
+    // also keep each shared_mutex alive until its unique_lock is released.
+    std::vector<std::unique_lock<std::shared_mutex>> fence_locks;
+    fence_locks.reserve(fence_refs.size());
+    for (const auto &fence : fence_refs) {
+        fence_locks.emplace_back(fence->mutex);
     }
     {
         std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
@@ -182,7 +195,12 @@ ErrorCode EventReportBackend::Close() {
         snapshot_versions_.clear();
         snapshot_token_owners_.clear();
     }
-    lifecycle_fences_.clear();
+    {
+        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
+        lifecycle_fences_.clear();
+    }
+    fence_locks.clear();
+    fence_refs.clear();
     snapshot_state_cv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
