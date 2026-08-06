@@ -1715,6 +1715,7 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
     EXPECT_EQ((std::vector<std::string>{success_results[0].location_id}), plan.pipeline_location_ids);
     std::vector<size_t> direct_indices = plan.direct_delete_indices;
     std::sort(direct_indices.begin(), direct_indices.end());
+    // 1 = uncertain_key (metadata deleted), 2 = no_id_key, 3 = ghost_key (delete hit EC_NOENT).
     EXPECT_EQ((std::vector<size_t>{1, 2, 3}), direct_indices);
 
     // uncertain metadata is deleted; confirmed-success metadata is left for the delete pipeline.
@@ -1800,6 +1801,8 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisWhenSyncFail
     BlockMask mask;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {uncertain_key}, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
+    // Unlike RetainsUrisOnDeleteError (location still present), here the in-memory
+    // delete succeeded and only the sync failed, so the map is empty.
     EXPECT_TRUE(location_maps[0].empty());
 }
 
