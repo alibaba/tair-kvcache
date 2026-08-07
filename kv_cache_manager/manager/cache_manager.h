@@ -216,7 +216,8 @@ public:
                       const std::string &instance_id,
                       QueryType query_type,
                       const KeyVector &block_cache_keys,
-                      const std::vector<std::string> &medium_filter = {});
+                      const std::vector<std::string> &medium_filter = {},
+                      size_t p2p_host_count = 0);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,

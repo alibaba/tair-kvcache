@@ -522,6 +522,7 @@ message GetHostCacheStateRequest {
     QueryType query_type = 3;
     repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
     repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
+    int32 p2p_host_count = 6;              // 继续计算 P2P 的 local top host 数；未传或 0 表示只计算 local
 }
 
 message HostCacheMatch {
