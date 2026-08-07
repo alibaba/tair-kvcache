@@ -17,6 +17,17 @@ cc_library(
 )
 
 cc_library(
+    name = "report_event_json_parser",
+    srcs = ["report_event_json_parser.cc"],
+    hdrs = ["report_event_json_parser.h"],
+    deps = [
+        ":proto_message_json_util",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "@rapidjson",
+    ],
+)
+
+cc_library(
     name = "manager_message_proto_util",
     srcs = ["manager_message_proto_util.cc"],
     hdrs = ["manager_message_proto_util.h"],
@@ -26,8 +37,8 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/config:meta_cache_policy_config",
         "//kv_cache_manager/data_storage",
-        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/manager:cache_location_view",
+        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],
 )
@@ -64,15 +75,14 @@ cc_library(
 cc_library(
     name = "fault_injector",
     srcs = [
-        "fault_injector.cc"
+        "fault_injector.cc",
     ],
     hdrs = [
-        "fault_injector.h"
+        "fault_injector.h",
     ],
     deps = [
         "//kv_cache_manager/common:logger",
     ],
-    
 )
 
 cc_library(

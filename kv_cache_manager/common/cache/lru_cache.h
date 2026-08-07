@@ -511,7 +511,13 @@ public:
     const CacheItemHelper *GetCacheItemHelper(Handle *handle) const override;
 
     void LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) override;
+    void PrepareBatchOperationScratch(size_t max_count, BatchOperationScratch *scratch) override;
+    void LookupBatchWithScratch(const std::string_view *keys,
+                                size_t count,
+                                Handle **out_handles,
+                                BatchOperationScratch *scratch) override;
     void ReleaseBatch(Handle *const *handles, size_t count) override;
+    void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override;
 
     void ApplyToHandle(Cache *cache,
                        Handle *handle,

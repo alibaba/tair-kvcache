@@ -842,14 +842,40 @@ const Cache::CacheItemHelper *LRUCache::GetCacheItemHelper(Handle *handle) const
 }
 
 void LRUCache::LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) {
+    BatchOperationScratch scratch;
+    PrepareBatchOperationScratch(count, &scratch);
+    LookupBatchWithScratch(keys, count, out_handles, &scratch);
+}
+
+void LRUCache::PrepareBatchOperationScratch(size_t max_count, BatchOperationScratch *scratch) {
+    if (!scratch) {
+        return;
+    }
+    scratch->hashes.reserve(max_count);
+    scratch->ordered_indices.reserve(max_count);
+    const size_t shard_slots = GetNumShards() + 1;
+    scratch->shard_offsets.reserve(shard_slots);
+    scratch->cursors.reserve(shard_slots);
+}
+
+void LRUCache::LookupBatchWithScratch(const std::string_view *keys,
+                                      size_t count,
+                                      Handle **out_handles,
+                                      BatchOperationScratch *scratch) {
     if (count == 0) {
+        return;
+    }
+    if (!scratch) {
+        LookupBatch(keys, count, out_handles);
         return;
     }
     std::fill(out_handles, out_handles + count, nullptr);
 
     const size_t shard_count = GetNumShards();
-    std::vector<uint32_t> hashes(count);
-    std::vector<size_t> shard_offsets(shard_count + 1, 0);
+    scratch->hashes.resize(count);
+    scratch->shard_offsets.assign(shard_count + 1, 0);
+    auto &hashes = scratch->hashes;
+    auto &shard_offsets = scratch->shard_offsets;
     for (size_t i = 0; i < count; ++i) {
         hashes[i] = LRUCacheShard::ComputeHash(keys[i], hash_seed_);
         const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
@@ -859,8 +885,10 @@ void LRUCache::LookupBatch(const std::string_view *keys, size_t count, Handle **
         shard_offsets[shard + 1] += shard_offsets[shard];
     }
 
-    std::vector<size_t> cursors = shard_offsets;
-    std::vector<size_t> ordered_indices(count);
+    scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
+    scratch->ordered_indices.resize(count);
+    auto &cursors = scratch->cursors;
+    auto &ordered_indices = scratch->ordered_indices;
     for (size_t i = 0; i < count; ++i) {
         const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
         ordered_indices[cursors[shard]++] = i;
@@ -877,12 +905,23 @@ void LRUCache::LookupBatch(const std::string_view *keys, size_t count, Handle **
 }
 
 void LRUCache::ReleaseBatch(Handle *const *handles, size_t count) {
+    BatchOperationScratch scratch;
+    PrepareBatchOperationScratch(count, &scratch);
+    ReleaseBatchWithScratch(handles, count, &scratch);
+}
+
+void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) {
     if (count == 0) {
+        return;
+    }
+    if (!scratch) {
+        ReleaseBatch(handles, count);
         return;
     }
 
     const size_t shard_count = GetNumShards();
-    std::vector<size_t> shard_offsets(shard_count + 1, 0);
+    scratch->shard_offsets.assign(shard_count + 1, 0);
+    auto &shard_offsets = scratch->shard_offsets;
     size_t non_null_count = 0;
     for (size_t i = 0; i < count; ++i) {
         if (handles[i] == nullptr) {
@@ -897,8 +936,10 @@ void LRUCache::ReleaseBatch(Handle *const *handles, size_t count) {
         shard_offsets[shard + 1] += shard_offsets[shard];
     }
 
-    std::vector<size_t> cursors = shard_offsets;
-    std::vector<size_t> ordered_indices(non_null_count);
+    scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
+    scratch->ordered_indices.resize(non_null_count);
+    auto &cursors = scratch->cursors;
+    auto &ordered_indices = scratch->ordered_indices;
     for (size_t i = 0; i < count; ++i) {
         if (handles[i] == nullptr) {
             continue;

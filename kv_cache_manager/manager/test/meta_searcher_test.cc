@@ -46,6 +46,32 @@ TEST(CacheLocationMoveTest, SetAndMoveLocationSpecsTransferVectorStorage) {
     EXPECT_EQ("tp1", moved.location_specs()[1].name());
 }
 
+TEST(CacheLocationMoveTest, ValidatedTotalSizeHintFollowsLocationSpecs) {
+    CacheLocation location;
+    std::uint64_t size = 0;
+    EXPECT_FALSE(location.GetValidatedTotalSize(size));
+
+    location.set_location_specs({LocationSpec("tp0", "event_report://size-hint:8080/mem?size=17")});
+    location.set_validated_total_size(17);
+    ASSERT_TRUE(location.GetValidatedTotalSize(size));
+    EXPECT_EQ(17u, size);
+
+    CacheLocation copied = location;
+    size = 0;
+    ASSERT_TRUE(copied.GetValidatedTotalSize(size));
+    EXPECT_EQ(17u, size);
+
+    copied.mutable_location_specs().front().set_uri("event_report://size-hint:8080/mem?size=23");
+    EXPECT_FALSE(copied.GetValidatedTotalSize(size));
+    copied.set_validated_total_size(23);
+    CacheLocation moved = std::move(copied);
+    ASSERT_TRUE(moved.GetValidatedTotalSize(size));
+    EXPECT_EQ(23u, size);
+
+    moved.push_location_spec(LocationSpec("tp1", "event_report://size-hint:8080/mem?size=29"));
+    EXPECT_FALSE(moved.GetValidatedTotalSize(size));
+}
+
 namespace {
 // Helper class to create test data
 class MetaSearcherTestHelper {
@@ -299,8 +325,7 @@ TEST_F(MetaSearcherTest, TestBatchAddLocationReturnsAlignedPartialResults) {
     meta_indexer_->max_key_count_ = 1;
 
     MetaSearcher::KeyVector keys = {1001, 1002};
-    while (GetShardIndex(keys[0], meta_indexer_->mutex_shard_mask_) ==
-           GetShardIndex(keys[1], meta_indexer_->mutex_shard_mask_)) {
+    while (meta_indexer_->GetMutexShardIndex(keys[0]) == meta_indexer_->GetMutexShardIndex(keys[1])) {
         ++keys[1];
     }
     auto location = MetaSearcherTestHelper::CreateCacheLocation(
@@ -440,6 +465,97 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_0"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["linear_1"]);
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["full_3"]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotalSize) {
+    const KeyType key = 10009;
+    const std::string location_id = "kvs#event_report_l2#mem#size-hint:8080";
+    auto make_tasks = [&location_id](std::uint64_t size) {
+        return std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>>{{
+            {location_id,
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CacheLocationStatus::CLS_SERVING,
+             {LocationSpec("tp0", "event_report://size-hint:8080/mem?size=" + std::to_string(size))}},
+        }};
+    };
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(17), per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(23), per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto location_it = location_maps[0].find(location_id);
+    ASSERT_NE(location_maps[0].end(), location_it);
+    ASSERT_TRUE(location_it->second);
+    ASSERT_EQ(1u, location_it->second->location_specs().size());
+    EXPECT_EQ("event_report://size-hint:8080/mem?size=23", location_it->second->location_specs()[0].uri());
+    std::uint64_t total_size = 0;
+    ASSERT_TRUE(location_it->second->GetValidatedTotalSize(total_size));
+    EXPECT_EQ(23u, total_size);
+    EXPECT_EQ(23u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeFlatTasksPreservesPerKeyRangesAndValidatesOffsets) {
+    const MetaSearcher::KeyVector keys{10010, 10011};
+    auto make_task = [](std::string location_id, std::string spec_name) {
+        return MetaSearcher::MergeLocationSpecsTask{
+            std::move(location_id),
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec(std::move(spec_name), "event_report://flat-task:8080/mem?size=1")},
+        };
+    };
+    std::vector<MetaSearcher::MergeLocationSpecsTask> flat_tasks;
+    const InternedLocationId borrowed_location_id =
+        std::make_shared<const std::string>("kvs#event_report_l2#mem#flat-a:8080");
+    MetaSearcher::MergeLocationSpecsTask inline_task{
+        {},
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        CacheLocationStatus::CLS_SERVING,
+        {},
+    };
+    inline_task.borrowed_interned_location_id = &borrowed_location_id;
+    inline_task.PushReportEventSpec(LocationSpec("tp0", "event_report://flat-task:8080/mem?size=1"), 1);
+    inline_task.prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(1);
+    ASSERT_TRUE(inline_task.specs.empty());
+    ASSERT_TRUE(inline_task.inline_spec.has_value());
+    EXPECT_EQ(1, borrowed_location_id.use_count());
+    flat_tasks.push_back(std::move(inline_task));
+    flat_tasks.push_back(make_task("kvs#event_report_l2#mem#flat-b:8080", "tp0"));
+    flat_tasks.push_back(make_task("kvs#event_report_l2#disk#flat-b:8080", "tp1"));
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 1, 3}, flat_tasks, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key_ec);
+    EXPECT_EQ(2, borrowed_location_id.use_count());
+    EXPECT_EQ("tp0", flat_tasks[0].SpecAt(0).name());
+    EXPECT_TRUE(flat_tasks[0].SpecAt(0).uri().empty());
+    EXPECT_EQ("tp0", flat_tasks[1].SpecAt(0).name());
+    EXPECT_FALSE(flat_tasks[1].SpecAt(0).uri().empty());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(2u, location_maps.size());
+    EXPECT_EQ(1u, location_maps[0].size());
+    EXPECT_EQ(2u, location_maps[1].size());
+    EXPECT_TRUE(location_maps[0].count(*borrowed_location_id));
+
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 2, 1}, flat_tasks, per_key_ec));
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 1, 2}, flat_tasks, per_key_ec));
 }
 
 TEST_F(MetaSearcherTest, TestBatchMergeFusedRmwTracksNewKeysAndCapacity) {

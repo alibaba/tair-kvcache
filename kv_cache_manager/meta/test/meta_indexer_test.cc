@@ -508,6 +508,109 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationPreservesPartialModifierResul
     EXPECT_FALSE(stored_locations[0][1]);
 }
 
+TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemantics) {
+    const std::string config_str = R"({
+        "max_key_count" : 2,
+        "mutex_shard_num" : 2,
+        "batch_key_size" : 100,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+    ASSERT_TRUE(meta_indexer_->SupportsSingleLocationRmw());
+
+    const std::string target_id = "target";
+    const std::string sibling_id = "sibling";
+    auto old_target = std::make_shared<CacheLocation>();
+    old_target->set_id(target_id);
+    auto sibling = std::make_shared<CacheLocation>();
+    sibling->set_id(sibling_id);
+    CacheLocationMapVector seed_locations(2);
+    seed_locations[0].emplace(target_id, old_target);
+    seed_locations[1].emplace(sibling_id, sibling);
+    PropertyMapVector seed_properties(2);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {1, 2}, seed_locations, seed_properties).ec);
+    ASSERT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    const KeyVector keys{1, 2, 3};
+    const LocationIdRefVector target_ids{&target_id, &target_id, &target_id};
+    std::vector<CacheLocationConstPtr> replacements(keys.size());
+    const long old_target_use_count = old_target.use_count();
+    const auto modifier = [&replacements, &old_target, old_target_use_count](ErrorCode get_ec,
+                                                                             const LocationId &location_id,
+                                                                             size_t key_index,
+                                                                             const CacheLocation *existing_location,
+                                                                             CacheLocationConstPtr &out_location) {
+        if (key_index == 0) {
+            EXPECT_EQ(EC_OK, get_ec);
+            EXPECT_EQ(old_target.get(), existing_location);
+            // The fused local read borrows the immutable value from the pinned
+            // cache item; it must not increment the shared_ptr control block.
+            EXPECT_EQ(old_target_use_count, old_target.use_count());
+        } else {
+            EXPECT_EQ(EC_NOENT, get_ec);
+            EXPECT_EQ(nullptr, existing_location);
+        }
+        auto replacement = std::make_shared<CacheLocation>();
+        replacement->set_id(location_id);
+        replacement->set_status(CLS_SERVING);
+        replacements[key_index] = replacement;
+        out_location = std::move(replacement);
+        return ModifierResult{MA_OK, EC_OK};
+    };
+
+    const auto result =
+        meta_indexer_->ReadModifyWriteSingleTargetLocations(request_context_.get(), keys, target_ids, modifier);
+    EXPECT_EQ(EC_PARTIAL_OK, result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOSPC}), result.error_codes);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    CacheLocationMapVector stored_locations;
+    const auto get_result = meta_indexer_->GetLocations(request_context_.get(), keys, stored_locations);
+    EXPECT_EQ(EC_PARTIAL_OK, get_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), get_result.error_codes);
+    ASSERT_EQ(1u, stored_locations[0].size());
+    EXPECT_EQ(replacements[0], stored_locations[0].at(target_id));
+    ASSERT_EQ(2u, stored_locations[1].size());
+    EXPECT_EQ(sibling, stored_locations[1].at(sibling_id));
+    EXPECT_EQ(replacements[1], stored_locations[1].at(target_id));
+    EXPECT_TRUE(stored_locations[2].empty());
+
+    size_t skip_calls = 0;
+    const auto skip_result =
+        meta_indexer_->ReadModifyWriteSingleTargetLocations(request_context_.get(),
+                                                            {3},
+                                                            LocationIdRefVector{&target_id},
+                                                            [&skip_calls](ErrorCode get_ec,
+                                                                          const LocationId &,
+                                                                          size_t,
+                                                                          const CacheLocation *existing_location,
+                                                                          CacheLocationConstPtr &) {
+                                                                ++skip_calls;
+                                                                EXPECT_EQ(EC_NOENT, get_ec);
+                                                                EXPECT_EQ(nullptr, existing_location);
+                                                                return ModifierResult{MA_SKIP, EC_OK};
+                                                            });
+    EXPECT_EQ(EC_OK, skip_result.ec);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), skip_result.error_codes);
+    EXPECT_EQ(1u, skip_calls);
+    EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    size_t duplicate_modifier_calls = 0;
+    const auto duplicate_result = meta_indexer_->ReadModifyWriteSingleTargetLocations(
+        request_context_.get(),
+        {4, 4},
+        LocationIdRefVector{&target_id, &target_id},
+        [&duplicate_modifier_calls](
+            ErrorCode, const LocationId &, size_t, const CacheLocation *, CacheLocationConstPtr &) {
+            ++duplicate_modifier_calls;
+            return ModifierResult{MA_SKIP, EC_OK};
+        });
+    EXPECT_EQ(EC_BADARGS, duplicate_result.ec);
+    EXPECT_TRUE(duplicate_result.error_codes.empty());
+    EXPECT_EQ(0u, duplicate_modifier_calls);
+}
+
 // Verifies the invariants of MakeBatches() that callers rely on, regardless
 // of the exact shard distribution (which is now hash-driven and therefore
 // not deterministic across keys):
@@ -543,7 +646,7 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
         for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
             const int32_t origin_idx = batch.batch_indexs[j];
             ASSERT_EQ(keys[origin_idx], batch.batch_keys[j]);
-            const int32_t shard = GetShardIndex(batch.batch_keys[j], 7);
+            const int32_t shard = meta_indexer_->GetMutexShardIndex(batch.batch_keys[j]);
             ASSERT_TRUE(shards_in_batch.count(shard) > 0)
                 << "key " << batch.batch_keys[j] << " hashed to shard " << shard
                 << " but the batch only locked shards declared in batch_shard_indexs";
@@ -556,6 +659,36 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
     std::vector<int32_t> expected_indexs(keys.size());
     std::iota(expected_indexs.begin(), expected_indexs.end(), 0);
     ASSERT_EQ(expected_indexs, covered_indexs);
+}
+
+TEST_F(MetaIndexerTest, TestPureLocalMutexShardsReuseLruHashSeed) {
+    std::string configStr = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 16,
+        "batch_key_size" : 4,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    auto *local_backend = dynamic_cast<MetaLocalBackend *>(meta_indexer_->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(nullptr, local_backend);
+    uint32_t lru_hash_seed = 0;
+    ASSERT_TRUE(local_backend->GetCacheHashSeed(lru_hash_seed));
+    ASSERT_EQ(static_cast<uint64_t>(lru_hash_seed), meta_indexer_->mutex_shard_hash_seed_);
+
+    const KeyVector keys = {KeyType{0},
+                            KeyType{1},
+                            KeyType{2},
+                            KeyType{17},
+                            KeyType{1'000},
+                            KeyType{94'422},
+                            std::numeric_limits<KeyType>::max()};
+    for (KeyType key : keys) {
+        const uint64_t lru_hash = Hash64(reinterpret_cast<const char *>(&key), sizeof(key), lru_hash_seed);
+        EXPECT_EQ(static_cast<int32_t>(lru_hash & meta_indexer_->mutex_shard_mask_),
+                  meta_indexer_->GetMutexShardIndex(key));
+    }
 }
 
 TEST_F(MetaIndexerTest, TestMakeBatches2) {
@@ -596,7 +729,7 @@ TEST_F(MetaIndexerTest, TestMakeBatches2) {
         for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
             const int32_t origin_idx = batch.batch_indexs[j];
             ASSERT_EQ(keys[origin_idx], batch.batch_keys[j]);
-            const int32_t shard = GetShardIndex(batch.batch_keys[j], 15);
+            const int32_t shard = meta_indexer_->GetMutexShardIndex(batch.batch_keys[j]);
             ASSERT_TRUE(shards_in_batch.count(shard) > 0);
             ASSERT_EQ(std::to_string(keys[origin_idx]), batch.batch_properties[j].at("uri"));
             covered_indexs.push_back(origin_idx);

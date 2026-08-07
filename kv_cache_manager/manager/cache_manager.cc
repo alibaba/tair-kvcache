@@ -3,11 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <charconv>
 #include <chrono>
 #include <cinttypes>
 #include <limits>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -136,57 +137,54 @@ public:
         std::string snapshot_version;
         uint64_t lifecycle_generation = 0;
     };
-    explicit DeltaMutationGuard(std::shared_ptr<EventReportBackend> backend) : backend_(std::move(backend)) {}
+    DeltaMutationGuard(std::shared_ptr<EventReportBackend> backend, ReporterSnapshotKey reporter_key)
+        : backend_(std::move(backend)), reporter_key_(std::move(reporter_key)) {}
     DeltaMutationGuard(const DeltaMutationGuard &) = delete;
     DeltaMutationGuard &operator=(const DeltaMutationGuard &) = delete;
 
     ~DeltaMutationGuard() {
-        for (const auto &entry : versions_) {
-            backend_->EndDeltaMutation(entry.first, entry.second.lifecycle_generation, entry.second.snapshot_version);
+        if (lease_) {
+            backend_->EndDeltaMutation(reporter_key_, lease_->lifecycle_generation, lease_->snapshot_version);
         }
     }
 
-    ErrorCode
-    Acquire(const ReporterSnapshotKey &reporter_key, const LeaseInfo *&out_lease, bool &out_created_generation) {
+    ErrorCode Acquire(const LeaseInfo *&out_lease, bool &out_created_generation) {
         out_lease = nullptr;
-        const auto failure_it = snapshot_wait_failures_.find(reporter_key);
-        if (failure_it != snapshot_wait_failures_.end()) {
+        if (snapshot_wait_failure_) {
             out_created_generation = false;
-            return failure_it->second;
+            return *snapshot_wait_failure_;
         }
-        const auto it = versions_.find(reporter_key);
-        if (it != versions_.end()) {
-            out_lease = &it->second;
+        if (lease_) {
+            out_lease = &*lease_;
             out_created_generation = false;
             return EC_OK;
         }
         LeaseInfo lease;
         const ErrorCode ec = backend_->BeginDeltaMutation(
-            reporter_key, lease.snapshot_version, &lease.lifecycle_generation, &out_created_generation);
+            reporter_key_, lease.snapshot_version, &lease.lifecycle_generation, &out_created_generation);
         if (ec != EC_OK) {
             out_created_generation = false;
             if (ec == EC_SNAPSHOT_IN_PROGRESS) {
-                snapshot_wait_failures_.emplace(reporter_key, ec);
+                snapshot_wait_failure_ = ec;
             }
             return ec;
         }
-        const auto [inserted_it, inserted] = versions_.emplace(reporter_key, std::move(lease));
-        (void)inserted;
-        out_lease = &inserted_it->second;
+        lease_.emplace(std::move(lease));
+        out_lease = &*lease_;
         return EC_OK;
     }
 
-    void AdoptLifecycleGeneration(const ReporterSnapshotKey &reporter_key, uint64_t lifecycle_generation) {
-        const auto it = versions_.find(reporter_key);
-        if (it != versions_.end()) {
-            it->second.lifecycle_generation = lifecycle_generation;
+    void AdoptLifecycleGeneration(uint64_t lifecycle_generation) {
+        if (lease_) {
+            lease_->lifecycle_generation = lifecycle_generation;
         }
     }
 
 private:
     std::shared_ptr<EventReportBackend> backend_;
-    std::unordered_map<ReporterSnapshotKey, LeaseInfo, ReporterSnapshotKeyHash> versions_;
-    std::unordered_map<ReporterSnapshotKey, ErrorCode, ReporterSnapshotKeyHash> snapshot_wait_failures_;
+    ReporterSnapshotKey reporter_key_;
+    std::optional<LeaseInfo> lease_;
+    std::optional<ErrorCode> snapshot_wait_failure_;
 };
 
 // 共享 helper：收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
@@ -2457,9 +2455,17 @@ bool ParseInt64(const std::string &s, int64_t &out) {
     }
 
     uint64_t magnitude = 0;
-    const auto [parsed_end, parse_ec] = std::from_chars(begin, end, magnitude);
-    if (parse_ec != std::errc{} || parsed_end != end) {
-        return false;
+    constexpr uint64_t kMaxMagnitude = std::numeric_limits<uint64_t>::max();
+    for (const char *cursor = begin; cursor != end; ++cursor) {
+        const unsigned char ch = static_cast<unsigned char>(*cursor);
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const uint64_t digit = ch - '0';
+        if (magnitude > (kMaxMagnitude - digit) / 10) {
+            return false;
+        }
+        magnitude = magnitude * 10 + digit;
     }
 
     constexpr uint64_t kSignBit = uint64_t{1} << 63;
@@ -2478,6 +2484,76 @@ bool ParseInt64(const std::string &s, int64_t &out) {
                                : std::numeric_limits<int64_t>::min() + static_cast<int64_t>(magnitude - kSignBit);
     return true;
 }
+
+struct ValidatedEventLocationSpec {
+    std::string_view name;
+    std::string_view raw_uri;
+    // Canonical ReportEvent URIs never need the heavyweight StandardUri
+    // object. Allocate it only for the compatibility fallback so the common
+    // validation result stays small and cheap to move through inline storage.
+    std::unique_ptr<DataStorageUri> parsed_uri;
+    CanonicalSnapshotUriAppendInfo canonical_uri;
+    std::uint64_t size = 0;
+    std::string versioned_uri;
+    bool is_canonical_uri = false;
+
+    bool AddPrevalidatedSnapshotVersion(const std::string &version) {
+        if (is_canonical_uri) {
+            return SnapshotUriUtils::AddPrevalidatedSnapshotVersionToCanonicalUri(
+                raw_uri, canonical_uri, version, versioned_uri);
+        }
+        if (!parsed_uri) {
+            return false;
+        }
+        versioned_uri = parsed_uri->ToUriStringWithExtraParam(SnapshotUriUtils::kSnapshotVersionParam, version);
+        return !versioned_uri.empty();
+    }
+};
+
+bool ValidateEventLocationSpec(const proto::meta::LocationSpec &spec, ValidatedEventLocationSpec &out) {
+    out = {};
+    if (spec.name().empty()) {
+        return false;
+    }
+    out.name = spec.name();
+    out.raw_uri = spec.uri();
+    if (SnapshotUriUtils::ParseCanonicalUriForSnapshotAppend(out.raw_uri, out.canonical_uri)) {
+        out.is_canonical_uri = true;
+        out.size = out.canonical_uri.size;
+        return true;
+    }
+    out.parsed_uri = std::make_unique<DataStorageUri>(spec.uri());
+    if (!out.parsed_uri->Valid() || SnapshotUriUtils::HasEventReportInternalUriMetadata(*out.parsed_uri)) {
+        return false;
+    }
+    out.parsed_uri->GetParamAs<std::uint64_t>("size", out.size);
+    return true;
+}
+
+class ValidatedEventLocationSpecs {
+public:
+    void Push(ValidatedEventLocationSpec &&spec, size_t max_spec_count) {
+        if (many_.empty() && !one_) {
+            one_.emplace(std::move(spec));
+            return;
+        }
+        if (one_) {
+            many_.reserve(max_spec_count < 2 ? 2 : max_spec_count);
+            many_.push_back(std::move(*one_));
+            one_.reset();
+        }
+        many_.push_back(std::move(spec));
+    }
+
+    [[nodiscard]] size_t Size() const noexcept { return many_.size() + (one_ ? 1 : 0); }
+    [[nodiscard]] ValidatedEventLocationSpec &At(size_t index) noexcept {
+        return index < many_.size() ? many_[index] : *one_;
+    }
+
+private:
+    std::optional<ValidatedEventLocationSpec> one_;
+    std::vector<ValidatedEventLocationSpec> many_;
+};
 
 bool IsSnapshotLocationStale(const EventReportBackend *event_backend,
                              const std::string &instance_id,
@@ -2721,57 +2797,87 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     const int events_size = request->events_size();
     std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
-    DeltaMutationGuard delta_mutations(event_backend);
+    DeltaMutationGuard delta_mutations(event_backend, reporter_key);
     uint64_t mutation_lifecycle_generation = 0;
+    bool delta_snapshot_version_validated = false;
 
     bool has_heartbeat = false;
     bool has_host_down = false;
     std::vector<int> valid_heartbeat_indices;
     std::vector<std::string> register_mediums;
     std::map<std::string, std::string> heartbeat_status;
-    for (int i = 0; i < events_size; ++i) {
-        const auto &item = request->events(i);
-        if (item.event_type() != proto::meta::EVENT_NODE_REGISTER || !item.has_node_register()) {
-            continue;
-        }
-        const bool valid_mediums =
-            std::all_of(item.node_register().mediums().begin(),
-                        item.node_register().mediums().end(),
-                        [](const std::string &medium) { return SnapshotUriUtils::IsValidLocationIdComponent(medium); });
-        if (!valid_mediums) {
-            per_item_ec[i] = EC_BADARGS;
-            continue;
-        }
-        for (const auto &medium : item.node_register().mediums()) {
-            if (std::find(register_mediums.begin(), register_mediums.end(), medium) == register_mediums.end()) {
-                register_mediums.push_back(medium);
-            }
-        }
-    }
+    bool registration_items_prepared = false;
     bool registration_applied = false;
     ErrorCode register_ec = EC_OK;
     bool node_registration_ensured = false;
-    std::unordered_set<std::string> ensured_mediums;
-    // The fold index below compares location ids by pointer identity. Every
-    // pointer comes from this request-owned intern map; unordered_map rehash
-    // invalidates iterators but preserves references/pointers to elements.
-    std::unordered_map<std::string, std::string> location_ids_by_medium;
-    location_ids_by_medium.reserve(register_mediums.size() + 1);
-    auto get_location_id = [&](const std::string &medium) -> const std::string & {
-        auto [it, inserted] = location_ids_by_medium.try_emplace(medium);
-        if (inserted) {
-            it->second = event_backend->BuildLocationId(medium, host_ip_port);
-        }
-        return it->second;
+    struct RequestMediumState {
+        InternedLocationId location_id;
+        bool registration_ensured = false;
     };
-    auto ensure_node_medium = [&](const std::string &medium) {
-        if (node_registration_ensured && ensured_mediums.count(medium) > 0) {
+    // A report overwhelmingly uses one medium. Keep registration state and
+    // the interned location id in one table, and retain the last node so the
+    // common run of thousands of `mem` events performs no repeated string
+    // hash or table probe. References to unordered_map elements survive a
+    // rehash and every resulting CacheLocation retains the shared id.
+    std::unordered_map<std::string, RequestMediumState> medium_states;
+    medium_states.reserve(register_mediums.size() + 1);
+    std::string_view last_medium;
+    RequestMediumState *last_medium_state = nullptr;
+    auto get_medium_state = [&](const std::string &medium) -> RequestMediumState & {
+        if (last_medium_state != nullptr && last_medium == medium) {
+            return *last_medium_state;
+        }
+        auto [it, inserted] = medium_states.try_emplace(medium);
+        (void)inserted;
+        last_medium = it->first;
+        last_medium_state = &it->second;
+        return *last_medium_state;
+    };
+    auto get_location_id_for_state = [&](const std::string &medium,
+                                         RequestMediumState &medium_state) -> const InternedLocationId & {
+        if (!medium_state.location_id) {
+            medium_state.location_id =
+                std::make_shared<const std::string>(event_backend->BuildLocationId(medium, host_ip_port));
+        }
+        return medium_state.location_id;
+    };
+    auto get_location_id = [&](const std::string &medium) -> const InternedLocationId & {
+        return get_location_id_for_state(medium, get_medium_state(medium));
+    };
+    auto prepare_registration_items = [&] {
+        if (registration_items_prepared) {
+            return;
+        }
+        registration_items_prepared = true;
+        for (int event_index = 0; event_index < events_size; ++event_index) {
+            const auto &event = request->events(event_index);
+            if (event.event_type() != proto::meta::EVENT_NODE_REGISTER || !event.has_node_register()) {
+                continue;
+            }
+            const bool valid_mediums = std::all_of(
+                event.node_register().mediums().begin(),
+                event.node_register().mediums().end(),
+                [](const std::string &medium) { return SnapshotUriUtils::IsValidLocationIdComponent(medium); });
+            if (!valid_mediums) {
+                per_item_ec[event_index] = EC_BADARGS;
+                continue;
+            }
+            for (const auto &medium : event.node_register().mediums()) {
+                if (std::find(register_mediums.begin(), register_mediums.end(), medium) == register_mediums.end()) {
+                    register_mediums.push_back(medium);
+                }
+            }
+        }
+        medium_states.reserve(register_mediums.size() + 1);
+    };
+    auto ensure_node_medium = [&](const std::string &medium, RequestMediumState &medium_state) {
+        if (medium_state.registration_ensured) {
             return EC_OK;
         }
         const ErrorCode ec = event_backend->EnsureNodeRegistered(instance_id, host_ip_port, {medium});
         if (ec == EC_OK) {
             node_registration_ensured = true;
-            ensured_mediums.insert(medium);
+            medium_state.registration_ensured = true;
         }
         return ec;
     };
@@ -2779,7 +2885,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         std::vector<std::string> missing_mediums;
         missing_mediums.reserve(mediums.size());
         for (const auto &medium : mediums) {
-            if (ensured_mediums.count(medium) == 0) {
+            if (!get_medium_state(medium).registration_ensured) {
                 missing_mediums.push_back(medium);
             }
         }
@@ -2789,19 +2895,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         const ErrorCode ec = event_backend->EnsureNodeRegistered(instance_id, host_ip_port, missing_mediums);
         if (ec == EC_OK) {
             node_registration_ensured = true;
-            ensured_mediums.insert(missing_mediums.begin(), missing_mediums.end());
+            for (const auto &medium : missing_mediums) {
+                get_medium_state(medium).registration_ensured = true;
+            }
         }
         return ec;
     };
 
-    struct ValidatedLocationSpec {
-        std::string name;
-        DataStorageUri uri;
-        std::uint64_t size = 0;
-        std::string versioned_uri;
-    };
     struct SnapshotReplaceEntry {
-        std::string location_id;
+        const InternedLocationId *location_id = nullptr;
         std::vector<LocationSpec> specs;
         int event_index;
     };
@@ -2818,70 +2920,142 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         size_t next = std::numeric_limits<size_t>::max();
     };
     struct DeltaEventMutation {
-        int event_index = 0;
+        std::uint32_t event_index = 0;
+        std::uint32_t next = std::numeric_limits<std::uint32_t>::max();
         bool materialized = false;
-        size_t next = std::numeric_limits<size_t>::max();
     };
     struct DeltaLocationMutation {
         int64_t block_key = 0;
-        std::string location_id;
+        const InternedLocationId *location_id = nullptr;
         size_t first_spec = std::numeric_limits<size_t>::max();
         size_t last_spec = std::numeric_limits<size_t>::max();
         size_t spec_count = 0;
-        // Structurally valid events in request order. ADD and DELETE are
-        // persisted in separate phases; if either phase fails, every event
-        // touching this stable block/location must be retried together.
-        size_t first_event = std::numeric_limits<size_t>::max();
-        size_t last_event = std::numeric_limits<size_t>::max();
-    };
-    struct DeltaLocationKey {
-        int64_t block_key = 0;
-        // Points into location_ids_by_medium for the whole request.
-        const std::string *location_id = nullptr;
-
-        bool operator==(const DeltaLocationKey &other) const noexcept {
-            return block_key == other.block_key && location_id == other.location_id;
-        }
-    };
-    struct DeltaLocationKeyHash {
-        size_t operator()(const DeltaLocationKey &key) const noexcept {
-            size_t seed = std::hash<int64_t>{}(key.block_key);
-            seed ^= std::hash<const void *>{}(key.location_id) + 0x9e3779b9U + (seed << 6) + (seed >> 2);
-            return seed;
-        }
+        // Keep the overwhelmingly common sole event inline. Only repeated
+        // mutations of one block/location need nodes in the extra-event list.
+        // ADD and DELETE are persisted in separate phases; if either phase
+        // fails, every related event must still be retried together.
+        std::uint32_t first_event_index = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t first_extra_event = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t last_extra_event = std::numeric_limits<std::uint32_t>::max();
+        bool first_event_materialized = false;
     };
     constexpr size_t kInvalidDeltaIndex = std::numeric_limits<size_t>::max();
+    constexpr std::uint32_t kInvalidDeltaEventIndex = std::numeric_limits<std::uint32_t>::max();
     std::vector<DeltaLocationMutation> delta_locations;
     std::vector<DeltaSpecMutation> delta_spec_mutations;
     std::vector<DeltaEventMutation> delta_event_mutations;
-    std::unordered_map<DeltaLocationKey, size_t, DeltaLocationKeyHash> delta_location_indices;
     delta_locations.reserve(events_size);
     delta_spec_mutations.reserve(events_size);
-    delta_event_mutations.reserve(events_size);
-    delta_location_indices.reserve(events_size);
+    bool has_materialized_delta_add = false;
+    bool has_materialized_delta_delete = false;
+
+    // Reporters normally emit unique block keys in ascending order. Fold that
+    // stream directly into the contiguous location vector: allocating and
+    // clearing an O(events) hash table only to prove every key is new costs
+    // hundreds of KiB per large request. On the first non-adjacent duplicate
+    // or out-of-order pair, lazily index all locations accumulated so far and
+    // retain the same last-op-wins semantics for arbitrary event order.
+    const size_t event_count = static_cast<size_t>(events_size);
+    size_t delta_slot_mask = 0;
+    std::vector<size_t> delta_location_slots;
+    bool delta_locations_sorted = true;
+    auto delta_location_hash = [](int64_t block_key, const InternedLocationId &location_id) {
+        size_t hash = std::hash<int64_t>{}(block_key);
+        hash ^= std::hash<const void *>{}(location_id.get()) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+        return hash;
+    };
+    auto find_delta_location = [&](int64_t block_key, const InternedLocationId &location_id) {
+        size_t slot = delta_location_hash(block_key, location_id) & delta_slot_mask;
+        while (delta_location_slots[slot] != kInvalidDeltaIndex) {
+            const size_t location_index = delta_location_slots[slot];
+            const auto &location = delta_locations[location_index];
+            if (location.block_key == block_key && location.location_id->get() == location_id.get()) {
+                return std::pair<size_t, size_t>{slot, location_index};
+            }
+            slot = (slot + 1) & delta_slot_mask;
+        }
+        return std::pair<size_t, size_t>{slot, kInvalidDeltaIndex};
+    };
+    auto build_delta_location_index = [&] {
+        size_t delta_slot_count = 8;
+        const size_t max_delta_slot_count = std::numeric_limits<size_t>::max() / 2;
+        while (event_count > delta_slot_count / 2 && delta_slot_count <= max_delta_slot_count) {
+            delta_slot_count <<= 1;
+        }
+        delta_location_slots.assign(delta_slot_count, kInvalidDeltaIndex);
+        delta_slot_mask = delta_slot_count - 1;
+        for (size_t location_index = 0; location_index < delta_locations.size(); ++location_index) {
+            const auto &location = delta_locations[location_index];
+            size_t slot = delta_location_hash(location.block_key, *location.location_id) & delta_slot_mask;
+            while (delta_location_slots[slot] != kInvalidDeltaIndex) {
+                slot = (slot + 1) & delta_slot_mask;
+            }
+            delta_location_slots[slot] = location_index;
+        }
+    };
+    auto append_delta_location = [&](int64_t block_key, const InternedLocationId &location_id) {
+        if (!delta_locations.empty()) {
+            const auto &previous = delta_locations.back();
+            if (block_key < previous.block_key ||
+                (block_key == previous.block_key && *location_id < **previous.location_id)) {
+                delta_locations_sorted = false;
+            }
+        }
+        const size_t location_index = delta_locations.size();
+        delta_locations.push_back(DeltaLocationMutation{block_key, &location_id});
+        return location_index;
+    };
     auto record_delta_event =
-        [&](int64_t block_key, const std::string &location_id, int event_index) -> std::pair<size_t, size_t> {
-        const DeltaLocationKey key{block_key, &location_id};
-        auto location_it = delta_location_indices.find(key);
-        if (location_it == delta_location_indices.end()) {
-            const size_t new_location_index = delta_locations.size();
-            delta_locations.push_back(DeltaLocationMutation{block_key, location_id});
-            location_it = delta_location_indices.emplace(key, new_location_index).first;
-        }
-        const size_t location_index = location_it->second;
-        auto &location = delta_locations[location_index];
-        const size_t event_mutation_index = delta_event_mutations.size();
-        delta_event_mutations.push_back(DeltaEventMutation{event_index, false, kInvalidDeltaIndex});
-        if (location.first_event == kInvalidDeltaIndex) {
-            location.first_event = event_mutation_index;
+        [&](int64_t block_key, const InternedLocationId &location_id, int event_index) -> std::pair<size_t, size_t> {
+        size_t location_index = kInvalidDeltaIndex;
+        if (delta_locations.empty()) {
+            location_index = append_delta_location(block_key, location_id);
         } else {
-            delta_event_mutations[location.last_event].next = event_mutation_index;
+            const auto &last = delta_locations.back();
+            if (last.block_key == block_key && last.location_id->get() == location_id.get()) {
+                location_index = delta_locations.size() - 1;
+            } else if (delta_location_slots.empty() &&
+                       (last.block_key < block_key ||
+                        (last.block_key == block_key && **last.location_id < *location_id))) {
+                location_index = append_delta_location(block_key, location_id);
+            } else {
+                if (delta_location_slots.empty()) {
+                    build_delta_location_index();
+                }
+                auto [slot, indexed_location] = find_delta_location(block_key, location_id);
+                location_index = indexed_location;
+                if (location_index == kInvalidDeltaIndex) {
+                    location_index = append_delta_location(block_key, location_id);
+                    delta_location_slots[slot] = location_index;
+                }
+            }
         }
-        location.last_event = event_mutation_index;
+        auto &location = delta_locations[location_index];
+        if (location.first_event_index == kInvalidDeltaEventIndex) {
+            location.first_event_index = static_cast<std::uint32_t>(event_index);
+            return {location_index, kInvalidDeltaIndex};
+        }
+        if (delta_event_mutations.empty()) {
+            // A request contains at most INT_MAX protobuf events, so uint32_t
+            // indexes are sufficient. Delay this allocation until a repeated
+            // block/location actually needs dependency closure.
+            delta_event_mutations.reserve(event_count);
+        }
+        const auto event_mutation_index = static_cast<std::uint32_t>(delta_event_mutations.size());
+        delta_event_mutations.push_back(
+            DeltaEventMutation{static_cast<std::uint32_t>(event_index), kInvalidDeltaEventIndex, false});
+        if (location.first_extra_event == kInvalidDeltaEventIndex) {
+            location.first_extra_event = event_mutation_index;
+        } else {
+            delta_event_mutations[location.last_extra_event].next = event_mutation_index;
+        }
+        location.last_extra_event = event_mutation_index;
         return {location_index, event_mutation_index};
     };
     auto apply_delta_spec =
         [&](DeltaLocationMutation &location, bool is_add, LocationSpec spec, std::uint64_t size = 0) {
+            has_materialized_delta_add = has_materialized_delta_add || is_add;
+            has_materialized_delta_delete = has_materialized_delta_delete || !is_add;
             for (size_t index = location.first_spec; index != kInvalidDeltaIndex;
                  index = delta_spec_mutations[index].next) {
                 auto &mutation = delta_spec_mutations[index];
@@ -2911,6 +3085,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         const auto &item = request->events(i);
         switch (item.event_type()) {
         case proto::meta::EVENT_NODE_REGISTER: {
+            prepare_registration_items();
             if (!item.has_node_register()) {
                 per_item_ec[i] = EC_BADARGS;
                 break;
@@ -2923,9 +3098,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 registration_applied = true;
                 if (register_ec == EC_OK) {
                     node_registration_ensured = true;
-                    ensured_mediums.insert(register_mediums.begin(), register_mediums.end());
+                    for (const auto &medium : register_mediums) {
+                        get_medium_state(medium).registration_ensured = true;
+                    }
                     mutation_lifecycle_generation = event_backend->GetNodeGeneration(instance_id, host_ip_port);
-                    delta_mutations.AdoptLifecycleGeneration(reporter_key, mutation_lifecycle_generation);
+                    delta_mutations.AdoptLifecycleGeneration(mutation_lifecycle_generation);
                 }
             }
             per_item_ec[i] = register_ec;
@@ -2964,34 +3141,31 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            std::vector<ValidatedLocationSpec> specs;
-            specs.reserve(params.specs_size());
+            ValidatedEventLocationSpecs specs;
             std::unordered_set<std::string_view> seen_spec_names;
             if (params.specs_size() > 1) {
                 seen_spec_names.reserve(params.specs_size());
             }
             std::uint64_t event_total_size = 0;
             for (const auto &spec : params.specs()) {
-                DataStorageUri parsed_uri(spec.uri());
-                if (spec.name().empty() ||
-                    (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) ||
-                    !parsed_uri.Valid() || SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
+                if (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
-                std::uint64_t spec_size = 0;
-                parsed_uri.GetParamAs<std::uint64_t>("size", spec_size);
-                if (spec_size > std::numeric_limits<std::uint64_t>::max() - event_total_size) {
+                ValidatedEventLocationSpec validated_spec;
+                if (!ValidateEventLocationSpec(spec, validated_spec) ||
+                    validated_spec.size > std::numeric_limits<std::uint64_t>::max() - event_total_size) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
-                event_total_size += spec_size;
-                specs.push_back(ValidatedLocationSpec{spec.name(), std::move(parsed_uri), spec_size, {}});
+                event_total_size += validated_spec.size;
+                specs.Push(std::move(validated_spec), params.specs_size());
             }
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            const std::string &location_id = get_location_id(params.medium());
+            auto &medium_state = get_medium_state(params.medium());
+            const auto &location_id = get_location_id_for_state(params.medium(), medium_state);
             // Record the retry dependency as soon as the event is
             // structurally valid. Admission may still fail before a mutation
             // is materialized (for example, a tombstoned reporter followed by
@@ -3000,7 +3174,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             // failed item could reverse the request's final operation order.
             const auto [location_mutation_index, event_mutation_index] = record_delta_event(block_key, location_id, i);
             auto &location_mutation = delta_locations[location_mutation_index];
-            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium());
+            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium(), medium_state);
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
                 break;
@@ -3008,7 +3182,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
             const DeltaMutationGuard::LeaseInfo *lease = nullptr;
             bool created_generation = false;
-            const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, lease, created_generation);
+            const ErrorCode fence_ec = delta_mutations.Acquire(lease, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
@@ -3017,9 +3191,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (created_generation) {
                 request_created_generation = true;
             }
-            for (auto &spec : specs) {
-                if (!SnapshotUriUtils::AddSnapshotVersionToUri(
-                        std::move(spec.uri), lease->snapshot_version, spec.versioned_uri)) {
+            if (!delta_snapshot_version_validated) {
+                if (!SnapshotUriUtils::IsValidSnapshotVersionToken(lease->snapshot_version)) {
+                    per_item_ec[i] = EC_BADARGS;
+                    break;
+                }
+                delta_snapshot_version_validated = true;
+            }
+            for (size_t spec_index = 0; spec_index < specs.Size(); ++spec_index) {
+                if (!specs.At(spec_index).AddPrevalidatedSnapshotVersion(lease->snapshot_version)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
@@ -3027,13 +3207,18 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            for (auto &spec : specs) {
+            for (size_t spec_index = 0; spec_index < specs.Size(); ++spec_index) {
+                auto &spec = specs.At(spec_index);
                 LocationSpec versioned_spec;
-                versioned_spec.set_name(std::move(spec.name));
+                versioned_spec.set_name_view(spec.name);
                 versioned_spec.set_uri(std::move(spec.versioned_uri));
                 apply_delta_spec(location_mutation, true, std::move(versioned_spec), spec.size);
             }
-            delta_event_mutations[event_mutation_index].materialized = true;
+            if (event_mutation_index == kInvalidDeltaIndex) {
+                location_mutation.first_event_materialized = true;
+            } else {
+                delta_event_mutations[event_mutation_index].materialized = true;
+            }
             break;
         }
         case proto::meta::EVENT_BLOCK_DELETE: {
@@ -3062,10 +3247,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
-            const std::string &location_id = get_location_id(params.medium());
+            auto &medium_state = get_medium_state(params.medium());
+            const auto &location_id = get_location_id_for_state(params.medium(), medium_state);
             const auto [location_mutation_index, event_mutation_index] = record_delta_event(block_key, location_id, i);
             auto &location_mutation = delta_locations[location_mutation_index];
-            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium());
+            const ErrorCode ensure_node_ec = ensure_node_medium(params.medium(), medium_state);
             if (ensure_node_ec != EC_OK) {
                 per_item_ec[i] = ensure_node_ec;
                 break;
@@ -3073,7 +3259,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
             const DeltaMutationGuard::LeaseInfo *lease = nullptr;
             bool created_generation = false;
-            const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, lease, created_generation);
+            const ErrorCode fence_ec = delta_mutations.Acquire(lease, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
@@ -3085,7 +3271,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             for (const auto &spec_name : params.spec_names()) {
                 apply_delta_spec(location_mutation, false, LocationSpec(spec_name, ""));
             }
-            delta_event_mutations[event_mutation_index].materialized = true;
+            if (event_mutation_index == kInvalidDeltaIndex) {
+                location_mutation.first_event_materialized = true;
+            } else {
+                delta_event_mutations[event_mutation_index].materialized = true;
+            }
             break;
         }
         case proto::meta::EVENT_BLOCK_SNAPSHOT: {
@@ -3097,7 +3287,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             struct ValidatedBlock {
                 int64_t block_key;
                 std::string medium;
-                std::vector<ValidatedLocationSpec> specs;
+                ValidatedEventLocationSpecs specs;
             };
             std::vector<ValidatedBlock> validated_blocks;
             validated_blocks.reserve(params.blocks_size());
@@ -3116,28 +3306,24 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
-                std::vector<ValidatedLocationSpec> specs;
-                specs.reserve(block.specs_size());
+                ValidatedEventLocationSpecs specs;
                 std::unordered_set<std::string_view> seen_spec_names;
                 if (block.specs_size() > 1) {
                     seen_spec_names.reserve(block.specs_size());
                 }
                 for (const auto &spec : block.specs()) {
-                    DataStorageUri parsed_uri(spec.uri());
-                    if (spec.name().empty() ||
-                        (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) ||
-                        !parsed_uri.Valid() || SnapshotUriUtils::HasEventReportInternalUriMetadata(parsed_uri)) {
+                    if (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
-                    std::uint64_t spec_size = 0;
-                    parsed_uri.GetParamAs<std::uint64_t>("size", spec_size);
-                    if (spec_size > std::numeric_limits<std::uint64_t>::max() - snapshot_total_size) {
+                    ValidatedEventLocationSpec validated_spec;
+                    if (!ValidateEventLocationSpec(spec, validated_spec) ||
+                        validated_spec.size > std::numeric_limits<std::uint64_t>::max() - snapshot_total_size) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
-                    snapshot_total_size += spec_size;
-                    specs.push_back(ValidatedLocationSpec{spec.name(), std::move(parsed_uri), spec_size, {}});
+                    snapshot_total_size += validated_spec.size;
+                    specs.Push(std::move(validated_spec), block.specs_size());
                 }
                 if (per_item_ec[i] != EC_OK) {
                     break;
@@ -3173,27 +3359,32 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 }
                 break;
             }
+            if (!SnapshotUriUtils::IsValidSnapshotVersionToken(request_snapshot_version)) {
+                per_item_ec[i] = EC_BADARGS;
+                event_backend->AbortSnapshotVersion(reporter_key, request_snapshot_version);
+                request_snapshot_version.clear();
+                break;
+            }
 
             for (auto &block : validated_blocks) {
                 std::vector<LocationSpec> versioned_specs;
-                versioned_specs.reserve(block.specs.size());
-                for (auto &spec : block.specs) {
-                    std::string versioned_uri;
-                    if (!SnapshotUriUtils::AddSnapshotVersionToUri(
-                            std::move(spec.uri), request_snapshot_version, versioned_uri)) {
+                versioned_specs.reserve(block.specs.Size());
+                for (size_t spec_index = 0; spec_index < block.specs.Size(); ++spec_index) {
+                    auto &spec = block.specs.At(spec_index);
+                    if (!spec.AddPrevalidatedSnapshotVersion(request_snapshot_version)) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
                     LocationSpec versioned_spec;
-                    versioned_spec.set_name(std::move(spec.name));
-                    versioned_spec.set_uri(std::move(versioned_uri));
+                    versioned_spec.set_name_view(spec.name);
+                    versioned_spec.set_uri(std::move(spec.versioned_uri));
                     versioned_specs.push_back(std::move(versioned_spec));
                 }
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
                 snapshot_to_replace[block.block_key].push_back(
-                    SnapshotReplaceEntry{get_location_id(block.medium), std::move(versioned_specs), i});
+                    SnapshotReplaceEntry{&get_location_id(block.medium), std::move(versioned_specs), i});
             }
             if (per_item_ec[i] != EC_OK) {
                 event_backend->AbortSnapshotVersion(reporter_key, request_snapshot_version);
@@ -3213,65 +3404,66 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     // A request is an ordered event stream. Specs and event dependencies are
     // linked through request-wide contiguous arrays, so the common one-spec,
-    // one-event block does not allocate three tiny vectors of its own. The
-    // location index implements last-op-wins while the sorted index below
-    // restores deterministic block/location task ordering.
-    std::vector<size_t> ordered_delta_location_indices(delta_locations.size());
-    for (size_t i = 0; i < delta_locations.size(); ++i) {
-        ordered_delta_location_indices[i] = i;
+    // one-event block does not allocate three tiny vectors of its own.
+    // Preserve deterministic block/location task ordering for arbitrary input
+    // without allocating an identity permutation for the already-sorted fast
+    // path.
+    std::vector<size_t> ordered_delta_location_indices;
+    if (!delta_locations_sorted) {
+        ordered_delta_location_indices.resize(delta_locations.size());
+        for (size_t i = 0; i < delta_locations.size(); ++i) {
+            ordered_delta_location_indices[i] = i;
+        }
+        std::sort(ordered_delta_location_indices.begin(),
+                  ordered_delta_location_indices.end(),
+                  [&delta_locations](size_t lhs_index, size_t rhs_index) {
+                      const auto &lhs = delta_locations[lhs_index];
+                      const auto &rhs = delta_locations[rhs_index];
+                      return lhs.block_key != rhs.block_key ? lhs.block_key < rhs.block_key
+                                                            : **lhs.location_id < **rhs.location_id;
+                  });
     }
-    std::sort(ordered_delta_location_indices.begin(),
-              ordered_delta_location_indices.end(),
-              [&delta_locations](size_t lhs_index, size_t rhs_index) {
-                  const auto &lhs = delta_locations[lhs_index];
-                  const auto &rhs = delta_locations[rhs_index];
-                  return lhs.block_key != rhs.block_key ? lhs.block_key < rhs.block_key
-                                                        : lhs.location_id < rhs.location_id;
-              });
-
-    struct DeltaBlockMutationRange {
-        int64_t block_key = 0;
-        size_t location_begin = 0;
-        size_t location_end = 0;
+    auto delta_location_index_at = [&ordered_delta_location_indices](size_t position) {
+        return ordered_delta_location_indices.empty() ? position : ordered_delta_location_indices[position];
     };
 
     KeyVector add_keys_aggr;
-    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks;
-    std::vector<DeltaBlockMutationRange> add_delta_blocks;
+    std::vector<MetaSearcher::MergeLocationSpecsTask> merge_tasks;
+    std::vector<size_t> merge_task_offsets{0};
     KeyVector del_keys_aggr;
     std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks;
-    std::vector<DeltaBlockMutationRange> del_delta_blocks;
-    add_keys_aggr.reserve(delta_locations.size());
-    merge_tasks.reserve(delta_locations.size());
-    add_delta_blocks.reserve(delta_locations.size());
-    del_keys_aggr.reserve(delta_locations.size());
-    delete_tasks.reserve(delta_locations.size());
-    del_delta_blocks.reserve(delta_locations.size());
+    if (has_materialized_delta_add) {
+        add_keys_aggr.reserve(delta_locations.size());
+        merge_tasks.reserve(delta_locations.size());
+        merge_task_offsets.reserve(delta_locations.size() + 1);
+    }
+    if (has_materialized_delta_delete) {
+        del_keys_aggr.reserve(delta_locations.size());
+        delete_tasks.reserve(delta_locations.size());
+    }
 
-    for (size_t block_begin = 0; block_begin < ordered_delta_location_indices.size();) {
-        const int64_t block_key = delta_locations[ordered_delta_location_indices[block_begin]].block_key;
+    for (size_t block_begin = 0; block_begin < delta_locations.size();) {
+        const int64_t block_key = delta_locations[delta_location_index_at(block_begin)].block_key;
         size_t block_end = block_begin + 1;
-        while (block_end < ordered_delta_location_indices.size() &&
-               delta_locations[ordered_delta_location_indices[block_end]].block_key == block_key) {
+        while (block_end < delta_locations.size() &&
+               delta_locations[delta_location_index_at(block_end)].block_key == block_key) {
             ++block_end;
         }
-        std::vector<MetaSearcher::MergeLocationSpecsTask> block_add_tasks;
         std::vector<MetaSearcher::DeleteLocationSpecsTask> block_delete_tasks;
-        block_add_tasks.reserve(block_end - block_begin);
-        block_delete_tasks.reserve(block_end - block_begin);
+        const size_t add_task_begin = merge_tasks.size();
         for (size_t location_position = block_begin; location_position < block_end; ++location_position) {
-            auto &location = delta_locations[ordered_delta_location_indices[location_position]];
+            auto &location = delta_locations[delta_location_index_at(location_position)];
             MetaSearcher::MergeLocationSpecsTask add_task{
-                location.location_id,
-                event_backend->GetStorageType(),
+                {},
+                requested_type,
                 CacheLocationStatus::CLS_SERVING,
                 {},
             };
+            add_task.borrowed_interned_location_id = location.location_id;
             std::uint64_t add_task_total_size = 0;
             bool add_task_size_overflow = false;
-            MetaSearcher::DeleteLocationSpecsTask delete_task{location.location_id, {}};
-            add_task.specs.reserve(location.spec_count);
-            delete_task.spec_names.reserve(location.spec_count);
+            MetaSearcher::DeleteLocationSpecsTask delete_task{{}, {}};
+            delete_task.borrowed_interned_location_id = location.location_id;
             for (size_t mutation_index = location.first_spec; mutation_index != kInvalidDeltaIndex;
                  mutation_index = delta_spec_mutations[mutation_index].next) {
                 auto &mutation = delta_spec_mutations[mutation_index];
@@ -3281,76 +3473,118 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     } else {
                         add_task_total_size += mutation.size;
                     }
-                    add_task.specs.push_back(std::move(mutation.spec));
+                    add_task.PushReportEventSpec(std::move(mutation.spec), location.spec_count);
                 } else {
+                    if (delete_task.spec_names.empty()) {
+                        delete_task.spec_names.reserve(location.spec_count);
+                    }
                     delete_task.spec_names.push_back(mutation.spec.name());
                 }
             }
-            std::sort(add_task.specs.begin(), add_task.specs.end(), [](const auto &lhs, const auto &rhs) {
-                return lhs.name() < rhs.name();
-            });
+            if (add_task.specs.size() > 1) {
+                std::sort(add_task.specs.begin(), add_task.specs.end(), [](const auto &lhs, const auto &rhs) {
+                    return lhs.name() < rhs.name();
+                });
+            }
             std::sort(delete_task.spec_names.begin(), delete_task.spec_names.end());
-            if (!add_task.specs.empty()) {
+            if (!add_task.SpecsEmpty()) {
                 // A pathological overflow falls back to the strict validator,
                 // which rejects the task without trusting a wrapped total.
                 if (!add_task_size_overflow) {
                     add_task.prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(add_task_total_size);
                 }
-                block_add_tasks.push_back(std::move(add_task));
+                merge_tasks.push_back(std::move(add_task));
             }
             if (!delete_task.spec_names.empty()) {
+                if (block_delete_tasks.empty()) {
+                    block_delete_tasks.reserve(block_end - block_begin);
+                }
                 block_delete_tasks.push_back(std::move(delete_task));
             }
         }
-        const DeltaBlockMutationRange block_range{block_key, block_begin, block_end};
-        if (!block_add_tasks.empty()) {
+        if (merge_tasks.size() != add_task_begin) {
             add_keys_aggr.push_back(block_key);
-            merge_tasks.push_back(std::move(block_add_tasks));
-            add_delta_blocks.push_back(block_range);
+            merge_task_offsets.push_back(merge_tasks.size());
         }
         if (!block_delete_tasks.empty()) {
             del_keys_aggr.push_back(block_key);
             delete_tasks.push_back(std::move(block_delete_tasks));
-            del_delta_blocks.push_back(block_range);
         }
         block_begin = block_end;
     }
 
+    // Failure propagation is exceptional. Avoid writing a 24-byte range for
+    // every successful block; locate the affected range in the already-sorted
+    // location view only if a backend error actually occurs.
+    auto find_delta_block_range = [&](int64_t block_key) {
+        size_t lower = 0;
+        size_t upper = delta_locations.size();
+        while (lower < upper) {
+            const size_t middle = lower + (upper - lower) / 2;
+            if (delta_locations[delta_location_index_at(middle)].block_key < block_key) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        const size_t block_begin = lower;
+        upper = delta_locations.size();
+        while (lower < upper) {
+            const size_t middle = lower + (upper - lower) / 2;
+            if (delta_locations[delta_location_index_at(middle)].block_key <= block_key) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        assert(block_begin < lower && delta_locations[delta_location_index_at(block_begin)].block_key == block_key);
+        return std::pair<size_t, size_t>{block_begin, lower};
+    };
+
+    auto visit_delta_events = [&delta_event_mutations, kInvalidDeltaEventIndex](const DeltaLocationMutation &location,
+                                                                                const auto &visitor) {
+        if (location.first_event_index != kInvalidDeltaEventIndex &&
+            !visitor(static_cast<int>(location.first_event_index), location.first_event_materialized)) {
+            return false;
+        }
+        for (std::uint32_t event_index = location.first_extra_event; event_index != kInvalidDeltaEventIndex;
+             event_index = delta_event_mutations[event_index].next) {
+            const auto &event = delta_event_mutations[event_index];
+            if (!visitor(static_cast<int>(event.event_index), event.materialized)) {
+                return false;
+            }
+        }
+        return true;
+    };
     auto mark_delta_phase_failure =
-        [&per_item_ec,
-         request,
-         &ordered_delta_location_indices,
-         &delta_locations,
-         &delta_event_mutations,
-         kInvalidDeltaIndex](const DeltaBlockMutationRange &block, ErrorCode ec, const auto &spec_participates) {
-            for (size_t location_position = block.location_begin; location_position < block.location_end;
-                 ++location_position) {
-                const auto &location = delta_locations[ordered_delta_location_indices[location_position]];
-                for (size_t event_index = location.first_event; event_index != kInvalidDeltaIndex;
-                     event_index = delta_event_mutations[event_index].next) {
-                    const auto &event_ref = delta_event_mutations[event_index];
-                    if (!event_ref.materialized || per_item_ec[event_ref.event_index] != EC_OK) {
-                        continue;
+        [&per_item_ec, request, &delta_location_index_at, &delta_locations, &visit_delta_events](
+            size_t location_begin, size_t location_end, ErrorCode ec, const auto &spec_participates) {
+            for (size_t location_position = location_begin; location_position < location_end; ++location_position) {
+                const auto &location = delta_locations[delta_location_index_at(location_position)];
+                visit_delta_events(location, [&](int event_index, bool materialized) {
+                    if (!materialized || per_item_ec[event_index] != EC_OK) {
+                        return true;
                     }
-                    const auto &event = request->events(event_ref.event_index);
+                    const auto &event = request->events(event_index);
                     bool participates = false;
                     if (event.event_type() == proto::meta::EVENT_BLOCK_ADD && event.has_block_add()) {
                         participates = std::any_of(event.block_add().specs().begin(),
                                                    event.block_add().specs().end(),
                                                    [&spec_participates, &location](const auto &spec) {
-                                                       return spec_participates(location.location_id, spec.name());
+                                                       return spec_participates(**location.location_id, spec.name());
                                                    });
                     } else if (event.event_type() == proto::meta::EVENT_BLOCK_DELETE && event.has_block_delete()) {
                         participates = std::any_of(event.block_delete().spec_names().begin(),
                                                    event.block_delete().spec_names().end(),
                                                    [&spec_participates, &location](const auto &spec_name) {
-                                                       return spec_participates(location.location_id, spec_name);
+                                                       return spec_participates(**location.location_id, spec_name);
                                                    });
                     }
                     if (participates) {
-                        per_item_ec[event_ref.event_index] = ec;
+                        per_item_ec[event_index] = ec;
                     }
-                }
+                    return true;
+                });
             }
         };
 
@@ -3366,7 +3600,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             // admitted by this same RPC belong to the recovered lifecycle;
             // retain that generation through metadata writes and lease drain.
             mutation_lifecycle_generation = event_backend->GetNodeGeneration(instance_id, host_ip_port);
-            delta_mutations.AdoptLifecycleGeneration(reporter_key, mutation_lifecycle_generation);
+            delta_mutations.AdoptLifecycleGeneration(mutation_lifecycle_generation);
         }
     }
 
@@ -3383,24 +3617,34 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (!add_keys_aggr.empty()) {
         std::vector<ErrorCode> per_key_ec;
-        meta_searcher->BatchMergeLocationSpecs(
-            request_context, add_keys_aggr, merge_tasks, per_key_ec, acquire_write_lease);
+        meta_searcher->BatchMergeLocationSpecsFlat(
+            request_context, add_keys_aggr, merge_task_offsets, merge_tasks, per_key_ec, acquire_write_lease);
 
         for (size_t k = 0; k < add_keys_aggr.size(); ++k) {
             ErrorCode key_ec = (k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR;
             if (key_ec == EC_OK) {
                 continue;
             }
-            const auto &tasks = merge_tasks[k];
+            const auto tasks_begin = merge_tasks.begin() + merge_task_offsets[k];
+            const auto tasks_end = merge_tasks.begin() + merge_task_offsets[k + 1];
+            const auto [location_begin, location_end] = find_delta_block_range(add_keys_aggr[k]);
             mark_delta_phase_failure(
-                add_delta_blocks[k], key_ec, [&tasks](const std::string &location_id, const std::string &spec_name) {
-                    const auto task = std::find_if(tasks.begin(), tasks.end(), [&location_id](const auto &candidate) {
-                        return candidate.location_id == location_id;
+                location_begin,
+                location_end,
+                key_ec,
+                [tasks_begin, tasks_end](const std::string &location_id, const std::string &spec_name) {
+                    const auto task = std::find_if(tasks_begin, tasks_end, [&location_id](const auto &candidate) {
+                        return candidate.ResolvedLocationId() == location_id;
                     });
-                    return task != tasks.end() &&
-                           std::any_of(task->specs.begin(), task->specs.end(), [&spec_name](const auto &spec) {
-                               return spec.name() == spec_name;
-                           });
+                    if (task == tasks_end) {
+                        return false;
+                    }
+                    for (size_t spec_index = 0; spec_index < task->SpecCount(); ++spec_index) {
+                        if (task->SpecAt(spec_index).name() == spec_name) {
+                            return true;
+                        }
+                    }
+                    return false;
                 });
         }
     }
@@ -3435,10 +3679,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 continue;
             }
             const auto &tasks = delete_tasks[k];
+            const auto [location_begin, location_end] = find_delta_block_range(del_keys_aggr[k]);
             mark_delta_phase_failure(
-                del_delta_blocks[k], key_ec, [&tasks](const std::string &location_id, const std::string &spec_name) {
+                location_begin,
+                location_end,
+                key_ec,
+                [&tasks](const std::string &location_id, const std::string &spec_name) {
                     const auto task = std::find_if(tasks.begin(), tasks.end(), [&location_id](const auto &candidate) {
-                        return candidate.location_id == location_id;
+                        return candidate.ResolvedLocationId() == location_id;
                     });
                     return task != tasks.end() &&
                            std::find(task->spec_names.begin(), task->spec_names.end(), spec_name) !=
@@ -3477,12 +3725,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             tasks.reserve(entries.size());
             indices.reserve(entries.size());
             for (auto &entry : entries) {
-                tasks.push_back(MetaSearcher::ReplaceLocationSpecsTask{
-                    entry.location_id,
-                    event_backend->GetStorageType(),
+                MetaSearcher::ReplaceLocationSpecsTask task{
+                    {},
+                    requested_type,
                     CacheLocationStatus::CLS_SERVING,
                     std::move(entry.specs),
-                });
+                };
+                task.borrowed_interned_location_id = entry.location_id;
+                tasks.push_back(std::move(task));
                 indices.push_back(entry.event_index);
             }
         }
@@ -3621,24 +3871,22 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     for (const auto &location : delta_locations) {
         ErrorCode group_failure = EC_OK;
-        for (size_t event_index = location.first_event; event_index != kInvalidDeltaIndex;
-             event_index = delta_event_mutations[event_index].next) {
-            const auto &event_ref = delta_event_mutations[event_index];
-            if (per_item_ec[event_ref.event_index] != EC_OK) {
-                group_failure = per_item_ec[event_ref.event_index];
-                break;
+        visit_delta_events(location, [&](int event_index, bool /*materialized*/) {
+            if (per_item_ec[event_index] != EC_OK) {
+                group_failure = per_item_ec[event_index];
+                return false;
             }
-        }
+            return true;
+        });
         if (group_failure == EC_OK) {
             continue;
         }
-        for (size_t event_index = location.first_event; event_index != kInvalidDeltaIndex;
-             event_index = delta_event_mutations[event_index].next) {
-            const auto &event_ref = delta_event_mutations[event_index];
-            if (per_item_ec[event_ref.event_index] == EC_OK) {
-                per_item_ec[event_ref.event_index] = group_failure;
+        visit_delta_events(location, [&](int event_index, bool /*materialized*/) {
+            if (per_item_ec[event_index] == EC_OK) {
+                per_item_ec[event_index] = group_failure;
             }
-        }
+            return true;
+        });
     }
 
     bool any_failure = false;

@@ -907,3 +907,773 @@ cleanup 的 generation lease 或 conditional-delete 语义。
 
 本节没有启动 Redis，也没有把 local 结果外推到 cached/Redis backend。后续 AI 至少应保留：36 项 HTTP
 功能套件、固定 blocks/s 的写读混合 A/B、TSAN 关闭期复现，以及 sanitizer 对第三方 ODR/stub 的精确处理。
+
+### 5.16 2026-08-07 perf/futex 驱动的 pure-local 单 location RMW 优化
+
+本节基于 `codex/mu-main` 的 Release/O2 产物重新采集 CPU 与 futex 栈，目标只覆盖用户线上采用的 pure-local
+metadata 模式。结论是：大请求确实会在 metadata shard mutex 上形成可见等待，但等待的根因是锁内做了过多
+通用 RMW 构造、local LRU 的逐 key lookup/release 以及 allocator 工作；单纯把 mutex 换成原子变量或增加
+writer 线程既不能保护多字段 RMW，也会破坏 key-count、capacity 和同 key 顺序语义。
+
+#### 优化前的证据
+
+- 20k `BLOCK_ADD` create/update 的 HTTP wall time 都约为 `145~147ms`；
+- CPU 样本中 HTTP JSON -> protobuf 约占 `34~36%`，`CacheManager::ReportEvent` 约占 `22%`，
+  BatchMerge/RMW 约占 `12%`；glibc `malloc/free/_int_malloc/_int_free` 等 allocator 自身累计接近 `29%`；
+- 117 个并发 10k update 请求的 paired futex 样本中，metadata shard mutex 有 284 次等待，总计
+  `119.31ms`，平均 `420us`，p95 `1.35ms`，p99 `3.65ms`，最大 `4.136ms`；glibc allocator 另有
+  1158 次等待，总计 `26.59ms`；local LRU futex 等待可忽略；
+- `meta_indexer.get_io_time_us` 在 pure-local 下并不是远端 I/O，它包含 local LRU lookup、item shared lock、
+  location 投影以及通用容器构造。不能仅凭指标名把它归因到 Redis。
+
+#### 最终实现
+
+1. `/api/reportEvent` 使用 request-scoped protobuf Arena。request/response 及其嵌套 event/spec 一次性回收，
+   不改变 protobuf wire/JSON schema；其他 HTTP API 继续使用原 handler，缩小行为变化范围；
+2. 仅当 backend 是**精确的生产 `MetaLocalBackend` 类型**、没有 cache/persistent 双层组合且每个 key 恰好一个
+   target location 时，启用扁平 RMW。装饰器、子类、测试 fault backend、cached/Redis 或多 location 请求全部
+   回退原 `ReadModifyWriteTargetLocations`，避免绕过它们覆写的审计、故障注入或恢复语义；
+3. 快路径使用扁平 `keys/location-id/location/result` 数组，一次 local batch lookup 同时返回“key 是否存在”和
+   “target location 是否存在”，随后在同一组 metadata shard locks 内 merge/upsert。这样去掉每 key 的
+   `vector<vector<...>>`、location map 构造和第二次 key existence probe，但仍严格区分新 key 与“已有 key
+   缺少该 location”，所以 `max_key_count`、`key_count` 与 sibling locations/properties 都保持正确；
+4. local backend 对 LRU 使用 `LookupBatch/ReleaseBatch`，并只替换一个 immutable `CacheLocation` shared_ptr。
+   所有 request-shaped scratch vector 在取得 metadata shard locks 前 reserve；`ScopedBatchLock` 借用稳定的
+   shard-index vector，不再为每个 batch 复制一次；
+5. duplicate key 在进入快路径前拒绝，防止同批次把一个新 key 重复计数。非法 location/null pointer、backend
+   返回 shape mismatch、key/location 状态矛盾、capacity full、modifier skip/fail 和写失败均有 fail-closed
+   处理；容量满时已有 key 的 update 仍可写入，新 key 返回 `EC_NOSPC`；
+6. metadata write lease 仍在读到旧值之后、实际 merge 前获取，并持续到 RMW 返回。不要为了缩短锁时间把
+   lease 提前到读取之前或在写入前释放，否则会破坏 snapshot generation/leader 切换期间的校验闭包。
+
+#### Release 结果
+
+同机、同配置、无编译负载的真实 HTTP `test_20_large_single_request_delta_scaling`：
+
+| events/request | 本轮基线 create/update | 最终 create/update | 降幅 |
+| ---: | ---: | ---: | ---: |
+| 100 | 约 1.5/1.4ms | 1.32~1.37/1.17~1.20ms | 小请求主要受固定 HTTP 开销影响 |
+| 1000 | 约 9ms | 7.23~7.35/6.72~6.79ms | 约 18%/24% |
+| 5000 | 约 43/42ms | 32.03~32.30/30.21~30.42ms | 约 25%/28% |
+| 20000 | 约 146/146ms | 128.01~128.11/119.76~121.40ms | 约 12%/17% |
+
+10k existing-location update 的并发墙钟时间为：单请求 `52~54ms`；同 reporter x2/x4/x8 分别
+`59.39/57.99/68.48ms`，distinct reporter x2/x4/x8 分别 `55.37/61.21/72.30ms`。x8 总吞吐超过
+`1.1M blocks/s`，说明此时继续拆 metadata lock 或增加 writer pool 没有收益证据。
+
+优化后的 futex 采样覆盖 186 个并发大请求，8 个 HTTP worker 没有一次进入 `FUTEX_WAIT`；原来最长的
+metadata shard wait 栈已降到内核休眠采样阈值以下。最新 CPU 样本的 flat-RMW 函数只剩约 `0.59%`，主要
+自耗时转为 protobuf JSON parser、glibc allocator 与 memmove/memcmp：`malloc 7.68%`、`_int_free 6.04%`、
+`_int_malloc 3.52%`、JSON token/string parse `10%+`。生产启动脚本会 preload jemalloc，直接运行 Bazel
+binary 的 benchmark 不会，因此这里的 glibc allocator 比例是保守结果。下一轮若继续优化，应先对 HTTP
+JSON 与 gRPC 做同 payload A/B；不要在没有新 futex 证据时重写正确性敏感的 RMW 锁协议。
+
+最终重新链接产物又做了一轮 20 秒全进程 trace，并在窗口内完成 8 个 10k-key reporter 的建库和 31 个
+existing-location 并发 update。全进程没有任何 `FUTEX_WAIT/FUTEX_WAIT_PRIVATE`；其余 wait-like 事件全部
+是后台线程稳定的 50ms/100ms/200ms/1s/5s timed condition wait，不在 ReportEvent 请求栈。最终 x8 same
+reporter/distinct reporter 墙钟为 `67.54/73.37ms`，吞吐为 `1.184M/1.090M blocks/s`。
+
+#### 回归门禁
+
+- pure-local HTTP snapshot/并发/失败功能套件 36/36、旧版双类型兼容套件 20/20 通过；
+- `meta_local_backend_test` 覆盖 flat read 的 key-status、sibling/property 保留、新建/更新、重复 key 顺序、
+  malformed/null/empty；`meta_indexer_test` 覆盖精确 capacity、已有 key 缺 target、modifier skip/no-op、
+  duplicate rejection；
+- `--nocache_test_results` 下 8 个核心 Release Bazel 目标全部通过；完整 `CacheManagerTest` 10 个 shard 全绿，
+  并专门验证继承 `MetaLocalBackend` 的 fault backend 会回退通用虚函数路径；MetaSearcher、backend manager、
+  HTTP JSON 等相关目标同时通过；
+- 本轮没有 Redis 性能结论，也没有修改 Redis 数据路径。以后改动借用的 location-id 生命周期、exact-type
+  guard、batch lock 范围、key-status 或 capacity 逻辑时，必须重跑上述单测、36 项 HTTP 套件、20k scaling
+  benchmark 和 paired futex 采样。
+
+### 5.17 2026-08-07 ReportEvent JSON/Arena 与 RMW allocator 收敛
+
+5.16 的锁内 flat RMW 完成后，Release `perf` 显示通用 protobuf JSON 转换仍占 CPU 的约 34%~36%，glibc
+allocator 相关符号累计接近 29%。protobuf 3.13 的通用 JSON 路径会先构造中间表示/二进制字符串，再把它解析
+进 request；默认 Arena block 只有 256B 起步、最大 8KiB。20k event 请求因此仍有大量短命分配。优化目标是
+只收敛 `/api/reportEvent` 的常见 JSON 形态，不改变其他 API、protobuf schema 或异常输入兼容性。
+
+#### JSON 与 request allocator
+
+1. 新增 `ReportEventJsonParser`，使用 RapidJSON 直接把已知 ReportEvent 字段写入最终 protobuf request；request
+   位于 handler 的 request-scoped Arena，因此不再经过“JSON -> 临时 protobuf binary -> request”的通用路径；
+2. fast parser 支持 protobuf JSON 的 snake_case/lowerCamel 字段名、字符串/数字 enum、全部现有 event oneof、
+   map/repeated 字段和未知字段忽略。`null`、未知 enum、重复字段等少见但通用 protobuf parser 可接受的形态会
+   返回 fast-path miss，清空 request 后退回 `ProtoMessageJsonUtil`。这个 fallback 是兼容性边界，不能删除；
+3. ASCII 请求先用同一轮 64-bit scan 同时检查 high bit 和原始 NUL。大于 32KiB、全 ASCII 且无原始 NUL 的
+   body 只做一次连续 mutable copy，再由 RapidJSON in-situ parse：DOM 字符串直接引用/原地 unescape 该 buffer，
+   不再先复制到 DOM pool、随后又复制到 protobuf。buffer 保持到 `ParseRequest` 完成，不跨 parser 生命周期；
+4. 非 ASCII 请求仍启用 length-aware 严格 UTF-8 校验；带原始 NUL 的 ASCII body 也保留 length-aware parser，
+   防止 C-string 提前结束把畸形 trailing bytes 当成合法 JSON。合法 `\u0000`、Unicode escape、quote/backslash/
+   newline escape 均由 in-situ 路径正确解码，并与通用 protobuf parser 做语义差分；
+5. 大于 32KiB 的 JSON 按 body 大小配置 RapidJSON pool/stack（pool 单块最多 4MiB，stack 64KiB~1MiB），
+   protobuf Arena 使用 64KiB start block、1MiB max block；小 heartbeat 保留小块默认行为。response string 预留
+   512B，避免常见响应的额外增长；
+6. parser 只借用 `req.get_body()` 的同步 `string_view`，不会保存指针。测试覆盖非 NUL 结尾 view、前后垃圾
+   backing storage、Unicode、非法 UTF-8、unknown field、数字 enum、oneof 和 fallback 与通用 parser 语义一致。
+
+#### RMW writer 临时分配
+
+1. `Cache::BatchOperationScratch` 保存 LRU batch lookup/release 的 hash、shard offset、cursor 和排序下标；pure-local
+   single-location RMW 在进入 metadata shard locks 前一次 reserve，并让读、写以及后续内部 batch 重用。普通
+   cache API 和其他 backend 仍走原虚函数语义；
+2. key view、handle、location、错误码和 upsert 数组提升到 RMW batch 循环外，按最大 batch 一次 reserve。
+   读阶段的错误码 vector 在 modifier 完成后直接承接 writer 返回值，不再另建 request-sized upsert vector；
+3. `max_key_count` 满时先把新 key 标记为 `EC_NOSPC`，再原地 compact 已有 key 的 update，删除锁内四个 subset
+   vector。已有 key 仍照常更新，新 key 不增加 key count；location handle 在每次 backend 调用结束前全部释放；
+4. scratch 快路径仍受 5.16 的 exact `MetaLocalBackend`、无 cache backend、single target location guard 保护。
+   cached/Redis、装饰 backend、fault backend 和多 location RMW 不会被静态转换或 allocation fast path 绕过。
+
+#### Release 性能与最终 profile
+
+同机、纯 local、8 HTTP worker、无编译负载，真实 HTTP
+`test_20_large_single_request_delta_scaling` 的最终结果：
+
+| events/request | create | update |
+| ---: | ---: | ---: |
+| 100 | 1.15ms | 1.15ms |
+| 1000 | 4.38ms | 4.54ms |
+| 5000 | 17.43ms | 18.12ms |
+| 20000 | 79.31~82.86ms，五轮均值 80.65ms | 74.21~76.07ms，五轮均值 74.85ms |
+
+只读 DOM 版本与 in-situ 版本在同机交替五轮均值为 `85.51/79.83ms` 与 `80.65/74.85ms`，in-situ 额外降低
+`5.7%/6.2%`。相对 5.16 同一基线的 `128.11/121.40ms`，最终 create/update 累计下降约 `37.0%/38.3%`。
+8 路同 reporter、每请求 10k existing update 的 1992 个稳态请求为 avg/p50/p95/p99
+`42.32/41.91/51.54/55.52ms`，墙钟吞吐 `1.561M blocks/s`。
+
+最终 in-situ `perf record -e cycles:u -F 999 -g --call-graph dwarf` 覆盖 14,272 个用户态样本。ASCII 路径原有的
+RapidJSON UTF-8 validation 热点保持为零，`ParseString` 从只读 DOM profile 的 `8.82%` 降到 `2.52%`。
+剩余 self CPU 以 `malloc 9.14%`、`_int_free 8.28%`、`_int_malloc 6.31%`、`memmove 5.56%` 为主，主要来自
+必须跨请求存活的 URI/LocationSpec、immutable CacheLocation、shared_ptr 和 hash/LRU 节点，而不再是 JSON
+临时 string。production 启动脚本还会 preload jemalloc，因此不要仅凭直接运行 Bazel binary 的 glibc self
+比例引入无界 thread-local body、全局对象池或 location-id interner。SAX 最多继续消除约 2.5% 的 string parse
+self CPU，却会显著扩大 parser 状态机；没有新的端到端收益证据前不建议实施。
+
+system-wide futex trace 在 792 个成功的 10k 请求窗口内，按当前 server PID 过滤后只有 9 次后台
+`FUTEX_WAIT_BITSET_PRIVATE|CLOCK_REALTIME` 定时等待和对应 wake；没有请求路径
+`FUTEX_WAIT_PRIVATE`。因此本轮没有继续拆 metadata locks 或增加 writer worker。
+
+#### 验证与后续 AI 门禁
+
+- Release 定向 `LruCacheTest`、`meta_local_backend_test`、`meta_indexer_test`、
+  `ProtoMessageJsonUtilTest` 全绿；最终真实 HTTP snapshot/并发/失败功能套件 36/36 全绿；
+- `bazelisk test --config=release --test_output=errors --nocache_test_results //kv_cache_manager/...` 分析 351 个
+  target，发现 107 个 test；106 个通过，唯一未执行的 `SdkBufferCheckUtilTest` 由 BUILD 在无 CUDA/MUSA 平台
+  显式标记 incompatible；
+- 仓库根 `//...` 会在 analysis 阶段因可选 `//3rdparty/tair_mempool` 引用未声明的 `@tair_mempool` 失败，
+  尚未进入任何 test。这是当前 checkout 的可选外部依赖配置限制，不能误报为本轮测试失败或“全仓通过”；
+- 后续修改 fast parser 必须保留 generic fallback、非 ASCII 严格校验和 bounded `string_view`；修改 RMW scratch
+  必须保证 reserve/clear 在 metadata lock 外、handle 不跨 backend 调用逃逸，并保留 exact-type/capacity/key-count
+  门禁。若新 profile 仍以 URI/CacheLocation 为主，应先优化解析结果复用或对象布局，不要回到盲目拆锁。
+
+### 5.18 2026-08-07 body 复用、location-id interning 与 fused LRU handle
+
+5.17 最终 profile 中，10K block 请求体约 1.94MiB，HTTP worker 每次仍要为 in-situ parse 创建 mutable copy；
+每个 block 又分别复制相同 reporter/medium location-id。pure-local fused RMW 的读阶段释放 LRU handle 后，写阶段
+还会对同一批 key 再做一次 hash/LookupBatch；替换旧 `CacheLocation` 时，最后一个 shared_ptr 的 URI/容器析构也
+发生在 metadata shard locks 内。本轮只优化这些已经由 profile 证实的重复工作，不改变 Redis/cached backend。
+
+#### 实现与边界
+
+1. 大 ASCII ReportEvent 使用每 HTTP thread 一个 mutable body buffer。常驻 capacity 上限为 4MiB；超过上限的
+   body 使用 request-local buffer，递归/重入解析同样回退本地 buffer。这样 10K 请求不再反复 malloc/free
+   约 1.94MiB，同时最多保留 `4MiB * HTTP worker 数`，不能删除该上限；
+2. ReportEvent request 内按 medium 创建一个 `shared_ptr<const string>` location-id，并贯通 delta ADD/DELETE、
+   snapshot replace 与 MetaSearcher task。`CacheLocation` 用 variant 保存 owned 或 interned id：普通调用方仍保留
+   owned string，只有 event path 共享。unordered_map rehash 只移动 shared_ptr，不会改变 pointee 地址，因此
+   request fold 可安全使用 pointee identity；序列化和值比较仍通过 `id()`，cache charge 继续按每 location
+   保守计算完整 id 大小；
+3. delta 的 `(block_key, location-id)` fold 从 node-based unordered_map 改为请求内 power-of-two linear-probing
+   table，正常负载不超过 50%，去掉每个 distinct block 的 hash node allocation。最终仍按 block/id 排序，
+   last-operation-wins、failure dependency closure 与输出顺序不变；
+4. exact `MetaLocalBackend` + pure-local + single-target 快路径的第一次 batch lookup 可把 handle 保留到匹配的
+   writer call。writer 使用原 read index 直接 update/insert，跳过第二次 key hash、LRU lookup 和 handle acquire；
+   skipped hit 会在新 key admission 前先释放，保持 strict-capacity 顺序。scratch 析构和所有 validation/shape/
+   capacity early-return 都兜底释放 handle；其他 backend 仍走原路径；
+5. writer 消费新 `CacheLocation` shared_ptr 并 move 进 item map，避免一次无意义的 refcount increment/decrement。
+   被替换的旧指针先移入预留好的 retired vector；该 vector 的 guard 在 `ScopedBatchLock` 之后析构，所以 URI、
+   spec vector 和 CacheLocation 的最终 free 发生在 metadata locks 外。guard 在 lock 前构造，`continue`/错误分支
+   也遵循“先 unlock、后 clear”的 C++ 逆序析构；
+6. 单 location item 用一次字符串比较代替 unordered_map hash+比较；多 location item 保留通用 find。针对
+   interned-id variant 的 hot copy constructor 显式分派 owned/shared alternative，避免 libstdc++ 通用 variant
+   copy 分派。曾尝试直接重建最终 spec vector、跳过旧 LocationSpec 深拷贝，但 20K update 五轮约慢 1ms，
+   已撤回，不能在没有新证据时重新引入。
+
+这里有意修正 5.17 的旧门禁：handle 现在可以**只在同一次 exact-local fused RMW 的配对 read/write backend
+调用之间**保留；不得越过 metadata shard lock 生命周期、请求或 backend。bounded TLS buffer 与 request-scoped
+location-id interning 也已有明确上限/所有权，不等同于无界 thread-local 或全局 interner。
+
+#### Release 性能
+
+同机、pure-local、8 HTTP worker 的 `test_20_large_single_request_delta_scaling`，最终 20K 五轮范围/均值为：
+
+| 路径 | 5.17 均值 | 本轮范围 | 本轮均值 | 进一步降幅 |
+| --- | ---: | ---: | ---: | ---: |
+| create | 80.65ms | 76.85~84.18ms | 78.40ms（中位数 77.12ms） | 2.8% |
+| existing update | 74.85ms | 69.46~71.43ms | 70.46ms（中位数 70.28ms） | 5.9% |
+
+8 路同 reporter、每请求 10K existing update 的长跑吞吐在多轮测试中为 `1.53~1.75M blocks/s`；较短且无
+编译干扰的轮次曾达到 `1.82~2.09M blocks/s`。并发结果会明显受同机编译负载和温度影响，因此不把某一轮
+最好值或固定提升百分比作为结论。可确定的结构性收益是第二次 LRU lookup/handle acquire 已消除，旧
+CacheLocation 的析构也已移出 metadata locks；perf 中 retained-handle writer self 约 0.2%，旧的 delta
+unordered_map node lookup 已退出主要热点。发布判断仍应使用隔离机器上的相同负载 A/B。
+
+#### 必须保留的测试门禁
+
+- parser 重复解析测试要覆盖 TLS buffer 复用、escaped NUL/Unicode 与 generic fallback；
+- ReportEvent 端到端测试要确认同一请求两个 block 的 `&CacheLocation::id()` 相同，不同 medium 仍隔离；
+- retained-handle 单测必须同时覆盖 existing target、existing key/missing target、new key、部分 skip、非法
+  read index 和 RAII release；MetaIndexer 的 capacity、duplicate、modifier skip/fail 用例不可删；
+- 性能结论只适用于 pure-local。任何把 retained-handle API 扩到 cached/Redis、装饰 backend 或多 target RMW
+  的修改，都必须重新证明 recovery、fault injection、capacity 和 lock ordering 语义。
+
+### 5.19 2026-08-07 spec/URI 与 request-scoped ownership 收敛
+
+5.18 后的同机 Release profile 仍显示 `StandardUri::ParseParams/Parse/ToUriStringWithExtraParam` 合计约 3.8%，
+单元素 spec/task 容器、旧 URI 深拷贝和 allocator 仍是主要 CPU 来源。RapidJSON ASCII in-situ 路径已经没有
+UTF-8 validation 栈；剩余 `ParseString` 是 JSON 字符串扫描和反转义，不能通过关闭合法性校验消除。本轮因此
+只收敛已被 profile 证明的 URI、LocationSpec、vector 和 shared ownership 开销，不引入 SAX parser，也不修改
+metadata lock、Redis/cached backend 或查询语义。
+
+#### 实现与所有权边界
+
+1. 常见单 spec BLOCK_ADD/SNAPSHOT 的校验结果和 `MergeLocationSpecsTask` 使用 inline optional；只有第二个 spec
+   到来时才提升为预留好容量的 vector。纯 ADD 请求也不再创建每 block 的一元素 task vector、空 delete task
+   reserve，最终用 flat task vector + offsets 调用 MetaSearcher；通用嵌套接口和多 spec 语义保持不变；
+2. canonical URI 使用 allocation-free string_view 扫描，一次得到 `size` 和 `s_version` 的有序插入位置，再直接
+   生成最终 URI。只有协议、正数 canonical port、显式 `key=value`、严格递增且无重复参数等条件全部满足时
+   才走快路；合法但非 canonical 的历史输入继续回退完整 StandardUri，非法 port、重复内部参数和溢出仍失败；
+3. 同一请求的 snapshot token 只做一次严格 ASCII `[0-9A-Fa-f]` 校验。每个已经独立验证过的 spec 随后使用
+   prevalidated append；通用 URI helper 仍保留逐次校验。locale `isxdigit` 被显式 ASCII 判断替代，非 ASCII
+   字节继续拒绝，不把协议 token 校验与 JSON UTF-8 校验混为一谈；
+4. `CacheLocation` 保存一个不序列化的 validated total-size hint。常见“一个旧 spec 被同名新 spec 替换”可直接
+   复用旧总大小并构造最终 immutable location，避免再次解析旧 URI、复制后立即销毁旧 URI。反序列化和任何
+   mutable spec 访问都会使 hint 失效并安全回退；多 spec、重复历史 name 和溢出仍走严格校验；
+5. ReportEvent 的 medium map 是请求内 location-id 的唯一 owner。delta fold、snapshot entry 和同步 MetaSearcher
+   task 只借用该 `shared_ptr` 对象，不再为每个 block 做原子 refcount 增减；持久化 CacheLocation 时仍获取正常
+   shared ownership。unordered_map rehash 不使 element reference 失效，且所有 borrowed 指针只允许存活到同一
+   次同步 Batch 调用返回，禁止缓存、异步投递或跨请求保存；
+6. 没有把“消费 task 并移动 spec”扩展成通用 RMW API：modifier 在不同 backend 上可能重试，贸然消费输入会改变
+   retry 语义。当前只在已经严格限定的 one-old/one-new/same-name 情况直接构造最终 immutable value，删除旧 URI
+   copy 和中间一元素 vector；CacheLocation 对外仍保持 `vector<LocationSpec>`，不扩大查询侧对象模型。
+
+#### Release A/B 与最终 profile
+
+同机、pure-local、8 HTTP worker、同一 Release 构建方式。修改前 20K 五轮 create/update 均值为
+`77.01/70.31ms`；最终独立五轮范围为 `66.96~69.57/56.12~57.57ms`，均值 `67.92/57.09ms`，分别降低约
+`11.8%/18.8%`。8 路同 reporter、每请求 10K existing update 的 100 轮长跑为 avg/p50/p95/p99
+`23.12/21.87/33.89/36.07ms`，吞吐 `2.572M blocks/s`；本轮初始基线为 avg `31.92ms`、吞吐
+`1.992M blocks/s`，对应平均 RT 降约 `27.6%`、吞吐升约 `29.1%`。共享机器存在频率和编译扰动，生产判断仍
+应在隔离机器做同 payload A/B。
+
+提交前另启一个长生命周期 pure-local Release 实例复验：20K 五轮 create/update 为
+`71.16~73.93/57.31~59.44ms`，均值 `73.00/58.41ms`；8x10K、100 轮的两次独立长跑 avg 为
+`22.68~27.67ms`、p99 为 `30.33~42.17ms`、吞吐 `2.328~2.973M blocks/s`。create 对共享机频率和
+allocator 冷热更敏感，但 update 与并发吞吐均保持相对基线的明确改善，且全程无业务错误。
+
+重放到包含 P2P host-count 配置的新远端基线后，再次从头构建 Release 二进制：20K create/update 为
+`67.51/55.96ms`；8x10K、100 轮为 avg/p50/p95/p99 `23.07/22.03/33.16/34.85ms`，吞吐
+`2.605M blocks/s`。这组提交前数据说明基线组合没有抵消本轮收益。
+
+最终 perf 中 `StandardUri::ParseParams/Parse/ToUriStringWithExtraParam` 和 locale `isxdigit` 已退出热点列表；
+中间版本的 shared_ptr add-ref self 从 `3.50%` 降到最终 `1.53%`。剩余主要是 JSON 必需字符串扫描、glibc
+allocator、immutable CacheLocation 写入、LRU hash/lock 和最终 URI copy。production 使用 jemalloc，直接 Bazel
+binary 的 glibc 比例仍是保守上界；没有证据支持无界 object pool、全局 location-id interner或放宽 JSON 校验。
+
+#### 验证门禁
+
+- `SnapshotUriUtilsTest` 覆盖 canonical 与 StandardUri 输出等价、非 canonical fallback、无效/重复参数、严格
+  ASCII token；`MetaSearcherTest` 覆盖 flat offsets、inline spec、borrowed owner 引用计数和 total-size hint；
+- `CacheManagerTest` 10 个 shard 覆盖 ADD/DELETE/SNAPSHOT、last-op-wins、failure closure、capacity 和同请求
+  location-id 共享；真实 HTTP snapshot 套件 36/36、双类型兼容套件 20/20 通过；
+- reporter lifecycle 定向阻塞回归连续 50/50 通过；全量 `bazel test --config=release
+  //kv_cache_manager/...` 共发现 107 个目标，106 个可执行目标全部通过，另 1 个 GPU-only 目标因环境不兼容跳过；
+- 修改 canonical parser 时必须维持“无法证明 canonical 就 fallback”的 fail-safe 边界；修改 borrowed id 时
+  必须证明 owner 覆盖整个同步 Batch 调用。不得把裸指针写入 backend、队列、cleanup callback 或 response。
+
+### 5.20 2026-08-07 顺序流快路、异常路径按需分配与最终锁审计
+
+5.19 之后用 production-like `LD_PRELOAD=/lib64/libjemalloc.so.2` 重新采样。常见请求是同一 reporter、同一
+medium、block key 递增且每个 `(block, location)` 只有一个 event；旧实现仍会为这些已经有序且唯一的数据建立
+完整 open-address index、event dependency 数组、排序 permutation 和 ADD/DELETE 两套 failure range。另一个
+剩余热点是通用字段名 helper 的函数调用，以及 canonical decimal 字段走 `from_chars`。本轮只增加能保持任意
+事件顺序、partial failure 和历史 URI 兼容性的按需快路，没有修改 persistent/cached/Redis backend、查询对象
+布局、metadata lock 范围或 lifecycle fencing。
+
+#### 实现与正确性边界
+
+1. `DeltaMutationGuard` 直接保存本 RPC 唯一的 `ReporterSnapshotKey`、可选 lease 和可选 snapshot-in-progress
+   failure，不再为每个 delta event 查两张 reporter-key unordered map。一个 ReportEvent request 的 instance、
+   host 和 storage 在入口已经固定，因此不存在第二个合法 reporter key；generation adoption 和析构时
+   `EndDeltaMutation` 仍只针对成功取得的同一 lease；
+2. registration 状态和 interned location-id 合并到 request-scoped medium state。连续相同 medium 用最后一次
+   state 指针命中，不重复 hash/probe；location-id 仍按需创建并由 medium state 持有。`NODE_REGISTER` 的全请求
+   预扫描改为第一次真正遇到 register 时才执行，纯 ADD/DELETE 不再额外遍历一遍 protobuf events；多 register、
+   malformed register、delta-before-register 和 generation 继承语义由原有回归保留；
+3. delta fold 对递增唯一 `(block_key, location-id)` 直接 append。只有出现非相邻 duplicate 或逆序 pair 时才
+   建立 power-of-two index；只有最终 unique-location 顺序确实非递增时才分配并排序 permutation。任意顺序仍
+   使用同一个 last-op-wins fold，随机 768-event reference-model 测试覆盖 48 keys、17 media、4 specs；
+4. 每个 location 的第一个 dependency event 内联保存，额外 event 链只在同一 `(block, location)` 第二次出现时
+   分配，索引收窄为 `uint32_t`（protobuf event count 上限是 `INT_MAX`）。ADD/DELETE phase failure 以及 admission
+   failure 的 retry closure 仍遍历完整逻辑 event 链；
+5. 只在实际 materialize ADD/DELETE 后 reserve 对应 phase 数组，ADD-only 不再分配 DELETE capacity，反之亦然。
+   每 block 的 24-byte failure range 也被移除：成功路径不写这份数据，只有 backend 返回错误时才在已排序
+   location view 中二分定位 block range。新增乱序三 block fault test 验证只标记实际失败 block，前后成功 block
+   仍可查询；
+6. canonical URI 的 port/size 与 block key 使用严格、overflow-checked 的手写十进制循环，去掉 generic
+   `from_chars`。port 继续拒绝 0、符号、前导零和大于 `INT64_MAX`；size 接受完整 `uint64`；block key 继续接受
+   signed int64 和 vLLM unsigned uint64 decimal，并保持相同 64-bit pattern。测试覆盖 `INT64_MAX` port、port
+   overflow、`UINT64_MAX` size、size overflow，以及 block-key 两侧边界和非法符号；
+7. canonical spec 不再内嵌构造重量级 `StandardUri`；只有合法但非 canonical 的兼容输入才按需分配 parser。
+   `ValidatedEventLocationSpecs::Push`、`PushReportEventSpec` 改为显式右值入口，最终 URI/LocationSpec 继续 move；
+8. JSON parser 的字段名比较改成 compile-time string-literal 长度加 `memcmp`，保留 snake_case、camelCase、
+   embedded-NUL 和 exact-length 语义。最终 profile 中原先约 1.58% 的 out-of-line `NameIs` 已完全退出热点；
+9. task 构造复用入口已验证过的 `requested_type`，不再对每个 block 重复调用 backend virtual getter。snapshot、
+   delta 和 query 仍使用同一 routing decision，不改变 L1P5/L2 隔离。
+
+#### 同机 A/B 与 perf 结论
+
+同一 Release 构建、pure-local、8 HTTP workers、jemalloc、五个 fresh instance 的 20K scaling：
+
+| 路径 | 修改前五轮均值 | 最终五轮范围/均值 | 降幅 |
+| --- | ---: | ---: | ---: |
+| create | 65.75ms | 58.38~61.89ms / 59.56ms | 约 9.4% |
+| existing update | 57.37ms | 49.20~51.99ms / 50.23ms | 约 12.5% |
+
+8 路同 reporter、每请求 10K existing update 在共享机器及 perf instrumentation 下为约
+`2.72~3.47M blocks/s`，所有轮次 fail/drop 均为 0。共享机器频率、其他 Bazel 进程和 perf tracing 会造成明显
+漂移，因此并发结果只用于排除回退，生产收益应继续做隔离机 paired A/B；串行五轮是本轮更稳定的比较。
+
+最终 `cycles:u` profile 覆盖 57,389 samples、35.92M blocks。主要 self CPU 为 LRU mutex unlock `9.34%`、
+`memmove 5.50%`、shared_ptr add/release `5.46%/3.47%`、RapidJSON `ParseString 4.99%`、ReportEvent orchestration
+`4.59%`、targeted RMW `3.60%`、mutex lock `3.01%`、`ParseObject 2.67%`、LRU hash find `2.05%` 和 canonical URI
+`1.75%`；jemalloc `malloc` 仅 `1.45%`。`from_chars`、out-of-line `NameIs`、eager fallback `StandardUri`、
+common-path delta hash-table build 和 success-path failure range 都已退出热点。
+
+锁需要区分“执行 lock/unlock 指令”与“线程实际睡眠”。15 秒 futex enter/exit 配对覆盖 2,392 个 10K 请求：
+
+- `FUTEX_WAIT_PRIVATE` 真正睡眠 17,679 次，总计约 2.879s，单次平均约 163us、最大 4.735ms，折合每请求约
+  1.20ms；另有 35,158 次在约 19.1ms 总计内返回 `EAGAIN`；
+- CPU call graph 将 mutex 成本定位在 local LRU `LookupBatchWithScratch` 和 retained-handle
+  `ReleaseBatchWithScratch`；metadata `pthread_rwlock` 没有进入 futex sleep，因此不是线上 80ms 的来源；
+- 尝试按 worker 旋转 LRU shard 遍历起点以打散 convoy，真实吞吐连续下降到 `2.21~2.77M blocks/s`，串行也
+  回退，已完整撤销。稳定 shard 顺序的 cache locality 比减少短 wait 更重要；
+- retained handle 的 release 当前仍发生在 metadata lock 生命周期内。把它移出锁会改变并发 capacity/LRU
+  admission 窗口，不能只为约 1.2ms/request 的可消除上界冒险。若以后重写 refs 为 atomic 或 fused shard
+  callback，必须单独证明 eviction、delete、capacity、query 并发和 lock ordering。
+
+剩余 `ParseString` 是 JSON 字符串扫描/反转义，ASCII 路径已没有 UTF-8 validation 栈；继续下降需要 SAX/direct
+parser，收益上界约 5% 且兼容性风险明显。shared_ptr/LRU 与最终 URI copy 是下一批结构性候选，但都会触及查询
+共享对象或 cache eviction。没有新的隔离机 profile 与正确性模型前，不应继续用全局 interner、无界对象池、
+扩大 metadata lock batch 或 lock-free refcount 改写换取小优化。
+
+#### 最终门禁
+
+- 每项结构变化后均运行对应 Release `CacheManagerTest --test_filter=*ReportEvent*`；新增乱序 failure-range 测试；
+- `SnapshotUriUtilsTest`、`ProtoMessageJsonUtilTest`、`MetaSearcherTest`、`LruCacheTest`、
+  `meta_local_backend_test` 必须保持全绿；
+- 提交前必须重新跑 pure-local HTTP snapshot 套件 41/41（36 functional + 5 benchmark）、旧 ReportEvent
+  兼容套件 21/21（20 functional + 1 benchmark）、完整 Release
+  `//kv_cache_manager/...`（无 GPU 环境预期 106 pass + 1 incompatible）；
+- 性能测试必须确认启动进程 maps 中加载 jemalloc。实验性 URI prefix cache、直接重建最终 spec vector 和 LRU
+  shard rotation 都已因无收益或回退撤销，后续 AI 不应在没有新的 paired A/B 证据时重复引入。
+
+### 5.21 2026-08-07 收敛复核：allocator、URI 所有权与 item lock 的负向实验
+
+5.20 后又在完全相同的 pure-local Release 配置下做了一轮独立复核。本节的目的不是记录“还能想到什么”，而是
+把已经实测无收益的候选、其正确性边界和停止条件固定下来，避免后续仅凭 profile 百分比重复引入更复杂的所有权
+或锁协议。下面所有实验都在独立修改后测试、A/B，未达到门槛的实现均已完整撤销；最终生产代码仍是 5.20 的
+实现。
+
+#### 更大样本的 clean profile
+
+使用 production-like `LD_PRELOAD=/lib64/libjemalloc.so.2`、8 HTTP workers，对干净 HEAD 采集
+`cycles:u -c 100003 -g --call-graph fp`。样本覆盖 198,470 个 samples、792 个 10K-block 请求，共 7.92M
+blocks；负载 avg/p50/p95/p99 为 `19.09/18.46/27.00/28.53ms`，吞吐 `3.177M blocks/s`，业务错误为 0。
+主要 self CPU 为：
+
+| 热点 | self CPU |
+| --- | ---: |
+| `memmove` | 10.08% |
+| LRU `pthread_mutex_unlock` | 6.22% |
+| RapidJSON in-situ `ParseString` | 5.19% |
+| `CacheManager::ReportEvent` | 4.73% |
+| targeted RMW | 3.63% |
+| merge modifier | 3.40% |
+| parser orchestration/ASCII scan | 3.08% |
+| shared_ptr add/release | 2.81% / 2.21% |
+| RapidJSON `ParseObject` | 2.77% |
+| LRU hash lookup | 2.20% |
+| LRU `pthread_mutex_lock` | 1.92% |
+| item rwlock read/write/unlock | 1.68% / 1.63% / 1.59% |
+| jemalloc `malloc` | 1.52% |
+
+`memmove` 的主要调用方依次是最终 immutable `LocationSpec` 构造、TLS body copy、protobuf arena string 和
+RapidJSON；它不是一个可整体删除的重复 copy。锁的百分比同样主要是成功的 lock/unlock 指令，不等于线程睡眠：
+5.20 的 futex trace 已把实际等待上限量化为约 1.20ms/request。
+
+#### 已撤销实验及 A/B
+
+1. **旧版消费 task URI 实验（历史结果；5.24 已用更窄的 prevalidated-only 实现重新验证并保留）。**
+   当时为 pure-local、单 location、flat task 增加了显式 consumable
+   API，并保留 spec name 供失败映射；create/update、多 location 不消费及错误语义定向 UT 全部通过。但五轮串行
+   existing-update 对照为 `50.02ms`，候选为 `50.08ms`，并发也无稳定信号。该 copy 在 profile 中可见，却不是
+   当前 wall-time 瓶颈；消费输入还会扩大 backend retry 语义，故完整撤销。5.18 中“直接重建最终 spec vector”
+   曾回退约 1ms，这次不同实现得到相同结论。
+2. **exact-local RMW 跳过逐 item shared read-lock。** 前提审计确认 MetaIndexer shard lock 覆盖本路径的生产写，
+   定向 `MetaLocalBackend/MetaIndexer/MetaSearcher/CacheManager` Release UT 全绿。12 轮 fresh-process A/B 中，baseline
+   update `50.01ms`、候选 `50.28ms`；并发吞吐 baseline `3.255M`、候选 `3.165M blocks/s`。把分支移出 key loop
+   后仍为 `50.42ms` 对 `50.48ms`，约 1.8% 的并发差异处于机器噪声内。可见的 rwlock 指令没有形成稳定 RT 收益，
+   而特殊“外层锁隐含保护”会增加未来 backend 维护风险，故完整撤销。
+3. **bounded TLS RapidJSON DOM arena + DOM/stack 共用 allocator。** 实测 DOM：`202,157B` body 使用
+   `256,160B`、capacity `404,314B`；`1,010,163B` body 使用 `1,280,160B`、capacity `2,020,326B`，即 DOM
+   约为 body 的 1.27 倍。第一版 `vector::resize` 首次清零使 create 从 baseline `60.15ms` 回退到 `62.12ms`，
+   虽然同连接 update 一度为 `48.93ms` 对 `50.09ms`。改成对齐但不初始化、最大 6MiB 的 TLS storage 后，七轮
+   create/update 仍为 `61.52/50.91ms`，相对 baseline `60.15/50.09ms` 均回退。jemalloc 已能有效复用大块；
+   单一 arena 的布局/局部性损失超过 1.52% allocator 上限，故完整撤销且不承担每 worker 额外常驻内存。
+
+#### 最终停止条件与后续边界
+
+- 不实现 SAX/direct JSON parser。剩余 `ParseString` 上界约 5.2%，但必须重新实现 snake/camel aliases、enum
+  string/numeric、int64/uint64 JSON 表达、unknown/duplicate field、escaped/raw NUL、Unicode/非法 UTF-8 和 generic
+  fallback 的全部兼容面；收益与上线风险不匹配。
+- 不启用 adaptive LRU mutex，也不把 item unique-lock跨越 modifier。真实 futex wait 很短，而持锁延长或自旋会
+  直接与优先级更高的 GetHostCacheState 争用；“CPU 有余量”不能替代 query p99 的同负载 A/B。
+- 不把**持久化 owner**改成裸指针/全局 interner，不原地修改对查询可见的 CacheLocation。add/ref 与析构是
+  immutable query snapshot 的所有权成本；只有 5.22 所述“同步调用内、retained handle + shard lock 双重保护”的
+  旧值借用是例外，借用结束后的 owner 仍是 `shared_ptr`。
+- `EstimateMemUsage`、metrics attach、block-key decimal parse 等单项均低于约 1%；为它们增加 persistent 字段、
+  request TLS side channel 或跨层 hint 会增加每 key 内存与协议耦合，不满足“端到端有稳定收益”的门槛。
+
+后续只有在隔离机的新 profile 显示热点结构发生变化时，才应重新打开上述方向。下一阶段若要获取超过噪声的收益，
+需要独立设计并验证 cache item/immutable location 的表示或真正的 backend shard callback；这属于新的并发协议，必须
+以 Get/ReportEvent 混合负载、eviction/capacity/fault/lifecycle 完整模型作为前置条件。5.22 只完成了 exact-local
+同步借用这一条窄路径的证明，不代表可以把相同假设扩展到持久 owner、异步 backend 或调用边界之外。
+
+### 5.22 2026-08-07 最终所有权复核：借用旧 location，保留 immutable query snapshot
+
+5.21 的停止条件之后又用更大的 clean profile 做了源码行和调用栈聚合。结论是不能把全部
+`shared_ptr add/release` 都看成同一个问题：新 `CacheLocation` 持有 interned location id 所产生的一次引用是
+持久化所有权，不能删除；pure-local fused RMW 从 item map 读取旧 `CacheLocation` 时产生的临时引用，仅用于同步
+modifier，生命周期已被 metadata shard lock 和 retained cache handle 覆盖，可以安全消除。本节记录两项先行负向
+实验、最终保留实现及其严格边界。
+
+#### 两项已完整撤销的 HTTP/parser 实验
+
+1. **canonical BLOCK_ADD 的 RapidJSON SAX parser。** 实现支持 snake/camel alias、字符串/数字 enum、任意字段顺序，
+   遇到 mixed event、未知形状、Unicode 或非 canonical 输入即回退现有 DOM parser，相关 JSON UT 全绿。SAX 确实
+   让 DOM `ParseObject`/`Document::String` 退出 profile，但状态机和逐 token protobuf setter 把成本转移到了 SAX
+   `ParseString`：七轮 20K create/update 为 `60.39/50.26ms`，同机 fresh baseline 为 `60.28/50.25ms`；8 路
+   concurrent 10K 为 avg `19.10ms`、`3.508M blocks/s`，baseline 为 `17.96ms`、`3.699M blocks/s`。没有串行
+   收益且并发回退，已完整撤销。
+2. **thread-local reusable protobuf Arena/request graph。** 对 32KiB~2MiB body 复用 worker-local request message，
+   reentrant/oversize 请求回退到 request-scoped arena，并设置 8MiB hard cap。`Clear()` 仍需遍历全部 message tree，
+   保留的 repeated message/string capacity 还增加 cache footprint。三轮 concurrent 10K 只有
+   `3.01~3.23M blocks/s`，低于同机 baseline `3.699M`；进程 RSS 约 `267MiB`。实现和常驻内存均已撤销。
+
+这两项说明 allocator 百分比不能直接当作可回收 wall time：jemalloc 和 request-scoped protobuf Arena 已能较好
+复用大块，跨请求保留对象反而破坏局部性；direct parser 也必须用端到端 A/B 判断，不能只看某个 DOM symbol 消失。
+
+#### 保留实现：RMW 旧值使用同步借用视图
+
+pure-local `ReadModifyWriteSingleTargetLocations` 原来把 item map 中的旧 `shared_ptr<CacheLocation const>` 复制到
+batch vector，modifier 构造新 immutable value 时再释放这份临时引用。最终实现改为：
+
+- backend 在 item shared lock 内只返回 `const CacheLocation *`；接口名显式为 borrowed view，并且**没有**
+  “不保留 handle”的开关；
+- `ScopedBatchLock` 在整个 read/modifier/write 周期持有目标 metadata shards，retained cache handle 保证被 LRU
+  eviction 摘除的 `MetaMemCacheItem` 也不会析构，item map 自身继续拥有旧 location；
+- modifier 只读旧对象，在栈上构造独立的 `shared_ptr<const CacheLocation>` 新值，成功后直接 move 到 upsert vector；
+  不原地修改任何查询可见对象；
+- writer 仍在 item unique lock 内原子替换 map entry，旧 owner move 到 `retired_locations`，并在 metadata lock
+  释放后析构。并发查询仍先在 item shared lock 内复制旧或新 `shared_ptr`，因此继续获得完整 immutable snapshot；
+- generic/Redis/cached backend 仍走原有 owning `shared_ptr` 路径。借用接口只在
+  `SupportsSingleLocationRmw()` 已确认 exact pure-local backend 时可达。
+
+第一版曾额外创建一个 request-sized replacement `shared_ptr` 数组；串行虽有约 2% 信号，但 8 路并发回退
+4%~8%。最终改成每次 modifier 的栈上新值、成功后直接 move，去掉第二个数组后并发回退消失。后续不得重新引入
+双 request-sized location 数组。
+
+#### 正确性门禁与性能证据
+
+- backend/indexer UT 直接记录旧 owner 的 `use_count`，断言 borrowed read 前后不增加；同时覆盖 hit、key exists but
+  location miss、key miss、capacity full 时保留 existing-key update、modifier skip、duplicate key、retained handle
+  subset validation 和旧值延迟析构；
+- `TestGetHostCacheStateConcurrentWithReportEventAndHostDown` 在 Release 下重复 200 个 sharded runs 全绿，覆盖查询
+  与连续 immutable replacement、HOST_DOWN 可见性切换并发；定向 local backend、MetaIndexer、CacheManager 测试全绿；
+- 最终完整 Release `//kv_cache_manager/...` 为 106 个可执行测试全绿、1 个 GPU-only 测试按预期 skip；最终链接
+  HTTP 二进制的 snapshot 套件 36 functional + 5 benchmark 全绿，旧协议/双类型套件 20 functional + 1 benchmark
+  全绿。`/proc/<pid>/environ` 和 `maps` 同时确认加载 `/usr/lib64/libjemalloc.so.2`；
+- 八组交错顺序的同机 20K paired A/B：create `61.017 -> 60.911ms`（符合预期，new-key 路径基本中性），existing
+  update `50.429 -> 49.714ms`，下降约 `1.42%`；
+- 三轮固定 800 个 10K 请求的 `perf stat`：cycles 均值 `44.171B -> 41.675B`（约 -5.65%），instructions
+  `103.277B -> 102.978B`（约 -0.29%），cache misses `211.54M -> 187.13M`（约 -11.54%）。共享机频率会影响
+  cycles，稳定结论是“没有新增指令膨胀，旧 owner 的 cache-line/refcount 流量下降”；
+- 最终候选 profile 覆盖 548,846 samples。`shared_ptr::_M_release` self share 从 clean baseline 的 `2.21%` 降到
+  `1.20%`。剩余 `_M_add_ref_copy` 主要来自每个新 `CacheLocation` 对 interned location id 的持久 owner，不应按本次
+  方法继续删除；
+- 8 路 10K update 加 200 次 10K-key GetHostCacheState 的 closed-loop 混合压测无错误。五组候选 Get avg 聚合约
+  `10.75ms`，baseline 约 `11.23ms`；p99 范围分别为 `22.13~27.97ms` 与 `14.53~26.84ms`，共享机 tail 有明显
+  抖动且两者重叠，因此只下“查询未出现系统性回退”的结论，不宣称 p99 提升。
+
+#### 本轮后的停止线
+
+当前 profile 的大项依次是 LRU mutex、最终 string/memmove、RapidJSON string scan、manager/merge、interned-id owner
+和 item rwlock。已有 futex trace 证明真正 sleep 远小于 lock/unlock self CPU；SAX、TLS protobuf graph、DOM pool、
+LRU shard rotation 和跳过 item read-lock 均已有负向 A/B。继续消除 interned-id owner 需要 process/instance lifetime
+string pool，继续消除 item lock 需要把 modifier 放进 backend critical section，这两者都会扩大查询或回收风险。
+在出现新的隔离机 profile 之前，本分支不再接受以 raw global pool、原地可变 CacheLocation、扩大锁范围或无界 TLS
+缓存换取低个位数百分比的改动。
+
+### 5.23 2026-08-07 HTTP body 原地解析、SIMD 扫描与 RMW 临时状态收敛
+
+5.22 的 clean profile 继续按 `memmove` 调用方拆分后发现一个此前被总占比掩盖的确定重复工作：
+`MutableJsonBufferLease` 把 cinatra 已经完整收进 `std::string` 的 HTTP body 再复制一遍，随后才执行 RapidJSON
+in-situ parse。该调用方占当时全部 `memmove` samples 的 `23.44%`，折算约占总 CPU `2.07%`。这与最终
+`LocationSpec/URI` 的持久化 copy 不同：后者建立 immutable metadata 所有权，前者只是为获得 mutable buffer
+而复制同一请求体，可以在明确 transport 生命周期后删除。
+
+#### 保留实现与兼容边界
+
+1. `GetArenaHandler` 允许为特定请求注册 `char * + size` parser。当前锁定的
+   yalantinglibs/cinatra 0.5.5 在 `coro_http_connection` 中用 mutable `std::string body_` 保存完整 Content-Length
+   body，`request_.set_body(body_)` 只暴露同步 `string_view`；logger 在 handler 前读取 request，handler 返回后才复用
+   connection。因此 ReportEvent 可以在 coroutine 内直接 ParseInsitu，protobuf/DOM 均不保存 body 指针；其他 HTTP
+   API 继续使用 immutable、length-aware parser。
+2. mutable API 的契约显式要求 `json[size]` 可读且为 `\0`，入口仍做防御检查。小于 32KiB、非 ASCII 或含 raw NUL
+   的 body 保留旧 parser；小 heartbeat/register 直接进入旧 parser，不再先做一次随后必然重复的 ASCII scan。
+3. 快速 protobuf converter 若遇到 `null`、未知 enum 等少见但 generic protobuf JSON 接受的形状，不能再使用已被
+   in-situ 修改的原文。实现从**完整 DOM**序列化一次 normalized JSON，再调用 generic parser；该分配只发生在兼容
+   fallback。JSON 语法错误直接返回 bad request，因为 fast/generic parser 都不应接受它。
+4. ASCII/raw-NUL 预扫描在 x86 上运行时分派 AVX2（32 bytes/iteration），无 AVX2 时使用 SSE2；AArch64 使用 NEON，
+   其他平台保留严格 scalar fallback。非 ASCII 路径仍启用 RapidJSON UTF-8 validation，没有用 SIMD 检测替代编码
+   正确性。
+5. `BatchMergeLocationSpecsImpl` 不再同时保存 `incoming_task_sizes` 与 `usage_changes`。incoming size 直接初始化对应
+   usage slot，modifier 一次调用内读出后写回 final size；exact pure-local 的一 location/key 路径还直接用 key index，
+   不分配 offsets。20K 主路径因此减少约 `160KiB + 160KiB` 临时数组和一次 request-shaped allocation；
+   multi-location 仍保留 flattened offsets 和完全相同的验证/计量语义。
+
+这里的 transport 假设是严格回退边界：若升级 cinatra 后 body 不再由 mutable、NUL-terminated `std::string` 支撑，
+必须删除 specialized parser 或恢复 immutable copy，不能仅依赖 `const_cast` 继续运行。UT 直接覆盖 mutable API 的
+escaped quote/backslash/newline、合法 `\u0000`、Unicode escape、raw NUL 拒绝，以及 source 已被修改后 rare fallback
+仍与 generic protobuf parser 完全一致。
+
+#### A/B 与最终 profile
+
+- 删除 HTTP TLS body copy 的 8 组交错 20K scaling：create `60.276 -> 59.301ms`（约 `-1.62%`），existing update
+  `50.035 -> 49.894ms`（接近中性）；8 路 10K steady throughput 约提高 `1.83%`。create 包含旧 TLS buffer 的首次
+  allocation/first-touch，warm update 的收益上界本来就较小。
+- SSE2/AVX2 各用 fresh process 做 8 组同长度 payload：`3.258M -> 3.307M blocks/s`，约 `+1.5%`；profile 中
+  ASCII scan self share 从约 `2.13%` 降至 `1.69%`。该数据只证明 portable SIMD dispatch 有小幅正收益，不外推
+  为整条 ReportEvent 的固定 SLA。
+- RMW 临时状态收敛单独做 8 组 paired A/B：20K create/update 均值
+  `56.755/49.008 -> 56.392/48.648ms`，约 `-0.64%/-0.73%`；8 路 10K 的平均 RT
+  `18.730 -> 18.281ms`，吞吐 `3.238M -> 3.347M blocks/s`（约 `+3.4%`）。共享机频率会放大低个位数差异，
+  稳定结论以“减少 320KiB 临时写流量且没有回退”为主。
+- 最终 `cycles:u` profile 覆盖 14.32M blocks。TLS body-copy caller 已从 `memmove` call graph 完全退出；剩余
+  `memmove` 中约 `72.26%` 来自 merge modifier 建立最终 LocationSpec/URI，约 `11.87%` 来自 protobuf arena string。
+  flat self CPU 主要为 LRU mutex unlock `8.91%`、RapidJSON ParseString `5.90%`、memmove `5.67%`、interned-id
+  persistent owner add-ref `5.00%`、single-target RMW `4.86%`、manager `4.06%`、mutex lock `2.94%`。热点结构与
+  5.22 的所有权/锁结论一致，没有出现新的远端 I/O、serialization 或 futex sleep 路径。
+
+#### 本轮已撤销实验
+
+1. **把 UTF-8 validation 融入一次 RapidJSON parse、删除预扫描。** 定向 UT 通过，但 fresh 20K create/update 从
+   `58.78/49.52ms` 回退到 `62.77/52.83ms`，约 6%；branch-heavy codepoint validation 明显慢于 SIMD ASCII scan，
+   已撤销。
+2. **按 canonical JSON 字段位置直接取 DOM member。** 兼容 fallback 与 UT 均通过，但 8 组吞吐信号仅约 `+1.4%`
+   且噪声较大，`memcmp` self share 仍为 `1.62%`，只是把成本移进 `ParseBlockAdd`，已撤销。5.22 已完整测试并撤销
+   SAX parser，本轮没有重复引入。
+3. **ordered unique key 只做一次 duplicate scan。** 理论上少一遍线性比较，但 10 组 20K A/B 为
+   `56.554/48.300 -> 56.270/48.792ms`，existing update 反向约 1%，没有端到端证据，已撤销。
+4. **优先访问 `CacheLocation` 的 interned-id variant。** 汇编确实少一个 index branch，但 10 组 ReportEvent
+   create/update 为 `55.785/48.578 -> 56.656/48.510ms`；两台 fresh process 的 6 组 20K Get 串行均值
+   `13.613 -> 13.880ms`，16-way p50/p99 基本重叠。为避免牺牲 owned-id 的通用路径，已撤销。`std::visit` 版本还
+   生成了 out-of-line indirect dispatch，更不应保留。
+5. **targeted RMW shard index 改成连续 counting-sort。** 第一版用一张 flat index 表替换 per-shard vector 和
+   batch index copy，却在 count/scatter 两遍重复计算 `HashKey`；8 组交错 20K A/B 为 baseline
+   `58.454/49.156ms`、candidate `59.020/49.084ms`，create 明确回退。第二版缓存首遍 shard id，定向 Release UT
+   通过，并重启两端进程做 10 组交错 A/B；baseline create/update 为 `57.628/48.962ms`，candidate 为
+   `57.903/49.062ms`，平均仍分别多 `0.275/0.100ms`。少量 allocator/node 收益被额外的连续 scatter 写流量抵消，
+   没有 wall-time 正收益，故代码完整撤销，只保留本记录。
+6. **直接 move 每个 shard 已排序的 index vector 到空 batch。** 典型 20K/16-shard 请求中单个 shard 已超过 soft
+   batch size，理论上可省掉每 batch 一次 allocation 和约 1250 个 `int32_t` copy，而且不改变 shard/batch 顺序。
+   定向 Release UT 通过后，重启 baseline/candidate 做 12 组交错 A/B：candidate 相对 baseline 的 create 平均
+   `+0.113ms`、update `-0.037ms`，paired median 为 `-0.025/-0.085ms`，全部处于噪声内。说明这段 index copy
+   已不是端到端瓶颈；为避免增加特殊所有权分支，代码完整撤销。
+
+最终源码重新构建后完成以下门禁（均为 pure-local metadata，不依赖 Redis）：
+
+- Release `//kv_cache_manager/...`：106 个可执行测试通过，1 个 GPU-only 测试按预期 skip；
+- snapshot HTTP：36 functional + 5 benchmark 全绿；20K scaling 对 create/update 后逐点查询验证最终 URI；
+- 旧协议/双 storage type HTTP：20 functional + 1 mixed benchmark 全绿；
+- `TestGetHostCacheStateConcurrentWithReportEventAndHostDown` 连续 200 次通过；最终二进制的 8 writer × 50 个
+  10K update 与 200 个 10K-key Get 混合压测零错误，write avg/p95/p99 为 `15.89/22.80/28.57ms`，Get
+  avg/p50/p95/p99 为 `10.86/7.39/23.20/24.81ms`；
+- 真实 HTTP 额外验证 large rare fallback 与 large Unicode 返回 200，截断 JSON 与 raw NUL 返回 400；
+- `/proc/<pid>/environ` 与 `/proc/<pid>/maps` 同时确认最终 Release 进程加载
+  `/usr/lib64/libjemalloc.so.2`。
+
+因此下一步不应继续围绕低于 1% 的 metrics、decimal parse、variant branch 或 URI copy 做局部改写。若线上新 profile
+仍以 LRU lock/unlock 与 persistent owner 为主，能够超过噪声的下一阶段已经属于 LRU ref/list 协议或 metadata
+representation 重设计，必须先建立 capacity/eviction、Get/ReportEvent 混合负载和 lifecycle fault 的独立正确性模型，
+不能作为本次低风险 hot-path patch 顺手合入。
+
+### 5.24 2026-08-08 对齐 pure-local 分片锁与消费 prevalidated URI
+
+5.23 的最终 profile 中，LRU lock/unlock 仍是最大项，且 memmove 的约 72% 来自把 flat task 中已经拥有的 URI
+复制到最终 immutable LocationSpec。本轮没有扩大 backend critical section，也没有改变 Get 的 immutable snapshot
+协议，而是分别消除两类可以严格证明为冗余的工作。
+
+#### 保留实现一：MetaIndexer mutex shard 复用真实 local LRU hash seed
+
+此前 MetaIndexer 用固定 HashKey seed 把请求按 16 个 metadata mutex shard 分批，而 pure-local LRU 用自身的
+host-specific seed 把同一批 key 分散到默认 1024 个 LRU shard。两个 seed 不同意味着一个 metadata batch 通常又
+横跨大部分 LRU shard；两阶段 lookup/release 因而反复执行数千次 LRU mutex lock/unlock。最终实现：
+
+- MetaLocalBackend 只读暴露其实际 Cache::GetHashSeed()；MetaStorageBackendManager 仅在 single pure-local
+  backend 下向 MetaIndexer 提供该值；
+- MetaIndexer 初始化完成后保存每实例的 mutex hash seed，所有 mutation/RMW batching 统一通过
+  GetMutexShardIndex()，不能让同一个 key 在不同操作中使用不同 mutex；
+- Redis、cached 和其他 backend 保留原固定 seed 与原 batching 行为。实现没有给 LRU 设置固定 seed，也没有改变
+  LRU 的 key→shard/capacity 分布；只是让外层 metadata mutex 使用 LRU 已经选定的 host seed，因此仍保留跨主机
+  hash 独立性；
+- 测试不再把两个连续 key 写死为“不同 shard”，而是按 indexer 的真实 seed 选择。新增 UT 直接断言 pure-local
+  mutex 的低 hash bits 与 LRU 一致；这也修复了更换 seed 后生命周期并发测试自身可能等待闸门造成的假死。
+
+原型 perf 在相同 8-way 10K update 下显示：pthread_mutex_unlock self share 7.93% → 1.99%，
+pthread_mutex_lock 2.53% → 0.94%，baseline 可见的 futex wait/wake 在候选中降到 0.05% 报告阈值以下。
+动态 seed 最终版的十组交错 20K A/B 为：
+
+- create 57.780 → 56.048ms（约 -3.0%）；
+- existing-location update 49.039 → 47.512ms（约 -3.1%），两项均 10/10 轮更快；
+- 两组各 2392 个请求的长窗口 8-way 10K update，吞吐平均约
+  3.226M → 3.686M blocks/s（约 +14.3%），两组 p95/p99 均下降。
+
+收益在并发下更大，符合“减少锁指令和 cache-line 争用、没有增加单 key 业务逻辑”的预期。该优化不得扩展为
+固定全局 LRU seed，也不得让 read/write 选择不同 metadata seed。
+
+#### 保留实现二：只消费 CacheManager-prevalidated flat task 的 URI
+
+ReportEvent 在进入 MetaSearcher 前已经完成 URI 解析、snapshot metadata 校验和 size 汇总，且 flat task 在同步调用
+结束后不再重试。旧实现仍把其中的 LocationSpec 复制到新 CacheLocation，长 URI 因而产生一次额外 allocation +
+memmove。最终实现将边界收窄为：
+
+- BatchMergeLocationSpecsFlat 接收 mutable task vector，但只有携带
+  CacheManager::PrevalidatedTotalSize 的 task 可以转移 URI 所有权；普通/non-prevalidated flat task 和 nested
+  通用 API 仍保持完整 copy/retry 语义；
+- 转移前复制并在 source task 中恢复 spec name。metadata write 即使失败，CacheManager 仍能用
+  (location_id, spec_name) 精确回填每个原始 event；source URI 可以为空，因为失败映射从不读取它；
+- allocation、reserve、类型/size/duplicate-name 校验都在消费前完成。最终对象继续是独立 immutable
+  shared_ptr<const CacheLocation>，没有原地修改查询可见值；
+- 多 spec、legacy duplicate name、new key、existing location、lease failure、capacity/error alignment 均继续走同一
+  modifier/write 结果模型。UT 同时断言 prevalidated task 的 URI 被消费、name 保留，non-prevalidated task 不变。
+
+相对“已含动态 shard seed、尚未消费 URI”的二进制，十二组交错 20K A/B 为：
+
+- create 56.289 → 54.570ms（约 -3.05%）；
+- existing update 47.674 → 46.950ms（约 -1.52%）；
+- 两组长窗口 8-way 10K update 吞吐分别
+  2.956M → 3.385M（+14.5%）和 2.951M → 3.290M blocks/s（+11.5%），p99 均下降约 3~4ms。
+
+5.21 记录的旧 consumable API 在当时代码形态和五轮短 A/B 中没有稳定收益，因此被正确撤销。本轮是在后续
+HTTP body copy、RMW scratch、borrowed old owner 都已经收敛后重新按调用栈定位，并以现有 prevalidated marker
+作为严格消费凭据；历史负向数据保留，后续不应恢复更宽泛的“所有 flat task 都可消费”版本。
+
+#### 本轮撤销实验与剩余停止线
+
+- 尝试在“旧 location 只有一个 spec、incoming 同名一个 spec”时更早折叠 update，跳过通用 old-name/duplicate
+  检查。定向 Release MetaSearcher/CacheManager UT 全绿，但 12 轮 fresh-process paired A/B 的 create/update
+  仅 -0.102/-0.104ms，update median 为 0ms，没有稳定收益，已完整撤销。
+- 不把 persistent interned location-id owner 改成 raw pointer/immortal global pool。剩余
+  shared_ptr::_M_add_ref_copy 是每个缓存 CacheLocation 的真实跨线程生命周期所有权；移除它会把收益建立在
+  backend/reporter 永不销毁的隐含假设上。
+- 不跳过 RapidJSON string/UTF-8 语义。当前 ASCII SIMD 预扫描后，ParseString 是输入字节本身的线性扫描；
+  SAX、TLS protobuf graph、DOM pool 和直接 UTF-8 parse 都已有负向 A/B。除非协议改成 protobuf/gRPC 或建立新的
+  direct parser 兼容模型，否则不能用放松 JSON/Unicode 校验换性能。
+- 不继续增加 ReportEvent worker 或延长 item/LRU 锁。当前优化已从锁次数入手；GetHostCacheState 优先级更高，
+  后续任何锁范围/并行度变化都必须先通过 mixed Get p99 门禁。
+
+#### 最终正确性与端到端门禁
+
+全部测试使用 pure-local metadata，不依赖 Redis：
+
+- Release bazel test //kv_cache_manager/...：106 个可执行测试通过，1 个 GPU-only 测试按预期 skip；
+- 最终 Release HTTP 二进制：snapshot 36 functional + 5 benchmark 全绿；旧协议/双 storage type
+  20 functional + 1 benchmark 全绿；
+- snapshot 20K scaling 在同一最终进程中为 create/update 59.25/48.70ms，随后逐点查询校验最终 URI；
+  GetHostCacheState 20K local serial p50/p99/avg 为 13.83/13.98/13.85ms；
+- 8 writer × 50 个 10K update 与 200 个 10K-key Get 的混合压测零错误，write avg/p95/p99
+  14.34/21.11/23.17ms，Get avg/p95/p99 11.08/21.15/22.41ms。共享机数据只作为无功能/查询回退门禁，
+  不声明线上固定 SLA。
+
+本轮之后，仍能看到的主要成本是协议 JSON scan、最终 URI 的第一次持久化所有权、interned-id owner 和必要的
+immutable object allocation。它们不再是可通过局部 move、换容器或跳过锁安全删除的重复工作。后续若继续优化，
+应从新 profile 重新建立证据，优先考虑协议边界或 metadata representation 的独立设计，不要重复 5.20~5.24
+已经完整撤销的微优化。
+
+### 5.25 2026-08-10 功能正确性复核与大批量部分失败门禁
+
+本轮不再改动生产逻辑，重点复核 5.24 优化后容易被性能测试遗漏的失败闭包、生命周期并发和 HTTP 大请求解析。
+新增或加强以下自动化门禁：
+
+- fast JSON parser 使用完整事件类型矩阵构造大于 40 KiB 的请求，强制进入 HTTP mutable in-situ 路径，并与
+  protobuf generic JSON parser 做 message 等价比较；同时断言输入 buffer 确实被原地消费，防止测试误走小请求
+  compatibility 路径；
+- `max_key_count=1` 下同批更新已有 key 并插入新 key，验证 fused writer 只拒绝新 key、已有 key 更新仍提交，且
+  已消费 URI 的 source task 仍能把 `EC_NOSPC` 精确映射到原 event index；
+- HTTP 端到端一次提交 512 个 ADD，按固定间隔混入 31 个非法 URI，请求体大于 32 KiB。验证
+  `item_results` 与全部 512 个输入严格对齐、合法项可查询、非法项无副作用；随后只重试失败项，验证 generation
+  不变、`snapshot_required` 清除且 metadata 最终收敛。
+
+pure-local Release 验证结果：
+
+- snapshot HTTP 功能集（包含上述大批量用例）37/37、legacy/dual-storage HTTP 功能集 20/20 全绿；
+- 5 个 reporter lifecycle/query 并发用例各重复 30 次，共 150 次通过；3 个 snapshot atomicity/lease/fused-RMW
+  用例各重复 50 次，共 150 次通过；
+- `CacheManagerTest` 全量重跑通过；其中一次并行构建压力下已有的 `TestFilterWriteCache_StaleSuffix` 报
+  `std::future_error: Broken promise`，该用例隔离重复 100 次以及随后全量重跑均未复现，因此未把偶发结果误判为
+  本轮生产缺陷或静默修改无关代码；
+- `bazel test --config=release //kv_cache_manager/...` 共 106 个可执行测试通过，1 个 GPU-only 测试按预期跳过。
+
+同一 Release 进程的功能后性能门禁仍保持：20K ReportEvent create/update 为 58.96/50.38ms；20K-key
+GetHostCacheState local serial p50/p99/avg 为 14.92/16.03/15.11ms。该共享机数据只证明本轮测试加强没有引入明显
+性能回退，不承诺线上固定 SLA。
+
+### 5.26 2026-08-10 parser 差分与跨请求多 reporter 状态机复核
+
+本轮从“快路径必须与原实现语义等价”出发补充差分测试，发现并修复一个此前用例未覆盖的真实兼容问题：
+heartbeat 的 `system_status` JSON object 若包含重复 key，protobuf `JsonStringToMessage` 会拒绝请求，而 specialized
+parser 原先通过 protobuf map 的 `operator[]` 静默采用最后一个值。这样同一 payload 会因为是否进入快速 parser
+而产生不同结果。现在写入 map 前显式检查已存在 key；重复 key 让 fast conversion 失败，再由 generic parser 给出
+与原协议完全一致的拒绝结果。该检查只位于低频 heartbeat map 解析，不进入 BLOCK_ADD/DELETE、metadata RMW 或
+查询路径，也不改变任何锁范围。
+
+新增 parser 兼容语料同时覆盖 canonical/snake/camel 字段、字符串和数字 enum、known field 为 null、未来 enum、
+数字形式的 string 字段、字段 alias 重复、map key 重复、多个 oneof member、unknown nested value、Unicode surrogate
+pair/未配对 surrogate、错误字段类型以及 null repeated/oneof entry。每个样例都执行两套比较：
+
+1. immutable `ReportEventJsonParser::FromJson` 与 protobuf generic parser 的成功/失败和 message equality；
+2. 追加未知 padding 形成大于 40 KiB 的 body，强制走 HTTP mutable in-situ 路径，再与 generic parser 做相同比较。
+
+ReportEvent 状态模型也从单请求、单 reporter 扩展到跨请求场景：两个 reporter 交替执行 8 轮、每轮 96 个事件，
+在 32 个 key、5 个 medium、3 个 spec 上做确定性随机 ADD/DELETE。每轮末尾强制更新两个 reporter 共用 block 的
+各自 location，专门验证 fused targeted RMW 只替换目标 `(block_key, location_id)`，不会覆盖同 key 的另一 reporter。
+每轮提交后均重新核对：
+
+- 全部物理 location id、spec name、完整 versioned URI 和 location type；
+- query-visible URI 必须来自 reference model，空 key 不能产生伪命中；
+- 两个 reporter 的 committed generation 独立且跨 delta 保持不变；
+- 删除最后一个 spec 后 location/key 收敛，所有 replacement/delete 后的 storage usage 与 reference 精确相等。
+
+pure-local Release 验证结果：
+
+- parser 完整测试进程重复 100 次通过；上述跨请求模型、单请求 flat-fold reference model 和容量部分失败映射分别
+  重复 20 次通过；
+- 真实 HTTP snapshot 功能集 37/37、legacy/dual-storage 功能集 20/20 全绿；另外直接发送保留重复 JSON member
+  的小 heartbeat 和大于 40 KiB heartbeat，均返回 HTTP 400，证明 handler 两条 parser 路径行为一致；
+- `bazel test --config=release //kv_cache_manager/... --nocache_test_results`：106 个可执行测试通过，1 个
+  GPU-only 测试按预期跳过；
+- 同一 Release + jemalloc 进程的 20K ReportEvent create/update 为 55.86/48.20ms；20K-key GetHostCacheState
+  local serial p50/p99/avg 为 14.15/14.74/14.17ms，16-way p50/p99 为 35.88/50.53ms。数据表明本轮兼容修复和测试
+  扩展没有造成 ADD/Get 性能回退，但仍只作为共享开发机门禁，不是线上 SLA。

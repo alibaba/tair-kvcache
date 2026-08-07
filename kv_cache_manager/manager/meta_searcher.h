@@ -117,6 +117,20 @@ public:
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
+        InternedLocationId interned_location_id;
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
     };
     // Replaces existing specs or creates the stable location in one metadata
     // read-modify-write operation per batch. Keys and location ids within a
@@ -151,6 +165,48 @@ public:
         // instead of parsing every versioned URI a second time. Other callers
         // must leave it empty and receive the normal strict validation.
         std::optional<PrevalidatedTotalSize> prevalidated_total_size;
+        InternedLocationId interned_location_id;
+        // ReportEvent owns one canonical id per medium for the duration of
+        // the synchronous Batch* call. Borrow it here so a 20K-key request
+        // does not perform 20K atomic shared_ptr increments/decrements merely
+        // to route tasks. A persisted CacheLocation still takes ownership.
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+        // ReportEvent overwhelmingly carries one spec per block. Keep that
+        // value inline so a 20K-block request does not allocate 20K one-item
+        // vectors; generic/multi-spec callers continue using specs unchanged.
+        std::optional<LocationSpec> inline_spec;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
+        [[nodiscard]] size_t SpecCount() const noexcept { return specs.size() + (inline_spec ? 1 : 0); }
+        [[nodiscard]] bool SpecsEmpty() const noexcept { return SpecCount() == 0; }
+        [[nodiscard]] const LocationSpec &SpecAt(size_t index) const noexcept {
+            return index < specs.size() ? specs[index] : *inline_spec;
+        }
+        [[nodiscard]] LocationSpec &MutableSpecAt(size_t index) noexcept {
+            return index < specs.size() ? specs[index] : *inline_spec;
+        }
+        void PushReportEventSpec(LocationSpec &&spec, size_t max_spec_count) {
+            if (specs.empty() && !inline_spec) {
+                inline_spec.emplace(std::move(spec));
+                return;
+            }
+            if (inline_spec) {
+                specs.reserve(max_spec_count < 2 ? 2 : max_spec_count);
+                specs.push_back(std::move(*inline_spec));
+                inline_spec.reset();
+            }
+            specs.push_back(std::move(spec));
+        }
     };
     // Keys and location ids within a key must be unique. Every task requires
     // non-empty, uniquely named specs with valid URIs and cannot mix
@@ -165,9 +221,35 @@ public:
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
                                       std::vector<ErrorCode> &out_per_key_ec,
                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    // Allocation-light equivalent used by ReportEvent. Tasks for key i are
+    // stored in [task_offsets[i], task_offsets[i + 1]); offsets must start at
+    // zero, be nondecreasing, and end at flat_tasks.size(). URI ownership in
+    // CacheManager-prevalidated tasks can be consumed during the synchronous
+    // call; their spec names remain available for per-item failure mapping.
+    // Non-prevalidated flat tasks retain the generic copy semantics.
+    ErrorCode BatchMergeLocationSpecsFlat(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          const std::vector<size_t> &task_offsets,
+                                          std::vector<MergeLocationSpecsTask> &flat_tasks,
+                                          std::vector<ErrorCode> &out_per_key_ec,
+                                          AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct DeleteLocationSpecsTask {
         std::string location_id;
         std::vector<std::string> spec_names;
+        InternedLocationId interned_location_id;
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
     };
     // Missing block/location targets are idempotent EC_OK. Keys and location
     // ids within a key must be unique, and every task must name at least one
@@ -239,6 +321,14 @@ public:
                                      AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
 
 private:
+    class MergeLocationSpecsTaskView;
+
+    ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          MergeLocationSpecsTaskView tasks,
+                                          std::vector<ErrorCode> &out_per_key_ec,
+                                          AcquireMetadataWriteLeaseFunc acquire_write_lease);
+
     struct StorageTypeWeights {
         static constexpr size_t NFS = 5;          // NFS存储权重较高
         static constexpr size_t MOONCAKE = 3;     // Mooncake存储权重中等

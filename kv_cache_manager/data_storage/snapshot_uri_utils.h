@@ -1,7 +1,9 @@
 #pragma once
 
-#include <cctype>
+#include <algorithm>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -34,6 +36,12 @@ struct ReporterSnapshotKeyHash {
 
 struct SnapshotUriInfo {
     std::string version;
+};
+
+struct CanonicalSnapshotUriAppendInfo {
+    size_t insertion_offset = 0;
+    std::uint64_t size = 0;
+    bool has_query = false;
 };
 
 class SnapshotUriUtils {
@@ -74,7 +82,7 @@ public:
             return false;
         }
         for (const unsigned char ch : version) {
-            if (!std::isxdigit(ch)) {
+            if (!IsAsciiHexDigit(ch)) {
                 return false;
             }
         }
@@ -142,8 +150,7 @@ public:
             return false;
         }
         for (const unsigned char ch : out_version) {
-            const bool is_hex_digit = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
-            if (!is_hex_digit) {
+            if (!IsAsciiHexDigit(ch)) {
                 return false;
             }
         }
@@ -152,6 +159,132 @@ public:
 
     static bool HasEventReportInternalUriMetadata(const DataStorageUri &uri) {
         return uri.HasParam(kSnapshotVersionParam);
+    }
+
+    // Allocation-free fast parser for an already canonical URI. It accepts
+    // exactly the textual form StandardUri::ToUriString() produces: a valid
+    // positive canonical port, explicit `key=value` query entries, and unique
+    // keys in strict lexical order. Noncanonical-but-valid input returns false
+    // so callers can use the full StandardUri fallback without changing wire
+    // compatibility. The returned offset inserts s_version in sorted order.
+    static bool ParseCanonicalUriForSnapshotAppend(std::string_view uri, CanonicalSnapshotUriAppendInfo &out) noexcept {
+        out = {};
+        const size_t protocol_end = uri.find("://");
+        if (protocol_end == std::string_view::npos || protocol_end == 0) {
+            return false;
+        }
+        const size_t authority_start = protocol_end + 3;
+        const size_t path_start = uri.find('/', authority_start);
+        const size_t query_start = uri.find('?', authority_start);
+        if (path_start != std::string_view::npos && query_start != std::string_view::npos && query_start < path_start) {
+            return false;
+        }
+        const size_t host_end = std::min(path_start == std::string_view::npos ? uri.size() : path_start,
+                                         query_start == std::string_view::npos ? uri.size() : query_start);
+        size_t host_start = authority_start;
+        const size_t user_info_end = uri.find('@', authority_start);
+        if (user_info_end != std::string_view::npos && user_info_end < host_end) {
+            // StandardUri omits an empty user-info when serializing, so this
+            // raw spelling is valid but not canonical.
+            if (user_info_end == authority_start) {
+                return false;
+            }
+            host_start = user_info_end + 1;
+        }
+        const size_t port_separator = uri.find(':', host_start);
+        if (port_separator != std::string_view::npos && port_separator < host_end) {
+            const std::string_view port_text = uri.substr(port_separator + 1, host_end - port_separator - 1);
+            std::uint64_t port = 0;
+            if (port_text.empty() || port_text.front() == '0' ||
+                !ParseDecimalUint64(
+                    port_text, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()), port)) {
+                return false;
+            }
+        }
+
+        out.insertion_offset = uri.size();
+        if (query_start == std::string_view::npos) {
+            return true;
+        }
+        out.has_query = true;
+        size_t param_start = query_start + 1;
+        if (param_start == uri.size()) {
+            return false;
+        }
+        std::string_view previous_key;
+        bool has_previous_key = false;
+        while (param_start < uri.size()) {
+            size_t param_end = uri.find('&', param_start);
+            if (param_end == std::string_view::npos) {
+                param_end = uri.size();
+            }
+            const size_t equals = uri.find('=', param_start);
+            if (equals == std::string_view::npos || equals >= param_end) {
+                return false;
+            }
+            const std::string_view key = uri.substr(param_start, equals - param_start);
+            const std::string_view value = uri.substr(equals + 1, param_end - equals - 1);
+            if ((has_previous_key && !(previous_key < key)) || key == kSnapshotVersionParam) {
+                return false;
+            }
+            if (out.insertion_offset == uri.size() && std::string_view(kSnapshotVersionParam) < key) {
+                out.insertion_offset = param_start;
+            }
+            if (key == "size") {
+                std::uint64_t parsed_size = 0;
+                if (ParseDecimalUint64(value, std::numeric_limits<std::uint64_t>::max(), parsed_size)) {
+                    out.size = parsed_size;
+                }
+            }
+            previous_key = key;
+            has_previous_key = true;
+            if (param_end == uri.size()) {
+                break;
+            }
+            param_start = param_end + 1;
+            if (param_start == uri.size()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool AddSnapshotVersionToCanonicalUri(std::string_view uri,
+                                                 const CanonicalSnapshotUriAppendInfo &info,
+                                                 const std::string &version,
+                                                 std::string &out_uri) {
+        out_uri.clear();
+        if (!IsValidSnapshotVersionToken(version)) {
+            return false;
+        }
+        return AddPrevalidatedSnapshotVersionToCanonicalUri(uri, info, version, out_uri);
+    }
+
+    // ReportEvent obtains one KVCM-generated, already validated generation
+    // token and appends it to tens of thousands of independently validated
+    // specs. Keep the public checked helper above for general callers; this
+    // variant avoids rescanning the same 32-byte token for every block.
+    static bool AddPrevalidatedSnapshotVersionToCanonicalUri(std::string_view uri,
+                                                             const CanonicalSnapshotUriAppendInfo &info,
+                                                             const std::string &version,
+                                                             std::string &out_uri) {
+        out_uri.clear();
+        if (info.insertion_offset > uri.size()) {
+            return false;
+        }
+        out_uri.reserve(uri.size() + std::char_traits<char>::length(kSnapshotVersionParam) + version.size() + 2);
+        if (info.insertion_offset == uri.size()) {
+            out_uri.assign(uri.data(), uri.size());
+            out_uri.push_back(info.has_query ? '&' : '?');
+            out_uri.append(kSnapshotVersionParam).push_back('=');
+            out_uri.append(version);
+            return true;
+        }
+        out_uri.assign(uri.data(), info.insertion_offset);
+        out_uri.append(kSnapshotVersionParam).push_back('=');
+        out_uri.append(version).push_back('&');
+        out_uri.append(uri.data() + info.insertion_offset, uri.size() - info.insertion_offset);
+        return true;
     }
 
     // DataStorageUri stores query parameters in a map, so duplicate keys from
@@ -265,6 +398,29 @@ public:
     }
 
 private:
+    static bool ParseDecimalUint64(std::string_view text, std::uint64_t limit, std::uint64_t &out) noexcept {
+        if (text.empty()) {
+            return false;
+        }
+        std::uint64_t value = 0;
+        for (const unsigned char ch : text) {
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            const std::uint64_t digit = ch - '0';
+            if (value > (limit - digit) / 10) {
+                return false;
+            }
+            value = value * 10 + digit;
+        }
+        out = value;
+        return true;
+    }
+
+    static constexpr bool IsAsciiHexDigit(unsigned char ch) noexcept {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+    }
+
     SnapshotUriUtils() = delete;
 };
 
