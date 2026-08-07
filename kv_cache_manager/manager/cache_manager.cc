@@ -4385,7 +4385,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 const std::string &instance_id,
                                 QueryType query_type,
                                 const KeyVector &block_cache_keys,
-                                const std::vector<std::string> &medium_filter) {
+                                const std::vector<std::string> &medium_filter,
+                                size_t p2p_host_count) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -4434,7 +4435,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               use_eagle_pop,
                                               medium_filter,
                                               host_matches,
-                                              &request_check_loc_data_exist);
+                                              &request_check_loc_data_exist,
+                                              p2p_host_count);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -4444,7 +4446,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
-                                                       &request_check_loc_data_exist);
+                                                       &request_check_loc_data_exist,
+                                                       p2p_host_count);
         break;
     }
     default:

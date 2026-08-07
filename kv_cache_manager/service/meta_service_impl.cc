@@ -580,9 +580,9 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Batch cache locations retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
-                      request->trace_id().c_str(),
-                      batch_result.size());
+        KVCM_LOG_DEBUG("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
+                       request->trace_id().c_str(),
+                       batch_result.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -981,6 +981,11 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
+    if (request->p2p_host_count() < 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "p2p_host_count (must be >= 0)", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
 
     CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
     std::vector<std::string> mediums(request->medium().begin(), request->medium().end());
@@ -995,7 +1000,8 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                           request->instance_id(),
                                           static_cast<CacheManager::QueryType>(request->query_type()),
                                           keys,
-                                          mediums);
+                                          mediums,
+                                          static_cast<size_t>(request->p2p_host_count()));
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());

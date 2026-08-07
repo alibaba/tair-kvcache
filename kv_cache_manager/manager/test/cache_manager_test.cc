@@ -8117,8 +8117,12 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_keys(proto::meta::ST_EVENT_REPORT_L2, host_b, {100, 200, 400});
     report_keys(proto::meta::ST_EVENT_REPORT_L2, host_c, {100, 200, 300});
 
-    auto [ec, hosts] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200, 300, 400, 500});
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                         instance_id,
+                                                         CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                         {100, 200, 300, 400, 500},
+                                                         {},
+                                                         5);
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(3u, hosts.size());
 
@@ -8158,7 +8162,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_keys(proto::meta::ST_EVENT_REPORT_L1P5, zero_local_host, {top5_keys[1]});
 
     auto [top5_ec, top5_matches] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys);
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 5);
     ASSERT_EQ(EC_OK, top5_ec);
     ASSERT_EQ(top5_hosts.size(), top5_matches.size());
     const std::vector<std::tuple<int64_t, int64_t, int64_t>> expected_top5_matches = {
@@ -8179,6 +8183,48 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     EXPECT_EQ(top5_matches.end(), std::find_if(top5_matches.begin(), top5_matches.end(), [&](const auto &match) {
                   return match.host_ip_port == zero_local_host;
               }));
+
+    auto [top2_ec, top2_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 2);
+    ASSERT_EQ(EC_OK, top2_ec);
+    ASSERT_EQ(top5_hosts.size(), top2_matches.size());
+    const std::vector<std::tuple<int64_t, int64_t, int64_t>> expected_top2_matches = {
+        {7, 0, 7},
+        {6, 1, 7},
+        {5, 0, 5},
+        {4, 0, 4},
+        {3, 0, 3},
+        {3, 0, 3},
+        {1, 0, 1},
+    };
+    for (size_t i = 0; i < top5_hosts.size(); ++i) {
+        EXPECT_EQ(top5_hosts[i].first, top2_matches[i].host_ip_port);
+        EXPECT_EQ(std::get<0>(expected_top2_matches[i]), top2_matches[i].local);
+        EXPECT_EQ(std::get<1>(expected_top2_matches[i]), top2_matches[i].p2p_1_fetch);
+        EXPECT_EQ(std::get<2>(expected_top2_matches[i]), top2_matches[i].p2p_1_total_match);
+    }
+
+    auto [top0_ec, top0_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 0);
+    ASSERT_EQ(EC_OK, top0_ec);
+    ASSERT_EQ(top5_hosts.size(), top0_matches.size());
+    for (size_t i = 0; i < top5_hosts.size(); ++i) {
+        EXPECT_EQ(top5_hosts[i].first, top0_matches[i].host_ip_port);
+        EXPECT_EQ(static_cast<int64_t>(top5_hosts[i].second), top0_matches[i].local);
+        EXPECT_EQ(0, top0_matches[i].p2p_1_fetch);
+        EXPECT_EQ(top0_matches[i].local, top0_matches[i].p2p_1_total_match);
+    }
+
+    auto [default_ec, default_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys);
+    ASSERT_EQ(EC_OK, default_ec);
+    ASSERT_EQ(top0_matches.size(), default_matches.size());
+    for (size_t i = 0; i < top0_matches.size(); ++i) {
+        EXPECT_EQ(top0_matches[i].host_ip_port, default_matches[i].host_ip_port);
+        EXPECT_EQ(top0_matches[i].local, default_matches[i].local);
+        EXPECT_EQ(top0_matches[i].p2p_1_fetch, default_matches[i].p2p_1_fetch);
+        EXPECT_EQ(top0_matches[i].p2p_1_total_match, default_matches[i].p2p_1_total_match);
+    }
 
     // Prefix match with Mamba: local and P2P specs jointly complete the blocks,
     // then the merged prefix is evaluated with the Mamba state and Eagle POP rules.
@@ -8242,7 +8288,9 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         cache_manager_->GetHostCacheState(request_context_.get(),
                                           mamba_instance_id,
                                           CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          {100, 200, 300, 400, 500});
+                                          {100, 200, 300, 400, 500},
+                                          {},
+                                          5);
     ASSERT_EQ(EC_OK, mamba_ec);
     ASSERT_EQ(1u, mamba_hosts.size());
     EXPECT_EQ(mamba_host, mamba_hosts[0].host_ip_port);
@@ -8320,7 +8368,9 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         cache_manager_->GetHostCacheState(request_context_.get(),
                                           coverage_instance_id,
                                           CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          {100, 200, 300, 400});
+                                          {100, 200, 300, 400},
+                                          {},
+                                          5);
     ASSERT_EQ(EC_OK, coverage_ec);
     ASSERT_EQ(1u, coverage_hosts.size());
     EXPECT_EQ(coverage_host, coverage_hosts[0].host_ip_port);
@@ -8356,7 +8406,9 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         cache_manager_->GetHostCacheState(request_context_.get(),
                                           coverage_instance_id,
                                           CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          mamba_top5_keys);
+                                          mamba_top5_keys,
+                                          {},
+                                          5);
     ASSERT_EQ(EC_OK, mamba_top5_ec);
     ASSERT_EQ(mamba_top5_hosts.size(), mamba_top5_matches.size());
     const std::vector<std::tuple<int64_t, int64_t, int64_t>> expected_mamba_top5_matches = {
@@ -8378,6 +8430,38 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
               std::find_if(mamba_top5_matches.begin(), mamba_top5_matches.end(), [&](const auto &match) {
                   return match.host_ip_port == mamba_zero_local_host;
               }));
+
+    auto [mamba_top2_ec, mamba_top2_matches] =
+        cache_manager_->GetHostCacheState(request_context_.get(),
+                                          coverage_instance_id,
+                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                          mamba_top5_keys,
+                                          {},
+                                          2);
+    ASSERT_EQ(EC_OK, mamba_top2_ec);
+    ASSERT_EQ(mamba_top5_hosts.size(), mamba_top2_matches.size());
+    for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
+        EXPECT_EQ(mamba_top5_hosts[i].first, mamba_top2_matches[i].host_ip_port);
+        EXPECT_EQ(std::get<0>(expected_top2_matches[i]), mamba_top2_matches[i].local);
+        EXPECT_EQ(std::get<1>(expected_top2_matches[i]), mamba_top2_matches[i].p2p_1_fetch);
+        EXPECT_EQ(std::get<2>(expected_top2_matches[i]), mamba_top2_matches[i].p2p_1_total_match);
+    }
+
+    auto [mamba_top0_ec, mamba_top0_matches] =
+        cache_manager_->GetHostCacheState(request_context_.get(),
+                                          coverage_instance_id,
+                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                          mamba_top5_keys,
+                                          {},
+                                          0);
+    ASSERT_EQ(EC_OK, mamba_top0_ec);
+    ASSERT_EQ(mamba_top5_hosts.size(), mamba_top0_matches.size());
+    for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
+        EXPECT_EQ(mamba_top5_hosts[i].first, mamba_top0_matches[i].host_ip_port);
+        EXPECT_EQ(static_cast<int64_t>(mamba_top5_hosts[i].second), mamba_top0_matches[i].local);
+        EXPECT_EQ(0, mamba_top0_matches[i].p2p_1_fetch);
+        EXPECT_EQ(mamba_top0_matches[i].local, mamba_top0_matches[i].p2p_1_total_match);
+    }
 
     dsm->storage_map_.erase("host_state_subscriber");
     dsm->storage_map_.erase("host_state_vineyard");

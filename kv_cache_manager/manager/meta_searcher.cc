@@ -357,9 +357,11 @@ bool IsMediumMatched(const StandardUri &uri, const std::unordered_set<std::strin
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
 using KeyToHostSpecNames = std::vector<HostToSpecNames>; // key -> host -> spec names
 
-constexpr size_t kMaxP2PHostCount = 5;
-
-std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::HostCacheMatch> &host_matches) {
+std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::HostCacheMatch> &host_matches,
+                                                size_t p2p_host_count) {
+    if (p2p_host_count == 0) {
+        return {};
+    }
     std::vector<size_t> host_indices;
     host_indices.reserve(host_matches.size());
     for (size_t i = 0; i < host_matches.size(); ++i) {
@@ -367,7 +369,7 @@ std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::
             host_indices.push_back(i);
         }
     }
-    const size_t selected_count = std::min(kMaxP2PHostCount, host_indices.size());
+    const size_t selected_count = std::min(p2p_host_count, host_indices.size());
     std::partial_sort(host_indices.begin(),
                       host_indices.begin() + selected_count,
                       host_indices.end(),
@@ -932,8 +934,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
 
                 const auto &vmap = valid_maps[i];
                 const std::string_view requested_spec_name =
-                    requested_spec_names.empty() ? std::string_view{}
-                                                 : requested_spec_names[query_to_output_index[i]];
+                    requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
@@ -987,8 +988,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
             // --- Per-key independent selection (WEIGHTED_RANDOM or other non-event-report) ---
             for (size_t i = 0; i < query_keys.size(); ++i) {
                 const std::string_view requested_spec_name =
-                    requested_spec_names.empty() ? std::string_view{}
-                                                 : requested_spec_names[query_to_output_index[i]];
+                    requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;
                 for (const auto &[id, loc] : vmap) {
@@ -1118,7 +1118,8 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           bool use_eagle_pop,
                                           const std::vector<std::string> &medium_filter,
                                           std::vector<HostCacheMatch> &out_matches,
-                                          const CheckLocDataExistFunc *request_check_loc_data_exist) const {
+                                          const CheckLocDataExistFunc *request_check_loc_data_exist,
+                                          size_t p2p_host_count) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
@@ -1196,34 +1197,36 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
             }
         });
     if (reduce_ok) {
-        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches);
-        reduce_ok = top_host_indices.empty() || meta_indexer_->ParallelForQuery(
-            top_host_indices.size(),
-            [&top_host_indices,
-             &candidate_hosts,
-             &keys,
-             &key_to_host_spec_names,
-             &key_to_vineyard_spec_names,
-             &host_matches,
-             use_eagle_pop](std::size_t begin, std::size_t end) {
-                for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
-                    const size_t host_index = top_host_indices[selected_index];
-                    const auto &host = candidate_hosts[host_index];
-                    auto p2p_selection = SelectP2PByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names);
-                    std::unordered_set<int64_t> fetched_block_keys;
-                    for (size_t index : p2p_selection.covered_indices) {
-                        fetched_block_keys.insert(keys[index]);
-                    }
-                    int64_t total_match = host_matches[host_index].local;
-                    if (!p2p_selection.covered_indices.empty()) {
-                        auto p2p_specs = MergeHostAndP2PSpecs(
-                            host, key_to_host_spec_names, key_to_vineyard_spec_names, p2p_selection);
-                        total_match = ComputePrefixMatchBlocks(p2p_specs, use_eagle_pop);
-                    }
-                    host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
-                    host_matches[host_index].p2p_1_total_match = total_match;
-                }
-            });
+        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches, p2p_host_count);
+        reduce_ok = top_host_indices.empty() ||
+                    meta_indexer_->ParallelForQuery(
+                        top_host_indices.size(),
+                        [&top_host_indices,
+                         &candidate_hosts,
+                         &keys,
+                         &key_to_host_spec_names,
+                         &key_to_vineyard_spec_names,
+                         &host_matches,
+                         use_eagle_pop](std::size_t begin, std::size_t end) {
+                            for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
+                                const size_t host_index = top_host_indices[selected_index];
+                                const auto &host = candidate_hosts[host_index];
+                                auto p2p_selection =
+                                    SelectP2PByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names);
+                                std::unordered_set<int64_t> fetched_block_keys;
+                                for (size_t index : p2p_selection.covered_indices) {
+                                    fetched_block_keys.insert(keys[index]);
+                                }
+                                int64_t total_match = host_matches[host_index].local;
+                                if (!p2p_selection.covered_indices.empty()) {
+                                    auto p2p_specs = MergeHostAndP2PSpecs(
+                                        host, key_to_host_spec_names, key_to_vineyard_spec_names, p2p_selection);
+                                    total_match = ComputePrefixMatchBlocks(p2p_specs, use_eagle_pop);
+                                }
+                                host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
+                                host_matches[host_index].p2p_1_total_match = total_match;
+                            }
+                        });
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     if (!reduce_ok) {
@@ -1245,7 +1248,8 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    const std::vector<std::string> &medium_filter,
                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                                    std::vector<HostCacheMatch> &out_matches,
-                                                   const CheckLocDataExistFunc *request_check_loc_data_exist) const {
+                                                   const CheckLocDataExistFunc *request_check_loc_data_exist,
+                                                   size_t p2p_host_count) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
@@ -1343,74 +1347,76 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
             }
         });
     if (reduce_ok) {
-        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches);
-        reduce_ok = top_host_indices.empty() || meta_indexer_->ParallelForQuery(
-            top_host_indices.size(),
-            [&top_host_indices,
-             &candidate_hosts,
-             &keys,
-             &key_to_host_spec_names,
-             &key_to_vineyard_spec_names,
-             &full_groups,
-             &mamba_state_groups,
-             &host_matches,
-             use_eagle_pop](std::size_t begin, std::size_t end) {
-                for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
-                    const size_t host_index = top_host_indices[selected_index];
-                    const auto &host = candidate_hosts[host_index];
-                    const V6DPeerSelection no_p2p;
-                    auto combined_specs =
-                        MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
-                    std::unordered_set<int64_t> fetched_block_keys;
+        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches, p2p_host_count);
+        reduce_ok =
+            top_host_indices.empty() ||
+            meta_indexer_->ParallelForQuery(
+                top_host_indices.size(),
+                [&top_host_indices,
+                 &candidate_hosts,
+                 &keys,
+                 &key_to_host_spec_names,
+                 &key_to_vineyard_spec_names,
+                 &full_groups,
+                 &mamba_state_groups,
+                 &host_matches,
+                 use_eagle_pop](std::size_t begin, std::size_t end) {
+                    for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
+                        const size_t host_index = top_host_indices[selected_index];
+                        const auto &host = candidate_hosts[host_index];
+                        const V6DPeerSelection no_p2p;
+                        auto combined_specs =
+                            MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
+                        std::unordered_set<int64_t> fetched_block_keys;
 
-                    for (const auto *full_group : full_groups) {
-                        auto full_selection =
-                            SelectP2PGroupByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names, *full_group);
-                        for (size_t block_index : full_selection.covered_indices) {
-                            const auto peer_it =
-                                key_to_vineyard_spec_names[block_index].find(full_selection.peer_addr);
-                            if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
-                                continue;
+                        for (const auto *full_group : full_groups) {
+                            auto full_selection = SelectP2PGroupByPrefix(
+                                host, key_to_host_spec_names, key_to_vineyard_spec_names, *full_group);
+                            for (size_t block_index : full_selection.covered_indices) {
+                                const auto peer_it =
+                                    key_to_vineyard_spec_names[block_index].find(full_selection.peer_addr);
+                                if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
+                                    continue;
+                                }
+                                MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *full_group);
+                                fetched_block_keys.insert(keys[block_index]);
                             }
-                            MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *full_group);
-                            fetched_block_keys.insert(keys[block_index]);
                         }
-                    }
 
-                    size_t full_prefix_len = 0;
-                    while (full_prefix_len < combined_specs.size() &&
-                           HasAllLocationSpecGroups(combined_specs[full_prefix_len], full_groups)) {
-                        ++full_prefix_len;
-                    }
-                    if (use_eagle_pop && full_prefix_len > 0) {
-                        --full_prefix_len;
-                    }
+                        size_t full_prefix_len = 0;
+                        while (full_prefix_len < combined_specs.size() &&
+                               HasAllLocationSpecGroups(combined_specs[full_prefix_len], full_groups)) {
+                            ++full_prefix_len;
+                        }
+                        if (use_eagle_pop && full_prefix_len > 0) {
+                            --full_prefix_len;
+                        }
 
-                    if (full_prefix_len > 0) {
-                        auto mamba_selection = SelectP2PGroupsByCoverage(host,
-                                                                        key_to_host_spec_names,
-                                                                        key_to_vineyard_spec_names,
-                                                                        full_prefix_len,
-                                                                        mamba_state_groups);
-                        for (size_t query_index : mamba_selection.selection.covered_indices) {
-                            const size_t block_index = mamba_selection.query_block_indices[query_index];
-                            const auto *group = mamba_selection.query_groups[query_index];
-                            const auto peer_it =
-                                key_to_vineyard_spec_names[block_index].find(mamba_selection.selection.peer_addr);
-                            if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
-                                continue;
+                        if (full_prefix_len > 0) {
+                            auto mamba_selection = SelectP2PGroupsByCoverage(host,
+                                                                             key_to_host_spec_names,
+                                                                             key_to_vineyard_spec_names,
+                                                                             full_prefix_len,
+                                                                             mamba_state_groups);
+                            for (size_t query_index : mamba_selection.selection.covered_indices) {
+                                const size_t block_index = mamba_selection.query_block_indices[query_index];
+                                const auto *group = mamba_selection.query_groups[query_index];
+                                const auto peer_it =
+                                    key_to_vineyard_spec_names[block_index].find(mamba_selection.selection.peer_addr);
+                                if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
+                                    continue;
+                                }
+                                MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *group);
+                                fetched_block_keys.insert(keys[block_index]);
                             }
-                            MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *group);
-                            fetched_block_keys.insert(keys[block_index]);
                         }
-                    }
 
-                    const int64_t total_match =
-                        ComputeMambaPrefixMatchBlocks(combined_specs, use_eagle_pop, full_groups, mamba_state_groups);
-                    host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
-                    host_matches[host_index].p2p_1_total_match = total_match;
-                }
-            });
+                        const int64_t total_match = ComputeMambaPrefixMatchBlocks(
+                            combined_specs, use_eagle_pop, full_groups, mamba_state_groups);
+                        host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
+                        host_matches[host_index].p2p_1_total_match = total_match;
+                    }
+                });
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     if (!reduce_ok) {
