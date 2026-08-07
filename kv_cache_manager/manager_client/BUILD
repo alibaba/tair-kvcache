@@ -27,6 +27,7 @@ py_wheel(
     name = "kv_cache_manager_manager_client_wheel",
     abi = "none",
     classifiers = [
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3 :: Only",
         "Operating System :: OS Independent",
@@ -34,7 +35,11 @@ py_wheel(
     description_content_type = "text/markdown",
     description_file = "README.md",
     distribution = "tair-kvcache-manager-client",
+    extra_distinfo_files = {
+        "//:LICENSE": "LICENSE",
+    },
     homepage = "https://github.com/alibaba/tair-kvcache",
+    license = "Apache-2.0",
     platform = "any",
     python_requires = ">=3.9",
     python_tag = "py3",

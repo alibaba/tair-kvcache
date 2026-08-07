@@ -37,8 +37,21 @@ class WheelContentsTest(unittest.TestCase):
         )
         metadata = self.archive.read(metadata_name).decode("utf-8")
         self.assertIn("Name: tair-kvcache-manager-client", metadata)
+        self.assertIn("License: Apache-2.0", metadata)
+        self.assertIn(
+            "Classifier: License :: OSI Approved :: Apache Software License",
+            metadata,
+        )
         self.assertIn("Requires-Dist: requests>=2.31.0,<3", metadata)
         self.assertIn("Requires-Python: >=3.9", metadata)
+
+    def test_contains_license(self):
+        license_name = next(
+            name for name in self.names if name.endswith(".dist-info/LICENSE")
+        )
+        license_text = self.archive.read(license_name).decode("utf-8")
+        self.assertIn("Apache License", license_text)
+        self.assertIn("Version 2.0", license_text)
 
 
 if __name__ == "__main__":
