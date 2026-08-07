@@ -146,9 +146,8 @@ public:
         }
     }
 
-    ErrorCode
-    Acquire(const ReporterSnapshotKey &reporter_key, const LeaseInfo *&out_lease, bool &out_created_generation) {
-        out_lease = nullptr;
+    ErrorCode Acquire(const ReporterSnapshotKey &reporter_key, LeaseInfo &out_lease, bool &out_created_generation) {
+        out_lease = LeaseInfo{};
         const auto failure_it = snapshot_wait_failures_.find(reporter_key);
         if (failure_it != snapshot_wait_failures_.end()) {
             out_created_generation = false;
@@ -156,7 +155,7 @@ public:
         }
         const auto it = versions_.find(reporter_key);
         if (it != versions_.end()) {
-            out_lease = &it->second;
+            out_lease = it->second;
             out_created_generation = false;
             return EC_OK;
         }
@@ -172,7 +171,7 @@ public:
         }
         const auto [inserted_it, inserted] = versions_.emplace(reporter_key, std::move(lease));
         (void)inserted;
-        out_lease = &inserted_it->second;
+        out_lease = inserted_it->second;
         return EC_OK;
     }
 
@@ -3006,20 +3005,20 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            const DeltaMutationGuard::LeaseInfo *lease = nullptr;
+            DeltaMutationGuard::LeaseInfo lease;
             bool created_generation = false;
             const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, lease, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
             }
-            mutation_lifecycle_generation = lease->lifecycle_generation;
+            mutation_lifecycle_generation = lease.lifecycle_generation;
             if (created_generation) {
                 request_created_generation = true;
             }
             for (auto &spec : specs) {
                 if (!SnapshotUriUtils::AddSnapshotVersionToUri(
-                        std::move(spec.uri), lease->snapshot_version, spec.versioned_uri)) {
+                        std::move(spec.uri), lease.snapshot_version, spec.versioned_uri)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
@@ -3071,14 +3070,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            const DeltaMutationGuard::LeaseInfo *lease = nullptr;
+            DeltaMutationGuard::LeaseInfo lease;
             bool created_generation = false;
             const ErrorCode fence_ec = delta_mutations.Acquire(reporter_key, lease, created_generation);
             if (fence_ec != EC_OK) {
                 per_item_ec[i] = fence_ec;
                 break;
             }
-            mutation_lifecycle_generation = lease->lifecycle_generation;
+            mutation_lifecycle_generation = lease.lifecycle_generation;
             if (created_generation) {
                 request_created_generation = true;
             }
