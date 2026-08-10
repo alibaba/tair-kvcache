@@ -3,6 +3,7 @@
 #include <memory>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -139,6 +140,9 @@ TEST_F(LiteHitTtlTest, CompactionDropsExpiredEntries) {
     core.ProcessRequest({1, 2, 3}, 5000);
     EXPECT_EQ(3, core.current_unique_blocks());
     EXPECT_EQ(3u, core.last_positions_.size());
+    // The bucket array shrinks with the entries instead of staying at the
+    // 6000-key high-water mark.
+    EXPECT_LT(core.last_positions_.bucket_count(), 1000u);
     // Semantics survive the cleanup: dropped keys stay cold, alive ones hit
     // (the re-committed cold key occupies MRU, shifting thresholds by one).
     EXPECT_TRUE(core.ProcessRequest({1000000}, 5001).hit_curve.empty());
@@ -179,6 +183,23 @@ TEST_F(LiteHitTtlTest, AdvanceTimeRefreshesUniqueCount) {
     EXPECT_EQ(2, pure_lru.current_unique_blocks());
 }
 
+TEST_F(LiteHitTtlTest, CountsTtlExpiredBlocks) {
+    LiteHit core(1000);
+    core.ProcessRequest({1, 2, 3}, 0);
+    EXPECT_EQ(0, core.ttl_expired_blocks());
+    // All three reached the deadline; key 1 revives after being counted.
+    core.ProcessRequest({1}, 2000);
+    EXPECT_EQ(3, core.ttl_expired_blocks());
+    // Repeated advances must not double count the already-swept markers.
+    core.AdvanceTime(2500);
+    EXPECT_EQ(3, core.ttl_expired_blocks());
+    // The revived key expires again and counts again, via AdvanceTime alone.
+    core.AdvanceTime(3000);
+    EXPECT_EQ(4, core.ttl_expired_blocks());
+    core.Reset();
+    EXPECT_EQ(0, core.ttl_expired_blocks());
+}
+
 TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
     std::mt19937_64 rng(20260730);
     std::uniform_int_distribution<int64_t> base_dist(0, 12);
@@ -194,6 +215,12 @@ TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
         cores.push_back(std::make_unique<LiteHit>(ttl));
     }
     NaiveLruTtlOracle oracle;
+    // Naive harvest model per TTL: a tracked key leaves the alive set and
+    // counts once when its age reaches the TTL at a step boundary; a commit
+    // re-adds it, so a revived key counts again on its next expiry.
+    std::unordered_map<int64_t, int64_t> naive_last_access;
+    std::vector<std::unordered_set<int64_t>> naive_alive(ttls.size());
+    std::vector<uint64_t> naive_expired(ttls.size(), 0);
     int64_t now = 0;
     for (int step = 0; step < 2000; ++step) {
         now += delta_dist(rng);
@@ -208,12 +235,27 @@ TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
         }
 
         for (std::size_t t = 0; t < ttls.size(); ++t) {
+            for (auto it = naive_alive[t].begin(); it != naive_alive[t].end();) {
+                const int64_t last_ns = naive_last_access.at(*it);
+                const uint64_t age = last_ns < now ? static_cast<uint64_t>(now - last_ns) : 0;
+                if (age >= ttls[t]) {
+                    it = naive_alive[t].erase(it);
+                    ++naive_expired[t];
+                } else {
+                    ++it;
+                }
+            }
             const RequestFact fact = cores[t]->ProcessRequest(keys, now);
+            ASSERT_EQ(naive_expired[t], cores[t]->ttl_expired_blocks()) << "step " << step << " ttl " << ttls[t];
             for (uint64_t capacity : capacities) {
                 ASSERT_EQ(oracle.Evaluate(keys, now, ttls[t], capacity),
                           HitCurveProjector::ProjectBlocks(fact, capacity))
                     << "step " << step << " ttl " << ttls[t] << " capacity " << capacity;
             }
+            naive_alive[t].insert(keys.begin(), keys.end());
+        }
+        for (int64_t key : keys) {
+            naive_last_access[key] = now;
         }
         oracle.Commit(keys, now);
         for (std::size_t t = 0; t < ttls.size(); ++t) {
