@@ -56,21 +56,25 @@ void RollbackAddedLocations(RequestContext *request_context,
                             const std::shared_ptr<SchedulePlanExecutor> &schedule_plan_executor,
                             const std::vector<AddLocationRollbackItem> &items) {
     MetaSearcher::AddLocationRollbackPlan plan;
+    KeyVector keys;
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    keys.reserve(items.size());
+    add_results.reserve(items.size());
+    for (const auto &item : items) {
+        keys.push_back(item.block_key);
+        add_results.push_back({item.ec, item.location_id});
+    }
     if (!indexer) {
-        KVCM_LOG_WARN("[%s] rollback migration locations retained URIs: meta indexer missing, instance %s, "
-                      "key_count %zu",
+        // 无元数据访问时无法 reconcile uncertain 项，只能保留其 URI；但
+        // confirmed-success 与无 ID 项的清理不依赖元数据，照常执行。
+        const size_t uncertain_count = MetaSearcher::ClassifyAddLocationRollback(keys, add_results, plan);
+        KVCM_LOG_WARN("[%s] rollback migration locations without meta indexer: uncertain URIs retained, instance %s, "
+                      "uncertain_count %zu, key_count %zu",
                       trace_id.c_str(),
                       instance_id.c_str(),
+                      uncertain_count,
                       items.size());
     } else {
-        KeyVector keys;
-        std::vector<MetaSearcher::AddLocationResult> add_results;
-        keys.reserve(items.size());
-        add_results.reserve(items.size());
-        for (const auto &item : items) {
-            keys.push_back(item.block_key);
-            add_results.push_back({item.ec, item.location_id});
-        }
         MetaSearcher meta_searcher(indexer);
         if (meta_searcher.ReconcileAddLocationRollback(request_context, keys, add_results, plan) != EC_OK) {
             KVCM_LOG_WARN("[%s] rollback migration locations reconcile failed, instance %s, key_count %zu",

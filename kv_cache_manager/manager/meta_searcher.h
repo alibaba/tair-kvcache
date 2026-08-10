@@ -122,6 +122,13 @@ public:
                                            const KeyVector &keys,
                                            const std::vector<AddLocationResult> &add_results,
                                            AddLocationRollbackPlan &out_plan);
+    // Metadata-free classification used when no MetaSearcher is available:
+    // confirmed-successful items go to pipeline_* and items without a location
+    // id go to direct_delete_indices, while uncertain items stay unclassified
+    // so their URIs are retained. Returns the number of uncertain items.
+    static size_t ClassifyAddLocationRollback(const KeyVector &keys,
+                                              const std::vector<AddLocationResult> &add_results,
+                                              AddLocationRollbackPlan &out_plan);
     struct ReplaceLocationSpecsTask {
         std::string location_id;
         DataStorageType type;

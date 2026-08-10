@@ -1741,6 +1741,25 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
     EXPECT_TRUE(plan.direct_delete_indices.empty());
 }
 
+TEST_F(MetaSearcherTest, TestClassifyAddLocationRollbackWithoutMetadata) {
+    // Metadata-free classification: confirmed-success -> pipeline, no id ->
+    // direct delete, uncertain (id present but non-OK) stays unclassified so
+    // its URI is retained.
+    const KeyVector keys = {8101, 8102, 8103};
+    const std::vector<MetaSearcher::AddLocationResult> add_results = {
+        {EC_OK, "confirmed_id"}, {EC_ERROR, "uncertain_id"}, {EC_ERROR, ""}};
+    MetaSearcher::AddLocationRollbackPlan plan;
+    plan.pipeline_keys = {42};
+    plan.pipeline_location_ids = {"stale_id"};
+    plan.direct_delete_indices = {0};
+
+    EXPECT_EQ(1u, MetaSearcher::ClassifyAddLocationRollback(keys, add_results, plan));
+    EXPECT_EQ((KeyVector{8101}), plan.pipeline_keys);
+    EXPECT_EQ((std::vector<std::string>{"confirmed_id"}), plan.pipeline_location_ids);
+    // 2 = no_id_key; index 1 (uncertain) is intentionally absent so its URI is retained.
+    EXPECT_EQ((std::vector<size_t>{2}), plan.direct_delete_indices);
+}
+
 TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisOnDeleteError) {
     auto backend = ReplaceWithRollbackFaultBackend();
     ASSERT_NE(nullptr, backend);

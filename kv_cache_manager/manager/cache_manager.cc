@@ -1131,14 +1131,17 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
     }
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
-    if (!meta_searcher) {
-        // 无法确认任何项的元数据状态：URI 全部保留，confirmed success 的 WRITING
-        // location 由既有清理扫描兜底。
-        PREFIX_LOG(ERROR, "rollback add locations failed: meta searcher not found");
-        return;
-    }
     MetaSearcher::AddLocationRollbackPlan plan;
-    if (meta_searcher->ReconcileAddLocationRollback(request_context, keys, add_results, plan) != EC_OK) {
+    if (!meta_searcher) {
+        // 无元数据访问时无法 reconcile uncertain 项，只能保留其 URI；但
+        // confirmed-success 与无 ID 项的清理不依赖元数据，照常执行。
+        const size_t uncertain_count = MetaSearcher::ClassifyAddLocationRollback(keys, add_results, plan);
+        PREFIX_LOG(ERROR,
+                   "rollback add locations without meta searcher: uncertain URIs retained, uncertain_count[%lu], "
+                   "key_count[%lu]",
+                   uncertain_count,
+                   keys.size());
+    } else if (meta_searcher->ReconcileAddLocationRollback(request_context, keys, add_results, plan) != EC_OK) {
         PREFIX_LOG(ERROR, "rollback add locations reconcile failed, key_count[%lu]", keys.size());
         return;
     }

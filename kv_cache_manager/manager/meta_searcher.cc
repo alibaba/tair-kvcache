@@ -1044,6 +1044,44 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     return aggregate_ec;
 }
 
+namespace {
+
+void ClassifyAddLocationRollbackItems(const KeyVector &keys,
+                                      const std::vector<MetaSearcher::AddLocationResult> &add_results,
+                                      MetaSearcher::AddLocationRollbackPlan &out_plan,
+                                      KeyVector &uncertain_keys,
+                                      std::vector<std::string> &uncertain_location_ids,
+                                      std::vector<size_t> &uncertain_indices) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &add_result = add_results[i];
+        if (add_result.ec == EC_OK && !add_result.location_id.empty()) {
+            out_plan.pipeline_keys.push_back(keys[i]);
+            out_plan.pipeline_location_ids.push_back(add_result.location_id);
+        } else if (!add_result.location_id.empty()) {
+            // location id 已生成但写结果失败/未知：先做幂等元数据删除，确认无引用后才能删 URI。
+            uncertain_keys.push_back(keys[i]);
+            uncertain_location_ids.push_back(add_result.location_id);
+            uncertain_indices.push_back(i);
+        } else {
+            out_plan.direct_delete_indices.push_back(i);
+        }
+    }
+}
+
+} // namespace
+
+size_t MetaSearcher::ClassifyAddLocationRollback(const KeyVector &keys,
+                                                 const std::vector<AddLocationResult> &add_results,
+                                                 AddLocationRollbackPlan &out_plan) {
+    out_plan = {};
+    KeyVector uncertain_keys;
+    std::vector<std::string> uncertain_location_ids;
+    std::vector<size_t> uncertain_indices;
+    ClassifyAddLocationRollbackItems(
+        keys, add_results, out_plan, uncertain_keys, uncertain_location_ids, uncertain_indices);
+    return uncertain_keys.size();
+}
+
 ErrorCode MetaSearcher::ReconcileAddLocationRollback(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const std::vector<AddLocationResult> &add_results,
@@ -1059,20 +1097,8 @@ ErrorCode MetaSearcher::ReconcileAddLocationRollback(RequestContext *request_con
     KeyVector uncertain_keys;
     std::vector<std::string> uncertain_location_ids;
     std::vector<size_t> uncertain_indices;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto &add_result = add_results[i];
-        if (add_result.ec == EC_OK && !add_result.location_id.empty()) {
-            out_plan.pipeline_keys.push_back(keys[i]);
-            out_plan.pipeline_location_ids.push_back(add_result.location_id);
-        } else if (!add_result.location_id.empty()) {
-            // location id 已生成但写结果失败/未知：先做幂等元数据删除，确认无引用后才能删 URI。
-            uncertain_keys.push_back(keys[i]);
-            uncertain_location_ids.push_back(add_result.location_id);
-            uncertain_indices.push_back(i);
-        } else {
-            out_plan.direct_delete_indices.push_back(i);
-        }
-    }
+    ClassifyAddLocationRollbackItems(
+        keys, add_results, out_plan, uncertain_keys, uncertain_location_ids, uncertain_indices);
 
     if (uncertain_keys.empty()) {
         return EC_OK;
