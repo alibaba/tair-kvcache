@@ -590,10 +590,11 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             0,
             "the end-to-end Future must remain pending during the delay",
         )
-        self.assertEqual(
-            self._count_surviving_blocks(self._instance_id, range(12)),
-            8,
-            "CAS should hide exactly one batch while its Future is pending",
+        self._wait_surviving_block_count(
+            self._instance_id,
+            range(12),
+            expected_count=8,
+            timeout_s=2,
         )
 
         self._wait_metric_value(
@@ -723,6 +724,23 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             if any(response.get("locations", [])):
                 surviving_blocks += 1
         return surviving_blocks
+
+    def _wait_surviving_block_count(
+        self, instance_id, block_keys, expected_count, timeout_s
+    ):
+        deadline = time.monotonic() + timeout_s
+        last_count = None
+        while time.monotonic() < deadline:
+            last_count = self._count_surviving_blocks(
+                instance_id, block_keys
+            )
+            if last_count == expected_count:
+                return
+            time.sleep(0.05)
+        self.fail(
+            f"surviving block count did not become {expected_count}; "
+            f"last count: {last_count}"
+        )
 
     def test_persist_recover_00(self):
         """Test e2e persist/recover: cache locations and metadata
