@@ -92,16 +92,30 @@ enum class CacheMetaLocationStatus : int32_t {
     CLS_DELETING = 4,
 };
 
+enum class CacheMetaStorageType : int32_t {
+    ST_UNSPECIFIED = 0,
+    ST_3FS = 1,
+    ST_MOONCAKE = 2,
+    ST_TAIRMEMPOOL = 3,
+    ST_NFS = 4,
+    ST_VCNS_3FS = 5,
+    ST_DUMMY = 6,
+    ST_EVENT_REPORT_L1P5 = 7,
+    ST_EVENT_REPORT_L2 = 8,
+};
+
 struct CacheMetaLocationDetail {
     std::string location_id;
     CacheMetaLocationStatus status{CacheMetaLocationStatus::CLS_NOT_FOUND};
-    int32_t storage_type{0};
+    CacheMetaStorageType storage_type{CacheMetaStorageType::ST_UNSPECIFIED};
     int32_t spec_size{0};
     int64_t create_time{0};
     Location location_specs;
 };
 
 struct CacheMetaDetailItem {
+    ClientErrorCode error_code{ClientErrorCode::ER_OK};
+    std::string error_message;
     int32_t request_index{0};
     int64_t block_key{0};
     std::string prev_block_key;

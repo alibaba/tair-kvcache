@@ -432,9 +432,15 @@ message CacheLocationDetail {
 message CacheMetaDetailItem {
     int32 request_index = 1;
     int64 block_key = 2;
+    // Convenience projection of properties["BP#prev_key"]. The raw property is
+    // intentionally retained in properties as well.
     string prev_block_key = 3;
     map<string, string> properties = 4;
     repeated CacheLocationDetail locations = 5;
+    // Per-key raw metadata lookup status. A missing key is a successful lookup
+    // represented by CLS_NOT_FOUND; backend/read failures are reported here so
+    // other successful items can still be returned.
+    Status status = 6;
 }
 
 message GetCacheMetaDetailResponse {

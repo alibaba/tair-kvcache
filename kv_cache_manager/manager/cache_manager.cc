@@ -802,13 +802,25 @@ std::pair<ErrorCode, CacheMetaDetailVec> CacheManager::GetCacheMetaDetail(Reques
         CacheKeyMetaDetail item;
         item.request_index = request_indices[idx];
         item.block_key = query_keys[idx];
-        if (idx < properties.size()) {
-            item.properties = properties[idx];
-        }
 
-        const bool key_not_found =
-            idx >= per_key_ecs.size() || per_key_ecs[idx] == ErrorCode::EC_NOENT || idx >= location_maps.size() ||
-            location_maps[idx].empty();
+        if (idx >= per_key_ecs.size()) {
+            item.error_code = EC_MISMATCH;
+            details.push_back(std::move(item));
+            continue;
+        }
+        if (per_key_ecs[idx] != EC_OK && per_key_ecs[idx] != EC_NOENT) {
+            item.error_code = per_key_ecs[idx];
+            details.push_back(std::move(item));
+            continue;
+        }
+        if (idx >= location_maps.size() || idx >= properties.size()) {
+            item.error_code = EC_MISMATCH;
+            details.push_back(std::move(item));
+            continue;
+        }
+        item.properties = properties[idx];
+
+        const bool key_not_found = per_key_ecs[idx] == ErrorCode::EC_NOENT || location_maps[idx].empty();
         if (key_not_found) {
             CacheLocationMetaDetail not_found;
             not_found.status = CacheLocationStatus::CLS_NOT_FOUND;
@@ -848,6 +860,12 @@ std::pair<ErrorCode, CacheMetaDetailVec> CacheManager::GetCacheMetaDetail(Reques
         details.push_back(std::move(item));
     }
 
+    const auto first_item_error =
+        std::find_if(details.begin(), details.end(), [](const auto &item) { return item.error_code != EC_OK; });
+    if (first_item_error != details.end() &&
+        std::all_of(details.begin(), details.end(), [](const auto &item) { return item.error_code != EC_OK; })) {
+        return {first_item_error->error_code, std::move(details)};
+    }
     return {EC_OK, std::move(details)};
 }
 

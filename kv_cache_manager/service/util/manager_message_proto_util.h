@@ -412,6 +412,14 @@ inline void ProtoConvert::CacheLocationMetaDetailToProto(
 
 inline void ProtoConvert::CacheKeyMetaDetailToProto(const CacheKeyMetaDetail &cache_meta_detail,
                                                     proto::meta::CacheMetaDetailItem *proto_cache_meta_detail) {
+    auto *status = proto_cache_meta_detail->mutable_status();
+    if (cache_meta_detail.error_code == EC_OK) {
+        status->set_code(proto::meta::OK);
+    } else {
+        status->set_code(ToPbError<proto::meta::ErrorCode>(cache_meta_detail.error_code));
+        status->set_message("Raw metadata lookup failed with internal error code: " +
+                            std::to_string(static_cast<int32_t>(cache_meta_detail.error_code)));
+    }
     proto_cache_meta_detail->set_request_index(static_cast<int32_t>(cache_meta_detail.request_index));
     proto_cache_meta_detail->set_block_key(cache_meta_detail.block_key);
     auto prev_key_iter = cache_meta_detail.properties.find(PROPERTY_PREV_BLOCK_KEY);

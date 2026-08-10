@@ -154,7 +154,35 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
 
         self._client.finish_write_cache(finish_write_data)
 
-        # Step 4: Get cache location to verify it was added correctly
+        # Step 4: Query raw metadata detail for one existing and one missing key.
+        detail_data = {
+            "trace_id": self._trace_id,
+            "instance_id": self._instance_id,
+            "block_keys": [123, 999],
+            "block_mask": {
+                "offset": 0
+            },
+            "detail_level": 1
+        }
+        detail_response = self._client.get_cache_meta_detail(detail_data)
+        self.assertIn('items', detail_response)
+        self.assertEqual(2, len(detail_response['items']))
+
+        found_item, missing_item = detail_response['items']
+        self.assertEqual(0, found_item['request_index'])
+        self.assertEqual(123, int(found_item['block_key']))
+        self.assertEqual('OK', found_item['status']['code'])
+        self.assertGreater(len(found_item['locations']), 0)
+        self.assertTrue(any(location['status'] == 'CLS_SERVING'
+                            for location in found_item['locations']))
+
+        self.assertEqual(1, missing_item['request_index'])
+        self.assertEqual(999, int(missing_item['block_key']))
+        self.assertEqual('OK', missing_item['status']['code'])
+        self.assertEqual(['CLS_NOT_FOUND'],
+                         [location['status'] for location in missing_item['locations']])
+
+        # Step 5: Get cache location to verify it was added correctly
         get_location_data = {
             "trace_id": self._trace_id,
             "query_type": "QT_PREFIX_MATCH",

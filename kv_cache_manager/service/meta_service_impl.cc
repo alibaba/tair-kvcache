@@ -727,15 +727,23 @@ void MetaServiceImpl::GetCacheMetaDetail(RequestContext *request_context,
                             request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] GetCacheMetaDetail failed, ec: %d", request->trace_id().c_str(), ec_info);
     } else {
+        size_t item_error_count = 0;
         for (const auto &cache_meta_detail : cache_meta_details) {
+            item_error_count += cache_meta_detail.error_code != EC_OK;
             ProtoConvert::CacheKeyMetaDetailToProto(cache_meta_detail, response->add_items());
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
-        status->set_message("Cache metadata detail retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetCacheMetaDetail succeeded, returned %d items",
+        if (item_error_count == 0) {
+            status->set_message("Cache metadata detail retrieved successfully");
+        } else {
+            status->set_message("Cache metadata detail retrieved with " + std::to_string(item_error_count) +
+                                " item errors");
+        }
+        KVCM_LOG_INFO("[traceId: %s] GetCacheMetaDetail succeeded, returned %d items with %zu item errors",
                       request->trace_id().c_str(),
-                      response->items_size());
+                      response->items_size(),
+                      item_error_count);
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
