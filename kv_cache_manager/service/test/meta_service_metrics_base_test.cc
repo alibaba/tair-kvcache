@@ -142,7 +142,8 @@ TEST_F(MetaServiceMetricsBaseTest, ReportEventTypeCollectorUsesBoundedTagsAndSta
     auto snapshot = base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_snapshot");
     ASSERT_NE(nullptr, snapshot);
     ASSERT_NE(nullptr, dynamic_cast<EventReportMetricsCollector *>(snapshot.get()));
-    MetricsTags expected_tags = {{"instance_group", "grp1"},
+    MetricsTags expected_tags = {{"api_name", "ReportEvent"},
+                                 {"instance_group", "grp1"},
                                  {"instance_id", "inst1"},
                                  {"type", "event_report_l2"},
                                  {"event_type", "block_snapshot"}};
@@ -151,7 +152,7 @@ TEST_F(MetaServiceMetricsBaseTest, ReportEventTypeCollectorUsesBoundedTagsAndSta
               base_->GetTypedMetricsCollectorForReportEventType("inst1", "event_report_l2", "block_snapshot"));
 }
 
-TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBoundsUnknownValues) {
+TEST_F(MetaServiceMetricsBaseTest, AttachesCollectorsOnlyForBlockMutationEventTypes) {
     SeedInstance("inst1", "grp1");
     proto::meta::ReportEventRequest request;
     request.set_instance_id("inst1");
@@ -167,7 +168,7 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBo
     base_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &request_context);
 
     const auto collectors = request_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
-    ASSERT_EQ(3, collectors.size());
+    ASSERT_EQ(1, collectors.size());
     std::set<std::string> event_types;
     for (const auto &collector : collectors) {
         auto *event_collector = dynamic_cast<EventReportMetricsCollector *>(collector.get());
@@ -179,7 +180,7 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesOneCollectorPerDistinctEventTypeAndBo
             EXPECT_DOUBLE_EQ(2., event_collector->GetRequestKeyCountSample());
         }
     }
-    EXPECT_EQ((std::set<std::string>{"block_snapshot", "heartbeat", "unknown"}), event_types);
+    EXPECT_EQ((std::set<std::string>{"block_snapshot"}), event_types);
 }
 
 TEST_F(MetaServiceMetricsBaseTest, AttachedEventCollectorsHaveRequestLocalSamplesAndSharedCounters) {
@@ -211,8 +212,8 @@ TEST_F(MetaServiceMetricsBaseTest, AttachedEventCollectorsHaveRequestLocalSample
 
     Counter first_counter;
     Counter second_counter;
-    first->copy_event_report_request_counter_metrics(first_counter);
-    second->copy_event_report_request_counter_metrics(second_counter);
+    first->copy_service_query_counter_metrics(first_counter);
+    second->copy_service_query_counter_metrics(second_counter);
     ++first_counter;
     EXPECT_EQ(1u, second_counter.Get());
 }

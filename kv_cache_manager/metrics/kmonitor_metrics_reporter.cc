@@ -50,10 +50,6 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(service, error_qps);
     DECLARE_METRICS(service, request_queue_size);
 
-    DECLARE_METRICS(event_report, qps);
-    DECLARE_METRICS(event_report, request_rt_us);
-    DECLARE_METRICS(event_report, error_qps);
-
     // manager metrics metrics
     DECLARE_METRICS(manager, request_key_count);
     DECLARE_METRICS(manager, prefix_match_len);
@@ -321,10 +317,6 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_QPS_METRIC(service, error_qps);
     REGISTER_GAUGE_METRIC(service, request_queue_size);
 
-    REGISTER_QPS_METRIC(event_report, qps);
-    REGISTER_GAUGE_METRIC(event_report, request_rt_us);
-    REGISTER_QPS_METRIC(event_report, error_qps);
-
     // manager metrics
     REGISTER_GAUGE_METRIC(manager, request_key_count);
     REGISTER_GAUGE_METRIC(manager, prefix_match_len);
@@ -580,11 +572,11 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
-        REPORT_METRICS(event_report, qps, 1.0);
-        REPORT_METRICS(event_report, request_rt_us, p->GetRequestRtUsSample());
+        REPORT_METRICS(service, qps, 1.0);
+        REPORT_METRICS(service, query_rt_us, p->GetRequestRtUsSample());
 
         const double error_code = p->GetErrorCodeSample();
-        REPORT_METRICS_WHEN(event_report, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
+        REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
         if (p->HasRequestKeyCountSample()) {
             REPORT_METRICS(manager, request_key_count, p->GetRequestKeyCountSample());
         }

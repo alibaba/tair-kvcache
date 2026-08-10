@@ -29,16 +29,16 @@ TEST_F(MetricsCollectorTest, EventReportMetricsTest) {
     EXPECT_EQ(tags, collector->GetMetricsTags());
     EXPECT_EQ(5, metrics_registry_->GetSize());
 
-    EXPECT_EQ(0, GET(collector, event_report, request_counter));
-    EXPECT_DOUBLE_EQ(0., GET(collector, event_report, request_rt_us));
-    EXPECT_DOUBLE_EQ(0., GET(collector, event_report, error_code));
-    EXPECT_EQ(0, GET(collector, event_report, error_counter));
+    EXPECT_EQ(0, GET(collector, service, query_counter));
+    EXPECT_DOUBLE_EQ(0., GET(collector, service, query_rt_us));
+    EXPECT_DOUBLE_EQ(0., GET(collector, service, error_code));
+    EXPECT_EQ(0, GET(collector, service, error_counter));
     EXPECT_DOUBLE_EQ(0., GET(collector, manager, request_key_count));
 
-    SET_METRICS_(collector, event_report, request_rt_us, 123.);
-    SET_METRICS_(collector, event_report, error_code, 10.);
-    EXPECT_DOUBLE_EQ(123., GET(collector, event_report, request_rt_us));
-    EXPECT_DOUBLE_EQ(10., GET(collector, event_report, error_code));
+    SET_METRICS_(collector, service, query_rt_us, 123.);
+    SET_METRICS_(collector, service, error_code, 10.);
+    EXPECT_DOUBLE_EQ(123., GET(collector, service, query_rt_us));
+    EXPECT_DOUBLE_EQ(10., GET(collector, service, error_code));
 }
 
 // Test MetaIndexer metrics functionality
