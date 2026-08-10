@@ -2610,9 +2610,11 @@ bool IsEventReportLocationReadable(const CacheLocation &location,
         return false;
     }
     bool contains_readable_version = !strict_query_visibility;
+    const bool uri_structure_prevalidated = location.HasValidatedLocationSpecs();
     for (const auto &spec : location.location_specs()) {
         std::string_view snapshot_version;
-        if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), snapshot_version)) {
+        if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(
+                spec.uri(), snapshot_version, uri_structure_prevalidated)) {
             return false;
         }
         if (!snapshot_version.empty() && strict_query_visibility &&
@@ -4541,7 +4543,8 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
     };
 }
 
-CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
+MetaSearcher::CheckHostCacheLocationFunc
+CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
     auto fallback = GetCheckLocDataExistFunc(instance_id);
     struct EventVisibilitySnapshot {
         std::shared_ptr<EventReportBackend> backend;
@@ -4581,7 +4584,9 @@ CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const
 
     return [fallback = std::move(fallback),
             event_snapshots = std::move(event_snapshots),
-            initialize_event_snapshots = std::move(initialize_event_snapshots)](const CacheLocation &location) -> bool {
+            initialize_event_snapshots = std::move(initialize_event_snapshots)](
+               const CacheLocation &location, MetaSearcher::HostCacheLocationInfo &out_info) -> bool {
+        out_info = {};
         if (!IsEventReportStorageType(location.type())) {
             return fallback ? fallback(location) : true;
         }
@@ -4593,17 +4598,23 @@ CheckLocDataExistFunc CacheManager::GetHostCacheStateCheckLocDataExistFunc(const
         if (snapshot_it == event_snapshots->by_storage_type.end() || !snapshot_it->second.backend) {
             return false;
         }
-        std::string reporter_medium;
-        std::string reporter_host;
-        if (!snapshot_it->second.backend->ParseLocationId(location.id(), reporter_medium, reporter_host)) {
+        std::string_view reporter_medium;
+        std::string_view reporter_host;
+        if (!snapshot_it->second.backend->ParseLocationIdView(location.id(), reporter_medium, reporter_host)) {
             return false;
         }
         const auto reporter_it = snapshot_it->second.reporters.find(reporter_host);
         if (reporter_it == snapshot_it->second.reporters.end()) {
             return false;
         }
-        return IsEventReportLocationReadable(
-            location, reporter_it->second.strict, reporter_it->second.committed_version);
+        if (!IsEventReportLocationReadable(
+                location, reporter_it->second.strict, reporter_it->second.committed_version)) {
+            return false;
+        }
+        out_info.has_reporter_identity = true;
+        out_info.reporter_medium = reporter_medium;
+        out_info.reporter_host = reporter_host;
+        return true;
     };
 }
 
@@ -4673,7 +4684,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
-    const auto request_check_loc_data_exist = GetHostCacheStateCheckLocDataExistFunc(instance_id);
+    const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
@@ -4683,7 +4694,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               use_eagle_pop,
                                               medium_filter,
                                               host_matches,
-                                              &request_check_loc_data_exist,
+                                              &request_check_location,
                                               p2p_host_count);
         break;
     }
@@ -4694,7 +4705,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
-                                                       &request_check_loc_data_exist,
+                                                       &request_check_location,
                                                        p2p_host_count);
         break;
     }

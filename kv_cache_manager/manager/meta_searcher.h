@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -55,6 +56,19 @@ public:
         int64_t p2p_1_total_match;
     };
 
+    struct HostCacheLocationInfo {
+        // When true, the checker has already parsed the EventReport location
+        // id and validated every spec URI while applying query visibility.
+        bool has_reporter_identity = false;
+        // Views borrow the immutable CacheLocation id and are consumed while
+        // that location is still held by the current projection; they are
+        // never retained in output.
+        std::string_view reporter_medium;
+        std::string_view reporter_host;
+    };
+    using CheckHostCacheLocationFunc =
+        std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
+
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
                  CheckLocDataExistFunc check_loc_data_exist,
@@ -89,7 +103,7 @@ public:
                                 bool use_eagle_pop,
                                 const std::vector<std::string> &medium_filter,
                                 std::vector<HostCacheMatch> &out_matches,
-                                const CheckLocDataExistFunc *request_check_loc_data_exist = nullptr,
+                                const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                 size_t p2p_host_count = 0) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
@@ -97,7 +111,7 @@ public:
                                          const std::vector<std::string> &medium_filter,
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
                                          std::vector<HostCacheMatch> &out_matches,
-                                         const CheckLocDataExistFunc *request_check_loc_data_exist = nullptr,
+                                         const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                          size_t p2p_host_count = 0) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,

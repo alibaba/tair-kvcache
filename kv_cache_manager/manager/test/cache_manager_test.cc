@@ -5386,6 +5386,11 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
          {"event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + upper_token},
          false},
         {"invalid_uri", {"not-a-uri"}, false},
+        {"invalid_empty_port", {"event_report://physical-cache:/mem"}, false},
+        {"invalid_negative_port", {"event_report://physical-cache:-1/mem"}, false},
+        {"invalid_text_port", {"event_report://physical-cache:not-a-port/mem"}, false},
+        {"invalid_overflow_port", {"event_report://physical-cache:9223372036854775808/mem"}, false},
+        {"invalid_userinfo_port", {"event_report://user:secret@physical-cache:not-a-port/mem"}, false},
         {"mixed_versioned_and_legacy",
          {"event_report://physical-cache:9600/mem?s_version=" + token,
           "event_report://physical-cache:9600/mem?source=legacy"},
@@ -5777,6 +5782,11 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
 
+    // This test removes queued executor tasks for direct inspection. Stop the
+    // supervisor first so it cannot wait on a packaged task that the test then
+    // destroys, which would surface as a nondeterministic broken promise.
+    cache_manager_->reclaimer_task_supervisor_->Stop();
+
     // write keys {1,2,3} and finish as CLS_SERVING
     std::vector<std::int64_t> write_keys{1, 2, 3};
     auto [ec1, swci1] =
@@ -5949,6 +5959,11 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
                                                createLocationSpecInfos(),
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
+
+    // This test removes queued executor tasks for direct inspection. Stop the
+    // supervisor first so it cannot wait on a packaged task that the test then
+    // destroys, which would surface as a nondeterministic broken promise.
+    cache_manager_->reclaimer_task_supervisor_->Stop();
 
     // write keys {1,2,3} and finish as CLS_SERVING
     std::vector<std::int64_t> write_keys{1, 2, 3};
@@ -8026,6 +8041,34 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
 //   host_B: 100→200→300→400→(miss 500) → prefix=4
 //   host_C: 100→(miss 200) → prefix=1
 //
+TEST_F(CacheManagerTest, TestGetHostCacheStateDoesNotExposeStartWriteBeforeFinish) {
+    const std::string instance_id = "test_host_cache_state_writing";
+    ASSERT_EQ(std::make_pair(EC_OK, default_storage_configs),
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>(),
+                                               CacheManager::QueryType::QT_PREFIX_MATCH));
+
+    const CacheManager::KeyVector keys = {8999};
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), instance_id, keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    auto [query_ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+    EXPECT_EQ(EC_OK, query_ec);
+    EXPECT_TRUE(hosts.empty());
+
+    const BlockMask success_mask = static_cast<size_t>(keys.size());
+    EXPECT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), instance_id, write_info.write_session_id(), success_mask));
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheStateSnapshotsHostLivenessAfterMetadataRead) {
     auto event_backend = InstallEventReportBackend();
     ASSERT_TRUE(event_backend);

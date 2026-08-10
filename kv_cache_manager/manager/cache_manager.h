@@ -362,7 +362,8 @@ private:
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
-    CheckLocDataExistFunc GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
+    MetaSearcher::CheckHostCacheLocationFunc
+    GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
     void DeactivateEventCleanupCallbacks();

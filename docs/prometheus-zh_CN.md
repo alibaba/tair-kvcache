@@ -130,8 +130,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `manager.get_cache_location_hit_block_counter` | counter | GetCacheLocation 命中的 Block 总数（累计） |
 | `manager.prefix_match_time_us` | gauge | GetHostCacheState 等前缀匹配的外层总延迟（微秒） |
 | `meta_searcher.indexer_get_time_us` | gauge | MetaSearcher 调用 MetaIndexer 读取 metadata 的墙钟时间（微秒） |
-| `meta_indexer.get_io_time_us` | gauge | metadata backend 调用墙钟时间；local 模式也包含 LRU/锁/复制，并不表示 Redis I/O |
-| `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性检查及 host/spec 投影时间（微秒） |
+| `meta_indexer.get_io_time_us` | gauge | metadata backend 调用区间的墙钟并集；local 模式包含 LRU/锁/复制，不包含并行 projection，也不表示 Redis I/O |
+| `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
@@ -154,8 +154,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 上述 GetHostCacheState 分段指标是嵌套关系：`meta_indexer.get_io_time_us` 位于
 `meta_searcher.indexer_get_time_us` 内，后者与 projection/reduce 又位于
-`manager.prefix_match_time_us` 内，排障时不能把它们相加。`get_io_time_us` 是历史命名；当实例使用
-`storage_type=local` 时没有 Redis 网络调用。
+`manager.prefix_match_time_us` 内。渐进 local 查询会流水化 backend read 与 projection，两者可能重叠，排障时
+不能把它们相加。`get_io_time_us` 是历史命名；当实例使用 `storage_type=local` 时没有 Redis 网络调用。
 
 ## 与 KMonitor 指标对照
 

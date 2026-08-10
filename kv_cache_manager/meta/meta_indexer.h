@@ -77,6 +77,8 @@ public:
     // the request key count to continue. Chunks after the first can arrive out
     // of order and concurrently; the first chunk is always visited before
     // any parallel work starts so callers can initialize candidate state.
+    // locations and every view/iterator obtained from it are callback-scoped;
+    // callers must copy any state that needs to outlive the invocation.
     using PrefixLocationVisitor =
         std::function<size_t(size_t begin, const CompactLocationsPerKey &locations, size_t valid_key_count)>;
 
@@ -135,8 +137,9 @@ public:
                         const KeyVector &keys,
                         CacheLocationMapVector &out_location_maps) noexcept;
     // Lightweight all-location view used by GetHostCacheState. For a single
-    // local backend, large requests are read concurrently through the shared
-    // bounded query executor. Other backend modes remain one batched call.
+    // local backend, VisitLocationValuesForPrefix performs a bounded first
+    // probe and then reads the still-needed suffix through the shared query
+    // executor. Other backend modes remain one batched call.
     Result
     GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
     PrefixLocationResult VisitLocationValuesForPrefix(RequestContext *request_context,

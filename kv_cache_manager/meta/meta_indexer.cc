@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -35,11 +37,53 @@ static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete
 static constexpr const char *kDeleteMetaOperation = "delete";
 static constexpr const char *kExistMetaOperation = "exist";
 static constexpr const char *kGetMetaOperation = "get";
-// Pure-local prefix scans group enough keys to amortize the 1024-shard LRU's
-// lookup/release locks. This is independent from the smaller CPU-projection
-// chunk configured on QueryExecutor. The first range remains bounded so a
-// short prefix still cancels a million-key suffix promptly.
-static constexpr size_t kLocalPrefixReadChunkSize = 4096;
+// Pure-local prefix scans first inspect a bounded window so a short prefix can
+// cancel a million-key suffix promptly. Once that probe succeeds, larger
+// ranges amortize the 1024-shard LRU's lookup/release locks while preserving
+// enough independent work for the query executor.
+static constexpr size_t kLocalPrefixProbeKeyCount = 4096;
+static constexpr size_t kLocalPrefixParallelReadChunkSize = 16384;
+static constexpr size_t kPrefixStateWordBits = 64;
+static_assert(kLocalPrefixProbeKeyCount % kPrefixStateWordBits == 0);
+static_assert(kLocalPrefixParallelReadChunkSize % kPrefixStateWordBits == 0);
+
+struct PrefixLocationScratch {
+    bool in_use = false;
+    CompactLocationsPerKey locations;
+};
+
+thread_local PrefixLocationScratch tls_prefix_location_scratch;
+
+class PrefixLocationScratchLease {
+public:
+    explicit PrefixLocationScratchLease(size_t key_count) {
+        if (key_count <= kLocalPrefixParallelReadChunkSize && !tls_prefix_location_scratch.in_use) {
+            scratch_ = &tls_prefix_location_scratch;
+            scratch_->in_use = true;
+            uses_thread_local_ = true;
+        } else {
+            local_.emplace();
+            scratch_ = &*local_;
+        }
+    }
+
+    ~PrefixLocationScratchLease() {
+        if (uses_thread_local_) {
+            // Retain only allocation capacity. Holding shared_ptr values until
+            // this worker's next query would pin replaced CacheLocations and
+            // make the scratch cache an accidental object cache.
+            scratch_->locations.Clear();
+            scratch_->in_use = false;
+        }
+    }
+
+    CompactLocationsPerKey &locations() noexcept { return scratch_->locations; }
+
+private:
+    std::optional<PrefixLocationScratch> local_;
+    PrefixLocationScratch *scratch_ = nullptr;
+    bool uses_thread_local_ = false;
+};
 } // namespace
 
 class MetaIndexer::ScopedBatchLock {
@@ -1395,17 +1439,34 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
-    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    const size_t chunk_size =
-        std::max(kLocalPrefixReadChunkSize, query_executor_ ? query_executor_->chunk_size() : size_t{256});
-    const size_t chunk_count = 1 + (keys.size() - 1) / chunk_size;
+    // Backend reads and projection are pipelined. Track the union of backend
+    // call intervals so get_io_time_us does not accidentally include visitor
+    // CPU time or double-count overlapping worker reads.
+    std::atomic<size_t> active_backend_reads(0);
+    std::atomic<int64_t> backend_read_interval_start_us(0);
+    std::atomic<int64_t> backend_read_wall_time_us(0);
+    const size_t configured_chunk_size =
+        std::max(kLocalPrefixParallelReadChunkSize, query_executor_ ? query_executor_->chunk_size() : size_t{256});
+    // Keep callback boundaries on 64-key words. The Mamba projection stores
+    // per-host state as disjoint key bit ranges, so concurrent callbacks never
+    // update the same word.
+    const size_t aligned_chunk_size =
+        configured_chunk_size > std::numeric_limits<size_t>::max() - (kPrefixStateWordBits - 1)
+            ? configured_chunk_size
+            : (configured_chunk_size + kPrefixStateWordBits - 1) & ~(kPrefixStateWordBits - 1);
+    // A configuration larger than the request still means one suffix range;
+    // clamp it so absolute range arithmetic cannot wrap around size_t.
+    const size_t parallel_chunk_size = std::min(aligned_chunk_size, keys.size());
+    const size_t first_chunk_size = std::min(kLocalPrefixProbeKeyCount, keys.size());
+    const size_t remaining_chunk_count =
+        first_chunk_size == keys.size() ? 0 : 1 + (keys.size() - first_chunk_size - 1) / parallel_chunk_size;
 
     struct ChunkTerminal {
         size_t index = 0;
         ErrorCode ec = EC_OK;
         bool present = false;
     };
-    std::vector<ChunkTerminal> terminals(chunk_count);
+    std::vector<ChunkTerminal> terminals(1 + remaining_chunk_count);
     std::atomic<size_t> metadata_stop(keys.size());
     std::atomic<size_t> visitor_stop(keys.size());
     std::atomic<size_t> read_key_count(0);
@@ -1425,15 +1486,28 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
                            &metadata_stop,
                            &visitor_stop,
                            &read_key_count,
+                           &active_backend_reads,
+                           &backend_read_interval_start_us,
+                           &backend_read_wall_time_us,
                            &reduce_stop_index,
-                           &current_stop,
-                           chunk_size](size_t chunk_begin, size_t count) {
+                           &current_stop](size_t chunk_begin, size_t count, size_t terminal_slot) {
         if (chunk_begin >= current_stop()) {
             return;
         }
 
-        CompactLocationsPerKey locations;
+        PrefixLocationScratchLease scratch_lease(count);
+        auto &locations = scratch_lease.locations();
+        const int64_t backend_read_begin_us = TimestampUtil::GetCurrentTimeUs();
+        if (active_backend_reads.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            backend_read_interval_start_us.store(backend_read_begin_us, std::memory_order_release);
+        }
         auto errors = backend_manager_->GetLocationValuesCompact(nullptr, keys.data() + chunk_begin, count, locations);
+        const int64_t backend_read_end_us = TimestampUtil::GetCurrentTimeUs();
+        const int64_t interval_start_us = backend_read_interval_start_us.load(std::memory_order_acquire);
+        if (active_backend_reads.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            backend_read_wall_time_us.fetch_add(std::max<int64_t>(backend_read_end_us - interval_start_us, 0),
+                                                std::memory_order_relaxed);
+        }
         read_key_count.fetch_add(count, std::memory_order_relaxed);
 
         size_t successful_count = 0;
@@ -1458,30 +1532,32 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
             reduce_stop_index(visitor_stop, requested_stop);
         }
         if (terminal_ec != EC_OK) {
-            auto &terminal = terminals[chunk_begin / chunk_size];
+            auto &terminal = terminals[terminal_slot];
             terminal.index = chunk_begin + successful_count;
             terminal.ec = terminal_ec;
             terminal.present = true;
             reduce_stop_index(metadata_stop, terminal.index);
         }
     };
-    auto read_ranges = [&read_one_chunk, &current_stop, &keys, chunk_size](size_t begin, size_t end) {
-        for (size_t chunk_begin = begin; chunk_begin < end; chunk_begin += chunk_size) {
+    auto read_ranges = [&read_one_chunk, &current_stop, &keys, first_chunk_size, parallel_chunk_size](size_t begin,
+                                                                                                      size_t end) {
+        for (size_t chunk_begin = begin; chunk_begin < end;) {
             if (chunk_begin >= current_stop()) {
                 return;
             }
-            const size_t chunk_end = std::min(end, std::min(keys.size(), chunk_begin + chunk_size));
-            read_one_chunk(chunk_begin, chunk_end - chunk_begin);
+            const size_t chunk_end = chunk_begin + std::min(parallel_chunk_size, end - chunk_begin);
+            const size_t terminal_slot = 1 + (chunk_begin - first_chunk_size) / parallel_chunk_size;
+            read_one_chunk(chunk_begin, chunk_end - chunk_begin, terminal_slot);
+            chunk_begin = chunk_end;
         }
     };
 
     bool completed = true;
-    const size_t first_chunk_size = std::min(chunk_size, keys.size());
     try {
         // Candidate hosts are derived from key zero. Visiting this chunk before
         // scheduling the suffix makes every later callback independent and
         // allows an early host miss to cancel all suffix metadata reads.
-        read_one_chunk(0, first_chunk_size);
+        read_one_chunk(0, first_chunk_size, 0);
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("first compact local location read failed: %s", e.what());
         completed = false;
@@ -1496,7 +1572,8 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
             read_ranges(first_chunk_size + begin, first_chunk_size + end);
         };
         if (query_executor_) {
-            completed = query_executor_->ParallelForWithChunkSize(remaining_count, chunk_size, read_remaining_ranges);
+            completed =
+                query_executor_->ParallelForWithChunkSize(remaining_count, parallel_chunk_size, read_remaining_ranges);
         } else {
             try {
                 read_remaining_ranges(0, remaining_count);
@@ -1520,7 +1597,10 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         prefix_result.stopped_by_visitor =
             first_visitor_stop <= first_metadata_error && first_visitor_stop < keys.size();
         if (first_metadata_error < first_visitor_stop && first_metadata_error < keys.size()) {
-            const auto &terminal = terminals[first_metadata_error / chunk_size];
+            const size_t terminal_slot = first_metadata_error < first_chunk_size
+                                             ? 0
+                                             : 1 + (first_metadata_error - first_chunk_size) / parallel_chunk_size;
+            const auto &terminal = terminals[terminal_slot];
             if (!terminal.present || terminal.index != first_metadata_error) {
                 prefix_result.terminal_ec = EC_MISMATCH;
                 prefix_result.valid_key_count = 0;
@@ -1536,8 +1616,10 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         }
     }
 
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                       meta_indexer,
+                                       get_io_time_us,
+                                       backend_read_wall_time_us.load(std::memory_order_relaxed));
     return prefix_result;
 }
 

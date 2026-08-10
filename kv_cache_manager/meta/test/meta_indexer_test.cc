@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -21,6 +24,8 @@
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 
 using namespace kv_cache_manager;
 
@@ -357,6 +362,80 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesReturnsEveryAllHitKey) {
         ASSERT_TRUE(observed[i]) << "index=" << i;
         EXPECT_EQ("loc_" + std::to_string(data.keys[i]), observed[i]->id()) << "index=" << i;
     }
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesClampsOversizedConfiguredChunk) {
+    constexpr std::size_t kKeyCount = 5000;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4,
+        /*parallel_threshold*/ 1,
+        /*chunk_size*/ std::numeric_limits<std::size_t>::max(),
+        /*queue_capacity*/ 4));
+    const std::string config_str = R"({
+        "max_key_count" : 8192,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    std::vector<size_t> chunk_begins;
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(
+        request_context_.get(),
+        data.keys,
+        [&data, &chunk_begins](size_t begin, const CompactLocationsPerKey &locations, size_t valid_count) {
+            chunk_begins.push_back(begin);
+            EXPECT_EQ(valid_count, locations.size());
+            return data.keys.size();
+        });
+    EXPECT_EQ(EC_OK, prefix.terminal_ec);
+    EXPECT_EQ(kKeyCount, prefix.valid_key_count);
+    EXPECT_EQ(kKeyCount, prefix.read_key_count);
+    EXPECT_EQ((std::vector<size_t>{0, 4096}), chunk_begins);
+}
+
+TEST_F(MetaIndexerTest, TestCompactPrefixGetIoMetricExcludesPipelinedVisitorTime) {
+    constexpr std::size_t kKeyCount = 5000;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+    const std::string config_str = R"({
+        "max_key_count" : 8192,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto metrics_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry);
+    ASSERT_TRUE(metrics_collector->Init());
+    RequestContext metrics_context("prefix_metric_test", metrics_collector);
+    size_t visitor_calls = 0;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto prefix = meta_indexer_->VisitLocationValuesForPrefix(
+        &metrics_context, data.keys, [&data, &visitor_calls](size_t, const CompactLocationsPerKey &, size_t) {
+            ++visitor_calls;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return data.keys.size();
+        });
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+
+    EXPECT_EQ(EC_OK, prefix.terminal_ec);
+    EXPECT_EQ(2u, visitor_calls);
+    const auto backend_wall_us = metrics_collector->get_meta_indexer_get_io_time_us_metrics();
+    EXPECT_GT(backend_wall_us, 0);
+    EXPECT_GE(elapsed_us - static_cast<int64_t>(backend_wall_us), 30000);
 }
 
 TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesRejectsMalformedShape) {

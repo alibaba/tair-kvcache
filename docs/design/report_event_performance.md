@@ -65,8 +65,9 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
 
 1. `MetaLocalBackend::GetLocationValues` 只复制不可变 `CacheLocation` 的 `shared_ptr`，不复制 map node、
    hash bucket 和 location-id 字符串。原有 `GetLocations` 保留给需要按 id 查找的调用方；
-2. 仅在“单一 persistent backend 且类型为 `local`”时，把达到阈值的 key 切成连续 chunk 并发读取。
-   `cached`、`redis`、dummy 等模式仍执行一次原有 batch 调用，避免放大远端请求或破坏 recovery 语义；
+2. 仅在“单一 persistent backend 且类型为 `local`”时启用渐进读取：先同步读取 4096-key probe，若候选
+   prefix 尚未终止，再以 16384-key chunk 有界并发读取后缀。`cached`、`redis`、dummy 等模式仍执行一次
+   原有 batch 调用，避免放大远端请求或破坏 recovery 语义；
 3. 全进程所有 MetaIndexer 共享一个有界 `QueryExecutor`。配置的 worker 数包含 RPC caller，默认 4
    表示 caller + 3 个后台线程，不为每个请求创建线程。队列满时 caller 自己完成剩余 chunk；若 caller
    已完成全部工作，尚未启动的 helper 会取消，不能为了一个排队中的空任务制造队头阻塞。线程池部分
@@ -80,7 +81,8 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
    Mamba、Eagle pop 和 medium filter 的结果语义不变；
 6. 普通 prefix 只为首 key 建立排序后的候选 host，后续 key 直接写入按候选编号组织的 packed bitset，
    不再为每个 key 构造 `map<string, set<string>>`，也不保存普通 prefix 根本不需要的 spec name。
-   Mamba 仍需 spec 完整性信息，但改用排序的小 vector，避免每个 key 的红黑树 node 分配；
+   Mamba 把 required spec 和每个 host 的 state presence 都编码为 64-bit words，不再为每个 key 建红黑树，
+   也不再保留一字节一个 `(key, host)` 的 state matrix；
 7. GetHostCacheState 专用可见性 checker 在校验 EventReport reporter 状态和 URI 时一并返回已经解析的
    medium/host。host 投影复用该结果，不再对同一 location id 做第二次 split。EventReport URI 的查询侧
    校验直接在不可变字符串上单次扫描，用 `string_view` 比较 generation；不再为每个 spec 拆分
@@ -95,7 +97,9 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
    `meta_indexer.get_io_time_us`；
 10. prefix 只把首个 `EC_NOENT` 当作正常终止。首个 miss 之后的 speculative read 结果不影响已经确定的
     前缀；但 miss 之前的 `EC_ERROR`、`EC_MISMATCH` 等硬错误必须原样返回，不能伪装成较短的 cache miss。
-    普通 prefix 与 Mamba 路径遵循相同规则。
+    普通 prefix 与 Mamba 路径遵循相同规则；
+11. 上述渐进取消只用于 `p2p_host_count=0`。启用 P2P 时 local miss 之后仍可能由 Vineyard peer 延续覆盖，
+    因此当前保留完整 metadata materialization；它仍执行 serving 过滤和错误传播，但不能套用 local-only stop。
 
 可见性快照在首个有界 metadata range 读取之后、其 projection 开始时采集。采集前已经可见的 HOST_DOWN
 会被当前请求过滤；采集后的 HOST_DOWN 允许当前请求继续看到旧状态，但采集完成后本请求不再变化，下一
@@ -1677,3 +1681,164 @@ pure-local Release 验证结果：
 - 同一 Release + jemalloc 进程的 20K ReportEvent create/update 为 55.86/48.20ms；20K-key GetHostCacheState
   local serial p50/p99/avg 为 14.15/14.74/14.17ms，16-way p50/p99 为 35.88/50.53ms。数据表明本轮兼容修复和测试
   扩展没有造成 ADD/Get 性能回退，但仍只作为共享开发机门禁，不是线上 SLA。
+
+### 5.27 2026-08-10 GetHostCacheState 渐进读取、可见性纠偏与百万 key 收敛
+
+本轮以 pure-local metadata 为唯一生产目标，重新从 GetHostCacheState 的 100 万 key Release benchmark、代码语义和
+`cycles:u` profile 交叉检查。基线的普通 host-prefix 路径虽然 metadata compact read 本身约 84ms，却在读完全部 key
+后为每个 key 构造 `map<string, set<string>>`；同机 4-worker 的 100K/500K/1M 全命中 p50 约为
+47.94/294.72/597.15ms。更严重的是，把第 1024 个 key 换成其他 host 或 metadata miss 时仍分别耗时约
+582.97/178.21ms，证明此前的并行投影不能取消已经无意义的百万 key 后缀。
+
+代码复核还发现两个比性能更优先的正确性问题：host projection 没有过滤 `CLS_WRITING/CLS_DELETING/CLS_NEW` 等
+非 serving 状态，`StartWriteCache` 尚未 `FinishWriteCache` 的 location 会被当成命中；普通与 Mamba 路径还把
+非 `EC_NOENT` backend 错误当作 prefix 结束并返回成功。这两点都可能直接造成 KVCM 统计命中与实际引擎可读命中
+不一致，因此本轮先建立失败用例，再实现优化。
+
+#### 最终实现与并发边界
+
+1. `p2p_host_count=0` 使用真正的渐进式 compact projection。先同步读取 4096 key，利用第 0 个 key 建立有序候选
+   host；每个候选维护 atomic prefix stop。只要所有候选均已停止，visitor 就降低全局 stop，尚未领取的后缀任务
+   直接取消。首窗口内的 host miss/no-entry 因而只读取 4096 key，而不是先物化整个请求。
+2. 首窗口成功后使用 16384-key 后续批次并由现有有界 QueryExecutor 调度。默认 local LRU 有 1024 shard，旧 4096
+   批次会在百万 key 请求中重复约 24 万次 lookup/release shard lock；增大后续批次可摊薄 lock/unlock，同时首窗口
+   仍保持早停上界。16384 相对 4096 的同机 A/B 将 1M metadata/all-hit p50 从约 109.3/114.9ms 降至
+   94.3/103.7ms；32768 没有进一步改善 all-hit 且放大后缀过读，已撤销。
+3. `p2p_host_count>0` 暂时保留完整读取。一个 host 的 local prefix 已停止时，Vineyard peer 仍可能继续覆盖后续 key，
+   不能把 local miss 直接当作全局取消条件。该路径仍获得 serving 状态过滤、一次 host/spec 扫描和严格错误传播，
+   但没有伪装成渐进路径；后续若优化，必须先设计 peer-aware stop 证明。
+4. request-specific checker 除返回可见/不可见外，同时借用返回已经解析的 reporter medium/host，并声明 EventReport URI
+   已通过 generation fence 校验。projection 因而不再对同一 location 重复拆 location id、解析 URI 和提取 host；
+   medium filter 使用借用的 `string_view` hash set，generic URI path 也不再复制 path string。
+5. 每个 location 必须先满足 `CLS_SERVING`，再执行 backend liveness/generation checker。`EC_NOENT` 是正常 prefix
+   终止；`EC_TIMEOUT/EC_MISMATCH/EC_ERROR` 等只要发生在仍需要的 prefix 内就原样返回。若所有候选已在更早位置停止，
+   后续错误不再影响结果，这与 prefix 查询的最小必要读取语义一致。
+6. ordinary projection 用候选 host 位图而不是 per-key ordered map/set。Mamba 将 `(key, host)` state byte matrix 压为
+   host-major 64-bit words，1M key/host 从约 1MiB 降到约 125KiB，并按 word 反向查找最后一个 state；read callback
+   边界固定按 64 key 对齐，保证不同 worker 写入互不重叠。
+7. MetaIndexer 和 MetaLocalBackend 各自使用可重入保护的 bounded thread-local scratch，复用 compact offsets/value、
+   key view、handle 和 LRU batch hash/shard 数组的 capacity。上限与后续批次同为 16384；每次 visitor 返回后立即清空
+   `shared_ptr` values，只保留 capacity，避免把 scratch 变成旧 CacheLocation 的隐式对象缓存。
+8. 流水化之后重新校准观测语义：`meta_indexer.get_io_time_us` 统计并行 backend call interval 的墙钟并集，不再把
+   visitor CPU 混入 I/O；`host_projection_time_us` 同样统计 projection callback interval 的墙钟并集，而不是把多个
+   worker 时间相加。两者会重叠，均包含在 `indexer_get_time_us`/`prefix_match_time_us` 内，不能相加。
+
+没有为这一优化扩大 item shared-lock 生命周期，也没有绕过 immutable `shared_ptr<const CacheLocation>` 快照。把 raw
+location 指针带出 item lock 虽可少一次 owner add-ref，但 ReportEvent 可在锁释放后替换 map entry，会形成真实 UAF；
+因此该方向明确不采用。最终 profile 中 URI visibility/location-id parse 已降为低个位数占比，`__lll_lock_wait` 约
+0.15%，没有长时间 futex sleep；剩余主要是每 key 必需的 item rwlock、LRU lookup/release 和 immutable owner copy。
+
+#### Release 性能与门禁
+
+一次同机 `perf record -e cycles:u -F 499 -g --call-graph dwarf` 的最终纯内存运行得到：
+
+| 场景 | 4-worker p50 | 8-worker p50 | 16-worker p50 |
+| --- | ---: | ---: | ---: |
+| 1M metadata only | 92.19ms | 71.63ms | 63.38ms |
+| 1M ordinary all-hit | 99.61ms | 71.38ms | 66.10ms |
+| 第 1024 key host stop | 0.48ms | - | - |
+| 第 1024 key metadata miss | 0.44ms | - | - |
+
+同一运行的 100K/500K ordinary all-hit p50 为 9.60/45.50ms。共享开发机另几轮 4-worker 1M all-hit 在
+约 104~123ms 波动，因此不能把单次 99.61ms 当成线上 SLA；但相对约 597ms 的全量 map/set 基线和约 583ms 的
+无效早停基线，量级收益稳定。默认 worker_count 仍保持 4：8-worker 对 isolated、CPU 充足的百万 key 查询明确有益，
+但 5.3 的混合负载已证明盲目增加 worker 可能恶化 Get p99，上线应按同负载 A/B 配置而不是在代码中改默认值。
+
+当前 Release HTTP 二进制、pure-local metadata 的真实 ReportEvent → GetHostCacheState benchmark 为：100/1K/5K/20K
+串行 p50 0.49/0.87/2.49/8.30ms；20K 的 16-way p50/p99 为 15.04/27.45ms。每次响应均校验目标 host 的完整 prefix，
+该数据包含 HTTP JSON parse/serialize，但仍只作当前机器回归门禁。
+
+最终验证均不依赖 Redis：
+
+- serving/WRITING/DELETING/NEW/NOT_FOUND 全状态矩阵在 p2p=0 和 p2p>0 下结果一致；Manager 端到端验证
+  StartWrite 在 Finish 前不可见；
+- ordinary/Mamba 覆盖 first-window stop、第二并行 range timeout、较早 visitor stop 屏蔽无关后续 timeout、70 host
+  多 presence word、75 个 required spec 跨 word，以及 40K key 跨 4096/16384 边界；Mamba fast path 与保留的
+  full-materialize path 逐项差分；极端 `chunk_size=SIZE_MAX` 也会被安全收敛为单个 suffix range，不发生整数回绕；
+- 上述并行/生命周期重点用例 20 轮重复通过；MetaSearcherTest、CacheManagerTest 全量通过；
+- `bazel test --config=release --nocache_test_results //kv_cache_manager/...` 为 106 个测试通过，1 个 GPU-only 测试
+  按预期 skip；
+- 当前 Release server 的 snapshot HTTP 功能集 37/37 全绿，覆盖 ReportEvent ADD/DELETE/SNAPSHOT、heartbeat/
+  host-down、部分失败、并发 generation 与 GetHostCacheState 可见性。
+
+后续停止线：pure-local、无 P2P 的查询已经没有证据支持继续删除锁或 URI 校验。下一项真正可能带来量级收益的是修改
+LRU ref/list 或 metadata item representation，但这会同时改变 eviction、ReportEvent writer 和对象生命周期，必须作为
+独立设计并建立 mixed ReportEvent/Get p99、capacity eviction、host-down/generation 与 fault-injection 门禁，不能继续
+作为本分支的低风险局部优化。
+
+#### 最终混合负载复核与附带健壮性修复
+
+在最终全量测试中，`EventReportBackendTest.CloseInterruptsLongLivenessWait` 曾低概率等待完整的 60 秒 tick。
+`Close()` 原先只更新 atomic predicate 后调用 condition-variable notify，没有用等待侧的 mutex 串行化 predicate 更新；
+因此 waiter 在“检查 predicate”和“真正睡眠”之间存在丢唤醒窗口。现在关闭路径在同一 mutex 下清除 running flag，再
+notify/join，不改变运行期 heartbeat、ReportEvent 或查询锁范围。该用例 Release 连续重复 100 次通过，随后全量测试也
+不再出现长等待。
+
+local compact read 还去掉了一个确定的逐 key 冗余：未配置 revisit histogram 时不再读取
+`last_access_time` atomic；访问时间仍按原语义更新，启用 histogram 时采样逻辑完全不变。另修正混合压测器读取已经
+废弃的 `prefix_match_blocks` 字段所造成的假失败，改为校验当前协议的 `local` 字段。
+
+最终 Release、pure-local 真实 HTTP 复核：
+
+- snapshot ReportEvent/GetHostCacheState 功能集 37/37 通过；20K 单请求 ADD create/update 为
+  57.00/50.34ms；
+- 最终二进制的 GetHostCacheState 100/1K/5K/20K 串行 p50 为 0.49/0.89/2.57/8.52ms，20K 的
+  16-way p50/p99 为 17.41/31.36ms；
+- 10 秒混合负载以约 15 QPS × 10K blocks（约 150K blocks/s）持续 L2 ADD，同时执行 10 QPS × 10K-key Get
+  和 heartbeat。151 次 ADD、101 次 Get、20 次 heartbeat 全部成功且逐事件抽样校验一致；ADD avg/p95/p99 为
+  63.41/102.64/112.04ms，Get avg/p95/p99/max 为 17.07/51.35/65.47/75.36ms；
+- 最后两次 1M-key 内部基准中，4-worker metadata p50 为 91.01~91.39ms、all-hit 为
+  107.97~113.74ms；8/16-worker all-hit 分别在 86.88~93.43ms/83.88~93.49ms，首 1024 key
+  host stop/metadata miss 为 0.43~0.47ms/0.42~0.44ms。共享机波动仍然明显，因此保留可配置 worker 数和默认 4，
+  不把单机数字声明为 SLA。
+
+最终 `bazel test --config=release --nocache_test_results //kv_cache_manager/...` 为 106 个可执行测试全部通过，1 个
+GPU-only 测试按预期跳过。上述 mixed 结果也说明渐进 query 没有通过扩大 LRU/item 锁范围把 ReportEvent 写路径拖慢。
+
+### 5.28 2026-08-10 恢复数据 URI 校验、渐进取消差分与最终门禁
+
+本轮继续以 GetHostCacheState 的“长命中性能不能用放松校验换取”为停止线，对渐进 visitor、EventReport URI
+可见性和 metadata mutation 生命周期做反例审查。审查发现一个真实的 fail-open：恢复或外部注入的
+`event_report://host:not-a-port/mem` 过去会通过 allocation-free visibility scanner，而完整 `StandardUri`
+会拒绝它。若 reporter/generation 其余条件满足，这类损坏 metadata 会被错误计为命中。
+
+最终实现同时保住恢复数据安全和 pure-local 热路径：
+
+1. 未知来源的 URI 在原字符串上严格检查 authority 里的 textual port，空端口、负数、`+`、非数字和
+   `int64` 上溢均 fail-closed；`:0`、前导零、user-info 里的冒号以及 path/query value 中的冒号继续与
+   `StandardUri` 保持兼容。该检查不构造 URI component、参数 map 或临时字符串；
+2. `CacheLocation::validated_total_size_` 的含义收紧为“全部当前 spec URI 已严格验证”的非序列化证明及 size
+   aggregate。任意 spec mutator 都清除证明；Replace 仅在完整校验成功后设置，Delete 仅从已有证明推导，Merge
+   只有在所有保留旧 spec 也验证通过时才恢复。反序列化/恢复值始终没有证明，必须重新检查；
+3. 特别覆盖“恢复值含坏端口，随后 merge 一个不同名字的正常 spec”：坏 spec 仍被保留时不能错误恢复证明，查询
+   继续 fail-closed；只有把最后一个坏 spec 按名替换掉后，最终 vector 才重新获得证明。这样 query 只对可信的
+   pure-local ReportEvent 值跳过重复 authority/port 扫描，scheme/query 位置和每次请求的 `s_version` generation
+   仍逐 spec 检查；
+4. ordinary 与 Mamba visitor 在一个已经读取的 callback range 内，一旦所有候选 host 的单调 prefix stop 都不晚于
+   当前 key，就立即停止剩余 location projection。它不取消仍可能决定更短 prefix 的早期 range，也不屏蔽仍在任一
+   host 必需区间内的 backend error；
+5. 新增 6000-key、6-host 的确定性随机差分模型，组合 medium、L1.5/L2、全部非 serving 状态、非法 URI、Eagle
+   pop 和 Mamba spec group，把渐进结果逐项与保留的 full-materialize 路径比较。另用 33000 key、两个不同 stop 的
+   host 验证：所有候选 stop 之后的 speculative timeout 可以忽略，但仍处于较长 host prefix 内的同类 timeout 必须
+   原样返回；
+6. 全量门禁顺便暴露两个测试自身的不确定假设并已固定：MigrationManager 的 capacity partial-failure 用例不再假设
+   固定 key 在动态 hash seed 下必然属于不同 shard；两个直接清空 executor queue 的 stale-cache 用例会先停止
+   reclaimer supervisor，避免销毁它正在等待的 `packaged_task` 后随机抛出 `broken promise`。两项均只修改测试，
+   不改变生产锁或调度语义。
+
+最终 Release、pure-local 1M-key 内部基准（同一进程 p50）为：4-worker metadata-only/all-hit
+89.12/106.32ms，8-worker为 64.48/84.38ms；16-worker为 64.85/93.28ms，说明当前共享机继续增加线程已经没有
+稳定收益。100K/500K 的 all-hit 为 9.44/48.57ms；首窗口 host stop 和 metadata miss 分别为 0.46/0.44ms。
+在校验证明接入前的一轮同机运行中，4-worker 1M metadata-only/all-hit 为 120.68/166.79ms；机器本身有明显波动，
+因此不能直接把两轮总耗时相减，但完整投影相对同轮 metadata 的增量从约 46ms 收敛到约 17ms，证明没有让恢复
+数据的端口校验重新成为长前缀主热点。以上仍是共享开发机回归数据，不承诺线上固定 SLA。
+
+本轮最终门禁：
+
+- Snapshot URI、MetaSearcher、CacheManager、MigrationManager 四个定向 Release 目标全绿；随机差分/错误边界
+  连续 20 轮通过，ReportEvent/Get/host-down 并发生命周期用例在 Bazel 10-shard 配置下 300 个 run 全部通过；
+- MigrationManager 完整测试进程连续 50 轮通过，两个 stale-cache 用例各 500 个 shard-run 通过；
+- 使用当前工作树独立 Bazel output base 执行
+  `bazel test --config=release --nocache_test_results --test_output=errors --jobs=8 //kv_cache_manager/...`：
+  106 个可执行测试全部通过，1 个 GPU-only 测试按预期跳过。工作树迁移后复用旧绝对路径 output base 曾导致 7 个
+  用例在 0ms 内因 runfiles 缺失失败；独立重建后这些用例全部通过，未把基础设施假失败当作代码缺陷。

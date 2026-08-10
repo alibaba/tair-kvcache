@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <optional>
 #include <random>
 #include <unordered_set>
 #include <utility>
@@ -11,6 +12,49 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr size_t kMaxRetainedCompactReadKeys = 16384;
+
+struct CompactReadScratch {
+    bool in_use = false;
+    std::vector<std::string_view> key_views;
+    std::vector<Cache::Handle *> handles;
+    std::vector<int64_t> revisit_intervals;
+    Cache::BatchOperationScratch cache_batch;
+};
+
+thread_local CompactReadScratch tls_compact_read_scratch;
+
+class CompactReadScratchLease {
+public:
+    explicit CompactReadScratchLease(size_t key_count) {
+        if (key_count <= kMaxRetainedCompactReadKeys && !tls_compact_read_scratch.in_use) {
+            scratch_ = &tls_compact_read_scratch;
+            scratch_->in_use = true;
+            uses_thread_local_ = true;
+        } else {
+            local_.emplace();
+            scratch_ = &*local_;
+        }
+    }
+
+    ~CompactReadScratchLease() {
+        if (uses_thread_local_) {
+            scratch_->in_use = false;
+        }
+    }
+
+    CompactReadScratch &get() noexcept { return *scratch_; }
+
+private:
+    std::optional<CompactReadScratch> local_;
+    CompactReadScratch *scratch_ = nullptr;
+    bool uses_thread_local_ = false;
+};
+
+} // namespace
 
 SingleLocationRmwScratch::~SingleLocationRmwScratch() { ReleaseRetainedHandles(); }
 
@@ -844,16 +888,22 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext
         return results;
     }
 
-    std::vector<int64_t> revisit_intervals;
+    CompactReadScratchLease scratch_lease(key_count);
+    auto &scratch = scratch_lease.get();
+    auto &revisit_intervals = scratch.revisit_intervals;
+    revisit_intervals.clear();
     if (revisit_histogram_) {
         revisit_intervals.reserve(key_count);
     }
-    std::vector<std::string_view> key_views(key_count);
+    auto &key_views = scratch.key_views;
+    key_views.resize(key_count);
     for (size_t i = 0; i < key_count; ++i) {
         key_views[i] = KeyToView(keys[i]);
     }
-    std::vector<Cache::Handle *> handles(key_count, nullptr);
-    cache_->LookupBatch(key_views.data(), key_count, handles.data());
+    auto &handles = scratch.handles;
+    handles.assign(key_count, nullptr);
+    cache_->PrepareBatchOperationScratch(key_count, &scratch.cache_batch);
+    cache_->LookupBatchWithScratch(key_views.data(), key_count, handles.data(), &scratch.cache_batch);
 
     const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < key_count; ++i) {
@@ -865,9 +915,11 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext
         }
 
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        const int64_t stored_time = item->GetLastAccessTime();
-        if (revisit_histogram_ && stored_time > 0 && stored_time <= access_time_us) {
-            revisit_intervals.push_back(access_time_us - stored_time);
+        if (revisit_histogram_) {
+            const int64_t stored_time = item->GetLastAccessTime();
+            if (stored_time > 0 && stored_time <= access_time_us) {
+                revisit_intervals.push_back(access_time_us - stored_time);
+            }
         }
         item->TouchAccessTime(access_time_us);
         {
@@ -879,7 +931,7 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext
         }
         out_locations.FinishKey();
     }
-    cache_->ReleaseBatch(handles.data(), handles.size());
+    cache_->ReleaseBatchWithScratch(handles.data(), handles.size(), &scratch.cache_batch);
     if (revisit_histogram_) {
         revisit_histogram_->ObserveBatch(revisit_intervals);
     }

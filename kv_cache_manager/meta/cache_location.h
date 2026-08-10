@@ -173,6 +173,9 @@ public:
         size = validated_total_size_;
         return true;
     }
+    [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
+        return validated_total_size_ != kUnknownValidatedTotalSize;
+    }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
@@ -211,11 +214,12 @@ private:
     size_t spec_size_ = 0;
     int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
-    // Pure-local ReportEvent has already validated and summed every URI size.
-    // Keep that aggregate beside the immutable specs so the common one-spec
-    // replacement does not rebuild StandardUri's parameter map on each ADD.
-    // It is intentionally not serialized; deserialized values safely parse
-    // once and repopulate the hint on their next successful mutation.
+    // Pure-local ReportEvent has already validated every URI and summed its
+    // sizes. Keep that proof and aggregate beside the immutable specs so the
+    // writer and query paths can skip repeated structural URI parsing. Every
+    // specs mutator clears it; merge/delete code may restore it only when all
+    // retained specs are also proven valid. It is intentionally not
+    // serialized, so recovered values fail closed and validate again.
     std::uint64_t validated_total_size_ = kUnknownValidatedTotalSize;
 };
 

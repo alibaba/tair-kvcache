@@ -31,6 +31,11 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityReturnsBorrowedVersi
 TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsLegacyAndUnrelatedParams) {
     const std::vector<std::string> uris = {
         "event_report://10.0.0.1:8080/mem",
+        "event_report://host:0/mem",
+        "event_report://host:08080/mem",
+        "event_report://host:9223372036854775807/mem",
+        "event_report://user:secret@host:8080/mem",
+        "event_report://host/path:with:colon?callback=http://peer:9000/path",
         "event_report://10.0.0.1:8080/mem?rank=0&size=4096",
         "event_report://10.0.0.1:8080/mem?xs_version=ignored&s_version_suffix=ignored",
         "event_report://10.0.0.1:8080/mem?&rank=0&&",
@@ -39,6 +44,9 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsLegacyAndUnre
     for (const auto &uri : uris) {
         std::string_view version = "must be cleared";
         EXPECT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version)) << uri;
+        EXPECT_TRUE(version.empty()) << uri;
+        version = "must be cleared";
+        EXPECT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version, true)) << uri;
         EXPECT_TRUE(version.empty()) << uri;
     }
 }
@@ -49,6 +57,13 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityRejectsMalformedUri)
         "event_report:/10.0.0.1/mem",
         "://10.0.0.1/mem",
         "event?bad_report://10.0.0.1/mem",
+        "event_report://host:/mem",
+        "event_report://host:-0/mem",
+        "event_report://host:-1/mem",
+        "event_report://host:+1/mem",
+        "event_report://host:not-a-port/mem",
+        "event_report://host:9223372036854775808/mem",
+        "event_report://user:secret@host:not-a-port/mem",
     };
 
     for (const auto &uri : uris) {
@@ -90,7 +105,19 @@ TEST_F(SnapshotUriUtilsTest, InspectSnapshotUriForVisibilityAcceptsVersionAtPara
         std::string_view version;
         ASSERT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version)) << uri;
         EXPECT_EQ(token, version) << uri;
+        version = {};
+        ASSERT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, version, true)) << uri;
+        EXPECT_EQ(token, version) << uri;
     }
+}
+
+TEST_F(SnapshotUriUtilsTest, PrevalidatedStructureStillRejectsProtocolQueryAndBadVersionMetadata) {
+    std::string_view version = "must be cleared";
+    EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility("event?bad_report://host/mem", version, true));
+    EXPECT_TRUE(version.empty());
+
+    EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility(
+        "event_report://host/mem?s_version=not-a-version", version, true));
 }
 
 TEST_F(SnapshotUriUtilsTest, AddSnapshotVersionRejectsInvalidPortWithoutCanonicalizingItAway) {

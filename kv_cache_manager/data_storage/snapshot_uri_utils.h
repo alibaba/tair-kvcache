@@ -98,25 +98,49 @@ public:
     // fail closed.
     //
     // The returned view borrows uri_text and must not outlive it.
-    static bool InspectSnapshotUriForVisibility(std::string_view uri_text, std::string_view &out_version) noexcept {
+    static bool InspectSnapshotUriForVisibility(std::string_view uri_text,
+                                                std::string_view &out_version,
+                                                bool uri_structure_prevalidated = false) noexcept {
         out_version = {};
 
-        // This is the observable validity condition used by StandardUri::Valid
-        // for a freshly constructed URI: it must have a non-empty protocol
-        // before "://". ReportEvent performs the full parse before persisting
-        // metadata; this read-side check additionally protects recovered or
-        // otherwise malformed metadata without rebuilding the parsed object.
+        // Match the observable validity conditions used by StandardUri
+        // without rebuilding its strings and parameter map. In addition to a
+        // non-empty protocol, a textual port must be a non-negative int64.
+        // Host/path/query contents otherwise remain intentionally permissive,
+        // just like StandardUri::Parse.
         const size_t protocol_end = uri_text.find("://");
         if (protocol_end == std::string_view::npos || protocol_end == 0) {
             return false;
         }
 
+        const size_t authority_begin = protocol_end + 3;
         const size_t query_begin = uri_text.find('?');
+        if (query_begin != std::string_view::npos && query_begin < authority_begin) {
+            return false;
+        }
+        if (!uri_structure_prevalidated) {
+            const size_t path_begin = uri_text.find('/', authority_begin);
+            const size_t authority_end =
+                std::min(path_begin == std::string_view::npos ? uri_text.size() : path_begin,
+                         query_begin == std::string_view::npos ? uri_text.size() : query_begin);
+            size_t host_begin = authority_begin;
+            const size_t user_info_end = uri_text.find('@', authority_begin);
+            if (user_info_end != std::string_view::npos && user_info_end < authority_end) {
+                host_begin = user_info_end + 1;
+            }
+            const size_t port_separator = uri_text.find(':', host_begin);
+            if (port_separator != std::string_view::npos && port_separator < authority_end) {
+                std::uint64_t port = 0;
+                if (!ParseDecimalUint64(uri_text.substr(port_separator + 1, authority_end - port_separator - 1),
+                                        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()),
+                                        port)) {
+                    return false;
+                }
+            }
+        }
+
         if (query_begin == std::string_view::npos) {
             return true;
-        }
-        if (query_begin < protocol_end + 3) {
-            return false;
         }
 
         bool found_version = false;
