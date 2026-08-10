@@ -319,3 +319,69 @@ TEST_F(TransferClientMultiStorageTest, TestSaveAndLoadMixedStorage) {
     // Load
     EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, block_buffers));
 }
+
+// 回归测试：nfs_a/path1, nfs_b/pathX, nfs_a/path2 —— 同 backend（nfs_a）内多个
+// 不同 path 被 nfs_b 交错隔开。修复前 LocalFileSdk::Put 按 path 分组后以
+// unordered_map 迭代顺序回填 actual_uris，返回顺序与输入不一致，上层按契约回填
+// 时会把 URI 写到错误位置，后续按返回 URI 读取将拿到错块数据。
+TEST_F(TransferClientMultiStorageTest, TestSaveLoadInterleavedMultiPathOrdering) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+
+    UriStrVec uri_str_vec = {
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/path1?blkid=0&size=1024",
+        "file://nfs_b/" + root_path_ + "tmp/nfs_b/pathX?blkid=0&size=1024",
+        "file://nfs_a/" + root_path_ + "tmp/nfs_a/path2?blkid=0&size=1024",
+    };
+
+    const char *payload1 = "payload for nfs_a path1";
+    const char *payloadX = "payload for nfs_b pathX";
+    const char *payload2 = "payload for nfs_a path2";
+    size_t len1 = strlen(payload1);
+    size_t lenX = strlen(payloadX);
+    size_t len2 = strlen(payload2);
+
+    void *mem1 = malloc(1024);
+    void *memX = malloc(1024);
+    void *mem2 = malloc(1024);
+    std::memcpy(mem1, payload1, len1);
+    std::memcpy(memX, payloadX, lenX);
+    std::memcpy(mem2, payload2, len2);
+
+    auto make_buffer = [](void *base, size_t size) {
+        BlockBuffer bb;
+        Iov iov;
+        iov.type = MemoryType::CPU;
+        iov.base = base;
+        iov.size = size;
+        iov.ignore = false;
+        bb.iovs.push_back(iov);
+        return bb;
+    };
+    BlockBuffers block_buffers = {make_buffer(mem1, len1), make_buffer(memX, lenX), make_buffer(mem2, len2)};
+
+    // Save：返回 URI 顺序必须与输入一致
+    auto [save_ec, actual_uris] = client->SaveKvCaches(uri_str_vec, block_buffers);
+    ASSERT_EQ(ER_OK, save_ec);
+    ASSERT_EQ(uri_str_vec.size(), actual_uris.size());
+    EXPECT_EQ(uri_str_vec[0], actual_uris[0]);
+    EXPECT_EQ(uri_str_vec[1], actual_uris[1]);
+    EXPECT_EQ(uri_str_vec[2], actual_uris[2]);
+
+    // Load：用全新 buffer 按返回 URI 读回，验证数据确实落在各自的文件
+    void *get1 = malloc(1024);
+    void *getX = malloc(1024);
+    void *get2 = malloc(1024);
+    BlockBuffers get_buffers = {make_buffer(get1, len1), make_buffer(getX, lenX), make_buffer(get2, len2)};
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, get_buffers));
+    EXPECT_EQ(std::memcmp(get1, payload1, len1), 0);
+    EXPECT_EQ(std::memcmp(getX, payloadX, lenX), 0);
+    EXPECT_EQ(std::memcmp(get2, payload2, len2), 0);
+
+    free(mem1);
+    free(memX);
+    free(mem2);
+    free(get1);
+    free(getX);
+    free(get2);
+}

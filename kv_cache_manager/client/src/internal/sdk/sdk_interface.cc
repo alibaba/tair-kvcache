@@ -11,6 +11,7 @@ SdkInterface::GroupMap SdkInterface::SplitByPath(const std::vector<DataStorageUr
         auto &group = groups[uri.GetPath()];
         group.remote_uris.push_back(uri);
         group.local_buffers.push_back(buf);
+        group.indices.push_back(i);
     }
     return groups;
 }
