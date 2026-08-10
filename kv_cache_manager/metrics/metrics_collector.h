@@ -321,14 +321,15 @@ public:
     bool Init() override;
 };
 
-// Lightweight per-event observability for ReportEvent. This intentionally
-// carries only the request key count from the manager metric family, rather
-// than registering every manager/meta metric from ServiceMetricsCollector.
+// Lightweight per-event observability for ReportEvent. It reuses service.*
+// metrics for request outcome and carries only request_key_count from the
+// manager metric family, rather than registering every manager/meta metric
+// from ServiceMetricsCollector.
 class EventReportMetricsCollector final : public MetricsCollector {
-    KVCM_COUNTER_METRICS(event_report, request_counter)
-    KVCM_GAUGE_METRICS(event_report, request_rt_us)
-    KVCM_GAUGE_METRICS(event_report, error_code)
-    KVCM_COUNTER_METRICS(event_report, error_counter)
+    KVCM_COUNTER_METRICS(service, query_counter)
+    KVCM_GAUGE_METRICS(service, query_rt_us)
+    KVCM_GAUGE_METRICS(service, error_code)
+    KVCM_COUNTER_METRICS(service, error_counter)
     KVCM_GAUGE_METRICS(manager, request_key_count)
 
 public:
@@ -349,10 +350,10 @@ public:
         has_request_sample_ = true;
     }
     [[nodiscard]] double GetRequestRtUsSample() const noexcept {
-        return has_request_sample_ ? request_rt_us_sample_ : get_event_report_request_rt_us_metrics();
+        return has_request_sample_ ? request_rt_us_sample_ : get_service_query_rt_us_metrics();
     }
     [[nodiscard]] double GetErrorCodeSample() const noexcept {
-        return has_request_sample_ ? error_code_sample_ : get_event_report_error_code_metrics();
+        return has_request_sample_ ? error_code_sample_ : get_service_error_code_metrics();
     }
     void SetRequestKeyCountSample(double request_key_count) noexcept {
         request_key_count_sample_ = request_key_count;

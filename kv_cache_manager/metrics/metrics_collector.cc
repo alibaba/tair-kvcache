@@ -190,20 +190,21 @@ bool ServiceMetricsCollector::Init() {
 
 /* ---------------- EventReportMetricsCollector -------------------- */
 
-#define DEFINE_METRICS_NAME_FOR_EVENT_REPORT(name) DEFINE_METRICS_NAME_(EventReportMetricsCollector, event_report, name)
-#define REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(name)                                                                \
-    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, event_report, name, metrics_tags_)
-#define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(name)                                                                  \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, event_report, name, metrics_tags_)
+#define DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(name)                                                             \
+    DEFINE_METRICS_NAME_(EventReportMetricsCollector, service, name)
+#define REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(name)                                                        \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, service, name, metrics_tags_)
+#define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(name)                                                          \
+    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, service, name, metrics_tags_)
 #define DEFINE_METRICS_NAME_FOR_EVENT_REPORT_MANAGER(name)                                                             \
     DEFINE_METRICS_NAME_(EventReportMetricsCollector, manager, name)
 #define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_MANAGER(name)                                                          \
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
 
-DEFINE_METRICS_NAME_FOR_EVENT_REPORT(request_counter);
-DEFINE_METRICS_NAME_FOR_EVENT_REPORT(request_rt_us);
-DEFINE_METRICS_NAME_FOR_EVENT_REPORT(error_code);
-DEFINE_METRICS_NAME_FOR_EVENT_REPORT(error_counter);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(query_counter);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(query_rt_us);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(error_code);
+DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(error_counter);
 DEFINE_METRICS_NAME_FOR_EVENT_REPORT_MANAGER(request_key_count);
 
 EventReportMetricsCollector::EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -212,10 +213,10 @@ EventReportMetricsCollector::EventReportMetricsCollector(std::shared_ptr<Metrics
 
 EventReportMetricsCollector::EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept
     : MetricsCollector(shared_collector.metrics_registry_, shared_collector.metrics_tags_) {
-    event_report_request_counter_metrics_ = shared_collector.event_report_request_counter_metrics_;
-    event_report_request_rt_us_metrics_ = shared_collector.event_report_request_rt_us_metrics_;
-    event_report_error_code_metrics_ = shared_collector.event_report_error_code_metrics_;
-    event_report_error_counter_metrics_ = shared_collector.event_report_error_counter_metrics_;
+    service_query_counter_metrics_ = shared_collector.service_query_counter_metrics_;
+    service_query_rt_us_metrics_ = shared_collector.service_query_rt_us_metrics_;
+    service_error_code_metrics_ = shared_collector.service_error_code_metrics_;
+    service_error_counter_metrics_ = shared_collector.service_error_counter_metrics_;
     manager_request_key_count_metrics_ = shared_collector.manager_request_key_count_metrics_;
 }
 
@@ -223,10 +224,10 @@ bool EventReportMetricsCollector::Init() {
     if (metrics_registry_ == nullptr) {
         return false;
     }
-    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(request_counter);
-    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(request_rt_us);
-    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT(error_code);
-    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT(error_counter);
+    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(query_counter);
+    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(query_rt_us);
+    REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(error_code);
+    REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(error_counter);
     REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_MANAGER(request_key_count);
     return true;
 }

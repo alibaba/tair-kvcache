@@ -162,8 +162,11 @@ std::shared_ptr<MetricsCollector> MetaServiceMetricsBase::GetEventTypeMetricsCol
     if (instance_group.empty()) {
         return nullptr;
     }
-    MetricsTags tags = {
-        {"instance_group", instance_group}, {"instance_id", instance_id}, {"type", type}, {"event_type", event_type}};
+    MetricsTags tags = {{"api_name", "ReportEvent"},
+                        {"instance_group", instance_group},
+                        {"instance_id", instance_id},
+                        {"type", type},
+                        {"event_type", event_type}};
     auto collector = std::make_shared<EventReportMetricsCollector>(metrics_registry_, std::move(tags));
     if (!collector->Init()) {
         return nullptr;
@@ -207,6 +210,8 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
 
     static constexpr std::array<const char *, 7> kEventTypeTags = {
         "unknown", "node_register", "block_add", "block_delete", "host_down", "heartbeat", "block_snapshot"};
+    static constexpr std::array<bool, kEventTypeTags.size()> kEnableEventTypeMetrics = {
+        false, false, true, true, false, false, true};
     uint32_t event_type_mask = 0;
     std::array<size_t, kEventTypeTags.size()> request_key_counts{};
     for (const auto &event : request.events()) {
@@ -239,6 +244,9 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
         if ((event_type_mask & (1U << event_type)) == 0) {
             continue;
         }
+        if (!kEnableEventTypeMetrics[event_type]) {
+            continue;
+        }
         auto shared_collector =
             GetTypedMetricsCollectorForReportEventType(request.instance_id(), type, kEventTypeTags[event_type]);
         auto event_collector = std::dynamic_pointer_cast<EventReportMetricsCollector>(shared_collector);
@@ -247,10 +255,7 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
             // lightweight view with the same handles but private sample state,
             // avoiding both registry re-registration and cross-request races.
             auto request_collector = std::make_shared<EventReportMetricsCollector>(*event_collector);
-            if (event_type == proto::meta::EVENT_BLOCK_ADD || event_type == proto::meta::EVENT_BLOCK_DELETE ||
-                event_type == proto::meta::EVENT_BLOCK_SNAPSHOT) {
-                request_collector->SetRequestKeyCountSample(request_key_counts[event_type]);
-            }
+            request_collector->SetRequestKeyCountSample(request_key_counts[event_type]);
             request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(std::move(request_collector));
         }
     }

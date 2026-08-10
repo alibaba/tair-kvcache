@@ -212,16 +212,16 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQueryEventReport) {
 
     reporter_->ReportPerQuery(&collector);
     std::uint64_t value = 0;
-    GET_METRICS_(&collector, event_report, request_counter, value);
+    GET_METRICS_(&collector, service, query_counter, value);
     EXPECT_EQ(1, value);
-    GET_METRICS_(&collector, event_report, error_counter, value);
+    GET_METRICS_(&collector, service, error_counter, value);
     EXPECT_EQ(0, value);
 
-    SET_METRICS_(&collector, event_report, error_code, 10.);
+    SET_METRICS_(&collector, service, error_code, 10.);
     reporter_->ReportPerQuery(&collector);
-    GET_METRICS_(&collector, event_report, request_counter, value);
+    GET_METRICS_(&collector, service, query_counter, value);
     EXPECT_EQ(2, value);
-    GET_METRICS_(&collector, event_report, error_counter, value);
+    GET_METRICS_(&collector, service, error_counter, value);
     EXPECT_EQ(1, value);
 }
 
@@ -236,14 +236,14 @@ TEST_F(LocalMetricsReporterTest, ConcurrentEventCollectorsDoNotShareErrorSamples
     failure.SetRequestSample(20.0, 1.0);
     // Both objects point at the same tagged registry gauge. Deliberately leave
     // that shared gauge in the failed state before reporting the success.
-    SET_METRICS_(&success, event_report, error_code, 0.0);
-    SET_METRICS_(&failure, event_report, error_code, 1.0);
+    SET_METRICS_(&success, service, error_code, 0.0);
+    SET_METRICS_(&failure, service, error_code, 1.0);
 
     reporter_->ReportPerQuery(&success);
     reporter_->ReportPerQuery(&failure);
 
-    EXPECT_EQ(2u, success.get_event_report_request_counter_metrics());
-    EXPECT_EQ(1u, success.get_event_report_error_counter_metrics());
+    EXPECT_EQ(2u, success.get_service_query_counter_metrics());
+    EXPECT_EQ(1u, success.get_service_error_counter_metrics());
 }
 
 TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventReportMetrics) {
@@ -262,10 +262,10 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    EXPECT_GT(snapshot_collector->get_event_report_request_rt_us_metrics(), 0.);
-    EXPECT_DOUBLE_EQ(1., snapshot_collector->get_event_report_error_code_metrics());
-    EXPECT_EQ(1, snapshot_collector->get_event_report_request_counter_metrics());
-    EXPECT_EQ(1, snapshot_collector->get_event_report_error_counter_metrics());
+    EXPECT_GT(snapshot_collector->get_service_query_rt_us_metrics(), 0.);
+    EXPECT_DOUBLE_EQ(1., snapshot_collector->get_service_error_code_metrics());
+    EXPECT_EQ(1, snapshot_collector->get_service_query_counter_metrics());
+    EXPECT_EQ(1, snapshot_collector->get_service_error_counter_metrics());
 }
 
 TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadOfSharedServiceGauge) {
@@ -283,9 +283,9 @@ TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadO
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(heartbeat_collector);
     { ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get()); }
 
-    EXPECT_DOUBLE_EQ(0., heartbeat_collector->get_event_report_error_code_metrics());
-    EXPECT_EQ(1, heartbeat_collector->get_event_report_request_counter_metrics());
-    EXPECT_EQ(0, heartbeat_collector->get_event_report_error_counter_metrics());
+    EXPECT_DOUBLE_EQ(0., heartbeat_collector->get_service_error_code_metrics());
+    EXPECT_EQ(1, heartbeat_collector->get_service_query_counter_metrics());
+    EXPECT_EQ(0, heartbeat_collector->get_service_error_counter_metrics());
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportInterval00) {
