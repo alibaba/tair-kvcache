@@ -90,6 +90,7 @@ struct CacheLocationMetaDetail {
 };
 
 struct CacheKeyMetaDetail {
+    ErrorCode error_code = EC_OK;
     size_t request_index = 0;
     KeyType block_key = 0;
     PropertyMap properties;
