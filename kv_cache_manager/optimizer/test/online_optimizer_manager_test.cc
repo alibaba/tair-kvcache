@@ -316,11 +316,25 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionRequiresConsistentInputTokenLeng
     EXPECT_EQ(7, summaries[0].total_input_tokens);
 }
 
-TEST_F(OnlineOptimizerManagerTest, FullAttentionRejectsTtlInLiteHitPhase) {
+TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
     auto info = MakeInfo("i1", "g1", 4, 0);
-    auto group = MakeGroup("g1", {FullCapacityGb(2)}, "lru", false, 60);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)}, "lru", /*enable_theoretical_max_cache=*/true, /*ttl=*/60);
     RegisterInstanceResult reg_result;
-    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, reg_result));
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, first));
+    EXPECT_EQ(0, first.max_hit_count);
+    // The immediate re-query is well inside the 60s TTL: plain LRU behavior.
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, second));
+    EXPECT_EQ(2, second.max_hit_count);
+    EXPECT_EQ(2, second.hit_count_per_capacity.at(0));
+
+    // Negative TTL is still rejected.
+    auto bad_info = MakeInfo("i2", "g2", 4, 0);
+    auto bad_group = MakeGroup("g2", {FullCapacityGb(2)}, "lru", false, /*ttl=*/-1);
+    EXPECT_EQ(EC_BADARGS, RegisterInstance(bad_info, bad_group, reg_result));
 }
 
 TEST_F(OnlineOptimizerManagerTest, ResetStatsResetsFullAttentionLiteHit) {
