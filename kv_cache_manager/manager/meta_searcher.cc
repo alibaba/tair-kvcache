@@ -1044,6 +1044,123 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     return aggregate_ec;
 }
 
+namespace {
+
+void ClassifyAddLocationRollbackItems(const KeyVector &keys,
+                                      const std::vector<MetaSearcher::AddLocationResult> &add_results,
+                                      MetaSearcher::AddLocationRollbackPlan &out_plan,
+                                      KeyVector &uncertain_keys,
+                                      std::vector<std::string> &uncertain_location_ids,
+                                      std::vector<size_t> &uncertain_indices) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &add_result = add_results[i];
+        if (add_result.ec == EC_OK && !add_result.location_id.empty()) {
+            out_plan.pipeline_keys.push_back(keys[i]);
+            out_plan.pipeline_location_ids.push_back(add_result.location_id);
+        } else if (!add_result.location_id.empty()) {
+            // location id 已生成但写结果失败/未知：先做幂等元数据删除，确认无引用后才能删 URI。
+            uncertain_keys.push_back(keys[i]);
+            uncertain_location_ids.push_back(add_result.location_id);
+            uncertain_indices.push_back(i);
+        } else {
+            out_plan.direct_delete_indices.push_back(i);
+        }
+    }
+}
+
+} // namespace
+
+size_t MetaSearcher::ClassifyAddLocationRollback(const KeyVector &keys,
+                                                 const std::vector<AddLocationResult> &add_results,
+                                                 AddLocationRollbackPlan &out_plan) {
+    out_plan = {};
+    KeyVector uncertain_keys;
+    std::vector<std::string> uncertain_location_ids;
+    std::vector<size_t> uncertain_indices;
+    ClassifyAddLocationRollbackItems(
+        keys, add_results, out_plan, uncertain_keys, uncertain_location_ids, uncertain_indices);
+    return uncertain_keys.size();
+}
+
+ErrorCode MetaSearcher::ReconcileAddLocationRollback(RequestContext *request_context,
+                                                     const KeyVector &keys,
+                                                     const std::vector<AddLocationResult> &add_results,
+                                                     AddLocationRollbackPlan &out_plan) {
+    out_plan = {};
+    if (keys.size() != add_results.size()) {
+        KVCM_LOG_ERROR("ReconcileAddLocationRollback input size mismatch, keys[%lu], results[%lu]",
+                       keys.size(),
+                       add_results.size());
+        return EC_BADARGS;
+    }
+
+    KeyVector uncertain_keys;
+    std::vector<std::string> uncertain_location_ids;
+    std::vector<size_t> uncertain_indices;
+    ClassifyAddLocationRollbackItems(
+        keys, add_results, out_plan, uncertain_keys, uncertain_location_ids, uncertain_indices);
+
+    if (uncertain_keys.empty()) {
+        return EC_OK;
+    }
+
+    LocationIdsPerKey location_ids_per_key;
+    location_ids_per_key.reserve(uncertain_location_ids.size());
+    for (const auto &location_id : uncertain_location_ids) {
+        location_ids_per_key.push_back({location_id});
+    }
+    std::vector<std::vector<ErrorCode>> delete_results;
+    const ErrorCode delete_ec = BatchDeleteLocations(request_context,
+                                                     uncertain_keys,
+                                                     location_ids_per_key,
+                                                     delete_results,
+                                                     {},
+                                                     false /* these failed adds were never included in usage */,
+                                                     false /* failed adds were never counted as new keys */);
+    const size_t invalid_result_count =
+        std::count_if(delete_results.begin(), delete_results.end(), [](const auto &per_location_results) {
+            return per_location_results.size() != 1;
+        });
+    if (delete_results.size() != uncertain_keys.size() || invalid_result_count != 0) {
+        KVCM_LOG_WARN("ReconcileAddLocationRollback metadata delete returned unexpected result shape, expected %zu, "
+                      "got %zu, invalid inner result count %zu, ec %d; retaining URIs",
+                      uncertain_keys.size(),
+                      delete_results.size(),
+                      invalid_result_count,
+                      delete_ec);
+        return EC_OK;
+    }
+
+    KeyVector sync_keys;
+    for (size_t i = 0; i < delete_results.size(); ++i) {
+        if (delete_results[i].front() == EC_OK) {
+            sync_keys.push_back(uncertain_keys[i]);
+        }
+    }
+    bool metadata_synced = true;
+    if (!sync_keys.empty()) {
+        metadata_synced = meta_indexer_->Sync(sync_keys);
+        if (!metadata_synced) {
+            KVCM_LOG_WARN("ReconcileAddLocationRollback failed to sync deleted metadata, key_count[%zu]",
+                          sync_keys.size());
+        }
+    }
+
+    for (size_t i = 0; i < delete_results.size(); ++i) {
+        const ErrorCode per_location_ec = delete_results[i].front();
+        if (per_location_ec == EC_NOENT || (per_location_ec == EC_OK && metadata_synced)) {
+            out_plan.direct_delete_indices.push_back(uncertain_indices[i]);
+        } else if (per_location_ec != EC_OK) {
+            KVCM_LOG_WARN("ReconcileAddLocationRollback metadata delete failed, key[%lu](%lu), location_id %s, ec %d",
+                          i,
+                          uncertain_keys[i],
+                          uncertain_location_ids[i].c_str(),
+                          per_location_ec);
+        }
+    }
+    return EC_OK;
+}
+
 ErrorCode
 MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,

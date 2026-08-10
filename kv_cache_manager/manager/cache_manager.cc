@@ -1147,12 +1147,34 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
         return;
     }
 
-    CacheLocationDelRequest metadata_rollback{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
-    std::map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
-    KeyVector uncertain_keys;
-    std::vector<std::string> uncertain_location_ids;
-    std::vector<size_t> uncertain_indices;
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    MetaSearcher::AddLocationRollbackPlan plan;
+    if (!meta_searcher) {
+        // 无元数据访问时无法 reconcile uncertain 项，只能保留其 URI；但
+        // confirmed-success 与无 ID 项的清理不依赖元数据，照常执行。
+        const size_t uncertain_count = MetaSearcher::ClassifyAddLocationRollback(keys, add_results, plan);
+        PREFIX_LOG(ERROR,
+                   "rollback add locations without meta searcher: uncertain URIs retained, uncertain_count[%lu], "
+                   "key_count[%lu]",
+                   uncertain_count,
+                   keys.size());
+    } else if (meta_searcher->ReconcileAddLocationRollback(request_context, keys, add_results, plan) != EC_OK) {
+        PREFIX_LOG(ERROR, "rollback add locations reconcile failed, key_count[%lu]", keys.size());
+        return;
+    }
 
+    // 已成功写入元数据的 location 复用标准删除流水线：标记 DELETING、Sync、删 URI、删元数据。
+    if (!plan.pipeline_keys.empty()) {
+        CacheLocationDelRequest metadata_rollback{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
+        metadata_rollback.block_keys = plan.pipeline_keys;
+        metadata_rollback.location_ids.reserve(plan.pipeline_location_ids.size());
+        for (const auto &location_id : plan.pipeline_location_ids) {
+            metadata_rollback.location_ids.push_back({location_id});
+        }
+        reclaimer_task_supervisor_->Submit(trace_id, std::move(metadata_rollback));
+    }
+
+    std::map<std::string, std::vector<DataStorageUri>> direct_delete_uris;
     auto queue_uri_delete = [&](size_t index) {
         if (!locations[index]) {
             PREFIX_LOG(WARN, "rollback add location has null location, key[%lu](%lu)", index, keys[index]);
@@ -1171,75 +1193,11 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
             direct_delete_uris[uri.GetHostName()].push_back(std::move(uri));
         }
     };
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto &add_result = add_results[i];
-        if (add_result.ec == EC_OK && !add_result.location_id.empty()) {
-            metadata_rollback.block_keys.push_back(keys[i]);
-            metadata_rollback.location_ids.push_back({add_result.location_id});
-            continue;
-        }
-        if (!add_result.location_id.empty()) {
-            // location id 已生成但写结果失败/未知：先做幂等元数据删除，确认无引用后才能删 URI。
-            uncertain_keys.push_back(keys[i]);
-            uncertain_location_ids.push_back(add_result.location_id);
-            uncertain_indices.push_back(i);
-            continue;
-        }
-        queue_uri_delete(i);
+    for (const size_t index : plan.direct_delete_indices) {
+        queue_uri_delete(index);
     }
-
-    // 已成功写入元数据的 location 复用标准删除流水线：标记 DELETING、Sync、删 URI、删元数据。
-    if (!metadata_rollback.block_keys.empty()) {
-        reclaimer_task_supervisor_->Submit(trace_id, std::move(metadata_rollback));
-    }
-
-    if (!uncertain_keys.empty()) {
-        MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
-        if (!meta_searcher) {
-            PREFIX_LOG(ERROR, "rollback uncertain add locations failed: meta searcher not found");
-        } else {
-            LocationIdsPerKey location_ids_per_key;
-            location_ids_per_key.reserve(uncertain_location_ids.size());
-            for (const auto &location_id : uncertain_location_ids) {
-                location_ids_per_key.push_back({location_id});
-            }
-            std::vector<std::vector<ErrorCode>> delete_results;
-            meta_searcher->BatchDeleteLocations(request_context,
-                                                uncertain_keys,
-                                                location_ids_per_key,
-                                                delete_results,
-                                                {},
-                                                false /* these failed adds were never included in usage */,
-                                                false /* failed adds were never counted as new keys */);
-            KeyVector deleted_metadata_keys;
-            for (size_t i = 0; i < uncertain_indices.size(); ++i) {
-                if (i < delete_results.size() && delete_results[i].size() == 1 &&
-                    delete_results[i].front() == EC_OK) {
-                    deleted_metadata_keys.push_back(uncertain_keys[i]);
-                }
-            }
-
-            bool metadata_synced = true;
-            if (!deleted_metadata_keys.empty()) {
-                auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
-                metadata_synced = meta_indexer && meta_indexer->Sync(deleted_metadata_keys);
-                if (!metadata_synced) {
-                    PREFIX_LOG(WARN,
-                               "rollback uncertain add locations failed to sync deleted metadata, key_count[%zu]",
-                               deleted_metadata_keys.size());
-                }
-            }
-            for (size_t i = 0; i < uncertain_indices.size(); ++i) {
-                if (i >= delete_results.size() || delete_results[i].size() != 1) {
-                    continue;
-                }
-                const ErrorCode delete_ec = delete_results[i].front();
-                if (delete_ec == EC_NOENT || (delete_ec == EC_OK && metadata_synced)) {
-                    queue_uri_delete(uncertain_indices[i]);
-                }
-            }
-        }
+    if (direct_delete_uris.empty()) {
+        return;
     }
 
     auto data_storage_manager = registry_manager_->data_storage_manager();
@@ -1247,7 +1205,7 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
         PREFIX_LOG(ERROR, "rollback add locations failed: data storage manager not found");
         return;
     }
-    // 明确未写入元数据的项没有 location 可交给删除流水线，直接释放其已分配 URI。
+    // 已确认元数据无引用的项直接释放其已分配 URI。
     for (const auto &[storage_name, uris] : direct_delete_uris) {
         const auto delete_results = data_storage_manager->Delete(request_context, storage_name, uris, nullptr);
         if (delete_results.size() != uris.size()) {

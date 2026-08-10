@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <future>
 #include <map>
@@ -90,6 +91,52 @@ private:
     bool fail_upsert_ = false;
 };
 
+class RollbackFaultBackend : public MetaLocalBackend {
+public:
+    void SetFailUpsert(bool fail_upsert) { fail_upsert_ = fail_upsert; }
+    void SetFailSync(bool fail_sync) { fail_sync_ = fail_sync; }
+    void SetGetLocationsFailedKey(std::optional<KeyType> key) { get_locations_failed_key_ = key; }
+
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        auto results = MetaLocalBackend::Upsert(request_context, keys, locations, properties);
+        if (fail_upsert_) {
+            for (auto &result : results) {
+                result = EC_ERROR;
+            }
+        }
+        return results;
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations) noexcept override {
+        auto results = MetaLocalBackend::GetLocations(request_context, keys, location_ids, out_locations);
+        if (!get_locations_failed_key_.has_value()) {
+            return results;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == get_locations_failed_key_.value()) {
+                for (auto &ec : results[i]) {
+                    ec = EC_ERROR;
+                }
+                out_locations[i].clear();
+            }
+        }
+        return results;
+    }
+
+    bool Sync(const KeyTypeVec & /*keys*/) noexcept override { return !fail_sync_; }
+
+private:
+    bool fail_upsert_ = false;
+    bool fail_sync_ = false;
+    std::optional<KeyType> get_locations_failed_key_;
+};
+
 ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
                                   RequestContext *request_context,
                                   const KeyVector &keys,
@@ -163,6 +210,18 @@ public:
     CommitThenFailUpsertBackend *ReplaceWithCommitThenFailUpsertBackend() {
         auto backend_config = ConstructMetaStorageBackendConfig();
         auto backend = std::make_unique<CommitThenFailUpsertBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    RollbackFaultBackend *ReplaceWithRollbackFaultBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<RollbackFaultBackend>();
         EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
         EXPECT_EQ(EC_OK, backend->Open());
         auto backend_raw = backend.get();
@@ -1614,6 +1673,156 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationsCanPreserveKeyCountForUncertain
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_EQ(1u, location_maps[0].count(existing_results[0].location_id));
     EXPECT_TRUE(location_maps[1].empty());
+}
+
+TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
+    auto backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType success_key = 7301;
+    const KeyType uncertain_key = 7302;
+    const KeyType no_id_key = 7303;
+    const KeyType ghost_key = 7304;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+
+    std::vector<MetaSearcher::AddLocationResult> success_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchAddLocation(request_context_.get(), {success_key}, {location}, success_results));
+    ASSERT_EQ(1u, success_results.size());
+    ASSERT_EQ(EC_OK, success_results[0].ec);
+    ASSERT_FALSE(success_results[0].location_id.empty());
+
+    backend->SetFailUpsert(true);
+    std::vector<MetaSearcher::AddLocationResult> uncertain_results;
+    ASSERT_EQ(EC_ERROR,
+              meta_searcher_->BatchAddLocation(request_context_.get(), {uncertain_key}, {location}, uncertain_results));
+    ASSERT_EQ(1u, uncertain_results.size());
+    ASSERT_EQ(EC_ERROR, uncertain_results[0].ec);
+    ASSERT_FALSE(uncertain_results[0].location_id.empty());
+    backend->SetFailUpsert(false);
+
+    // batch: confirmed success / uncertain with id / failed without id / failed with a ghost id
+    const KeyVector keys = {success_key, uncertain_key, no_id_key, ghost_key};
+    std::vector<MetaSearcher::AddLocationResult> add_results = {success_results[0],
+                                                                uncertain_results[0],
+                                                                {EC_ERROR, ""},
+                                                                {EC_ERROR, "ghost_location_id"}};
+    MetaSearcher::AddLocationRollbackPlan plan;
+    ASSERT_EQ(EC_OK, meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), keys, add_results, plan));
+
+    EXPECT_EQ((KeyVector{success_key}), plan.pipeline_keys);
+    EXPECT_EQ((std::vector<std::string>{success_results[0].location_id}), plan.pipeline_location_ids);
+    std::vector<size_t> direct_indices = plan.direct_delete_indices;
+    std::sort(direct_indices.begin(), direct_indices.end());
+    // 1 = uncertain_key (metadata deleted), 2 = no_id_key, 3 = ghost_key (delete hit EC_NOENT).
+    EXPECT_EQ((std::vector<size_t>{1, 2, 3}), direct_indices);
+
+    // uncertain metadata is deleted; confirmed-success metadata is left for the delete pipeline.
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
+    ASSERT_EQ(2u, location_maps.size());
+    EXPECT_EQ(1u, location_maps[0].count(success_results[0].location_id));
+    EXPECT_TRUE(location_maps[1].empty());
+}
+
+TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
+    MetaSearcher::AddLocationRollbackPlan plan;
+    plan.pipeline_keys = {42};
+    plan.pipeline_location_ids = {"stale_id"};
+    plan.direct_delete_indices = {0};
+
+    EXPECT_EQ(EC_BADARGS,
+              meta_searcher_->ReconcileAddLocationRollback(
+                  request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
+    EXPECT_TRUE(plan.pipeline_keys.empty());
+    EXPECT_TRUE(plan.pipeline_location_ids.empty());
+    EXPECT_TRUE(plan.direct_delete_indices.empty());
+}
+
+TEST_F(MetaSearcherTest, TestClassifyAddLocationRollbackWithoutMetadata) {
+    // Metadata-free classification: confirmed-success -> pipeline, no id ->
+    // direct delete, uncertain (id present but non-OK) stays unclassified so
+    // its URI is retained.
+    const KeyVector keys = {8101, 8102, 8103};
+    const std::vector<MetaSearcher::AddLocationResult> add_results = {
+        {EC_OK, "confirmed_id"}, {EC_ERROR, "uncertain_id"}, {EC_ERROR, ""}};
+    MetaSearcher::AddLocationRollbackPlan plan;
+    plan.pipeline_keys = {42};
+    plan.pipeline_location_ids = {"stale_id"};
+    plan.direct_delete_indices = {0};
+
+    EXPECT_EQ(1u, MetaSearcher::ClassifyAddLocationRollback(keys, add_results, plan));
+    EXPECT_EQ((KeyVector{8101}), plan.pipeline_keys);
+    EXPECT_EQ((std::vector<std::string>{"confirmed_id"}), plan.pipeline_location_ids);
+    // 2 = no_id_key; index 1 (uncertain) is intentionally absent so its URI is retained.
+    EXPECT_EQ((std::vector<size_t>{2}), plan.direct_delete_indices);
+}
+
+TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisOnDeleteError) {
+    auto backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType uncertain_key = 7400;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+
+    backend->SetFailUpsert(true);
+    std::vector<MetaSearcher::AddLocationResult> uncertain_results;
+    ASSERT_EQ(EC_ERROR,
+              meta_searcher_->BatchAddLocation(request_context_.get(), {uncertain_key}, {location}, uncertain_results));
+    ASSERT_EQ(1u, uncertain_results.size());
+    ASSERT_FALSE(uncertain_results[0].location_id.empty());
+
+    backend->SetGetLocationsFailedKey(uncertain_key);
+    MetaSearcher::AddLocationRollbackPlan plan;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->ReconcileAddLocationRollback(
+                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    EXPECT_TRUE(plan.pipeline_keys.empty());
+    EXPECT_TRUE(plan.direct_delete_indices.empty());
+
+    // metadata state unconfirmed: the location stays and the URI must be retained.
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {uncertain_key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_EQ(1u, location_maps[0].count(uncertain_results[0].location_id));
+}
+
+TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisWhenSyncFails) {
+    auto backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType uncertain_key = 7500;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+
+    backend->SetFailUpsert(true);
+    std::vector<MetaSearcher::AddLocationResult> uncertain_results;
+    ASSERT_EQ(EC_ERROR,
+              meta_searcher_->BatchAddLocation(request_context_.get(), {uncertain_key}, {location}, uncertain_results));
+    ASSERT_EQ(1u, uncertain_results.size());
+    ASSERT_FALSE(uncertain_results[0].location_id.empty());
+    backend->SetFailUpsert(false);
+
+    backend->SetFailSync(true);
+    MetaSearcher::AddLocationRollbackPlan plan;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->ReconcileAddLocationRollback(
+                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    EXPECT_TRUE(plan.pipeline_keys.empty());
+    // metadata was deleted in memory but the delete could not be synced: retain the URI.
+    EXPECT_TRUE(plan.direct_delete_indices.empty());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {uncertain_key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    // Unlike RetainsUrisOnDeleteError (location still present), here the in-memory
+    // delete succeeded and only the sync failed, so the map is empty.
+    EXPECT_TRUE(location_maps[0].empty());
 }
 
 TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
