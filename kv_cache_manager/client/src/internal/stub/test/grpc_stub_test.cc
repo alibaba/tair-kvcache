@@ -5,6 +5,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 
 #include "kv_cache_manager/client/src/internal/stub/grpc_stub.h"
 #include "kv_cache_manager/common/logger.h"
@@ -43,6 +44,24 @@ bool WaitUntil(Func condition, int timeout_ms = 5000, int interval_ms = 100) {
     }
     return false;
 }
+
+class ScopedSocket {
+public:
+    explicit ScopedSocket(int fd) : fd_(fd) {}
+    ~ScopedSocket() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    ScopedSocket(const ScopedSocket &) = delete;
+    ScopedSocket &operator=(const ScopedSocket &) = delete;
+
+    int Get() const { return fd_; }
+
+private:
+    int fd_;
+};
 
 } // namespace
 
@@ -177,8 +196,24 @@ Stub::LocationSpecInfoMap GrpcStubTest::createLocationSpecInfos(int32_t spec_siz
 }
 
 TEST_F(GrpcStubTest, TestBadAddress) {
+    // Keep an ephemeral loopback port reserved without listening on it. This
+    // guarantees connection refusal without racing another process for port_ + 1.
+    ScopedSocket unavailable_socket(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_NE(-1, unavailable_socket.Get());
+
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(0, bind(unavailable_socket.Get(), reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+
+    socklen_t len = sizeof(addr);
+    ASSERT_EQ(0, getsockname(unavailable_socket.Get(), reinterpret_cast<struct sockaddr *>(&addr), &len));
+    const int unavailable_port = ntohs(addr.sin_port);
+
     stub_ = std::make_shared<GrpcStub>();
-    ASSERT_EQ(ER_CONNECT_FAIL, stub_->AddConnection("0.0.0.0:" + std::to_string(port_ + 1), 1000));
+    ASSERT_EQ(ER_CONNECT_FAIL, stub_->AddConnection("127.0.0.1:" + std::to_string(unavailable_port), 1000));
 }
 
 TEST_F(GrpcStubTest, TestRetry) {
