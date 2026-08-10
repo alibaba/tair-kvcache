@@ -4,7 +4,7 @@
 
 > **维护提示**：当模块的职责、依赖方向或调用关系发生变化，或新增/删除模块时，请同步更新本文档与文末的 Mermaid 图，并同步更新 [AGENTS.md](../../AGENTS.md) 中的缩略图。
 
-相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
+相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[后台扫描 GC 设计](cache_garbage_collector.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
 
 ---
 
@@ -32,7 +32,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
 | **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。 |
-| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。 |
+| **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 管理 `MetaIndexer`，维护 cache key → `CacheLocation` 的索引；元数据后端可插拔；`meta_search_cache` 做查询缓存。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义各类配置对象；`RegistryManager` 持久化实例注册信息；`CoordinationBackend` + `LeaderElector` 提供一主多备的分布式选主。 |
 | **data_storage** | `data_storage/` | 可插拔的 KVCache 数据存储后端。`DataStorageManager` 管理后端集合，`DataStorageBackend` 抽象存储介质，`DataStorageUri` 统一位置描述。 |
@@ -298,9 +298,13 @@ flowchart LR
     reclaim_task --> storage
 ```
 
-### 4.7 HA 故障转移
+### 4.7 后台 metadata GC
 
-`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，降级时调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+`CacheGarbageCollector` 只在 Leader 上运行，复用公共 `LoopThread`，按 Registry 快照和 backend cursor 串行扫描 authoritative metadata；扫描协调不占用共享的删除 worker。维护扫描不更新在线 LRU/revisit，也不向 local hot cache 回填。V1 识别超过 grace、且不属于活跃 Migration Copy 目标的 `CLS_WRITING`，并对普通 `CLS_SERVING` Location 按 storage 批量调用低成本 `MightExist()`，任一 spec 明确 missing 时选择整个 Location；EventReport 和探测不确定项均跳过。两类候选都通过 `SchedulePlanExecutor::SubmitAsync` 提交扫描时的完整序列化 Location，由 Executor worker 重新读取并以精确值条件 CAS 仲裁并发 Finish、Location 刷新和 Reclaimer。GC 使用固定小窗口管理在途 Future，并以 Instance-aware pending target 覆盖 accepted 到 CAS 的重复窗口；每 tick 最多提交一个请求，窗口满后停止扫描，完整 round 后进入长 cooldown。详细边界见 [后台扫描 GC 设计](cache_garbage_collector.md)。
+
+### 4.8 HA 故障转移
+
+`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager 并开放 leader-only 请求。降级时先通知 GC/Reclaimer 停止新工作并关闭、排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
 
 ---
 

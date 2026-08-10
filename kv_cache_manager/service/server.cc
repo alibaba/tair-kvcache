@@ -67,6 +67,13 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
+    CacheGarbageCollector::Config cache_gc_config;
+    cache_gc_config.enabled = config_.IsCacheGcEnabled();
+    cache_gc_config.scan_interval_ms = config_.GetCacheGcScanIntervalMs();
+    cache_gc_config.round_pause_ms = config_.GetCacheGcRoundPauseMs();
+    cache_gc_config.scan_batch_size = static_cast<size_t>(config_.GetCacheGcScanBatchSize());
+    cache_gc_config.orphan_writing_grace_period_ms = config_.GetCacheGcOrphanWritingGracePeriodMs();
+    cache_gc_config.max_inflight_delete_requests = static_cast<size_t>(config_.GetCacheGcMaxInflightDeleteRequests());
     if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                               config_.GetCacheReclaimerKeySamplingSizeTotal(),
                               config_.GetCacheReclaimerKeySamplingSizePerTask(),
@@ -74,7 +81,8 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetCacheReclaimerIdleIntervalMs(),
                               config_.GetCacheReclaimerWorkerSize(),
                               async_delete_config,
-                              config_.GetSchedulePlanMigrationWorkerBudget())) {
+                              config_.GetSchedulePlanMigrationWorkerBudget(),
+                              cache_gc_config)) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;
     }
@@ -124,6 +132,11 @@ void Server::OnBecomeLeader() {
         KVCM_LOG_ERROR("cache_manager recover failed");
         return;
     }
+    ec = cache_manager_->StartCacheGarbageCollector();
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("cache garbage collector start failed, ec[%d]", static_cast<int>(ec));
+        return;
+    }
     cache_manager_->ResumeReclaimer();
     cache_manager_->StartMigrationManager();
 
@@ -134,6 +147,7 @@ void Server::OnBecomeLeader() {
 
 void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
+    cache_manager_->RequestStopCacheGarbageCollector();
     cache_manager_->PauseReclaimer();
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -142,8 +156,9 @@ void Server::OnNoLongerLeader() {
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
 
-    // Stop migration after leader-only requests drain, so MigrateCache cannot submit
-    // new copy tasks after the migration monitor has stopped.
+    cache_manager_->JoinCacheGarbageCollector();
+    // Stop migration after leader-only requests drain and after GC has stopped consulting
+    // active Copy reservations.
     cache_manager_->StopMigrationManager();
 
     ErrorCode ec = cache_manager_->DoCleanup();

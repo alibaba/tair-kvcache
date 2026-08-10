@@ -518,6 +518,81 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
     return results;
 }
 
+std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPersistent(
+    RequestContext *request_context, const KeyVector &keys, CacheLocationMapVector &out_location_maps) noexcept {
+    out_location_maps.clear();
+    if (keys.empty()) {
+        return {};
+    }
+    if (!persistent_backend_) {
+        KVCM_LOG_ERROR("persistent GetLocations failed, backend is null, instance[%s]", instance_id_.c_str());
+        out_location_maps.resize(keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    std::vector<ErrorCode> results = persistent_backend_->GetLocations(request_context, keys, out_location_maps);
+    if (results.size() != keys.size() || out_location_maps.size() != keys.size()) {
+        KVCM_LOG_ERROR("persistent GetLocations shape mismatch, instance[%s] keys[%zu] results[%zu] locations[%zu]",
+                       instance_id_.c_str(),
+                       keys.size(),
+                       results.size(),
+                       out_location_maps.size());
+        out_location_maps.resize(keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::RefreshCacheFromPersistent(RequestContext *request_context,
+                                                                             const KeyVector &keys) noexcept {
+    if (keys.empty()) {
+        return {};
+    }
+    if (!cache_backend_) {
+        return std::vector<ErrorCode>(keys.size(), EC_OK);
+    }
+
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    std::vector<ErrorCode> persistent_results = persistent_backend_->Get(request_context, keys, locations, properties);
+    if (persistent_results.size() != keys.size() || locations.size() != keys.size() ||
+        properties.size() != keys.size()) {
+        KVCM_LOG_ERROR("persistent refresh shape mismatch, instance[%s] keys[%zu] results[%zu] locations[%zu] "
+                       "properties[%zu]",
+                       instance_id_.c_str(),
+                       keys.size(),
+                       persistent_results.size(),
+                       locations.size(),
+                       properties.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+
+    std::vector<ErrorCode> results = persistent_results;
+    const std::vector<ErrorCode> put_results =
+        cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
+    if (put_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("cache refresh Put shape mismatch, instance[%s] keys[%zu] results[%zu]",
+                       instance_id_.c_str(),
+                       keys.size(),
+                       put_results.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+
+    KeyVector missing_keys;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (persistent_results[i] == EC_OK) {
+            results[i] = put_results[i];
+        } else if (persistent_results[i] == EC_NOENT) {
+            // Do not let a stale hot-cache entry resurrect metadata that has
+            // already disappeared from the source of truth.
+            missing_keys.push_back(keys[i]);
+        }
+    }
+    if (!missing_keys.empty()) {
+        (void)cache_backend_->Delete(request_context, missing_keys);
+    }
+    return results;
+}
+
 std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(RequestContext *request_context,
                                                                             const KeyVector &keys,
                                                                             const LocationIdsPerKey &location_ids,
@@ -694,6 +769,36 @@ ErrorCode MetaStorageBackendManager::ListKeys(RequestContext *request_context,
         return cache_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
     }
     return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+}
+
+ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                                 const std::string &cursor,
+                                                                 const int64_t limit,
+                                                                 MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (!persistent_backend_) {
+        KVCM_LOG_ERROR("maintenance scan failed, persistent backend is null, instance[%s]", instance_id_.c_str());
+        return EC_ERROR;
+    }
+
+    MaintenanceScanBatch batch;
+    ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    if (batch.next_cursor.empty() || batch.keys.size() != batch.locations.size() ||
+        batch.keys.size() != batch.location_results.size()) {
+        KVCM_LOG_ERROR(
+            "maintenance scan result invalid, instance[%s] cursor_empty[%d] keys[%zu] locations[%zu] results[%zu]",
+            instance_id_.c_str(),
+            batch.next_cursor.empty(),
+            batch.keys.size(),
+            batch.locations.size(),
+            batch.location_results.size());
+        return EC_ERROR;
+    }
+    out = std::move(batch);
+    return EC_OK;
 }
 
 ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_context,

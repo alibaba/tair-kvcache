@@ -16,6 +16,7 @@ cc_library(
         "cache_manager.h",
     ],
     deps = [
+        ":cache_garbage_collector",
         ":cache_location_view",
         ":cache_manager_metrics_recorder",
         ":cache_reclaimer",
@@ -32,6 +33,25 @@ cc_library(
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_registry",
+    ],
+)
+
+cc_library(
+    name = "cache_garbage_collector",
+    srcs = ["cache_garbage_collector.cc"],
+    hdrs = ["cache_garbage_collector.h"],
+    deps = [
+        ":migration_manager",
+        ":schedule_plan_executor",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:loop_thread",
+        "//kv_cache_manager/common:timestamp_util",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:types",
         "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
@@ -180,4 +200,3 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )
-

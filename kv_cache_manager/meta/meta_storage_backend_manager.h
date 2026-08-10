@@ -61,6 +61,11 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyVector &keys,
                                         CacheLocationMapVector &out_location_maps) noexcept;
+    // Read the source-of-truth backend directly without touching the hot cache.
+    // Maintenance admission uses this to revalidate a persistent scan result.
+    std::vector<ErrorCode> GetLocationsFromPersistent(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      CacheLocationMapVector &out_location_maps) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
@@ -75,12 +80,21 @@ public:
     std::vector<ErrorCode>
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 
+    // Refresh complete keys from persistent storage into the hot cache before
+    // a maintenance RMW. The caller must hold the corresponding shard locks.
+    // In single-backend mode this is a no-op.
+    std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
+
     // ----- Cross-batch APIs (no shard locks) -----
     ErrorCode ListKeys(RequestContext *request_context,
                        const std::string &cursor,
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
+    ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
+                                          const std::string &cursor,
+                                          int64_t limit,
+                                          MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
 

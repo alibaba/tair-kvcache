@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -480,7 +481,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const KeyVector &keys,
                                                                  const LocationIdsPerKey &location_ids,
                                                                  const LocationModifierFunc &modifier,
-                                                                 bool adjust_reclaimed_key_count) noexcept {
+                                                                 bool adjust_reclaimed_key_count,
+                                                                 bool refresh_cache_from_persistent) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -518,9 +520,42 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         const auto &batch_keys = batch.batch_keys;
         LocationsPerKey batch_locations_per_key;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
+        std::vector<ErrorCode> refresh_results;
+        if (refresh_cache_from_persistent) {
+            // Maintenance candidates originate from the persistent scan. Under
+            // the same shard lock as the CAS, replace a missing or stale hot
+            // cache entry with the complete source-of-truth key first.
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+        }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key = backend_manager_->GetLocations(
             ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+        if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
+            (refresh_cache_from_persistent && refresh_results.size() != batch_keys.size())) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "ReadModifyWriteLocation read shape mismatch, keys[%lu] ecs[%lu] locations[%lu] "
+                               "refresh[%lu]",
+                               batch_keys.size(),
+                               get_ecs_per_key.size(),
+                               batch_locations_per_key.size(),
+                               refresh_results.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(), EC_ERROR);
+            }
+            error_count += static_cast<int32_t>(batch.batch_indexs.size());
+            continue;
+        }
+        for (size_t i = 0; i < batch_keys.size(); ++i) {
+            const size_t location_count = batch.batch_location_ids[i].size();
+            if (get_ecs_per_key[i].size() != location_count || batch_locations_per_key[i].size() != location_count) {
+                get_ecs_per_key[i].assign(location_count, EC_ERROR);
+                batch_locations_per_key[i].assign(location_count, nullptr);
+            }
+            if (refresh_cache_from_persistent && refresh_results[i] != EC_OK) {
+                get_ecs_per_key[i].assign(location_count, refresh_results[i]);
+                batch_locations_per_key[i].assign(location_count, nullptr);
+            }
+        }
         int64_t v = 0;
         auto *ephemeral_service_metrics_collector =
             dynamic_cast<ServiceMetricsCollector *>(ephemeral_request_context->metrics_collector());
@@ -683,6 +718,28 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
     return result;
 }
 
+MetaIndexer::Result MetaIndexer::GetLocationsFromPersistent(RequestContext *request_context,
+                                                            const KeyVector &keys,
+                                                            CacheLocationMapVector &out_location_maps) noexcept {
+    if (keys.empty()) {
+        out_location_maps.clear();
+        return Result(EC_OK);
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    auto error_codes = backend_manager_->GetLocationsFromPersistent(request_context, keys, out_location_maps);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+
+    Result result(keys.size());
+    const int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
+    return result;
+}
+
 MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       const LocationIdsPerKey &location_ids,
@@ -766,6 +823,30 @@ ErrorCode MetaIndexer::Scan(RequestContext *request_context,
             limit,
             out_next_cursor.c_str(),
             out_keys.size());
+    }
+    return ec;
+}
+
+ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                   const std::string &cursor,
+                                                   const size_t limit,
+                                                   MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (limit == 0 || limit > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        KVCM_LOG_ERROR("instance[%s] maintenance scan invalid limit[%zu], cursor[%s]",
+                       instance_id_.c_str(),
+                       limit,
+                       cursor.c_str());
+        return EC_BADARGS;
+    }
+    ErrorCode ec =
+        backend_manager_->ScanLocationsForMaintenance(request_context, cursor, static_cast<int64_t>(limit), out);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] maintenance scan failed, cursor[%s] limit[%zu] ec[%d]",
+                       instance_id_.c_str(),
+                       cursor.c_str(),
+                       limit,
+                       ec);
     }
     return ec;
 }

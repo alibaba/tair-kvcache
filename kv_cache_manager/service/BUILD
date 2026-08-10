@@ -30,6 +30,7 @@ cc_library(
         "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/manager:cache_garbage_collector",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/manager:write_location_manager",

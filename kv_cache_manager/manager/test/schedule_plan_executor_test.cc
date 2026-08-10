@@ -114,6 +114,29 @@ public:
         return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
     }
 
+    ErrorCode CreateCachedMetaIndexer(const std::string &instance_id, const std::string &path) {
+        std::filesystem::remove(path);
+        auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+        backend_config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+        backend_config->SetStorageUri("file://" + path + "?persistent_type=dummy&cache_type=local");
+        auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+        meta_indexer_config->meta_storage_backend_config_ = std::move(backend_config);
+        meta_indexer_config->mutex_shard_num_ = 32;
+        meta_indexer_config->max_key_count_ = 10000;
+        return meta_manager_->CreateMetaIndexer(instance_id, meta_indexer_config);
+    }
+
+    static void WaitForCachedMetaIndexerRunning(const std::shared_ptr<MetaIndexer> &indexer) {
+        ASSERT_TRUE(indexer);
+        for (int i = 0; i < 100; ++i) {
+            if (indexer->backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        FAIL() << "cached metadata recovery did not finish in time";
+    }
+
     ErrorCode CreateDataStorage() {
         auto nfs_storage_spec = std::make_shared<NfsStorageSpec>();
         nfs_storage_spec->set_root_path("/mnt/nfs");
@@ -769,8 +792,7 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
     };
 
     std::atomic<size_t> delete_calls{0};
-    data_storage_manager_->storage_map_["external_cache"] =
-        std::make_shared<CountingDeleteBackend>(delete_calls);
+    data_storage_manager_->storage_map_["external_cache"] = std::make_shared<CountingDeleteBackend>(delete_calls);
 
     auto request_context = std::make_shared<RequestContext>("metadata_only_delete");
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
@@ -798,17 +820,15 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
 
     std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
-    ASSERT_EQ(EC_OK,
-              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_TRUE(location_maps.front().empty());
 
     const int64_t control_block_key = 702;
     std::vector<std::string> control_location_ids;
-    ASSERT_EQ(
-        EC_OK,
-        BatchAddLocationForTest(
-            &meta_searcher, request_context.get(), {control_block_key}, {location}, control_location_ids));
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(
+                  &meta_searcher, request_context.get(), {control_block_key}, {location}, control_location_ids));
     ASSERT_EQ(1u, control_location_ids.size());
     CacheLocationDelRequest control_request{
         .instance_id = kTestInstanceName,
@@ -1319,7 +1339,10 @@ TEST_F(SchedulePlanExecutorTest, TestCopyTaskShortResultVector) {
     // 注入一个 Copy 返回短 vector 的 mock 后端（覆盖真实 dummy backend）。
     class ShortCopyBackend : public DataStorageBackend {
     public:
-        ShortCopyBackend() : DataStorageBackend(nullptr) { SetOpen(true); SetAvailable(true); }
+        ShortCopyBackend() : DataStorageBackend(nullptr) {
+            SetOpen(true);
+            SetAvailable(true);
+        }
         DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
         bool Available() override { return true; }
         double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
@@ -1327,12 +1350,22 @@ TEST_F(SchedulePlanExecutorTest, TestCopyTaskShortResultVector) {
         ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
         ErrorCode Close() override { return EC_OK; }
         std::vector<std::pair<ErrorCode, DataStorageUri>>
-        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override { return {}; }
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+            return {};
+        }
         std::vector<ErrorCode>
-        Delete(const std::vector<DataStorageUri> &, const std::string &, std::function<void()>) override { return {}; }
-        std::vector<bool> Exist(const std::vector<DataStorageUri> &u) override { return std::vector<bool>(u.size(), true); }
-        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
-        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
+        Delete(const std::vector<DataStorageUri> &, const std::string &, std::function<void()>) override {
+            return {};
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &u) override {
+            return std::vector<bool>(u.size(), true);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &u) override {
+            return std::vector<ErrorCode>(u.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &u) override {
+            return std::vector<ErrorCode>(u.size(), EC_OK);
+        }
         std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src,
                                     const std::vector<DataStorageUri> &,
                                     const std::string &) override {
@@ -1429,8 +1462,8 @@ TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetLeavesWorkerForReclaim) {
     std::promise<void> reclaim_ran;
     auto reclaim_future = reclaim_ran.get_future();
     const bool reclaim_accepted = executor.SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
-    const bool reclaim_completed = reclaim_accepted &&
-                                   reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    const bool reclaim_completed =
+        reclaim_accepted && reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1474,17 +1507,15 @@ TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetClampAppliesAcrossPrepareAnd
             cv.notify_all();
         };
 
-        const bool prepare_accepted =
-            executor->SubmitTask(ScheduleTaskClass::kMigrationPrepare, migration_task);
+        const bool prepare_accepted = executor->SubmitTask(ScheduleTaskClass::kMigrationPrepare, migration_task);
         const bool continuation_accepted =
             executor->SubmitTask(ScheduleTaskClass::kMigrationContinuation, migration_task);
 
         bool expected_concurrency_reached = false;
         {
             std::unique_lock<std::mutex> lock(mutex);
-            expected_concurrency_reached = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
-                return running_migrations == expected_running;
-            });
+            expected_concurrency_reached =
+                cv.wait_for(lock, std::chrono::seconds(3), [&]() { return running_migrations == expected_running; });
         }
 
         // With a clamped budget of one, the second worker must remain available for reclaim
@@ -1495,8 +1526,8 @@ TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetClampAppliesAcrossPrepareAnd
             auto reclaim_future = reclaim_ran.get_future();
             const bool reclaim_accepted =
                 executor->SubmitTask(ScheduleTaskClass::kReclaim, [&]() { reclaim_ran.set_value(); });
-            reclaim_completed = reclaim_accepted &&
-                                reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+            reclaim_completed =
+                reclaim_accepted && reclaim_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
         }
 
         {
@@ -1507,9 +1538,7 @@ TEST_F(SchedulePlanExecutorTest, TestMigrationBudgetClampAppliesAcrossPrepareAnd
         bool all_completed = false;
         {
             std::unique_lock<std::mutex> lock(mutex);
-            all_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() {
-                return completed_migrations == 2;
-            });
+            all_completed = cv.wait_for(lock, std::chrono::seconds(3), [&]() { return completed_migrations == 2; });
         }
 
         EXPECT_TRUE(prepare_accepted);
@@ -1587,4 +1616,121 @@ TEST_F(SchedulePlanExecutorTest, TestMigrationExceptionReleasesBudget) {
     ASSERT_TRUE(executor.SubmitTask(ScheduleTaskClass::kMigrationPrepare, [&]() { second_ran.set_value(); }));
 
     EXPECT_EQ(std::future_status::ready, second_future.wait_for(std::chrono::seconds(3)));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAdmission) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("finish_before_gc_admission_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc",
+                                                            "nfs://nfs_01/finish_before_gc_admission?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {912}, {location}, location_ids));
+    ASSERT_EQ(1, location_ids.size());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {912}, empty_mask, location_maps));
+    ASSERT_EQ(1, location_maps.size());
+    ASSERT_EQ(1, location_maps.front().size());
+    const std::string expected_location_value = location_maps.front().at(location_ids.front())->ToJsonString();
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    const auto release_future = release_blocker.get_future().share();
+    ASSERT_TRUE(executor.SubmitTask([&blocker_started, release_future]() {
+        blocker_started.set_value();
+        release_future.wait_for(std::chrono::seconds(2));
+    }));
+    ASSERT_EQ(std::future_status::ready, blocker_started.get_future().wait_for(std::chrono::seconds(1)));
+
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {912},
+        .location_ids = {{location_ids.front()}},
+        .expected_location_values = {{expected_location_value}},
+    };
+    auto submit_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(submit_result.accepted);
+    ASSERT_TRUE(submit_result.future.valid());
+
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchUpdateLocationStatus(request_context.get(),
+                                                      {912},
+                                                      {{{location_ids.front(), CacheLocationStatus::CLS_SERVING}}},
+                                                      update_results));
+
+    release_blocker.set_value();
+    const auto result = submit_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_OK, result.status) << result.error_message;
+
+    location_maps.clear();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {912}, empty_mask, location_maps));
+    ASSERT_EQ(1, location_maps.size());
+    ASSERT_EQ(1, location_maps.front().size());
+    EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
+}
+
+TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetadataBeforeConditionalDelete) {
+    const std::string instance_id = "cached_authoritative_delete";
+    const std::string persistent_path = GetPrivateTestRuntimeDataPath() + "schedule_plan_executor_cached_authoritative";
+    ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
+    const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
+    WaitForCachedMetaIndexerRunning(indexer);
+
+    auto request_context = std::make_shared<RequestContext>("cached_authoritative_delete_test");
+    MetaSearcher meta_searcher(indexer);
+    const int64_t block_key = 913;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("default",
+                                                            "nfs://nfs_01/cached_authoritative_delete?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const std::string expected_value = location_maps.front().at(location_ids.front())->ToJsonString();
+
+    // Simulate a Running dual-backend instance whose authoritative metadata
+    // still contains the key after the local hot-cache entry was evicted.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer->backend_manager_->cache_backend_->Delete(nullptr, {block_key}));
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_TRUE(location_maps.front().empty());
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = instance_id,
+        .block_keys = {block_key},
+        .location_ids = {{location_ids.front()}},
+        .expected_location_values = {{expected_value}},
+        .metadata_only = true,
+        .authoritative_read = true,
+    };
+    const PlanExecuteResult result = executor.Submit(request).get();
+    ASSERT_EQ(EC_OK, result.status) << result.error_message;
+
+    CacheLocationMapVector persistent_locations;
+    const auto persistent_results =
+        indexer->backend_manager_->GetLocationsFromPersistent(request_context.get(), {block_key}, persistent_locations);
+    ASSERT_EQ(1u, persistent_results.size());
+    ASSERT_EQ(1u, persistent_locations.size());
+    EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
 }

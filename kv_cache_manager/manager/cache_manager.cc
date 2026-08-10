@@ -412,6 +412,10 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Stop();
+        cache_garbage_collector_.reset();
+    }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     if (write_location_manager_) {
@@ -435,7 +439,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint32_t cache_reclaimer_idle_interval_ms,
                         uint32_t cache_reclaimer_worker_size,
                         CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config,
-                        uint32_t schedule_plan_migration_worker_budget) {
+                        uint32_t schedule_plan_migration_worker_budget,
+                        CacheGarbageCollector::Config cache_gc_config) {
     if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
         schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
         KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
@@ -466,6 +471,18 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
     // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
     assert(migration_manager_ != nullptr);
+
+    cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(std::move(cache_gc_config),
+                                                                       registry_manager_,
+                                                                       meta_indexer_manager_,
+                                                                       registry_manager_->data_storage_manager(),
+                                                                       schedule_plan_executor_,
+                                                                       metrics_registry_,
+                                                                       migration_manager_);
+    if (cache_garbage_collector_->Validate() != EC_OK) {
+        KVCM_LOG_ERROR("CacheManager init failed: invalid CacheGarbageCollector config");
+        return false;
+    }
 
     cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
                                                         cache_reclaimer_key_sampling_size_per_task,
@@ -1554,6 +1571,22 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     result.rejected = domain.rejected;
     result.message = domain.message;
     return result;
+}
+
+ErrorCode CacheManager::StartCacheGarbageCollector() {
+    return cache_garbage_collector_ ? cache_garbage_collector_->Start() : EC_ERROR;
+}
+
+void CacheManager::RequestStopCacheGarbageCollector() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->RequestStop();
+    }
+}
+
+void CacheManager::JoinCacheGarbageCollector() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Join();
+    }
 }
 
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
@@ -3672,6 +3705,9 @@ void CacheManager::ClearEventCleanupCallbacks() {
 }
 
 ErrorCode CacheManager::DoCleanup() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Stop();
+    }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     // aborting write session need meta indexer

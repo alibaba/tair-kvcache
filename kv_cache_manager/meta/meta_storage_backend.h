@@ -214,6 +214,20 @@ public:
                                std::string &out_next_cursor,
                                KeyTypeVec &out_keys) noexcept = 0;
 
+    // Scan keys and their full CacheLocationMap for background maintenance.
+    // Unlike the online ListKeys/GetLocations path, this operation must not
+    // update access/LRU/revisit state or populate another cache tier.
+    //
+    // `limit` is a batch-size hint, matching ListKeys/Redis SCAN semantics;
+    // a backend may return more or fewer keys while advancing its cursor.
+    //
+    // `out` is only valid when EC_OK is returned. On success, out.keys,
+    // out.locations and out.location_results must have identical sizes.
+    virtual ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
+                                                  const std::string &cursor,
+                                                  int64_t limit,
+                                                  MaintenanceScanBatch &out) noexcept = 0;
+
     // 随机采样 key。
     // @param request_context 请求上下文；可为 nullptr
     // @param count    期望采样数量

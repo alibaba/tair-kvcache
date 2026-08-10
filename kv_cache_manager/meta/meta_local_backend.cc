@@ -597,6 +597,51 @@ ErrorCode MetaLocalBackend::ListKeys(RequestContext * /*request_context*/,
     return EC_OK;
 }
 
+ErrorCode MetaLocalBackend::ScanLocationsForMaintenance(RequestContext * /*request_context*/,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+
+    int64_t start_shard = 0;
+    if (!StringUtil::StrToInt64(cursor.c_str(), start_shard) || start_shard < 0 || start_shard > shard_mask_) {
+        return EC_BADARGS;
+    }
+
+    const uint32_t num_shards = shard_mask_ + 1;
+    int64_t collected = 0;
+    for (uint32_t shard_id = static_cast<uint32_t>(start_shard); shard_id < num_shards; ++shard_id) {
+        cache_->ApplyToSingleShard(shard_id,
+                                   [&](const std::string_view &key,
+                                       Cache::ObjectPtr value,
+                                       size_t /*charge*/,
+                                       const Cache::CacheItemHelper * /*helper*/) {
+                                       if (key.size() != sizeof(KeyType) || value == nullptr) {
+                                           return;
+                                       }
+                                       const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                                       CacheLocationMap locations;
+                                       {
+                                           std::shared_lock lock(item->GetMutex());
+                                           locations = item->GetLocations();
+                                       }
+                                       out.keys.push_back(ViewToKey(key));
+                                       out.locations.emplace_back(std::move(locations));
+                                       out.location_results.push_back(EC_OK);
+                                       ++collected;
+                                   });
+
+        if (collected >= limit) {
+            const uint32_t next_shard = shard_id + 1;
+            out.next_cursor = (next_shard >= num_shards) ? SCAN_BASE_CURSOR : std::to_string(next_shard);
+            return EC_OK;
+        }
+    }
+
+    out.next_cursor = SCAN_BASE_CURSOR;
+    return EC_OK;
+}
+
 ErrorCode MetaLocalBackend::RandomSample(RequestContext * /*request_context*/,
                                          const int64_t count,
                                          std::vector<KeyType> &out_keys) noexcept {

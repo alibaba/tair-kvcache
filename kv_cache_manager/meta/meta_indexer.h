@@ -75,7 +75,8 @@ public:
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier,
-                                           bool adjust_reclaimed_key_count = true) noexcept;
+                                           bool adjust_reclaimed_key_count = true,
+                                           bool refresh_cache_from_persistent = false) noexcept;
 
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
@@ -86,6 +87,11 @@ public:
     Result GetLocations(RequestContext *request_context,
                         const KeyVector &keys,
                         CacheLocationMapVector &out_location_maps) noexcept;
+    // Source-of-truth read used by maintenance admission. It never backfills
+    // or touches the optional hot-cache backend.
+    Result GetLocationsFromPersistent(RequestContext *request_context,
+                                      const KeyVector &keys,
+                                      CacheLocationMapVector &out_location_maps) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
@@ -99,6 +105,10 @@ public:
                    const size_t limit,
                    std::string &out_next_cursor,
                    KeyVector &out_keys) noexcept;
+    ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
+                                          const std::string &cursor,
+                                          size_t limit,
+                                          MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
