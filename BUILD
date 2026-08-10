@@ -1,3 +1,8 @@
+exports_files(
+    ["LICENSE"],
+    visibility = ["//visibility:public"],
+)
+
 config_setting(
     name = "using_cuda",
     values = {"define": "using_cuda=true"},
