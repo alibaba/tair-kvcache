@@ -65,6 +65,8 @@
 
 namespace {
 
+kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::ErrorCode service_error);
+
 kv_cache_manager::Locations GenLocations(
     const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations) {
     kv_cache_manager::Locations locations;
@@ -80,13 +82,17 @@ kv_cache_manager::Locations GenLocations(
     return locations;
 }
 
-kv_cache_manager::CacheMetaDetails GenCacheMetaDetails(
-    const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheMetaDetailItem>
-        &proto_cache_meta_details) {
+kv_cache_manager::CacheMetaDetails
+GenCacheMetaDetails(const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheMetaDetailItem>
+                        &proto_cache_meta_details) {
     kv_cache_manager::CacheMetaDetails cache_meta_details;
     cache_meta_details.reserve(proto_cache_meta_details.size());
     for (const auto &proto_item : proto_cache_meta_details) {
         kv_cache_manager::CacheMetaDetailItem item;
+        if (proto_item.has_status() && proto_item.status().code() != kv_cache_manager::proto::meta::OK) {
+            item.error_code = ToClientError(proto_item.status().code());
+            item.error_message = proto_item.status().message();
+        }
         item.request_index = proto_item.request_index();
         item.block_key = proto_item.block_key();
         item.prev_block_key = proto_item.prev_block_key();
@@ -97,9 +103,8 @@ kv_cache_manager::CacheMetaDetails GenCacheMetaDetails(
         for (const auto &proto_location : proto_item.locations()) {
             kv_cache_manager::CacheMetaLocationDetail location;
             location.location_id = proto_location.location_id();
-            location.status =
-                static_cast<kv_cache_manager::CacheMetaLocationStatus>(proto_location.status());
-            location.storage_type = static_cast<int32_t>(proto_location.type());
+            location.status = static_cast<kv_cache_manager::CacheMetaLocationStatus>(proto_location.status());
+            location.storage_type = static_cast<kv_cache_manager::CacheMetaStorageType>(proto_location.type());
             location.spec_size = proto_location.spec_size();
             location.create_time = proto_location.create_time();
             location.location_specs.reserve(proto_location.location_specs_size());

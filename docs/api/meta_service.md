@@ -256,6 +256,9 @@ Example response:
   },
   "items": [
     {
+      "status": {
+        "code": "OK"
+      },
       "request_index": 0,
       "block_key": 123,
       "prev_block_key": "",
@@ -287,6 +290,9 @@ Example response:
       ]
     },
     {
+      "status": {
+        "code": "OK"
+      },
       "request_index": 1,
       "block_key": 456,
       "locations": [
@@ -299,4 +305,4 @@ Example response:
 }
 ```
 
-This diagnostic API returns raw metadata for every unmasked requested key. It does not apply location selection, data-file existence filtering, or lazy prune.
+This diagnostic API returns raw metadata for every unmasked requested key. It does not apply location selection, data-file existence filtering, or lazy prune. `prev_block_key` is a convenience projection of `properties["BP#prev_key"]`; the raw property is intentionally retained. A missing key is reported as a successful item with `CLS_NOT_FOUND`. Backend or deserialization failures are reported in that item's `status` while other successful items are still returned. If every item fails to read, the request returns an overall error.
