@@ -9,7 +9,6 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/index/online/cache_indexer_factory.h"
 #include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
 #include "kv_cache_manager/optimizer/liteHit/request_preprocess.h"
 
@@ -31,20 +30,18 @@ const LocationSpecGroup *FindLocationSpecGroup(const std::vector<LocationSpecGro
 
 constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
 
-bool ConvertCapacitiesToBlocks(const std::vector<double> &capacity_gb,
-                               int64_t block_charge_bytes,
-                               std::vector<int64_t> &capacity_blocks) {
-    capacity_blocks.clear();
-    capacity_blocks.reserve(capacity_gb.size());
+bool ConvertCapacitiesToBytes(const std::vector<double> &capacity_gb, std::vector<uint64_t> &capacity_bytes) {
+    capacity_bytes.clear();
+    capacity_bytes.reserve(capacity_gb.size());
     for (double capacity : capacity_gb) {
         if (!std::isfinite(capacity) || capacity < 0.0) {
             return false;
         }
-        const long double blocks = static_cast<long double>(capacity) * kBytesPerGb / block_charge_bytes;
-        if (blocks >= static_cast<long double>(std::numeric_limits<int64_t>::max())) {
-            capacity_blocks.push_back(std::numeric_limits<int64_t>::max());
+        const long double bytes = static_cast<long double>(capacity) * kBytesPerGb;
+        if (bytes >= static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+            capacity_bytes.push_back(static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
         } else {
-            capacity_blocks.push_back(static_cast<int64_t>(blocks));
+            capacity_bytes.push_back(static_cast<uint64_t>(bytes));
         }
     }
     return true;
@@ -60,6 +57,34 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
         return std::numeric_limits<int64_t>::max();
     }
     return static_cast<int64_t>(lhs * rhs);
+}
+
+int64_t ClampToInt64(long double value) {
+    if (value >= static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return value <= 0.0L ? 0 : static_cast<int64_t>(value);
+}
+
+// Block count of one capacity tier for the register response.
+//
+// full-attention (step_blocks == 0): exact, and the same value doubles as the
+// LiteHit projection slot because every block costs exactly full_charge_bytes.
+//
+// linear: an ESTIMATE only. Full blocks and Mamba checkpoints have different
+// charges, so no single block count describes the byte-axis cache; hits are
+// always decided on the byte axis. The estimate amortizes one checkpoint over
+// step_blocks blocks.
+int64_t CapacityBlocksForResponse(uint64_t capacity_bytes,
+                                  int64_t full_charge_bytes,
+                                  int64_t mamba_charge_bytes,
+                                  int32_t step_blocks) {
+    if (step_blocks <= 0) {
+        return ClampToInt64(capacity_bytes / static_cast<uint64_t>(full_charge_bytes));
+    }
+    const long double bytes_per_step =
+        static_cast<long double>(step_blocks) * full_charge_bytes + static_cast<long double>(mamba_charge_bytes);
+    return ClampToInt64(static_cast<long double>(capacity_bytes) * step_blocks / bytes_per_step);
 }
 
 } // namespace
@@ -101,6 +126,11 @@ ErrorCode OnlineOptimizerManager::CreateInstanceGroup(const OptimizerInstanceGro
     if (!registry_manager_) {
         return EC_ERROR;
     }
+    std::string invalid_fields;
+    if (!instance_group.ValidateRequiredFields(invalid_fields)) {
+        KVCM_LOG_ERROR("CreateInstanceGroup failed: invalid group config %s", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     std::lock_guard admin_guard(admin_ops_mutex_);
     return registry_manager_->CreateInstanceGroup(instance_group);
 }
@@ -108,6 +138,11 @@ ErrorCode OnlineOptimizerManager::CreateInstanceGroup(const OptimizerInstanceGro
 ErrorCode OnlineOptimizerManager::UpdateInstanceGroup(const OptimizerInstanceGroup &instance_group) {
     if (!registry_manager_) {
         return EC_ERROR;
+    }
+    std::string invalid_fields;
+    if (!instance_group.ValidateRequiredFields(invalid_fields)) {
+        KVCM_LOG_ERROR("UpdateInstanceGroup failed: invalid group config %s", invalid_fields.c_str());
+        return EC_BADARGS;
     }
 
     std::lock_guard admin_guard(admin_ops_mutex_);
@@ -255,9 +290,27 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         KVCM_LOG_ERROR("RegisterInstance failed: negative linear_step for instance[%s]", instance_id.c_str());
         return EC_BADARGS;
     }
-    int32_t linear_step = instance_info.linear_step();
+    const int32_t linear_step = instance_info.linear_step();
     if (instance_info.block_size() <= 0) {
         KVCM_LOG_ERROR("RegisterInstance failed: non-positive token block_size for instance[%s]", instance_id.c_str());
+        return EC_BADARGS;
+    }
+    // linear_step counts tokens; checkpoints can only land on complete block
+    // boundaries, so it must divide evenly into whole blocks.
+    if (linear_step > 0 && linear_step % instance_info.block_size() != 0) {
+        KVCM_LOG_ERROR(
+            "RegisterInstance failed: linear_step=%d tokens is not a multiple of block_size=%d for instance[%s]",
+            linear_step,
+            instance_info.block_size(),
+            instance_id.c_str());
+        return EC_BADARGS;
+    }
+    const int32_t linear_step_blocks = linear_step / instance_info.block_size();
+    std::string invalid_group_fields;
+    if (!instance_group.ValidateRequiredFields(invalid_group_fields)) {
+        KVCM_LOG_ERROR("RegisterInstance failed: invalid group config %s for instance[%s]",
+                       invalid_group_fields.c_str(),
+                       instance_id.c_str());
         return EC_BADARGS;
     }
     if (instance_group.eviction_policy() != "lru") {
@@ -268,6 +321,12 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     }
     if (instance_group.ttl_seconds() < 0) {
         KVCM_LOG_ERROR("RegisterInstance failed: negative TTL for instance[%s]", instance_id.c_str());
+        return EC_BADARGS;
+    }
+    if (linear_step > 0 && instance_group.ttl_seconds() > 0) {
+        KVCM_LOG_ERROR("RegisterInstance failed: instance[%s] is linear-attention in a TTL group; TTL is only "
+                       "supported by the full-attention LiteHit core",
+                       instance_id.c_str());
         return EC_BADARGS;
     }
 
@@ -285,6 +344,17 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
                        instance_id.c_str());
         return EC_BADARGS;
     }
+    if (linear_step == 0 && !optimizer_state_info.linear_location_spec_group_name().empty()) {
+        KVCM_LOG_ERROR(
+            "RegisterInstance failed: full-attention instance[%s] must not configure a linear/Mamba spec group",
+            instance_id.c_str());
+        return EC_BADARGS;
+    }
+    if (linear_step > 0 && optimizer_state_info.linear_location_spec_group_name().empty()) {
+        KVCM_LOG_ERROR("RegisterInstance failed: linear instance[%s] requires a non-empty Mamba spec group",
+                       instance_id.c_str());
+        return EC_BADARGS;
+    }
 
     const auto *full_group = FindLocationSpecGroup(groups, optimizer_state_info.full_location_spec_group_name());
     if (!full_group) {
@@ -293,16 +363,16 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
                        instance_id.c_str());
         return EC_BADARGS;
     }
-    int64_t size_full_only = ComputeSizeForGroup(specs, *full_group);
-    if (size_full_only <= 0) {
+    int64_t full_charge_bytes = ComputeSizeForGroup(specs, *full_group);
+    if (full_charge_bytes <= 0) {
         KVCM_LOG_ERROR("RegisterInstance failed: invalid full group[%s] size[%ld] for instance[%s]",
                        full_group->name().c_str(),
-                       size_full_only,
+                       full_charge_bytes,
                        instance_id.c_str());
         return EC_BADARGS;
     }
 
-    int64_t size_full_linear = size_full_only;
+    int64_t mamba_charge_bytes = 0;
     if (!optimizer_state_info.linear_location_spec_group_name().empty()) {
         const auto *linear_group =
             FindLocationSpecGroup(groups, optimizer_state_info.linear_location_spec_group_name());
@@ -312,66 +382,54 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
                            instance_id.c_str());
             return EC_BADARGS;
         }
-        const int64_t size_linear = ComputeSizeForGroup(specs, *linear_group);
-        if (size_linear <= 0) {
+        mamba_charge_bytes = ComputeSizeForGroup(specs, *linear_group);
+        if (mamba_charge_bytes <= 0) {
             KVCM_LOG_ERROR("RegisterInstance failed: invalid linear group[%s] size[%ld] for instance[%s]",
                            linear_group->name().c_str(),
-                           size_linear,
+                           mamba_charge_bytes,
                            instance_id.c_str());
             return EC_BADARGS;
         }
-        size_full_linear += size_linear;
-    }
-
-    int64_t estimated_bytes_per_block;
-    if (linear_step == 0) {
-        estimated_bytes_per_block = size_full_only;
-    } else if (linear_step == 1) {
-        estimated_bytes_per_block = size_full_linear;
-    } else {
-        estimated_bytes_per_block = ((linear_step - 1) * size_full_only + size_full_linear) / linear_step;
-    }
-
-    if (estimated_bytes_per_block <= 0) {
-        KVCM_LOG_ERROR("RegisterInstance failed: estimated_bytes_per_block <= 0 for instance[%s]", instance_id.c_str());
-        return EC_BADARGS;
     }
 
     const auto &capacity_gb = instance_group.capacity_gb();
-    std::vector<int64_t> estimated_capacity_blocks;
-    if (!ConvertCapacitiesToBlocks(capacity_gb, estimated_bytes_per_block, estimated_capacity_blocks)) {
+    std::vector<uint64_t> capacity_bytes;
+    if (!ConvertCapacitiesToBytes(capacity_gb, capacity_bytes)) {
         KVCM_LOG_ERROR("RegisterInstance failed: invalid capacity for instance[%s]", instance_id.c_str());
         return EC_BADARGS;
+    }
+    std::vector<int64_t> capacity_blocks;
+    capacity_blocks.reserve(capacity_bytes.size());
+    for (uint64_t bytes : capacity_bytes) {
+        capacity_blocks.push_back(
+            CapacityBlocksForResponse(bytes, full_charge_bytes, mamba_charge_bytes, linear_step_blocks));
     }
 
     auto state = std::make_shared<InstanceState>();
     state->instance_info = std::make_shared<OptimizerInstanceInfo>(instance_info);
     state->instance_group = std::make_shared<OptimizerInstanceGroup>(instance_group);
 
-    state->size_full_only = size_full_only;
-    state->size_full_linear = size_full_linear;
+    state->full_charge_bytes = full_charge_bytes;
+    state->mamba_charge_bytes = mamba_charge_bytes;
     state->linear_step = linear_step;
+    state->linear_step_blocks = linear_step_blocks;
     state->total_hits_per_capacity.resize(capacity_gb.size(), 0);
 
     if (linear_step == 0) {
-        state->lite_hit_capacity_blocks = estimated_capacity_blocks;
-        // A group TTL is layered onto the LiteHit core; online time is the
-        // wall clock, mirroring the linear-path TtlCacheIndexerWrapper.
+        state->lite_hit_capacity_blocks = capacity_blocks;
+        // A group TTL is layered onto the LiteHit core; online replay reads the
+        // wall clock, while offline replay feeds trace timestamps.
         state->lite_hit =
             std::make_unique<LiteHit>(static_cast<uint64_t>(instance_group.ttl_seconds()) * 1000000000ULL);
     } else {
-        auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
-                                                               instance_group.enable_theoretical_max_cache(),
-                                                               capacity_gb,
-                                                               size_full_only,
-                                                               size_full_linear,
-                                                               linear_step,
-                                                               instance_group.ttl_seconds());
-        if (!indexer) {
-            KVCM_LOG_ERROR("RegisterInstance failed: initialize linear indexer for instance[%s]", instance_id.c_str());
-            return EC_BADARGS;
-        }
-        state->indexer = std::move(indexer);
+        // Linear attention runs on the Full+Mamba LiteHit core; TTL groups are
+        // rejected above.
+        LiteHitMamba::Config mamba_config;
+        mamba_config.full_charge_bytes = static_cast<uint64_t>(full_charge_bytes);
+        mamba_config.mamba_charge_bytes = static_cast<uint64_t>(mamba_charge_bytes);
+        mamba_config.step_blocks = static_cast<uint64_t>(linear_step_blocks);
+        state->total_capacity_bytes = capacity_bytes;
+        state->lite_hit_mamba = std::make_unique<LiteHitMamba>(mamba_config);
     }
 
     {
@@ -379,16 +437,18 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         instances_[instance_id] = std::move(state);
     }
 
-    result.estimated_capacity_blocks = estimated_capacity_blocks;
-    result.size_full_only = size_full_only;
-    result.size_full_linear = size_full_linear;
+    result.estimated_capacity_blocks = capacity_blocks;
+    result.full_charge_bytes = full_charge_bytes;
+    result.mamba_charge_bytes = mamba_charge_bytes;
 
-    KVCM_LOG_INFO("RegisterInstance OK: instance[%s] group[%s] linear_step=%d estimated_bytes_per_block=%ld caps=%zu",
-                  instance_id.c_str(),
-                  instance_info.instance_group_name().c_str(),
-                  linear_step,
-                  estimated_bytes_per_block,
-                  estimated_capacity_blocks.size());
+    KVCM_LOG_INFO(
+        "RegisterInstance OK: instance[%s] group[%s] linear_step=%d full_charge=%ld mamba_charge=%ld caps=%zu",
+        instance_id.c_str(),
+        instance_info.instance_group_name().c_str(),
+        linear_step,
+        full_charge_bytes,
+        mamba_charge_bytes,
+        capacity_blocks.size());
     return EC_OK;
 }
 
@@ -526,44 +586,63 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         return EC_OK;
     }
 
-    std::vector<int64_t> hit_count;
-    int64_t max_hit_count;
-    if (!state->indexer) {
-        return EC_ERROR;
-    }
-    // Legacy analyzers keep their algorithm but share the same prefix-hash
-    // preprocessing switch.
-    if (state->instance_group->enable_prefix_hash()) {
-        state->indexer->ProcessKeys(ApplyPrefixHash(block_keys), hit_count, max_hit_count);
-    } else {
-        state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
+    if (state->lite_hit_mamba) {
+        if (input_token_len < 0) {
+            return EC_BADARGS;
+        }
+
+        NormalizedRequest normalized;
+        try {
+            normalized = NormalizeRequest(block_keys,
+                                          input_token_len,
+                                          static_cast<uint64_t>(state->instance_info->block_size()),
+                                          state->instance_group->enable_prefix_hash());
+        } catch (const std::invalid_argument &e) {
+            KVCM_LOG_ERROR(
+                "TraceQuery failed: invalid Mamba request for instance[%s]: %s", instance_id.c_str(), e.what());
+            return EC_BADARGS;
+        }
+
+        const MambaRequestFact fact = state->lite_hit_mamba->ProcessRequest(normalized.block_keys);
+        result.input_token_len = ClampToInt64(normalized.input_token_len);
+
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        const double token_denominator = static_cast<double>(normalized.input_token_len);
+        result.hit_count_per_capacity.reserve(num_caps);
+        result.hit_rate_per_capacity.reserve(num_caps);
+        for (std::size_t i = 0; i < num_caps; ++i) {
+            const uint64_t hits = HitCurveProjector::ProjectMambaBytes(fact, state->total_capacity_bytes[i]);
+            result.hit_count_per_capacity.push_back(ClampToInt64(hits));
+            result.hit_rate_per_capacity.push_back(
+                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(hits * block_size) / token_denominator);
+            state->total_hits_per_capacity[i] += static_cast<int64_t>(hits);
+        }
+
+        result.unique_keys_per_capacity.reserve(state->total_capacity_bytes.size());
+        for (uint64_t capacity_bytes : state->total_capacity_bytes) {
+            result.unique_keys_per_capacity.push_back(
+                ClampToInt64(state->lite_hit_mamba->FullObjectsWithinTotalBytes(capacity_bytes)));
+        }
+
+        if (state->instance_group->enable_theoretical_max_cache()) {
+            const uint64_t max_hits = HitCurveProjector::ProjectMambaInfinite(fact);
+            result.max_hit_count = ClampToInt64(max_hits);
+            result.max_hit_rate =
+                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
+            result.theoretical_unique_keys = ClampToInt64(state->lite_hit_mamba->current_unique_blocks());
+            state->total_max_hits += static_cast<int64_t>(max_hits);
+        } else {
+            result.max_hit_rate = -1.0;
+            result.theoretical_unique_keys = -1;
+        }
+
+        state->total_queries++;
+        state->total_blocks_queried += total_blocks;
+        state->total_input_tokens += ClampToInt64(normalized.input_token_len);
+        return EC_OK;
     }
 
-    state->indexer->PostQueryMaintenance();
-
-    state->total_queries++;
-    state->total_blocks_queried += total_blocks;
-    for (size_t j = 0; j < num_caps; j++) {
-        state->total_hits_per_capacity[j] += hit_count[j];
-    }
-    if (max_hit_count >= 0) {
-        state->total_max_hits += max_hit_count;
-    }
-
-    hit_count.resize(num_caps);
-    result.hit_count_per_capacity = std::move(hit_count);
-    result.hit_rate_per_capacity.reserve(num_caps);
-    for (int64_t hits : result.hit_count_per_capacity) {
-        result.hit_rate_per_capacity.push_back(total_blocks > 0 ? static_cast<double>(hits) / total_blocks : 0.0);
-    }
-    result.unique_keys_per_capacity = state->indexer->capacity_unique_counts();
-    result.theoretical_unique_keys = max_hit_count >= 0 ? state->indexer->unique_count() : -1;
-    result.max_hit_count = max_hit_count;
-    result.max_hit_rate = total_blocks > 0 && max_hit_count >= 0
-                              ? static_cast<double>(max_hit_count) / static_cast<double>(total_blocks)
-                              : 0.0;
-
-    return EC_OK;
+    return EC_ERROR;
 }
 
 ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_group_filter,
@@ -583,10 +662,12 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.instance_group = state->instance_info->instance_group_name();
         s.block_size = state->instance_info->block_size();
         s.total_blocks_queried = state->total_blocks_queried;
-        s.bytes_per_block =
-            (state->linear_step == 0)
-                ? state->size_full_only
-                : ((state->linear_step - 1) * state->size_full_only + state->size_full_linear) / state->linear_step;
+        // Exact for full-attention; for linear it is an estimate that amortizes
+        // one checkpoint over step_blocks blocks. Observability only.
+        s.bytes_per_block = state->full_charge_bytes;
+        if (state->linear_step_blocks > 0) {
+            s.bytes_per_block += state->mamba_charge_bytes / state->linear_step_blocks;
+        }
         s.linear_step = state->linear_step;
 
         const auto &caps = state->instance_group->capacity_gb();
@@ -613,7 +694,7 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // set does. Finite tiers are min(U, C) of this same U and need no
             // separate report.
             s.kv_cache_usage_bytes = SaturatingMultiplyToInt64(state->lite_hit->current_unique_blocks(),
-                                                               static_cast<uint64_t>(state->size_full_only));
+                                                               static_cast<uint64_t>(state->full_charge_bytes));
 
             // Full-attention rates are token based: cumulative hit blocks are
             // converted to tokens with the fixed block size and divided by the
@@ -640,47 +721,37 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
                 // distinguishable from "computed as 0".
                 s.max_hit_rate = -1.0;
             }
-        } else {
-            if (!state->indexer) {
-                continue;
-            }
+        } else if (state->lite_hit_mamba) {
             s.total_queries = state->total_queries;
-            s.total_max_hits = state->total_max_hits;
-            s.max_hit_rate = state->total_blocks_queried > 0 ? static_cast<double>(s.total_max_hits) /
-                                                                   static_cast<double>(state->total_blocks_queried)
-                                                             : 0.0;
-            s.unique_keys = state->indexer->unique_count();
-            s.eviction_count = state->indexer->eviction_count();
-            s.memory_usage_bytes = state->indexer->memory_usage_bytes();
-            s.kv_cache_usage_bytes = state->indexer->kv_cache_usage_bytes();
-            s.ttl_eviction_count = state->indexer->ttl_eviction_count();
+            s.total_input_tokens = state->total_input_tokens;
+            // unique_keys intentionally counts only Full objects.
+            s.unique_keys = ClampToInt64(state->lite_hit_mamba->current_unique_blocks());
+            s.memory_usage_bytes = ClampToInt64(state->lite_hit_mamba->memory_usage_bytes());
+            // Infinite-capacity working set, Full and Mamba bytes included.
+            s.kv_cache_usage_bytes = ClampToInt64(state->lite_hit_mamba->resident_bytes());
 
-            for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); i++) {
+            const double token_denominator = static_cast<double>(state->total_input_tokens);
+            const int64_t block_size_tokens = state->instance_info->block_size();
+            for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); ++i) {
                 PerCapacityHitRateInfo info;
                 info.capacity_gb = caps[i];
                 info.total_hits = state->total_hits_per_capacity[i];
-                info.hit_rate = state->total_blocks_queried > 0 ? static_cast<double>(info.total_hits) /
-                                                                      static_cast<double>(state->total_blocks_queried)
-                                                                : 0.0;
+                info.hit_rate = state->total_input_tokens > 0
+                                    ? static_cast<double>(info.total_hits * block_size_tokens) / token_denominator
+                                    : 0.0;
                 s.per_capacity_hit_rates.push_back(info);
             }
 
-            // Hit-age is a legacy indexer statistic and is intentionally not
-            // part of LiteHit's full-attention state.
-            auto age_buckets = state->indexer->GetHitAgeBuckets();
-            int64_t bucket_total = 0;
-            for (const auto &bucket : age_buckets) {
-                bucket_total += bucket.hit_count;
+            if (state->instance_group->enable_theoretical_max_cache()) {
+                s.total_max_hits = state->total_max_hits;
+                s.max_hit_rate = state->total_input_tokens > 0
+                                     ? static_cast<double>(s.total_max_hits * block_size_tokens) / token_denominator
+                                     : 0.0;
+            } else {
+                s.max_hit_rate = -1.0;
             }
-            int64_t age_denom = s.total_max_hits > 0 ? s.total_max_hits : bucket_total;
-            for (const auto &bucket : age_buckets) {
-                HitAgeBucketRatio ratio_info;
-                ratio_info.threshold_seconds = bucket.threshold_seconds;
-                ratio_info.hit_count = bucket.hit_count;
-                ratio_info.ratio =
-                    age_denom > 0 ? static_cast<double>(bucket.hit_count) / static_cast<double>(age_denom) : 0.0;
-                s.hit_age_bucket_ratios.push_back(ratio_info);
-            }
+        } else {
+            continue;
         }
 
         summaries.push_back(std::move(s));
@@ -705,22 +776,10 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
             return EC_ERROR;
         }
         state->lite_hit->Reset();
+    } else if (state->lite_hit_mamba) {
+        state->lite_hit_mamba->Reset();
     } else {
-        auto new_indexer =
-            CacheIndexerFactory::CreateCacheIndexer(state->instance_group->eviction_policy(),
-                                                    state->instance_group->enable_theoretical_max_cache(),
-                                                    state->instance_group->capacity_gb(),
-                                                    state->size_full_only,
-                                                    state->size_full_linear,
-                                                    state->linear_step,
-                                                    state->instance_group->ttl_seconds());
-        if (!new_indexer) {
-            KVCM_LOG_ERROR("ResetStats failed: unsupported eviction_policy[%s] for instance[%s]",
-                           state->instance_group->eviction_policy().c_str(),
-                           instance_id.c_str());
-            return EC_ERROR;
-        }
-        state->indexer = std::move(new_indexer);
+        return EC_ERROR;
     }
     state->total_queries = 0;
     state->total_blocks_queried = 0;

@@ -12,8 +12,8 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
-#include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit_mamba.h"
 
 namespace kv_cache_manager {
 
@@ -23,17 +23,28 @@ struct InstanceState {
     std::shared_ptr<const OptimizerInstanceInfo> instance_info;
     std::shared_ptr<const OptimizerInstanceGroup> instance_group;
 
-    // Exactly one analyzer is active. Full-attention uses LiteHit directly;
-    // linear attention remains on the legacy CacheIndexer path.
+    // Exactly one analyzer is active: full-attention uses LiteHit, linear
+    // attention uses LiteHitMamba.
     std::unique_ptr<LiteHit> lite_hit;
-    std::unique_ptr<CacheIndexer> indexer;
-    // Static byte->block estimation of the configured capacities, kept for
-    // the existing response contract and used as projection slots.
+    std::unique_ptr<LiteHitMamba> lite_hit_mamba;
+    // Full-attention projection slots: the configured capacities floored to
+    // whole blocks. Exact, because every block costs the same charge.
     std::vector<int64_t> lite_hit_capacity_blocks;
+    // Mamba projection slots: the TOTAL byte capacity of each tier. Full
+    // blocks and Mamba checkpoints share this one budget, so the projector
+    // always sees the total.
+    std::vector<uint64_t> total_capacity_bytes;
 
-    int64_t size_full_only = 0;
-    int64_t size_full_linear = 0;
+    // Byte charges of the two object types. A Full block always costs
+    // full_charge_bytes; a checkpoint additionally stores a Mamba state of
+    // mamba_charge_bytes (0 for full-attention instances).
+    int64_t full_charge_bytes = 0;
+    int64_t mamba_charge_bytes = 0;
+    // Configured token interval (0 = full-attention only). Reported as-is.
     int32_t linear_step = 0;
+    // linear_step converted to whole blocks (linear_step / block_size); it is
+    // the checkpoint interval and feeds the bytes-per-block estimation.
+    int32_t linear_step_blocks = 0;
     std::mutex mutex;
 
     // Minimal cumulative integers per the existing contract. LiteHit itself
@@ -60,20 +71,14 @@ struct TraceQueryResult {
 
 struct RegisterInstanceResult {
     std::vector<int64_t> estimated_capacity_blocks;
-    int64_t size_full_only = 0;
-    int64_t size_full_linear = 0;
+    int64_t full_charge_bytes = 0;
+    int64_t mamba_charge_bytes = 0;
 };
 
 struct PerCapacityHitRateInfo {
     double capacity_gb;
     int64_t total_hits;
     double hit_rate;
-};
-
-struct HitAgeBucketRatio {
-    int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
-    int64_t hit_count;
-    double ratio; // hit_count / total_max_hits
 };
 
 struct InstanceSummary {
@@ -93,7 +98,6 @@ struct InstanceSummary {
     int64_t kv_cache_usage_bytes = 0;
     int64_t ttl_eviction_count = 0;
     std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
-    std::vector<HitAgeBucketRatio> hit_age_bucket_ratios;
 };
 
 class OnlineOptimizerManager {

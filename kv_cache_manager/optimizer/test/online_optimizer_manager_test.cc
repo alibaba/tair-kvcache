@@ -33,7 +33,9 @@ protected:
     OptimizerInstanceInfo MakeInfo(const std::string &instance_id = "i1",
                                    const std::string &group_name = "g1",
                                    int32_t block_size = 16,
-                                   int32_t linear_step = 1) {
+                                   int32_t linear_step = 0) {
+        // Full-only specs: linear_step > 0 would require a Mamba spec group,
+        // use MakeHybridInfo for linear instances.
         return OptimizerInstanceInfo(group_name,
                                      instance_id,
                                      block_size,
@@ -46,7 +48,10 @@ protected:
     OptimizerInstanceInfo MakeHybridInfo(const std::string &instance_id = "i1",
                                          const std::string &group_name = "g1",
                                          int32_t block_size = 16,
-                                         int32_t linear_step = 1) {
+                                         int32_t linear_step = -1) {
+        if (linear_step < 0) {
+            linear_step = block_size;
+        }
         return OptimizerInstanceInfo(group_name,
                                      instance_id,
                                      block_size,
@@ -122,20 +127,26 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceBasic) {
 
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
-    EXPECT_EQ(16384, result.size_full_only);
-    EXPECT_EQ(16384, result.size_full_linear);
+    EXPECT_EQ(16384, result.full_charge_bytes);
+    EXPECT_EQ(0, result.mamba_charge_bytes);
     EXPECT_EQ(1, result.estimated_capacity_blocks.size());
 }
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceHybrid) {
-    auto info = MakeHybridInfo("i1", "g1", 16, 3);
+    // 48 tokens / 16 tokens-per-block = one checkpoint every 3 blocks.
+    auto info = MakeHybridInfo("i1", "g1", 16, 48);
     auto group = MakeGroup("g1", {1.0});
     RegisterInstanceResult result;
 
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
-    EXPECT_EQ(16384, result.size_full_only);
-    EXPECT_EQ(20480, result.size_full_linear);
+    EXPECT_EQ(16384, result.full_charge_bytes);
+    EXPECT_EQ(4096, result.mamba_charge_bytes);
+    // Estimate only (hits run on the byte axis): a shared pool spends
+    // 3 * 16384 + 4096 = 53248 bytes per 3 blocks, so 1 GB holds about
+    // floor(1073741824 * 3 / 53248) blocks.
+    ASSERT_EQ(1, result.estimated_capacity_blocks.size());
+    EXPECT_EQ(60494, result.estimated_capacity_blocks[0]);
 }
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceEmptyIdFails) {
@@ -160,7 +171,7 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingOptimizerStateInfoFail
 }
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingFullGroupFails) {
-    OptimizerInstanceInfo info("g1", "i1", 16, MakeSpecs(), MakeGroups(), 1, OptimizerStateInfo("missing", ""));
+    OptimizerInstanceInfo info("g1", "i1", 16, MakeSpecs(), MakeGroups(), 16, OptimizerStateInfo("missing", ""));
     auto group = MakeGroup();
     RegisterInstanceResult result;
     EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
@@ -168,10 +179,25 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingFullGroupFails) {
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingSpecInStateGroupFails) {
     std::vector<LocationSpecGroup> groups = {LocationSpecGroup("full", {"tp0", "tp_missing"})};
-    OptimizerInstanceInfo info("g1", "i1", 16, MakeSpecs(), groups, 1, OptimizerStateInfo("full", ""));
+    OptimizerInstanceInfo info("g1", "i1", 16, MakeSpecs(), groups, 16, OptimizerStateInfo("full", ""));
     auto group = MakeGroup();
     RegisterInstanceResult result;
     EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
+}
+
+TEST_F(OnlineOptimizerManagerTest, RegisterInstanceLinearStepNotTokenMultipleFails) {
+    // linear_step counts tokens and must divide into whole blocks.
+    auto info = MakeHybridInfo("i1", "g1", 16, /*linear_step tokens=*/24);
+    auto group = MakeGroup();
+    RegisterInstanceResult result;
+    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
+
+    auto ok_info = MakeHybridInfo("i1", "g1", 16, /*linear_step tokens=*/32);
+    EXPECT_EQ(EC_OK, RegisterInstance(ok_info, group, result));
+
+    // A linear instance without a Mamba spec group is rejected.
+    auto no_mamba_group = MakeInfo("i2", "g1", 16, /*linear_step tokens=*/32);
+    EXPECT_EQ(EC_BADARGS, RegisterInstance(no_mamba_group, group, result));
 }
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceSharedGroupQuotaFails) {
@@ -245,13 +271,12 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", init_keys, result);
-    // This legacy (non-full-attention) path replays with the eviction-policy
-    // simulator: cache_hit_count uses index 0 (smallest capacity ~6 blocks),
-    // prefix match starts at key 0 whose stack distance (99) exceeds the small
-    // capacity, so prefix hit = 0.
-    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
-    // Large capacity (index 1) should hit all 100 keys
+    // Full-attention LiteHit path with tail-first commit: the chain head is
+    // most recent, so the small capacity (~6 blocks) serves exactly its
+    // capacity as prefix hits.
     ASSERT_EQ(2, result.hit_count_per_capacity.size());
+    EXPECT_EQ(reg_result.estimated_capacity_blocks[0], result.hit_count_per_capacity.at(0));
+    // Large capacity (index 1) should hit all 100 keys
     EXPECT_EQ(100, result.hit_count_per_capacity[1]);
 }
 
@@ -279,7 +304,6 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
         checked_state = true;
         EXPECT_NE(nullptr, state.lite_hit);
-        EXPECT_EQ(nullptr, state.indexer);
         EXPECT_EQ(2, state.total_queries);
         EXPECT_EQ(26, state.total_input_tokens);
     }));
@@ -296,6 +320,57 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_EQ(3, summaries[0].per_capacity_hit_rates[1].total_hits);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].per_capacity_hit_rates[1].hit_rate);
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);
+}
+
+TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
+    // block_size 16, linear_step 48 tokens -> one checkpoint every 3 blocks
+    // plus the forced last block. Hybrid specs: full charge 16384, mamba
+    // charge 4096 per checkpoint.
+    auto info = MakeHybridInfo("i1", "g1", 16, 48);
+    auto group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, first));
+    ASSERT_EQ(1, first.hit_count_per_capacity.size());
+    EXPECT_EQ(0, first.hit_count_per_capacity[0]);
+    EXPECT_EQ(0, first.max_hit_count);
+
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, second));
+    // 1 GB covers everything: the forced last checkpoint (position 3)
+    // recovers all 4 complete blocks.
+    EXPECT_EQ(4, second.hit_count_per_capacity[0]);
+    EXPECT_DOUBLE_EQ(64.0 / 70.0, second.hit_rate_per_capacity[0]);
+    EXPECT_EQ(4, second.max_hit_count);
+    EXPECT_DOUBLE_EQ(64.0 / 70.0, second.max_hit_rate);
+    EXPECT_EQ(4, second.theoretical_unique_keys); // Full objects only
+
+    bool checked_state = false;
+    ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
+        checked_state = true;
+        EXPECT_EQ(nullptr, state.lite_hit);
+        EXPECT_NE(nullptr, state.lite_hit_mamba);
+    }));
+    EXPECT_TRUE(checked_state);
+
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(2, summaries[0].total_queries);
+    EXPECT_EQ(140, summaries[0].total_input_tokens);
+    EXPECT_EQ(4, summaries[0].unique_keys);
+    // Working set: 4 Full * 16384 + 2 checkpoints (positions 2 and 3) * 4096.
+    EXPECT_EQ(4 * 16384 + 2 * 4096, summaries[0].kv_cache_usage_bytes);
+    ASSERT_EQ(1, summaries[0].per_capacity_hit_rates.size());
+    EXPECT_EQ(4, summaries[0].per_capacity_hit_rates[0].total_hits);
+    EXPECT_DOUBLE_EQ(64.0 / 140.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
+
+    ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
+    TraceQueryResult after_reset;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, after_reset));
+    EXPECT_EQ(0, after_reset.hit_count_per_capacity[0]);
 }
 
 TEST_F(OnlineOptimizerManagerTest, FullAttentionRequiresConsistentInputTokenLength) {
@@ -342,6 +417,19 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
     auto bad_info = MakeInfo("i2", "g2", 4, 0);
     auto bad_group = MakeGroup("g2", {FullCapacityGb(2)}, "lru", false, /*ttl=*/-1);
     EXPECT_EQ(EC_BADARGS, RegisterInstance(bad_info, bad_group, reg_result));
+}
+
+TEST_F(OnlineOptimizerManagerTest, RejectsLinearInstanceInTtlGroup) {
+    // The Mamba core carries no time axis yet, so a linear instance in a TTL
+    // group has no analyzer to run on and must be rejected at registration.
+    auto info = MakeHybridInfo("i1", "g1", 16, 48);
+    auto ttl_group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/false, /*ttl=*/300);
+    RegisterInstanceResult reg_result;
+    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, ttl_group, reg_result));
+
+    // The very same instance registers fine without a group TTL.
+    auto group = MakeGroup("g1", {1.0});
+    EXPECT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
 }
 
 TEST_F(OnlineOptimizerManagerTest, ResetStatsResetsFullAttentionLiteHit) {

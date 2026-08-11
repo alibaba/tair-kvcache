@@ -232,8 +232,10 @@ void OptimizerServiceImpl::RegisterInstance(RequestContext *request_context,
         for (int64_t cap : result.estimated_capacity_blocks) {
             response->add_estimated_capacity_blocks(cap);
         }
-        response->set_size_full_only(result.size_full_only);
-        response->set_size_full_linear(result.size_full_linear);
+        // The response contract keeps the fused wording: size_full_linear is
+        // the byte size of a block that also stores a Mamba checkpoint.
+        response->set_size_full_only(result.full_charge_bytes);
+        response->set_size_full_linear(result.full_charge_bytes + result.mamba_charge_bytes);
     }
 }
 

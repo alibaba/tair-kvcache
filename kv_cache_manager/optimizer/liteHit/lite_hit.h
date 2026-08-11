@@ -17,14 +17,13 @@ namespace kv_cache_manager {
 // list and never accumulates per-capacity results. Any capacity is answered
 // afterwards by projecting the facts with HitCurveProjector.
 //
-// An optional fixed TTL adds the online TtlCacheIndexerWrapper semantics on
-// top of the LRU stack: a block whose age since last access reached the TTL
-// is a miss for every capacity, every access (hit or miss) refreshes
-// last_access, and time is the caller-provided trace timestamp so the replay
-// stays deterministic. Ages are monotone along the LRU stack (younger blocks
-// are always fresher), so expired blocks never inflate the reuse distance of
-// alive ones and one replay stays exact for every capacity under the fixed
-// TTL.
+// An optional fixed TTL is layered on top of the LRU stack: a block whose age
+// since last access reached the TTL is a miss for every capacity, every access
+// (hit or miss) refreshes last_access, and time is the caller-provided trace
+// timestamp so the replay stays deterministic. Ages are monotone along the LRU
+// stack (younger blocks are always fresher), so expired blocks never inflate
+// the reuse distance of alive ones and one replay stays exact for every
+// capacity under the fixed TTL.
 //
 // The TTL needs no per-key timestamps: marker positions are assigned
 // monotonically, so a block's last access time is the commit time of the
@@ -78,8 +77,7 @@ public:
     uint64_t current_unique_blocks() const { return alive_marker_count(); }
 
     // Cumulative blocks that reached the TTL deadline without a refreshing
-    // access; counted when the watermark sweeps over them, matching the
-    // online TtlCacheIndexerWrapper eviction statistics. A revived block
+    // access; counted when the watermark sweeps over them. A revived block
     // counts again on its next expiry.
     uint64_t ttl_expired_blocks() const { return ttl_expired_blocks_; }
 
