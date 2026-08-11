@@ -2326,6 +2326,9 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 }
 
 void CacheManager::RecordWriteBytesForLocations(const CacheLocationVector &locations) {
+    if (metrics_registry_ == nullptr) {
+        return;
+    }
     if (locations.empty()) {
         return;
     }
