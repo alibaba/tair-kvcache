@@ -2,6 +2,8 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/metrics/kmonitor_metrics_reporter.h"
@@ -123,4 +125,25 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         reporter_->metrics_registry_ = nullptr;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {
+    // the per-storage counter lives on the backend's DataStorageMetricsCollector,
+    // which is only created after Open()
+    auto be = std::make_shared<NfsBackend>(metrics_registry_);
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_root_path(GetPrivateTestRuntimeDataPath() + "nfs_root/");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "abc", spec);
+    ASSERT_EQ(ErrorCode::EC_OK, be->Open(config, "trace_1"));
+
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("abc", be);
+
+    registry_manager_->data_storage_manager_->RecordWriteBytes("abc", 2048);
+    EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
+
+    // the kmonitor side has no mock injection point; assert the registry-side value
+    // that ReportInterval reads from instead
+    const auto &tags = be->GetMetricsCollector()->GetMetricsTags();
+    EXPECT_EQ(2048u, metrics_registry_->GetCounter("data_storage.write_bytes_total", tags).Get());
 }
