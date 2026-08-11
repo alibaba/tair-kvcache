@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
 import logging
+import time
 import uuid
 import math
 
@@ -22,6 +23,7 @@ import torch.distributed as dist
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.client.pybind import kvcm_py_client
+from kv_cache_manager.py_connector.common.utils import deadline_ms_from_now
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +141,12 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
 
         self.write_timeout_seconds = self.kvcm_config.get("write_timeout_seconds", 30)
 
+        # sdk_get/put_timeout_ms 目前只在 init_kvcm_transfer_client 里作为局部变量
+        # （本文件 :75-76）—— Worker 的 wait_for_save/start_load_kv 需要它们计算
+        # DDL_自律，必须先落到 self 上（connector-dataflow.md 6.3 前置缺口）。
+        self.sdk_get_timeout_ms = self.kvcm_config.get("sdk_get_timeout_ms", 15000)
+        self.sdk_put_timeout_ms = self.kvcm_config.get("sdk_put_timeout_ms", 15000)
+
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
         self.kv_cache_tensor = kv_cache_tensor
@@ -210,7 +218,8 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         for locations, block_ids in self._metadata.load:
             uris = self._extract_uris(locations)
             buffers, cpu_tensors = self._prepare_buffers(block_ids)
-            result = self.transfer_client.LoadKvCaches(uris, buffers)
+            get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
+            result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_ms)
             logger.debug(f"LoadKvCaches {result=}")
             for block_id, cpu_tensor in zip(block_ids, cpu_tensors):
                 self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
@@ -229,7 +238,8 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         for locations, block_ids, write_session_id in self._metadata.save:
             uris = self._extract_uris(locations)
             buffers, _ = self._prepare_buffers(block_ids)
-            result = self.transfer_client.SaveKvCaches(uris, buffers)
+            deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
+            result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms)
             logger.debug(f"SaveKvCaches {result=}")
             flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
             if self.tp_world_size > 1:
@@ -348,8 +358,9 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
             save_indices = self._parse_block_mask(block_mask, len(block_keys))
             assert len(store_locations) == len(save_indices)
 
-            metadata.save.append((store_locations, [block_ids[block_pos]
-                                 for block_pos in save_indices], write_session_id))
+            metadata.save.append((store_locations,
+                                  [block_ids[block_pos] for block_pos in save_indices],
+                                  write_session_id))
         
         logger.info(f"{metadata=}")
 

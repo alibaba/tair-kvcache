@@ -23,14 +23,17 @@ ClientErrorCode TairMempoolSdk::Init(const std::shared_ptr<SdkBackendConfig> &sd
 
 SdkType TairMempoolSdk::Type() { return SdkType::TAIR_MEMPOOL; }
 
-ClientErrorCode TairMempoolSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode TairMempoolSdk::Get(const std::vector<DataStorageUri> &remote_uris,
+                                    const BlockBuffers &local_buffers,
+                                    int64_t deadline_ms) {
     KVCM_LOG_ERROR("no implementation for TairMempoolSdk");
     return ER_SDKREAD_ERROR;
 }
 
 ClientErrorCode TairMempoolSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                     const BlockBuffers &local_buffers,
-                                    std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                    std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                    int64_t deadline_ms) {
     KVCM_LOG_ERROR("no implementation for TairMempoolSdk");
     return ER_SDKWRITE_ERROR;
 }

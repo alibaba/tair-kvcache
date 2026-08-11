@@ -22,10 +22,12 @@ public:
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
+                                 int64_t deadline_ms,
                                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
     std::pair<ClientErrorCode, UriStrVec>
     SaveKvCaches(const UriStrVec &uri_str_vec,
                  const BlockBuffers &block_buffers,
+                 int64_t deadline_ms,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
 
 protected:

@@ -67,6 +67,7 @@ cc_library(
         "//conditions:default": [],
     }),
     hdrs = [
+        "deadline_util.h",
         "local_file_sdk.h",
         "sdk_factory.h",
         "sdk_interface.h",

@@ -18,10 +18,12 @@ public:
 
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
+                                         int64_t deadline_ms,
                                          std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec>
     SaveKvCaches(const UriStrVec &uri_str_vec,
                  const BlockBuffers &block_buffers,
+                 int64_t deadline_ms,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
 protected:

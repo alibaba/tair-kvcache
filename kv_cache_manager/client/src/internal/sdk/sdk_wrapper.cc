@@ -110,7 +110,9 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
     return ER_OK;
 }
 
-ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
+ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
+                                const BlockBuffers &local_buffers,
+                                int64_t deadline_ms) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ec;
@@ -124,18 +126,25 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
     // Build task vector for parallel dispatch
     std::vector<std::function<ClientErrorCode()>> tasks;
     tasks.reserve(groups.size());
-    for (const auto &group : groups) {
-        // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
-    }
-
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
+    auto now = std::chrono::steady_clock::now();
+    auto internal_deadline = now + std::chrono::milliseconds(timeout_ms);
+    auto deadline =
+        (deadline_ms > 0)
+            ? std::min(internal_deadline, std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)))
+            : internal_deadline;
+
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
+        tasks.push_back([group, deadline_ms]() { return group.sdk->Get(group.uris, group.buffers, deadline_ms); });
+    }
+    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), deadline, timeout_ms);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
                                 const BlockBuffers &local_buffers,
-                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+                                std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                int64_t deadline_ms) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
@@ -153,18 +162,25 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     std::vector<std::shared_ptr<std::vector<DataStorageUri>>> group_results;
     tasks.reserve(groups.size());
     group_results.reserve(groups.size());
+    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
+    auto now = std::chrono::steady_clock::now();
+    auto internal_deadline = now + std::chrono::milliseconds(timeout_ms);
+    auto deadline =
+        (deadline_ms > 0)
+            ? std::min(internal_deadline, std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)))
+            : internal_deadline;
 
-    for (const auto &group : groups) {
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
+        tasks.push_back([group, group_actual_uris, deadline_ms]() {
+            return group.sdk->Put(group.uris, group.buffers, group_actual_uris, deadline_ms);
         });
     }
 
-    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
-    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), deadline, timeout_ms);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
         return ec;
@@ -174,7 +190,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
         const auto &group_actual_uris = group_results[i];
-        
+
         if (group_actual_uris->size() != group.indices.size()) {
             KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
                           group_actual_uris->size(),
@@ -233,63 +249,51 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                                   std::chrono::steady_clock::time_point deadline,
                                                    int timeout_ms) const {
     if (tasks.empty()) {
         return ER_OK;
     }
 
-    // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
-                      getOpTypeString(op_type).c_str());
+        KVCM_LOG_WARN("run %s parallel failed, task thread pool is full", getOpTypeString(op_type).c_str());
         return ER_THREADPOOL_ERROR;
     }
 
-    // Submit all tasks with shared stop flag
-    auto stop = std::make_shared<std::atomic<bool>>(false);
+    const std::string op_str = getOpTypeString(op_type);
+    auto start = deadline - std::chrono::milliseconds(timeout_ms);
+
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
-        auto wrapped = [stop, task]() -> ClientErrorCode {
-            if (stop->load()) {
+        auto wrapped = [deadline, task = std::move(task)]() -> ClientErrorCode {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                auto overdue_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                        .count();
+                KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
                 return ER_SDK_TIMEOUT;
             }
             return task();
         };
-        futures.push_back(wait_task_thread_pool_->async(wrapped));
+        futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
     }
 
-    // Wait with shared deadline
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-    // Drain in-flight tasks with bounded wait to prevent background writes into caller's buffers
-    auto drain = [&](size_t from) {
-        stop->store(true);
-        for (size_t j = from; j < futures.size(); ++j) {
-            futures[j].wait_until(deadline);
-        }
-    };
-
     for (size_t i = 0; i < futures.size(); ++i) {
-        auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::steady_clock::duration::zero()) {
-            remaining = std::chrono::steady_clock::duration::zero();
-        }
-
-        if (futures[i].wait_for(remaining) != std::future_status::ready) {
-            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu)",
-                          getOpTypeString(op_type).c_str(),
-                          timeout_ms,
-                          i + 1,
-                          futures.size());
-            drain(i + 1);
+        if (futures[i].wait_until(deadline) != std::future_status::ready) {
+            auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+            KVCM_LOG_WARN("run %s parallel timeout: elapsed_ms=%lld, return immediately "
+                          "(in-flight I/O may still write caller buffer)",
+                          op_str.c_str(),
+                          static_cast<long long>(elapsed_ms));
             return ER_SDK_TIMEOUT;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
-            drain(i + 1);
+            KVCM_LOG_WARN("run %s parallel failed, error: %d", op_str.c_str(), static_cast<int>(ec));
             return ec;
         }
     }

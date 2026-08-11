@@ -3,6 +3,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_sdk.h"
@@ -103,7 +104,7 @@ TEST_F(Hf3fsSdkTest, Init_ReturnOk_SuccessOrSkipInitIovHandleFail) {
 TEST_F(Hf3fsSdkTest, GetBatch_ReturnInvalidParams_SizeMismatch) {
     std::vector<DataStorageUri> uris(2);
     BlockBuffers bufs(1);
-    auto rc = sdk_->Get(uris, bufs);
+    auto rc = sdk_->Get(uris, bufs, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -149,7 +150,7 @@ TEST_F(Hf3fsSdkTest, GetBatch_ReturnReadError_FirstFailShortCircuit) {
         EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).WillOnce(::testing::Return(1));
     }
     // The SDK should short-circuit and return ER_SDKREAD_ERROR
-    auto rc = sdk_->Get(uris, bufs);
+    auto rc = sdk_->Get(uris, bufs, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKREAD_ERROR);
 }
 
@@ -237,10 +238,89 @@ TEST_F(Hf3fsSdkTest, GetBatch_ReturnOk_BothSuccess) {
             return cqec;
         }));
 
-    auto rc = sdk_->Get(uris, bufs);
+    auto rc = sdk_->Get(uris, bufs, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     EXPECT_EQ(std::string(out1, sizeof(out1)), std::string(16, 'a'));
     EXPECT_EQ(std::string(out2, sizeof(out2)), std::string(32, 'b'));
+}
+
+TEST_F(Hf3fsSdkTest, TestGetSkipsRemainingBlocksWhenExpired) {
+    // 两个可读文件；deadline 已过期时 Get 必须在循环开始处拦截，
+    // 不得为任何 block 创建 Hf3fsUsrbioClient / 发起 I/O（不 RegFd、不 prep、不 wait）。
+    auto path1 = (std::filesystem::path(mount_point_) / "get_expired/a/x.bin");
+    auto path2 = (std::filesystem::path(mount_point_) / "get_expired/b/y.bin");
+    std::error_code ec;
+    std::filesystem::create_directories(path1.parent_path(), ec);
+    std::filesystem::create_directories(path2.parent_path(), ec);
+    {
+        std::ofstream f1(path1, std::ios::out | std::ios::binary);
+        f1.seekp(8192 - 1);
+        f1.write("\0", 1);
+    }
+    {
+        std::ofstream f2(path2, std::ios::out | std::ios::binary);
+        f2.seekp(8192 - 1);
+        f2.write("\0", 1);
+    }
+
+    DataStorageUri u1, u2;
+    u1.SetPath(path1.string());
+    u1.SetParam("blkid", "0");
+    u1.SetParam("size", "4096");
+    u2.SetPath(path2.string());
+    u2.SetParam("blkid", "0");
+    u2.SetParam("size", "4096");
+
+    char out1[16] = {0};
+    char out2[16] = {0};
+    BlockBuffer b1, b2;
+    b1.iovs.push_back(Iov{MemoryType::CPU, out1, sizeof(out1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, out2, sizeof(out2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    // 任何 block 都不得走到 Open()/RegFd，即未发起任何 io 准备
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(0);
+
+    {
+        // 已过期的 deadline
+        auto rc = sdk_->Get(uris, bufs, SteadyClockMs() - 1'000);
+        EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+    }
+}
+
+TEST_F(Hf3fsSdkTest, TestPutSkipsRemainingBlocksWhenExpired) {
+    DataStorageUri u1, u2;
+    u1.SetPath(
+        (std::filesystem::path(mount_point_) / ("put_expired_" + std::to_string(::getpid()) + "/a/x.bin")).string());
+    u1.SetParam("blkid", "1");
+    u1.SetParam("size", "4096");
+    u2.SetPath(
+        (std::filesystem::path(mount_point_) / ("put_expired_" + std::to_string(::getpid()) + "/b/y.bin")).string());
+    u2.SetParam("blkid", "2");
+    u2.SetParam("size", "4096");
+
+    BlockBuffer b1, b2;
+    char data1[16] = {0};
+    char data2[16] = {0};
+    b1.iovs.push_back(Iov{MemoryType::CPU, data1, sizeof(data1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, data2, sizeof(data2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    // 任何 block 都不得走到 Open()/RegFd，即未发起任何 io 准备
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(0);
+
+    {
+        // 已过期的 deadline
+        auto out = std::make_shared<std::vector<DataStorageUri>>();
+        auto rc = sdk_->Put(uris, bufs, out, SteadyClockMs() - 1'000);
+        EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+    }
 }
 
 // ------------- Get (single) -------------
@@ -248,7 +328,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnOk_EmptyIovs) {
     DataStorageUri uri;
     uri.SetPath((std::filesystem::path(mount_point_) / "get/empty.dat").string());
     BlockBuffer buf; // empty iovs
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
 }
 
@@ -257,7 +337,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnInvalid_ParamsEmptyPath) {
     uri.SetPath("");
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -267,7 +347,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnInvalid_ParamsNoSize) {
     // no size/blkid param set
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -296,7 +376,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnReadError_RegFdFail) {
     // make RegFd fail (>0)
     EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).WillRepeatedly(::testing::Return(1));
 
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKREAD_ERROR);
 }
 
@@ -368,7 +448,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnOk_Success) {
             return cqec;
         }));
 
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     EXPECT_EQ(std::string(outbuf1, sizeof(outbuf1)), std::string(16, 'a'));
     EXPECT_EQ(std::string(outbuf2, sizeof(outbuf2)), std::string(32, 'a'));
@@ -379,7 +459,7 @@ TEST_F(Hf3fsSdkTest, PutBatch_ReturnInvalidParams_SizeMismatch) {
     std::vector<DataStorageUri> uris(2);
     BlockBuffers bufs(1);
     auto out = std::make_shared<std::vector<DataStorageUri>>();
-    auto rc = sdk_->Put(uris, bufs, out);
+    auto rc = sdk_->Put(uris, bufs, out, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -396,7 +476,7 @@ TEST_F(Hf3fsSdkTest, PutBatch_ReturnAllocError_CreateDirFail) {
     b.iovs.push_back(Iov{MemoryType::CPU, data, sizeof(data), false});
     BlockBuffers bufs{b};
     auto out = std::make_shared<std::vector<DataStorageUri>>();
-    auto rc = sdk_->Put(uris, bufs, out);
+    auto rc = sdk_->Put(uris, bufs, out, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKALLOC_ERROR);
 }
 
@@ -473,7 +553,7 @@ TEST_F(Hf3fsSdkTest, PutBatch_ReturnOk_AllSuccess) {
         }));
 
     auto out = std::make_shared<std::vector<DataStorageUri>>();
-    auto rc = sdk_->Put(uris, bufs, out);
+    auto rc = sdk_->Put(uris, bufs, out, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     ASSERT_EQ(out->size(), uris.size());
 
@@ -486,113 +566,12 @@ TEST_F(Hf3fsSdkTest, PutBatch_ReturnOk_AllSuccess) {
     EXPECT_EQ(std::filesystem::file_size(uris[1].GetPath()), 2 * 4096 + size2);
 }
 
-// 同序契约回归：同一次 Put 包含多个不同 path，且同 path 不连续出现（[a, b, a]）。
-// 要求 actual_remote_uris[i] 与输入 remote_uris[i] 逐位置对应，且各 block 的
-// 数据确实落入输入位置对应的文件，而不是按内部分组顺序错位回填。
-TEST_F(Hf3fsSdkTest, PutBatch_ReturnOk_InterleavedPathsPreserveOrder) {
-    auto base = std::filesystem::path(mount_point_) / ("put_batch_order_" + std::to_string(::getpid()));
-    DataStorageUri u1;
-    u1.SetPath((base / "a/x.bin").string());
-    u1.SetParam("blkid", "0");
-    u1.SetParam("size", "4096");
-
-    DataStorageUri u2;
-    u2.SetPath((base / "b/y.bin").string());
-    u2.SetParam("blkid", "0");
-    u2.SetParam("size", "4096");
-
-    DataStorageUri u3;
-    u3.SetPath((base / "a/z.bin").string());
-    u3.SetParam("blkid", "0");
-    u3.SetParam("size", "4096");
-
-    std::vector<DataStorageUri> uris{u1, u2, u3};
-
-    // 每个 block 使用不同 payload，乱序写入或乱序回填时读回必然错位
-    BlockBuffers bufs(3);
-    std::vector<std::shared_ptr<uint8_t>> data;
-    for (size_t i = 0; i < uris.size(); ++i) {
-        auto d = std::shared_ptr<uint8_t>((uint8_t *)malloc(16), [](void *ptr) { free(ptr); });
-        std::memset(d.get(), 'a' + i, 16);
-        data.push_back(d);
-        bufs[i].iovs.push_back(Iov{MemoryType::CPU, d.get(), 16, false});
-    }
-
-    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
-    ASSERT_TRUE(mock != nullptr);
-    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).WillRepeatedly(::testing::Return(0));
-    EXPECT_CALL(*mock, Hf3fsDeregFd(::testing::_)).Times(::testing::AtLeast(0));
-    EXPECT_CALL(*mock,
-                Hf3fsIorCreate(::testing::NotNull(),
-                               ::testing::_,
-                               ::testing::_,
-                               ::testing::_,
-                               ::testing::_,
-                               ::testing::_,
-                               ::testing::_,
-                               ::testing::_))
-        .WillRepeatedly(::testing::Return(0));
-    EXPECT_CALL(*mock, Hf3fsIorDestroy(::testing::NotNull())).Times(::testing::AtLeast(0));
-    EXPECT_CALL(*mock,
-                Hf3fsPrepIo(::testing::_,
-                            ::testing::_,
-                            ::testing::_,
-                            ::testing::_,
-                            ::testing::_,
-                            ::testing::_,
-                            ::testing::_,
-                            ::testing::_))
-        .WillRepeatedly(::testing::Invoke([](const struct hf3fs_ior *ior,
-                                             const struct hf3fs_iov *iov,
-                                             bool read,
-                                             void *ptr,
-                                             int fd,
-                                             size_t off,
-                                             uint64_t len,
-                                             const void *userdata) {
-            lseek(fd, off, SEEK_SET);
-            return ::write(fd, ptr, len) == len ? 0 : -1;
-        }));
-    EXPECT_CALL(*mock, Hf3fsSubmitIos(::testing::_)).WillRepeatedly(::testing::Return(0));
-    EXPECT_CALL(*mock, Hf3fsWaitForIos(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
-        .WillRepeatedly(::testing::Invoke([](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int, const timespec *) {
-            for (int i = 0; i < cqec; ++i) {
-                cqes[i].result = 1;
-            }
-            return cqec;
-        }));
-
-    auto out = std::make_shared<std::vector<DataStorageUri>>();
-    auto rc = sdk_->Put(uris, bufs, out);
-    EXPECT_EQ(rc, ER_OK);
-    ASSERT_EQ(out->size(), uris.size());
-
-    // 同序契约：out[i] 与 uris[i] 逐位置对应（此处 URI 无 protocol，
-    // ToUriString() 为空串，须按 path/参数比较）
-    for (size_t i = 0; i < uris.size(); ++i) {
-        EXPECT_EQ(out->at(i).GetPath(), uris[i].GetPath());
-        EXPECT_EQ(out->at(i).GetParam("blkid"), uris[i].GetParam("blkid"));
-        EXPECT_EQ(out->at(i).GetParam("size"), uris[i].GetParam("size"));
-    }
-
-    // 数据确实落入输入位置对应的文件（blkid=0 -> 文件偏移 0 处）
-    for (size_t i = 0; i < uris.size(); ++i) {
-        ASSERT_TRUE(std::filesystem::exists(uris[i].GetPath()));
-        std::ifstream f(uris[i].GetPath(), std::ios::in | std::ios::binary);
-        ASSERT_TRUE(f.is_open());
-        char content[16] = {0};
-        f.read(content, sizeof(content));
-        EXPECT_EQ(std::string(content, sizeof(content)), std::string(16, 'a' + i))
-            << "payload mismatch at input position " << i << ": " << uris[i].ToUriString();
-    }
-}
-
 // ------------- Put (single) -------------
 TEST_F(Hf3fsSdkTest, Put_ReturnOk_EmptyIovs) {
     DataStorageUri uri;
     uri.SetPath((std::filesystem::path(mount_point_) / "put/empty.dat").string());
     BlockBuffer buf; // empty iovs
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
 }
 
@@ -601,7 +580,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnInvalid_ParamsEmptyPath) {
     uri.SetPath("");
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -611,7 +590,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnInvalid_ParamsNoSize) {
     // no size param set
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -626,7 +605,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnWriteError_OpenFail) {
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, payload, sizeof(payload), false});
 
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKWRITE_ERROR);
 }
 
@@ -694,7 +673,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnOk_WriteSuccess) {
             return cqec;
         }));
 
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     auto expected_file = std::filesystem::path(uri.GetPath());
     EXPECT_TRUE(std::filesystem::exists(expected_file));

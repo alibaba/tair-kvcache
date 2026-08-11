@@ -46,6 +46,7 @@ from kv_cache_manager.py_connector.vllm.metadata import SaveRequest, LoadRequest
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQueryManager
 from kv_cache_manager.py_connector.vllm.data_transfer import MultiResult, DataTransferManager, _get_device_module
+from kv_cache_manager.py_connector.common.utils import deadline_ms_from_now
 
 if typing_extensions.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -131,6 +132,11 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         # Apply log level with priority: env var > startup param > default
         configure_log_level(self._extra_config.log_level)
+
+        # 租约超时（写路径 DDL_租约的基准，scheduler 与 worker 均需要）：
+        # 之前只设置在 WORKER 分支且从未被使用（start_write_cache 请求里硬编码 30），
+        # 这里统一在 __init__ 设置，scheduler 侧 :773 与 DDL 计算才能读到。
+        self._write_timeout_seconds = self._extra_config.write_timeout_seconds
 
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
         self._local_block_size = vllm_config.cache_config.block_size
@@ -236,7 +242,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self._storage_configs = register_response["storage_configs"]
             # data transfer setup
             self._location_spec_name = self._tp_rank_to_spec_name(self._tp_rank)
-            self._write_timeout_seconds = self._extra_config.write_timeout_seconds
 
             sdk_backend_configs = []
 
@@ -470,6 +475,11 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             block_token_indices = self.generate_blocks_idx(load_req.manager_block_idxes, load_req.local_block_ids)
             all_remote_uris = self.get_self_uris(load_req.need_load_locations)
 
+            # 读路径无租约：deadline 只含自律项（DDL_自律 = T_submit + sdk_get_timeout_ms）。
+            # T_submit = 任务提交到 io_executor 的时刻（传输线程池可能排队，deadline 须在
+            # 提交前算好）。time.monotonic_ns() 与 C++ steady_clock 同为 CLOCK_MONOTONIC。
+            load_deadline_ms = deadline_ms_from_now(self._extra_config.sdk_get_timeout_ms)
+
             per_task_size = self._extra_config.block_per_load_task
             task_num = math.ceil(len(block_token_indices) / per_task_size)
             done_callback = self._data_transfer.create_load_done_callback(
@@ -486,7 +496,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = block_token_indices[i:end_idx]
                 self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
-                                                task_block_token_indices)
+                                                task_block_token_indices, load_deadline_ms)
                 task_idx += 1
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -528,9 +538,10 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 end_idx = min(len(blocks_idx), i + per_task_size)
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = blocks_idx[i:end_idx]
+                deadline_ms = deadline_ms_from_now(self._extra_config.sdk_put_timeout_ms)
                 self._data_transfer.submit_task(self._data_transfer.save_task, multi_result, task_idx, task_remote_uris,
                                                 task_block_token_indices,
-                                                kvcache_ready_event)
+                                                kvcache_ready_event, deadline_ms)
                 task_idx += 1
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
@@ -770,7 +781,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             "instance_id": self._extra_config.instance_id,
             "block_keys": [],
             "token_ids": token_ids,
-            "write_timeout_seconds": 30
+            "write_timeout_seconds": self._write_timeout_seconds
         }
         logger.debug("start_write_cache req: %s", request)
         try:
@@ -816,7 +827,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 req_id,
                 locations,
                 need_block_idx,
-                write_session_id
+                write_session_id,
             ))
 
     def handle_canceled_save_req(self):

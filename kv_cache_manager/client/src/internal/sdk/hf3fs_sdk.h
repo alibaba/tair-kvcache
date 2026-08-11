@@ -17,18 +17,21 @@ public:
     SdkType Type() override { return SdkType::HF3FS; }
     ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                          const std::shared_ptr<StorageConfig> &storage_config) override;
-    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) override;
+    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
+                        const BlockBuffers &local_buffers,
+                        int64_t deadline_ms) override;
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                        int64_t deadline_ms) override;
 
 protected:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
                           std::vector<DataStorageUri> &alloc_uris) override;
 
 private:
-    ClientErrorCode Get(const DataStorageUri &uri, const BlockBuffer &block_buffer) const;
-    ClientErrorCode Put(const DataStorageUri &uri, const BlockBuffer &block_buffer) const;
+    ClientErrorCode Get(const DataStorageUri &uri, const BlockBuffer &block_buffer, int64_t deadline_ms) const;
+    ClientErrorCode Put(const DataStorageUri &uri, const BlockBuffer &block_buffer, int64_t deadline_ms) const;
 
     bool CheckConfig(const Hf3fsSdkConfig &hf3fs_config) const;
     void DeleteRemainingIovShm() const;

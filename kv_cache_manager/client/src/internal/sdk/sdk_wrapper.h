@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -24,10 +25,12 @@ public:
 public:
     ClientErrorCode Init(const std::unique_ptr<ClientConfig> &client_config, const InitParams &init_params);
 
-    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
+    ClientErrorCode
+    Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris);
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                        int64_t deadline_ms);
 
 private:
     enum class OpType : uint8_t {
@@ -54,6 +57,7 @@ private:
     std::string getOpTypeString(OpType op_type) const;
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
                                            std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                           std::chrono::steady_clock::time_point deadline,
                                            int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,

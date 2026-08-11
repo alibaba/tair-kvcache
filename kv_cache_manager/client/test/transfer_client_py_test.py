@@ -191,7 +191,7 @@ class TransferClientPyTest(unittest.TestCase):
         # 创建BlockBuffers
         block_buffers = [kvcm_py_client.BlockBuffer(), kvcm_py_client.BlockBuffer()]
         
-        result = client.LoadKvCaches(self.uri_str_vec, block_buffers)
+        result = client.LoadKvCaches(self.uri_str_vec, block_buffers, 0)
         self.assertEqual(result, kvcm_py_client.ClientErrorCode.ER_OK, 
                          "LoadKvCaches should return ER_OK")
 
@@ -205,7 +205,7 @@ class TransferClientPyTest(unittest.TestCase):
         # 创建BlockBuffers
         block_buffers = [kvcm_py_client.BlockBuffer(), kvcm_py_client.BlockBuffer()]
         
-        result = client.SaveKvCaches(self.uri_str_vec, block_buffers)
+        result = client.SaveKvCaches(self.uri_str_vec, block_buffers, 0)
         
         self.assertEqual(result[0], kvcm_py_client.ClientErrorCode.ER_OK, 
                          "SaveKvCaches should return ER_OK")
@@ -224,12 +224,12 @@ class TransferClientPyTest(unittest.TestCase):
         empty_block_buffers = []
         
         # 测试LoadKvCaches
-        result_load = client.LoadKvCaches(empty_locations, empty_block_buffers)
+        result_load = client.LoadKvCaches(empty_locations, empty_block_buffers, 0)
         self.assertEqual(result_load, kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
                          "LoadKvCaches should return ER_INVALID_PARAMS for empty uri_str_vec")
         
         # 测试SaveKvCaches
-        result_save = client.SaveKvCaches(empty_locations, empty_block_buffers)
+        result_save = client.SaveKvCaches(empty_locations, empty_block_buffers, 0)
         self.assertEqual(result_save[0], kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
                          "SaveKvCaches should return ER_INVALID_PARAMS for empty uri_str_vec")
         self.assertTrue(len(result_save[1]) == 0, 
@@ -257,7 +257,7 @@ class TransferClientPyTest(unittest.TestCase):
             block_buffers.append(kvcm_py_client.BlockBuffer())
         
         # 测试SaveKvCaches
-        result = client.SaveKvCaches(uri_str_vec, block_buffers)
+        result = client.SaveKvCaches(uri_str_vec, block_buffers, 0)
         self.assertEqual(result[0], kvcm_py_client.ClientErrorCode.ER_OK, 
                          "SaveKvCaches should return ER_OK for many uri_str_vec")
         self.assertEqual(len(result[1]), len(uri_str_vec), 
@@ -273,7 +273,7 @@ class TransferClientPyTest(unittest.TestCase):
         # 创建只有一个缓冲区，但有两个位置的情况
         block_buffers = [kvcm_py_client.BlockBuffer()]  # 只有一个缓冲区
         
-        result = client.LoadKvCaches(self.uri_str_vec, block_buffers)
+        result = client.LoadKvCaches(self.uri_str_vec, block_buffers, 0)
         self.assertEqual(result, kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS, 
                          "LoadKvCaches should return ER_INVALID_PARAMS for mismatched uri_str_vec and buffers")
 
@@ -319,7 +319,7 @@ class TransferClientPyTest(unittest.TestCase):
         block_buffers = [buffer1, buffer2]
         
         # 加载KV缓存
-        result = client.LoadKvCaches(self.uri_str_vec, block_buffers)
+        result = client.LoadKvCaches(self.uri_str_vec, block_buffers, 0)
         self.assertEqual(result, kvcm_py_client.ClientErrorCode.ER_OK, 
                          "LoadKvCaches should return ER_OK")
         
