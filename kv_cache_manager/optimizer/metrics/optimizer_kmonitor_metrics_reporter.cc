@@ -68,7 +68,6 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_ttl_eviction_count);
     DECLARE_METRICS(trace, query_hit_rate);
     DECLARE_METRICS(trace, query_capacity_efficiency);
-    DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
 
     std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
 
@@ -232,7 +231,6 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_ttl_eviction_count);
     REGISTER_GAUGE_METRIC(trace, query_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_capacity_efficiency);
-    REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
 
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
@@ -332,14 +330,6 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             }
         }
 
-        for (const auto &bucket : summary.hit_age_bucket_ratios) {
-            const std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_base_tags = base_tags;
-            bucket_base_tags["age_bucket"] = bucket_label;
-            const auto bucket_tags = kmon_ctx_->GetKmonitorTags(bucket_base_tags);
-            kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&bucket_tags, bucket.ratio);
-        }
     }
 
     for (const auto &metric : interval_metrics) {

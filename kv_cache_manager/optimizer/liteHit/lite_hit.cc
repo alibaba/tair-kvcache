@@ -22,10 +22,9 @@ RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int6
 }
 
 void LiteHit::AdvanceTtlWatermark(int64_t now_ns) {
-    // Strict boundary: an epoch whose deadline has been reached is dead,
-    // matching the online TtlCacheIndexerWrapper harvest. Every position of
-    // a dead epoch is below the next epoch's start (or below everything when
-    // it is the last one).
+    // Strict boundary: an epoch whose deadline has been reached is dead. Every
+    // position of a dead epoch is below the next epoch's start (or below
+    // everything when it is the last one).
     const std::size_t old_watermark = dead_below_position_;
     while (!position_epochs_.empty() &&
            position_epochs_.front().timestamp_ns <= now_ns - static_cast<int64_t>(ttl_ns_)) {

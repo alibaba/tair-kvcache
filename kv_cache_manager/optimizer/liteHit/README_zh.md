@@ -249,11 +249,11 @@ capacity_blocks = floor(capacity_bytes / block_bytes)
 capacity_gb 使用二进制换算：capacity_bytes = capacity_gb * 1024^3
 ```
 
-`block_bytes` 来自实例注册的 full location spec group 各 spec.size 之和（`size_full_only`）。facts CSV 每行记录 `block_bytes`，事实自描述：即使日后修正 charge 估计，也能对历史事实重投影。
+`block_bytes` 来自实例注册的 full location spec group 各 spec.size 之和（一个 Full block 的 charge）。facts CSV 每行记录 `block_bytes`，事实自描述：即使日后修正 charge 估计，也能对历史事实重投影。
 
 ### 6.4 等 charge 不变量（block 单位 RLE 的前提）
 
-hit curve 以 block 为单位、`ProjectBytes` 做单一 floor 除法，**当且仅当**所有参与块 charge 完全相等才精确——full-only 实例满足（每块 charge 恒为 `size_full_only`，是精确值不是平均值）。linear/Mamba 混合实例每块 charge 不等，必须改用 charge 加权门槛，属于后续独立任务；当前 Offline 拒绝 `linear_step != 0` 的实例。
+hit curve 以 block 为单位、`ProjectBytes` 做单一 floor 除法，**当且仅当**所有参与块 charge 完全相等才精确——full-attention 实例满足（每块 charge 恒为 Full charge，是精确值不是平均值）。linear/Mamba 实例的 Full block 与 Mamba checkpoint charge 不等，因此不走 block 轴：`MambaRequestFact` 直接是**总字节容量轴**上的阶梯曲线（见 §10），投影用 `ProjectMambaBytes`，不做 block 换算。
 
 ---
 
@@ -274,7 +274,7 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
 
 **fanout 模式**：`fanout_all_instances = true` 时每条请求广播到全部 lane（各 lane 独立 LRU 状态、独立 facts 行），配合多个不同 `block_size` 的 instance 即可一次回放对同一份 trace 扫多个分析粒度；与 `override_instance_id` 互斥。facts query 的 summary 按 instance 分组输出（每 instance 一行 + 总计一行），fanout 结果直接可读。
 
-**TTL 回放**：instance group 配置 `ttl_seconds != 0` 时，该组 lane 的 `LiteHit` 核心叠加固定 TTL（与 online `TtlCacheIndexerWrapper` 语义一致：块在距上次访问严格小于 TTL 内存活，过期块对任意容量都是 miss 并像冷块一样截断前缀；每次访问（命中或未命中）都刷新 last_access；时间取 trace 时间戳，回放确定性）。年龄沿 LRU 栈单调，过期块不会抬高存活块的复用距离，因此一次回放对"固定 TTL × 任意容量"的联合口径仍然精确，facts 仍是普通 hit curve 行。TTL 是回放期参数，直接取组里的 `ttl_seconds`；要扫多个 TTL 就配多个 group 各带不同 `ttl_seconds`（可配合 fanout 一次回放完成）。
+**TTL 回放**：instance group 配置 `ttl_seconds != 0` 时，该组 lane 的 `LiteHit` 核心叠加固定 TTL（块在距上次访问严格小于 TTL 内存活，过期块对任意容量都是 miss 并像冷块一样截断前缀；每次访问（命中或未命中）都刷新 last_access；时间取 trace 时间戳，回放确定性）。年龄沿 LRU 栈单调，过期块不会抬高存活块的复用距离，因此一次回放对"固定 TTL × 任意容量"的联合口径仍然精确，facts 仍是普通 hit curve 行。TTL 是回放期参数，直接取组里的 `ttl_seconds`；要扫多个 TTL 就配多个 group 各带不同 `ttl_seconds`（可配合 fanout 一次回放完成）。
 
 **fail-fast**：时间戳乱序、未知 instance、长度校验失败、全文件零有效行，任一发生即整体失败并给出原因——facts 是全有或全无的对账账本，不允许静默丢行。
 
@@ -305,7 +305,7 @@ trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,
 
 ## 8. Online 集成
 
-Online Optimizer 的 full-attention `InstanceState` 直接持有 `LiteHit`（组配置 `ttl_seconds != 0` 时以墙钟时间叠加固定 TTL，口径与 linear 路径的 `TtlCacheIndexerWrapper` 一致）。每次 TraceQuery：
+Online Optimizer 的 full-attention `InstanceState` 直接持有 `LiteHit`（组配置 `ttl_seconds != 0` 时以墙钟时间叠加固定 TTL，语义与离线回放一致，只是时间源不同）。每次 TraceQuery：
 
 ```text
 NormalizeRequest → ProcessRequest → 得到 RequestFact
@@ -314,7 +314,7 @@ NormalizeRequest → ProcessRequest → 得到 RequestFact
   └─ 更新累计整数：total_queries / total_input_tokens / 各 slot total_hits
 ```
 
-Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 继续走 legacy indexer 路径（启用 prefix hash 时仅做 `ApplyPrefixHash`）。
+Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 走 `LiteHitMamba`：容量轴是总字节，投影用 `ProjectMambaBytes`，其余流程（归一化、prefix hash、累计整数）与 full-attention 一致；`linear_step > 0` 且 `ttl_seconds > 0` 的组合注册即拒绝（Mamba 核心还没有时间轴）。
 
 ---
 

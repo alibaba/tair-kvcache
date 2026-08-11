@@ -93,13 +93,6 @@ void OptimizerMetricsReporter::ReportInterval() {
                                          : std::numeric_limits<double>::quiet_NaN();
         }
 
-        for (const auto &bucket : summary.hit_age_bucket_ratios) {
-            const std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = instance_tags;
-            bucket_tags["age_bucket"] = bucket_label;
-            metrics_registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags) = bucket.ratio;
-        }
     }
 
     for (const auto &metric : interval_metrics) {
