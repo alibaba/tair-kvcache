@@ -34,7 +34,7 @@ std::string ExtractIpFromPeer(const std::string &peer);
 #define API_CONTEXT_GET_AND_INIT_COLLECTOR(method, return_value)                                                       \
     auto metrics_collector = get_metrics_collector_from_map_for_##method(request->instance_id());                      \
     if (metrics_collector == nullptr) {                                                                                \
-        KVCM_LOG_ERROR("get " #method " metrics collector failed");                                                    \
+        KVCM_LOG_ERROR("get " #method " metrics collector failed, instance_id: %s", request->instance_id().c_str());   \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
         status->set_code(proto::meta::INSTANCE_NOT_EXIST);                                                             \
