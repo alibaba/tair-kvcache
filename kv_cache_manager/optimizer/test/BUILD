@@ -184,6 +184,31 @@ cc_test(
 )
 
 cc_test(
+    name = "WeightedLruPoolTest",
+    srcs = [
+        "weighted_lru_pool_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:weighted_lru_pool",
+    ],
+)
+
+cc_test(
+    name = "LiteHitMambaTest",
+    srcs = [
+        "lite_hit_mamba_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit_mamba",
+    ],
+)
+
+cc_test(
     name = "LiteHitOfflineRunnerTest",
     srcs = [
         "lite_hit_offline_runner_test.cc",

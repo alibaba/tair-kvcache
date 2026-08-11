@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <sstream>
+#include <utility>
 
 namespace kv_cache_manager {
 
@@ -93,8 +94,8 @@ bool ParseInt64Field(const std::string &field, int64_t &value, const char *name,
 }
 
 // Parses a JSON array of [uint, uint] pairs, e.g. "[[1,2],[4,1]]".
-bool ParseHitCurve(const std::string &field, std::vector<HitCurveSegment> &segments, std::string &error) {
-    segments.clear();
+bool ParsePairArray(const std::string &field, std::vector<std::pair<uint64_t, uint64_t>> &pairs, std::string &error) {
+    pairs.clear();
     std::size_t i = 0;
     const auto skip_spaces = [&] {
         while (i < field.size() && std::isspace(static_cast<unsigned char>(field[i]))) {
@@ -140,8 +141,8 @@ bool ParseHitCurve(const std::string &field, std::vector<HitCurveSegment> &segme
             return false;
         }
         ++i;
-        HitCurveSegment segment;
-        if (!parse_uint(segment.start_required_blocks)) {
+        std::pair<uint64_t, uint64_t> pair;
+        if (!parse_uint(pair.first)) {
             error = "hit_curve segment start is not a valid integer";
             return false;
         }
@@ -151,7 +152,7 @@ bool ParseHitCurve(const std::string &field, std::vector<HitCurveSegment> &segme
             return false;
         }
         ++i;
-        if (!parse_uint(segment.run_length)) {
+        if (!parse_uint(pair.second)) {
             error = "hit_curve segment length is not a valid integer";
             return false;
         }
@@ -161,7 +162,7 @@ bool ParseHitCurve(const std::string &field, std::vector<HitCurveSegment> &segme
             return false;
         }
         ++i;
-        segments.push_back(segment);
+        pairs.push_back(pair);
         skip_spaces();
         if (i < field.size() && field[i] == ',') {
             ++i;
@@ -183,19 +184,59 @@ bool ParseHitCurve(const std::string &field, std::vector<HitCurveSegment> &segme
     return true;
 }
 
+constexpr const char *kMambaCurvePrefix = "mamba:";
+
+bool ParseHitCurveField(const std::string &field, LiteHitFactRecord &record, std::string &error) {
+    std::vector<std::pair<uint64_t, uint64_t>> pairs;
+    if (field.rfind(kMambaCurvePrefix, 0) == 0) {
+        record.is_mamba = true;
+        if (!ParsePairArray(field.substr(std::string(kMambaCurvePrefix).size()), pairs, error)) {
+            return false;
+        }
+        record.mamba_fact.points.clear();
+        record.mamba_fact.points.reserve(pairs.size());
+        for (const auto &[capacity, hits] : pairs) {
+            record.mamba_fact.points.push_back(MambaCurvePoint{capacity, hits});
+        }
+        return true;
+    }
+    record.is_mamba = false;
+    if (!ParsePairArray(field, pairs, error)) {
+        return false;
+    }
+    record.fact.hit_curve.clear();
+    record.fact.hit_curve.reserve(pairs.size());
+    for (const auto &[start, length] : pairs) {
+        record.fact.hit_curve.push_back(HitCurveSegment{start, length});
+    }
+    return true;
+}
+
 } // namespace
 
 std::string SerializeLiteHitFactRow(const LiteHitFactRecord &record) {
     std::ostringstream curve;
-    curve << '[';
-    for (std::size_t i = 0; i < record.fact.hit_curve.size(); ++i) {
-        const HitCurveSegment &segment = record.fact.hit_curve[i];
-        if (i > 0) {
-            curve << ',';
+    if (record.is_mamba) {
+        curve << "mamba:[";
+        for (std::size_t i = 0; i < record.mamba_fact.points.size(); ++i) {
+            const MambaCurvePoint &point = record.mamba_fact.points[i];
+            if (i > 0) {
+                curve << ',';
+            }
+            curve << '[' << point.min_total_capacity_bytes << ',' << point.hit_blocks << ']';
         }
-        curve << '[' << segment.start_required_blocks << ',' << segment.run_length << ']';
+        curve << ']';
+    } else {
+        curve << '[';
+        for (std::size_t i = 0; i < record.fact.hit_curve.size(); ++i) {
+            const HitCurveSegment &segment = record.fact.hit_curve[i];
+            if (i > 0) {
+                curve << ',';
+            }
+            curve << '[' << segment.start_required_blocks << ',' << segment.run_length << ']';
+        }
+        curve << ']';
     }
-    curve << ']';
 
     std::ostringstream row;
     row << QuoteCsvField(record.trace_id) << ',' << QuoteCsvField(record.instance_id) << ',' << record.timestamp_ns
@@ -219,7 +260,7 @@ bool ParseLiteHitFactRow(const std::string &line, LiteHitFactRecord &record, std
            ParseUint64Field(fields[3], record.input_token_len, "input_token_len", error) &&
            ParseUint64Field(fields[4], record.block_size_tokens, "block_size_tokens", error) &&
            ParseUint64Field(fields[5], record.block_bytes, "block_bytes", error) &&
-           ParseHitCurve(fields[6], record.fact.hit_curve, error);
+           ParseHitCurveField(fields[6], record, error);
 }
 
 } // namespace kv_cache_manager
