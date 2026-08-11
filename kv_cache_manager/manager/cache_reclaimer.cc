@@ -1488,6 +1488,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             if (!loc_ptr) {
                 continue;
             }
+            // Reporter-owned locations are not reclaim candidates, but still
+            // keep the metadata key alive after all ordinary locations have
+            // been removed. Count them before filtering so key-count credit is
+            // only granted when the deletion can actually remove the key.
             ++valid_location_count;
             const auto &loc = *loc_ptr;
             if (IsEventReportStorageType(loc.type())) {
