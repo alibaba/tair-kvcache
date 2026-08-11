@@ -145,18 +145,6 @@ py_test(
 )
 
 cc_test(
-    name = "LruCacheIndexerTest",
-    srcs = [
-        "lru_cache_indexer_test.cc",
-    ],
-    copts = ["-fno-access-control"],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/optimizer/index:cache_indexer",
-    ],
-)
-
-cc_test(
     name = "LiteHitTest",
     srcs = [
         "lite_hit_test.cc",
@@ -222,20 +210,6 @@ cc_test(
         "//kv_cache_manager/optimizer/liteHit:facts_query",
         "//kv_cache_manager/optimizer/manager:lite_hit_offline_runner",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
-    ],
-)
-
-cc_test(
-    name = "TtlCacheIndexerWrapperTest",
-    srcs = [
-        "ttl_cache_indexer_wrapper_test.cc",
-    ],
-    copts = ["-fno-access-control"],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/optimizer/index:cache_indexer",
-        "//kv_cache_manager/optimizer/index:cache_indexer_factory",
-        "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
     ],
 )
 

@@ -39,6 +39,22 @@ protected:
                                      OptimizerStateInfo("full", ""));
     }
 
+    // Hybrid full+linear instance: full charge 16384, mamba charge 4096.
+    static OptimizerInstanceInfo
+    MakeHybridInfo(const std::string &instance_id, int32_t block_size = 4, int32_t linear_step_tokens = 12) {
+        return OptimizerInstanceInfo(
+            "g1",
+            instance_id,
+            block_size,
+            {LocationSpecInfo("tp0_F0", 8192),
+             LocationSpecInfo("tp1_F0", 8192),
+             LocationSpecInfo("tp0_L1", 2048),
+             LocationSpecInfo("tp1_L1", 2048)},
+            {LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}), LocationSpecGroup("L1", {"tp0_L1", "tp1_L1"})},
+            linear_step_tokens,
+            OptimizerStateInfo("F0", "L1"));
+    }
+
     static std::string TraceLine(const std::string &instance_id,
                                  const std::string &trace_id,
                                  int64_t timestamp_ns,
@@ -181,6 +197,39 @@ TEST_F(LiteHitOfflineRunnerTest, RejectsNegativeTtlGroup) {
     EXPECT_FALSE(LiteHitOfflineRunner(config).Run());
 }
 
+TEST_F(LiteHitOfflineRunnerTest, MambaFactsCsvRowRoundTrips) {
+    LiteHitFactRecord record;
+    record.trace_id = "m1";
+    record.instance_id = "mamba-0";
+    record.timestamp_ns = 1720000000001;
+    record.input_token_len = 700;
+    record.block_size_tokens = 128;
+    record.block_bytes = 65536;
+    record.is_mamba = true;
+    record.mamba_fact.points = {{4096, 1}, {131072, 5}};
+
+    const std::string row = SerializeLiteHitFactRow(record);
+    EXPECT_NE(std::string::npos, row.find("mamba:"));
+
+    LiteHitFactRecord parsed;
+    std::string error;
+    ASSERT_TRUE(ParseLiteHitFactRow(row, parsed, error)) << error;
+    EXPECT_TRUE(parsed.is_mamba);
+    EXPECT_EQ(record.mamba_fact.points, parsed.mamba_fact.points);
+    EXPECT_TRUE(parsed.fact.hit_curve.empty());
+
+    record.mamba_fact.points.clear();
+    LiteHitFactRecord parsed_empty;
+    ASSERT_TRUE(ParseLiteHitFactRow(SerializeLiteHitFactRow(record), parsed_empty, error)) << error;
+    EXPECT_TRUE(parsed_empty.is_mamba);
+    EXPECT_TRUE(parsed_empty.mamba_fact.points.empty());
+
+    // A full-attention row keeps is_mamba false.
+    LiteHitFactRecord full_row;
+    ASSERT_TRUE(ParseLiteHitFactRow("t,i,1,2,3,4,\"[[1,2]]\"", full_row, error)) << error;
+    EXPECT_FALSE(full_row.is_mamba);
+}
+
 TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
     const std::string trace_path = WriteTrace("facts_ok.jsonl",
                                               {
@@ -239,6 +288,75 @@ TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
     }
     EXPECT_EQ(4, online_cap2_hits);
     EXPECT_EQ(5, online_infinite_hits);
+}
+
+TEST_F(LiteHitOfflineRunnerTest, PublishesMambaFactsAndMatchesOnlineReplay) {
+    // block_size 4, linear_step 12 tokens -> checkpoint every 3 blocks plus
+    // the forced last block. 17 tokens -> 4 complete blocks.
+    const std::string trace_path = WriteTrace("facts_mamba.jsonl",
+                                              {
+                                                  TraceLine("m1", "r1", 1000, {1, 2, 3, 4}, 17),
+                                                  TraceLine("m1", "r2", 2000, {1, 2, 3, 4}, 17),
+                                              });
+    const std::string output_dir = GetTestTempRootPath() + "/mamba";
+    ASSERT_EQ(0, ::system(("mkdir -p " + output_dir).c_str()));
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, output_dir);
+    config.set_instances({MakeHybridInfo("m1")});
+    ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
+
+    const std::vector<std::string> lines = ReadLines(output_dir + "/" + kLiteHitFactsFileName);
+    ASSERT_EQ(3, lines.size());
+    std::string error;
+    LiteHitFactRecord r1;
+    ASSERT_TRUE(ParseLiteHitFactRow(lines[1], r1, error)) << error;
+    EXPECT_TRUE(r1.is_mamba);
+    EXPECT_TRUE(r1.mamba_fact.points.empty()); // cold: no recoverable checkpoint
+    EXPECT_EQ(16384, r1.block_bytes);          // per-row charge stays the Full charge
+
+    // Warm request. Shared-pool recency after r1 (oldest->newest):
+    // M3,F3,M2,F2,F1,F0. Checkpoint p=2: max(full prefix 3x16384, Mamba
+    // 3x16384+4096) = 53248 -> 3 blocks; p=3: 4x16384+2x4096 = 73728 -> 4.
+    LiteHitFactRecord r2;
+    ASSERT_TRUE(ParseLiteHitFactRow(lines[2], r2, error)) << error;
+    EXPECT_TRUE(r2.is_mamba);
+    EXPECT_EQ((std::vector<MambaCurvePoint>{{53248, 3}, {73728, 4}}), r2.mamba_fact.points);
+
+    const double capacity_gb = 53248.0 / (1024.0 * 1024.0 * 1024.0);
+    const std::string query_log = output_dir + "/query.jsonl";
+    ASSERT_TRUE(RunLiteHitFactsQuery(output_dir + "/" + kLiteHitFactsFileName, {capacity_gb, -1.0}, query_log, error))
+        << error;
+    const std::vector<std::string> query_lines = ReadLines(query_log);
+    ASSERT_EQ(4, query_lines.size()); // 2 requests + m1 summary + overall
+    EXPECT_NE(std::string::npos, query_lines[3].find("\"total_hit_blocks\":[3,4]"));
+    EXPECT_NE(std::string::npos, query_lines[3].find("\"total_input_tokens\":34"));
+
+    // Same trace through the online manager must agree.
+    auto registry = std::make_shared<OptimizerRegistryManager>("");
+    OnlineOptimizerManager manager(registry);
+    OptimizerInstanceGroup group = MakeGroup();
+    group.set_capacity_gb({capacity_gb});
+    group.set_enable_theoretical_max_cache(true);
+    ASSERT_EQ(EC_OK, registry->CreateInstanceGroup(group));
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, manager.RegisterInstance(MakeHybridInfo("m1"), reg_result));
+
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, manager.TraceQuery("m1", {1, 2, 3, 4}, 17, first));
+    EXPECT_EQ(0, first.hit_count_per_capacity.at(0));
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, manager.TraceQuery("m1", {1, 2, 3, 4}, 17, second));
+    EXPECT_EQ(3, second.hit_count_per_capacity.at(0));
+    EXPECT_EQ(4, second.max_hit_count);
+}
+
+TEST_F(LiteHitOfflineRunnerTest, RejectsLinearInstanceInTtlGroup) {
+    const std::string trace_path = WriteTrace("facts_mamba_ttl.jsonl", {TraceLine("m1", "r1", 1000, {1}, 4)});
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, GetTestTempRootPath());
+    OptimizerInstanceGroup group = MakeGroup();
+    group.set_ttl_seconds(300);
+    config.set_instance_groups({group});
+    config.set_instances({MakeHybridInfo("m1")});
+    EXPECT_FALSE(LiteHitOfflineRunner(config).Run());
 }
 
 TEST_F(LiteHitOfflineRunnerTest, ParallelPipelineMatchesSerialOutput) {
