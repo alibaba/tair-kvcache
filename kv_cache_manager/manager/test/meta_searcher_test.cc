@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <future>
 #include <limits>
@@ -24,6 +25,8 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 
 using namespace kv_cache_manager;
 
@@ -112,6 +115,335 @@ SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &,
                                            bool) -> void {};
 
+MetaSearcher::MergeLocationSpecsTask MakeEventReportTask(const std::string &host,
+                                                         DataStorageType type,
+                                                         const std::vector<std::string> &spec_names = {"tp0"}) {
+    const std::string storage_type =
+        type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ? "event_report_l2" : "event_report_l1p5";
+    std::vector<LocationSpec> specs;
+    specs.reserve(spec_names.size());
+    for (const auto &name : spec_names) {
+        specs.emplace_back(name, "event_report://" + host + "/mem");
+    }
+    return {"kvs#" + storage_type + "#mem#" + host, type, CacheLocationStatus::CLS_SERVING, std::move(specs)};
+}
+
+// Deliberately simple, materialized model of the intended P2P semantics.
+// It is kept independent from the production dense-id/bitmask reducers so the
+// randomized differential test below can catch errors in peer selection,
+// group merging, Eagle pop, and fetched-key de-duplication.
+using ReferenceSpecNames = std::set<std::string>;
+using ReferenceHostSpecs = std::map<std::string, ReferenceSpecNames>;
+
+struct ReferenceP2PMatrix {
+    std::vector<ReferenceHostSpecs> all;
+    std::vector<ReferenceHostSpecs> vineyard;
+};
+
+const ReferenceSpecNames &ReferenceSpecsFor(const ReferenceHostSpecs &host_specs, const std::string &host) {
+    static const ReferenceSpecNames empty;
+    const auto it = host_specs.find(host);
+    return it == host_specs.end() ? empty : it->second;
+}
+
+bool ReferenceHasGroup(const ReferenceSpecNames &specs, const LocationSpecGroup &group) {
+    return std::all_of(group.spec_names().begin(), group.spec_names().end(), [&](const std::string &name) {
+        return specs.find(name) != specs.end();
+    });
+}
+
+bool ReferenceHasGroups(const ReferenceSpecNames &specs, const std::vector<const LocationSpecGroup *> &groups) {
+    return std::all_of(
+        groups.begin(), groups.end(), [&](const LocationSpecGroup *group) { return ReferenceHasGroup(specs, *group); });
+}
+
+bool ReferenceLocalAndPeerCoverGroup(const ReferenceSpecNames &local,
+                                     const ReferenceSpecNames &peer,
+                                     const LocationSpecGroup &group) {
+    return std::all_of(group.spec_names().begin(), group.spec_names().end(), [&](const std::string &name) {
+        return local.find(name) != local.end() || peer.find(name) != peer.end();
+    });
+}
+
+struct ReferencePrefixPeerSelection {
+    std::string peer;
+    std::vector<size_t> covered_key_indices;
+};
+
+ReferencePrefixPeerSelection ReferenceSelectPrefixPeer(const std::string &target_host,
+                                                       const ReferenceP2PMatrix &matrix,
+                                                       const LocationSpecGroup *required_group = nullptr) {
+    struct GapCandidates {
+        size_t key_index = 0;
+        std::vector<std::string> peers;
+    };
+    std::vector<GapCandidates> gaps;
+    for (size_t key_index = 0; key_index < matrix.all.size(); ++key_index) {
+        const auto local_it = matrix.all[key_index].find(target_host);
+        const auto &local = ReferenceSpecsFor(matrix.all[key_index], target_host);
+        const bool local_hit =
+            required_group ? ReferenceHasGroup(local, *required_group) : local_it != matrix.all[key_index].end();
+        if (local_hit) {
+            continue;
+        }
+
+        GapCandidates gap;
+        gap.key_index = key_index;
+        for (const auto &[peer, peer_specs] : matrix.vineyard[key_index]) {
+            if (peer == target_host) {
+                continue;
+            }
+            const bool peer_hit = required_group ? ReferenceLocalAndPeerCoverGroup(local, peer_specs, *required_group)
+                                                 : !peer_specs.empty();
+            if (peer_hit) {
+                gap.peers.push_back(peer);
+            }
+        }
+        if (gap.peers.empty()) {
+            break;
+        }
+        gaps.push_back(std::move(gap));
+    }
+    if (gaps.empty()) {
+        return {};
+    }
+
+    ReferencePrefixPeerSelection best;
+    for (const auto &peer : gaps.front().peers) {
+        std::vector<size_t> covered;
+        for (const auto &gap : gaps) {
+            if (std::find(gap.peers.begin(), gap.peers.end(), peer) == gap.peers.end()) {
+                break;
+            }
+            covered.push_back(gap.key_index);
+        }
+        if (covered.size() > best.covered_key_indices.size() ||
+            (covered.size() == best.covered_key_indices.size() && (best.peer.empty() || peer < best.peer))) {
+            best.peer = peer;
+            best.covered_key_indices = std::move(covered);
+        }
+    }
+    return best;
+}
+
+struct ReferenceCoverageSelection {
+    std::string peer;
+    std::vector<std::pair<size_t, const LocationSpecGroup *>> covered_queries;
+};
+
+ReferenceCoverageSelection ReferenceSelectCoveragePeer(const std::string &target_host,
+                                                       const ReferenceP2PMatrix &matrix,
+                                                       size_t block_count,
+                                                       const std::vector<const LocationSpecGroup *> &required_groups) {
+    struct CoverageQuery {
+        size_t key_index = 0;
+        const LocationSpecGroup *group = nullptr;
+        std::vector<std::string> peers;
+    };
+    std::vector<CoverageQuery> queries;
+    std::map<std::string, size_t> peer_counts;
+    for (const auto *group : required_groups) {
+        for (size_t key_index = 0; key_index < block_count; ++key_index) {
+            const auto &local = ReferenceSpecsFor(matrix.all[key_index], target_host);
+            if (ReferenceHasGroup(local, *group)) {
+                continue;
+            }
+            CoverageQuery query{key_index, group, {}};
+            for (const auto &[peer, peer_specs] : matrix.vineyard[key_index]) {
+                if (peer != target_host && ReferenceLocalAndPeerCoverGroup(local, peer_specs, *group)) {
+                    query.peers.push_back(peer);
+                    ++peer_counts[peer];
+                }
+            }
+            if (!query.peers.empty()) {
+                queries.push_back(std::move(query));
+            }
+        }
+    }
+    if (peer_counts.empty()) {
+        return {};
+    }
+
+    ReferenceCoverageSelection selection;
+    size_t best_count = 0;
+    for (const auto &[peer, count] : peer_counts) {
+        if (count > best_count || (count == best_count && (selection.peer.empty() || peer < selection.peer))) {
+            selection.peer = peer;
+            best_count = count;
+        }
+    }
+    for (const auto &query : queries) {
+        if (std::find(query.peers.begin(), query.peers.end(), selection.peer) != query.peers.end()) {
+            selection.covered_queries.emplace_back(query.key_index, query.group);
+        }
+    }
+    return selection;
+}
+
+void ReferenceMergeGroup(ReferenceSpecNames &target, const ReferenceSpecNames &source, const LocationSpecGroup &group) {
+    for (const auto &name : group.spec_names()) {
+        if (source.find(name) != source.end()) {
+            target.insert(name);
+        }
+    }
+}
+
+int64_t ReferenceOrdinaryPrefix(const std::vector<ReferenceSpecNames> &specs_by_key, bool use_eagle_pop) {
+    size_t prefix = 0;
+    while (prefix < specs_by_key.size() && !specs_by_key[prefix].empty()) {
+        ++prefix;
+    }
+    return static_cast<int64_t>(prefix - (use_eagle_pop && prefix != 0 ? 1 : 0));
+}
+
+int64_t ReferenceMambaPrefix(const std::vector<ReferenceSpecNames> &specs_by_key,
+                             bool use_eagle_pop,
+                             const std::vector<const LocationSpecGroup *> &full_groups,
+                             const std::vector<const LocationSpecGroup *> &state_groups) {
+    size_t full_prefix = 0;
+    while (full_prefix < specs_by_key.size() && ReferenceHasGroups(specs_by_key[full_prefix], full_groups)) {
+        ++full_prefix;
+    }
+    if (use_eagle_pop && full_prefix != 0) {
+        --full_prefix;
+    }
+    for (size_t offset = full_prefix; offset != 0; --offset) {
+        if (ReferenceHasGroups(specs_by_key[offset - 1], state_groups)) {
+            return static_cast<int64_t>(offset);
+        }
+    }
+    return 0;
+}
+
+std::vector<size_t> ReferenceTopHosts(const std::vector<MetaSearcher::HostCacheMatch> &matches, size_t p2p_host_count) {
+    std::vector<size_t> indices;
+    for (size_t i = 0; i < matches.size(); ++i) {
+        if (matches[i].local > 0) {
+            indices.push_back(i);
+        }
+    }
+    std::sort(indices.begin(), indices.end(), [&matches](size_t lhs, size_t rhs) {
+        if (matches[lhs].local != matches[rhs].local) {
+            return matches[lhs].local > matches[rhs].local;
+        }
+        return matches[lhs].host_ip_port < matches[rhs].host_ip_port;
+    });
+    indices.resize(std::min(indices.size(), p2p_host_count));
+    return indices;
+}
+
+std::vector<MetaSearcher::HostCacheMatch> ReferenceOrdinaryMatches(const MetaSearcher::KeyVector &keys,
+                                                                   const ReferenceP2PMatrix &matrix,
+                                                                   bool use_eagle_pop,
+                                                                   size_t p2p_host_count) {
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    if (matrix.all.empty()) {
+        return matches;
+    }
+    for (const auto &[host, ignored] : matrix.all.front()) {
+        (void)ignored;
+        std::vector<ReferenceSpecNames> local_specs(matrix.all.size());
+        for (size_t i = 0; i < matrix.all.size(); ++i) {
+            local_specs[i] = ReferenceSpecsFor(matrix.all[i], host);
+        }
+        const int64_t local = ReferenceOrdinaryPrefix(local_specs, use_eagle_pop);
+        matches.push_back({host, local, 0, local});
+    }
+
+    for (size_t host_index : ReferenceTopHosts(matches, p2p_host_count)) {
+        auto &match = matches[host_index];
+        std::vector<ReferenceSpecNames> merged(matrix.all.size());
+        for (size_t i = 0; i < matrix.all.size(); ++i) {
+            merged[i] = ReferenceSpecsFor(matrix.all[i], match.host_ip_port);
+        }
+        const auto selection = ReferenceSelectPrefixPeer(match.host_ip_port, matrix);
+        std::set<int64_t> fetched_keys;
+        for (size_t key_index : selection.covered_key_indices) {
+            const auto &peer_specs = ReferenceSpecsFor(matrix.vineyard[key_index], selection.peer);
+            merged[key_index].insert(peer_specs.begin(), peer_specs.end());
+            fetched_keys.insert(keys[key_index]);
+        }
+        match.p2p_1_fetch = static_cast<int64_t>(fetched_keys.size());
+        match.p2p_1_total_match = ReferenceOrdinaryPrefix(merged, use_eagle_pop);
+    }
+    matches.erase(std::remove_if(matches.begin(), matches.end(), [](const auto &match) { return match.local == 0; }),
+                  matches.end());
+    return matches;
+}
+
+std::vector<MetaSearcher::HostCacheMatch> ReferenceMambaMatches(const MetaSearcher::KeyVector &keys,
+                                                                const ReferenceP2PMatrix &matrix,
+                                                                bool use_eagle_pop,
+                                                                const std::vector<LocationSpecGroup> &groups,
+                                                                size_t p2p_host_count) {
+    std::vector<const LocationSpecGroup *> full_groups;
+    std::vector<const LocationSpecGroup *> state_groups;
+    for (const auto &group : groups) {
+        (group.name().front() == 'F' ? full_groups : state_groups).push_back(&group);
+    }
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    if (matrix.all.empty()) {
+        return matches;
+    }
+    for (const auto &[host, ignored] : matrix.all.front()) {
+        (void)ignored;
+        std::vector<ReferenceSpecNames> local_specs(matrix.all.size());
+        for (size_t i = 0; i < matrix.all.size(); ++i) {
+            local_specs[i] = ReferenceSpecsFor(matrix.all[i], host);
+        }
+        const int64_t local = ReferenceMambaPrefix(local_specs, use_eagle_pop, full_groups, state_groups);
+        matches.push_back({host, local, 0, local});
+    }
+
+    for (size_t host_index : ReferenceTopHosts(matches, p2p_host_count)) {
+        auto &match = matches[host_index];
+        std::vector<ReferenceSpecNames> merged(matrix.all.size());
+        for (size_t i = 0; i < matrix.all.size(); ++i) {
+            merged[i] = ReferenceSpecsFor(matrix.all[i], match.host_ip_port);
+        }
+        std::set<int64_t> fetched_keys;
+        for (const auto *group : full_groups) {
+            const auto selection = ReferenceSelectPrefixPeer(match.host_ip_port, matrix, group);
+            for (size_t key_index : selection.covered_key_indices) {
+                ReferenceMergeGroup(
+                    merged[key_index], ReferenceSpecsFor(matrix.vineyard[key_index], selection.peer), *group);
+                fetched_keys.insert(keys[key_index]);
+            }
+        }
+
+        size_t full_prefix = 0;
+        while (full_prefix < merged.size() && ReferenceHasGroups(merged[full_prefix], full_groups)) {
+            ++full_prefix;
+        }
+        if (use_eagle_pop && full_prefix != 0) {
+            --full_prefix;
+        }
+        const auto coverage = ReferenceSelectCoveragePeer(match.host_ip_port, matrix, full_prefix, state_groups);
+        for (const auto &[key_index, group] : coverage.covered_queries) {
+            ReferenceMergeGroup(
+                merged[key_index], ReferenceSpecsFor(matrix.vineyard[key_index], coverage.peer), *group);
+            fetched_keys.insert(keys[key_index]);
+        }
+        match.p2p_1_fetch = static_cast<int64_t>(fetched_keys.size());
+        match.p2p_1_total_match = ReferenceMambaPrefix(merged, use_eagle_pop, full_groups, state_groups);
+    }
+    matches.erase(std::remove_if(matches.begin(), matches.end(), [](const auto &match) { return match.local == 0; }),
+                  matches.end());
+    return matches;
+}
+
+using HostCacheMatchTuple = std::tuple<std::string, int64_t, int64_t, int64_t>;
+
+std::vector<HostCacheMatchTuple> ToMatchTuples(const std::vector<MetaSearcher::HostCacheMatch> &matches) {
+    std::vector<HostCacheMatchTuple> tuples;
+    tuples.reserve(matches.size());
+    for (const auto &match : matches) {
+        tuples.emplace_back(match.host_ip_port, match.local, match.p2p_1_fetch, match.p2p_1_total_match);
+    }
+    return tuples;
+}
+
 class FaultyTargetedLocationBackend : public MetaLocalBackend {
 public:
     void SetFailedKey(KeyType key) { failed_key_ = key; }
@@ -139,6 +471,116 @@ public:
 
 private:
     std::optional<KeyType> failed_key_;
+};
+
+// A MetaLocalBackend subclass deliberately reports a non-local storage type
+// so it falls back to the generic batched read path. It verifies that
+// multi-pass Mamba P2P replays one retained batch instead of issuing repeated
+// backend reads.
+class CountingBatchedLocationBackend : public MetaLocalBackend {
+public:
+    std::string GetStorageType() noexcept override { return "counting_batched"; }
+
+    void SetFailedKey(std::optional<KeyType> key) { failed_key_ = key; }
+
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override {
+        ++location_value_read_count_;
+        auto results = MetaLocalBackend::GetLocationValues(request_context, keys, out_locations);
+        if (failed_key_) {
+            for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+                if (keys[key_index] == *failed_key_) {
+                    results[key_index] = EC_TIMEOUT;
+                }
+            }
+        }
+        return results;
+    }
+
+    void ResetLocationValueReadCount() { location_value_read_count_ = 0; }
+    [[nodiscard]] size_t LocationValueReadCount() const { return location_value_read_count_; }
+
+private:
+    std::optional<KeyType> failed_key_;
+    size_t location_value_read_count_ = 0;
+};
+
+// Replaces one location or injects one error only in a selected compact-read
+// result. The stored metadata stays unchanged, allowing tests to model a
+// concurrent update or read failure between Mamba's local, planning, and final
+// ordered passes deterministically.
+class MutatingCompactLocationBackend : public MetaLocalBackend {
+public:
+    void SetReadDelay(std::chrono::microseconds delay) { read_delay_ = delay; }
+
+    void ReplaceOnRead(size_t read_number, KeyType key, std::string location_id, CacheLocationConstPtr replacement) {
+        mutation_read_number_ = read_number;
+        mutation_key_ = key;
+        mutation_location_id_ = std::move(location_id);
+        replacement_ = std::move(replacement);
+        failure_read_number_ = 0;
+        failure_ec_ = EC_OK;
+        compact_read_count_.store(0, std::memory_order_relaxed);
+    }
+
+    void FailOnRead(size_t read_number, KeyType key, ErrorCode ec) {
+        mutation_read_number_ = 0;
+        replacement_.reset();
+        failure_read_number_ = read_number;
+        failure_key_ = key;
+        failure_ec_ = ec;
+        compact_read_count_.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t CompactReadCount() const { return compact_read_count_.load(std::memory_order_relaxed); }
+
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                    const KeyType *keys,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept override {
+        if (read_delay_.count() != 0) {
+            std::this_thread::sleep_for(read_delay_);
+        }
+        auto results = MetaLocalBackend::GetLocationValuesCompact(request_context, keys, key_count, out_locations);
+        const size_t read_number = compact_read_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (read_number == failure_read_number_) {
+            for (size_t key_index = 0; key_index < key_count; ++key_index) {
+                if (keys[key_index] == failure_key_) {
+                    results[key_index] = failure_ec_;
+                }
+            }
+            return results;
+        }
+        if (read_number != mutation_read_number_ || !replacement_) {
+            return results;
+        }
+        for (size_t key_index = 0; key_index < key_count; ++key_index) {
+            if (keys[key_index] != mutation_key_) {
+                continue;
+            }
+            for (size_t value_index = out_locations.offsets[key_index];
+                 value_index < out_locations.offsets[key_index + 1];
+                 ++value_index) {
+                const auto &location = out_locations.values[value_index];
+                if (location && location->id() == mutation_location_id_) {
+                    out_locations.values[value_index] = replacement_;
+                }
+            }
+        }
+        return results;
+    }
+
+private:
+    size_t mutation_read_number_ = 0;
+    KeyType mutation_key_ = 0;
+    std::string mutation_location_id_;
+    CacheLocationConstPtr replacement_;
+    size_t failure_read_number_ = 0;
+    KeyType failure_key_ = 0;
+    ErrorCode failure_ec_ = EC_OK;
+    std::atomic<size_t> compact_read_count_{0};
+    std::chrono::microseconds read_delay_{0};
 };
 
 class CommitThenFailUpsertBackend : public MetaLocalBackend {
@@ -349,6 +791,30 @@ public:
         auto backend_raw = faulty_backend.get();
         meta_indexer_->backend_manager_->persistent_backend_->Close();
         meta_indexer_->backend_manager_->persistent_backend_ = std::move(faulty_backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    CountingBatchedLocationBackend *ReplaceWithCountingBatchedLocationBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<CountingBatchedLocationBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    MutatingCompactLocationBackend *ReplaceWithMutatingCompactLocationBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<MutatingCompactLocationBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
         meta_indexer_->backend_manager_->cache_backend_.reset();
         return backend_raw;
     }
@@ -983,18 +1449,19 @@ TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParalle
         return matches.empty() ? int64_t{-1} : matches.front().local;
     };
 
-    // p2p_host_count=1 intentionally selects the established full-materialize
-    // implementation as a semantic reference for the progressive bitset path.
+    // Enabling P2P must not change the independently computed local result,
+    // including the state checkpoint immediately before Eagle pop.
     EXPECT_EQ(static_cast<int64_t>(kFullPrefix), run(false, 0));
     EXPECT_EQ(run(false, 1), run(false, 0));
     EXPECT_EQ(static_cast<int64_t>(kLastStateBeforeEaglePop + 1), run(true, 0));
     EXPECT_EQ(run(true, 1), run(true, 0));
 }
 
-TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadReference) {
+TEST_F(MetaSearcherTest, TestStreamingHostP2PMatchesMaterializedReference) {
     constexpr size_t kKeyCount = 6000;
-    constexpr size_t kHostCount = 6;
+    constexpr size_t kHostCount = 7;
     constexpr size_t kLongMambaFullPrefix = 5501;
+    constexpr size_t kOrdinaryP2PGap = 5000;
 
     meta_searcher_.reset();
     meta_indexer_.reset();
@@ -1013,6 +1480,11 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
     MetaSearcher::KeyVector keys(kKeyCount);
     std::iota(keys.begin(), keys.end(), 300000);
     CacheLocationMapVector location_maps(kKeyCount);
+    std::array<ReferenceP2PMatrix, 3> reference_matrices;
+    for (auto &matrix : reference_matrices) {
+        matrix.all.resize(kKeyCount);
+        matrix.vineyard.resize(kKeyCount);
+    }
     std::mt19937 random(0x51A7E5u);
     auto add_location = [&](size_t key_index,
                             size_t host_index,
@@ -1024,6 +1496,20 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
         const std::string type_name =
             type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ? "event_report_l2" : "event_report_l1p5";
         const std::string location_id = "kvs#" + type_name + "#" + std::string(medium) + "#" + hosts[host_index];
+        if (status == CacheLocationStatus::CLS_SERVING && valid_uri) {
+            for (size_t filter_index = 0; filter_index < reference_matrices.size(); ++filter_index) {
+                const bool medium_matches = filter_index == 0 || (filter_index == 1 && medium == "mem") ||
+                                            (filter_index == 2 && medium == "ssd");
+                if (!medium_matches) {
+                    continue;
+                }
+                auto &matrix = reference_matrices[filter_index];
+                matrix.all[key_index][hosts[host_index]].insert(spec_names.begin(), spec_names.end());
+                if (type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+                    matrix.vineyard[key_index][hosts[host_index]].insert(spec_names.begin(), spec_names.end());
+                }
+            }
+        }
         std::vector<LocationSpec> specs;
         specs.reserve(spec_names.size());
         for (auto &name : spec_names) {
@@ -1064,7 +1550,9 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
                          true);
         }
 
-        for (size_t host_index = 1; host_index < kHostCount; ++host_index) {
+        // The last two host ids are reserved for a deterministic ordinary-P2P
+        // extension below; the other hosts retain the mixed random model.
+        for (size_t host_index = 1; host_index + 2 < kHostCount; ++host_index) {
             const uint32_t sample = random();
             if (key_index != 0 && sample % 5 == 0) {
                 continue;
@@ -1094,52 +1582,443 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
                          std::move(names),
                          key_index == 0 || sample % 13 != 0);
         }
+
+        const size_t ordinary_target = kHostCount - 2;
+        const size_t ordinary_peer = kHostCount - 1;
+        if (key_index != kOrdinaryP2PGap) {
+            add_location(key_index,
+                         ordinary_target,
+                         "mem",
+                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                         CacheLocationStatus::CLS_SERVING,
+                         {"ordinary_only"},
+                         true);
+        } else {
+            add_location(key_index,
+                         ordinary_peer,
+                         "mem",
+                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                         CacheLocationStatus::CLS_SERVING,
+                         {"ordinary_peer"},
+                         true);
+        }
     }
     PropertyMapVector properties;
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
 
-    auto local_prefixes = [](const std::vector<MetaSearcher::HostCacheMatch> &matches) {
-        std::map<std::string, int64_t> prefixes;
-        for (const auto &match : matches) {
-            prefixes.emplace(match.host_ip_port, match.local);
-        }
-        return prefixes;
-    };
     const std::vector<std::vector<std::string>> medium_filters = {{}, {"mem"}, {"ssd"}};
     const std::vector<LocationSpecGroup> groups = {
         LocationSpecGroup("F0", {"full_a", "full_b"}),
         LocationSpecGroup("L0", {"state_a", "state_b"}),
     };
-    for (const auto &medium_filter : medium_filters) {
+    bool saw_ordinary_fetch = false;
+    bool saw_ordinary_extension = false;
+    bool saw_mamba_fetch = false;
+    bool saw_mamba_extension = false;
+    for (size_t filter_index = 0; filter_index < medium_filters.size(); ++filter_index) {
+        const auto &medium_filter = medium_filters[filter_index];
+        const auto &reference_matrix = reference_matrices[filter_index];
         for (const bool use_eagle_pop : {false, true}) {
-            std::vector<MetaSearcher::HostCacheMatch> progressive;
-            std::vector<MetaSearcher::HostCacheMatch> full_read;
-            ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, progressive, nullptr, 0));
-            ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, full_read, nullptr, kHostCount));
-            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+            for (const size_t p2p_host_count : {size_t{0}, size_t{1}, size_t{3}, kHostCount}) {
+                SCOPED_TRACE("filter=" + std::to_string(filter_index) + " eagle=" + std::to_string(use_eagle_pop) +
+                             " p2p=" + std::to_string(p2p_host_count));
+                std::vector<MetaSearcher::HostCacheMatch> actual;
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_searcher_->PrefixMatchByHost(
+                        request_context_.get(), keys, use_eagle_pop, medium_filter, actual, nullptr, p2p_host_count));
+                const auto expected_ordinary =
+                    ReferenceOrdinaryMatches(keys, reference_matrix, use_eagle_pop, p2p_host_count);
+                EXPECT_EQ(ToMatchTuples(expected_ordinary), ToMatchTuples(actual));
+                for (const auto &match : expected_ordinary) {
+                    saw_ordinary_fetch = saw_ordinary_fetch || match.p2p_1_fetch > 0;
+                    saw_ordinary_extension = saw_ordinary_extension || match.p2p_1_total_match > match.local;
+                }
 
-            ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchWithMambaByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, groups, progressive, nullptr, 0));
-            ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
-                                                                 keys,
-                                                                 use_eagle_pop,
-                                                                 medium_filter,
-                                                                 groups,
-                                                                 full_read,
-                                                                 nullptr,
-                                                                 kHostCount));
-            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+                ASSERT_EQ(EC_OK,
+                          meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                                     keys,
+                                                                     use_eagle_pop,
+                                                                     medium_filter,
+                                                                     groups,
+                                                                     actual,
+                                                                     nullptr,
+                                                                     p2p_host_count));
+                for (const auto &match : actual) {
+                    EXPECT_GE(match.p2p_1_total_match, match.local);
+                }
+                const auto expected_mamba =
+                    ReferenceMambaMatches(keys, reference_matrix, use_eagle_pop, groups, p2p_host_count);
+                EXPECT_EQ(ToMatchTuples(expected_mamba), ToMatchTuples(actual));
+                for (const auto &match : expected_mamba) {
+                    saw_mamba_fetch = saw_mamba_fetch || match.p2p_1_fetch > 0;
+                    saw_mamba_extension = saw_mamba_extension || match.p2p_1_total_match > match.local;
+                }
+            }
         }
     }
+    EXPECT_TRUE(saw_ordinary_fetch);
+    EXPECT_TRUE(saw_ordinary_extension);
+    EXPECT_TRUE(saw_mamba_fetch);
+    EXPECT_TRUE(saw_mamba_extension);
+}
+
+TEST_F(MetaSearcherTest, TestStreamingPrefixP2PRetainsOnlyTheFinalTopHostPlan) {
+    const MetaSearcher::KeyVector keys = {10050, 10051, 10052, 10053, 10054};
+    const std::string host_a = "stream-host-a:8080";
+    const std::string host_b = "stream-host-b:8080";
+    const std::string host_c = "stream-host-c:8080";
+    const std::string peer = "stream-peer:8080";
+    const auto host_a_task = MakeEventReportTask(host_a, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    const auto host_b_task = MakeEventReportTask(host_b, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    const auto host_c_task = MakeEventReportTask(host_c, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    const auto peer_task = MakeEventReportTask(peer, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {host_a_task, host_b_task, host_c_task},
+        {host_b_task, host_c_task, peer_task},
+        {host_c_task, peer_task},
+        {peer_task},
+        {peer_task},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches, nullptr, 1));
+    auto find_match = [&matches](const std::string &host) {
+        return std::find_if(
+            matches.begin(), matches.end(), [&host](const auto &match) { return match.host_ip_port == host; });
+    };
+    ASSERT_EQ(3u, matches.size());
+    const auto match_a = find_match(host_a);
+    const auto match_b = find_match(host_b);
+    const auto match_c = find_match(host_c);
+    ASSERT_NE(matches.end(), match_a);
+    ASSERT_NE(matches.end(), match_b);
+    ASSERT_NE(matches.end(), match_c);
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{1, 0, 1}),
+              std::make_tuple(match_a->local, match_a->p2p_1_fetch, match_a->p2p_1_total_match));
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{2, 0, 2}),
+              std::make_tuple(match_b->local, match_b->p2p_1_fetch, match_b->p2p_1_total_match));
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{3, 2, 5}),
+              std::make_tuple(match_c->local, match_c->p2p_1_fetch, match_c->p2p_1_total_match));
+}
+
+TEST_F(MetaSearcherTest, TestStreamingMambaP2PReusesBatchAndDeduplicatesFetchedKeys) {
+    auto *backend = ReplaceWithCountingBatchedLocationBackend();
+    const MetaSearcher::KeyVector stored_keys = {10060, 10061, 10062, 10063};
+    const MetaSearcher::KeyVector query_keys = {10060, 10061, 10061, 10062, 10063};
+    const std::string target = "mamba-stream-target:8080";
+    const std::string peer_a = "mamba-stream-peer-a:8080";
+    const std::string peer_b = "mamba-stream-peer-b:8080";
+    const auto target_full =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_0", "state_0"});
+    const auto target_state =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"state_0"});
+    const auto a_full = MakeEventReportTask(peer_a, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0"});
+    const auto b_full = MakeEventReportTask(peer_b, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0"});
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {target_full},
+        {target_state, a_full, b_full},
+        {target_state, b_full},
+        {target_state, a_full},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), stored_keys, tasks, per_key_ec));
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    backend->ResetLocationValueReadCount();
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), query_keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(target, matches[0].host_ip_port);
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{1, 2, 4}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+    EXPECT_EQ(1u, backend->LocationValueReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestBatchedMambaP2PDefersSuffixErrorUntilNeeded) {
+    auto *backend = ReplaceWithCountingBatchedLocationBackend();
+    ASSERT_TRUE(backend);
+    const MetaSearcher::KeyVector keys = {10064, 10065, 10066};
+    const std::string target = "mamba-batched-stop:8080";
+    const auto target_full =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_0"});
+    const auto target_other =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"other"});
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {target_full},
+        {target_other},
+        {target_other},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    backend->SetFailedKey(keys.back());
+    backend->ResetLocationValueReadCount();
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+
+    // The first two successful keys prove that the only candidate has no
+    // usable local checkpoint. No P2P plan can be selected, so the batched
+    // backend's later error is outside the required prefix just as it is for
+    // the progressive backend.
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    EXPECT_TRUE(matches.empty());
+    EXPECT_EQ(1u, backend->LocationValueReadCount());
+
+    // Give the target one valid local checkpoint and a peer that crosses the
+    // local full-prefix stop. Planning must now reach the failed suffix and
+    // propagate the original error without issuing another backend read.
+    const auto target_state =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"state_0"});
+    const auto peer_full =
+        MakeEventReportTask("mamba-batched-peer:8080", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0"});
+    tasks = {
+        {target_state},
+        {peer_full},
+        {peer_full},
+    };
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    backend->ResetLocationValueReadCount();
+    EXPECT_EQ(EC_TIMEOUT,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    EXPECT_TRUE(matches.empty());
+    EXPECT_EQ(1u, backend->LocationValueReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestStreamingMambaP2PMergesIndependentFullGroupPeers) {
+    const MetaSearcher::KeyVector keys = {10070, 10071, 10072, 10073};
+    const std::string target = "mamba-cross-target:8080";
+    const std::string peer_a = "mamba-cross-peer-a:8080";
+    const std::string peer_b = "mamba-cross-peer-b:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_a", "full_b"})},
+        {MakeEventReportTask(peer_a, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_a"}),
+         MakeEventReportTask(peer_b, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_b"})},
+        {MakeEventReportTask(peer_a, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_a"})},
+        {MakeEventReportTask(peer_a, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_a"})},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_a"}),
+        LocationSpecGroup("F1", {"full_b"}),
+        LocationSpecGroup("L0", {"full_a", "full_b"}),
+    };
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(target, matches[0].host_ip_port);
+    // full_b fixes the combined prefix at key 2, while full_a's independently
+    // selected peer covers keys 1..3. All three selected fetch keys remain part
+    // of the public counter even though only key 1 extends the final match.
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{1, 3, 2}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+}
+
+TEST_F(MetaSearcherTest, TestStreamingMambaP2PPreservesEmptySpecGroupSemantics) {
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+    const MetaSearcher::KeyVector keys = {10075, 10076, 10077};
+    const std::string target = "mamba-empty-group-target:8080";
+    const std::string peer = "mamba-empty-group-peer:8080";
+    const auto target_task =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_0", "state_0"});
+    const auto peer_task =
+        MakeEventReportTask(peer, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0", "state_0"});
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {target_task},
+        {peer_task},
+        {peer_task},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+
+    // Empty groups are valid today and their all-of predicate is true even
+    // when the target host is absent. The non-empty state group makes the
+    // empty full-group mask span allocated words and still requires a final
+    // state-peer projection.
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F_empty", {}),
+        LocationSpecGroup("L_empty", {}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    backend->ResetReadCounts();
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(target, matches[0].host_ip_port);
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{1, 2, 3}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+    // Three Mamba phases over three keys. The empty full group is a vacuous
+    // predicate and must not enlarge the final peer-validation range.
+    EXPECT_EQ(9u, backend->CompactReadCount());
+
+    backend->ResetReadCounts();
+    const std::vector<LocationSpecGroup> all_empty_groups = {
+        LocationSpecGroup("F_empty", {}),
+        LocationSpecGroup("L_empty", {}),
+    };
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, all_empty_groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{3, 0, 3}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+    EXPECT_EQ(keys.size(), backend->CompactReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestStreamingMambaP2PHandlesErrorsAndMetadataChangesBetweenPasses) {
+    auto *backend = ReplaceWithMutatingCompactLocationBackend();
+    ASSERT_TRUE(backend);
+    const MetaSearcher::KeyVector keys = {10080, 10081, 10082};
+    const std::string target = "mamba-mutating-target:8080";
+    const std::string peer = "mamba-mutating-peer:8080";
+    const auto target_task =
+        MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_0", "state_0"});
+    const auto peer_task = MakeEventReportTask(peer, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0"});
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {target_task},
+        {target_task},
+        {peer_task},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    auto replacement = [&target_task, &target](std::vector<std::string> spec_names) {
+        std::vector<LocationSpec> specs;
+        specs.reserve(spec_names.size());
+        for (const auto &name : spec_names) {
+            specs.emplace_back(name, "event_report://" + target + "/mem");
+        }
+        return std::make_shared<CacheLocation>(target_task.location_id,
+                                               CacheLocationStatus::CLS_SERVING,
+                                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                               specs.size(),
+                                               std::move(specs));
+    };
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+
+    // A hard metadata error that appears only during peer planning must stop
+    // before the final pass and must not expose a result derived from pass one.
+    backend->FailOnRead(/*read_number*/ 2, keys[1], EC_TIMEOUT);
+    EXPECT_EQ(EC_TIMEOUT,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    EXPECT_TRUE(matches.empty());
+    EXPECT_EQ(2u, backend->CompactReadCount());
+
+    // The same error in the final pass takes precedence over the peer-plan
+    // mismatch caused by the truncated view; partial matches remain hidden.
+    backend->FailOnRead(/*read_number*/ 3, keys[1], EC_TIMEOUT);
+    EXPECT_EQ(EC_TIMEOUT,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    EXPECT_TRUE(matches.empty());
+    EXPECT_EQ(3u, backend->CompactReadCount());
+
+    // The first two passes observe a two-key local result. Removing only the
+    // second key's state in the final pass must not make P2P total regress
+    // below the already returned local count.
+    backend->ReplaceOnRead(/*read_number*/ 3, keys[1], target_task.location_id, replacement({"full_0"}));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(target, matches[0].host_ip_port);
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{2, 1, 2}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+    EXPECT_EQ(3u, backend->CompactReadCount());
+
+    // Removing a required full spec invalidates the peer plan selected by the
+    // second pass. Returning a partial result would be unsafe, so the final
+    // pass must reject the inconsistent view.
+    backend->ReplaceOnRead(/*read_number*/ 3, keys[1], target_task.location_id, replacement({"state_0"}));
+    EXPECT_EQ(EC_MISMATCH,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    EXPECT_TRUE(matches.empty());
+    EXPECT_EQ(3u, backend->CompactReadCount());
+
+    // If the final view gains a local full spec, no remote data is actually
+    // needed at that key. Fetched count must come from the validated final
+    // plan rather than the earlier planning pass.
+    backend->ReplaceOnRead(
+        /*read_number*/ 3, keys[2], peer_task.location_id, replacement({"full_0", "state_0"}));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ((std::tuple<int64_t, int64_t, int64_t>{2, 0, 3}),
+              std::make_tuple(matches[0].local, matches[0].p2p_1_fetch, matches[0].p2p_1_total_match));
+    EXPECT_EQ(3u, backend->CompactReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestStreamingMambaP2PAggregatesBackendTimeAcrossPasses) {
+    auto *backend = ReplaceWithMutatingCompactLocationBackend();
+    ASSERT_TRUE(backend);
+    backend->SetReadDelay(std::chrono::milliseconds(3));
+
+    const MetaSearcher::KeyVector keys = {10090, 10091};
+    const std::string target = "mamba-metric-target:8080";
+    const std::string peer = "mamba-metric-peer:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
+        {MakeEventReportTask(target, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, {"full_0", "state_0"})},
+        {MakeEventReportTask(peer, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"full_0", "state_0"})},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto collector = std::make_shared<ServiceMetricsCollector>(registry);
+    ASSERT_TRUE(collector->Init());
+    RequestContext metrics_context("mamba_metric", collector);
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  &metrics_context, keys, false, {"mem"}, groups, matches, nullptr, 1));
+    ASSERT_EQ(3u, backend->CompactReadCount());
+    EXPECT_GE(collector->get_meta_indexer_get_io_time_us_metrics(), 8000.0);
 }
 
 TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithAndWithoutP2P) {
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
     const MetaSearcher::KeyVector keys = {10040, 10041};
     const std::vector<std::pair<std::string, CacheLocationStatus>> hosts = {
         {"serving-host:8080", CacheLocationStatus::CLS_SERVING},
@@ -1196,7 +2075,11 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithA
         EXPECT_EQ(2, matches[0].p2p_1_total_match);
     };
     verify_mamba(0);
+    backend->ResetReadCounts();
     verify_mamba(5);
+    // Local scoring plus peer planning are sufficient when no peer is
+    // selected; the final validation pass is reserved for an actual plan.
+    EXPECT_EQ(2 * keys.size(), backend->CompactReadCount());
 }
 
 TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWithoutP2P) {
@@ -3217,10 +4100,8 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
 
     // batch: confirmed success / uncertain with id / failed without id / failed with a ghost id
     const KeyVector keys = {success_key, uncertain_key, no_id_key, ghost_key};
-    std::vector<MetaSearcher::AddLocationResult> add_results = {success_results[0],
-                                                                uncertain_results[0],
-                                                                {EC_ERROR, ""},
-                                                                {EC_ERROR, "ghost_location_id"}};
+    std::vector<MetaSearcher::AddLocationResult> add_results = {
+        success_results[0], uncertain_results[0], {EC_ERROR, ""}, {EC_ERROR, "ghost_location_id"}};
     MetaSearcher::AddLocationRollbackPlan plan;
     ASSERT_EQ(EC_OK, meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), keys, add_results, plan));
 
@@ -3234,7 +4115,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
     // uncertain metadata is deleted; confirmed-success metadata is left for the delete pipeline.
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_EQ(1u, location_maps[0].count(success_results[0].location_id));
     EXPECT_TRUE(location_maps[1].empty());
@@ -3247,8 +4130,7 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
     plan.direct_delete_indices = {0};
 
     EXPECT_EQ(EC_BADARGS,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
+              meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.pipeline_location_ids.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
@@ -3290,9 +4172,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisOnDeleteErro
 
     backend->SetGetLocationsFailedKey(uncertain_key);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
 
@@ -3322,9 +4204,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisWhenSyncFail
 
     backend->SetFailSync(true);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     // metadata was deleted in memory but the delete could not be synced: retain the URI.
     EXPECT_TRUE(plan.direct_delete_indices.empty());

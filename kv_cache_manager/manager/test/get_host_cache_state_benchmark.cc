@@ -11,6 +11,7 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -131,7 +132,7 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
             const auto elapsed =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             const auto match = std::find_if(
-                matches.begin(), matches.end(), [](const auto &item) { return item.host_ip_port == kHost; });
+                matches.begin(), matches.end(), [kHost](const auto &item) { return item.host_ip_port == kHost; });
             ASSERT_NE(matches.end(), match) << name;
             ASSERT_EQ(expected_prefix, match->local) << name;
             if (iteration >= 0) {
@@ -171,6 +172,41 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
                   << " avg_ms=" << average << std::endl;
     };
 
+    auto run_p2p_case = [&](const char *name, const KeyVector &query_keys, bool mamba) {
+        std::vector<double> elapsed_ms;
+        for (int iteration = -1; iteration < 3; ++iteration) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            const auto begin = std::chrono::steady_clock::now();
+            ErrorCode ec = EC_OK;
+            if (mamba) {
+                const std::vector<LocationSpecGroup> groups = {
+                    LocationSpecGroup("F0", {"tp0"}),
+                    LocationSpecGroup("L0", {"tp0"}),
+                };
+                ec = searcher.PrefixMatchWithMambaByHost(
+                    request_context.get(), query_keys, false, {"mem"}, groups, matches, &visibility_check, 1);
+            } else {
+                ec = searcher.PrefixMatchByHost(
+                    request_context.get(), query_keys, false, {"mem"}, matches, &visibility_check, 1);
+            }
+            const auto elapsed =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            ASSERT_EQ(EC_OK, ec);
+            const auto match = std::find_if(
+                matches.begin(), matches.end(), [kHost](const auto &item) { return item.host_ip_port == kHost; });
+            ASSERT_NE(matches.end(), match) << name;
+            ASSERT_EQ(static_cast<int64_t>(kEarlyStopIndex), match->local) << name;
+            ASSERT_EQ(1, match->p2p_1_fetch) << name;
+            ASSERT_EQ(static_cast<int64_t>(query_keys.size()), match->p2p_1_total_match) << name;
+            if (iteration >= 0) {
+                elapsed_ms.push_back(elapsed);
+            }
+        }
+        std::sort(elapsed_ms.begin(), elapsed_ms.end());
+        std::cout << "[GET_HOST_BENCH] case=" << name << " keys=" << query_keys.size()
+                  << " workers=" << active_worker_count << " p50_ms=" << elapsed_ms[elapsed_ms.size() / 2] << std::endl;
+    };
+
     for (const size_t key_count : {size_t{100'000}, size_t{500'000}, kMaxKeyCount}) {
         KeyVector query_keys(all_hit_keys.begin(), all_hit_keys.begin() + static_cast<ptrdiff_t>(key_count));
         run_metadata_only(query_keys, 3);
@@ -180,6 +216,8 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     KeyVector early_host_stop = all_hit_keys;
     early_host_stop[kEarlyStopIndex] = other_host_key;
     run_case("early_host_stop", early_host_stop, kEarlyStopIndex, 5);
+    run_p2p_case("p2p_prefix_single_gap", early_host_stop, false);
+    run_p2p_case("p2p_mamba_single_gap", early_host_stop, true);
 
     KeyVector early_metadata_miss = all_hit_keys;
     early_metadata_miss[kEarlyStopIndex] = kBaseKey + static_cast<KeyType>(kMaxKeyCount + 10);
