@@ -28,4 +28,19 @@ uint64_t HitCurveProjector::ProjectInfinite(const RequestFact &fact) {
     return hits;
 }
 
+uint64_t HitCurveProjector::ProjectMambaBytes(const MambaRequestFact &fact, uint64_t total_capacity_bytes) {
+    uint64_t hits = 0;
+    for (const MambaCurvePoint &point : fact.points) {
+        if (point.min_total_capacity_bytes > total_capacity_bytes) {
+            break;
+        }
+        hits = point.hit_blocks;
+    }
+    return hits;
+}
+
+uint64_t HitCurveProjector::ProjectMambaInfinite(const MambaRequestFact &fact) {
+    return fact.points.empty() ? 0 : fact.points.back().hit_blocks;
+}
+
 } // namespace kv_cache_manager
