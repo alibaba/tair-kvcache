@@ -550,16 +550,46 @@ TEST_F(MetaStorageBackendManagerTest, TestDestructorClosesOpenedBackendExactlyOn
 TEST_F(MetaStorageBackendManagerTest, TestConcurrentLocationValueReadsAreLocalOnly) {
     MetaStorageBackendManager mgr;
     EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
 
     mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
     EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_TRUE(mgr.SupportsSingleLocationRmw());
 
     mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
     EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+
+    mgr.cache_backend_.reset();
+    mgr.persistent_backend_ = std::make_unique<MalformedMetaCacheBackend>();
+    EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+
+    mgr.persistent_backend_ = std::make_unique<MetaDummyBackend>();
+    EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestPureLocalHashSeedIsNotExposedForCachedOrNonLocalBackends) {
+    MetaStorageBackendManager mgr;
+    uint32_t hash_seed = 0;
+    EXPECT_FALSE(mgr.GetPureLocalCacheHashSeed(hash_seed));
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    auto local_backend = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, local_backend->Init("hash_seed_local", backend_config));
+    uint32_t expected_hash_seed = 0;
+    ASSERT_TRUE(local_backend->GetCacheHashSeed(expected_hash_seed));
+    mgr.persistent_backend_ = std::move(local_backend);
+    ASSERT_TRUE(mgr.GetPureLocalCacheHashSeed(hash_seed));
+    EXPECT_EQ(expected_hash_seed, hash_seed);
+
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    EXPECT_FALSE(mgr.GetPureLocalCacheHashSeed(hash_seed));
 
     mgr.cache_backend_.reset();
     mgr.persistent_backend_ = std::make_unique<MetaDummyBackend>();
-    EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.GetPureLocalCacheHashSeed(hash_seed));
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestMalformedCacheReadShapesFailClosed) {

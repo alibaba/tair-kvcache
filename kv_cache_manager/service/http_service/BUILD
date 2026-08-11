@@ -36,6 +36,7 @@ cc_library(
         "//kv_cache_manager/service:meta_service_impl",
         "//kv_cache_manager/service:meta_service_metrics_base",
         "//kv_cache_manager/service/util:proto_message_json_util",
+        "//kv_cache_manager/service/util:report_event_json_parser",
         "@com_google_protobuf//:protobuf",
         "@com_google_protobuf//:protobuf_headers",
         "@yalantinglibs//:ylt",

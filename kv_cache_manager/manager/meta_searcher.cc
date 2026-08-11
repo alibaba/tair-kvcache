@@ -42,14 +42,26 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
+bool TryGetLocationSpecSize(const LocationSpec &spec, std::uint64_t &size) {
+    size = 0;
+    DataStorageUri uri(spec.uri());
+    if (!uri.Valid()) {
+        return false;
+    }
+    uri.GetParamAs<std::uint64_t>("size", size);
+    return true;
+}
+
+std::uint64_t GetLocationSpecSize(const LocationSpec &spec) {
+    std::uint64_t size = 0;
+    (void)TryGetLocationSpecSize(spec, size);
+    return size;
+}
+
 std::uint64_t GetLocationSpecsSize(const std::vector<LocationSpec> &specs) {
     std::uint64_t total_size = 0;
     for (const auto &loc_spec : specs) {
-        if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-            std::uint64_t spec_size = 0;
-            ds_uri.GetParamAs<std::uint64_t>("size", spec_size);
-            total_size += spec_size;
-        }
+        total_size += GetLocationSpecSize(loc_spec);
     }
     return total_size;
 }
@@ -71,9 +83,10 @@ struct StorageUsageChange {
     bool has_old = false;
 };
 
-ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &specs,
-                                            std::uint64_t *out_total_size = nullptr) {
-    if (specs.empty()) {
+template <typename SpecAccessor>
+ErrorCode
+ValidateConsistentSnapshotVersion(size_t spec_count, SpecAccessor spec_at, std::uint64_t *out_total_size = nullptr) {
+    if (spec_count == 0) {
         return EC_BADARGS;
     }
     bool has_snapshot_version = false;
@@ -81,12 +94,13 @@ ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &spe
     bool has_unversioned_spec = false;
     std::uint64_t total_size = 0;
     std::unordered_set<std::string_view> spec_names;
-    if (specs.size() > 1) {
-        spec_names.reserve(specs.size());
+    if (spec_count > 1) {
+        spec_names.reserve(spec_count);
     }
-    for (const auto &spec : specs) {
+    for (size_t spec_index = 0; spec_index < spec_count; ++spec_index) {
+        const auto &spec = spec_at(spec_index);
         const DataStorageUri uri(spec.uri());
-        if (spec.name().empty() || (specs.size() > 1 && !spec_names.insert(std::string_view(spec.name())).second) ||
+        if (spec.name().empty() || (spec_count > 1 && !spec_names.insert(std::string_view(spec.name())).second) ||
             !uri.Valid()) {
             return EC_BADARGS;
         }
@@ -122,7 +136,20 @@ ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &spe
     return EC_OK;
 }
 
-void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs, const std::vector<LocationSpec> &new_specs) {
+ErrorCode ValidateConsistentSnapshotVersion(const std::vector<LocationSpec> &specs,
+                                            std::uint64_t *out_total_size = nullptr) {
+    return ValidateConsistentSnapshotVersion(
+        specs.size(), [&specs](size_t index) -> const LocationSpec & { return specs[index]; }, out_total_size);
+}
+
+ErrorCode ValidateConsistentSnapshotVersion(const MetaSearcher::MergeLocationSpecsTask &task,
+                                            std::uint64_t *out_total_size = nullptr) {
+    return ValidateConsistentSnapshotVersion(
+        task.SpecCount(), [&task](size_t index) -> const LocationSpec & { return task.SpecAt(index); }, out_total_size);
+}
+
+void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs,
+                              const MetaSearcher::MergeLocationSpecsTask &task) {
     // Snapshot generations are reconciliation/cleanup tags, not a visibility
     // fence. After a KVCM restart, a new delta may use a fresh generation while
     // untouched specs still carry an older one. Preserve those specs and
@@ -146,7 +173,8 @@ void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs, const std
     }
     merged_specs.resize(unique_count);
 
-    for (const auto &spec : new_specs) {
+    for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
+        const auto &spec = task.SpecAt(spec_index);
         auto existing = std::find_if(merged_specs.begin(), merged_specs.end(), [&spec](const auto &candidate) {
             return candidate.name() == spec.name();
         });
@@ -343,15 +371,192 @@ CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
     return valid;
 }
 
-bool IsMediumMatched(const StandardUri &uri, const std::unordered_set<std::string> &medium_set) {
+using MediumViewSet = std::unordered_set<std::string_view>;
+
+constexpr size_t WordCountForBits(size_t bit_count) noexcept { return bit_count == 0 ? 0 : 1 + (bit_count - 1) / 64; }
+
+// Measures the union of concurrently executing callback intervals. Summing
+// per-worker durations would turn the existing wall-time metric into CPU time
+// and could make it exceed the enclosing request latency.
+class ConcurrentWallTimer {
+public:
+    class Scope {
+    public:
+        explicit Scope(ConcurrentWallTimer *timer) noexcept : timer_(timer) { timer_->Begin(); }
+        ~Scope() { timer_->End(); }
+
+        Scope(const Scope &) = delete;
+        Scope &operator=(const Scope &) = delete;
+
+    private:
+        ConcurrentWallTimer *timer_;
+    };
+
+    [[nodiscard]] Scope Measure() noexcept { return Scope(this); }
+    [[nodiscard]] int64_t elapsed_us() const noexcept { return elapsed_us_.load(std::memory_order_relaxed); }
+
+private:
+    void Begin() noexcept {
+        const int64_t now = TimestampUtil::GetCurrentTimeUs();
+        if (active_.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            interval_start_us_.store(now, std::memory_order_release);
+        }
+    }
+
+    void End() noexcept {
+        const int64_t now = TimestampUtil::GetCurrentTimeUs();
+        const int64_t interval_start = interval_start_us_.load(std::memory_order_acquire);
+        if (active_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            elapsed_us_.fetch_add(std::max<int64_t>(now - interval_start, 0), std::memory_order_relaxed);
+        }
+    }
+
+private:
+    std::atomic<size_t> active_{0};
+    std::atomic<int64_t> interval_start_us_{0};
+    std::atomic<int64_t> elapsed_us_{0};
+};
+
+MediumViewSet BuildMediumViewSet(const std::vector<std::string> &medium_filter) {
+    MediumViewSet mediums;
+    mediums.reserve(medium_filter.size());
+    for (const auto &medium : medium_filter) {
+        mediums.emplace(medium);
+    }
+    return mediums;
+}
+
+bool IsMediumMatched(const StandardUri &uri, const MediumViewSet &medium_set) {
     if (medium_set.empty()) {
         return true;
     }
-    std::string medium = uri.GetPath();
-    if (!medium.empty() && medium[0] == '/') {
-        medium = medium.substr(1);
+    std::string_view medium(uri.GetPath());
+    if (!medium.empty() && medium.front() == '/') {
+        medium.remove_prefix(1);
     }
     return medium_set.find(medium) != medium_set.end();
+}
+
+bool IsReporterMediumMatched(std::string_view medium, const MediumViewSet &medium_set) {
+    return medium_set.empty() || medium_set.find(medium) != medium_set.end();
+}
+
+template <typename LocationRange, typename Visitor>
+void VisitHostSpecsForOneKey(const LocationRange &locations,
+                             const CheckLocDataExistFunc &check_loc_data_exist,
+                             const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                             const MediumViewSet &medium_set,
+                             bool visit_spec_names,
+                             Visitor &&visitor) {
+    for (const auto &loc : locations) {
+        // GetHostCacheState reports readable data, not metadata intent. A URI
+        // attached to WRITING/DELETING/NEW must never become a cache hit.
+        if (!loc || loc->status() != CacheLocationStatus::CLS_SERVING || loc->location_specs().empty()) {
+            continue;
+        }
+
+        MetaSearcher::HostCacheLocationInfo location_info;
+        if (request_check_location) {
+            if (!(*request_check_location)(*loc, location_info)) {
+                continue;
+            }
+        } else if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
+            continue;
+        }
+
+        const bool is_event_report = IsEventReportStorageType(loc->type());
+        bool has_reporter_identity = is_event_report && location_info.has_reporter_identity;
+        if (!has_reporter_identity && is_event_report) {
+            std::string_view storage_type;
+            has_reporter_identity = SnapshotUriUtils::ParseEventReportLocationIdView(
+                loc->id(), storage_type, location_info.reporter_medium, location_info.reporter_host);
+        }
+        const bool is_vineyard = loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        if (has_reporter_identity) {
+            if (!IsReporterMediumMatched(location_info.reporter_medium, medium_set) ||
+                location_info.reporter_host.empty()) {
+                continue;
+            }
+            // The request checker already scans every EventReport URI while
+            // applying the reporter generation fence. Reuse that result.
+            const bool specs_already_validated =
+                request_check_location != nullptr && is_event_report && location_info.has_reporter_identity;
+            if (!visit_spec_names) {
+                if (specs_already_validated) {
+                    visitor(location_info.reporter_host, std::string_view{}, is_vineyard);
+                    continue;
+                }
+                for (const auto &spec : loc->location_specs()) {
+                    if (StandardUri(spec.uri()).Valid()) {
+                        visitor(location_info.reporter_host, std::string_view{}, is_vineyard);
+                        break;
+                    }
+                }
+                continue;
+            }
+            for (const auto &spec : loc->location_specs()) {
+                if (!specs_already_validated && !StandardUri(spec.uri()).Valid()) {
+                    continue;
+                }
+                visitor(location_info.reporter_host, std::string_view(spec.name()), is_vineyard);
+            }
+            continue;
+        }
+
+        for (const auto &spec : loc->location_specs()) {
+            const StandardUri uri(spec.uri());
+            if (!uri.Valid() || !IsMediumMatched(uri, medium_set)) {
+                continue;
+            }
+            const std::string host = uri.GetHostPort();
+            if (!host.empty()) {
+                visitor(std::string_view(host), std::string_view(spec.name()), false);
+            }
+        }
+    }
+}
+
+template <typename LocationRange>
+void BuildHostsForOneKey(const LocationRange &locations,
+                         const CheckLocDataExistFunc &check_loc_data_exist,
+                         const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                         const MediumViewSet &medium_set,
+                         std::vector<std::string> &hosts) {
+    VisitHostSpecsForOneKey(locations,
+                            check_loc_data_exist,
+                            request_check_location,
+                            medium_set,
+                            false,
+                            [&hosts](std::string_view host, std::string_view, bool) { hosts.emplace_back(host); });
+    std::sort(hosts.begin(), hosts.end());
+    hosts.erase(std::unique(hosts.begin(), hosts.end()), hosts.end());
+}
+
+template <typename LocationRange>
+void BuildCandidatePresenceForOneKey(const LocationRange &locations,
+                                     const CheckLocDataExistFunc &check_loc_data_exist,
+                                     const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                                     const MediumViewSet &medium_set,
+                                     const std::vector<std::string> &candidate_hosts,
+                                     std::uint64_t *presence_words) {
+    VisitHostSpecsForOneKey(locations,
+                            check_loc_data_exist,
+                            request_check_location,
+                            medium_set,
+                            false,
+                            [&candidate_hosts, presence_words](std::string_view host, std::string_view, bool) {
+                                const auto it =
+                                    std::lower_bound(candidate_hosts.begin(),
+                                                     candidate_hosts.end(),
+                                                     host,
+                                                     [](const std::string &candidate, std::string_view value) {
+                                                         return std::string_view(candidate) < value;
+                                                     });
+                                if (it != candidate_hosts.end() && std::string_view(*it) == host) {
+                                    const size_t index = static_cast<size_t>(it - candidate_hosts.begin());
+                                    presence_words[index / 64] |= std::uint64_t{1} << (index % 64);
+                                }
+                            });
 }
 
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
@@ -383,62 +588,26 @@ std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::
     return host_indices;
 }
 
-void BuildHostSpecNamesForOneKey(const CacheLocationVector &locations,
+template <typename LocationRange>
+void BuildHostSpecNamesForOneKey(const LocationRange &locations,
                                  const CheckLocDataExistFunc &check_loc_data_exist,
-                                 const std::unordered_set<std::string> &medium_set,
-                                 HostToSpecNames &host_specs) {
-    for (const auto &loc : locations) {
-        if (!loc || loc->location_specs().empty()) {
-            continue;
-        }
-        if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
-            continue;
-        }
-        std::string event_medium;
-        std::string reporter_host;
-        const bool has_reporter_identity =
-            IsEventReportStorageType(loc->type()) &&
-            SnapshotUriUtils::ParseEventReportLocationId(loc->id(), event_medium, reporter_host);
-        for (const auto &spec : loc->location_specs()) {
-            StandardUri uri(spec.uri());
-            const bool medium_matches = has_reporter_identity ? medium_set.empty() || medium_set.count(event_medium) > 0
-                                                              : IsMediumMatched(uri, medium_set);
-            if (!uri.Valid() || !medium_matches) {
-                continue;
+                                 const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                                 const MediumViewSet &medium_set,
+                                 HostToSpecNames &host_specs,
+                                 HostToSpecNames &vineyard_host_specs) {
+    VisitHostSpecsForOneKey(
+        locations,
+        check_loc_data_exist,
+        request_check_location,
+        medium_set,
+        true,
+        [&host_specs, &vineyard_host_specs](std::string_view host, std::string_view spec_name, bool is_vineyard) {
+            auto &local_names = host_specs[std::string(host)];
+            local_names.emplace(spec_name);
+            if (is_vineyard) {
+                vineyard_host_specs[std::string(host)].emplace(spec_name);
             }
-            std::string host = has_reporter_identity ? reporter_host : uri.GetHostPort();
-            if (host.empty()) {
-                continue;
-            }
-            host_specs[std::move(host)].insert(spec.name());
-        }
-    }
-}
-
-void BuildVineyardHostSpecNamesForOneKey(const CacheLocationVector &locations,
-                                         const CheckLocDataExistFunc &check_loc_data_exist,
-                                         const std::unordered_set<std::string> &medium_set,
-                                         HostToSpecNames &host_specs) {
-    for (const auto &loc : locations) {
-        if (!loc || loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ||
-            loc->location_specs().empty()) {
-            continue;
-        }
-        if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
-            continue;
-        }
-        std::string event_medium;
-        std::string reporter_host;
-        if (!SnapshotUriUtils::ParseEventReportLocationId(loc->id(), event_medium, reporter_host) ||
-            reporter_host.empty() || (!medium_set.empty() && medium_set.count(event_medium) == 0)) {
-            continue;
-        }
-        for (const auto &spec : loc->location_specs()) {
-            if (StandardUri(spec.uri()).Valid()) {
-                host_specs[reporter_host].insert(spec.name());
-            }
-        }
-    }
+        });
 }
 
 bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
@@ -659,6 +828,374 @@ int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &
         }
     }
     return 0;
+}
+
+ErrorCode PrefixMatchByHostWithoutP2P(MetaIndexer *meta_indexer,
+                                      const CheckLocDataExistFunc &check_loc_data_exist,
+                                      RequestContext *request_context,
+                                      const MetaSearcher::KeyVector &keys,
+                                      bool use_eagle_pop,
+                                      const std::vector<std::string> &medium_filter,
+                                      std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                      const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
+    std::vector<std::string> candidate_hosts;
+    std::unique_ptr<std::atomic<std::size_t>[]> prefix_stops;
+    std::size_t presence_word_count = 0;
+    ConcurrentWallTimer projection_wall_timer;
+
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    const auto visitor =
+        [&keys,
+         &check_loc_data_exist,
+         request_check_location,
+         &medium_set,
+         &candidate_hosts,
+         &prefix_stops,
+         &presence_word_count,
+         &projection_wall_timer](std::size_t begin, const CompactLocationsPerKey &locations, std::size_t valid_count) {
+            auto projection_scope = projection_wall_timer.Measure();
+            std::size_t first_local_index = 0;
+            if (begin == 0) {
+                BuildHostsForOneKey(
+                    locations[0], check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
+                if (candidate_hosts.empty()) {
+                    return size_t{0};
+                }
+                presence_word_count = WordCountForBits(candidate_hosts.size());
+                prefix_stops = std::make_unique<std::atomic<std::size_t>[]>(candidate_hosts.size());
+                for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
+                    prefix_stops[i].store(keys.size(), std::memory_order_relaxed);
+                }
+                first_local_index = 1;
+            }
+
+            std::vector<std::uint64_t> presence_words(presence_word_count, 0);
+            for (std::size_t local_index = first_local_index; local_index < valid_count; ++local_index) {
+                const std::size_t key_index = begin + local_index;
+                bool any_host_needs_key = false;
+                for (std::size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+                    if (key_index < prefix_stops[host_index].load(std::memory_order_relaxed)) {
+                        any_host_needs_key = true;
+                        break;
+                    }
+                }
+                if (!any_host_needs_key) {
+                    // Prefix stops are monotonic. Once every candidate has
+                    // stopped at or before this key, no later key in this
+                    // ordered callback range can change the result.
+                    break;
+                }
+
+                std::fill(presence_words.begin(), presence_words.end(), 0);
+                BuildCandidatePresenceForOneKey(locations[local_index],
+                                                check_loc_data_exist,
+                                                request_check_location,
+                                                medium_set,
+                                                candidate_hosts,
+                                                presence_words.data());
+                for (std::size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+                    std::size_t current = prefix_stops[host_index].load(std::memory_order_relaxed);
+                    if (key_index >= current) {
+                        continue;
+                    }
+                    const std::uint64_t bit = std::uint64_t{1} << (host_index % 64);
+                    if ((presence_words[host_index / 64] & bit) != 0) {
+                        continue;
+                    }
+                    while (key_index < current &&
+                           !prefix_stops[host_index].compare_exchange_weak(
+                               current, key_index, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+                }
+            }
+
+            bool every_host_stopped = true;
+            std::size_t last_required_key = 0;
+            for (std::size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+                const std::size_t stop = prefix_stops[host_index].load(std::memory_order_relaxed);
+                if (stop == keys.size()) {
+                    every_host_stopped = false;
+                    break;
+                }
+                last_required_key = std::max(last_required_key, stop);
+            }
+            return every_host_stopped ? last_required_key : keys.size();
+        };
+    const auto result = meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
+    const std::size_t valid_key_count = result.valid_key_count;
+    if (valid_key_count < keys.size() && result.terminal_ec != EC_OK) {
+        KVCM_LOG_DEBUG("prefix match by host end because Get keys[%lu](%lu) return %d",
+                       valid_key_count,
+                       keys[valid_key_count],
+                       result.terminal_ec);
+        if (result.terminal_ec != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("prefix match metadata read failed");
+            return result.terminal_ec;
+        }
+    }
+    if (candidate_hosts.empty() || valid_key_count == 0) {
+        return EC_OK;
+    }
+
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    out_matches.reserve(candidate_hosts.size());
+    for (std::size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+        int64_t prefix_len =
+            static_cast<int64_t>(std::min(valid_key_count, prefix_stops[host_index].load(std::memory_order_relaxed)));
+        if (use_eagle_pop) {
+            prefix_len = std::max<int64_t>(prefix_len - 1, 0);
+        }
+        if (prefix_len > 0) {
+            out_matches.push_back(
+                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[host_index]), prefix_len, 0, prefix_len});
+        }
+    }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    return EC_OK;
+}
+
+ErrorCode PrefixMatchWithMambaByHostWithoutP2P(MetaIndexer *meta_indexer,
+                                               const CheckLocDataExistFunc &check_loc_data_exist,
+                                               RequestContext *request_context,
+                                               const MetaSearcher::KeyVector &keys,
+                                               bool use_eagle_pop,
+                                               const std::vector<std::string> &medium_filter,
+                                               const std::vector<const LocationSpecGroup *> &full_groups,
+                                               const std::vector<const LocationSpecGroup *> &mamba_state_groups,
+                                               std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                               const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
+
+    std::vector<std::string> required_spec_names;
+    auto append_required_names = [&required_spec_names](const std::vector<const LocationSpecGroup *> &groups) {
+        for (const auto *group : groups) {
+            required_spec_names.insert(
+                required_spec_names.end(), group->spec_names().begin(), group->spec_names().end());
+        }
+    };
+    append_required_names(full_groups);
+    append_required_names(mamba_state_groups);
+    std::sort(required_spec_names.begin(), required_spec_names.end());
+    required_spec_names.erase(std::unique(required_spec_names.begin(), required_spec_names.end()),
+                              required_spec_names.end());
+    const size_t spec_word_count = WordCountForBits(required_spec_names.size());
+    std::vector<std::uint64_t> full_required(spec_word_count, 0);
+    std::vector<std::uint64_t> state_required(spec_word_count, 0);
+    auto build_required_mask = [&required_spec_names](const std::vector<const LocationSpecGroup *> &groups,
+                                                      std::vector<std::uint64_t> &mask) {
+        for (const auto *group : groups) {
+            for (const auto &spec_name : group->spec_names()) {
+                const auto it = std::lower_bound(required_spec_names.begin(), required_spec_names.end(), spec_name);
+                assert(it != required_spec_names.end() && *it == spec_name);
+                const size_t index = static_cast<size_t>(it - required_spec_names.begin());
+                mask[index / 64] |= std::uint64_t{1} << (index % 64);
+            }
+        }
+    };
+    build_required_mask(full_groups, full_required);
+    build_required_mask(mamba_state_groups, state_required);
+
+    std::vector<std::string> candidate_hosts;
+    std::unique_ptr<std::atomic<std::size_t>[]> full_prefix_stops;
+    std::vector<std::uint64_t> state_present_words;
+    std::size_t state_key_word_count = 0;
+    std::atomic<bool> projection_invalid(false);
+    ConcurrentWallTimer projection_wall_timer;
+
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    const auto visitor = [&keys,
+                          &check_loc_data_exist,
+                          request_check_location,
+                          &medium_set,
+                          &candidate_hosts,
+                          &required_spec_names,
+                          &full_required,
+                          &state_required,
+                          &full_prefix_stops,
+                          &state_present_words,
+                          &state_key_word_count,
+                          &projection_invalid,
+                          &projection_wall_timer,
+                          spec_word_count](
+                             std::size_t begin, const CompactLocationsPerKey &locations, std::size_t valid_count) {
+        auto projection_scope = projection_wall_timer.Measure();
+        if (begin == 0) {
+            BuildHostsForOneKey(
+                locations[0], check_loc_data_exist, request_check_location, medium_set, candidate_hosts);
+            if (candidate_hosts.empty()) {
+                return size_t{0};
+            }
+            if (spec_word_count > std::numeric_limits<size_t>::max() / candidate_hosts.size()) {
+                projection_invalid.store(true, std::memory_order_relaxed);
+                return size_t{0};
+            }
+            full_prefix_stops = std::make_unique<std::atomic<std::size_t>[]>(candidate_hosts.size());
+            for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
+                full_prefix_stops[i].store(keys.size(), std::memory_order_relaxed);
+            }
+            state_key_word_count = WordCountForBits(keys.size());
+            if (state_key_word_count > std::numeric_limits<size_t>::max() / candidate_hosts.size()) {
+                projection_invalid.store(true, std::memory_order_relaxed);
+                return size_t{0};
+            }
+            state_present_words.assign(state_key_word_count * candidate_hosts.size(), 0);
+        }
+
+        std::vector<std::uint64_t> seen_words(candidate_hosts.size() * spec_word_count, 0);
+        std::vector<std::uint8_t> host_present(candidate_hosts.size(), 0);
+        for (std::size_t local_index = 0; local_index < valid_count; ++local_index) {
+            const std::size_t key_index = begin + local_index;
+            bool any_host_needs_key = false;
+            for (size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+                if (key_index < full_prefix_stops[host_index].load(std::memory_order_relaxed)) {
+                    any_host_needs_key = true;
+                    break;
+                }
+            }
+            if (!any_host_needs_key) {
+                break;
+            }
+            std::fill(seen_words.begin(), seen_words.end(), 0);
+            std::fill(host_present.begin(), host_present.end(), 0);
+            VisitHostSpecsForOneKey(
+                locations[local_index],
+                check_loc_data_exist,
+                request_check_location,
+                medium_set,
+                true,
+                [&candidate_hosts, &required_spec_names, &seen_words, &host_present, spec_word_count](
+                    std::string_view host, std::string_view spec_name, bool) {
+                    const auto host_it = std::lower_bound(candidate_hosts.begin(),
+                                                          candidate_hosts.end(),
+                                                          host,
+                                                          [](const std::string &candidate, std::string_view value) {
+                                                              return std::string_view(candidate) < value;
+                                                          });
+                    if (host_it == candidate_hosts.end() || std::string_view(*host_it) != host) {
+                        return;
+                    }
+                    const size_t host_index = static_cast<size_t>(host_it - candidate_hosts.begin());
+                    host_present[host_index] = 1;
+                    const auto spec_it = std::lower_bound(required_spec_names.begin(),
+                                                          required_spec_names.end(),
+                                                          spec_name,
+                                                          [](const std::string &candidate, std::string_view value) {
+                                                              return std::string_view(candidate) < value;
+                                                          });
+                    if (spec_it == required_spec_names.end() || std::string_view(*spec_it) != spec_name) {
+                        return;
+                    }
+                    const size_t spec_index = static_cast<size_t>(spec_it - required_spec_names.begin());
+                    seen_words[host_index * spec_word_count + spec_index / 64] |= std::uint64_t{1} << (spec_index % 64);
+                });
+
+            for (size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+                bool has_full = host_present[host_index] != 0;
+                bool has_state = has_full;
+                for (size_t word = 0; word < spec_word_count && (has_full || has_state); ++word) {
+                    const auto seen = seen_words[host_index * spec_word_count + word];
+                    has_full = has_full && (seen & full_required[word]) == full_required[word];
+                    has_state = has_state && (seen & state_required[word]) == state_required[word];
+                }
+                if (has_state) {
+                    state_present_words[host_index * state_key_word_count + key_index / 64] |= std::uint64_t{1}
+                                                                                               << (key_index % 64);
+                }
+                if (!has_full) {
+                    std::size_t current = full_prefix_stops[host_index].load(std::memory_order_relaxed);
+                    while (key_index < current &&
+                           !full_prefix_stops[host_index].compare_exchange_weak(
+                               current, key_index, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+                }
+            }
+        }
+
+        bool every_host_stopped = true;
+        std::size_t last_required_key = 0;
+        for (std::size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
+            const std::size_t stop = full_prefix_stops[host_index].load(std::memory_order_relaxed);
+            if (stop == keys.size()) {
+                every_host_stopped = false;
+                break;
+            }
+            last_required_key = std::max(last_required_key, stop);
+        }
+        return every_host_stopped ? last_required_key : keys.size();
+    };
+    const auto result = meta_indexer->VisitLocationValuesForPrefix(request_context, keys, visitor);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
+    if (projection_invalid.load(std::memory_order_relaxed)) {
+        request_context->error_tracer()->AddErrorMsg("mamba host/spec flag matrix size overflow");
+        return EC_ERROR;
+    }
+    const std::size_t valid_key_count = result.valid_key_count;
+    if (valid_key_count < keys.size() && result.terminal_ec != EC_OK) {
+        KVCM_LOG_DEBUG("prefix match with mamba by host end because Get keys[%lu](%lu) return %d",
+                       valid_key_count,
+                       keys[valid_key_count],
+                       result.terminal_ec);
+        if (result.terminal_ec != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
+            return result.terminal_ec;
+        }
+    }
+    if (candidate_hosts.empty() || valid_key_count == 0) {
+        return EC_OK;
+    }
+
+    std::vector<int64_t> prefix_lengths(candidate_hosts.size(), 0);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    const bool reduce_ok = meta_indexer->ParallelForQuery(
+        candidate_hosts.size(),
+        [&full_prefix_stops,
+         &state_present_words,
+         state_key_word_count,
+         valid_key_count,
+         &prefix_lengths,
+         use_eagle_pop](std::size_t begin, std::size_t end) {
+            for (std::size_t host_index = begin; host_index < end; ++host_index) {
+                size_t full_prefix_len =
+                    std::min(valid_key_count, full_prefix_stops[host_index].load(std::memory_order_relaxed));
+                if (use_eagle_pop && full_prefix_len > 0) {
+                    --full_prefix_len;
+                }
+                while (full_prefix_len > 0) {
+                    const size_t last_index = full_prefix_len - 1;
+                    const size_t word_index = last_index / 64;
+                    const unsigned used_bits = static_cast<unsigned>(last_index % 64) + 1;
+                    const std::uint64_t prefix_mask = used_bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                                                      : (std::uint64_t{1} << used_bits) - 1;
+                    const std::uint64_t present =
+                        state_present_words[host_index * state_key_word_count + word_index] & prefix_mask;
+                    if (present != 0) {
+                        const size_t highest_bit = 63U - static_cast<size_t>(__builtin_clzll(present));
+                        prefix_lengths[host_index] = static_cast<int64_t>(word_index * 64 + highest_bit + 1);
+                        break;
+                    }
+                    full_prefix_len = word_index * 64;
+                }
+            }
+        });
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    if (!reduce_ok) {
+        request_context->error_tracer()->AddErrorMsg("parallel mamba host prefix reduction failed");
+        return EC_ERROR;
+    }
+    out_matches.reserve(candidate_hosts.size());
+    for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
+        if (prefix_lengths[i] > 0) {
+            out_matches.push_back(
+                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[i]), prefix_lengths[i], 0, prefix_lengths[i]});
+        }
+    }
+    return EC_OK;
 }
 
 } // namespace
@@ -1118,12 +1655,22 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           bool use_eagle_pop,
                                           const std::vector<std::string> &medium_filter,
                                           std::vector<HostCacheMatch> &out_matches,
-                                          const CheckLocDataExistFunc *request_check_loc_data_exist,
+                                          const CheckHostCacheLocationFunc *request_check_location,
                                           size_t p2p_host_count) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
         return EC_OK;
+    }
+    if (p2p_host_count == 0) {
+        return PrefixMatchByHostWithoutP2P(meta_indexer_.get(),
+                                           check_loc_data_exist_func_,
+                                           request_context,
+                                           keys,
+                                           use_eagle_pop,
+                                           medium_filter,
+                                           out_matches,
+                                           request_check_location);
     }
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -1143,6 +1690,10 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                        valid_key_count,
                        keys[valid_key_count],
                        result.error_codes[valid_key_count]);
+        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("prefix match metadata read failed");
+            return result.error_codes[valid_key_count];
+        }
     }
     if (valid_key_count == 0) {
         return EC_OK;
@@ -1150,21 +1701,26 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
 
     KeyToHostSpecNames key_to_host_spec_names(valid_key_count);
     KeyToHostSpecNames key_to_vineyard_spec_names(valid_key_count);
-    const std::unordered_set<std::string> medium_set(medium_filter.begin(), medium_filter.end());
-    const auto &check_loc_data_exist =
-        request_check_loc_data_exist ? *request_check_loc_data_exist : check_loc_data_exist_func_;
+    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
+    const auto &check_loc_data_exist = check_loc_data_exist_func_;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
-    const bool projection_ok = meta_indexer_->ParallelForQuery(
-        valid_key_count,
-        [&location_values, &check_loc_data_exist, &medium_set, &key_to_host_spec_names, &key_to_vineyard_spec_names](
-            std::size_t begin, std::size_t end) {
-            for (std::size_t i = begin; i < end; ++i) {
-                BuildHostSpecNamesForOneKey(
-                    location_values[i], check_loc_data_exist, medium_set, key_to_host_spec_names[i]);
-                BuildVineyardHostSpecNamesForOneKey(
-                    location_values[i], check_loc_data_exist, medium_set, key_to_vineyard_spec_names[i]);
-            }
-        });
+    const bool projection_ok =
+        meta_indexer_->ParallelForQuery(valid_key_count,
+                                        [&location_values,
+                                         &check_loc_data_exist,
+                                         request_check_location,
+                                         &medium_set,
+                                         &key_to_host_spec_names,
+                                         &key_to_vineyard_spec_names](std::size_t begin, std::size_t end) {
+                                            for (std::size_t i = begin; i < end; ++i) {
+                                                BuildHostSpecNamesForOneKey(location_values[i],
+                                                                            check_loc_data_exist,
+                                                                            request_check_location,
+                                                                            medium_set,
+                                                                            key_to_host_spec_names[i],
+                                                                            key_to_vineyard_spec_names[i]);
+                                            }
+                                        });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
     if (!projection_ok) {
         request_context->error_tracer()->AddErrorMsg("parallel host cache projection failed");
@@ -1248,7 +1804,7 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    const std::vector<std::string> &medium_filter,
                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                                    std::vector<HostCacheMatch> &out_matches,
-                                                   const CheckLocDataExistFunc *request_check_loc_data_exist,
+                                                   const CheckHostCacheLocationFunc *request_check_location,
                                                    size_t p2p_host_count) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
@@ -1274,6 +1830,18 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
         KVCM_LOG_WARN("%s", error_msg.c_str());
         return EC_BADARGS;
     }
+    if (p2p_host_count == 0) {
+        return PrefixMatchWithMambaByHostWithoutP2P(meta_indexer_.get(),
+                                                    check_loc_data_exist_func_,
+                                                    request_context,
+                                                    keys,
+                                                    use_eagle_pop,
+                                                    medium_filter,
+                                                    full_groups,
+                                                    mamba_state_groups,
+                                                    out_matches,
+                                                    request_check_location);
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     LocationsPerKey location_values;
@@ -1291,6 +1859,10 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                        valid_key_count,
                        keys[valid_key_count],
                        result.error_codes[valid_key_count]);
+        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
+            request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
+            return result.error_codes[valid_key_count];
+        }
     }
     if (valid_key_count == 0) {
         return EC_OK;
@@ -1298,21 +1870,26 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
 
     KeyToHostSpecNames key_to_host_spec_names(valid_key_count);
     KeyToHostSpecNames key_to_vineyard_spec_names(valid_key_count);
-    const std::unordered_set<std::string> medium_set(medium_filter.begin(), medium_filter.end());
-    const auto &check_loc_data_exist =
-        request_check_loc_data_exist ? *request_check_loc_data_exist : check_loc_data_exist_func_;
+    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
+    const auto &check_loc_data_exist = check_loc_data_exist_func_;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
-    const bool projection_ok = meta_indexer_->ParallelForQuery(
-        valid_key_count,
-        [&location_values, &check_loc_data_exist, &medium_set, &key_to_host_spec_names, &key_to_vineyard_spec_names](
-            std::size_t begin, std::size_t end) {
-            for (std::size_t i = begin; i < end; ++i) {
-                BuildHostSpecNamesForOneKey(
-                    location_values[i], check_loc_data_exist, medium_set, key_to_host_spec_names[i]);
-                BuildVineyardHostSpecNamesForOneKey(
-                    location_values[i], check_loc_data_exist, medium_set, key_to_vineyard_spec_names[i]);
-            }
-        });
+    const bool projection_ok =
+        meta_indexer_->ParallelForQuery(valid_key_count,
+                                        [&location_values,
+                                         &check_loc_data_exist,
+                                         request_check_location,
+                                         &medium_set,
+                                         &key_to_host_spec_names,
+                                         &key_to_vineyard_spec_names](std::size_t begin, std::size_t end) {
+                                            for (std::size_t i = begin; i < end; ++i) {
+                                                BuildHostSpecNamesForOneKey(location_values[i],
+                                                                            check_loc_data_exist,
+                                                                            request_check_location,
+                                                                            medium_set,
+                                                                            key_to_host_spec_names[i],
+                                                                            key_to_vineyard_spec_names[i]);
+                                            }
+                                        });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
     if (!projection_ok) {
         request_context->error_tracer()->AddErrorMsg("parallel mamba host cache projection failed");
@@ -1711,13 +2288,14 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
         std::unordered_set<std::string> seen_location_ids;
         for (size_t task_index = 0; task_index < tasks_per_key[key_index].size(); ++task_index) {
             const auto &task = tasks_per_key[key_index][task_index];
+            const auto &location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
-            if (task.location_id.empty() || !seen_location_ids.insert(task.location_id).second ||
+            if (location_id.empty() || !seen_location_ids.insert(location_id).second ||
                 ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
-            location_ids.push_back(task.location_id);
+            location_ids.push_back(location_id);
             key_usage_changes[task_index].new_size = incoming_size;
         }
     }
@@ -1778,6 +2356,12 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
                 new_location = std::make_shared<CacheLocation>(*locations[location_index]);
             } else {
                 new_location = std::make_shared<CacheLocation>();
+            }
+            if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+                // New locations and legacy owned-id locations converge to the
+                // request's canonical reporter/medium id on the next write.
+                new_location->set_id(*interned_location_id);
+            } else if (get_ec != ErrorCode::EC_OK || !locations[location_index]) {
                 new_location->set_id(task.location_id);
             }
 
@@ -1791,6 +2375,7 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
             new_location->set_status(task.status);
             new_location->set_spec_size(new_location->location_specs().size());
             new_location->set_create_time(batch_create_time);
+            new_location->set_validated_total_size(usage.new_size);
             locations[location_index] = std::move(new_location);
             updated = true;
         }
@@ -1848,12 +2433,96 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
     return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
 }
 
+class MetaSearcher::MergeLocationSpecsTaskView {
+public:
+    explicit MergeLocationSpecsTaskView(const std::vector<std::vector<MergeLocationSpecsTask>> &nested_tasks)
+        : nested_tasks_(&nested_tasks) {}
+
+    MergeLocationSpecsTaskView(const std::vector<size_t> &offsets, std::vector<MergeLocationSpecsTask> &flat_tasks)
+        : offsets_(&offsets), flat_tasks_(&flat_tasks) {}
+
+    [[nodiscard]] bool Valid(size_t key_count) const noexcept {
+        if (nested_tasks_) {
+            return nested_tasks_->size() == key_count;
+        }
+        if (!offsets_ || !flat_tasks_ || offsets_->size() != key_count + 1 || offsets_->front() != 0 ||
+            offsets_->back() != flat_tasks_->size()) {
+            return false;
+        }
+        return std::is_sorted(offsets_->begin(), offsets_->end());
+    }
+
+    [[nodiscard]] size_t Size(size_t key_index) const noexcept {
+        if (nested_tasks_) {
+            return (*nested_tasks_)[key_index].size();
+        }
+        return (*offsets_)[key_index + 1] - (*offsets_)[key_index];
+    }
+
+    [[nodiscard]] const MergeLocationSpecsTask &At(size_t key_index, size_t task_index) const noexcept {
+        if (nested_tasks_) {
+            return (*nested_tasks_)[key_index][task_index];
+        }
+        return (*flat_tasks_)[(*offsets_)[key_index] + task_index];
+    }
+
+    // The ReportEvent-only flat representation owns its input strings and is
+    // dead after this call except for spec names used to map failures back to
+    // request items. Transfer the potentially large URI into the immutable
+    // CacheLocation while restoring the usually-SSO name in the task. Generic
+    // nested callers retain their historical copy semantics.
+    [[nodiscard]] LocationSpec CopyOrConsumeSpec(size_t key_index, size_t task_index, size_t spec_index) {
+        if (!flat_tasks_) {
+            return At(key_index, task_index).SpecAt(spec_index);
+        }
+        auto &task = (*flat_tasks_)[(*offsets_)[key_index] + task_index];
+        if (!task.prevalidated_total_size.has_value()) {
+            return task.SpecAt(spec_index);
+        }
+        auto &source = task.MutableSpecAt(spec_index);
+        std::string retained_name = source.name();
+        LocationSpec result = std::move(source);
+        source.set_name(std::move(retained_name));
+        return result;
+    }
+
+private:
+    const std::vector<std::vector<MergeLocationSpecsTask>> *nested_tasks_ = nullptr;
+    const std::vector<size_t> *offsets_ = nullptr;
+    std::vector<MergeLocationSpecsTask> *flat_tasks_ = nullptr;
+};
+
 ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                                                 const KeyVector &keys,
                                                 const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
                                                 std::vector<ErrorCode> &out_per_key_ec,
                                                 AcquireMetadataWriteLeaseFunc acquire_write_lease) {
-    if (keys.size() != tasks_per_key.size()) {
+    return BatchMergeLocationSpecsImpl(request_context,
+                                       keys,
+                                       MergeLocationSpecsTaskView(tasks_per_key),
+                                       out_per_key_ec,
+                                       std::move(acquire_write_lease));
+}
+
+ErrorCode MetaSearcher::BatchMergeLocationSpecsFlat(RequestContext *request_context,
+                                                    const KeyVector &keys,
+                                                    const std::vector<size_t> &task_offsets,
+                                                    std::vector<MergeLocationSpecsTask> &flat_tasks,
+                                                    std::vector<ErrorCode> &out_per_key_ec,
+                                                    AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+    return BatchMergeLocationSpecsImpl(request_context,
+                                       keys,
+                                       MergeLocationSpecsTaskView(task_offsets, flat_tasks),
+                                       out_per_key_ec,
+                                       std::move(acquire_write_lease));
+}
+
+ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_context,
+                                                    const KeyVector &keys,
+                                                    MergeLocationSpecsTaskView tasks,
+                                                    std::vector<ErrorCode> &out_per_key_ec,
+                                                    AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+    if (!tasks.Valid(keys.size())) {
         return EC_BADARGS;
     }
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
@@ -1879,180 +2548,251 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         return EC_BADARGS;
     }
 
-    LocationIdsPerKey location_ids_per_key(keys.size());
-    std::vector<size_t> usage_offsets(keys.size() + 1, 0);
-    std::vector<std::uint64_t> incoming_task_sizes;
-    incoming_task_sizes.reserve(keys.size());
+    bool use_single_location_fast_path = meta_indexer_->SupportsSingleLocationRmw();
+    for (size_t key_index = 0; key_index < keys.size() && use_single_location_fast_path; ++key_index) {
+        use_single_location_fast_path = tasks.Size(key_index) == 1;
+    }
+    LocationIdsPerKey location_ids_per_key(use_single_location_fast_path ? 0 : keys.size());
+    LocationIdRefVector single_location_ids;
+    if (use_single_location_fast_path) {
+        single_location_ids.reserve(keys.size());
+    }
+    // Keep the incoming and final usage in one request-shaped allocation.
+    // The dominant pure-local ReportEvent shape has exactly one location per
+    // key, so its usage index is the key index and needs no offsets array.
+    // Multi-location callers retain the generic flattened-offset layout.
+    std::vector<size_t> usage_offsets(use_single_location_fast_path ? 0 : keys.size() + 1, 0);
+    std::vector<StorageUsageChange> usage_changes;
+    usage_changes.reserve(keys.size());
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        const size_t task_count = tasks.Size(key_index);
         std::unordered_set<std::string_view> seen_location_ids;
-        if (tasks_per_key[key_index].size() > 1) {
-            seen_location_ids.reserve(tasks_per_key[key_index].size());
+        if (task_count > 1) {
+            seen_location_ids.reserve(task_count);
         }
-        auto &location_ids = location_ids_per_key[key_index];
-        location_ids.reserve(tasks_per_key[key_index].size());
-        for (const auto &task : tasks_per_key[key_index]) {
+        if (!use_single_location_fast_path) {
+            location_ids_per_key[key_index].reserve(task_count);
+        }
+        for (size_t task_index = 0; task_index < task_count; ++task_index) {
+            const auto &task = tasks.At(key_index, task_index);
+            const auto &task_location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
             const ErrorCode validation_ec = task.prevalidated_total_size.has_value()
-                                                ? (task.specs.empty() ? EC_BADARGS : EC_OK)
-                                                : ValidateConsistentSnapshotVersion(task.specs, &incoming_size);
+                                                ? (task.SpecsEmpty() ? EC_BADARGS : EC_OK)
+                                                : ValidateConsistentSnapshotVersion(task, &incoming_size);
             if (task.prevalidated_total_size.has_value()) {
                 incoming_size = task.prevalidated_total_size->value();
             }
-            if (task.location_id.empty() ||
-                (tasks_per_key[key_index].size() > 1 &&
-                 !seen_location_ids.insert(std::string_view(task.location_id)).second) ||
+            if (task_location_id.empty() ||
+                (task_count > 1 && !seen_location_ids.insert(std::string_view(task_location_id)).second) ||
                 validation_ec != EC_OK) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
-            location_ids.push_back(task.location_id);
-            incoming_task_sizes.push_back(incoming_size);
+            if (use_single_location_fast_path) {
+                single_location_ids.push_back(&task_location_id);
+            } else {
+                location_ids_per_key[key_index].push_back(task_location_id);
+            }
+            usage_changes.push_back(StorageUsageChange{0, incoming_size, false});
         }
-        usage_offsets[key_index + 1] = usage_offsets[key_index] + location_ids.size();
+        if (!use_single_location_fast_path) {
+            usage_offsets[key_index + 1] = usage_offsets[key_index] + task_count;
+        }
     }
-    std::vector<StorageUsageChange> usage_changes(usage_offsets.back());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
     bool write_lease_attempted = false;
     ErrorCode write_lease_ec = EC_OK;
     MetadataWriteLease write_lease;
-    auto modifier = [&keys,
-                     &tasks_per_key,
-                     &usage_offsets,
-                     &usage_changes,
-                     &incoming_task_sizes,
-                     &acquire_write_lease,
-                     &write_lease_attempted,
-                     &write_lease_ec,
-                     &write_lease,
-                     batch_create_time](const std::vector<ErrorCode> &get_ecs,
-                                        const LocationIdVector &location_ids,
-                                        size_t key_index,
-                                        CacheLocationVector &locations,
-                                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
-        if (location_ids.empty()) {
-            return {ModifierAction::MA_SKIP, {}};
-        }
+    auto ensure_write_lease = [&acquire_write_lease, &write_lease_attempted, &write_lease_ec, &write_lease]() {
         if (acquire_write_lease && !write_lease_attempted) {
             std::tie(write_lease_ec, write_lease) = acquire_write_lease();
             write_lease_attempted = true;
         }
-        if (write_lease_ec != EC_OK) {
-            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), write_lease_ec)};
+        return write_lease_ec;
+    };
+
+    auto merge_one_location =
+        [&keys, &tasks, &usage_offsets, &usage_changes, use_single_location_fast_path, batch_create_time](
+            ErrorCode get_ec,
+            const LocationId &location_id,
+            size_t key_index,
+            size_t location_index,
+            const CacheLocation *existing_location,
+            CacheLocationConstPtr &out_location) -> ErrorCode {
+        if (key_index >= keys.size() || location_index >= tasks.Size(key_index)) {
+            return EC_MISMATCH;
         }
-        if (key_index >= tasks_per_key.size() || get_ecs.size() != location_ids.size() ||
-            locations.size() != location_ids.size() || tasks_per_key[key_index].size() != location_ids.size()) {
+        const auto &task = tasks.At(key_index, location_index);
+        const auto &task_location_id = task.ResolvedLocationId();
+        if (location_id != task_location_id) {
+            return EC_MISMATCH;
+        }
+
+        if (get_ec != EC_OK && get_ec != EC_NOENT) {
+            KVCM_LOG_WARN("load target location failed, key[%lu](%lu), location_id[%s], return[%d]",
+                          key_index,
+                          keys[key_index],
+                          task_location_id.c_str(),
+                          get_ec);
+            return get_ec;
+        }
+
+        const size_t usage_index =
+            use_single_location_fast_path ? key_index : usage_offsets[key_index] + location_index;
+        auto &usage = usage_changes[usage_index];
+        const std::uint64_t incoming_size = usage.new_size;
+        std::shared_ptr<CacheLocation> new_location;
+        bool final_specs_validated = true;
+        if (get_ec == EC_OK) {
+            if (!existing_location || existing_location->type() != task.type) {
+                return existing_location ? ErrorCode::EC_BADARGS : ErrorCode::EC_MISMATCH;
+            }
+            std::uint64_t replaced_old_size = 0;
+            bool has_legacy_duplicate_names = false;
+            const auto &old_specs = existing_location->location_specs();
+            std::uint64_t cached_single_spec_size = 0;
+            const bool has_cached_single_spec_size =
+                old_specs.size() == 1 && existing_location->GetValidatedTotalSize(cached_single_spec_size);
+            bool old_size_overflow = false;
+            for (size_t old_index = 0; old_index < old_specs.size(); ++old_index) {
+                const auto &old_spec = old_specs[old_index];
+                std::uint64_t old_spec_size = cached_single_spec_size;
+                const bool old_spec_validated =
+                    has_cached_single_spec_size || TryGetLocationSpecSize(old_spec, old_spec_size);
+                if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.old_size) {
+                    old_size_overflow = true;
+                    break;
+                }
+                usage.old_size += old_spec_size;
+                bool replaces_old_spec = false;
+                for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
+                    if (task.SpecAt(spec_index).name() == old_spec.name()) {
+                        replaces_old_spec = true;
+                        break;
+                    }
+                }
+                if (!replaces_old_spec && !old_spec_validated) {
+                    final_specs_validated = false;
+                }
+                if (replaces_old_spec) {
+                    if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - replaced_old_size) {
+                        old_size_overflow = true;
+                        break;
+                    }
+                    replaced_old_size += old_spec_size;
+                }
+                has_legacy_duplicate_names =
+                    has_legacy_duplicate_names ||
+                    std::any_of(old_specs.begin(), old_specs.begin() + old_index, [&old_spec](const auto &prior) {
+                        return prior.name() == old_spec.name();
+                    });
+            }
+            if (old_size_overflow) {
+                return EC_BADARGS;
+            }
+            usage.has_old = true;
+            const bool replaces_only_spec =
+                old_specs.size() == 1 && task.SpecCount() == 1 && old_specs.front().name() == task.SpecAt(0).name();
+            if (replaces_only_spec) {
+                // The dominant ReportEvent update replaces the only stored
+                // spec with one same-named spec. Copying CacheLocation first
+                // allocates/copies the old URI only to destroy it immediately
+                // in MergeLocationSpecsByName. Build the final immutable value
+                // directly for this exact case; every CacheLocation field is
+                // assigned below and the incoming spec is still copied once.
+                new_location = std::make_shared<CacheLocation>();
+                if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+                    new_location->set_id(*interned_location_id);
+                } else {
+                    new_location->set_id(existing_location->id());
+                }
+                std::vector<LocationSpec> specs;
+                specs.reserve(1);
+                specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, 0));
+                new_location->set_location_specs(std::move(specs));
+            } else {
+                new_location = std::make_shared<CacheLocation>(*existing_location);
+                if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+                    new_location->set_id(*interned_location_id);
+                }
+                MergeLocationSpecsByName(new_location->mutable_location_specs(), task);
+            }
+            if (has_legacy_duplicate_names) {
+                usage.new_size = 0;
+                final_specs_validated = true;
+                for (const auto &merged_spec : new_location->location_specs()) {
+                    std::uint64_t merged_spec_size = 0;
+                    if (!TryGetLocationSpecSize(merged_spec, merged_spec_size)) {
+                        final_specs_validated = false;
+                    }
+                    if (merged_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.new_size) {
+                        return EC_BADARGS;
+                    }
+                    usage.new_size += merged_spec_size;
+                }
+            } else {
+                const std::uint64_t retained_size = usage.old_size - replaced_old_size;
+                if (incoming_size > std::numeric_limits<std::uint64_t>::max() - retained_size) {
+                    return EC_BADARGS;
+                }
+                usage.new_size = retained_size + incoming_size;
+            }
+        } else {
+            new_location = std::make_shared<CacheLocation>();
+            if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+                new_location->set_id(*interned_location_id);
+            } else {
+                new_location->set_id(task.location_id);
+            }
+            std::vector<LocationSpec> specs;
+            specs.reserve(task.SpecCount());
+            for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
+                specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, spec_index));
+            }
+            new_location->set_location_specs(std::move(specs));
+            usage.new_size = incoming_size;
+        }
+        new_location->set_type(task.type);
+        new_location->set_status(task.status);
+        new_location->set_create_time(batch_create_time);
+        new_location->set_spec_size(new_location->location_specs().size());
+        if (final_specs_validated) {
+            new_location->set_validated_total_size(usage.new_size);
+        }
+        out_location = std::move(new_location);
+        return EC_OK;
+    };
+
+    auto modifier = [&tasks, &keys, &ensure_write_lease, &merge_one_location](
+                        const std::vector<ErrorCode> &get_ecs,
+                        const LocationIdVector &location_ids,
+                        size_t key_index,
+                        CacheLocationVector &locations,
+                        PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        if (location_ids.empty()) {
+            return {ModifierAction::MA_SKIP, {}};
+        }
+        const ErrorCode lease_ec = ensure_write_lease();
+        if (lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), lease_ec)};
+        }
+        if (key_index >= keys.size() || get_ecs.size() != location_ids.size() ||
+            locations.size() != location_ids.size() || tasks.Size(key_index) != location_ids.size()) {
             return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), EC_MISMATCH)};
         }
 
         std::vector<ErrorCode> modifier_ecs(location_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
         for (size_t location_index = 0; location_index < location_ids.size(); ++location_index) {
-            const auto &task = tasks_per_key[key_index][location_index];
-            if (location_ids[location_index] != task.location_id) {
-                modifier_ecs[location_index] = EC_MISMATCH;
-                continue;
-            }
-
-            const ErrorCode get_ec = get_ecs[location_index];
-            if (get_ec != EC_OK && get_ec != EC_NOENT) {
-                modifier_ecs[location_index] = get_ec;
-                KVCM_LOG_WARN("load target location failed, key[%lu](%lu), location_id[%s], return[%d]",
-                              key_index,
-                              keys[key_index],
-                              task.location_id.c_str(),
-                              get_ec);
-                continue;
-            }
-
-            const size_t usage_index = usage_offsets[key_index] + location_index;
-            auto &usage = usage_changes[usage_index];
-            const std::uint64_t incoming_size = incoming_task_sizes[usage_index];
-            std::shared_ptr<CacheLocation> new_location;
-            if (get_ec == EC_OK) {
-                if (!locations[location_index] || locations[location_index]->type() != task.type) {
-                    modifier_ecs[location_index] =
-                        locations[location_index] ? ErrorCode::EC_BADARGS : ErrorCode::EC_MISMATCH;
-                    continue;
-                }
-                std::uint64_t replaced_old_size = 0;
-                bool has_legacy_duplicate_names = false;
-                const auto &old_specs = locations[location_index]->location_specs();
-                bool old_size_overflow = false;
-                for (size_t old_index = 0; old_index < old_specs.size(); ++old_index) {
-                    const auto &old_spec = old_specs[old_index];
-                    std::uint64_t old_spec_size = 0;
-                    if (DataStorageUri old_uri(old_spec.uri()); old_uri.Valid()) {
-                        old_uri.GetParamAs<std::uint64_t>("size", old_spec_size);
-                    }
-                    if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.old_size) {
-                        old_size_overflow = true;
-                        break;
-                    }
-                    usage.old_size += old_spec_size;
-                    if (std::any_of(task.specs.begin(), task.specs.end(), [&old_spec](const auto &new_spec) {
-                            return new_spec.name() == old_spec.name();
-                        })) {
-                        if (old_spec_size > std::numeric_limits<std::uint64_t>::max() - replaced_old_size) {
-                            old_size_overflow = true;
-                            break;
-                        }
-                        replaced_old_size += old_spec_size;
-                    }
-                    has_legacy_duplicate_names =
-                        has_legacy_duplicate_names ||
-                        std::any_of(old_specs.begin(), old_specs.begin() + old_index, [&old_spec](const auto &prior) {
-                            return prior.name() == old_spec.name();
-                        });
-                }
-                if (old_size_overflow) {
-                    modifier_ecs[location_index] = EC_BADARGS;
-                    continue;
-                }
-                usage.has_old = true;
-                new_location = std::make_shared<CacheLocation>(*locations[location_index]);
-                MergeLocationSpecsByName(new_location->mutable_location_specs(), task.specs);
-                if (has_legacy_duplicate_names) {
-                    usage.new_size = 0;
-                    for (const auto &merged_spec : new_location->location_specs()) {
-                        std::uint64_t merged_spec_size = 0;
-                        if (DataStorageUri merged_uri(merged_spec.uri()); merged_uri.Valid()) {
-                            merged_uri.GetParamAs<std::uint64_t>("size", merged_spec_size);
-                        }
-                        if (merged_spec_size > std::numeric_limits<std::uint64_t>::max() - usage.new_size) {
-                            modifier_ecs[location_index] = EC_BADARGS;
-                            break;
-                        }
-                        usage.new_size += merged_spec_size;
-                    }
-                    if (modifier_ecs[location_index] != EC_OK) {
-                        continue;
-                    }
-                } else {
-                    const std::uint64_t retained_size = usage.old_size - replaced_old_size;
-                    if (incoming_size > std::numeric_limits<std::uint64_t>::max() - retained_size) {
-                        modifier_ecs[location_index] = EC_BADARGS;
-                        continue;
-                    }
-                    usage.new_size = retained_size + incoming_size;
-                }
-            } else {
-                new_location = std::make_shared<CacheLocation>();
-                new_location->set_id(task.location_id);
-                std::vector<LocationSpec> specs;
-                specs.reserve(task.specs.size());
-                for (const auto &spec : task.specs) {
-                    specs.emplace_back(spec.name(), spec.uri());
-                }
-                new_location->set_location_specs(std::move(specs));
-                usage.new_size = incoming_size;
-            }
-            new_location->set_type(task.type);
-            new_location->set_status(task.status);
-            new_location->set_create_time(batch_create_time);
-            new_location->set_spec_size(new_location->location_specs().size());
-            locations[location_index] = std::move(new_location);
-            updated = true;
+            modifier_ecs[location_index] = merge_one_location(get_ecs[location_index],
+                                                              location_ids[location_index],
+                                                              key_index,
+                                                              location_index,
+                                                              locations[location_index].get(),
+                                                              locations[location_index]);
+            updated = updated || modifier_ecs[location_index] == EC_OK;
         }
         if (!updated) {
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
@@ -2060,8 +2800,60 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
         return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
+    auto single_modifier = [&tasks, &keys, &ensure_write_lease, &merge_one_location](
+                               ErrorCode get_ec,
+                               const LocationId &location_id,
+                               size_t key_index,
+                               const CacheLocation *existing_location,
+                               CacheLocationConstPtr &out_location) -> ModifierResult {
+        const ErrorCode lease_ec = ensure_write_lease();
+        if (lease_ec != EC_OK) {
+            return {ModifierAction::MA_FAIL, lease_ec};
+        }
+        if (key_index >= keys.size() || tasks.Size(key_index) != 1) {
+            return {ModifierAction::MA_FAIL, EC_MISMATCH};
+        }
+        const ErrorCode ec = merge_one_location(get_ec, location_id, key_index, 0, existing_location, out_location);
+        return {ec == EC_OK ? ModifierAction::MA_OK : ModifierAction::MA_SKIP, ec};
+    };
+
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    if (use_single_location_fast_path) {
+        auto result = meta_indexer_->ReadModifyWriteSingleTargetLocations(
+            request_context, keys, single_location_ids, single_modifier);
+        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+
+        bool malformed_result = result.error_codes.size() != keys.size();
+        if (malformed_result) {
+            KVCM_LOG_ERROR("BatchMergeLocationSpecs flat result size mismatch, keys[%zu], results[%zu]",
+                           keys.size(),
+                           result.error_codes.size());
+        }
+        for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+            const ErrorCode key_ec =
+                key_index < result.error_codes.size() ? result.error_codes[key_index] : EC_MISMATCH;
+            out_per_key_ec[key_index] = key_ec;
+            if (key_ec == EC_OK) {
+                const auto &usage = usage_changes[key_index];
+                const auto &task = tasks.At(key_index, 0);
+                if (usage.has_old) {
+                    ApplyStorageUsageChange(meta_indexer_.get(), task.type, usage.old_size, usage.new_size);
+                } else {
+                    meta_indexer_->AddStorageUsageByType(task.type, usage.new_size);
+                }
+            }
+        }
+        ErrorCode final_ec = result.ec;
+        if (result.ec != EC_OK) {
+            KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteSingleTargetLocations failed, ec: %d", result.ec);
+        }
+        if (malformed_result) {
+            final_ec = final_ec == EC_OK ? EC_MISMATCH : (final_ec == EC_MISMATCH ? EC_MISMATCH : EC_PARTIAL_OK);
+        }
+        return final_ec;
+    }
+
     auto result = meta_indexer_->ReadModifyWriteTargetLocations(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
 
@@ -2073,7 +2865,7 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
     }
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
         ErrorCode key_ec = EC_OK;
-        const size_t expected_location_count = tasks_per_key[key_index].size();
+        const size_t expected_location_count = tasks.Size(key_index);
         if (key_index >= result.per_location_error_codes.size() ||
             result.per_location_error_codes[key_index].size() != expected_location_count) {
             key_ec = EC_MISMATCH;
@@ -2088,7 +2880,7 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                     continue;
                 }
                 const auto &usage = usage_changes[usage_offsets[key_index] + location_index];
-                const auto &task = tasks_per_key[key_index][location_index];
+                const auto &task = tasks.At(key_index, location_index);
                 if (usage.has_old) {
                     ApplyStorageUsageChange(meta_indexer_.get(), task.type, usage.old_size, usage.new_size);
                 } else {
@@ -2139,9 +2931,13 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         if (!seen_keys.insert(keys[key_index]).second) {
             invalid_input = true;
         }
-        std::unordered_set<std::string> seen_location_ids;
+        std::unordered_set<std::string_view> seen_location_ids;
+        if (tasks_per_key[key_index].size() > 1) {
+            seen_location_ids.reserve(tasks_per_key[key_index].size());
+        }
         for (const auto &task : tasks_per_key[key_index]) {
-            if (task.location_id.empty() || !seen_location_ids.insert(task.location_id).second) {
+            const auto &location_id = task.ResolvedLocationId();
+            if (location_id.empty() || !seen_location_ids.insert(location_id).second) {
                 invalid_input = true;
             }
         }
@@ -2163,7 +2959,7 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
     for (size_t i = 0; i < keys.size(); ++i) {
         for (size_t task_index = 0; task_index < tasks_per_key[i].size(); ++task_index) {
             flat_keys.push_back(keys[i]);
-            flat_location_ids.push_back({tasks_per_key[i][task_index].location_id});
+            flat_location_ids.push_back({tasks_per_key[i][task_index].ResolvedLocationId()});
             flat_to_original_task_indices.push_back({i, task_index});
             flat_deleted_specs_size.emplace_back(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0);
             flat_missing_targets.push_back(0);
@@ -2237,6 +3033,8 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
 
+        std::uint64_t validated_total_size = 0;
+        const bool old_specs_validated = locs[0]->GetValidatedTotalSize(validated_total_size);
         std::unordered_set<std::string> delete_spec_names(task.spec_names.begin(), task.spec_names.end());
         std::vector<LocationSpec> kept_specs;
         std::vector<LocationSpec> deleted_specs;
@@ -2253,14 +3051,21 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
             return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
 
-        flat_deleted_specs_size[key_index] = std::make_pair(locs[0]->type(), GetLocationSpecsSize(deleted_specs));
+        const std::uint64_t deleted_specs_size = GetLocationSpecsSize(deleted_specs);
+        flat_deleted_specs_size[key_index] = std::make_pair(locs[0]->type(), deleted_specs_size);
         if (kept_specs.empty()) {
             return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
         }
 
         auto new_loc = std::make_shared<CacheLocation>(*locs[0]);
+        if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
+            new_loc->set_id(*interned_location_id);
+        }
         new_loc->set_location_specs(std::move(kept_specs));
         new_loc->set_spec_size(new_loc->location_specs().size());
+        if (old_specs_validated && deleted_specs_size <= validated_total_size) {
+            new_loc->set_validated_total_size(validated_total_size - deleted_specs_size);
+        }
         locs[0] = std::move(new_loc);
         return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };

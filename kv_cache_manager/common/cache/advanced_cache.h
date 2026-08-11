@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "kv_cache_manager/common/cache/cache.h"
 
@@ -42,6 +43,16 @@ class Cache {
 public: // types hidden from API client
     // Opaque handle to an entry stored in the cache.
     struct Handle {};
+
+    // Caller-owned workspace for allocation-free repeated batch lookup and
+    // release. The fields are intentionally generic storage owned by Cache;
+    // callers only prepare and pass the object back to the same cache.
+    struct BatchOperationScratch {
+        std::vector<uint32_t> hashes;
+        std::vector<size_t> shard_offsets;
+        std::vector<size_t> cursors;
+        std::vector<size_t> ordered_indices;
+    };
 
 public: // types hidden from Cache implementation
     // Pointer to cached object of unspecified type. (This type alias is
@@ -310,6 +321,21 @@ public: // functions
         }
     }
 
+    // Reserve implementation-specific batch workspace before entering a
+    // caller's critical section. The default backend needs no workspace.
+    virtual void PrepareBatchOperationScratch(size_t /*max_count*/, BatchOperationScratch * /*scratch*/) {}
+
+    // Scratch-aware variants preserve the ordinary Handle lifetime contract.
+    // Backends without a specialized implementation delegate to the existing
+    // methods, so decorators and alternate cache implementations keep their
+    // behavior unchanged.
+    virtual void LookupBatchWithScratch(const std::string_view *keys,
+                                        size_t count,
+                                        Handle **out_handles,
+                                        BatchOperationScratch * /*scratch*/) {
+        LookupBatch(keys, count, out_handles);
+    }
+
     // Convenience wrapper when secondary cache not supported
     inline Handle *BasicLookup(const std::string_view &key, Statistics *stats) {
         return Lookup(key, nullptr, nullptr, Priority::LOW, stats);
@@ -342,6 +368,10 @@ public: // functions
                 Release(handles[i]);
             }
         }
+    }
+
+    virtual void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch * /*scratch*/) {
+        ReleaseBatch(handles, count);
     }
 
     // Return the object assiciated with a handle returned by a successful
@@ -664,6 +694,17 @@ public:
         target_->LookupBatch(keys, count, out_handles);
     }
 
+    void PrepareBatchOperationScratch(size_t max_count, BatchOperationScratch *scratch) override {
+        target_->PrepareBatchOperationScratch(max_count, scratch);
+    }
+
+    void LookupBatchWithScratch(const std::string_view *keys,
+                                size_t count,
+                                Handle **out_handles,
+                                BatchOperationScratch *scratch) override {
+        target_->LookupBatchWithScratch(keys, count, out_handles, scratch);
+    }
+
     bool Ref(Handle *handle) override { return target_->Ref(handle); }
 
     using Cache::Release;
@@ -672,6 +713,10 @@ public:
     }
 
     void ReleaseBatch(Handle *const *handles, size_t count) override { target_->ReleaseBatch(handles, count); }
+
+    void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override {
+        target_->ReleaseBatchWithScratch(handles, count, scratch);
+    }
 
     ObjectPtr Value(Handle *handle) override { return target_->Value(handle); }
 

@@ -3970,6 +3970,132 @@ class EventReportFunctionalTest(unittest.TestCase):
             baseline_version,
         )
 
+    def test_34_large_partial_batch_preserves_item_alignment_and_retry(self):
+        host = f"large-partial-{time.time_ns()}:8080"
+        base_key = 34_000_000_000 + time.time_ns() % 1_000_000_000
+        event_count = 512
+        invalid_indices = set(range(0, event_count, 17))
+
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem"])],
+                trace_id="t34_register",
+            )
+        )
+
+        events = []
+        raw_uris = {}
+        for index in range(event_count):
+            block_key = base_key + index
+            raw_uri = _build_event_report_uri(
+                host,
+                "mem",
+                {"size": str(index + 1), "source": f"large_{index}"},
+            )
+            raw_uris[index] = raw_uri
+            events.append(
+                _ev_block_add(
+                    block_key,
+                    "mem",
+                    _make_single_spec(
+                        "tp0",
+                        "not-a-uri" if index in invalid_indices else raw_uri,
+                    ),
+                )
+            )
+
+        payload = _make_request(
+            self.instance_id,
+            host,
+            events,
+            trace_id="t34_large_partial",
+        )
+        self.assertGreater(len(json.dumps(payload)), 32 * 1024)
+        partial = self.client.report_event(payload, check_ok=False)
+        self.assertEqual(
+            partial.get("header", {}).get("status", {}).get("code"),
+            "INVALID_ARGUMENT",
+            partial,
+        )
+        self.assertEqual(
+            partial.get("item_results"),
+            [
+                "INVALID_ARGUMENT" if index in invalid_indices else "OK"
+                for index in range(event_count)
+            ],
+        )
+        generation = partial.get("committed_snapshot_version", "")
+        self.assertEqual(len(generation), 32)
+        self.assertTrue(partial.get("snapshot_required"))
+
+        valid_samples = [1, event_count // 2 + 1, event_count - 1]
+        invalid_samples = [0, 17, max(invalid_indices)]
+        for index in valid_samples:
+            specs = _query_block_specs(
+                self.client,
+                self.instance_id,
+                base_key + index,
+                f"t34_valid_{index}",
+            )
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].get("name"), "tp0")
+            self.assertEqual(
+                _uri_identity_without_snapshot_version(specs[0]["uri"]),
+                _uri_identity_without_snapshot_version(raw_uris[index]),
+            )
+            self.assertEqual(
+                _snapshot_version_from_uri(self, specs[0]["uri"]),
+                generation,
+            )
+        for index in invalid_samples:
+            self.assertEqual(
+                _query_block_specs(
+                    self.client,
+                    self.instance_id,
+                    base_key + index,
+                    f"t34_invalid_absent_{index}",
+                ),
+                [],
+            )
+
+        retry_events = [
+            _ev_block_add(
+                base_key + index,
+                "mem",
+                _make_single_spec("tp0", raw_uris[index]),
+            )
+            for index in sorted(invalid_indices)
+        ]
+        retry = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                retry_events,
+                trace_id="t34_retry_failed_only",
+            )
+        )
+        self.assertEqual(retry.get("item_results", []), [])
+        self.assertEqual(retry.get("committed_snapshot_version"), generation)
+        self.assertFalse(retry.get("snapshot_required"))
+        for index in invalid_samples:
+            specs = _query_block_specs(
+                self.client,
+                self.instance_id,
+                base_key + index,
+                f"t34_retry_visible_{index}",
+            )
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(
+                _uri_identity_without_snapshot_version(specs[0]["uri"]),
+                _uri_identity_without_snapshot_version(raw_uris[index]),
+            )
+            self.assertEqual(
+                _snapshot_version_from_uri(self, specs[0]["uri"]),
+                generation,
+            )
+
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------

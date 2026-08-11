@@ -3,6 +3,10 @@ syntax = "proto3";
 package kv_cache_manager.proto.meta;
 
 option cc_generic_services = false;
+// HTTP handlers keep request/response messages on one request-scoped arena.
+// This is a C++ allocation policy only; it does not change the wire or JSON
+// representation of any MetaService message.
+option cc_enable_arenas = true;
 
 enum ErrorCode {
     UNSPECIFIED = 0;

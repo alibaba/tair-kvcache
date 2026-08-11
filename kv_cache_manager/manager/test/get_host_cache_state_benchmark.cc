@@ -56,12 +56,16 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
 
     auto make_location = [](std::string_view host) {
         const std::string host_text(host);
-        return std::make_shared<CacheLocation>(
+        auto location = std::make_shared<CacheLocation>(
             "kvs#event_report_l2#mem#" + host_text,
             CacheLocationStatus::CLS_SERVING,
             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
             1,
             std::vector<LocationSpec>{LocationSpec("tp0", "event_report://" + host_text + "/mem")});
+        // Model the in-memory ReportEvent write path, which has already
+        // validated every URI and records the zero aggregate size.
+        location->set_validated_total_size(0);
+        return location;
     };
     const auto location = make_location(kHost);
     const auto other_location = make_location(kOtherHost);
@@ -91,7 +95,10 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     ASSERT_EQ(EC_OK, indexer->Put(request_context.get(), extra_keys, extra_locations, extra_properties).ec);
 
     MetaSearcher searcher(indexer, [](const CacheLocation &) { return true; }, {});
-    const CheckLocDataExistFunc visibility_check = [](const CacheLocation &candidate) {
+    size_t active_worker_count = 4;
+    const MetaSearcher::CheckHostCacheLocationFunc visibility_check = [](const CacheLocation &candidate,
+                                                                         MetaSearcher::HostCacheLocationInfo &out) {
+        out = {};
         std::string_view storage_type;
         std::string_view reporter_medium;
         std::string_view reporter_host;
@@ -99,12 +106,16 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
                 candidate.id(), storage_type, reporter_medium, reporter_host)) {
             return false;
         }
+        const bool uri_structure_prevalidated = candidate.HasValidatedLocationSpecs();
         for (const auto &spec : candidate.location_specs()) {
             std::string_view version;
-            if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version)) {
+            if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version, uri_structure_prevalidated)) {
                 return false;
             }
         }
+        out.has_reporter_identity = true;
+        out.reporter_medium = reporter_medium;
+        out.reporter_host = reporter_host;
         return true;
     };
 
@@ -122,7 +133,7 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
             const auto match = std::find_if(
                 matches.begin(), matches.end(), [](const auto &item) { return item.host_ip_port == kHost; });
             ASSERT_NE(matches.end(), match) << name;
-            ASSERT_EQ(expected_prefix, match->prefix_match_blocks) << name;
+            ASSERT_EQ(expected_prefix, match->local) << name;
             if (iteration >= 0) {
                 elapsed_ms.push_back(elapsed);
             }
@@ -131,7 +142,8 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
         const double average =
             std::accumulate(elapsed_ms.begin(), elapsed_ms.end(), 0.0) / static_cast<double>(elapsed_ms.size());
         std::cout << "[GET_HOST_BENCH] case=" << name << " keys=" << query_keys.size()
-                  << " p50_ms=" << elapsed_ms[elapsed_ms.size() / 2] << " avg_ms=" << average << std::endl;
+                  << " workers=" << active_worker_count << " p50_ms=" << elapsed_ms[elapsed_ms.size() / 2]
+                  << " avg_ms=" << average << std::endl;
     };
 
     auto run_metadata_only = [&](const KeyVector &query_keys, int iterations) {
@@ -155,7 +167,8 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
         const double average =
             std::accumulate(elapsed_ms.begin(), elapsed_ms.end(), 0.0) / static_cast<double>(elapsed_ms.size());
         std::cout << "[GET_HOST_BENCH] case=metadata_only keys=" << query_keys.size()
-                  << " p50_ms=" << elapsed_ms[elapsed_ms.size() / 2] << " avg_ms=" << average << std::endl;
+                  << " workers=" << active_worker_count << " p50_ms=" << elapsed_ms[elapsed_ms.size() / 2]
+                  << " avg_ms=" << average << std::endl;
     };
 
     for (const size_t key_count : {size_t{100'000}, size_t{500'000}, kMaxKeyCount}) {
@@ -171,6 +184,14 @@ TEST_F(GetHostCacheStateBenchmark, DISABLED_MillionKeyPureLocalPrefixScenarios) 
     KeyVector early_metadata_miss = all_hit_keys;
     early_metadata_miss[kEarlyStopIndex] = kBaseKey + static_cast<KeyType>(kMaxKeyCount + 10);
     run_case("early_metadata_miss", early_metadata_miss, kEarlyStopIndex, 5);
+
+    for (const size_t worker_count : {size_t{1}, size_t{2}, size_t{8}, size_t{16}}) {
+        active_worker_count = worker_count;
+        indexer->SetQueryExecutor(
+            std::make_shared<QueryExecutor>(worker_count, /*parallel_threshold*/ 256, /*chunk_size*/ 128, 64));
+        run_metadata_only(all_hit_keys, 3);
+        run_case("all_hit_worker_scaling", all_hit_keys, static_cast<int64_t>(kMaxKeyCount), 3);
+    }
 
     // Skip million-key persistence in a manual latency benchmark; all tested
     // data lives solely in the local in-memory backend.
