@@ -377,6 +377,8 @@ class DataStorageMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(data_storage, copy_keys_qps)
     KVCM_CHRONO_METRICS(data_storage, copy_time_us, DataStorageCopy)
 
+    KVCM_COUNTER_METRICS(data_storage, write_bytes_total) // 按 storage 聚合的累计预估写入字节数
+
 public:
     DataStorageMetricsCollector() = delete;
     explicit DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept;
@@ -384,6 +386,10 @@ public:
     ~DataStorageMetricsCollector() override = default;
 
     bool Init() override;
+
+    void AddWriteBytes(std::uint64_t bytes) {
+        data_storage_write_bytes_total_metrics_ += bytes;
+    }
 };
 
 /* --------------- DataStorageIntervalMetricsCollector ---------------- */

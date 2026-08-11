@@ -1305,6 +1305,11 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
                       block_key);
         return;
     }
+
+    if (metrics_enabled_) {
+        data_storage_manager_->RecordWriteBytes(ctx.dst_storage_name, ctx.total_bytes);
+    }
+
     if (claim == ClaimResult::kWasCancelling) {
         // 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
         CompleteCancelledTask(ctx);

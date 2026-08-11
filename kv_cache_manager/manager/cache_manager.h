@@ -256,6 +256,10 @@ private:
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
                                CacheLocationVector &new_locations);
+    // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
+    // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
+    // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。
+    void RecordWriteBytesForLocations(const CacheLocationVector &locations);
     // 在指定 storage 上为 keys 分配写 location（GenWriteLocation 的单 storage 分配单元，
     // 供多层存储 Mark 路径按 block 路由到不同 storage 复用）。out_locations 与 keys 同序追加。
     ErrorCode GenWriteLocationOnStorage(RequestContext *request_context,

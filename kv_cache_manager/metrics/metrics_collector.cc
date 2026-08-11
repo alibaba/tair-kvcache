@@ -234,6 +234,7 @@ DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_keys_counter);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_time_us);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(copy_keys_qps);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(copy_time_us);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE(write_bytes_total);
 
 DataStorageMetricsCollector::DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
@@ -253,6 +254,7 @@ bool DataStorageMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(create_time_us);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_keys_qps);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_time_us);
+    REGISTER_COUNTER_METRICS_FOR_DATA_STORAGE(write_bytes_total);
 
     return true;
 }

@@ -114,7 +114,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery00) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
-    constexpr int kDataStorageMetricsCount = 9;
+    constexpr int kDataStorageMetricsCount = 10;
     EXPECT_EQ(3, metrics_registry_->GetSize());
 
     DataStorageMetricsCollector collector(metrics_registry_);

@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdint>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
@@ -56,6 +57,10 @@ public:
     Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
     std::vector<ErrorCode> UnLock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
+
+    // 写入量统计统一入口：按 unique_name 找到 backend 的 collector 并累加预估写入字节数。
+    // 普通写入（StartWriteCache）与 Migration Copy 共用。
+    void RecordWriteBytes(const std::string &unique_name, std::uint64_t bytes);
 
 private:
     std::shared_ptr<DataStorageBackend> CreateStorageBackend(const DataStorageType &type);
