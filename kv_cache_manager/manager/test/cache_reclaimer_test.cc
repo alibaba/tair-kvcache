@@ -1699,6 +1699,34 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     }
 }
 
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerStorageTypeWaterLevel) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 90);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 90);
+
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(100);
+    instance_group->quota_.set_quota_config({
+        QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5),
+        QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2),
+    });
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    key_count = 0;
+    max_key_count = 100;
+
+    cache_reclaimer_->job_state_flag_ = true;
+    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(
+        request_context_.get(),
+        instance_group->name(),
+        instance_group->quota(),
+        instance_group->cache_config()->reclaim_strategy(),
+        instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_TRUE(water_level->GetGeneralWaterLevelExceed());
+    EXPECT_FALSE(
+        water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+    EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -3160,6 +3188,65 @@ TEST_F(CacheReclaimerTest, TestFilterLocationCreditsNormalizeTypeAndPredictKeysC
                                               create_age_stats));
     EXPECT_EQ(2, location_ids.front().size());
     EXPECT_EQ(1, predicted_keys);
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocationExcludesEventReportStorage) {
+    const auto instance = InstanceInfoFactory();
+    batch_get_loc_out_maps = {
+        CacheLocationMap{
+            {"event_l1p5",
+             MakeCacheLocation("event_l1p5",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                               "nfs://reporter/l1p5?size=10")},
+            {"event_l2",
+             MakeCacheLocation("event_l2",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                               "nfs://reporter/l2?size=20")},
+        },
+        CacheLocationMap{
+            {"event_l2",
+             MakeCacheLocation("event_l2",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                               "nfs://reporter/l2?size=20")},
+            {"nfs",
+             MakeCacheLocation("nfs",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store/nfs?size=30")},
+        },
+    };
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGeneralWaterLevelExceed(true);
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {10, 11},
+                                              water_level,
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+
+    ASSERT_EQ(2, location_ids.size());
+    EXPECT_TRUE(location_ids[0].empty());
+    ASSERT_EQ(1, location_ids[1].size());
+    EXPECT_EQ("nfs", location_ids[1][0]);
+    EXPECT_EQ(0, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5)]);
+    EXPECT_EQ(0, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)]);
+    EXPECT_EQ(0, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5)]);
+    EXPECT_EQ(0, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)]);
+    EXPECT_EQ(30, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(1, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(0, predicted_keys);
 }
 
 TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHardQuota) {
