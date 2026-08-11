@@ -42,6 +42,23 @@ cc_library(
 )
 
 cc_library(
+    name = "weighted_lru_pool",
+    srcs = ["weighted_lru_pool.cc"],
+    hdrs = ["weighted_lru_pool.h"],
+    deps = [":dynamic_fenwick_tree"],
+)
+
+cc_library(
+    name = "lite_hit_mamba",
+    srcs = ["lite_hit_mamba.cc"],
+    hdrs = ["lite_hit_mamba.h"],
+    deps = [
+        ":hit_curve",
+        ":weighted_lru_pool",
+    ],
+)
+
+cc_library(
     name = "lite_hit",
     srcs = ["lite_hit.cc"],
     hdrs = ["lite_hit.h"],

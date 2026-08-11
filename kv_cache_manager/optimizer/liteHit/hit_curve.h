@@ -26,6 +26,26 @@ struct RequestFact {
     std::vector<HitCurveSegment> hit_curve;
 };
 
+// One breakpoint of a Mamba (linear-attention) request curve. Unlike the
+// full-attention arithmetic runs, recovery jumps checkpoint-by-checkpoint, so
+// the curve is an explicit step function on the TOTAL byte-capacity axis:
+// once min_total_capacity_bytes fits both the Full prefix and the checkpoint
+// state, the request hits hit_blocks blocks.
+struct MambaCurvePoint {
+    uint64_t min_total_capacity_bytes = 0;
+    uint64_t hit_blocks = 0;
+
+    bool operator==(const MambaCurvePoint &other) const {
+        return min_total_capacity_bytes == other.min_total_capacity_bytes && hit_blocks == other.hit_blocks;
+    }
+};
+
+// Points are strictly increasing in both fields (monotone envelope). Empty
+// means no capacity can recover any checkpoint of this request.
+struct MambaRequestFact {
+    std::vector<MambaCurvePoint> points;
+};
+
 // Stateless projection from capacity-independent facts to hit blocks for a
 // concrete capacity. Both the online path and the facts post-query must use
 // this projector; no other component may reimplement the boundary logic.
@@ -41,6 +61,13 @@ public:
     // Hit blocks with unbounded capacity: cold misses remain, capacity misses
     // disappear, so this is the total run length of the curve.
     static uint64_t ProjectInfinite(const RequestFact &fact);
+
+    // Mamba step curve: largest hit_blocks whose threshold fits into the
+    // total byte capacity.
+    static uint64_t ProjectMambaBytes(const MambaRequestFact &fact, uint64_t total_capacity_bytes);
+
+    // Unbounded capacity recovers the furthest resident checkpoint.
+    static uint64_t ProjectMambaInfinite(const MambaRequestFact &fact);
 };
 
 } // namespace kv_cache_manager
