@@ -81,6 +81,27 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
+    // Allocation-light one-location upsert used by pure-local targeted RMW.
+    // The default adapter preserves backend semantics; local memory overrides
+    // it to avoid constructing one temporary unordered_map per key.
+    virtual std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdRefVector &location_ids,
+                                                         const CacheLocationVector &locations) noexcept {
+        if (keys.size() != location_ids.size() || keys.size() != locations.size()) {
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+        CacheLocationMapVector location_maps(keys.size());
+        PropertyMapVector properties(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (location_ids[i] == nullptr) {
+                return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+            }
+            location_maps[i].emplace(*location_ids[i], locations[i]);
+        }
+        return Upsert(request_context, keys, location_maps, properties);
+    }
+
     // 删除整个 key 及其所有 locations 和 properties。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys  待删除的 key 列表
@@ -267,6 +288,45 @@ public:
             const size_t original_index = ambiguous_indices[i];
             out_key_error_codes[original_index] =
                 exists_results[i] == EC_OK ? (exists[i] ? EC_OK : EC_NOENT) : exists_results[i];
+        }
+        return results;
+    }
+
+    // Flat one-location form of GetLocationsWithKeyStatus. The default
+    // adapter is deliberately generic; local memory overrides it so the
+    // common ReportEvent shape allocates O(1) vectors per batch instead of
+    // two tiny vectors per key.
+    virtual std::vector<ErrorCode>
+    GetSingleLocationsWithKeyStatus(RequestContext *request_context,
+                                    const KeyTypeVec &keys,
+                                    const LocationIdRefVector &location_ids,
+                                    CacheLocationVector &out_locations,
+                                    std::vector<ErrorCode> &out_key_error_codes) noexcept {
+        out_locations.assign(keys.size(), CacheLocationConstPtr{});
+        out_key_error_codes.assign(keys.size(), EC_BADARGS);
+        if (keys.size() != location_ids.size()) {
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+        LocationIdsPerKey ids_per_key(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (location_ids[i] == nullptr) {
+                return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+            }
+            ids_per_key[i].push_back(*location_ids[i]);
+        }
+        LocationsPerKey locations_per_key;
+        auto nested_results =
+            GetLocationsWithKeyStatus(request_context, keys, ids_per_key, locations_per_key, out_key_error_codes);
+        std::vector<ErrorCode> results(keys.size(), EC_MISMATCH);
+        if (nested_results.size() != keys.size() || locations_per_key.size() != keys.size() ||
+            out_key_error_codes.size() != keys.size()) {
+            return results;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (nested_results[i].size() == 1 && locations_per_key[i].size() == 1) {
+                results[i] = nested_results[i][0];
+                out_locations[i] = std::move(locations_per_key[i][0]);
+            }
         }
         return results;
     }

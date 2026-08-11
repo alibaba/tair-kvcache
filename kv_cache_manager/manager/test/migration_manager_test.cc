@@ -1877,7 +1877,14 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     indexer->batch_key_size_ = 1;
     indexer->max_key_count_ = 1;
 
-    const std::vector<int64_t> block_keys{814, 815};
+    std::vector<int64_t> block_keys{814, 815};
+    // batch_key_size is a soft limit: every key in one mutex shard remains
+    // in the same batch. Select two shards using this indexer's runtime hash
+    // seed so max_key_count=1 deterministically exercises one successful
+    // batch followed by one capacity failure.
+    while (indexer->GetMutexShardIndex(block_keys[0]) == indexer->GetMutexShardIndex(block_keys[1])) {
+        ++block_keys[1];
+    }
     auto make_request = [&](int64_t block_key) {
         MigrationManager::MigrationRequest req;
         req.instance_group_name = "group_a";

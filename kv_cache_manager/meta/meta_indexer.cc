@@ -5,8 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/common.h"
@@ -17,6 +20,7 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -33,11 +37,53 @@ static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete
 static constexpr const char *kDeleteMetaOperation = "delete";
 static constexpr const char *kExistMetaOperation = "exist";
 static constexpr const char *kGetMetaOperation = "get";
-// Pure-local prefix scans group enough keys to amortize the 1024-shard LRU's
-// lookup/release locks. This is independent from the smaller CPU-projection
-// chunk configured on QueryExecutor. The first range remains bounded so a
-// short prefix still cancels a million-key suffix promptly.
-static constexpr size_t kLocalPrefixReadChunkSize = 4096;
+// Pure-local prefix scans first inspect a bounded window so a short prefix can
+// cancel a million-key suffix promptly. Once that probe succeeds, larger
+// ranges amortize the 1024-shard LRU's lookup/release locks while preserving
+// enough independent work for the query executor.
+static constexpr size_t kLocalPrefixProbeKeyCount = 4096;
+static constexpr size_t kLocalPrefixParallelReadChunkSize = 16384;
+static constexpr size_t kPrefixStateWordBits = 64;
+static_assert(kLocalPrefixProbeKeyCount % kPrefixStateWordBits == 0);
+static_assert(kLocalPrefixParallelReadChunkSize % kPrefixStateWordBits == 0);
+
+struct PrefixLocationScratch {
+    bool in_use = false;
+    CompactLocationsPerKey locations;
+};
+
+thread_local PrefixLocationScratch tls_prefix_location_scratch;
+
+class PrefixLocationScratchLease {
+public:
+    explicit PrefixLocationScratchLease(size_t key_count) {
+        if (key_count <= kLocalPrefixParallelReadChunkSize && !tls_prefix_location_scratch.in_use) {
+            scratch_ = &tls_prefix_location_scratch;
+            scratch_->in_use = true;
+            uses_thread_local_ = true;
+        } else {
+            local_.emplace();
+            scratch_ = &*local_;
+        }
+    }
+
+    ~PrefixLocationScratchLease() {
+        if (uses_thread_local_) {
+            // Retain only allocation capacity. Holding shared_ptr values until
+            // this worker's next query would pin replaced CacheLocations and
+            // make the scratch cache an accidental object cache.
+            scratch_->locations.Clear();
+            scratch_->in_use = false;
+        }
+    }
+
+    CompactLocationsPerKey &locations() noexcept { return scratch_->locations; }
+
+private:
+    std::optional<PrefixLocationScratch> local_;
+    PrefixLocationScratch *scratch_ = nullptr;
+    bool uses_thread_local_ = false;
+};
 } // namespace
 
 class MetaIndexer::ScopedBatchLock {
@@ -67,7 +113,7 @@ public:
 
 private:
     MetaIndexer &indexer_;
-    std::vector<int32_t> shard_indexs_;
+    const std::vector<int32_t> &shard_indexs_;
 };
 
 MetaIndexer::~MetaIndexer() {
@@ -109,6 +155,15 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         backend_manager_.reset();
         return ec;
     }
+    mutex_shard_hash_seed_ = kDefaultMetaShardHashSeed;
+    uint32_t local_cache_hash_seed = 0;
+    if (backend_manager_->GetPureLocalCacheHashSeed(local_cache_hash_seed)) {
+        // Pure-memory RMW batches already hold one metadata mutex shard at a
+        // time. Reusing the LRU's host-specific hash seed makes each such
+        // batch touch only the corresponding subset of LRU shards, avoiding
+        // thousands of redundant LRU lock/unlock cycles for large reports.
+        mutex_shard_hash_seed_ = local_cache_hash_seed;
+    }
     ec = backend_manager_->Open();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta storage backend manager open failed, ec[%d]", instance_id_.c_str(), ec);
@@ -122,10 +177,12 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
         return ec;
     }
-    KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], max key count[%lu], "
+    KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
+                  "], max key count[%lu], "
                   "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
                   instance_id_.c_str(),
                   mutex_shard_num,
+                  mutex_shard_hash_seed_,
                   max_key_count_,
                   batch_key_size_,
                   key_count_.load(),
@@ -138,6 +195,10 @@ void MetaIndexer::SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> 
     if (backend_manager_) {
         backend_manager_->SetRevisitHistogram(histogram);
     }
+}
+
+int32_t MetaIndexer::GetMutexShardIndex(KeyType key) const noexcept {
+    return GetShardIndex(key, mutex_shard_mask_, mutex_shard_hash_seed_);
 }
 
 MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
@@ -838,6 +899,377 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     return location_result;
 }
 
+bool MetaIndexer::SupportsSingleLocationRmw() const noexcept {
+    return backend_manager_ && backend_manager_->SupportsSingleLocationRmw();
+}
+
+MetaIndexer::SingleLocationResult
+MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_context,
+                                                  const KeyVector &keys,
+                                                  const LocationIdRefVector &location_ids,
+                                                  const SingleLocationModifierFunc &modifier) noexcept {
+    const auto &trace_id = request_context->trace_id();
+    if (keys.empty()) {
+        return SingleLocationResult(EC_OK);
+    }
+    if (keys.size() != location_ids.size() || !modifier ||
+        std::any_of(location_ids.begin(), location_ids.end(), [](const LocationId *id) {
+            return id == nullptr || id->empty();
+        })) {
+        PREFIX_INDEXER_LOG(
+            ERROR, "single target RMW invalid inputs, keys[%lu], location ids[%lu]", keys.size(), location_ids.size());
+        return SingleLocationResult(EC_BADARGS);
+    }
+    bool has_duplicate_keys = false;
+    if (std::is_sorted(keys.begin(), keys.end())) {
+        has_duplicate_keys = std::adjacent_find(keys.begin(), keys.end()) != keys.end();
+    } else {
+        std::unordered_set<KeyType> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const KeyType key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
+        }
+    }
+    if (has_duplicate_keys) {
+        PREFIX_INDEXER_LOG(ERROR, "single target RMW requires unique keys");
+        return SingleLocationResult(EC_BADARGS);
+    }
+    if (!SupportsSingleLocationRmw()) {
+        PREFIX_INDEXER_LOG(ERROR, "single target RMW requires a pure local metadata backend");
+        return SingleLocationResult(EC_UNIMPLEMENTED);
+    }
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+
+    // Preserve MakeBatches' observable ordering and capacity behavior: shards
+    // are visited in ascending order, indices within one shard retain request
+    // order, and a whole shard is appended before the soft limit is checked.
+    struct SingleLocationBatch {
+        std::vector<int32_t> shard_indices;
+        std::vector<int32_t> global_indices;
+    };
+    std::vector<std::vector<int32_t>> indices_by_shard(mutex_shards_.size());
+    for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
+        indices_by_shard[GetMutexShardIndex(keys[i])].push_back(i);
+    }
+    std::vector<SingleLocationBatch> batches;
+    batches.reserve(indices_by_shard.size());
+    SingleLocationBatch current_batch;
+    size_t current_batch_size = 0;
+    size_t nonempty_shards_remaining = static_cast<size_t>(std::count_if(
+        indices_by_shard.begin(), indices_by_shard.end(), [](const auto &indices) { return !indices.empty(); }));
+    for (size_t shard_index = 0; shard_index < indices_by_shard.size(); ++shard_index) {
+        const auto &indices = indices_by_shard[shard_index];
+        if (indices.empty()) {
+            continue;
+        }
+        current_batch.shard_indices.push_back(static_cast<int32_t>(shard_index));
+        current_batch.global_indices.reserve(current_batch.global_indices.size() + indices.size());
+        current_batch.global_indices.insert(current_batch.global_indices.end(), indices.begin(), indices.end());
+        current_batch_size += indices.size();
+        --nonempty_shards_remaining;
+        if (current_batch_size >= batch_key_size_ || nonempty_shards_remaining == 0) {
+            batches.push_back(std::move(current_batch));
+            current_batch = SingleLocationBatch{};
+            current_batch_size = 0;
+        }
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
+
+    // Prepare backend-owned lookup/release workspace once, before acquiring
+    // any metadata shard mutex. The same storage is reused by the read and
+    // upsert halves of every batch in this synchronous request.
+    const size_t max_batch_size =
+        std::max_element(batches.begin(), batches.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.global_indices.size() < rhs.global_indices.size();
+        })->global_indices.size();
+    SingleLocationRmwScratch backend_scratch;
+    backend_manager_->PrepareSingleLocationRmwScratch(max_batch_size, backend_scratch);
+
+    SingleLocationResult result(keys.size());
+    std::vector<bool> key_level_failures(keys.size(), false);
+    RmwStats stats;
+    stats.has_index_deserialize = true;
+
+    KeyVector batch_keys;
+    LocationIdRefVector batch_location_ids;
+    CacheLocationViewVector batch_existing_locations;
+    std::vector<ErrorCode> batch_get_ecs;
+    std::vector<ErrorCode> batch_key_get_ecs;
+    KeyVector upsert_keys;
+    LocationIdRefVector upsert_location_ids;
+    CacheLocationVector upsert_locations;
+    std::vector<int32_t> upsert_global_indices;
+    std::vector<bool> upsert_is_new_key;
+    std::vector<size_t> upsert_read_indices;
+    batch_keys.reserve(max_batch_size);
+    batch_location_ids.reserve(max_batch_size);
+    batch_existing_locations.reserve(max_batch_size);
+    batch_get_ecs.reserve(max_batch_size);
+    batch_key_get_ecs.reserve(max_batch_size);
+    upsert_keys.reserve(max_batch_size);
+    upsert_location_ids.reserve(max_batch_size);
+    upsert_locations.reserve(max_batch_size);
+    upsert_global_indices.reserve(max_batch_size);
+    upsert_is_new_key.reserve(max_batch_size);
+    upsert_read_indices.reserve(max_batch_size);
+
+    struct DeferredLocationRelease {
+        CacheLocationVector &locations;
+        ~DeferredLocationRelease() { locations.clear(); }
+    };
+
+    for (const auto &batch : batches) {
+        // Reuse request-shaped buffers across internal batches. Clear happens
+        // before the next ScopedBatchLock, so releasing replacement locations
+        // and growing these vectors never extends metadata lock hold time.
+        batch_keys.clear();
+        batch_location_ids.clear();
+        batch_existing_locations.clear();
+        batch_get_ecs.clear();
+        batch_key_get_ecs.clear();
+        upsert_keys.clear();
+        upsert_location_ids.clear();
+        upsert_locations.clear();
+        upsert_global_indices.clear();
+        upsert_is_new_key.clear();
+        upsert_read_indices.clear();
+        for (const int32_t global_index : batch.global_indices) {
+            batch_keys.push_back(keys[global_index]);
+            batch_location_ids.push_back(location_ids[global_index]);
+        }
+        // Allocate all request-shaped scratch vectors before taking metadata
+        // shard locks. Large ReportEvent requests otherwise extend every lock
+        // hold with allocator work and can amplify allocator futex contention.
+        backend_scratch.retired_locations.clear();
+        // Construct this guard before the shard lock. Reverse destruction
+        // releases the lock first, then drops replaced CacheLocations and
+        // their URI strings outside the metadata critical section.
+        DeferredLocationRelease deferred_location_release{backend_scratch.retired_locations};
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us);
+
+        const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
+        backend_manager_->GetSingleLocationViewsWithKeyStatusInto(nullptr,
+                                                                  batch_keys,
+                                                                  batch_location_ids,
+                                                                  batch_existing_locations,
+                                                                  batch_key_get_ecs,
+                                                                  batch_get_ecs,
+                                                                  backend_scratch);
+        stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+        if (batch_get_ecs.size() != batch_keys.size() || batch_key_get_ecs.size() != batch_keys.size() ||
+            batch_existing_locations.size() != batch_keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "single target RMW result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
+                               "key ecs[%lu]",
+                               batch_keys.size(),
+                               batch_get_ecs.size(),
+                               batch_existing_locations.size(),
+                               batch_key_get_ecs.size());
+            for (const int32_t global_index : batch.global_indices) {
+                result.error_codes[global_index] = EC_MISMATCH;
+                key_level_failures[global_index] = true;
+            }
+            backend_scratch.ReleaseRetainedHandles();
+            continue;
+        }
+
+        for (size_t i = 0; i < batch_keys.size(); ++i) {
+            const int32_t global_index = batch.global_indices[i];
+            ErrorCode get_ec = batch_get_ecs[i];
+            const ErrorCode key_get_ec = batch_key_get_ecs[i];
+            if (key_get_ec != EC_OK && key_get_ec != EC_NOENT) {
+                result.error_codes[global_index] = key_get_ec;
+                key_level_failures[global_index] = true;
+                continue;
+            }
+            if (get_ec == EC_OK &&
+                (!batch_existing_locations[i] || batch_existing_locations[i]->id() != *batch_location_ids[i])) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "single target RMW invalid EC_OK value, key[%ld], requested id[%s]",
+                                   batch_keys[i],
+                                   batch_location_ids[i]->c_str());
+                batch_existing_locations[i] = nullptr;
+                get_ec = EC_MISMATCH;
+            }
+            if (key_get_ec == EC_NOENT && get_ec == EC_OK) {
+                PREFIX_INDEXER_LOG(ERROR,
+                                   "single target RMW key[%ld] reported missing with an existing target location",
+                                   batch_keys[i]);
+                result.error_codes[global_index] = EC_MISMATCH;
+                key_level_failures[global_index] = true;
+                continue;
+            }
+            if (get_ec != EC_OK && get_ec != EC_NOENT) {
+                key_level_failures[global_index] = true;
+            }
+
+            CacheLocationConstPtr new_location;
+            auto [action, modifier_ec] = modifier(get_ec,
+                                                  *batch_location_ids[i],
+                                                  static_cast<size_t>(global_index),
+                                                  batch_existing_locations[i],
+                                                  new_location);
+            if (get_ec != EC_OK && get_ec != EC_NOENT) {
+                modifier_ec = get_ec;
+            }
+            if (action == MA_OK && modifier_ec == EC_OK) {
+                if (!new_location || new_location->id() != *batch_location_ids[i]) {
+                    result.error_codes[global_index] = EC_MISMATCH;
+                    key_level_failures[global_index] = true;
+                    continue;
+                }
+                upsert_keys.push_back(batch_keys[i]);
+                upsert_location_ids.push_back(batch_location_ids[i]);
+                upsert_locations.push_back(std::move(new_location));
+                upsert_global_indices.push_back(global_index);
+                upsert_is_new_key.push_back(key_get_ec == EC_NOENT);
+                upsert_read_indices.push_back(i);
+            } else {
+                if (action == MA_OK && modifier_ec != EC_OK) {
+                    action = MA_SKIP;
+                }
+                if (action == MA_FAIL || action == MA_DELETE || (action != MA_SKIP && action != MA_OK)) {
+                    key_level_failures[global_index] = true;
+                }
+                result.error_codes[global_index] =
+                    action == MA_SKIP ? modifier_ec : (modifier_ec == EC_OK ? EC_ERROR : modifier_ec);
+            }
+        }
+
+        const size_t new_key_count =
+            static_cast<size_t>(std::count(upsert_is_new_key.begin(), upsert_is_new_key.end(), true));
+        stats.put_key_count += static_cast<int64_t>(new_key_count);
+        stats.update_key_count += static_cast<int64_t>(upsert_keys.size() - new_key_count);
+        if (upsert_keys.empty()) {
+            backend_scratch.ReleaseRetainedHandles();
+            continue;
+        }
+
+        const bool capacity_exceeded = new_key_count + GetKeyCount() > max_key_count_;
+        if (!capacity_exceeded) {
+            const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
+            // The read result is dead after modifier evaluation. Reuse its
+            // capacity for writer status instead of allocating another
+            // request-sized vector under the metadata lock.
+            backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(nullptr,
+                                                                            upsert_keys,
+                                                                            upsert_location_ids,
+                                                                            upsert_locations,
+                                                                            upsert_read_indices,
+                                                                            batch_get_ecs,
+                                                                            backend_scratch);
+            stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
+        } else {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "single target RMW put keys count[%lu] + current key count[%lu] > max key count[%lu]",
+                               new_key_count,
+                               GetKeyCount(),
+                               max_key_count_);
+
+            // Compact existing-key updates in place. The old implementation
+            // allocated four subset vectors while all metadata shard locks
+            // were held. New-key positions are already final EC_NOSPC, while
+            // the compacted global indices retain the mapping needed below.
+            for (size_t i = 0; i < upsert_is_new_key.size(); ++i) {
+                if (upsert_is_new_key[i]) {
+                    const int32_t global_index = upsert_global_indices[i];
+                    result.error_codes[global_index] = EC_NOSPC;
+                    key_level_failures[global_index] = true;
+                }
+            }
+            size_t existing_count = 0;
+            for (size_t i = 0; i < upsert_keys.size(); ++i) {
+                if (upsert_is_new_key[i]) {
+                    continue;
+                }
+                if (existing_count != i) {
+                    upsert_keys[existing_count] = upsert_keys[i];
+                    upsert_location_ids[existing_count] = upsert_location_ids[i];
+                    upsert_locations[existing_count] = std::move(upsert_locations[i]);
+                    upsert_global_indices[existing_count] = upsert_global_indices[i];
+                    upsert_read_indices[existing_count] = upsert_read_indices[i];
+                }
+                ++existing_count;
+            }
+            upsert_keys.resize(existing_count);
+            upsert_location_ids.resize(existing_count);
+            upsert_locations.resize(existing_count);
+            upsert_global_indices.resize(existing_count);
+            upsert_read_indices.resize(existing_count);
+
+            if (existing_count > 0) {
+                const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
+                // The get result vector is dead after modifier evaluation and
+                // already has sufficient capacity, so reuse it for writes.
+                backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(nullptr,
+                                                                                upsert_keys,
+                                                                                upsert_location_ids,
+                                                                                upsert_locations,
+                                                                                upsert_read_indices,
+                                                                                batch_get_ecs,
+                                                                                backend_scratch);
+                stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
+                if (batch_get_ecs.size() != existing_count) {
+                    batch_get_ecs.assign(existing_count, EC_MISMATCH);
+                }
+            } else {
+                backend_scratch.ReleaseRetainedHandles();
+            }
+
+            // New keys cannot be admitted, but existing locations retain
+            // ordinary update semantics. Finish this exceptional batch here
+            // because its arrays were compacted in place.
+            for (size_t i = 0; i < existing_count; ++i) {
+                const int32_t global_index = upsert_global_indices[i];
+                const ErrorCode ec = batch_get_ecs[i];
+                result.error_codes[global_index] = ec;
+                if (ec != EC_OK) {
+                    key_level_failures[global_index] = true;
+                    PREFIX_INDEXER_LOG(
+                        ERROR, "single target RMW upsert failed, key[%ld], ec[%d]", keys[global_index], ec);
+                }
+            }
+            continue;
+        }
+
+        int32_t successful_new_keys = 0;
+        if (batch_get_ecs.size() != upsert_keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "single target RMW upsert result size[%lu] mismatch keys[%lu]",
+                               batch_get_ecs.size(),
+                               upsert_keys.size());
+            batch_get_ecs.assign(upsert_keys.size(), EC_MISMATCH);
+        }
+        for (size_t i = 0; i < batch_get_ecs.size(); ++i) {
+            const int32_t global_index = upsert_global_indices[i];
+            result.error_codes[global_index] = batch_get_ecs[i];
+            if (batch_get_ecs[i] != EC_OK) {
+                key_level_failures[global_index] = true;
+                PREFIX_INDEXER_LOG(
+                    ERROR, "single target RMW upsert failed, key[%ld], ec[%d]", keys[global_index], batch_get_ecs[i]);
+            } else if (upsert_is_new_key[i]) {
+                ++successful_new_keys;
+            }
+        }
+        AdjustKeyCountMeta(successful_new_keys);
+    }
+
+    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    const size_t failed_key_count =
+        static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
+    if (failed_key_count == keys.size()) {
+        result.ec = EC_ERROR;
+    } else if (failed_key_count > 0) {
+        result.ec = EC_PARTIAL_OK;
+    }
+    return result;
+}
+
 MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {
     const auto &trace_id = request_context->trace_id();
@@ -1055,17 +1487,34 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
-    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    const size_t chunk_size =
-        std::max(kLocalPrefixReadChunkSize, query_executor_ ? query_executor_->chunk_size() : size_t{256});
-    const size_t chunk_count = 1 + (keys.size() - 1) / chunk_size;
+    // Backend reads and projection are pipelined. Track the union of backend
+    // call intervals so get_io_time_us does not accidentally include visitor
+    // CPU time or double-count overlapping worker reads.
+    std::atomic<size_t> active_backend_reads(0);
+    std::atomic<int64_t> backend_read_interval_start_us(0);
+    std::atomic<int64_t> backend_read_wall_time_us(0);
+    const size_t configured_chunk_size =
+        std::max(kLocalPrefixParallelReadChunkSize, query_executor_ ? query_executor_->chunk_size() : size_t{256});
+    // Keep callback boundaries on 64-key words. The Mamba projection stores
+    // per-host state as disjoint key bit ranges, so concurrent callbacks never
+    // update the same word.
+    const size_t aligned_chunk_size =
+        configured_chunk_size > std::numeric_limits<size_t>::max() - (kPrefixStateWordBits - 1)
+            ? configured_chunk_size
+            : (configured_chunk_size + kPrefixStateWordBits - 1) & ~(kPrefixStateWordBits - 1);
+    // A configuration larger than the request still means one suffix range;
+    // clamp it so absolute range arithmetic cannot wrap around size_t.
+    const size_t parallel_chunk_size = std::min(aligned_chunk_size, keys.size());
+    const size_t first_chunk_size = std::min(kLocalPrefixProbeKeyCount, keys.size());
+    const size_t remaining_chunk_count =
+        first_chunk_size == keys.size() ? 0 : 1 + (keys.size() - first_chunk_size - 1) / parallel_chunk_size;
 
     struct ChunkTerminal {
         size_t index = 0;
         ErrorCode ec = EC_OK;
         bool present = false;
     };
-    std::vector<ChunkTerminal> terminals(chunk_count);
+    std::vector<ChunkTerminal> terminals(1 + remaining_chunk_count);
     std::atomic<size_t> metadata_stop(keys.size());
     std::atomic<size_t> visitor_stop(keys.size());
     std::atomic<size_t> read_key_count(0);
@@ -1085,15 +1534,28 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
                            &metadata_stop,
                            &visitor_stop,
                            &read_key_count,
+                           &active_backend_reads,
+                           &backend_read_interval_start_us,
+                           &backend_read_wall_time_us,
                            &reduce_stop_index,
-                           &current_stop,
-                           chunk_size](size_t chunk_begin, size_t count) {
+                           &current_stop](size_t chunk_begin, size_t count, size_t terminal_slot) {
         if (chunk_begin >= current_stop()) {
             return;
         }
 
-        CompactLocationsPerKey locations;
+        PrefixLocationScratchLease scratch_lease(count);
+        auto &locations = scratch_lease.locations();
+        const int64_t backend_read_begin_us = TimestampUtil::GetCurrentTimeUs();
+        if (active_backend_reads.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            backend_read_interval_start_us.store(backend_read_begin_us, std::memory_order_release);
+        }
         auto errors = backend_manager_->GetLocationValuesCompact(nullptr, keys.data() + chunk_begin, count, locations);
+        const int64_t backend_read_end_us = TimestampUtil::GetCurrentTimeUs();
+        const int64_t interval_start_us = backend_read_interval_start_us.load(std::memory_order_acquire);
+        if (active_backend_reads.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            backend_read_wall_time_us.fetch_add(std::max<int64_t>(backend_read_end_us - interval_start_us, 0),
+                                                std::memory_order_relaxed);
+        }
         read_key_count.fetch_add(count, std::memory_order_relaxed);
 
         size_t successful_count = 0;
@@ -1118,30 +1580,32 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
             reduce_stop_index(visitor_stop, requested_stop);
         }
         if (terminal_ec != EC_OK) {
-            auto &terminal = terminals[chunk_begin / chunk_size];
+            auto &terminal = terminals[terminal_slot];
             terminal.index = chunk_begin + successful_count;
             terminal.ec = terminal_ec;
             terminal.present = true;
             reduce_stop_index(metadata_stop, terminal.index);
         }
     };
-    auto read_ranges = [&read_one_chunk, &current_stop, &keys, chunk_size](size_t begin, size_t end) {
-        for (size_t chunk_begin = begin; chunk_begin < end; chunk_begin += chunk_size) {
+    auto read_ranges = [&read_one_chunk, &current_stop, &keys, first_chunk_size, parallel_chunk_size](size_t begin,
+                                                                                                      size_t end) {
+        for (size_t chunk_begin = begin; chunk_begin < end;) {
             if (chunk_begin >= current_stop()) {
                 return;
             }
-            const size_t chunk_end = std::min(end, std::min(keys.size(), chunk_begin + chunk_size));
-            read_one_chunk(chunk_begin, chunk_end - chunk_begin);
+            const size_t chunk_end = chunk_begin + std::min(parallel_chunk_size, end - chunk_begin);
+            const size_t terminal_slot = 1 + (chunk_begin - first_chunk_size) / parallel_chunk_size;
+            read_one_chunk(chunk_begin, chunk_end - chunk_begin, terminal_slot);
+            chunk_begin = chunk_end;
         }
     };
 
     bool completed = true;
-    const size_t first_chunk_size = std::min(chunk_size, keys.size());
     try {
         // Candidate hosts are derived from key zero. Visiting this chunk before
         // scheduling the suffix makes every later callback independent and
         // allows an early host miss to cancel all suffix metadata reads.
-        read_one_chunk(0, first_chunk_size);
+        read_one_chunk(0, first_chunk_size, 0);
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("first compact local location read failed: %s", e.what());
         completed = false;
@@ -1156,7 +1620,8 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
             read_ranges(first_chunk_size + begin, first_chunk_size + end);
         };
         if (query_executor_) {
-            completed = query_executor_->ParallelForWithChunkSize(remaining_count, chunk_size, read_remaining_ranges);
+            completed =
+                query_executor_->ParallelForWithChunkSize(remaining_count, parallel_chunk_size, read_remaining_ranges);
         } else {
             try {
                 read_remaining_ranges(0, remaining_count);
@@ -1180,7 +1645,10 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         prefix_result.stopped_by_visitor =
             first_visitor_stop <= first_metadata_error && first_visitor_stop < keys.size();
         if (first_metadata_error < first_visitor_stop && first_metadata_error < keys.size()) {
-            const auto &terminal = terminals[first_metadata_error / chunk_size];
+            const size_t terminal_slot = first_metadata_error < first_chunk_size
+                                             ? 0
+                                             : 1 + (first_metadata_error - first_chunk_size) / parallel_chunk_size;
+            const auto &terminal = terminals[terminal_slot];
             if (!terminal.present || terminal.index != first_metadata_error) {
                 prefix_result.terminal_ec = EC_MISMATCH;
                 prefix_result.valid_key_count = 0;
@@ -1196,8 +1664,10 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         }
     }
 
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                       meta_indexer,
+                                       get_io_time_us,
+                                       backend_read_wall_time_us.load(std::memory_order_relaxed));
     return prefix_result;
 }
 
@@ -1448,7 +1918,7 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
 
     std::map<int32_t, std::vector<int32_t>> shard_map;
     for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
-        const int32_t shard_idx = GetShardIndex(keys[i], mutex_shard_mask_);
+        const int32_t shard_idx = GetMutexShardIndex(keys[i]);
         shard_map[shard_idx].push_back(i);
     }
     if (shard_map.empty()) {

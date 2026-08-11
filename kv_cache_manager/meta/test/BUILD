@@ -34,6 +34,8 @@ cc_test(
     deps = [
         ":meta_indexer_testlib",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
 

@@ -122,6 +122,190 @@ TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
     EXPECT_FALSE(selected[2][0]);
 }
 
+TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathPreservesKeyStatusAndMetadata) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_fast_path", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string target_id = "target";
+    const std::string sibling_id = "sibling";
+    auto old_target = std::make_shared<CacheLocation>();
+    old_target->set_id(target_id);
+    auto sibling = std::make_shared<CacheLocation>();
+    sibling->set_id(sibling_id);
+    CacheLocationMapVector seed_locations(2);
+    seed_locations[0].emplace(target_id, old_target);
+    seed_locations[0].emplace(sibling_id, sibling);
+    PropertyMapVector seed_properties(2);
+    seed_properties[1].emplace("property_only", "preserved");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, seed_locations, seed_properties));
+
+    const LocationIdRefVector target_ids{&target_id, &target_id, &target_id};
+    auto stale = std::make_shared<CacheLocation>();
+    stale->set_id("stale");
+    CacheLocationVector selected(3, stale);
+    std::vector<ErrorCode> key_error_codes;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}),
+              meta_storage_backend_->GetSingleLocationsWithKeyStatus(
+                  nullptr, {1, 2, 3}, target_ids, selected, key_error_codes));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_error_codes);
+    ASSERT_EQ(3u, selected.size());
+    EXPECT_EQ(old_target, selected[0]);
+    EXPECT_FALSE(selected[1]);
+    EXPECT_FALSE(selected[2]);
+
+    auto replacement = std::make_shared<CacheLocation>();
+    replacement->set_id(target_id);
+    replacement->set_status(CLS_SERVING);
+    auto property_key_location = std::make_shared<CacheLocation>();
+    property_key_location->set_id(target_id);
+    auto new_key_location = std::make_shared<CacheLocation>();
+    new_key_location->set_id(target_id);
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+        meta_storage_backend_->UpsertSingleLocations(
+            nullptr, {1, 2, 3}, target_ids, CacheLocationVector{replacement, property_key_location, new_key_location}));
+
+    CacheLocationMapVector stored_locations;
+    PropertyMapVector stored_properties;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Get(nullptr, {1, 2, 3}, stored_locations, stored_properties));
+    ASSERT_EQ(2u, stored_locations[0].size());
+    EXPECT_EQ(replacement, stored_locations[0].at(target_id));
+    EXPECT_EQ(sibling, stored_locations[0].at(sibling_id));
+    ASSERT_EQ(1u, stored_locations[1].size());
+    EXPECT_EQ(property_key_location, stored_locations[1].at(target_id));
+    EXPECT_EQ("preserved", stored_properties[1].at("property_only"));
+    ASSERT_EQ(1u, stored_locations[2].size());
+    EXPECT_EQ(new_key_location, stored_locations[2].at(target_id));
+}
+
+TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_retained_handles", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string target_id = "target";
+    auto old_target = std::make_shared<CacheLocation>();
+    old_target->set_id(target_id);
+    CacheLocationMapVector seed_locations(2);
+    seed_locations[0].emplace(target_id, old_target);
+    PropertyMapVector seed_properties(2);
+    seed_properties[1].emplace("property_only", "preserved");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, seed_locations, seed_properties));
+
+    auto *backend = GetLocalBackend();
+    SingleLocationRmwScratch scratch;
+    backend->PrepareSingleLocationRmwScratch(3, scratch);
+    const KeyTypeVec read_keys{1, 2, 3};
+    const LocationIdRefVector read_ids{&target_id, &target_id, &target_id};
+    CacheLocationViewVector selected_views;
+    std::vector<ErrorCode> key_ecs;
+    std::vector<ErrorCode> location_ecs;
+    const long old_target_use_count = old_target.use_count();
+    backend->GetSingleLocationViewsWithKeyStatusInto(
+        nullptr, read_keys, read_ids, selected_views, key_ecs, location_ecs, scratch);
+    EXPECT_TRUE(scratch.HasRetainedHandles());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}), location_ecs);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_ecs);
+    ASSERT_EQ(3u, selected_views.size());
+    EXPECT_EQ(old_target.get(), selected_views[0]);
+    EXPECT_EQ(nullptr, selected_views[1]);
+    EXPECT_EQ(old_target_use_count, old_target.use_count());
+
+    auto replacement = std::make_shared<CacheLocation>();
+    replacement->set_id(target_id);
+    replacement->set_status(CLS_SERVING);
+    auto new_key_location = std::make_shared<CacheLocation>();
+    new_key_location->set_id(target_id);
+    std::vector<ErrorCode> write_ecs;
+    CacheLocationVector replacements{replacement, new_key_location};
+    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
+        nullptr, {1, 3}, {&target_id, &target_id}, replacements, {0, 2}, write_ecs, scratch);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), write_ecs);
+    EXPECT_FALSE(scratch.HasRetainedHandles());
+    ASSERT_EQ(1u, scratch.retired_locations.size());
+    EXPECT_EQ(old_target, scratch.retired_locations[0]);
+    scratch.retired_locations.clear();
+
+    CacheLocationMapVector stored_locations;
+    PropertyMapVector stored_properties;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Get(nullptr, {1, 2, 3}, stored_locations, stored_properties));
+    EXPECT_EQ(replacement, stored_locations[0].at(target_id));
+    EXPECT_TRUE(stored_locations[1].empty());
+    EXPECT_EQ("preserved", stored_properties[1].at("property_only"));
+    EXPECT_EQ(new_key_location, stored_locations[2].at(target_id));
+
+    // Invalid subset metadata must fail the whole write and release the read
+    // handle, so an early validation return cannot pin an LRU entry.
+    CacheLocationVector selected;
+    backend->GetSingleLocationsWithKeyStatusInto(nullptr,
+                                                 {1},
+                                                 {&target_id},
+                                                 selected,
+                                                 key_ecs,
+                                                 location_ecs,
+                                                 scratch,
+                                                 /*retain_handles=*/true);
+    ASSERT_TRUE(scratch.HasRetainedHandles());
+    CacheLocationVector invalid_replacement{replacement};
+    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
+        nullptr, {1}, {&target_id}, invalid_replacement, {1}, write_ecs, scratch);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), write_ecs);
+    EXPECT_FALSE(scratch.HasRetainedHandles());
+}
+
+TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathValidatesBatchAndPreservesDuplicateOrder) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_edge_cases", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string first_id = "first";
+    const std::string second_id = "second";
+    auto first_old = std::make_shared<CacheLocation>();
+    first_old->set_id(first_id);
+    auto second = std::make_shared<CacheLocation>();
+    second->set_id(second_id);
+    auto first_new = std::make_shared<CacheLocation>();
+    first_new->set_id(first_id);
+    first_new->set_status(CLS_SERVING);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->UpsertSingleLocations(nullptr,
+                                                           {10, 10, 10},
+                                                           LocationIdRefVector{&first_id, &second_id, &first_id},
+                                                           CacheLocationVector{first_old, second, first_new}));
+
+    CacheLocationMapVector stored_locations;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->GetLocations(nullptr, {10}, stored_locations));
+    ASSERT_EQ(2u, stored_locations[0].size());
+    EXPECT_EQ(first_new, stored_locations[0].at(first_id));
+    EXPECT_EQ(second, stored_locations[0].at(second_id));
+
+    const std::string mismatched_id = "mismatched";
+    auto malformed = std::make_shared<CacheLocation>();
+    malformed->set_id(mismatched_id);
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}),
+        meta_storage_backend_->UpsertSingleLocations(
+            nullptr, {20, 21}, LocationIdRefVector{&first_id, &first_id}, CacheLocationVector{first_old, malformed}));
+    std::vector<bool> exists;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), meta_storage_backend_->Exists(nullptr, {20, 21}, exists));
+    EXPECT_EQ((std::vector<bool>{false, false}), exists);
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}),
+              meta_storage_backend_->UpsertSingleLocations(
+                  nullptr, {30}, LocationIdRefVector{nullptr}, CacheLocationVector{first_old}));
+    EXPECT_TRUE(meta_storage_backend_->UpsertSingleLocations(nullptr, {}, {}, {}).empty());
+
+    CacheLocationVector empty_locations{first_old};
+    std::vector<ErrorCode> empty_key_error_codes{EC_ERROR};
+    EXPECT_TRUE(
+        meta_storage_backend_->GetSingleLocationsWithKeyStatus(nullptr, {}, {}, empty_locations, empty_key_error_codes)
+            .empty());
+    EXPECT_TRUE(empty_locations.empty());
+    EXPECT_TRUE(empty_key_error_codes.empty());
+}
+
 TEST_F(MetaLocalBackendTest, TestInit) {
     // invalid config
     ASSERT_EQ(EC_BADARGS, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));

@@ -45,8 +45,16 @@ using PropertyMapVector = std::vector<PropertyMap>;
 // ---------- Location primitives ----------
 using LocationId = std::string;
 using LocationIdVector = std::vector<LocationId>;
+// Borrowed ids used by the pure-local one-location RMW fast path. The owner
+// (normally a MetaSearcher task vector) must outlive the synchronous call.
+using LocationIdRefVector = std::vector<const LocationId *>;
 using LocationIdsPerKey = std::vector<LocationIdVector>;
 using LocationsPerKey = std::vector<CacheLocationVector>;
+// Non-owning immutable values used only by the synchronous pure-local RMW
+// path. The retained cache handles and metadata shard locks keep the backing
+// MetaMemCacheItem (and its location map) alive until the matching write or
+// explicit handle release. These views must never escape that interval.
+using CacheLocationViewVector = std::vector<const CacheLocation *>;
 
 // A maintenance scan reads keys and their locations from the authoritative
 // backend without updating online access/LRU state. The three vectors are
@@ -97,6 +105,17 @@ using LocationModifierFunc = std::function<LocationModifierResult(const std::vec
                                                                   size_t /*key_index*/,
                                                                   CacheLocationVector & /*locs*/,
                                                                   PropertyMap & /*upsert_property_map*/)>;
+
+// Allocation-light targeted-upsert modifier for the common one-location-per-
+// key ReportEvent shape. `existing_location` is a borrowed immutable view
+// protected by the synchronous RMW's retained cache handle and shard lock;
+// `out_location` receives the independently-owned replacement when MA_OK is
+// returned. MA_DELETE is not supported by this specialized path.
+using SingleLocationModifierFunc = std::function<ModifierResult(ErrorCode /*get_ec*/,
+                                                                const LocationId & /*location_id*/,
+                                                                size_t /*key_index*/,
+                                                                const CacheLocation * /*existing_location*/,
+                                                                CacheLocationConstPtr & /*out_location*/)>;
 
 // ---------- Batch primitives ----------
 // Single-batch view consumed by MetaStorageBackendManager. Fields with suffix
