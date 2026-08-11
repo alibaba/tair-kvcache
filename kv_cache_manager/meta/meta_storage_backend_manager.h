@@ -17,6 +17,7 @@ namespace kv_cache_manager {
 
 class MetaStorageBackendConfig;
 class RequestContext;
+struct SingleLocationRmwScratch;
 
 // Backend orchestrator with two modes (auto-selected at Init):
 //   * Dual-backend: persistent (source-of-truth) + cache (hot cache).
@@ -47,6 +48,24 @@ public:
     // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
+    std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 const CacheLocationVector &locations) noexcept;
+    void PrepareSingleLocationRmwScratch(size_t max_count, SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsInto(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const LocationIdRefVector &location_ids,
+                                   const CacheLocationVector &locations,
+                                   std::vector<ErrorCode> &out_results,
+                                   SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext *request_context,
+                                                       const KeyVector &keys,
+                                                       const LocationIdRefVector &location_ids,
+                                                       CacheLocationVector &locations,
+                                                       const std::vector<size_t> &read_indices,
+                                                       std::vector<ErrorCode> &out_results,
+                                                       SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyVector &keys,
@@ -76,6 +95,26 @@ public:
                                                                   const LocationIdsPerKey &location_ids,
                                                                   LocationsPerKey &out_locations,
                                                                   std::vector<ErrorCode> &out_key_error_codes) noexcept;
+    std::vector<ErrorCode> GetSingleLocationsWithKeyStatus(RequestContext *request_context,
+                                                           const KeyVector &keys,
+                                                           const LocationIdRefVector &location_ids,
+                                                           CacheLocationVector &out_locations,
+                                                           std::vector<ErrorCode> &out_key_error_codes) noexcept;
+    void GetSingleLocationsWithKeyStatusInto(RequestContext *request_context,
+                                             const KeyVector &keys,
+                                             const LocationIdRefVector &location_ids,
+                                             CacheLocationVector &out_locations,
+                                             std::vector<ErrorCode> &out_key_error_codes,
+                                             std::vector<ErrorCode> &out_results,
+                                             SingleLocationRmwScratch &scratch,
+                                             bool retain_handles = false) noexcept;
+    void GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 CacheLocationViewVector &out_locations,
+                                                 std::vector<ErrorCode> &out_key_error_codes,
+                                                 std::vector<ErrorCode> &out_results,
+                                                 SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyVector &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept;
@@ -115,6 +154,8 @@ public:
     // and items are independently sharded/locked and it ignores RequestContext.
     // Redis and cached modes retain their existing batched request semantics.
     bool SupportsConcurrentLocationValueReads() const noexcept;
+    bool SupportsSingleLocationRmw() const noexcept;
+    bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
 private:
     void AsyncRecoverTask() noexcept;

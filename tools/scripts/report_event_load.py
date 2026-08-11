@@ -446,7 +446,7 @@ def build_get_payload(
 
 def parse_host_prefixes(response: Dict) -> Dict[str, int]:
     return {
-        item["host_ip_port"]: int(item["prefix_match_blocks"])
+        item["host_ip_port"]: int(item["local"])
         for item in response.get("hosts", [])
     }
 

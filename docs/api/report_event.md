@@ -822,6 +822,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | D-12 | KVCM 只追加一个合法 s_version，不改变客户端 URI 其他部分 | 基础集成 `_assert_profile_specs_in_locations`；snapshot 集成 `_assert_reporter_scope` |
 | D-13 | 第一条 delta 已创建 generation、metadata 写失败时准确报错，重试复用 generation | `TestReportEventFirstDeltaMetadataFailureReportsFailureAndReusesGeneration` |
 | D-14 | 同一 spec 的折叠事件共享最终 metadata 写入失败结果 | `TestReportEventFoldedDeltaEventsShareFinalWriteFailure` |
+| D-15 | 大于 32 KiB 的部分失败批次保持逐项结果与输入索引严格对齐，只重试失败项后复用 generation 并最终收敛 | snapshot 集成 `test_34_large_partial_batch_preserves_item_alignment_and_retry` |
 | S-01 | snapshot 跨 medium 完整上报、响应返回 generation | `TestReportEventSnapshotReplacesCompleteSpecSetPerBlock`；snapshot 集成 `test_17/22` |
 | S-02 | 同 block 跨 medium 合法，同 block+medium 重复非法 | `TestReportEventRejectsCanonicalDuplicateSnapshotKeysButAllowsDifferentMedia`；snapshot 集成 `test_27_*` |
 | S-03 | snapshot block 内重复 spec name 被拒绝 | `TestReportEventRejectsDuplicateSpecNamesWithinSnapshotBlock` |

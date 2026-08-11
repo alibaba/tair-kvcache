@@ -161,7 +161,13 @@ ErrorCode EventReportBackend::Close() {
     retired_.store(true, std::memory_order_release);
     SetOpen(false);
     SetAvailable(false);
-    liveness_checker_running_.store(false, std::memory_order_release);
+    // Serialize the predicate update with wait_for().  An atomic predicate is
+    // not sufficient to prevent a lost notification when the waiter is
+    // between checking the predicate and actually sleeping.
+    {
+        std::lock_guard<std::mutex> wait_guard(liveness_wait_mutex_);
+        liveness_checker_running_.store(false, std::memory_order_release);
+    }
     liveness_wait_cv_.notify_all();
     if (liveness_checker_thread_.joinable()) {
         liveness_checker_thread_.join();

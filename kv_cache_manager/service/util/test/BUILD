@@ -1,6 +1,6 @@
-package(default_visibility = ["//visibility:private"])
-
 load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
+
+package(default_visibility = ["//visibility:private"])
 
 cc_test(
     name = "ProtoMessageJsonUtilTest",
@@ -14,6 +14,8 @@ cc_test(
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
+        "//kv_cache_manager/service/util:report_event_json_parser",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 

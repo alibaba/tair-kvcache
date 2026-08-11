@@ -52,6 +52,13 @@ public:
         }
     };
 
+    struct SingleLocationResult {
+        ErrorCode ec = EC_OK;
+        std::vector<ErrorCode> error_codes;
+        explicit SingleLocationResult(ErrorCode error_code) : ec(error_code) {}
+        explicit SingleLocationResult(size_t count) : ec(EC_OK), error_codes(count, EC_OK) {}
+    };
+
     struct PrefixLocationResult {
         // terminal_ec is the first backend error that precedes the visitor's
         // stop point. EC_NOENT is a normal metadata-prefix terminator; other
@@ -70,6 +77,8 @@ public:
     // the request key count to continue. Chunks after the first can arrive out
     // of order and concurrently; the first chunk is always visited before
     // any parallel work starts so callers can initialize candidate state.
+    // locations and every view/iterator obtained from it are callback-scoped;
+    // callers must copy any state that needs to outlive the invocation.
     using PrefixLocationVisitor =
         std::function<size_t(size_t begin, const CompactLocationsPerKey &locations, size_t valid_key_count)>;
 
@@ -108,6 +117,15 @@ public:
                                                   const KeyVector &keys,
                                                   const LocationIdsPerKey &location_ids,
                                                   const LocationModifierFunc &modifier) noexcept;
+    // Pure-local fast path for one target location per unique key. It keeps
+    // ids and results flat, avoids per-key temporary maps/vectors, and retains
+    // the same metadata shard locking and key-count semantics as the generic
+    // targeted RMW.
+    SingleLocationResult ReadModifyWriteSingleTargetLocations(RequestContext *request_context,
+                                                              const KeyVector &keys,
+                                                              const LocationIdRefVector &location_ids,
+                                                              const SingleLocationModifierFunc &modifier) noexcept;
+    bool SupportsSingleLocationRmw() const noexcept;
 
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
@@ -119,8 +137,9 @@ public:
                         const KeyVector &keys,
                         CacheLocationMapVector &out_location_maps) noexcept;
     // Lightweight all-location view used by GetHostCacheState. For a single
-    // local backend, large requests are read concurrently through the shared
-    // bounded query executor. Other backend modes remain one batched call.
+    // local backend, VisitLocationValuesForPrefix performs a bounded first
+    // probe and then reads the still-needed suffix through the shared query
+    // executor. Other backend modes remain one batched call.
     Result
     GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
     PrefixLocationResult VisitLocationValuesForPrefix(RequestContext *request_context,
@@ -178,6 +197,7 @@ private:
                                                bool track_created_key_count) noexcept;
 
 private:
+    int32_t GetMutexShardIndex(KeyType key) const noexcept;
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            CacheLocationMapVector &locations,
@@ -243,6 +263,7 @@ private:
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;
     size_t mutex_shard_mask_ = MetaIndexerConfig::kDefaultMutexShardNum - 1;
+    uint64_t mutex_shard_hash_seed_ = 0;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;

@@ -10,6 +10,7 @@
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
+#include "kv_cache_manager/service/util/report_event_json_parser.h"
 
 namespace kv_cache_manager {
 
@@ -43,7 +44,10 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
-    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, reportEvent, ReportEvent, ReportEvent, ReportEvent);
+    RegisterPostHandler(
+        "/api/reportEvent",
+        GetArenaHandler<MetaServiceHttp, proto::meta::ReportEventRequest, proto::meta::ReportEventResponse>(
+            &MetaServiceHttp::ReportEvent, &ReportEventJsonParser::FromMutableNullTerminatedJson));
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getHostCacheState, GetHostCacheState, GetHostCacheState, GetHostCacheState);
 }
