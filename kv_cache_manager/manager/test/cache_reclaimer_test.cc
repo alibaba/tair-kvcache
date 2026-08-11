@@ -2733,9 +2733,8 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     // on absolute scheduler timing, while still requiring the second round to
     // arrive before the original sleep interval would have elapsed again.
     ASSERT_TRUE(WaitUntilSubmittedDelRequests(initial_sleep_interval + std::chrono::milliseconds(1000)));
-    ASSERT_TRUE(WaitUntil(
-        [this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
-        initial_sleep_interval / 2));
+    ASSERT_TRUE(WaitUntil([this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
+                          initial_sleep_interval / 2));
     cache_reclaimer_->Stop(); // join the worker thread
 
     ASSERT_LT(1, ListInstanceGroupCallCount());
@@ -3162,6 +3161,67 @@ TEST_F(CacheReclaimerTest, TestFilterLocationCreditsNormalizeTypeAndPredictKeysC
     EXPECT_EQ(1, predicted_keys);
 }
 
+TEST_F(CacheReclaimerTest, TestFilterLocIDAlwaysSkipsEventReportLocations) {
+    const auto instance = InstanceInfoFactory();
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"event_l1p5",
+         MakeCacheLocation("event_l1p5",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                           "event_report://10.0.0.1:9600/key?size=10")},
+        {"event_l2",
+         MakeCacheLocation("event_l2",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                           "event_report://10.0.0.2:9600/key?size=20")},
+        {"nfs",
+         MakeCacheLocation("nfs",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=30")},
+    }};
+
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+
+    CacheReclaimer::WaterLevelExceed general_water_level;
+    general_water_level.SetGeneralWaterLevelExceed(true);
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              general_water_level,
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    EXPECT_EQ((std::vector<std::string>{"nfs"}), location_ids.front());
+    EXPECT_EQ(0, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5)]);
+    EXPECT_EQ(0, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2)]);
+    EXPECT_EQ(1, counts_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(30, bytes_by_type[ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(1, predicted_keys);
+
+    CacheReclaimer::WaterLevelExceed event_water_level;
+    event_water_level.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, true);
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(),
+                                              instance,
+                                              {1},
+                                              event_water_level,
+                                              location_ids,
+                                              bytes_by_type,
+                                              counts_by_type,
+                                              predicted_keys,
+                                              create_age_stats));
+    ASSERT_EQ(1, location_ids.size());
+    EXPECT_TRUE(location_ids.front().empty());
+    EXPECT_EQ(0, predicted_keys);
+}
+
 TEST_F(CacheReclaimerTest, TestCreditDeadlineDisablesCreditButKeepsPendingAndHardQuota) {
     CacheReclaimerAsyncDeleteConfig config;
     config.inflight_delete_timeout_ms = 1;
@@ -3433,6 +3493,35 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
                                               instance_infos);
     ASSERT_NE(nullptr, zero_effective_usage);
     EXPECT_FALSE(zero_effective_usage->CheckGroupWaterLevelExceed());
+}
+
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerReclaimerWaterLevel) {
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(1ULL << 40);
+    instance_group->quota_.quota_config_.clear();
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+
+    QuotaConfig l1p5_quota;
+    l1p5_quota.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    l1p5_quota.set_capacity(100);
+    QuotaConfig l2_quota;
+    l2_quota.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    l2_quota.set_capacity(100);
+    instance_group->quota_.set_quota_config({l1p5_quota, l2_quota});
+
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 90);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 90);
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+
+    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                   instance_group->name(),
+                                                                   instance_group->quota(),
+                                                                   instance_group->cache_config()->reclaim_strategy(),
+                                                                   instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_FALSE(water_level->CheckGroupWaterLevelExceed());
 }
 
 TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstance) {
@@ -4015,8 +4104,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
         // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
@@ -4071,8 +4160,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -4124,8 +4213,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1
@@ -4149,12 +4238,12 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
     auto make_serving_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_SERVING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
@@ -4200,21 +4289,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
 TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
-    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10,
-        100,
-        1,
-        10,
-        16,
-        rm_,
-        mim_,
-        msm_,
-        spe_,
-        mr_,
-        em_,
-        write_location_manager,
-        CacheReclaimerAsyncDeleteConfig{},
-        mm_);
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
 
     const auto ins_info = InstanceInfoFactory();
     mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
@@ -4227,20 +4315,17 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
         std::lock_guard<std::mutex> lock(mm_->task_mutex_);
         ASSERT_TRUE(mm_->ReservePreparingTaskLocked(preparing_req));
     }
-    write_location_manager->Put("write_session",
-                                {44},
-                                {"client_writing"},
-                                60,
-                                [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
+    write_location_manager->Put(
+        "write_session", {44}, {"client_writing"}, 60, [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
 
     auto make_writing_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_WRITING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_WRITING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
@@ -4397,15 +4482,14 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
 
     const auto ins_info = InstanceInfoFactory();
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
     auto partial_cold_loc = std::make_shared<CacheLocation>(
         "cold_partial",
         CacheLocationStatus::CLS_SERVING,
@@ -4434,21 +4518,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
 
 TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
-    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10,
-        100,
-        1,
-        10,
-        16,
-        rm_,
-        mim_,
-        msm_,
-        spe_,
-        mr_,
-        em_,
-        write_location_manager,
-        CacheReclaimerAsyncDeleteConfig{},
-        mm_);
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
 
     auto ig = InstanceGroupFactory();
     {
@@ -4628,10 +4711,8 @@ bool MigrationManager_SubmitAsyncMigrationPrepare_stub(void *obj, MigrationManag
     return true;
 }
 
-static MigrationStrategy MakeStrategy(const std::string &src,
-                                      const std::string &dst,
-                                      bool copy_enabled,
-                                      bool mark_enabled) {
+static MigrationStrategy
+MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, bool mark_enabled) {
     MigrationStrategy strategy;
     strategy.set_source_storage_name(src);
     strategy.set_target_storage_name(dst);
@@ -4926,8 +5007,8 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareRejectsAmbiguousRoute) {
     config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
     config->set_migration_copy_max_concurrency(1);
     // Direct mutation deliberately bypasses config validation to cover recovered legacy data.
-    config->set_migration_strategies({std::make_shared<MigrationStrategy>(copy_strategy),
-                                      std::make_shared<MigrationStrategy>(mark_strategy)});
+    config->set_migration_strategies(
+        {std::make_shared<MigrationStrategy>(copy_strategy), std::make_shared<MigrationStrategy>(mark_strategy)});
     instance_group->set_cache_config(config);
     EnableAsyncMigration(instance_group, ins_info);
 
@@ -4984,8 +5065,8 @@ TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) 
     bool read_started = false;
     {
         std::unique_lock<std::mutex> lock(async_prepare_read_mutex);
-        read_started = async_prepare_read_cv.wait_for(
-            lock, std::chrono::seconds(3), []() { return async_prepare_read_started; });
+        read_started =
+            async_prepare_read_cv.wait_for(lock, std::chrono::seconds(3), []() { return async_prepare_read_started; });
     }
 
     std::future<void> stop_future;
@@ -5125,8 +5206,7 @@ TEST_F(CacheReclaimerTest, TestExecutorStopCancelsQueuedAsyncMigrationPrepare) {
         release_blocker = true;
     }
     cv.notify_all();
-    const bool stop_completed =
-        stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    const bool stop_completed = stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
 
     EXPECT_TRUE(started);
     EXPECT_TRUE(accepted);
@@ -5206,19 +5286,16 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
     }
 
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {first_instance});
-    const auto pending_after_first_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_first_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
 
     sample_reclaim_call_counter = 0;
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {second_instance, third_instance});
-    const auto pending_after_second_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_second_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_on_second_tick = sample_reclaim_call_counter;
 
     sample_reclaim_call_counter = 0;
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {third_instance});
-    const auto pending_after_full_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_full_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_when_full = sample_reclaim_call_counter;
 
     {
@@ -5231,8 +5308,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
     EXPECT_TRUE(started);
     EXPECT_EQ(1u, pending_after_first_tick);
     EXPECT_EQ(2u, pending_after_second_tick);
-    EXPECT_EQ(1, sampled_on_second_tick)
-        << "only one remaining copy slot may enqueue one instance prepare job";
+    EXPECT_EQ(1, sampled_on_second_tick) << "only one remaining copy slot may enqueue one instance prepare job";
     EXPECT_EQ(2u, pending_after_full_tick);
     EXPECT_EQ(0, sampled_when_full) << "a full pending budget must prune before candidate sampling";
     EXPECT_TRUE(became_idle);
@@ -5550,27 +5626,26 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
     const auto ins_info = InstanceInfoFactory();
 
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
-    auto cold_a = std::make_shared<CacheLocation>(
-        "cold_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
-    auto cold_b = std::make_shared<CacheLocation>(
-        "cold_b",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
+    auto cold_a =
+        std::make_shared<CacheLocation>("cold_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
+    auto cold_b =
+        std::make_shared<CacheLocation>("cold_b",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_full", hot_loc);
@@ -5652,18 +5727,18 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
     const auto ins_info = InstanceInfoFactory();
 
     // hot: SERVING, cold: WRITING(迁移中半成品)
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
-    auto cold_writing = std::make_shared<CacheLocation>(
-        "cold_w",
-        CacheLocationStatus::CLS_WRITING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
+    auto hot_loc =
+        std::make_shared<CacheLocation>("hot_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
+    auto cold_writing =
+        std::make_shared<CacheLocation>("cold_w",
+                                        CacheLocationStatus::CLS_WRITING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_a", hot_loc);

@@ -1407,26 +1407,28 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                                      const std::string &location_id) -> bool {
         return pending_locations_.find(PendingLocationKey{ins_id, block_key, location_id}) != pending_locations_.end();
     };
-    const auto cold_locations_cover_specs = [&is_pending_location, &loc_on_cold_storage](
-                                                 const std::int64_t block_key,
-                                                 const CacheLocationMap &loc_map,
-                                                 const CacheLocation &source_loc) -> bool {
+    const auto cold_locations_cover_specs =
+        [&is_pending_location, &loc_on_cold_storage](
+            const std::int64_t block_key, const CacheLocationMap &loc_map, const CacheLocation &source_loc) -> bool {
         if (source_loc.location_specs().empty()) {
             return false;
         }
         for (const auto &source_spec : source_loc.location_specs()) {
-            const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
-                const auto &loc_ptr = entry.second;
-                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
-                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
-                    return false;
-                }
-                return std::any_of(loc_ptr->location_specs().begin(),
-                                   loc_ptr->location_specs().end(),
-                                   [&source_spec](const auto &cold_spec) {
-                                       return cold_spec.name() == source_spec.name();
-                                   });
-            });
+            const bool covered =
+                std::any_of(loc_map.begin(),
+                            loc_map.end(),
+                            [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
+                                const auto &loc_ptr = entry.second;
+                                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
+                                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
+                                    return false;
+                                }
+                                return std::any_of(loc_ptr->location_specs().begin(),
+                                                   loc_ptr->location_specs().end(),
+                                                   [&source_spec](const auto &cold_spec) {
+                                                       return cold_spec.name() == source_spec.name();
+                                                   });
+                            });
             if (!covered) {
                 return false;
             }
@@ -1454,16 +1456,18 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     continue;
                 }
                 const auto &loc = *loc_ptr;
+                if (IsEventReportStorageType(loc.type())) {
+                    continue;
+                }
                 if (is_pending_location(block_key, loc.id())) {
                     continue;
                 }
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                     migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-                const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
-                                                 write_location_manager_ != nullptr &&
-                                                 !write_location_manager_->HasLocationId(loc.id()) &&
-                                                 !is_active_copy_target;
+                const bool is_orphaned_writing =
+                    loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
+                    !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
                 if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
                     continue;
                 }
@@ -1480,8 +1484,14 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             if (!loc_ptr) {
                 continue;
             }
-            ++valid_location_count;
             const auto &loc = *loc_ptr;
+            // EventReport metadata describes cache owned by an external reporter.
+            // Its lifecycle is reconciled by ReportEvent snapshot/host cleanup and
+            // must never enter the generic physical-storage reclaim pipeline.
+            if (IsEventReportStorageType(loc.type())) {
+                continue;
+            }
+            ++valid_location_count;
             if (is_pending_location(block_key, loc.id())) {
                 METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
                 continue;
@@ -1494,10 +1504,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             const bool is_active_copy_target =
                 loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                 migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-            const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
-                                             write_location_manager_ != nullptr &&
-                                             !write_location_manager_->HasLocationId(loc.id()) &&
-                                             !is_active_copy_target;
+            const bool is_orphaned_writing =
+                loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
+                !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 bool selected_by_water_level = false;
                 if (in_storage_type_eviction_zone) {
@@ -1594,9 +1603,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     return true;
 }
 
-void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
-                                       const std::shared_ptr<const InstanceGroup> &instance_group,
-                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
+void CacheReclaimer::TryMigrateOnGroup(
+    const std::shared_ptr<RequestContext> &request_context,
+    const std::shared_ptr<const InstanceGroup> &instance_group,
+    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         return;
     }
@@ -1747,8 +1757,7 @@ bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestC
 }
 
 std::vector<std::vector<std::string>>
-CacheReclaimer::SnapshotPendingLocations(const std::string &instance_id,
-                                         const std::vector<std::int64_t> &batch) const {
+CacheReclaimer::SnapshotPendingLocations(const std::string &instance_id, const std::vector<std::int64_t> &batch) const {
     std::vector<std::vector<std::string>> snapshot(batch.size());
     for (std::size_t block_idx = 0; block_idx < batch.size(); ++block_idx) {
         const auto block_key = batch[block_idx];
@@ -1987,7 +1996,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
 
         for (std::size_t idx = 1; idx < static_cast<std::size_t>(DataStorageType::COUNT); ++idx) {
             const auto type = static_cast<DataStorageType>(idx);
-            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || IsEventReportStorageType(type)) {
                 continue;
             }
             data->AddGroupUsageByType(type, meta_indexer->GetStorageUsageByType(type));
