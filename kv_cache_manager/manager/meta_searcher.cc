@@ -791,9 +791,54 @@ int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs
     return prefix_len;
 }
 
-bool IsFullLocationSpecGroup(const LocationSpecGroup &group) {
-    const auto &name = group.name();
-    return name.rfind("full", 0) == 0 || name.rfind("FULL", 0) == 0;
+ErrorCode ClassifySpecGroups(RequestContext *request_context,
+                             const std::vector<LocationSpecGroup> &location_spec_groups,
+                             std::vector<const LocationSpecGroup *> &full_groups,
+                             std::vector<const LocationSpecGroup *> &mamba_state_groups) {
+    full_groups.clear();
+    mamba_state_groups.clear();
+    for (const auto &group : location_spec_groups) {
+        const auto &group_name = group.name();
+        const char category = group_name.empty() ? '?' : group_name.front();
+        switch (category) {
+        case 'F':
+            full_groups.push_back(&group);
+            break;
+        case 'L':
+            mamba_state_groups.push_back(&group);
+            break;
+        case 'W':
+        case 'C':
+        case 'E':
+        case 'X': {
+            std::string error_msg =
+                "unsupported location spec category for QT_PREFIX_MATCH_WITH_MAMBA, group: " + group_name +
+                ", category: " + std::string(1, category);
+            request_context->error_tracer()->AddErrorMsg(error_msg);
+            KVCM_LOG_WARN("%s", error_msg.c_str());
+            return EC_BADARGS;
+        }
+        default: {
+            std::string error_msg =
+                "invalid location spec category for QT_PREFIX_MATCH_WITH_MAMBA, group: " + group_name +
+                ", category: " + std::string(1, category);
+            request_context->error_tracer()->AddErrorMsg(error_msg);
+            KVCM_LOG_WARN("%s", error_msg.c_str());
+            return EC_BADARGS;
+        }
+        }
+    }
+
+    if (full_groups.empty() || mamba_state_groups.empty()) {
+        std::string group_names = Jsonizable::ToJsonString(location_spec_groups);
+        std::string error_msg =
+            full_groups.empty() ? "no full location spec group" : "no mamba state location spec group";
+        error_msg += ", location_spec_groups: " + group_names;
+        request_context->error_tracer()->AddErrorMsg(error_msg);
+        KVCM_LOG_WARN("%s", error_msg.c_str());
+        return EC_BADARGS;
+    }
+    return EC_OK;
 }
 
 bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
@@ -1814,21 +1859,9 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
 
     std::vector<const LocationSpecGroup *> full_groups;
     std::vector<const LocationSpecGroup *> mamba_state_groups;
-    for (const auto &group : location_spec_groups) {
-        if (IsFullLocationSpecGroup(group)) {
-            full_groups.push_back(&group);
-        } else {
-            mamba_state_groups.push_back(&group);
-        }
-    }
-    if (full_groups.empty() || mamba_state_groups.empty()) {
-        std::string group_names = Jsonizable::ToJsonString(location_spec_groups);
-        std::string error_msg =
-            full_groups.empty() ? "no full location spec group" : "no mamba state location spec group";
-        error_msg += ", location_spec_groups: " + group_names;
-        request_context->error_tracer()->AddErrorMsg(error_msg);
-        KVCM_LOG_WARN("%s", error_msg.c_str());
-        return EC_BADARGS;
+    auto ec = ClassifySpecGroups(request_context, location_spec_groups, full_groups, mamba_state_groups);
+    if (ec != EC_OK) {
+        return ec;
     }
     if (p2p_host_count == 0) {
         return PrefixMatchWithMambaByHostWithoutP2P(meta_indexer_.get(),

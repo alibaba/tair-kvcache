@@ -3351,7 +3351,7 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
 TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesReference) {
     const std::array<std::string, 2> hosts{"192.168.10.85:8080", "192.168.10.86:8080"};
     const std::array<std::string, 5> mediums{"mem", "disk", "hbm", "ssd", "remote"};
-    const std::array<std::string, 3> spec_names{"tp0", "tp1", "mamba"};
+    const std::array<std::string, 3> spec_names{"tp0", "tp1", "tp2"};
     constexpr int64_t first_key = 96'200;
     constexpr size_t key_count = 32;
     constexpr size_t round_count = 8;
@@ -6557,6 +6557,10 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)->mutable_specs(0)->clear_name();
          }},
+        {"add_unregistered_spec_name",
+         [=](auto *event, int64_t key, const std::string &host) {
+             configure_valid_add(event, key, host)->mutable_specs(0)->set_name("unregistered");
+         }},
         {"add_duplicate_spec_name",
          [=](auto *event, int64_t key, const std::string &host) {
              auto *params = configure_valid_add(event, key, host);
@@ -6604,6 +6608,10 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &) {
              configure_valid_delete(event, key)->set_spec_names(0, "");
          }},
+        {"delete_unregistered_spec_name",
+         [=](auto *event, int64_t key, const std::string &) {
+             configure_valid_delete(event, key)->set_spec_names(0, "unregistered");
+         }},
         {"delete_duplicate_spec_name",
          [=](auto *event, int64_t key, const std::string &) {
              configure_valid_delete(event, key)->add_spec_names("tp0");
@@ -6627,6 +6635,10 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
         {"snapshot_empty_spec_name",
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_snapshot(event, key, host)->mutable_specs(0)->clear_name();
+         }},
+        {"snapshot_unregistered_spec_name",
+         [=](auto *event, int64_t key, const std::string &host) {
+             configure_valid_snapshot(event, key, host)->mutable_specs(0)->set_name("unregistered");
          }},
         {"snapshot_duplicate_spec_name",
          [=](auto *event, int64_t key, const std::string &host) {
@@ -6688,6 +6700,28 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
         EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", host}).empty());
         EXPECT_TRUE(QueryRawEventReportUris(key).empty());
     }
+}
+
+TEST_F(CacheManagerTest, TestReportEventUnregisteredSpecIsIsolatedFromValidItem) {
+    const std::string host = "192.168.12.200:8080";
+    const int64_t invalid_key = 95'900;
+    const int64_t valid_key = 95'901;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto request = MakeAddRequest(host, invalid_key, "unregistered_spec");
+    request.mutable_events(0)->mutable_block_add()->mutable_specs(0)->set_name("unregistered");
+    *request.add_events() = MakeAddRequest(host, valid_key, "registered_spec").events(0);
+
+    const auto [ec, response] = CallReportEvent(request, "unregistered_spec_isolated");
+    EXPECT_EQ(EC_PARTIAL_OK, ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    ASSERT_EQ(2, response.item_results_size());
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(0));
+    EXPECT_EQ(proto::meta::OK, response.item_results(1));
+    EXPECT_TRUE(QueryRawEventReportUris(invalid_key).empty());
+    EXPECT_FALSE(QueryRawEventReportUris(valid_key).empty());
 }
 
 TEST_F(CacheManagerTest, TestReportEventAcceptsSignedAndUnsignedBlockKeySpellingsWithoutChangingBitPattern) {
@@ -8627,14 +8661,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     // then the merged prefix is evaluated with the Mamba state and Eagle POP rules.
     const std::string mamba_instance_id = "test_host_cache_state_mamba_p2p";
     std::vector<LocationSpecInfo> mamba_location_spec_infos = {
-        LocationSpecInfo("full_0", 512),
-        LocationSpecInfo("linear_0", 512),
-        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("F0", 512),
+        LocationSpecInfo("L0", 512),
+        LocationSpecInfo("L1", 512),
     };
     std::vector<LocationSpecGroup> mamba_location_spec_groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("linear_0", {"linear_0"}),
-        LocationSpecGroup("linear_1", {"linear_1"}),
+        LocationSpecGroup("F0", {"F0"}),
+        LocationSpecGroup("L0", {"L0"}),
+        LocationSpecGroup("L1", {"L1"}),
     };
     ASSERT_EQ(expected_reg,
               cache_manager_->RegisterInstance(request_context_.get(),
@@ -8673,13 +8707,13 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
     };
 
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 100, {"full_0", "linear_0", "linear_1"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 200, {"full_0"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 300, {"full_0", "linear_0", "linear_1"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 400, {"full_0", "linear_0"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 200, {"linear_0", "linear_1"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 400, {"linear_1"});
-    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 500, {"full_0", "linear_0", "linear_1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 100, {"F0", "L0", "L1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 200, {"F0"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 300, {"F0", "L0", "L1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L1P5, mamba_host, 400, {"F0", "L0"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 200, {"L0", "L1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 400, {"L1"});
+    report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 500, {"F0", "L0", "L1"});
 
     auto [mamba_ec, mamba_hosts] =
         cache_manager_->GetHostCacheState(request_context_.get(),
@@ -8696,20 +8730,20 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     EXPECT_EQ(4, mamba_hosts[0].p2p_1_total_match);
 
     // Hybrid P2P uses coverage across missing spec positions. Peer A owns the
-    // first two linear_1 positions, while peer B owns four later positions on
+    // first two L1 positions, while peer B owns four later positions on
     // only three distinct block keys. Coverage must select B and fetch=3.
     const std::string coverage_instance_id = "test_host_cache_state_mamba_coverage";
     std::vector<LocationSpecInfo> coverage_spec_infos = {
-        LocationSpecInfo("full_0", 512),
-        LocationSpecInfo("linear_1", 512),
-        LocationSpecInfo("linear_2", 512),
-        LocationSpecInfo("linear_3", 512),
+        LocationSpecInfo("F0", 512),
+        LocationSpecInfo("L1", 512),
+        LocationSpecInfo("L2", 512),
+        LocationSpecInfo("L3", 512),
     };
     std::vector<LocationSpecGroup> coverage_spec_groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("linear_1", {"linear_1"}),
-        LocationSpecGroup("linear_2", {"linear_2"}),
-        LocationSpecGroup("linear_3", {"linear_3"}),
+        LocationSpecGroup("F0", {"F0"}),
+        LocationSpecGroup("L1", {"L1"}),
+        LocationSpecGroup("L2", {"L2"}),
+        LocationSpecGroup("L3", {"L3"}),
     };
     ASSERT_EQ(expected_reg,
               cache_manager_->RegisterInstance(request_context_.get(),
@@ -8750,16 +8784,15 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
     };
 
-    report_coverage_specs(
-        proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 100, {"full_0", "linear_1", "linear_2", "linear_3"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 200, {"full_0"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 300, {"full_0"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 400, {"full_0", "linear_1"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 200, {"linear_1"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 300, {"linear_1"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 200, {"linear_2"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 300, {"linear_2"});
-    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 400, {"linear_2", "linear_3"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 100, {"F0", "L1", "L2", "L3"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 200, {"F0"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 300, {"F0"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L1P5, coverage_host, 400, {"F0", "L1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 200, {"L1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, prefix_peer, 300, {"L1"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 200, {"L2"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 300, {"L2"});
+    report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 400, {"L2", "L3"});
 
     auto [coverage_ec, coverage_hosts] =
         cache_manager_->GetHostCacheState(request_context_.get(),
@@ -8785,7 +8818,7 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         {"10.0.6.6:8080", 3},
         {"10.0.6.7:8080", 1},
     };
-    const std::vector<std::string> all_coverage_specs = {"full_0", "linear_1", "linear_2", "linear_3"};
+    const std::vector<std::string> all_coverage_specs = {"F0", "L1", "L2", "L3"};
     for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
         const auto &[host, prefix_len] = mamba_top5_hosts[i];
         const auto storage_type = i == 0 ? proto::meta::ST_EVENT_REPORT_L2 : proto::meta::ST_EVENT_REPORT_L1P5;
@@ -8887,14 +8920,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_host_cache_state_mamba";
     std::vector<LocationSpecInfo> location_spec_infos = {
-        LocationSpecInfo("full_0", 512),
-        LocationSpecInfo("linear_0", 512),
-        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("F0", 512),
+        LocationSpecInfo("L0", 512),
+        LocationSpecInfo("L1", 512),
     };
     std::vector<LocationSpecGroup> location_spec_groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("linear_0", {"linear_0"}),
-        LocationSpecGroup("linear_1", {"linear_1"}),
+        LocationSpecGroup("F0", {"F0"}),
+        LocationSpecGroup("L0", {"L0"}),
+        LocationSpecGroup("L1", {"L1"}),
     };
     ASSERT_EQ(expected_reg,
               cache_manager_->RegisterInstance(request_context_.get(),
@@ -8950,28 +8983,28 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     InitializeEventReporter(instance_id, host_c, proto::meta::ST_EVENT_REPORT_L1P5);
     InitializeEventReporter(instance_id, host_e, proto::meta::ST_EVENT_REPORT_L1P5);
 
-    report_specs(host_a, 100, {"full_0", "linear_0", "linear_1"});
-    report_specs(host_a, 200, {"full_0"});
-    report_specs(host_a, 300, {"full_0"});
-    report_specs(host_a, 300, {"linear_0", "linear_1"});
-    report_specs(host_a, 400, {"full_0", "linear_0"});
+    report_specs(host_a, 100, {"F0", "L0", "L1"});
+    report_specs(host_a, 200, {"F0"});
+    report_specs(host_a, 300, {"F0"});
+    report_specs(host_a, 300, {"L0", "L1"});
+    report_specs(host_a, 400, {"F0", "L0"});
 
-    report_specs(host_b, 100, {"full_0"});
-    report_specs(host_b, 200, {"full_0"});
-    report_specs(host_b, 300, {"full_0"});
-    report_specs(host_b, 400, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_b, 100, {"F0"});
+    report_specs(host_b, 200, {"F0"});
+    report_specs(host_b, 300, {"F0"});
+    report_specs(host_b, 400, {"F0", "L0", "L1"});
 
-    report_specs(host_c, 100, {"full_0"});
-    report_specs(host_c, 200, {"full_0"});
+    report_specs(host_c, 100, {"F0"});
+    report_specs(host_c, 200, {"F0"});
 
-    report_specs(host_e, 100, {"full_0", "linear_0", "linear_1"});
-    report_specs(host_e, 200, {"full_0", "linear_0", "linear_1"});
-    report_specs(host_e, 300, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_e, 100, {"F0", "L0", "L1"});
+    report_specs(host_e, 200, {"F0", "L0", "L1"});
+    report_specs(host_e, 300, {"F0", "L0", "L1"});
 
     const std::string host_d = "10.0.1.4:8080";
     InitializeEventReporter(instance_id, host_d, proto::meta::ST_EVENT_REPORT_L1P5);
-    report_specs(host_d, 200, {"full_0", "linear_0", "linear_1"});
-    report_specs(host_d, 300, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_d, 200, {"F0", "L0", "L1"});
+    report_specs(host_d, 300, {"F0", "L0", "L1"});
 
     auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
         for (const auto &h : hosts) {

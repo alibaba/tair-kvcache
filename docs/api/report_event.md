@@ -62,7 +62,10 @@ unsigned uint64；KVCM 按相同的 64-bit bit pattern 归一化，例如
 使用 uint64 的约定兼容；超出 uint64 或 int64 表示范围、带正号或空白的字符串会被拒绝。
 
 - `medium` 是 block 级属性，例如 `gpu`、`hbm`、`memory`、`disk`；
-- `spec.name` 区分一个 block 内的多个物理组成部分，例如不同 TP、full attention 或 mamba state；
+- `spec.name` 区分一个 block 内的多个物理组成部分，例如 `F0`、`L1` 等 cache group；
+- ADD、DELETE 和 SNAPSHOT 中使用的每个 spec name 都必须已在
+  `RegisterInstance.location_spec_infos` 中注册；未注册的 spec 对应 item 返回
+  `INVALID_ARGUMENT`，且不会修改 metadata。同一请求中的其他合法 item 仍可生效；
 - 同一 `block_key` 可以同时存在于多个 medium；
 - 同一 `block_key + medium` 可以包含多个不同的 spec name；
 - 同一 `block_key + medium + spec.name` 是集合语义，不是引用计数。
@@ -249,11 +252,11 @@ InstanceGroup 必须把对应 EventReport storage 配置在
     "medium": "gpu",
     "specs": [
       {
-        "name": "full_attention:group=0:tp=0",
+        "name": "F0",
         "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096"
       },
       {
-        "name": "mamba_state:group=0:tp=0",
+        "name": "L1",
         "uri": "event_report://10.0.0.8:9600/gpu/123?size=1024"
       }
     ]
@@ -266,7 +269,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - `block_key` 必须是可解析的十进制整数文本；
 - `medium` 非空，且不能包含 location id 分隔符 `#`；
 - `specs` 非空；
-- 每个 `spec.name` 非空，且同一事件内不能重复；
+- 每个 `spec.name` 非空、已在 `RegisterInstance.location_spec_infos` 中注册，且同一事件内不能重复；
 - 每个 URI 必须合法；
 - 客户端 URI 不能带 `s_version`；
 - 旧字段 `block_add.uri` 已废弃，只有 `specs` 生效。
@@ -288,7 +291,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
     "block_key": "123",
     "medium": "gpu",
     "spec_names": [
-      "full_attention:group=0:tp=0"
+      "F0"
     ]
   }
 }
@@ -298,7 +301,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 
 - `block_key`、`medium` 非空且合法；`medium` 不能包含 location id 分隔符 `#`；
 - `spec_names` 非空；
-- spec name 非空且同一事件内不能重复。
+- spec name 非空、已在 `RegisterInstance.location_spec_infos` 中注册，且同一事件内不能重复。
 
 行为：
 
@@ -321,11 +324,11 @@ InstanceGroup 必须把对应 EventReport storage 配置在
         "medium": "gpu",
         "specs": [
           {
-            "name": "full_attention:group=0:tp=0",
+            "name": "F0",
             "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096"
           },
           {
-            "name": "mamba_state:group=0:tp=0",
+            "name": "L1",
             "uri": "event_report://10.0.0.8:9600/gpu/123?size=1024"
           }
         ]
@@ -335,7 +338,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
         "medium": "memory",
         "specs": [
           {
-            "name": "full_attention:group=0:tp=0",
+            "name": "F0",
             "uri": "event_report://10.0.0.8:9600/memory/456"
           }
         ]
@@ -353,7 +356,8 @@ Snapshot 的完整性规则：
 - 同一 `block_key + medium` 只能出现一次；
 - 相同 block key 可以出现在不同 medium；
 - `medium` 不能包含 location id 分隔符 `#`；
-- 每个 block 的 specs 必须非空，且 spec name 不能重复；
+- 每个 block 的 specs 必须非空，且 spec name 必须已在
+  `RegisterInstance.location_spec_infos` 中注册并且不能重复；
 - `blocks=[]` 表示该 reporter 当前没有任何 cache，会异步清理其全部旧 location。
 
 Snapshot 的更新语义：

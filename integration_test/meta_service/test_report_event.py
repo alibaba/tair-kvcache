@@ -352,6 +352,14 @@ class EventReportFunctionalTest(unittest.TestCase):
                 },
                 "location_spec_infos": [
                     {"name": "tp0", "size": 1024},
+                    {"name": "mem_spec", "size": 1024},
+                    {"name": "disk_spec", "size": 1024},
+                    {"name": "spec_4096", "size": 1024},
+                    {"name": "spec_8192", "size": 1024},
+                    {"name": "keep_spec", "size": 1024},
+                    {"name": "drop_spec", "size": 1024},
+                    {"name": "l1p5_spec", "size": 1024},
+                    {"name": "l2_spec", "size": 1024},
                 ],
             })
         except Exception as e:

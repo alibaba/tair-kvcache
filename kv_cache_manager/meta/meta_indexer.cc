@@ -302,18 +302,26 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
         return {0, 0};
     }
 
-    stats.put_key_count += static_cast<int64_t>(put_global_indexs.size());
-    stats.update_key_count += static_cast<int64_t>(upsert_batch.batch_keys.size() - put_global_indexs.size());
+    std::unordered_set<KeyType> unique_put_keys;
+    unique_put_keys.reserve(put_global_indexs.size());
+    for (const int32_t global_index : put_global_indexs) {
+        if (global_index >= 0 && static_cast<size_t>(global_index) < all_keys.size()) {
+            unique_put_keys.insert(all_keys[global_index]);
+        }
+    }
+    const size_t unique_put_key_count = unique_put_keys.size();
+    stats.put_key_count += static_cast<int64_t>(unique_put_key_count);
+    stats.update_key_count += static_cast<int64_t>(upsert_batch.batch_keys.size() - unique_put_key_count);
 
     std::vector<ErrorCode> upsert_ecs;
     BatchMetaData existing_update_batch;
     std::vector<size_t> existing_update_positions;
     BatchMetaData *backend_batch = &upsert_batch;
-    const bool capacity_exceeded = put_global_indexs.size() + GetKeyCount() > max_key_count_;
+    const bool capacity_exceeded = unique_put_key_count + GetKeyCount() > max_key_count_;
     if (capacity_exceeded) {
         PREFIX_INDEXER_LOG(ERROR,
                            "ReadModifyWrite put keys count[%lu] + current key count[%lu] > max key count[%lu]",
-                           put_global_indexs.size(),
+                           unique_put_key_count,
                            GetKeyCount(),
                            max_key_count_);
         if (!preserve_existing_updates_when_full) {
@@ -381,15 +389,18 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
 
     const int32_t error_count =
         ProcessErrorCodes(trace_id, upsert_ecs, upsert_batch.batch_indexs, all_keys, kRmwUpsertMetaOperation, result);
-    int32_t put_success_count = 0;
-    if (error_count == 0) {
-        put_success_count = static_cast<int32_t>(put_global_indexs.size());
-    } else {
-        for (const int32_t idx : put_global_indexs) {
-            if (result.error_codes[idx] == EC_OK) {
-                ++put_success_count;
+    int32_t put_success_count = static_cast<int32_t>(unique_put_key_count);
+    if (error_count != 0) {
+        // Reuse the existing buckets to avoid another allocation on the
+        // partial-failure path. The all-success path needs no second scan.
+        unique_put_keys.clear();
+        for (const int32_t global_index : put_global_indexs) {
+            if (global_index >= 0 && static_cast<size_t>(global_index) < all_keys.size() &&
+                result.error_codes[global_index] == EC_OK) {
+                unique_put_keys.insert(all_keys[global_index]);
             }
         }
+        put_success_count = static_cast<int32_t>(unique_put_keys.size());
     }
     return {error_count, put_success_count};
 }
