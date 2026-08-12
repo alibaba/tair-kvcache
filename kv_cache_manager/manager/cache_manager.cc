@@ -2789,6 +2789,21 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         return EC_INSTANCE_NOT_EXIST;
     }
 
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!instance_info) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: instance info not found for instance [%s]",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("instance info not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+    std::unordered_set<std::string_view> registered_spec_names;
+    registered_spec_names.reserve(instance_info->location_spec_infos().size());
+    for (const auto &spec_info : instance_info->location_spec_infos()) {
+        registered_spec_names.insert(spec_info.name());
+    }
+
     const int events_size = request->events_size();
     std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
     DeltaMutationGuard delta_mutations(event_backend, reporter_key);
@@ -3142,7 +3157,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             std::uint64_t event_total_size = 0;
             for (const auto &spec : params.specs()) {
-                if (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) {
+                if (registered_spec_names.find(spec.name()) == registered_spec_names.end() ||
+                    (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
@@ -3232,7 +3248,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 seen_spec_names.reserve(params.spec_names_size());
             }
             for (const auto &spec_name : params.spec_names()) {
-                if (spec_name.empty() ||
+                if (spec_name.empty() || registered_spec_names.find(spec_name) == registered_spec_names.end() ||
                     (params.spec_names_size() > 1 && !seen_spec_names.insert(std::string_view(spec_name)).second)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
@@ -3306,7 +3322,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     seen_spec_names.reserve(block.specs_size());
                 }
                 for (const auto &spec : block.specs()) {
-                    if (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second) {
+                    if (registered_spec_names.find(spec.name()) == registered_spec_names.end() ||
+                        (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second)) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }

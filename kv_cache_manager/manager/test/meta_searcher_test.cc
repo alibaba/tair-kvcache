@@ -850,8 +850,8 @@ TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAnd
         state_names.push_back("state_spec_" + std::to_string(i));
     }
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_cross_word", full_names),
-        LocationSpecGroup("mamba_state", state_names),
+        LocationSpecGroup("F0", full_names),
+        LocationSpecGroup("L1", state_names),
     };
 
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
@@ -971,8 +971,8 @@ TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParalle
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
 
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("state_0", {"state_0"}),
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
     };
     auto run = [&](bool use_eagle_pop, size_t p2p_host_count) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
@@ -1107,8 +1107,8 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
     };
     const std::vector<std::vector<std::string>> medium_filters = {{}, {"mem"}, {"ssd"}};
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_primary", {"full_a", "full_b"}),
-        LocationSpecGroup("state_primary", {"state_a", "state_b"}),
+        LocationSpecGroup("F0", {"full_a", "full_b"}),
+        LocationSpecGroup("L0", {"state_a", "state_b"}),
     };
     for (const auto &medium_filter : medium_filters) {
         for (const bool use_eagle_pop : {false, true}) {
@@ -1181,8 +1181,8 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithA
     verify_prefix(5);
 
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("state_0", {"state_0"}),
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
     };
     auto verify_mamba = [&](size_t p2p_host_count) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
@@ -1233,8 +1233,8 @@ TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWith
     }
 
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("state_0", {"state_0"}),
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
     };
     for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
@@ -1299,8 +1299,8 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixOrdersParallelErrorsAndVisitor
     EXPECT_TRUE(matches.empty());
 
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("state_0", {"state_0"}),
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
     };
     EXPECT_EQ(
         EC_TIMEOUT,
@@ -1375,8 +1375,8 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixIgnoresOnlyErrorsBeyondEveryCa
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
 
     const std::vector<LocationSpecGroup> groups = {
-        LocationSpecGroup("full_0", {"full_0"}),
-        LocationSpecGroup("state_0", {"state_0"}),
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
     };
     auto expect_success = [&] {
         std::vector<MetaSearcher::HostCacheMatch> matches;
