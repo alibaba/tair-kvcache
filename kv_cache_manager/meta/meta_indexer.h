@@ -68,15 +68,31 @@ public:
         ErrorCode terminal_ec = EC_OK;
         size_t valid_key_count = 0;
         size_t read_key_count = 0;
+        // Union wall time of backend calls made by this invocation. This is
+        // returned as well as published so a multi-pass reducer can aggregate
+        // all of its scans instead of leaving the request metric at the last
+        // pass only. Non-progressive backends continue to publish their
+        // existing GetLocationValues metric and leave this field at zero.
+        int64_t backend_read_wall_time_us = 0;
         bool stopped_by_visitor = false;
+    };
+
+    enum class PrefixVisitOrder {
+        // The first chunk is visited synchronously; suffix callbacks may run
+        // concurrently and arrive out of key order.
+        CONCURRENT,
+        // Backend chunks are still read in bounded parallel windows, but the
+        // visitor consumes them in key order. Stateful reducers can therefore
+        // keep bounded state instead of materializing every key.
+        ORDERED,
     };
 
     // Called once per successfully read compact chunk. valid_key_count can be
     // smaller than locations.size() when the chunk ends at a backend error.
     // Return the first absolute key index that no longer needs to be read, or
-    // the request key count to continue. Chunks after the first can arrive out
-    // of order and concurrently; the first chunk is always visited before
-    // any parallel work starts so callers can initialize candidate state.
+    // the request key count to continue. The first chunk is always visited
+    // before suffix work so callers can initialize candidate state. Suffix
+    // callback ordering is controlled by PrefixVisitOrder.
     // locations and every view/iterator obtained from it are callback-scoped;
     // callers must copy any state that needs to outlive the invocation.
     using PrefixLocationVisitor =
@@ -143,9 +159,12 @@ public:
     // executor. Other backend modes remain one batched call.
     Result
     GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
-    PrefixLocationResult VisitLocationValuesForPrefix(RequestContext *request_context,
-                                                      const KeyVector &keys,
-                                                      const PrefixLocationVisitor &visitor) noexcept;
+    PrefixLocationResult
+    VisitLocationValuesForPrefix(RequestContext *request_context,
+                                 const KeyVector &keys,
+                                 const PrefixLocationVisitor &visitor,
+                                 PrefixVisitOrder visit_order = PrefixVisitOrder::CONCURRENT) noexcept;
+    [[nodiscard]] bool SupportsProgressiveLocationValueReads() const noexcept;
     // Source-of-truth read used by maintenance admission. It never backfills
     // or touches the optional hot-cache backend.
     Result GetLocationsFromPersistent(RequestContext *request_context,

@@ -364,6 +364,59 @@ TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesReturnsEveryAllHitKey) {
     }
 }
 
+TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesOrderedVisitorIsBoundedAndStopsInOrder) {
+    constexpr std::size_t kKeyCount = 70000;
+    constexpr std::size_t kStopIndex = 25000;
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 32));
+    const std::string config_str = R"({
+        "max_key_count" : 131072,
+        "mutex_shard_num" : 64,
+        "batch_key_size" : 128,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KVData data;
+    MakeKVData(0, kKeyCount, data);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties).ec);
+
+    size_t visited_until = 0;
+    const auto all = meta_indexer_->VisitLocationValuesForPrefix(
+        request_context_.get(),
+        data.keys,
+        [&data, &visited_until](size_t begin, const CompactLocationsPerKey &, size_t valid_count) {
+            EXPECT_EQ(visited_until, begin);
+            visited_until += valid_count;
+            return data.keys.size();
+        },
+        MetaIndexer::PrefixVisitOrder::ORDERED);
+    EXPECT_EQ(EC_OK, all.terminal_ec);
+    EXPECT_EQ(kKeyCount, all.valid_key_count);
+    EXPECT_EQ(kKeyCount, visited_until);
+
+    visited_until = 0;
+    std::vector<size_t> callback_begins;
+    const auto stopped = meta_indexer_->VisitLocationValuesForPrefix(
+        request_context_.get(),
+        data.keys,
+        [&visited_until, &callback_begins, kStopIndex](
+            size_t begin, const CompactLocationsPerKey &, size_t valid_count) {
+            EXPECT_EQ(visited_until, begin);
+            callback_begins.push_back(begin);
+            visited_until = std::min(kStopIndex, begin + valid_count);
+            return kStopIndex;
+        },
+        MetaIndexer::PrefixVisitOrder::ORDERED);
+    EXPECT_EQ(EC_OK, stopped.terminal_ec);
+    EXPECT_EQ(kStopIndex, stopped.valid_key_count);
+    EXPECT_EQ(kStopIndex, visited_until);
+    EXPECT_EQ((std::vector<size_t>{0, 4096, 20480}), callback_begins);
+    EXPECT_EQ(69632u, stopped.read_key_count);
+    EXPECT_TRUE(stopped.stopped_by_visitor);
+}
+
 TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesClampsOversizedConfiguredChunk) {
     constexpr std::size_t kKeyCount = 5000;
     meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
@@ -435,6 +488,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixGetIoMetricExcludesPipelinedVisitorTime
     EXPECT_EQ(2u, visitor_calls);
     const auto backend_wall_us = metrics_collector->get_meta_indexer_get_io_time_us_metrics();
     EXPECT_GT(backend_wall_us, 0);
+    EXPECT_EQ(static_cast<int64_t>(backend_wall_us), prefix.backend_read_wall_time_us);
     EXPECT_GE(elapsed_us - static_cast<int64_t>(backend_wall_us), 30000);
 }
 

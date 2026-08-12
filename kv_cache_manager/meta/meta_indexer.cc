@@ -681,8 +681,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
-            refresh_results =
-                backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -1440,8 +1439,14 @@ MetaIndexer::Result MetaIndexer::GetLocationValues(RequestContext *request_conte
     return result;
 }
 
-MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
-    RequestContext *request_context, const KeyVector &keys, const PrefixLocationVisitor &visitor) noexcept {
+bool MetaIndexer::SupportsProgressiveLocationValueReads() const noexcept {
+    return backend_manager_ && backend_manager_->SupportsConcurrentLocationValueReads();
+}
+
+MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(RequestContext *request_context,
+                                                                            const KeyVector &keys,
+                                                                            const PrefixLocationVisitor &visitor,
+                                                                            PrefixVisitOrder visit_order) noexcept {
     PrefixLocationResult prefix_result;
     if (keys.empty()) {
         return prefix_result;
@@ -1517,9 +1522,175 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
     // clamp it so absolute range arithmetic cannot wrap around size_t.
     const size_t parallel_chunk_size = std::min(aligned_chunk_size, keys.size());
     const size_t first_chunk_size = std::min(kLocalPrefixProbeKeyCount, keys.size());
+    if (visit_order == PrefixVisitOrder::ORDERED) {
+        struct OrderedChunk {
+            size_t begin = 0;
+            size_t successful_count = 0;
+            ErrorCode terminal_ec = EC_OK;
+            CompactLocationsPerKey locations;
+        };
+
+        std::atomic<size_t> read_key_count(0);
+        auto read_chunk = [this,
+                           &keys,
+                           &read_key_count,
+                           &active_backend_reads,
+                           &backend_read_interval_start_us,
+                           &backend_read_wall_time_us](size_t begin, size_t count, OrderedChunk &chunk) {
+            chunk.begin = begin;
+            chunk.successful_count = 0;
+            chunk.terminal_ec = EC_OK;
+            const int64_t backend_read_begin_us = TimestampUtil::GetCurrentTimeUs();
+            if (active_backend_reads.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                backend_read_interval_start_us.store(backend_read_begin_us, std::memory_order_release);
+            }
+            auto errors =
+                backend_manager_->GetLocationValuesCompact(nullptr, keys.data() + begin, count, chunk.locations);
+            const int64_t backend_read_end_us = TimestampUtil::GetCurrentTimeUs();
+            const int64_t interval_start_us = backend_read_interval_start_us.load(std::memory_order_acquire);
+            if (active_backend_reads.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                backend_read_wall_time_us.fetch_add(std::max<int64_t>(backend_read_end_us - interval_start_us, 0),
+                                                    std::memory_order_relaxed);
+            }
+            read_key_count.fetch_add(count, std::memory_order_relaxed);
+            if (errors.size() != count || !chunk.locations.IsValid(count)) {
+                KVCM_LOG_ERROR("ordered compact local location read size mismatch: errors[%zu] locations[%zu] "
+                               "expected[%zu]",
+                               errors.size(),
+                               chunk.locations.size(),
+                               count);
+                chunk.terminal_ec = EC_MISMATCH;
+                return;
+            }
+            while (chunk.successful_count < count && errors[chunk.successful_count] == EC_OK) {
+                ++chunk.successful_count;
+            }
+            if (chunk.successful_count < count) {
+                chunk.terminal_ec = errors[chunk.successful_count];
+            }
+        };
+
+        size_t metadata_stop = keys.size();
+        size_t visitor_stop = keys.size();
+        ErrorCode metadata_terminal_ec = EC_OK;
+        bool visitor_failed = false;
+        auto consume_chunk = [&keys, &visitor, &metadata_stop, &visitor_stop, &metadata_terminal_ec, &visitor_failed](
+                                 const OrderedChunk &chunk) {
+            if (chunk.begin >= std::min(metadata_stop, visitor_stop)) {
+                return false;
+            }
+            const size_t visible_stop = std::min(metadata_stop, visitor_stop);
+            const size_t visitable_count =
+                std::min(chunk.successful_count, visible_stop > chunk.begin ? visible_stop - chunk.begin : size_t{0});
+            if (visitable_count != 0 && visitor) {
+                try {
+                    visitor_stop = std::min(
+                        visitor_stop, std::min(keys.size(), visitor(chunk.begin, chunk.locations, visitable_count)));
+                } catch (const std::exception &e) {
+                    KVCM_LOG_ERROR("ordered location prefix visitor failed: %s", e.what());
+                    visitor_failed = true;
+                    return false;
+                } catch (...) {
+                    KVCM_LOG_ERROR("ordered location prefix visitor failed with unknown exception");
+                    visitor_failed = true;
+                    return false;
+                }
+            }
+
+            const size_t terminal_index = chunk.begin + chunk.successful_count;
+            // A visitor stop at the same position wins: the reducer already
+            // proved that this key and the suffix cannot affect the answer.
+            if (chunk.terminal_ec != EC_OK && terminal_index < visitor_stop) {
+                metadata_stop = terminal_index;
+                metadata_terminal_ec = chunk.terminal_ec;
+                return false;
+            }
+            return visitor_stop > terminal_index;
+        };
+
+        bool completed = true;
+        bool should_continue = true;
+        OrderedChunk first_chunk;
+        try {
+            read_chunk(0, first_chunk_size, first_chunk);
+            should_continue = consume_chunk(first_chunk);
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("first ordered compact local location read failed: %s", e.what());
+            completed = false;
+        } catch (...) {
+            KVCM_LOG_ERROR("first ordered compact local location read failed with unknown exception");
+            completed = false;
+        }
+
+        size_t window_begin = first_chunk_size;
+        const size_t max_window_chunks =
+            std::max<size_t>(1, query_executor_ ? query_executor_->worker_count() : size_t{1});
+        std::vector<OrderedChunk> chunks(max_window_chunks);
+        while (completed && should_continue && window_begin < keys.size() &&
+               window_begin < std::min(metadata_stop, visitor_stop)) {
+            const size_t remaining = keys.size() - window_begin;
+            const size_t window_chunk_count =
+                std::min(max_window_chunks, size_t{1} + (remaining - 1) / parallel_chunk_size);
+            const size_t window_size = window_chunk_count > remaining / parallel_chunk_size
+                                           ? remaining
+                                           : window_chunk_count * parallel_chunk_size;
+            auto read_window = [window_begin, parallel_chunk_size, &read_chunk, &chunks](size_t begin, size_t end) {
+                for (size_t relative_begin = begin; relative_begin < end; relative_begin += parallel_chunk_size) {
+                    const size_t relative_end = std::min(end, relative_begin + parallel_chunk_size);
+                    read_chunk(window_begin + relative_begin,
+                               relative_end - relative_begin,
+                               chunks[relative_begin / parallel_chunk_size]);
+                }
+            };
+            if (query_executor_) {
+                completed = query_executor_->ParallelForWithChunkSize(window_size, parallel_chunk_size, read_window);
+            } else {
+                try {
+                    read_window(0, window_size);
+                } catch (const std::exception &e) {
+                    KVCM_LOG_ERROR("ordered compact local location read failed: %s", e.what());
+                    completed = false;
+                } catch (...) {
+                    KVCM_LOG_ERROR("ordered compact local location read failed with unknown exception");
+                    completed = false;
+                }
+            }
+            if (!completed) {
+                break;
+            }
+            for (size_t chunk_index = 0; chunk_index < window_chunk_count; ++chunk_index) {
+                if (!consume_chunk(chunks[chunk_index])) {
+                    should_continue = false;
+                    break;
+                }
+            }
+            window_begin += window_size;
+        }
+
+        prefix_result.read_key_count = read_key_count.load(std::memory_order_relaxed);
+        if (!completed || visitor_failed) {
+            prefix_result.terminal_ec = EC_ERROR;
+        } else {
+            prefix_result.valid_key_count = std::min(metadata_stop, visitor_stop);
+            prefix_result.stopped_by_visitor = visitor_stop <= metadata_stop && visitor_stop < keys.size();
+            if (metadata_stop < visitor_stop && metadata_stop < keys.size()) {
+                prefix_result.terminal_ec = metadata_terminal_ec;
+                if (prefix_result.terminal_ec != EC_NOENT) {
+                    PREFIX_INDEXER_LOG(ERROR,
+                                       "meta indexer ordered prefix get failed, key[%lu] ec[%d]",
+                                       keys[metadata_stop],
+                                       prefix_result.terminal_ec);
+                }
+            }
+        }
+        prefix_result.backend_read_wall_time_us = backend_read_wall_time_us.load(std::memory_order_relaxed);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, get_io_time_us, prefix_result.backend_read_wall_time_us);
+        return prefix_result;
+    }
+
     const size_t remaining_chunk_count =
         first_chunk_size == keys.size() ? 0 : 1 + (keys.size() - first_chunk_size - 1) / parallel_chunk_size;
-
     struct ChunkTerminal {
         size_t index = 0;
         ErrorCode ec = EC_OK;
@@ -1675,10 +1846,9 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         }
     }
 
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
-                                       meta_indexer,
-                                       get_io_time_us,
-                                       backend_read_wall_time_us.load(std::memory_order_relaxed));
+    prefix_result.backend_read_wall_time_us = backend_read_wall_time_us.load(std::memory_order_relaxed);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, prefix_result.backend_read_wall_time_us);
     return prefix_result;
 }
 

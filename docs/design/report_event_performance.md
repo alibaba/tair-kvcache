@@ -98,8 +98,10 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
 10. prefix 只把首个 `EC_NOENT` 当作正常终止。首个 miss 之后的 speculative read 结果不影响已经确定的
     前缀；但 miss 之前的 `EC_ERROR`、`EC_MISMATCH` 等硬错误必须原样返回，不能伪装成较短的 cache miss。
     普通 prefix 与 Mamba 路径遵循相同规则；
-11. 上述渐进取消只用于 `p2p_host_count=0`。启用 P2P 时 local miss 之后仍可能由 Vineyard peer 延续覆盖，
-    因此当前保留完整 metadata materialization；它仍执行 serving 过滤和错误传播，但不能套用 local-only stop。
+11. `p2p_host_count>0` 不能把 local miss 直接当作全局 stop，因为 Vineyard peer 仍可能延续覆盖。该路径改用
+    ordered compact visitor：普通 prefix 在线维护候选 peer 的前缀交集；Mamba 最多分 local、peer plan、最终投影
+    三个有界 pass，没有实际 peer plan 时跳过最终 pass。非 local backend 只读取一次 compact batch 并在内存中
+    重放，均不再构造逐 key 的 `map/set` 图。
 
 可见性快照在首个有界 metadata range 读取之后、其 projection 开始时采集。采集前已经可见的 HOST_DOWN
 会被当前请求过滤；采集后的 HOST_DOWN 允许当前请求继续看到旧状态，但采集完成后本请求不再变化，下一
@@ -1704,9 +1706,12 @@ pure-local Release 验证结果：
    批次会在百万 key 请求中重复约 24 万次 lookup/release shard lock；增大后续批次可摊薄 lock/unlock，同时首窗口
    仍保持早停上界。16384 相对 4096 的同机 A/B 将 1M metadata/all-hit p50 从约 109.3/114.9ms 降至
    94.3/103.7ms；32768 没有进一步改善 all-hit 且放大后缀过读，已撤销。
-3. `p2p_host_count>0` 暂时保留完整读取。一个 host 的 local prefix 已停止时，Vineyard peer 仍可能继续覆盖后续 key，
-   不能把 local miss 直接当作全局取消条件。该路径仍获得 serving 状态过滤、一次 host/spec 扫描和严格错误传播，
-   但没有伪装成渐进路径；后续若优化，必须先设计 peer-aware stop 证明。
+3. `p2p_host_count>0` 使用 peer-aware ordered reduction。普通 prefix 只为最终 top-N host 保留 peer 交集和精确
+   fetched-key 计数；Mamba 最多用三个有界 pass 分别求 local 状态、各 full group 的 prefix peer 与 state coverage
+   peer、最终合并结果；没有选中实际 peer plan 时跳过最终 pass。local backend 不再保留逐 key 的 host/spec 图；
+   常驻状态随请求内 distinct host 数、top-N plan 和协议要求的 fetched-key 去重向量增长，而不是随
+   `key × host × spec` 组合数增长。不支持 progressive read 的
+   backend 保留一次 compact batch，后续 pass 只重放该 batch，避免重复远端 I/O。
 4. request-specific checker 除返回可见/不可见外，同时借用返回已经解析的 reporter medium/host，并声明 EventReport URI
    已通过 generation fence 校验。projection 因而不再对同一 location 重复拆 location id、解析 URI 和提取 host；
    medium filter 使用借用的 `string_view` hash set，generic URI path 也不再复制 path string。
@@ -1753,8 +1758,8 @@ location 指针带出 item lock 虽可少一次 owner add-ref，但 ReportEvent 
 - serving/WRITING/DELETING/NEW/NOT_FOUND 全状态矩阵在 p2p=0 和 p2p>0 下结果一致；Manager 端到端验证
   StartWrite 在 Finish 前不可见；
 - ordinary/Mamba 覆盖 first-window stop、第二并行 range timeout、较早 visitor stop 屏蔽无关后续 timeout、70 host
-  多 presence word、75 个 required spec 跨 word，以及 40K key 跨 4096/16384 边界；Mamba fast path 与保留的
-  full-materialize path 逐项差分；极端 `chunk_size=SIZE_MAX` 也会被安全收敛为单个 suffix range，不发生整数回绕；
+  多 presence word、75 个 required spec 跨 word，以及 40K key 跨 4096/16384 边界；极端
+  `chunk_size=SIZE_MAX` 也会被安全收敛为单个 suffix range，不发生整数回绕；
 - 上述并行/生命周期重点用例 20 轮重复通过；MetaSearcherTest、CacheManagerTest 全量通过；
 - `bazel test --config=release --nocache_test_results //kv_cache_manager/...` 为 106 个测试通过，1 个 GPU-only 测试
   按预期 skip；
@@ -1817,10 +1822,10 @@ GPU-only 测试按预期跳过。上述 mixed 结果也说明渐进 query 没有
 4. ordinary 与 Mamba visitor 在一个已经读取的 callback range 内，一旦所有候选 host 的单调 prefix stop 都不晚于
    当前 key，就立即停止剩余 location projection。它不取消仍可能决定更短 prefix 的早期 range，也不屏蔽仍在任一
    host 必需区间内的 backend error；
-5. 新增 6000-key、6-host 的确定性随机差分模型，组合 medium、L1.5/L2、全部非 serving 状态、非法 URI、Eagle
-   pop 和 Mamba spec group，把渐进结果逐项与保留的 full-materialize 路径比较。另用 33000 key、两个不同 stop 的
-   host 验证：所有候选 stop 之后的 speculative timeout 可以忽略，但仍处于较长 host prefix 内的同类 timeout 必须
-   原样返回；
+5. 新增 6000-key、7-host 的确定性随机模型，组合 medium、L1.5/L2、全部非 serving 状态、非法 URI、Eagle pop
+   和 Mamba spec group；用独立的 materialized `map/set` 参考算法逐项比较 ordinary/Mamba 的 host、local、P2P
+   fetched-key 去重数和 total match，并覆盖 top-N 为 0/1/3/7。另用 33000 key、两个不同 stop 的 host 验证：
+   所有候选 stop 之后的 speculative timeout 可以忽略，但仍处于较长 host prefix 内的同类 timeout 必须原样返回；
 6. 全量门禁顺便暴露两个测试自身的不确定假设并已固定：MigrationManager 的 capacity partial-failure 用例不再假设
    固定 key 在动态 hash seed 下必然属于不同 shard；两个直接清空 executor queue 的 stale-cache 用例会先停止
    reclaimer supervisor，避免销毁它正在等待的 `packaged_task` 后随机抛出 `broken promise`。两项均只修改测试，
@@ -1842,3 +1847,25 @@ GPU-only 测试按预期跳过。上述 mixed 结果也说明渐进 query 没有
   `bazel test --config=release --nocache_test_results --test_output=errors --jobs=8 //kv_cache_manager/...`：
   106 个可执行测试全部通过，1 个 GPU-only 测试按预期跳过。工作树迁移后复用旧绝对路径 output base 曾导致 7 个
   用例在 0ms 内因 runfiles 缺失失败；独立重建后这些用例全部通过，未把基础设施假失败当作代码缺陷。
+
+### 5.29 2026-08-11 P2P 有界归约
+
+更新后的基线已经解决 `p2p_host_count=0` 的渐进读取，但 P2P 路径仍为每个 key 构造两份
+`map<host, set<spec>>`。本轮删除这套逐 key 对象图：host 在请求内映射为 dense id，spec group 编码为多 word
+bitmask；普通 prefix 在线维护最终 top-N host 的 peer 交集，Mamba 通过最多三个有界 ordered pass 保留原来的
+“full group 独立选 prefix peer、state group 统一选 coverage peer”语义；没有选中实际 peer plan 时跳过最终 pass。
+非 local backend 仍只读取一次 compact batch，后续 pass 重放该 batch。
+
+同一 Release/O2 二进制、4 query workers、pure-local metadata、1M key、在第 1024 key 制造一个可由 Vineyard
+peer 补齐的 local gap，对更新前后的 `mu-main` 使用完全相同的 benchmark：
+
+| 场景 | 更新前 p50 | 本轮 p50 | 变化 |
+| --- | ---: | ---: | ---: |
+| ordinary P2P | 632.07ms | 162.81ms | -74.2% |
+| Mamba P2P | 635.87ms | 370.01ms | -41.8% |
+| 进程峰值 RSS | 1,340,012KiB | 586,120KiB | -56.3%（约 -736MiB） |
+
+数字来自共享开发机，只用于同机回归，不是线上 SLA。门禁覆盖动态 top-N 淘汰、重复 block key 的 fetched count
+去重、多个 full group 分别选 peer 后合并、非 local backend 单次读取、跨 64 个 spec 的 bitmask、ordered visitor
+窗口/stop、空 spec group，以及 P2P 前缀内硬错误传播。Mamba 的 pure-local 路径最多会用三遍有界扫描换取不随
+`key * host * spec` 增长的中间对象图；后续 pass 会重复命中 local LRU，但最后的 LRU 顺序/访问时间与单遍扫描一致。
