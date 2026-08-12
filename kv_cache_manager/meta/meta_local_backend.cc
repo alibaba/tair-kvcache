@@ -957,22 +957,13 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
     out_key_error_codes.assign(keys.size(), EC_OK);
     out_locations.assign(keys.size(), CacheLocationVector{});
 
-    // Targeted RMW commonly reads thousands of one-location keys at once.
-    // Group the LRU lookups/releases by cache shard instead of taking the same
-    // shard mutex once per key. Handles remain pinned while the immutable
-    // CacheLocation pointers are projected below, matching the compact query
-    // path's lifetime contract.
-    std::vector<std::string_view> key_views(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        key_views[i] = KeyToView(keys[i]);
-    }
-    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
-    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+    // Shards far outnumber one RMW batch's keys, so grouping cannot coalesce
+    // enough locks to offset batch wrappers and temporaries; look up per key.
     const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
 
-        Cache::Handle *handle = handles[i];
+        Cache::Handle *handle = cache_->Lookup(KeyToView(keys[i]));
         if (!handle) {
             out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
@@ -994,8 +985,8 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
                 }
             }
         }
+        cache_->Release(handle);
     }
-    cache_->ReleaseBatch(handles.data(), handles.size());
     return results;
 }
 

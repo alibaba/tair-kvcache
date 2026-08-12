@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -202,6 +203,54 @@ TEST_F(LRUCacheTest, BatchReleaseFreesEntryErasedWhilePinned) {
     EXPECT_FALSE(Lookup("a"));
     EXPECT_TRUE(Lookup("b"));
     ValidateLRUList({"b"}, 0, 1);
+}
+
+TEST_F(LRUCacheTest, SmallPublicBatchAvoidsShardGroupingScratch) {
+    auto cache = NewLRUCache(/*capacity=*/1024,
+                             /*num_shard_bits=*/4,
+                             /*strict_capacity_limit=*/false,
+                             /*no_evict_on_insert=*/false,
+                             /*high_pri_pool_ratio=*/0.0,
+                             /*memory_allocator=*/nullptr,
+                             /*use_adaptive_mutex=*/false,
+                             kDontChargeCacheMetadata);
+    ASSERT_NE(nullptr, cache);
+
+    for (const std::string_view key : {std::string_view("a"), std::string_view("b")}) {
+        Cache::Handle *handle = nullptr;
+        ASSERT_EQ(EC_OK, cache->Insert(key, nullptr, &kNoopCacheItemHelper, 1, &handle));
+        ASSERT_NE(nullptr, handle);
+        cache->Release(handle);
+    }
+
+    const std::string_view keys[] = {"a", "missing", "a", "b"};
+    Cache::Handle *handles[4] = {};
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(std::size(keys), &scratch);
+    EXPECT_TRUE(scratch.hashes.empty());
+    EXPECT_TRUE(scratch.shard_offsets.empty());
+    EXPECT_TRUE(scratch.cursors.empty());
+    EXPECT_TRUE(scratch.ordered_indices.empty());
+    EXPECT_EQ(0u, scratch.hashes.capacity());
+    EXPECT_EQ(0u, scratch.shard_offsets.capacity());
+    EXPECT_EQ(0u, scratch.cursors.capacity());
+    EXPECT_EQ(0u, scratch.ordered_indices.capacity());
+
+    cache->LookupBatchWithScratch(keys, std::size(keys), handles, &scratch);
+    ASSERT_NE(nullptr, handles[0]);
+    EXPECT_EQ(nullptr, handles[1]);
+    EXPECT_EQ(handles[0], handles[2]);
+    ASSERT_NE(nullptr, handles[3]);
+    EXPECT_TRUE(scratch.hashes.empty());
+    EXPECT_TRUE(scratch.shard_offsets.empty());
+    EXPECT_TRUE(scratch.cursors.empty());
+    EXPECT_TRUE(scratch.ordered_indices.empty());
+
+    cache->ReleaseBatchWithScratch(handles, std::size(handles), &scratch);
+    EXPECT_TRUE(scratch.hashes.empty());
+    EXPECT_TRUE(scratch.shard_offsets.empty());
+    EXPECT_TRUE(scratch.cursors.empty());
+    EXPECT_TRUE(scratch.ordered_indices.empty());
 }
 
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
