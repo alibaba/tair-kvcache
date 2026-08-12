@@ -1891,7 +1891,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
         return req;
     };
 
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
     mgr.DebugEnableCopySubmissionsForTest();
     preparing_reservation_stub::Reset();
     preparing_reservation_stub::g_manager = &mgr;
@@ -1920,6 +1920,14 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     EXPECT_NE(std::string::npos,
               preparing_reservation_stub::g_deleted_uris.front().ToUriString().find(
                   StringUtil::Uint64ToHex(block_keys[failed_index])));
+
+    // 统一口径：add 成功项已提交 executor（stub pending future），计入其 4 字节；
+    // add 失败项（EC_NOSPC）已回滚且未提交，不计入。
+    EXPECT_EQ(4u,
+              metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                                            {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
+                                             {"unique_name", "cold_01"}})
+                  .Get());
 }
 
 // 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
@@ -2553,7 +2561,7 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
     mgr.DebugEnableCopySubmissionsForTest();
 
     auto get_write_bytes = [&]() {
-        return metrics_registry_->GetCounter("data_storage.write_bytes_total",
+        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
                               {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
                                {"unique_name", "cold_01"}}).Get();
     };
@@ -2570,7 +2578,10 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
         ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // 统一口径：任务成功提交 executor 即计入（Submit 返回时已发生）
+        ASSERT_EQ(10u, get_write_bytes());
         mgr.OnTaskSuccess(kInstance, block_key);
+        // 完成回调不再重复计入
         ASSERT_EQ(10u, get_write_bytes());
         ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
     }
@@ -2587,11 +2598,12 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
         ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(20u, get_write_bytes()); // 提交 executor 即计入，累计：场景1的10 + 本次10
         // copy 进行中用户取消：任务标记 kCancelling，仍留在活跃表
         ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
-        // 完成回调认领到 kWasCancelling：统计点先于取消分支执行，计入但不走主路径
+        // 完成回调认领到 kWasCancelling：不计入也不走主路径（计数在提交时已发生）
         mgr.OnTaskSuccess(kInstance, block_key);
-        ASSERT_EQ(20u, get_write_bytes()); // 累计：场景1的10 + 本次10
+        ASSERT_EQ(20u, get_write_bytes());
         ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 取消不 promote，不涨
     }
 
@@ -2607,8 +2619,10 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
         ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // copy 失败仍计入：任务已提交 executor，失败属于派发未兑现（累计 20 + 10）
+        ASSERT_EQ(30u, get_write_bytes());
         mgr.OnTaskFailed(kInstance, block_key, ErrorCode::EC_IO_ERROR);
-        ASSERT_EQ(20u, get_write_bytes()); // copy 失败不计入，保持场景2结束时的累计值
+        ASSERT_EQ(30u, get_write_bytes()); // 失败回调不再影响计数
         ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
     }
 
@@ -2624,6 +2638,7 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
         ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(40u, get_write_bytes()); // 提交 executor 即计入，累计：30 + 10
 
         // 破坏源：把源 location 从 SERVING CAS 成 DELETING，模拟 copy 期间源被回收
         auto rc = std::make_shared<RequestContext>("break_source");
@@ -2633,9 +2648,9 @@ TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
         std::vector<std::vector<ErrorCode>> cas_results;
         ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas, cas_results));
 
-        // 完成回调：统计点先于 IsSourceLocationServing 检查执行，计入后走 source_lost 失败收尾
+        // 完成回调：计数已在提交时发生；此处走 source_lost 失败收尾，不再影响计数
         mgr.OnTaskSuccess(kInstance, block_key);
-        ASSERT_EQ(30u, get_write_bytes()); // 累计：20 + 10
+        ASSERT_EQ(40u, get_write_bytes());
         ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 源丢失按失败收尾，不涨
     }
 

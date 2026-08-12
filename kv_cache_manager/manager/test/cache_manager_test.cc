@@ -1004,7 +1004,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
                                                std::vector<LocationSpecGroup>()));
     // 取出统计的写入量
     auto get_write_bytes = [&]() {
-        return metrics_registry_->GetCounter("data_storage.write_bytes_total",
+        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
                                              {{"type", ToString(kDefaultStorageType)},
                                               {"unique_name", "nfs_01"}}).Get();
     };

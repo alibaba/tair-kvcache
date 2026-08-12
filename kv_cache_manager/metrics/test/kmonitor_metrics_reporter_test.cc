@@ -145,5 +145,5 @@ TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {
     // the kmonitor side has no mock injection point; assert the registry-side value
     // that ReportInterval reads from instead
     const auto &tags = be->GetMetricsCollector()->GetMetricsTags();
-    EXPECT_EQ(2048u, metrics_registry_->GetCounter("data_storage.write_bytes_total", tags).Get());
+    EXPECT_EQ(2048u, metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total", tags).Get());
 }

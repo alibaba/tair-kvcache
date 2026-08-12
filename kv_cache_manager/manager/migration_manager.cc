@@ -751,6 +751,10 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
     if (metrics_enabled_) {
         ++m_tasks_submitted_total_;
+        // 统一口径：copy 任务成功提交 executor（派发不可逆完成）即计入，
+        // 与普通写路径（StartWriteCache 在 BatchAddLocation 成功后、location 交付
+        // client 前）的统计点对成；之后的取消/copy 失败/源丢失均不影响该计数。
+        data_storage_manager_->RecordWriteBytes(ctx.dst_storage_name, ctx.total_bytes);
     }
     if (event_manager_ != nullptr) {
         auto ev = std::make_shared<MigrationSubmittedEvent>(ctx.instance_id);
@@ -1220,6 +1224,8 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
             if (metrics_enabled_) {
                 ++m_tasks_submitted_total_;
+                // 与单条 Submit 同口径：任务成功提交 executor 即计入，后续结果不影响。
+                data_storage_manager_->RecordWriteBytes(ctx.dst_storage_name, ctx.total_bytes);
             }
             if (event_manager_ != nullptr) {
                 auto ev = std::make_shared<MigrationSubmittedEvent>(ctx.instance_id);
@@ -1304,10 +1310,6 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
                       instance_id.c_str(),
                       block_key);
         return;
-    }
-
-    if (metrics_enabled_) {
-        data_storage_manager_->RecordWriteBytes(ctx.dst_storage_name, ctx.total_bytes);
     }
 
     if (claim == ClaimResult::kWasCancelling) {

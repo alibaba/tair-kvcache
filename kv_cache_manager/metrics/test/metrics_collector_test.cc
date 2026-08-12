@@ -280,12 +280,12 @@ TEST_F(MetricsCollectorTest, DataStorageMetricsCollectorTest) {
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, DataStorageCreate);
     EXPECT_GT(GET(p, data_storage, create_time_us), 1000.);
 
-    // Test write_bytes counter.
-    EXPECT_EQ(GET(p, data_storage, write_bytes_total), 0);
+    // Test write_bytes_dispatched counter.
+    EXPECT_EQ(GET(p, data_storage, write_bytes_dispatched_total), 0);
     p->AddWriteBytes(1024);
     p->AddWriteBytes(1024);
-    EXPECT_EQ(GET(p, data_storage, write_bytes_total), 2048);
-    EXPECT_EQ(metrics_registry_->GetCounter("data_storage.write_bytes_total").Get(), 2048);
+    EXPECT_EQ(GET(p, data_storage, write_bytes_dispatched_total), 2048);
+    EXPECT_EQ(metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total").Get(), 2048);
 }
 
 TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {

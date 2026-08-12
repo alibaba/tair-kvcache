@@ -119,7 +119,7 @@ struct KmonitorMetricsReporter::Context {
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
-    DECLARE_METRICS(data_storage, write_bytes_total);
+    DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     DECLARE_METRICS(scheduler_plan_executor, waiting_task_count);
@@ -381,7 +381,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
-    REGISTER_GAUGE_METRIC(data_storage, write_bytes_total);
+    REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     REGISTER_GAUGE_METRIC(scheduler_plan_executor, waiting_task_count);
@@ -617,10 +617,11 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // for per-storage accumulative write bytes
+        // for per-storage accumulative dispatched write bytes
         // the counter is updated in real-time on each backend's DataStorageMetricsCollector
         // (via DataStorageManager::RecordWriteBytes, covering both normal writes and migration
-        // copies), so read the current cumulative values and report them to kmonitor periodically
+        // copies at their dispatch points), so read the current cumulative values and report
+        // them to kmonitor periodically
         const auto registry_manager = cache_manager_->GetRegistryManager();
         if (!registry_manager) {
             break;
@@ -641,9 +642,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                 continue;
             }
             std::uint64_t write_bytes_v;
-            GET_METRICS_(collector, data_storage, write_bytes_total, write_bytes_v);
+            GET_METRICS_(collector, data_storage, write_bytes_dispatched_total, write_bytes_v);
             const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(collector->GetMetricsTags());
-            REPORT_METRICS(data_storage, write_bytes_total, static_cast<double>(write_bytes_v));
+            REPORT_METRICS(data_storage, write_bytes_dispatched_total, static_cast<double>(write_bytes_v));
         }
     } while (false);
 

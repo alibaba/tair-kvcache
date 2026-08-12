@@ -58,8 +58,12 @@ public:
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
     std::vector<ErrorCode> UnLock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
 
-    // 写入量统计统一入口：按 unique_name 找到 backend 的 collector 并累加预估写入字节数。
-    // 普通写入（StartWriteCache）与 Migration Copy 共用。
+    // 写入量统计统一入口：按 unique_name 找到 backend 的 collector 并累加。
+    // Adds `bytes` to the named storage's data_storage.write_bytes_dispatched_total
+    // counter. Dispatched-view semantics: callers invoke this once a write has been
+    // dispatched (locations handed to the client / copy task accepted by executor),
+    // NOT when bytes are confirmed written to the backend. See the metric definition
+    // in metrics/metrics_collector.h for the full semantic contract.
     void RecordWriteBytes(const std::string &unique_name, std::uint64_t bytes);
 
 private:
