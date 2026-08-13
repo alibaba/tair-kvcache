@@ -43,3 +43,22 @@ cc_library(
         "//kv_cache_manager/common:jsonizable",
     ],
 )
+
+cc_library(
+    name = "optimizer_event_publisher",
+    srcs = [
+        "optimizer_event_publisher.cc",
+    ],
+    hdrs = [
+        "optimizer_event_publisher.h",
+    ],
+    deps = [
+        ":base_event",
+        ":event_publisher",
+        ":event_publishers_config",
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/event/optimizer_stream:event_sink",
+        "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)
