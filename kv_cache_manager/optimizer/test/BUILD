@@ -285,3 +285,23 @@ cc_test(
         "//kv_cache_manager/optimizer:online_optimizer_server_config",
     ],
 )
+
+cc_test(
+    name = "KvcmEventSubscriberTest",
+    srcs = [
+        "kvcm_event_subscriber_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
+        "//kv_cache_manager/common:static_service_discovery",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:kvcm_event_subscriber",
+        "//kv_cache_manager/optimizer:online_optimizer_server_config",
+        "//kv_cache_manager/optimizer/config:online_optimizer_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "@grpc//:grpc++",
+    ],
+)
