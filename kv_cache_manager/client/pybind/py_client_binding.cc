@@ -128,15 +128,15 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              &kvcm::TransferClient::LoadKvCaches,
              py::arg("uri_str_vec"),
              py::arg("block_buffers"),
-             py::arg("deadline_ms") = 0,
              py::arg("trace_info") = nullptr,
+             py::arg("deadline_ms") = 0,
              py::call_guard<py::gil_scoped_release>())
         .def("SaveKvCaches",
              &kvcm::TransferClient::SaveKvCaches,
              py::arg("uri_str_vec"),
              py::arg("block_buffers"),
-             py::arg("deadline_ms") = 0,
              py::arg("trace_info") = nullptr,
+             py::arg("deadline_ms") = 0,
              py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager

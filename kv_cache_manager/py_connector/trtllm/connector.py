@@ -215,7 +215,7 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
             uris = self._extract_uris(locations)
             buffers, cpu_tensors = self._prepare_buffers(block_ids)
             get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
-            result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_ms)
+            result = self.transfer_client.LoadKvCaches(uris, buffers, deadline_ms=get_deadline_ms)
             logger.debug(f"LoadKvCaches {result=}")
             for block_id, cpu_tensor in zip(block_ids, cpu_tensors):
                 self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
@@ -235,7 +235,7 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
             uris = self._extract_uris(locations)
             buffers, _ = self._prepare_buffers(block_ids)
             deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
-            result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms)
+            result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms=deadline_ms)
             logger.debug(f"SaveKvCaches {result=}")
             flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
             if self.tp_world_size > 1:

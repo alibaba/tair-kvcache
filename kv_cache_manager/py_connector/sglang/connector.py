@@ -337,7 +337,7 @@ class HiCacheKVCM(HiCacheStorage):
         # Perform data transfer
         get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
         start_time = time.perf_counter()
-        result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_ms)
+        result = self.transfer_client.LoadKvCaches(uris, buffers, deadline_ms=get_deadline_ms)
         end_time = time.perf_counter()
         self.prefetch_pgs.append(matched)
         self.prefetch_bandwidth.append(matched * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -414,7 +414,7 @@ class HiCacheKVCM(HiCacheStorage):
                 # 读路径：deadline = now + sdk_get_timeout_ms
                 get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
                 start_time = time.perf_counter()
-                load_result = self.transfer_client.LoadKvCaches(uris, buffers, get_deadline_ms)
+                load_result = self.transfer_client.LoadKvCaches(uris, buffers, deadline_ms=get_deadline_ms)
                 end_time = time.perf_counter()
                 flag = (load_result == kvcm_py_client.ClientErrorCode.ER_OK)
                 if flag:
@@ -603,7 +603,7 @@ class HiCacheKVCM(HiCacheStorage):
                     # Perform data transfer
                     deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
                     start_time = time.perf_counter()
-                    result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms)
+                    result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms=deadline_ms)
                     end_time = time.perf_counter()
                     self.backup_pgs.append(num_valid)
                     self.backup_bandwidth.append(num_valid * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -801,7 +801,7 @@ class HiCacheKVCM(HiCacheStorage):
                     # DDL_租约取 min（见 _batch_set 注释）。
                     deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
                     start_time = time.perf_counter()
-                    save_result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms)
+                    save_result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms=deadline_ms)
                     end_time = time.perf_counter()
                     flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
                     if flag:

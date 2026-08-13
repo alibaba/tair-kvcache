@@ -149,7 +149,7 @@ class DataTransferManager:
             buffer.iovs = iovs
             buffers.append(buffer)
         logger.debug("start transfer")
-        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers, deadline_ms)
+        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers, deadline_ms=deadline_ms)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
             with self._device_mod.stream(self._load_stream):
@@ -251,7 +251,7 @@ class DataTransferManager:
             buffers.append(buffer)
         logger.debug("start transfer")
 
-        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers, deadline_ms)
+        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers, deadline_ms=deadline_ms)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result[0] != kvcm_py_client.ClientErrorCode.ER_OK:
             logger.warning("save task failed, remote_uris:%s, block_token_indices:%s, transfer_result:%s", remote_uris,

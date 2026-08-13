@@ -121,8 +121,8 @@ void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
 
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
-                                                 int64_t deadline_ms,
-                                                 std::shared_ptr<TransferTraceInfo> trace_info) {
+                                                 std::shared_ptr<TransferTraceInfo> trace_info,
+                                                 int64_t deadline_ms) {
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -149,8 +149,8 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                        const BlockBuffers &block_buffers,
-                                                                       int64_t deadline_ms,
-                                                                       std::shared_ptr<TransferTraceInfo> trace_info) {
+                                                                       std::shared_ptr<TransferTraceInfo> trace_info,
+                                                                       int64_t deadline_ms) {
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());

@@ -130,7 +130,7 @@ TEST_F(TransferClientTest, TestLoadKvCaches) {
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
 
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, /*deadline_ms=*/0));
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers));
 }
 
 TEST_F(TransferClientTest, TestSaveKvCaches) {
@@ -140,7 +140,7 @@ TEST_F(TransferClientTest, TestSaveKvCaches) {
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
 
-    auto result = client->SaveKvCaches(locations_, block_buffers, /*deadline_ms=*/0);
+    auto result = client->SaveKvCaches(locations_, block_buffers);
 
     EXPECT_EQ(ER_OK, result.first);
     EXPECT_EQ(result.second.size(), locations_.size());
@@ -153,9 +153,9 @@ TEST_F(TransferClientTest, TestEmptyLocations) {
     UriStrVec uri_str_vec = {};
     BlockBuffers block_buffers = {};
 
-    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0));
+    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(uri_str_vec, block_buffers));
 
-    auto save_result = client->SaveKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0);
+    auto save_result = client->SaveKvCaches(uri_str_vec, block_buffers);
     EXPECT_EQ(ER_INVALID_PARAMS, save_result.first);
     EXPECT_TRUE(save_result.second.empty());
 }
@@ -173,7 +173,7 @@ TEST_F(TransferClientTest, TestManyLocations) {
         block_buffers.push_back(BlockBuffer());
     }
 
-    auto save_result = client->SaveKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0);
+    auto save_result = client->SaveKvCaches(uri_str_vec, block_buffers);
     EXPECT_EQ(ER_OK, save_result.first);
     EXPECT_EQ(save_result.second.size(), uri_str_vec.size());
 }
@@ -192,7 +192,7 @@ TEST_F(TransferClientTest, TestMismatchedLocationsAndBuffers) {
     BlockBuffer buffer1;
     BlockBuffers block_buffers = {buffer1};
 
-    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(locations_, block_buffers, /*deadline_ms=*/0));
+    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadKvCaches(locations_, block_buffers));
 }
 
 TEST_F(TransferClientTest, TestBlockBufferUsage) {
@@ -220,7 +220,7 @@ TEST_F(TransferClientTest, TestBlockBufferUsage) {
     buffer2.iovs[0].ignore = false;
 
     BlockBuffers block_buffers = {buffer1, buffer2};
-    ASSERT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers));
 
     ASSERT_EQ(std::memcmp(buffer1.iovs[0].base, test_data1_, buffer1.iovs[0].size), 0);
     ASSERT_EQ(std::memcmp(buffer2.iovs[0].base, test_data2_, buffer2.iovs[0].size), 0);
@@ -308,7 +308,7 @@ TEST_F(TransferClientMultiStorageTest, TestSaveAndLoadMixedStorage) {
     BlockBuffers block_buffers = {BlockBuffer(), BlockBuffer(), BlockBuffer()};
 
     // Save
-    auto [save_ec, actual_uris] = client->SaveKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0);
+    auto [save_ec, actual_uris] = client->SaveKvCaches(uri_str_vec, block_buffers);
     ASSERT_EQ(ER_OK, save_ec);
     ASSERT_EQ(3, actual_uris.size());
     // 验证返回 URI 顺序与输入一致
@@ -317,7 +317,7 @@ TEST_F(TransferClientMultiStorageTest, TestSaveAndLoadMixedStorage) {
     EXPECT_EQ(uri_str_vec[2], actual_uris[2]);
 
     // Load
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, block_buffers, /*deadline_ms=*/0));
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(actual_uris, block_buffers));
 }
 
 // 回归测试：nfs_a/path1, nfs_b/pathX, nfs_a/path2 —— 同 backend（nfs_a）内多个

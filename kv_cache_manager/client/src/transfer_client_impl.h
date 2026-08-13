@@ -22,13 +22,12 @@ public:
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
-                                 int64_t deadline_ms,
-                                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
-    std::pair<ClientErrorCode, UriStrVec>
-    SaveKvCaches(const UriStrVec &uri_str_vec,
-                 const BlockBuffers &block_buffers,
-                 int64_t deadline_ms,
-                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
+                                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
+                                 int64_t deadline_ms = 0) override;
+    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                       const BlockBuffers &block_buffers,
+                                                       std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
+                                                       int64_t deadline_ms = 0) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;

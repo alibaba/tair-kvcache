@@ -18,15 +18,15 @@ public:
 
     // deadline_ms: 绝对时间点（steady_clock 毫秒），到点后本次调用不再触碰 block_buffers；
     // 0 = 调用方不施加 deadline，退回 client 配置的静态超时预算。
+    // 置于 trace_info 之后以保持既有位置参数调用兼容。
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
-                                         int64_t deadline_ms = 0,
-                                         std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
-    virtual std::pair<ClientErrorCode, UriStrVec>
-    SaveKvCaches(const UriStrVec &uri_str_vec,
-                 const BlockBuffers &block_buffers,
-                 int64_t deadline_ms = 0,
-                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
+                                         std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
+                                         int64_t deadline_ms = 0) = 0;
+    virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                               const BlockBuffers &block_buffers,
+                                                               std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
+                                                               int64_t deadline_ms = 0) = 0;
 
 protected:
     TransferClient() = default;
