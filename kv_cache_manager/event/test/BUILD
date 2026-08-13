@@ -77,3 +77,34 @@ cc_test(
         "//kv_cache_manager/event:event_publishers_config",
     ],
 )
+
+cc_test(
+    name = "SubscriptionEventSinkTest",
+    srcs = [
+        "subscription_event_sink_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publishers_config",
+        "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)
+
+cc_test(
+    name = "OptimizerEventPublisherTest",
+    srcs = [
+        "optimizer_event_publisher_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publishers_config",
+        "//kv_cache_manager/event:optimizer_event_publisher",
+        "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)

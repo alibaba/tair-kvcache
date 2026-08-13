@@ -24,6 +24,13 @@ public:
     const BlockMask &get_block_mask() const { return block_mask_; }
     int32_t sw_size() const { return sw_size_; }
     const std::vector<std::string> &location_spec_names() const { return location_spec_names_; }
+    // Trace id of the request that produced this event. BaseEvent only has a
+    // randomly generated event id, which cannot be joined against the access
+    // log; carrying the trace id makes a consumer-side anomaly traceable back
+    // to the originating request. Set separately from SetAddtionalArgs so the
+    // existing call signature stays untouched.
+    const std::string &trace_id() const { return trace_id_; }
+    void set_trace_id(const std::string &trace_id) { trace_id_ = trace_id; }
 
     void SetAddtionalArgs(const std::string &query_type,
                           const optimizer_event::KeyVector &keys,
@@ -41,6 +48,7 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         BaseEvent::ToRapidWriter(writer);
 
+        Put(writer, "trace_id", trace_id_);
         Put(writer, "query_type", query_type_);
         Put(writer, "keys", keys_);
         Put(writer, "tokens", tokens_);
@@ -50,6 +58,7 @@ public:
     }
 
 private:
+    std::string trace_id_;
     std::string query_type_;
     optimizer_event::KeyVector keys_;
     optimizer_event::TokenIdsVector tokens_;
