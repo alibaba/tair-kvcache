@@ -44,6 +44,12 @@ struct InstanceState {
     int64_t total_input_tokens = 0;
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
+
+    // Range-add difference array for the current reporting interval's
+    // distribution of minimum LRU capacities required by theoretically
+    // hittable blocks.
+    std::vector<int64_t> mrc_interval_hit_count_deltas;
+    uint64_t mrc_interval_total_hits = 0;
 };
 
 struct TraceQueryResult {
@@ -74,6 +80,11 @@ struct HitAgeBucketRatio {
     int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
     int64_t hit_count;
     double ratio; // hit_count / total_max_hits
+};
+
+struct MrcMetricInfo {
+    std::string instance_id;
+    int64_t capacity_bytes = 0;
 };
 
 struct InstanceSummary {
@@ -114,18 +125,18 @@ public:
 
     ErrorCode RemoveInstance(const std::string &instance_id);
 
+    // input_token_len == 0 infers a full-block request. timestamp_ns == 0
+    // falls back to the local arrival time.
     ErrorCode TraceQuery(const std::string &instance_id,
                          const std::vector<int64_t> &block_keys,
                          int64_t input_token_len,
+                         int64_t timestamp_ns,
                          TraceQueryResult &result);
 
-    // Compatibility entry point for legacy block-only callers. It assumes the
-    // request contains no incomplete tail tokens. New full-attention callers
-    // must pass input_token_len explicitly through the overload above.
-    ErrorCode
-    TraceQuery(const std::string &instance_id, const std::vector<int64_t> &block_keys, TraceQueryResult &result);
-
     ErrorCode ListInstances(const std::string &instance_group_filter, std::vector<InstanceSummary> &summaries) const;
+
+    // Returns and clears the MRC curve accumulated since the previous call.
+    ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);
 
     ErrorCode ResetStats(const std::string &instance_id);
 

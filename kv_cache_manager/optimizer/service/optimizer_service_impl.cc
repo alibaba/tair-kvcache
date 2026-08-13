@@ -304,15 +304,8 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
     }
 
     TraceQueryResult result;
-    ErrorCode ec;
-    if (input_token_len == 0 && request->token_ids_size() == 0) {
-        // Backward compatibility for block-only clients: assume there is no
-        // incomplete tail. New full-attention clients should always provide
-        // input_token_len so the token denominator is exact.
-        ec = manager_->TraceQuery(request->instance_id(), block_keys, result);
-    } else {
-        ec = manager_->TraceQuery(request->instance_id(), block_keys, input_token_len, result);
-    }
+    const ErrorCode ec =
+        manager_->TraceQuery(request->instance_id(), block_keys, input_token_len, request->timestamp_ns(), result);
 
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));
