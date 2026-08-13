@@ -64,3 +64,16 @@ cc_test(
         "//kv_cache_manager/event/spec_events:spec_events",
     ],
 )
+
+cc_test(
+    name = "EventPublishersConfigTest",
+    srcs = [
+        "event_publishers_config_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publishers_config",
+    ],
+)
