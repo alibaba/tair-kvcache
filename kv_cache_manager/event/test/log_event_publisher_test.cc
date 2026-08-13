@@ -40,6 +40,14 @@ TEST_F(LogEventPublisherTest, TestInit) {
     EXPECT_TRUE(result);
 }
 
+TEST_F(LogEventPublisherTest, TestConfiguredQueueSize) {
+    EventPublishersConfig configs;
+    ASSERT_TRUE(configs.FromJsonString(R"({"log":{"queue_size":123}})"));
+    publisher_ = std::make_unique<LogEventPublisher>(configs.log_event_publisher_config());
+    ASSERT_TRUE(publisher_->Init(""));
+    EXPECT_EQ(123u, publisher_->basic_queue_->max_queue_size);
+}
+
 // Test Publish
 TEST_F(LogEventPublisherTest, TestPublish) {
     ASSERT_TRUE(publisher_->Init(log_config_));
