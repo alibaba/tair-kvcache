@@ -28,9 +28,30 @@ void TtlCacheIndexerWrapper::ProcessKeys(const std::vector<int64_t> &keys,
                                          std::vector<int64_t> &hit_count,
                                          int64_t &max_hit_count,
                                          std::vector<bool> *key_hits) {
-    int64_t now = clock_();
+    ProcessKeysAtTime(keys, clock_(), hit_count, max_hit_count, key_hits);
+}
 
-    HarvestExpired(now);
+void TtlCacheIndexerWrapper::ProcessKeysAtTimestamp(const std::vector<int64_t> &keys,
+                                                    int64_t timestamp_ns,
+                                                    std::vector<int64_t> &hit_count,
+                                                    int64_t &max_hit_count,
+                                                    std::vector<bool> *key_hits) {
+    constexpr int64_t kNanosecondsPerSecond = 1000000000;
+    const int64_t now_seconds = timestamp_ns == 0 ? clock_() : timestamp_ns / kNanosecondsPerSecond;
+    ProcessKeysAtTime(keys, now_seconds, hit_count, max_hit_count, key_hits);
+}
+
+void TtlCacheIndexerWrapper::ProcessKeysAtTime(const std::vector<int64_t> &keys,
+                                               int64_t now_seconds,
+                                               std::vector<int64_t> &hit_count,
+                                               int64_t &max_hit_count,
+                                               std::vector<bool> *key_hits) {
+    if (has_process_time_) {
+        now_seconds = std::max(now_seconds, last_process_time_seconds_);
+    }
+    last_process_time_seconds_ = now_seconds;
+    has_process_time_ = true;
+    HarvestExpired(now_seconds);
 
     std::vector<bool> inner_key_hits;
     inner_->ProcessKeys(keys, hit_count, max_hit_count, &inner_key_hits);
@@ -43,17 +64,17 @@ void TtlCacheIndexerWrapper::ProcessKeys(const std::vector<int64_t> &keys,
         auto it = key_access_time_.find(key);
         if (it != key_access_time_.end()) {
             if (i < inner_key_hits.size() && inner_key_hits[i]) {
-                int64_t age_seconds = now - it->second;
+                int64_t age_seconds = now_seconds - it->second;
                 size_t bucket_index = FindAgeBucket(age_seconds);
                 hit_age_bucket_counts_[bucket_index]++;
             }
 
             expire_set_.erase({it->second + ttl_seconds_, key});
-            it->second = now;
-            expire_set_.insert({now + ttl_seconds_, key});
+            it->second = now_seconds;
+            expire_set_.insert({now_seconds + ttl_seconds_, key});
         } else {
-            key_access_time_[key] = now;
-            expire_set_.insert({now + ttl_seconds_, key});
+            key_access_time_[key] = now_seconds;
+            expire_set_.insert({now_seconds + ttl_seconds_, key});
         }
     }
 }
