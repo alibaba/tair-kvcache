@@ -97,7 +97,7 @@ service → manager → meta → config → data_storage → common
 ### 3.3 客户端与 Optimizer
 
 - **client** 是独立的对外分支，仅共享 `common`、`config`、`data_storage`、`protocol` 以及 `service/util:manager_message_proto_util`；**py_connector** 通过 pybind 位于 client 之上。核心服务端不依赖 client。运行时，元数据面经 gRPC（C++ `MetaClient`）或 HTTP（py_connector 的 Python `KvCacheManagerClient`）调用 KVCM 服务，数据面经 C++ `TransferClient` 直接读写存储后端——这几条链路是理解端到端流程的关键（见第 4 节）。
-- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优），并通过独立 online runtime/service 提供实时 TraceQuery。full-attention LRU 的在线多容量统计复用 LiteHit；它通过 `meta:cache_location` 类型与 `event` 的 optimizer 事件与核心关联。
+- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优），并通过独立 online runtime/service 提供实时 TraceQuery。full-attention LRU 的在线多容量统计复用 LiteHit；在线进程还可通过通用服务发现找到全部 KVCM endpoint，在 KVCM 的 Meta gRPC 端口调用 `SubscribeEvents` 并直接回放事件。KVCM 不反向发现 Optimizer。
 
 ### 3.4 模块关系图
 
@@ -146,6 +146,7 @@ flowchart TD
     service --> data_storage
     service --> protocol
     manager --> protocol
+    event --> protocol
     config --> protocol
     meta --> config
     meta --> data_storage
@@ -165,6 +166,8 @@ flowchart TD
     %% optimizer 的关联
     optimizer -. cache_location 类型 .-> meta
     optimizer --> common
+    optimizer --> protocol
+    optimizer -. gRPC SubscribeEvents（运行时） .-> service
 
     %% 底层通用模块被广泛依赖
     meta --> common
@@ -306,6 +309,12 @@ flowchart LR
 ### 4.8 HA 故障转移
 
 `LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager 并开放 leader-only 请求。降级时先通知 GC/Reclaimer 停止新工作并关闭、排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+
+### 4.9 KVCM 到在线 Optimizer 的事件流
+
+`CacheManager` 在读取路径产生 `CacheGetEvent`，`EventManager` 将其同时交给各 publisher。启用 optimizer publisher 后，单 worker 按事件顺序转换为 `TraceQueryRequest`，再写入每个 gRPC 订阅者的独立有界队列。KVCM 的 `OptimizerEventStreamService` 注册在现有 Meta gRPC server 上，不新增端口。
+
+Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpoint，再调用 `MetaService.GetClusterInfo` 定位当前 Leader；任意时刻只向 Leader 保持一条 `SubscribeEvents` response stream。supervisor 周期刷新服务发现和 Leader，并通过同一 Meta gRPC 端口上的 `OptimizerEventStreamService.GetConfiguration` 拉取 Instance Group / Instance 快照，按 Group 后 Instance 的顺序自动注册新增配置；未知 `instance_id` 会立即触发一次额外刷新。切主时先同步配置，再迁移 stream。stream 收到事件后直接调用 `OnlineOptimizerManager::TraceQuery`，Optimizer 侧不再增加业务队列。
 
 ---
 
