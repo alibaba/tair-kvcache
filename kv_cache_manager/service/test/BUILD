@@ -44,6 +44,43 @@ cc_test(
 )
 
 cc_test(
+    name = "ServerEventPublisherTest",
+    srcs = [
+        "server_event_publisher_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/event:optimizer_event_publisher",
+        "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
+        "//kv_cache_manager/service",
+    ],
+)
+
+cc_test(
+    name = "OptimizerEventServiceGRpcTest",
+    srcs = [
+        "optimizer_event_service_grpc_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/event:event_publishers_config",
+        "//kv_cache_manager/event:optimizer_event_publisher",
+        "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
+        "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "//kv_cache_manager/service:grpc_wrapper",
+        "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
+    ],
+)
+
+cc_test(
     name = "AdminServiceRemoveInstanceGroupTest",
     srcs = [
         "admin_service_remove_instance_group_test.cc",
