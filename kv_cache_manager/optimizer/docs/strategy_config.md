@@ -1,49 +1,51 @@
-# Optimizer 标准策略配置说明
+# Optimizer Standard Strategy Configuration Guide
 
-本文档定义标准版 optimizer 的策略配置、multi-instance replay 入口和命中率口径。后续新增实验脚本应复用这里的字段语义，避免在脚本里引入另一套配置命名。
+> [中文](strategy_config_zh.md) | English
 
-## 指标口径
+This document defines the strategy configuration, multi-instance replay entry point, and hit-rate metrics of the standard edition optimizer. Subsequent new experimental scripts should reuse the field semantics here, avoiding introducing another set of configuration naming in scripts.
 
-标准版只对外暴露一种命中率口径：
+## Metric Definitions
+
+The standard edition exposes only one hit-rate metric externally:
 
 ```text
 HitRate = HitTokens / InputTokens
 AccHitRate = AccHitTokens / AccInputTokens
 ```
 
-相关约定：
+Related conventions:
 
-- `HitRate`、`AccHitRate`、`LocalHitRate`、`RemoteHitRate` 和 `Tier*_HitRate` 都是 token hit rate。
-- 标准命中率只按 token 计算，但 CSV 保留 block 读/命中计数，便于核对读放大、命中规模和容量行为。
-- 标准分析不把 local/remote 当作独立结论维度。`local` 只表示 trace `block_mask` 带进来的已有本地命中 block，例如 optimizer 作为单独 L3 模拟并和 HiSim 结合时，或直接分析 KVCacheManager event log 时，日志里已经包含的本地命中 block key；`remote` 表示 optimizer 模拟层贡献的命中。当前标准报告直接按请求输入计算整体 `HitRate`，不依赖 local/remote 拆分。
-- 标准 `get` trace 必须包含 `input_len`，`InputTokens` 直接使用 `input_len`。
-- 不再兼容缺失 `input_len` 的旧 `get` trace。其他来源的日志需要先转换成 optimizer schema。
-- `keys` 只包含完整 block key；不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `InputTokens`。例如 `block_size=16`、`input_len=33` 时，`keys` 最多包含 2 个完整 block，尾部 1 个 token 只进入分母。
+- `HitRate`, `AccHitRate`, `LocalHitRate`, `RemoteHitRate`, and `Tier*_HitRate` are all token hit rates.
+- The standard hit rate is computed only by token, but the CSV retains block read/hit counts for verifying read amplification, hit scale, and capacity behavior.
+- The standard analysis does not treat local/remote as independent conclusion dimensions. `local` only denotes existing local hit blocks brought in by the trace `block_mask`, e.g. when the optimizer acts as a standalone L3 simulation combined with HiSim, or when directly analyzing KVCacheManager event logs, the local hit block keys already contained in the log; `remote` denotes hits contributed by the optimizer simulation layer. The current standard report directly computes the overall `HitRate` from request input, without relying on the local/remote split.
+- A standard `get` trace must contain `input_len`; `InputTokens` directly uses `input_len`.
+- Old `get` traces missing `input_len` are no longer compatible. Logs from other sources must first be converted to the optimizer schema.
+- `keys` only contains complete block keys; trailing tokens that do not fill a block are not written into `keys`, but are still counted into `InputTokens`. For example, when `block_size=16` and `input_len=33`, `keys` contains at most 2 complete blocks, and the trailing 1 token only enters the denominator.
 
-标准 `*_hit_rates.csv` 的核心列：
+Core columns of the standard `*_hit_rates.csv`:
 
-| 列 | 说明 |
+| Column | Description |
 |---|---|
-| `TimestampNs` | trace 时间戳，单位 ns |
-| `CachedBlocks` | 当前 CSV 对应 instance 的缓存 block 数 |
-| `CachedBlocksAllInstances` | 同一 optimizer 进程内所有 instance 的总缓存 block 数 |
-| `ReadBlocks` / `HitBlocks` | 当前请求读取 / 命中的 block 数 |
-| `LocalHitBlocks` / `RemoteHitBlocks` | 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中 |
-| `InputTokens` / `HitTokens` | 当前请求的输入 token 数 / 命中 token 数 |
-| `LocalHitTokens` / `RemoteHitTokens` | 诊断字段：本地 / optimizer 模拟层命中 token 数 |
-| `HitRate` | 当前请求整体 token hit rate |
-| `LocalHitRate` / `RemoteHitRate` | 诊断字段，不作为标准分析主口径 |
-| `AccReadBlocks` / `AccHitBlocks` | 累计读取 / 命中的 block 数 |
-| `AccInputTokens` / `AccHitTokens` | 累计输入 token 数 / 累计命中 token 数 |
-| `AccLocalHitTokens` / `AccRemoteHitTokens` | 诊断字段：累计本地 / optimizer 模拟层命中 token 数 |
-| `AccHitRate` | 累计整体 token hit rate |
-| `AccLocalHitRate` / `AccRemoteHitRate` | 诊断字段，不作为标准分析主口径 |
-| `AccWriteBlocks` | 截至当前时间的累计写入 block 数 |
-| `Tier<N>(name)_HitTokens` | 当前请求在某个 tier 的命中 token 数 |
-| `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` | 当前 / 累计 tier token hit rate |
-| `Tier<N>(name)_BlockNum` | 当前 tier 的缓存 block 数 |
+| `TimestampNs` | trace timestamp, in ns |
+| `CachedBlocks` | number of cached blocks for the instance corresponding to the current CSV |
+| `CachedBlocksAllInstances` | total number of cached blocks across all instances within the same optimizer process |
+| `ReadBlocks` / `HitBlocks` | number of blocks read / hit by the current request |
+| `LocalHitBlocks` / `RemoteHitBlocks` | diagnostic fields: existing local hits brought in by trace `block_mask` / hits from the optimizer simulation layer |
+| `InputTokens` / `HitTokens` | input token count / hit token count of the current request |
+| `LocalHitTokens` / `RemoteHitTokens` | diagnostic fields: local / optimizer simulation layer hit token count |
+| `HitRate` | overall token hit rate of the current request |
+| `LocalHitRate` / `RemoteHitRate` | diagnostic fields, not used as the main metric of standard analysis |
+| `AccReadBlocks` / `AccHitBlocks` | cumulative read / hit block count |
+| `AccInputTokens` / `AccHitTokens` | cumulative input token count / cumulative hit token count |
+| `AccLocalHitTokens` / `AccRemoteHitTokens` | diagnostic fields: cumulative local / optimizer simulation layer hit token count |
+| `AccHitRate` | cumulative overall token hit rate |
+| `AccLocalHitRate` / `AccRemoteHitRate` | diagnostic fields, not used as the main metric of standard analysis |
+| `AccWriteBlocks` | cumulative written block count up to the current time |
+| `Tier<N>(name)_HitTokens` | hit token count of the current request in a certain tier |
+| `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` | current / cumulative tier token hit rate |
+| `Tier<N>(name)_BlockNum` | number of cached blocks in the current tier |
 
-## 顶层配置
+## Top-Level Configuration
 
 ```json
 {
@@ -60,36 +62,36 @@ AccHitRate = AccHitTokens / AccInputTokens
 }
 ```
 
-`output_result_path` 是所有 config 驱动入口的结果输出目录，包括 `optimizer_main`、`optimizer_run`、`tradeoff` 和 `export_tree`。`export_tree` 会写到该目录下的 `radix_tree/`。`multi_instance_replay` 不读取完整 optimizer config，需要通过 `--output-dir` 显式指定输出目录。
+`output_result_path` is the result output directory for all config-driven entry points, including `optimizer_main`, `optimizer_run`, `tradeoff`, and `export_tree`. `export_tree` writes to `radix_tree/` under that directory. `multi_instance_replay` does not read the full optimizer config and requires the output directory to be explicitly specified via `--output-dir`.
 
 ### eviction_params
 
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---:|---:|---|
-| `eviction_mode` | int | 必填 | `1`=`GROUP_ROUGH`，`2`=`INSTANCE_ROUGH`，`3`=`INSTANCE_PRECISE` |
-| `eviction_batch_size_per_instance` | int | 必填 | 每轮每实例最多驱逐的 block 数。rough 模式必须大于 0 |
+| `eviction_mode` | int | required | `1`=`GROUP_ROUGH`, `2`=`INSTANCE_ROUGH`, `3`=`INSTANCE_PRECISE` |
+| `eviction_batch_size_per_instance` | int | required | maximum number of blocks evicted per instance per round. Must be greater than 0 in rough mode |
 
-推荐标准实验使用 `eviction_mode=3`，因为它按剩余超额容量截断最后一轮驱逐，容量点更稳定。
+It is recommended to use `eviction_mode=3` for standard experiments, because it truncates the last eviction round by the remaining excess capacity, making capacity points more stable.
 
 ### trace_replay
 
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---:|---:|---|
-| `write_delay_ns` | int64 | `1` | `type=request` trace 的内部写入延迟。回放时先在 `timestamp_ns` 执行读，再在 `timestamp_ns + write_delay_ns` 调度写入。必须大于 0 |
+| `write_delay_ns` | int64 | `1` | internal write delay for `type=request` traces. During replay, the read is executed first at `timestamp_ns`, then the write is scheduled at `timestamp_ns + write_delay_ns`. Must be greater than 0 |
 
-## 标准 trace schema
+## Standard Trace Schema
 
-optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完整时直接失败，不做旧格式推断。
+The optimizer replay input only accepts JSONL, with one standard trace per line. When fields are incomplete it fails directly, without doing old-format inference.
 
-`timestamp_ns`、`get.input_len`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
+`timestamp_ns`, `get.input_len`, `block_mask` offset, and `ttl_us` must fall within the `int64_t` range:
 
 ```text
 [-9223372036854775808, 9223372036854775807]
 ```
 
-`keys` 支持 JSON signed/unsigned 整数。超过 `INT64_MAX=9223372036854775807` 的 unsigned 64-bit 值会按补码稳定映射到内部 `int64_t`，例如 `9223372036854775808 -> -9223372036854775808`、`18446744073709551615 -> -1`。
+`keys` supports JSON signed/unsigned integers. Unsigned 64-bit values exceeding `INT64_MAX=9223372036854775807` are stably mapped to the internal `int64_t` via two's complement, e.g. `9223372036854775808 -> -9223372036854775808`, `18446744073709551615 -> -1`.
 
-Get trace：
+Get trace:
 
 ```json
 {
@@ -106,12 +108,12 @@ Get trace：
 }
 ```
 
-Request trace：
+Request trace:
 
-当外部 trace 只有请求级记录、没有显式拆成读写两行时，使用 `request`。它等价于：
+When the external trace only has request-level records and is not explicitly split into read and write rows, use `request`. It is equivalent to:
 
-- 在 `timestamp_ns` 执行一次 `get`
-- 在 `timestamp_ns + trace_replay.write_delay_ns` 执行一次 `write`
+- executing a `get` at `timestamp_ns`
+- executing a `write` at `timestamp_ns + trace_replay.write_delay_ns`
 
 ```json
 {
@@ -129,7 +131,7 @@ Request trace：
 }
 ```
 
-Write trace：
+Write trace:
 
 ```json
 {
@@ -142,54 +144,54 @@ Write trace：
 }
 ```
 
-必填字段：
+Required fields:
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |---|---|---|
-| `type` | string | 只能是 `get`、`write` 或 `request` |
-| `instance_id` | string | 非空，必须匹配配置中的 instance |
-| `timestamp_ns` | int64 | ns 时间戳，必须为正整数；不再接受 `timestamp_us` |
-| `keys` | int64/uint64 array | block key 列表，可为空 |
+| `type` | string | can only be `get`, `write`, or `request` |
+| `instance_id` | string | non-empty, must match an instance in the config |
+| `timestamp_ns` | int64 | ns timestamp, must be a positive integer; `timestamp_us` is no longer accepted |
+| `keys` | int64/uint64 array | list of block keys, may be empty |
 
-可选公共字段：
+Optional common fields:
 
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `trace_id` | string | 空字符串 | 请求标识，用于调试和模板分析 |
+| `trace_id` | string | empty string | request identifier, used for debugging and template analysis |
 
-`get` 专用字段：
+`get`-specific fields:
 
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `input_len` | int64 | 必填 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
-| `query_type` | string | `prefix_match` | 当前只支持 `prefix_match`；其他值会被跳过 |
-| `block_mask` | bool array 或非负 int64 | 空数组 | trace 已经知道的本地命中 block。数组形式逐 block 标记；整数形式表示从前缀开始的本地命中 block 数 |
-| `sw_size` | int32 | 0 | 滑窗参数，当前标准前缀匹配通常为 0 |
-| `location_spec_names` | string array | 空数组 | 兼容字段，标准分析通常为空 |
+| `input_len` | int64 | required | input token count, must be a positive integer; `InputTokens` directly uses this value |
+| `query_type` | string | `prefix_match` | currently only `prefix_match` is supported; other values are skipped |
+| `block_mask` | bool array or non-negative int64 | empty array | local hit blocks already known by the trace. The array form marks per block; the integer form denotes the number of local hit blocks from the prefix start |
+| `sw_size` | int32 | 0 | sliding window parameter, usually 0 for the current standard prefix matching |
+| `location_spec_names` | string array | empty array | compatibility field, usually empty for standard analysis |
 
-`write` 专用字段：
+`write`-specific fields:
 
-| 字段 | 类型 | 默认 | 说明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
+| `ttl_us` | int64 | 0 | request-level TTL, in microseconds; `0` uses the group default TTL, `-1` denotes disabling TTL |
 
-`request` 字段：
+`request` fields:
 
-`request` 复用 `get` 的所有字段，并额外支持 `write.ttl_us`。`request` 内部生成的写入会使用同一组 `keys` 和该 `ttl_us`。
+`request` reuses all fields of `get`, and additionally supports `write.ttl_us`. The write internally generated by `request` uses the same set of `keys` and that `ttl_us`.
 
-`write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len` 和 `block_mask` 都忽略。`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
+`write` only reads `type`, `instance_id`, `trace_id`, `timestamp_ns`, `keys`, and `ttl_us`; other fields including `input_len` and `block_mask` are ignored. `block_mask` is only used to mark local hit blocks already known by the trace, and is not the grouping basis of the standard report. When directly analyzing request input, an empty array can usually be passed, in which case the overall `HitRate` is still computed as `HitTokens / InputTokens`.
 
-旧格式或不合法输入会失败，包括：
+Old-format or invalid input will fail, including:
 
-- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` / `request` trace 缺少 `input_len`。
-- `get/request.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
-- `get/request.keys.size() > input_len / block_size`。标准 trace 的 `keys` 只能包含完整 block，不允许把不足一个 block 的尾部 key 写入 trace。
-- 使用 `timestamp_us` 但没有 `timestamp_ns`。
-- `keys` 中存在非整数。
-- `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
-- legacy dialog-style trace 只有 `query_type` / `block_mask` / decode metadata 但没有显式 `type=get/write`。
+- Missing `type`, `instance_id`, `timestamp_ns`, `keys`, or `get` / `request` traces missing `input_len`.
+- `get/request.input_len <= 0`, `timestamp_ns <= 0`, or `keys` not being an array.
+- `get/request.keys.size() > input_len / block_size`. The `keys` of a standard trace can only contain complete blocks; writing a trailing key that does not fill a block into the trace is not allowed.
+- Using `timestamp_us` but without `timestamp_ns`.
+- Non-integers present in `keys`.
+- Non-bool values present in the `block_mask` array, or offset being negative / exceeding `INT64_MAX`.
+- Legacy dialog-style traces that only have `query_type` / `block_mask` / decode metadata but no explicit `type=get/write`.
 
-## instance group 配置
+## Instance Group Configuration
 
 ```json
 {
@@ -211,45 +213,45 @@ Write trace：
 }
 ```
 
-| 字段 | 类型 | 默认 | 标准语义 |
+| Field | Type | Default | Standard Semantics |
 |---|---:|---:|---|
-| `group_name` | string | 必填 | 实例组名称。multi-instance replay 中通常等于 instance 的 `instance_id` |
-| `quota_capacity` | number | 必填 | group 总容量，单位 GB。非分层模式按该字段驱逐；`-1` 表示无限容量，不触发容量驱逐，主要用于全局池化理论命中和 Pareto warmup |
-| `used_percentage` | number | 必填 | 容量水位比例，实际阈值为 capacity × used_percentage |
-| `tier_strategy` | object | 必填 | 多层读写策略包，见下表 |
-| `default_block_ttl_seconds` | int | `0` | group 默认 TTL 秒数，`0` 表示组级禁用 TTL |
-| `ttl_refresh_on_read` | bool | `true` | TTL 策略下读命中是否刷新 TTL 锚点 |
-| `storages` | array | 必填 | tier 列表，按 `priority` 从小到大排序 |
-| `instances` | array | 必填 | 该 group 下的 optimizer instance 列表 |
+| `group_name` | string | required | instance group name. In multi-instance replay usually equal to the instance's `instance_id` |
+| `quota_capacity` | number | required | total group capacity, in GB. Non-tiered mode evicts by this field; `-1` means infinite capacity, no capacity eviction triggered, mainly used for global pooled theoretical hits and Pareto warmup |
+| `used_percentage` | number | required | capacity watermark ratio; the actual threshold is capacity × used_percentage |
+| `tier_strategy` | object | required | multi-tier read/write policy package, see table below |
+| `default_block_ttl_seconds` | int | `0` | group default TTL in seconds; `0` means TTL disabled at the group level |
+| `ttl_refresh_on_read` | bool | `true` | whether a read hit refreshes the TTL anchor under the TTL policy |
+| `storages` | array | required | tier list, sorted by `priority` ascending |
+| `instances` | array | required | list of optimizer instances under this group |
 
 ### tier_strategy
 
-`tier_strategy` 顶层字段是所有相邻 tier edge 的默认策略；`tier_flows` 只用于覆盖特定相邻 edge。若所有层间策略一致，可以只配置顶层字段并省略 `tier_flows`，它们不是两套重复配置。
+The top-level fields of `tier_strategy` are the default policy for all adjacent tier edges; `tier_flows` is only used to override specific adjacent edges. If all inter-tier policies are consistent, you can configure only the top-level fields and omit `tier_flows`; they are not two sets of duplicate configuration.
 
-| 字段 | 类型 | 默认 | 标准语义 |
+| Field | Type | Default | Standard Semantics |
 |---|---:|---:|---|
-| `hierarchical_eviction_enabled` | bool | 必填 | 是否启用分层容量和分层驱逐；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额 |
-| `write_mode` | string | `write_through` | 多 tier 写入和层间流动策略 |
-| `access_propagation_enabled` | bool | `true` | 读命中高优先级 tier 时，是否刷新后续持有副本 tier 的访问时间；`false` 表示只刷新命中 tier |
-| `promote_enabled` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
-| `selective_write_threshold` | int | `2` | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
-| `tier_flows` | array | `[]` | 相邻 tier edge 的策略覆盖。未覆盖的 edge 继承 `tier_strategy` 的默认策略 |
+| `hierarchical_eviction_enabled` | bool | required | whether to enable tiered capacity and tiered eviction; when `false`, all tiers share one `shared` policy and the `quota_capacity` quota |
+| `write_mode` | string | `write_through` | multi-tier write and inter-tier flow policy |
+| `access_propagation_enabled` | bool | `true` | when a read hits a higher-priority tier, whether to refresh the access time of subsequent tiers holding copies; `false` means only the hit tier is refreshed |
+| `promote_enabled` | bool | `true` | whether to copy back layer by layer to the higher-priority tiers passed through after a lower-tier hit |
+| `selective_write_threshold` | int | `2` | under `write_through_selective`, copy to the next tier after the hit tier's access count reaches this threshold; must be a positive integer |
+| `tier_flows` | array | `[]` | policy overrides for adjacent tier edges. Unoverridden edges inherit the default policy of `tier_strategy` |
 
 ### write_mode
 
-| 值 | 写入行为 | 驱逐行为 | 适用场景 |
+| Value | Write Behavior | Eviction Behavior | Applicable Scenario |
 |---|---|---|---|
-| `write_through` | 写入时同时落所有 tier | 各 tier 独立按自身容量驱逐 | 基线、全量副本、多层独立命中率分析 |
-| `cascading` | 写入时只落 tier 0 | tier i 驱逐出的 block 降级到 tier i+1，最后一层驱逐后丢弃 | HBM→DRAM→SSD 逐级下沉 |
-| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `tier_strategy.selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
+| `write_through` | writes land in all tiers simultaneously | each tier evicts independently by its own capacity | baseline, full replicas, multi-tier independent hit-rate analysis |
+| `cascading` | writes land only in tier 0 | blocks evicted from tier i are demoted to tier i+1; discarded after eviction from the last tier | HBM→DRAM→SSD progressive sinking |
+| `write_through_selective` | initially lands only in tier 0 | copy to the next tier after the hit tier's access count reaches `tier_strategy.selective_write_threshold` | control lower-tier write amplification, only let hot blocks sink |
 
-`tier_strategy.write_mode` 只接受上表三个值，其他值会导致 config 解析失败。
-`access_propagation_enabled` 不是一种 `write_mode`，而是读命中后是否刷新下层副本访问时间的独立开关。
+`tier_strategy.write_mode` only accepts the three values in the table above; other values cause config parsing to fail.
+`access_propagation_enabled` is not a kind of `write_mode`, but an independent switch for whether to refresh the access time of lower-tier copies after a read hit.
 
 ### tier_flows
 
-`tier_flows` 用于覆盖相邻 tier 之间的读写流动策略。每个 flow 必须引用 `storages` 中相邻的两个 `unique_name`，不支持跨层跳配，也不允许重复配置同一条 edge。
-配置加载时会按 `storages[*].priority` 排序后校验 edge。未知 tier、非相邻 edge、重复 edge、重复 `unique_name` 或重复 `priority` 都会直接报错并拒绝加载。
+`tier_flows` is used to override the read/write flow policy between adjacent tiers. Each flow must reference two adjacent `unique_name`s in `storages`; cross-tier skipping is not supported, and configuring the same edge twice is not allowed.
+At config load time, edges are validated after sorting by `storages[*].priority`. Unknown tiers, non-adjacent edges, duplicate edges, duplicate `unique_name`s, or duplicate `priority`s all directly raise an error and refuse to load.
 
 ```json
 {
@@ -277,27 +279,27 @@ Write trace：
 }
 ```
 
-单条 flow 的字段：
+Fields of a single flow:
 
-| 字段 | 类型 | 默认 | 标准语义 |
+| Field | Type | Default | Standard Semantics |
 |---|---:|---:|---|
-| `from_tier` | string | 必填 | edge 的高优先级 tier 名称，必须等于某个 `storages[i].unique_name` |
-| `to_tier` | string | 必填 | edge 的低优先级 tier 名称，必须等于相邻的 `storages[i+1].unique_name` |
-| `write_mode` | string | 继承默认 | 这条 edge 的写入/驱逐下沉策略 |
-| `access_propagation_enabled` | bool | 继承默认 | 访问命中高层后，是否跨这条 edge 刷新下层访问时间 |
-| `promote_enabled` | bool | 继承默认 | 低层命中后，是否允许跨这条 edge 回填到高层 |
-| `selective_write_threshold` | int | 继承默认 | 这条 edge 使用 `write_through_selective` 时的下写阈值 |
+| `from_tier` | string | required | the higher-priority tier name of the edge, must equal some `storages[i].unique_name` |
+| `to_tier` | string | required | the lower-priority tier name of the edge, must equal the adjacent `storages[i+1].unique_name` |
+| `write_mode` | string | inherit default | the write/eviction sinking policy of this edge |
+| `access_propagation_enabled` | bool | inherit default | after a hit on the higher tier, whether to refresh the lower-tier access time across this edge |
+| `promote_enabled` | bool | inherit default | after a lower-tier hit, whether to allow backfilling to the higher tier across this edge |
+| `selective_write_threshold` | int | inherit default | the down-write threshold when this edge uses `write_through_selective` |
 
 ### access_propagation_enabled
 
-这个开关与 `tier_strategy.write_mode` 正交：
+This switch is orthogonal to `tier_strategy.write_mode`:
 
-- `true`：一个 block 在多个 tier 有副本时，读命中最高优先级 tier 后，也刷新后续副本 tier 的访问时间。这是默认行为。
-- `false`：只刷新实际命中的最高优先级 tier，不刷新下层副本的访问时间。适用于评估 write-through 或 cascading/promote 后多副本场景下的下层独立冷热衰减。
+- `true`: when a block has copies in multiple tiers, after a read hits the highest-priority tier, the access time of subsequent copy tiers is also refreshed. This is the default behavior.
+- `false`: only the actually hit highest-priority tier is refreshed; the access time of lower-tier copies is not refreshed. Suitable for evaluating the independent lower-tier hot/cold decay in multi-copy scenarios after write-through or cascading/promote.
 
-`promote_enabled=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
+When `promote_enabled=true`, a lower-priority tier hit triggers layer-by-layer copying to higher-priority tiers. For example, an L3 hit fills in L2 and L1, an L2 hit only fills in L1, and there is no extra writing to even lower tiers. The copy action goes through capacity checks and may immediately trigger eviction of the corresponding tier.
 
-## storage 配置
+## Storage Configuration
 
 ```json
 {
@@ -309,15 +311,15 @@ Write trace：
 }
 ```
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |---|---:|---|
-| `unique_name` | string | tier 名称，会进入 CSV 的 `Tier<N>(name)_*` 列 |
-| `storage_type` | string | 存储类型标签，当前主要用于配置记录 |
-| `band_width_mbps` | number | 带宽标签，当前主要用于分析记录 |
-| `priority` | int | tier 优先级，越小越靠近计算侧 |
-| `capacity` | number | tier 容量，单位 GB；`-1` 表示该 tier 无限容量，不触发该 tier 的容量驱逐 |
+| `unique_name` | string | tier name, which enters the `Tier<N>(name)_*` columns of the CSV |
+| `storage_type` | string | storage type label, currently mainly used for config records |
+| `band_width_mbps` | number | bandwidth label, currently mainly used for analysis records |
+| `priority` | int | tier priority; smaller means closer to the compute side |
+| `capacity` | number | tier capacity, in GB; `-1` means infinite capacity for that tier, no capacity eviction triggered for that tier |
 
-## instance 配置
+## Instance Configuration
 
 ```json
 {
@@ -329,13 +331,13 @@ Write trace：
 }
 ```
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |---|---:|---|
-| `instance_id` | string | trace 中的实例 ID，必须与 trace 行内 `instance_id` 匹配 |
-| `block_size` | int | 每个 block 的 token 数。token hit rate 会用它把命中 block 转为命中 token |
-| `bytes_per_token` | int | 单 token KV 大小。`bytes_per_block = block_size * bytes_per_token` |
-| `eviction_policy_type` | string | `lru`、`random_lru`、`leaf_aware_lru`、`ttl` |
-| `eviction_policy_params` | object | 策略参数，见下文 |
+| `instance_id` | string | instance ID in the trace, must match the `instance_id` within trace rows |
+| `block_size` | int | number of tokens per block. Token hit rate uses it to convert hit blocks to hit tokens |
+| `bytes_per_token` | int | KV size per token. `bytes_per_block = block_size * bytes_per_token` |
+| `eviction_policy_type` | string | `lru`, `random_lru`, `leaf_aware_lru`, `ttl` |
+| `eviction_policy_params` | object | policy parameters, see below |
 
 ## eviction_policy_params
 
@@ -350,12 +352,12 @@ Write trace：
 }
 ```
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `sample_rate` | 采样比例。`1.0` 表示完整 LRU |
-| `shard_count` | LRU 分片数 |
-| `sample_times` | 每次采样次数 |
-| `eviction_amplification_factor` | 驱逐放大系数 |
+| `sample_rate` | sampling ratio. `1.0` means complete LRU |
+| `shard_count` | number of LRU shards |
+| `sample_times` | number of samples per round |
+| `eviction_amplification_factor` | eviction amplification factor |
 
 ### random_lru
 
@@ -365,7 +367,7 @@ Write trace：
 }
 ```
 
-`random_lru` 只要求 `sample_rate`，用于控制采样范围。
+`random_lru` only requires `sample_rate`, used to control the sampling range.
 
 ### ttl
 
@@ -375,18 +377,18 @@ Write trace：
 }
 ```
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `fallback_on_pressure=true` | 先清理 TTL 过期 block；容量仍超限时按 LRU 兜底 |
-| `fallback_on_pressure=false` | 纯 TTL，只清理过期 block；容量压力不会触发 LRU 兜底 |
+| `fallback_on_pressure=true` | first clear TTL-expired blocks; if capacity still exceeds the limit, fall back to LRU |
+| `fallback_on_pressure=false` | pure TTL, only clear expired blocks; capacity pressure does not trigger LRU fallback |
 
-TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `default_block_ttl_seconds` 和 `ttl_refresh_on_read` 的过期清理语义。
+TTL is only executed when `eviction_policy_type="ttl"`. Non-TTL policies ignore the expiration cleanup semantics of `default_block_ttl_seconds` and `ttl_refresh_on_read`.
 
-## 标准多实例回放
+## Standard Multi-Instance Replay
 
-标准版保留 `multi_instance_replay`，不再把 multi-machine scheduler 作为默认回放入口。
-脚本完整参数以 [analysis/script/README.md](../analysis/script/README.md) 为准；这里给出标准回放配置示例和输出约定。
-`multi_instance_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个 pod/instance 生成单实例 config，然后并行运行 optimizer。当前 CLI 直接支持 L1/L2 两层容量；需要 L3 或更复杂 tier 拓扑时，需要使用完整 optimizer config 跑单次回放，或扩展该脚本的 config 生成逻辑。
+The standard edition retains `multi_instance_replay` and no longer uses the multi-machine scheduler as the default replay entry point.
+The complete script parameters are subject to [analysis/script/README.md](../analysis/script/README.md); here we give a standard replay configuration example and output conventions.
+`multi_instance_replay` does not read the full optimizer config; it generates a single-instance config for each pod/instance based on CLI parameters, then runs the optimizer in parallel. The current CLI directly supports two tiers of capacity, L1/L2; when L3 or more complex tier topologies are needed, you need to use a full optimizer config to run a single replay, or extend the config generation logic of this script.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
@@ -403,15 +405,15 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
   --max-workers 32
 ```
 
-输出：
+Output:
 
-- 输出根目录为 `--output-dir`。
-- `configs/<instance_id>.json`：每个 instance 的生成配置。
-- `<instance_id>_hit_rates.csv`：每个 instance 的标准 token hit-rate 时序。
-- `aggregate/instance_aggregate.csv`：每个 instance 的聚合结果。
-- `aggregate/global_aggregate.csv`：所有 instance 汇总后的全局结果。
-- `aggregate/global_window_hit_rates.csv`：指定 `--window-ns` 或 `--window-seconds` 时生成的窗口结果。
+- The output root directory is `--output-dir`.
+- `configs/<instance_id>.json`: the generated config for each instance.
+- `<instance_id>_hit_rates.csv`: the standard token hit-rate time series for each instance.
+- `aggregate/instance_aggregate.csv`: the aggregated result for each instance.
+- `aggregate/global_aggregate.csv`: the global result after summarizing all instances.
+- `aggregate/global_window_hit_rates.csv`: the window result generated when `--window-ns` or `--window-seconds` is specified.
 
-multi-instance replay 聚合后的 `HitRate` 仍然是 token hit rate，计算方式为所有 instance 的 `HitTokens` 总和除以 `InputTokens` 总和。
-`--bucket-name` 只写入聚合 CSV 的 `Bucket` 列，用于标记实验来源；`--trace-glob` 和 `--recursive` 只在使用 `--trace-dir` 扫描输入文件时生效。
-`--default-tier-write-mode`、`--tier-flow-config`、`--enable/disable-tier-access-propagation`、`--enable/disable-promote` 和 `--selective-write-threshold` 会写入生成 config 的 `tier_strategy`，语义与上文一致。
+The aggregated `HitRate` of multi-instance replay is still token hit rate, computed as the sum of `HitTokens` across all instances divided by the sum of `InputTokens`.
+`--bucket-name` only writes into the `Bucket` column of the aggregate CSV, used to mark the experiment source; `--trace-glob` and `--recursive` only take effect when using `--trace-dir` to scan input files.
+`--default-tier-write-mode`, `--tier-flow-config`, `--enable/disable-tier-access-propagation`, `--enable/disable-promote`, and `--selective-write-threshold` are written into the `tier_strategy` of the generated config, with semantics consistent with the above.
