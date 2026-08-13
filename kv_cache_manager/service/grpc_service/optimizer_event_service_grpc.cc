@@ -1,0 +1,108 @@
+#include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
+
+#include <chrono>
+#include <utility>
+
+#include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
+
+namespace kv_cache_manager {
+
+OptimizerEventServiceGRpc::OptimizerEventServiceGRpc(std::shared_ptr<SubscriptionEventSink> sink,
+                                                     std::shared_ptr<RegistryManager> registry_manager)
+    : sink_(std::move(sink)), registry_manager_(std::move(registry_manager)) {}
+
+grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
+                                                         const proto::optimizer::KvcmConfigurationRequest *request,
+                                                         proto::optimizer::KvcmConfigurationResponse *response) {
+    auto *status = response->mutable_header()->mutable_status();
+    if (!registry_manager_) {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("KVCM registry manager is unavailable");
+        return grpc::Status::OK;
+    }
+
+    RequestContext request_context(request->trace_id());
+    const auto [group_ec, instance_groups] = registry_manager_->ListInstanceGroup(&request_context);
+    if (group_ec != EC_OK) {
+        status->set_code(proto::optimizer::INTERNAL_ERROR);
+        status->set_message("Failed to list KVCM instance groups");
+        return grpc::Status::OK;
+    }
+
+    for (const auto &instance_group : instance_groups) {
+        auto *group = response->add_instance_groups();
+        group->set_name(instance_group->name());
+        group->set_capacity_bytes(instance_group->quota().capacity());
+
+        const auto [instance_ec, instances] =
+            registry_manager_->ListInstanceInfo(&request_context, instance_group->name());
+        if (instance_ec != EC_OK) {
+            response->clear_instance_groups();
+            response->clear_instances();
+            status->set_code(proto::optimizer::INTERNAL_ERROR);
+            status->set_message("Failed to list KVCM instances");
+            return grpc::Status::OK;
+        }
+        for (const auto &instance_info : instances) {
+            auto *instance = response->add_instances();
+            instance->set_instance_group_name(instance_info->instance_group_name());
+            instance->set_instance_id(instance_info->instance_id());
+            instance->set_block_size(instance_info->block_size());
+            for (const auto &spec_info : instance_info->location_spec_infos()) {
+                auto *spec = instance->add_location_spec_infos();
+                spec->set_name(spec_info.name());
+                spec->set_size(spec_info.size());
+            }
+            for (const auto &spec_group : instance_info->location_spec_groups()) {
+                auto *group_config = instance->add_location_spec_groups();
+                group_config->set_name(spec_group.name());
+                for (const auto &spec_name : spec_group.spec_names()) {
+                    group_config->add_spec_names(spec_name);
+                }
+            }
+        }
+    }
+
+    status->set_code(proto::optimizer::OK);
+    return grpc::Status::OK;
+}
+
+grpc::Status
+OptimizerEventServiceGRpc::SubscribeEvents(grpc::ServerContext *context,
+                                           const proto::optimizer::OptimizerEventSubscriptionRequest *request,
+                                           grpc::ServerWriter<proto::optimizer::TraceQueryRequest> *writer) {
+    if (!sink_ || sink_->stopped()) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "optimizer event publisher is unavailable");
+    }
+    auto subscription = sink_->Subscribe(request->consumer_id());
+    if (!subscription) {
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "optimizer subscriber limit reached");
+    }
+
+    KVCM_LOG_INFO("OptimizerEventServiceGRpc: stream opened, consumer_id=%s, peer=%s",
+                  subscription->consumer_id().c_str(),
+                  context->peer().c_str());
+    while (!context->IsCancelled()) {
+        proto::optimizer::TraceQueryRequest event;
+        const auto result = subscription->WaitNext(&event, std::chrono::milliseconds(100));
+        if (result == SubscriptionEventSink::Subscription::WaitResult::kTimeout) {
+            continue;
+        }
+        if (result == SubscriptionEventSink::Subscription::WaitResult::kClosed) {
+            break;
+        }
+        if (!writer->Write(event)) {
+            break;
+        }
+    }
+    sink_->Unsubscribe(subscription);
+    KVCM_LOG_INFO("OptimizerEventServiceGRpc: stream closed, consumer_id=%s", subscription->consumer_id().c_str());
+    return grpc::Status::OK;
+}
+
+} // namespace kv_cache_manager
