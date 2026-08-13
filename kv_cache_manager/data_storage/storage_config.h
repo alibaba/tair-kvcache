@@ -18,6 +18,9 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_DUMMY = 6,
     DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 = 7,
     DATA_STORAGE_TYPE_EVENT_REPORT_L2 = 8,
+    // Keep the legacy TairMempool type for DRAM/backward compatibility and
+    // account explicit SSD locations independently for quota and water level.
+    DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD = 9,
     COUNT, // as sentinel, must be last
 };
 
@@ -35,6 +38,15 @@ constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
 }
+
+constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
+           type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+}
+
+// Storage type names are persisted in KVCM metadata, while both TairMempool
+// media types use the same PACE data-plane URI scheme.
+inline constexpr char kTairMempoolUriScheme[] = "pace";
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)

@@ -206,7 +206,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 ```TEXT
 {
     "storage_config": {
-        "type": "file", # 后端类型，可选值file,pace,mooncake,hf3fs,vcns_hf3fs
+        "type": "file", # 后端类型，可选值file,pace,pace_ssd,mooncake,hf3fs,vcns_hf3fs
         "global_unique_name": "nfs_01", # storage backend的名字，需要全局唯一
         "storage_spec": { # storage spec 需根据不同backend类型相应配置，TODO：具体每个type的spec配置文档
             "root_path": "/tmp/nfs/",
@@ -234,6 +234,10 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 {
                     "storage_type": "pace",
                     "capacity": 10000000000
+                },
+                {
+                    "storage_type": "pace_ssd",
+                    "capacity": 10000000000
                 }
             ]
         },
@@ -256,6 +260,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
             # CPS_PREFER_TAIR_MEMPOOL = 6,
             # CPS_ALWAYS_VCNS_3FS = 7,
             # CPS_PREFER_VCNS_3FS = 8,
+            # CPS_ALWAYS_TAIR_MEMPOOL_SSD = 9,
+            # CPS_PREFER_TAIR_MEMPOOL_SSD = 10,
             # };
             "cache_prefer_strategy": 2,
             "meta_indexer_config": {
@@ -282,6 +288,28 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
+`pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage
+仍使用 `pace://` 数据面 URI，但 quota、类型水位和迁移触发用量分别统计。旧的
+`ST_TAIRMEMPOOL + media_type=5` 配置仍可读取，迁移到新类型后才能获得独立 SSD 水位。
+
+启用独立 SSD 类型时还需遵守以下配置约束：
+
+- 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有
+  `pace` Storage 原地更新为 `pace_ssd`。Storage 类型会写入 CacheLocation 和用量账本，
+  服务端会拒绝同名 Storage 的类型变更。
+- Instance Group 的 `quota.quota_config` 必须同时为 `pace` 和 `pace_ssd` 配置正容量。
+  类型水位只遍历这里显式出现的类型；缺少 `pace_ssd` 时不会形成 SSD 类型水位和容量上限，
+  缺少迁移源 `pace` 时迁移规则不会触发。
+- SSD 仅作为迁移目标时，不要求放入 `storage_candidates`；迁移规则按
+  `target_storage_name` 精确选择它。若需要把普通新写入直接落到 SSD，则必须把 SSD Storage
+  放入 `storage_candidates`，并使用 `CPS_ALWAYS_TAIR_MEMPOOL_SSD` 或
+  `CPS_PREFER_TAIR_MEMPOOL_SSD`。
+- `pace` 和 `pace_ssd` 的数据面 URI scheme 都是 `pace://`。`pace_ssd` 只用于配置、计量
+  和选择，不能生成 `pace_ssd://` URI。
+
+详细升级顺序和回滚限制见 [Breaking Changes](BREAK_CHANGE.md#tairmempool-ssd-独立-storage-type)。
 
 ## Logger Config
 

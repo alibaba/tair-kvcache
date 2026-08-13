@@ -191,6 +191,9 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS usage data
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
+    // slot 7: DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 usage data
+    // slot 8: DATA_STORAGE_TYPE_EVENT_REPORT_L2 usage data
+    // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD usage data
     array_t_ grp_storage_usage_by_type_;
 };
 
