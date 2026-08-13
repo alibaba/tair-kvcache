@@ -11,10 +11,13 @@
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
+#include "kv_cache_manager/optimizer/service/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
 namespace kv_cache_manager {
+
+OnlineOptimizerServer::OnlineOptimizerServer() = default;
 
 OnlineOptimizerServer::~OnlineOptimizerServer() { Stop(); }
 
@@ -57,6 +60,14 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     }
 
     service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
+
+    if (config_.kvcm_event_subscription().enable()) {
+        kvcm_event_subscriber_ = std::make_unique<KvcmEventSubscriber>(config_.kvcm_event_subscription(), manager_);
+        if (!kvcm_event_subscriber_->Init()) {
+            KVCM_LOG_ERROR("Failed to init KVCM event subscriber");
+            return false;
+        }
+    }
 
     KVCM_LOG_INFO("OnlineOptimizerServer initialized");
     return true;
@@ -114,6 +125,12 @@ bool OnlineOptimizerServer::Start() {
 
     running_ = true;
 
+    if (kvcm_event_subscriber_ && !kvcm_event_subscriber_->Start()) {
+        KVCM_LOG_ERROR("Failed to start KVCM event subscriber");
+        Stop();
+        return false;
+    }
+
     if (recovery_needed_) {
         recovery_thread_ = std::thread(&OnlineOptimizerServer::RecoveryRetryLoop, this);
     }
@@ -141,6 +158,10 @@ void OnlineOptimizerServer::RequestShutdown() {
 
 void OnlineOptimizerServer::DoStop() {
     running_ = false;
+
+    if (kvcm_event_subscriber_) {
+        kvcm_event_subscriber_->Stop();
+    }
 
     // Stop listeners first so no new requests are accepted and in-flight
     // requests can drain before we tear down metrics infrastructure.

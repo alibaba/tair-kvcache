@@ -305,3 +305,18 @@ cc_test(
         "@grpc//:grpc++",
     ],
 )
+
+cc_test(
+    name = "OnlineOptimizerServerEventSubscriptionTest",
+    srcs = [
+        "online_optimizer_server_event_subscription_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:kvcm_event_subscriber",
+        "//kv_cache_manager/optimizer:online_optimizer_server",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "@grpc//:grpc++",
+    ],
+)
