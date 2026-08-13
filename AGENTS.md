@@ -24,6 +24,7 @@ flowchart TD
     service --> config
     service --> data_storage
     manager --> protocol["protocol（proto/grpc）"]
+    event --> protocol
 
     %% 有意的反向边（近似环，改动需谨慎）
     common -. request_context .-> metrics
@@ -33,6 +34,8 @@ flowchart TD
     py_connector["py_connector"] --> client["client SDK"]
     client -.-> config
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
+    optimizer --> protocol
+    optimizer -. SubscribeEvents .-> service
 ```
 
 > 若模块职责、依赖方向或调用关系变动，或新增/删除模块，请同步更新本图与 [docs/design/module_architecture.md](docs/design/module_architecture.md)。
