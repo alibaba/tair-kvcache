@@ -3,6 +3,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/mrc/online_mrc_fact_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -37,6 +38,7 @@ OptimizerInstanceGroup ConvertProtoToInstanceGroup(const proto::optimizer::Optim
     group.set_shared_group_quota(pb.shared_group_quota());
     group.set_enable_theoretical_max_cache(pb.enable_theoretical_max_cache());
     group.set_ttl_seconds(pb.ttl_seconds());
+    group.set_enable_prefix_hash(pb.enable_prefix_hash());
     return group;
 }
 
@@ -49,6 +51,7 @@ void ConvertInstanceGroupToProto(const OptimizerInstanceGroup &group,
     pb->set_shared_group_quota(group.shared_group_quota());
     pb->set_ttl_seconds(group.ttl_seconds());
     pb->set_enable_theoretical_max_cache(group.enable_theoretical_max_cache());
+    pb->set_enable_prefix_hash(group.enable_prefix_hash());
     if (group.eviction_policy() == "lru") {
         pb->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
     } else {
@@ -92,8 +95,11 @@ void SetErrorOnCollector(RequestContext *request_context, ErrorCode ec) {
 } // namespace
 
 OptimizerServiceImpl::OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManager> manager,
-                                           std::shared_ptr<OptimizerMetricsReporter> metrics_reporter)
-    : manager_(std::move(manager)), metrics_reporter_(std::move(metrics_reporter)) {}
+                                           std::shared_ptr<OptimizerMetricsReporter> metrics_reporter,
+                                           std::shared_ptr<OnlineMrcFactRegistry> online_mrc_fact_registry)
+    : manager_(std::move(manager)),
+      metrics_reporter_(std::move(metrics_reporter)),
+      online_mrc_fact_registry_(std::move(online_mrc_fact_registry)) {}
 
 // InstanceGroup CRUD
 
@@ -391,6 +397,31 @@ void OptimizerServiceImpl::ResetStats(RequestContext *request_context,
 
     if (ec == EC_OK && metrics_reporter_) {
         metrics_reporter_->RemoveInstanceMetrics(instance_id);
+    }
+
+    SetPbResponseHeader(response->mutable_header(), ec);
+    request_context->set_status_code(static_cast<int>(ec));
+    SetErrorOnCollector(request_context, ec);
+}
+
+void OptimizerServiceImpl::UpdateOnlineMrcProjectionConfig(
+    RequestContext *request_context,
+    const proto::optimizer::UpdateOnlineMrcProjectionConfigRequest *request,
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse *response) {
+    request_context->set_api_name("UpdateOnlineMrcProjectionConfig");
+    OptimizerCallGuard guard(request_context, metrics_reporter_.get());
+
+    ErrorCode ec = EC_UNIMPLEMENTED;
+    if (online_mrc_fact_registry_) {
+        const std::vector<double> capacity_gb_grid(request->capacity_gb_grid().begin(),
+                                                   request->capacity_gb_grid().end());
+        ec = online_mrc_fact_registry_->UpdateCapacityGrid(capacity_gb_grid) ? EC_OK : EC_BADARGS;
+        if (ec == EC_OK) {
+            for (const double capacity_gb : online_mrc_fact_registry_->CapacityGrid()) {
+                response->add_capacity_gb_grid(capacity_gb);
+            }
+            response->set_projection_generation(online_mrc_fact_registry_->ProjectionGeneration());
+        }
     }
 
     SetPbResponseHeader(response->mutable_header(), ec);

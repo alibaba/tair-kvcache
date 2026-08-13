@@ -129,4 +129,14 @@ grpc::Status OptimizerServiceGRpc::ResetStats(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status OptimizerServiceGRpc::UpdateOnlineMrcProjectionConfig(
+    grpc::ServerContext *context,
+    const proto::optimizer::UpdateOnlineMrcProjectionConfigRequest *request,
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->UpdateOnlineMrcProjectionConfig(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

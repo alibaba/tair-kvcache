@@ -19,6 +19,8 @@ class OptimizerServiceHttp;
 class OptimizerRegistryManager;
 class OptimizerMetricsReporter;
 class MetricsRegistry;
+class OnlineMrcFactRegistry;
+class KvcmEventStreamClient;
 
 class OnlineOptimizerServer {
 public:
@@ -51,6 +53,8 @@ private:
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::shared_ptr<OnlineMrcFactRegistry> online_mrc_fact_registry_;
+    std::shared_ptr<KvcmEventStreamClient> kvcm_event_stream_client_;
 
     std::unique_ptr<grpc::Server> grpc_server_;
     std::thread http_thread_;

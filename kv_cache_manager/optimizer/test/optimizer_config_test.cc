@@ -18,6 +18,7 @@ TEST_F(OptimizerInstanceGroupTest, DefaultValues) {
     EXPECT_EQ("lru", group.eviction_policy());
     EXPECT_FALSE(group.shared_group_quota());
     EXPECT_FALSE(group.enable_theoretical_max_cache());
+    EXPECT_FALSE(group.enable_prefix_hash());
     EXPECT_EQ(0, group.ttl_seconds());
 }
 
@@ -28,6 +29,7 @@ TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     group.set_ttl_seconds(3600);
     group.set_shared_group_quota(true);
     group.set_enable_theoretical_max_cache(true);
+    group.set_enable_prefix_hash(true);
 
     std::string json = group.ToJsonString();
 
@@ -42,6 +44,7 @@ TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     EXPECT_EQ(3600, group2.ttl_seconds());
     EXPECT_TRUE(group2.shared_group_quota());
     EXPECT_TRUE(group2.enable_theoretical_max_cache());
+    EXPECT_TRUE(group2.enable_prefix_hash());
 }
 
 TEST_F(OptimizerInstanceGroupTest, ValidateEmptyName) {

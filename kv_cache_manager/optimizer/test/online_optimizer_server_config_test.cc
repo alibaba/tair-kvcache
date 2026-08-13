@@ -134,4 +134,73 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     EXPECT_EQ(8888, config.http_port());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, OnlineMrcDefaultsOffAndValid) {
+    OnlineOptimizerServerConfig config;
+    EXPECT_FALSE(config.online_mrc_config().enable);
+    EXPECT_EQ(60, config.online_mrc_config().report_interval_seconds);
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, OnlineMrcRequiresKvcmServiceDiscovery) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({
+        "online_mrc_enable": true
+    })"));
+    EXPECT_FALSE(config.Check());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, OnlineMrcEnvironmentOverrides) {
+    OnlineOptimizerServerConfig config;
+    std::unordered_map<std::string, std::string> environ = {
+        {"optimizer.online_mrc.enable", "true"},
+        {"optimizer.online_mrc.kvcm_service_discovery_url", "static://127.0.0.1:19000"},
+        {"optimizer.online_mrc.capacity_gb_grid", "1,2,4"},
+        {"optimizer.online_mrc.report_interval_seconds", "120"},
+        {"optimizer.online_mrc.instance_groups",
+         R"([{"name":"group_a","capacity_gb":[1,2,4],"enable_prefix_hash":true},{"name":"group_b","capacity_gb":[8],"enable_prefix_hash":true}])"},
+    };
+    ASSERT_TRUE(config.OverrideFromEnviron(environ));
+    EXPECT_TRUE(config.online_mrc_config().enable);
+    EXPECT_EQ("static://127.0.0.1:19000", config.online_mrc_config().kvcm_service_discovery_url);
+    EXPECT_EQ((std::vector<double>{1, 2, 4}), config.online_mrc_config().capacity_gb_grid);
+    EXPECT_EQ(120, config.online_mrc_config().report_interval_seconds);
+    ASSERT_EQ(2u, config.online_mrc_instance_groups().size());
+    EXPECT_EQ("group_a", config.online_mrc_instance_groups()[0].name());
+    EXPECT_EQ("group_b", config.online_mrc_instance_groups()[1].name());
+    EXPECT_TRUE(config.online_mrc_instance_groups()[0].enable_prefix_hash());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, OptimizerInitiatedStreamConfiguration) {
+    OnlineOptimizerServerConfig config;
+    std::unordered_map<std::string, std::string> environ = {
+        {"optimizer.online_mrc.enable", "true"},
+        {"optimizer.online_mrc.kvcm_service_discovery_url", "static://127.0.0.1:19000"},
+        {"optimizer.online_mrc.instance_groups",
+         R"([{"name":"group_a","capacity_gb":[1],"enable_prefix_hash":true}])"},
+        {"optimizer.online_mrc.discovery_refresh_interval_ms", "1000"},
+        {"optimizer.online_mrc.connect_timeout_ms", "200"},
+        {"optimizer.online_mrc.reconnect_interval_ms", "300"},
+        {"optimizer.online_mrc.max_frame_bytes", "4096"},
+    };
+    ASSERT_TRUE(config.OverrideFromEnviron(environ));
+    EXPECT_EQ("static://127.0.0.1:19000", config.online_mrc_config().kvcm_service_discovery_url);
+    EXPECT_EQ(1000, config.online_mrc_config().discovery_refresh_interval_ms);
+    EXPECT_EQ(200, config.online_mrc_config().connect_timeout_ms);
+    EXPECT_EQ(300, config.online_mrc_config().reconnect_interval_ms);
+    EXPECT_EQ(4096, config.online_mrc_config().max_frame_bytes);
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, OnlineMrcRejectsGroupWithoutPrefixHash) {
+    OnlineOptimizerServerConfig config;
+    std::unordered_map<std::string, std::string> environ = {
+        {"optimizer.online_mrc.enable", "true"},
+        {"optimizer.online_mrc.kvcm_service_discovery_url", "static://127.0.0.1:19000"},
+        {"optimizer.online_mrc.instance_groups", R"([{"name":"group_a","capacity_gb":[1]}])"},
+    };
+    ASSERT_TRUE(config.OverrideFromEnviron(environ));
+    EXPECT_FALSE(config.Check());
+}
+
 } // namespace kv_cache_manager

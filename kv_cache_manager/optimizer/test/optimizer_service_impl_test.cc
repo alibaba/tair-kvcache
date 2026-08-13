@@ -1,5 +1,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/mrc/online_mrc_config.h"
+#include "kv_cache_manager/mrc/online_mrc_fact_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
@@ -593,6 +595,47 @@ TEST_F(OptimizerServiceImplTest, RegisterInstanceUnsupportedIndexerType) {
     RegisterInstanceResult result;
     ErrorCode ec = manager_->RegisterInstance(info, result);
     EXPECT_EQ(EC_BADARGS, ec);
+}
+
+TEST_F(OptimizerServiceImplTest, UpdateOnlineMrcProjectionConfig) {
+    OnlineMrcConfig config;
+    config.capacity_gb_grid = {2};
+    auto facts = std::make_shared<OnlineMrcFactRegistry>(config, std::vector<OptimizerInstanceGroup>{}, nullptr, manager_);
+    auto service = std::make_shared<OptimizerServiceImpl>(manager_, nullptr, facts);
+
+    proto::optimizer::UpdateOnlineMrcProjectionConfigRequest request;
+    request.set_trace_id("mrc-grid-update");
+    request.add_capacity_gb_grid(1);
+    request.add_capacity_gb_grid(4);
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse response;
+    RequestContext context("mrc-grid-update", nullptr);
+    service->UpdateOnlineMrcProjectionConfig(&context, &request, &response);
+
+    EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
+    ASSERT_EQ(2, response.capacity_gb_grid_size());
+    EXPECT_DOUBLE_EQ(1, response.capacity_gb_grid(0));
+    EXPECT_DOUBLE_EQ(4, response.capacity_gb_grid(1));
+    EXPECT_EQ(2u, response.projection_generation());
+
+    proto::optimizer::UpdateOnlineMrcProjectionConfigRequest invalid_request;
+    invalid_request.set_trace_id("invalid-mrc-grid-update");
+    invalid_request.add_capacity_gb_grid(4);
+    invalid_request.add_capacity_gb_grid(1);
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse invalid_response;
+    service->UpdateOnlineMrcProjectionConfig(&context, &invalid_request, &invalid_response);
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, invalid_response.header().status().code());
+    EXPECT_EQ(2u, facts->ProjectionGeneration());
+}
+
+TEST_F(OptimizerServiceImplTest, UpdateOnlineMrcProjectionConfigIsUnsupportedWhenObserverIsDisabled) {
+    proto::optimizer::UpdateOnlineMrcProjectionConfigRequest request;
+    request.set_trace_id("disabled-mrc-grid-update");
+    request.add_capacity_gb_grid(1);
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse response;
+    RequestContext context("disabled-mrc-grid-update", nullptr);
+
+    service_->UpdateOnlineMrcProjectionConfig(&context, &request, &response);
+    EXPECT_EQ(proto::optimizer::UNSUPPORTED, response.header().status().code());
 }
 
 } // namespace kv_cache_manager

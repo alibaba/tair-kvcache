@@ -62,6 +62,11 @@ public:
                             const proto::optimizer::OptimizerResetStatsRequest *request,
                             proto::optimizer::OptimizerResetStatsResponse *response) override;
 
+    grpc::Status UpdateOnlineMrcProjectionConfig(
+        grpc::ServerContext *context,
+        const proto::optimizer::UpdateOnlineMrcProjectionConfigRequest *request,
+        proto::optimizer::UpdateOnlineMrcProjectionConfigResponse *response) override;
+
 private:
     std::shared_ptr<OptimizerServiceImpl> service_impl_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;

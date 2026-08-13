@@ -72,6 +72,11 @@ void OptimizerServiceHttp::RegisterHandler() {
         Post, "/api/optimizer/listInstances", OptimizerListInstances, OptimizerListInstances, ListInstances);
     REGISTER_HTTP_HANDLER_FOR_OPTIMIZER_SERVICE(
         Post, "/api/optimizer/resetStats", OptimizerResetStats, OptimizerResetStats, ResetStats);
+    REGISTER_HTTP_HANDLER_FOR_OPTIMIZER_SERVICE(Post,
+                                                "/api/optimizer/updateOnlineMrcProjectionConfig",
+                                                UpdateOnlineMrcProjectionConfig,
+                                                UpdateOnlineMrcProjectionConfig,
+                                                UpdateOnlineMrcProjectionConfig);
 }
 
 // InstanceGroup CRUD
@@ -166,6 +171,15 @@ void OptimizerServiceHttp::ResetStats(coro_http::coro_http_connection *http_conn
     RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
     request_context.set_client_ip(CoroHttpService::GetHttpClientIp(http_conn));
     service_impl_->ResetStats(&request_context, request, response);
+}
+
+void OptimizerServiceHttp::UpdateOnlineMrcProjectionConfig(
+    coro_http::coro_http_connection *http_conn,
+    proto::optimizer::UpdateOnlineMrcProjectionConfigRequest *request,
+    proto::optimizer::UpdateOnlineMrcProjectionConfigResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(CoroHttpService::GetHttpClientIp(http_conn));
+    service_impl_->UpdateOnlineMrcProjectionConfig(&request_context, request, response);
 }
 
 void OptimizerServiceHttp::RegisterPrometheusEndpoint(std::shared_ptr<MetricsRegistry> registry,

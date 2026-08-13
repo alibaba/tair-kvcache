@@ -62,6 +62,7 @@ message OptimizerInstanceGroupProto {
     bool shared_group_quota = 4;         // true 表示 group 内 instance 共享容量预算
     int64 ttl_seconds = 5;               // TTL 秒数，0 表示不启用 TTL
     bool enable_theoretical_max_cache = 6; // 是否启用 theoretical/max cache
+    bool enable_prefix_hash = 7; // 是否把每块原始 key 统一转换为滚动前缀 key
 }
 
 // InstanceGroup 增删改查
@@ -225,6 +226,72 @@ message OptimizerResetStatsResponse {
     CommonResponseHeader header = 1;
 }
 
+// Observation-only access trace ingestion. One span is one complete prefix
+// request; keys must not be sampled or split because LiteHit evaluates the
+// request against one request-start LRU snapshot.
+message AccessTraceSpan {
+    string instance_group = 1;
+    string instance_id = 2;
+    int32 block_size = 3;
+    int64 bytes_per_block = 4;
+    repeated int64 keys = 5;
+    int64 event_time_us = 6;
+    string source_id = 7;
+    uint64 sequence_number = 8;
+}
+
+message ReportAccessTraceRequest {
+    string trace_id = 1;
+    string cluster = 2; // required; combines with instance_id for lane isolation
+    repeated AccessTraceSpan spans = 3;
+    uint64 dropped_spans = 4;
+    uint64 dropped_keys = 5;
+}
+
+// Lightweight stream used when optimizer discovers and
+// connects to every KVCM node. The TCP envelope is:
+//   [4-byte network-order frame length][1-byte message type][protobuf payload]
+// Message type 1 carries OptimizerHello; type 2 carries CacheEventBatch.
+message OptimizerHello {
+    uint32 protocol_version = 1;
+    string optimizer_id = 2;
+}
+
+message MrcInstanceMeta {
+    int32 block_size = 1;
+    repeated LocationSpecInfo location_spec_infos = 2;
+    repeated LocationSpecGroup location_spec_groups = 3;
+    OptimizerStateInfo optimizer_state_info = 4;
+    int32 linear_step = 5;
+}
+
+message CacheGetEventItem {
+    string event_id = 1;
+    int64 timestamp_ns = 2;
+    repeated int64 block_keys = 3; // complete-block keys in request order; optimizer normalizes with prefix hash
+    int64 input_token_len = 4;
+}
+
+message CacheEventBatch {
+    string instance_id = 1;
+    string instance_group = 2;
+    MrcInstanceMeta instance_meta = 3;
+    repeated CacheGetEventItem events = 4;
+}
+
+// MRC projection configuration. Updating the capacity grid
+// never resets the accumulated request facts or makes quota decisions.
+message UpdateOnlineMrcProjectionConfigRequest {
+    string trace_id = 1;
+    repeated double capacity_gb_grid = 2;
+}
+
+message UpdateOnlineMrcProjectionConfigResponse {
+    CommonResponseHeader header = 1;
+    repeated double capacity_gb_grid = 2;
+    uint64 projection_generation = 3;
+}
+
 service OptimizerService {
     // InstanceGroup 管理
     rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
@@ -242,4 +309,12 @@ service OptimizerService {
     // 在线 TraceQuery
     rpc TraceQuery(TraceQueryRequest) returns (TraceQueryResponse);
     rpc ResetStats(OptimizerResetStatsRequest) returns (OptimizerResetStatsResponse);
+
+    // Fire-and-forget from KVCM's background forwarder. The response only
+    // acknowledges admission to the optimizer-side bounded queue.
+    rpc ReportAccessTrace(ReportAccessTraceRequest) returns (CommonResponse);
+
+    // Runtime update for the observation-only online MRC projection grid.
+    rpc UpdateOnlineMrcProjectionConfig(UpdateOnlineMrcProjectionConfigRequest)
+        returns (UpdateOnlineMrcProjectionConfigResponse);
 }

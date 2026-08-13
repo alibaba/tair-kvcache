@@ -9,7 +9,6 @@
 namespace kv_cache_manager {
 
 class OptimizerServiceImpl;
-
 class OptimizerServiceHttp : public CoroHttpService {
 public:
     OptimizerServiceHttp(std::shared_ptr<OptimizerServiceImpl> service_impl,
@@ -66,6 +65,11 @@ public:
     void ResetStats(coro_http::coro_http_connection *http_conn,
                     proto::optimizer::OptimizerResetStatsRequest *request,
                     proto::optimizer::OptimizerResetStatsResponse *response);
+
+    void UpdateOnlineMrcProjectionConfig(
+        coro_http::coro_http_connection *http_conn,
+        proto::optimizer::UpdateOnlineMrcProjectionConfigRequest *request,
+        proto::optimizer::UpdateOnlineMrcProjectionConfigResponse *response);
 
 private:
     std::shared_ptr<OptimizerServiceImpl> service_impl_;

@@ -19,6 +19,7 @@ bool OptimizerInstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value)
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "shared_group_quota", shared_group_quota_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_theoretical_max_cache", enable_theoretical_max_cache_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "ttl_seconds", ttl_seconds_, int64_t(0));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_prefix_hash", enable_prefix_hash_, false);
     SortCapacities();
     return true;
 }
@@ -32,6 +33,7 @@ void OptimizerInstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "shared_group_quota", shared_group_quota_);
     Put(writer, "enable_theoretical_max_cache", enable_theoretical_max_cache_);
     Put(writer, "ttl_seconds", ttl_seconds_);
+    Put(writer, "enable_prefix_hash", enable_prefix_hash_);
 }
 
 bool OptimizerInstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {

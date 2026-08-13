@@ -7,6 +7,8 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/mrc/kvcm_event_stream_client.h"
+#include "kv_cache_manager/mrc/online_mrc_fact_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
@@ -33,6 +35,10 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
         KVCM_LOG_ERROR("Failed to override config from environ");
         return false;
     }
+    if (!config_.Check()) {
+        KVCM_LOG_ERROR("Invalid optimizer server config");
+        return false;
+    }
 
     // Create registry first, then manager holds it
     registry_manager_ = std::make_shared<OptimizerRegistryManager>(config_.registry_storage_uri());
@@ -56,7 +62,23 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
         KVCM_LOG_WARN("KMonitor init failed, kmonitor metrics disabled");
     }
 
-    service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
+    if (config_.online_mrc_config().enable) {
+        online_mrc_fact_registry_ = std::make_shared<OnlineMrcFactRegistry>(
+            config_.online_mrc_config(), config_.online_mrc_instance_groups(), metrics_registry_, manager_);
+        if (!online_mrc_fact_registry_->Init()) {
+            KVCM_LOG_ERROR("Failed to create online MRC formal instance groups");
+            return false;
+        }
+        kvcm_event_stream_client_ = std::make_shared<KvcmEventStreamClient>(
+            config_.online_mrc_config(), online_mrc_fact_registry_, metrics_registry_);
+        if (!kvcm_event_stream_client_->Init()) {
+            KVCM_LOG_ERROR("Failed to initialize optimizer-side KVCM event stream client");
+            return false;
+        }
+    }
+
+    service_impl_ =
+        std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_, online_mrc_fact_registry_);
 
     KVCM_LOG_INFO("OnlineOptimizerServer initialized");
     return true;
@@ -112,6 +134,11 @@ bool OnlineOptimizerServer::Start() {
     if (!InitHttpServer())
         return false;
 
+    if (kvcm_event_stream_client_ && !kvcm_event_stream_client_->Start()) {
+        KVCM_LOG_ERROR("Failed to start optimizer-side KVCM event stream client");
+        return false;
+    }
+
     running_ = true;
 
     if (recovery_needed_) {
@@ -163,6 +190,9 @@ void OnlineOptimizerServer::DoStop() {
     if (metrics_thread_.joinable()) {
         metrics_thread_.join();
     }
+    if (kvcm_event_stream_client_) {
+        kvcm_event_stream_client_->Stop();
+    }
     if (metrics_reporter_) {
         metrics_reporter_->ShutdownKmonitor();
     }
@@ -177,10 +207,20 @@ void OnlineOptimizerServer::WaitForShutdown() {
 }
 
 void OnlineOptimizerServer::MetricsReportLoop() {
+    auto next_mrc_report = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(config_.online_mrc_config().report_interval_seconds);
     while (running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.metrics_report_interval_ms()));
         if (!running_)
             break;
+        const auto now = std::chrono::steady_clock::now();
+        if (online_mrc_fact_registry_ && now >= next_mrc_report) {
+            online_mrc_fact_registry_->ReportMetrics();
+            next_mrc_report = now + std::chrono::seconds(config_.online_mrc_config().report_interval_seconds);
+        }
+        if (kvcm_event_stream_client_) {
+            kvcm_event_stream_client_->ReportMetrics();
+        }
         metrics_reporter_->ReportInterval();
     }
 }
