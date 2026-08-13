@@ -1,18 +1,16 @@
 #pragma once
 
 // 可控 slow/fake SDK（W5 验收测试替身，仅测试使用）。
-//
-// 能力（对应 15-W5-tests.md §2）：
+// 能力：
 //  - get_delay_ms / set_delay(ms)          ：模拟慢 I/O（运行中超时场景）
 //  - per_block_check + per_block_delay_ms  ：模拟逐 block 慢 + 每块前准入检查，
-//                                            验证"中途停下"（契约 §2(2) 逐 block 检查）
+//                                            验证"中途停下"
 //  - write_after_return                    ：模拟"返回后仍写 caller buffer"的违约
 //                                            （soft 级，如 mooncake）后端
 //  - get_call_count() / put_call_count()   ：断言超时任务从未发起 I/O（准入检查核心验证）
 //  - deadline_set / observed_deadline_ms   ：Get 入口对传入 deadline_ms 的观测
 //                                            （验证 deadline 透传）
 //  - touch_buffer_on_get                   ：正常路径写 kTouchByte，验证成功时数据确实被搬运
-//
 // 稳定性约定：所有跨线程控制字段都是 std::atomic（池内工作线程与测试线程共享）；
 // 完成事件用 get_done / write_done / blocks_touched 暴露，测试用轮询替代 sleep 同步，
 // 避免紧耦合时序断言（main 7f7f20c2 之后不允许引入 flaky 测试）。
@@ -37,7 +35,7 @@ struct FakeSlowSdkControl {
     std::atomic<int> put_call_count{0};           // Put 被发起的次数
     std::atomic<int> get_delay_ms{0};             // Get 内的睡眠时长（模拟慢 I/O）
     std::atomic<int> per_block_delay_ms{0};       // 逐 block 睡眠时长（模拟逐 block 慢）
-    std::atomic<bool> per_block_check{false};     // 开启逐 block 前置准入检查（契约 §2(2)）
+    std::atomic<bool> per_block_check{false};     // 开启逐 block 前置准入检查
     std::atomic<bool> write_after_return{false};  // 违约：sleep 结束后仍写 caller buffer
     std::atomic<bool> touch_buffer_on_get{false}; // 正常路径：Get 返回前写 kTouchByte
     std::atomic<int> get_result{static_cast<int>(ER_OK)};
@@ -79,7 +77,7 @@ public:
         // 这里 const_cast 只是模拟"后端向 caller buffer 搬运/写入"这一事实行为。
         auto *buffers = const_cast<BlockBuffers *>(&local_buffers);
 
-        // 逐 block 准入模式：模拟契约 §2(2)"每一块前检查 deadline"（W1/W3 的逐 block/逐 key 行为）。
+        // 逐 block 准入模式：模拟"每一块前检查 deadline"。
         // 块边界发现已过期即停止，不再触碰后续 block。
         if (ctrl_->per_block_check.load()) {
             size_t touched = 0;

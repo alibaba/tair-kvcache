@@ -372,7 +372,6 @@ TEST_F(SdkWrapperMultiStorageTest, TestGroupBySdk) {
 }
 
 // ============================================================================
-// W0：deadline 准入 / 超时有界返回 / deadline 传播 / F3 保序基础设施
 // ============================================================================
 
 // 可控 fake SDK：记录 Get/Put 调用，可注入延迟；Get 入口观测传入的 deadline_ms。
@@ -574,7 +573,7 @@ protected:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override { return ER_OK; }
 };
 
-// 验证 F3 保序基础设施：交错多 path 输入时，每组 indices 记录原始下标。
+// 验证保序：交错多 path 输入时，每组 indices 记录原始下标。
 TEST_F(SdkWrapperTest, TestSplitByPathRecordsIndices) {
     TestSplitSdk sdk;
     std::vector<DataStorageUri> remote_uris = {

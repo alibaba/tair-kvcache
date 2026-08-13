@@ -16,14 +16,16 @@ public:
     virtual ~TransferClient() = default;
     static std::unique_ptr<TransferClient> Create(const std::string &client_config, const InitParams &init_params);
 
+    // deadline_ms: 绝对时间点（steady_clock 毫秒），到点后本次调用不再触碰 block_buffers；
+    // 0 = 调用方不施加 deadline，退回 client 配置的静态超时预算。
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
-                                         int64_t deadline_ms,
+                                         int64_t deadline_ms = 0,
                                          std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec>
     SaveKvCaches(const UriStrVec &uri_str_vec,
                  const BlockBuffers &block_buffers,
-                 int64_t deadline_ms,
+                 int64_t deadline_ms = 0,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
 protected:

@@ -1,7 +1,6 @@
 // W5 验收测试：可控 slow/fake SDK 覆盖超时与 buffer 生命周期契约
-// （任务卡 15-W5-tests.md；契约正文见 docs/design/client_sdk_io_contract.md）。
-//
-// 覆盖场景（对照 15-W5-tests.md §3）：
+// 契约正文见 docs/design/client_sdk_io_contract.md。
+// 覆盖场景：
 //  3.1 运行中超时（有界返回）            —— TestRunningTimeoutBoundedReturn
 //  3.2 排队超时被拦下（核心缺陷防回归）  —— TestQueuedTaskNeverStartsIo
 //                                         + TestPreExpiredDeadlineRejectsBeforeIo
@@ -10,14 +9,15 @@
 //  3.4 违约（soft）后端的可观测性        —— TestSoftBackendViolationIsObservable
 //  3.5 deadline 传播                     —— TestDeadlinePropagationIntoSdk
 //  3.6 多后端混合                       —— TestMixedBackendsFastCompletesSlowTimesOut
-//  额外：逐 block 准入（契约 §2(2)）    —— TestPerBlockAdmissionStopsMidway
-//
+//  额外：逐 block 准入    —— TestPerBlockAdmissionStopsMidway
 // 稳定性约定：全部用宽松上下界（如"耗时 < 1.5s"而非"≈200ms"）、计数器与事件
 // （get_done/write_done/轮询）替代 sleep 同步；"证明某事没有发生"处给足余量
 // （如返回后等 500ms 再断言哨兵完好）；测试目标 size=medium（含 sleep）。
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <gtest/gtest.h>
@@ -231,7 +231,7 @@ protected:
         }
     };
 
-    // 由毫秒预算构造显式 deadline_ms（绝对 steady_clock 微秒，契约 §2 语义）。
+    // 由毫秒预算构造显式 deadline_ms（绝对 steady_clock 毫秒）。
     static int64_t DeadlineFromNowMs(int64_t timeout_ms) { return SteadyClockMs() + timeout_ms; }
 
     // 事件轮询等待（替代 sleep 同步；给足余量，绝不依赖"恰好 X ms 后"）。
@@ -285,7 +285,7 @@ TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
 }
 
 // ============================================================================
-// 3.2 排队超时被拦下（本次修复的核心缺陷，00-context.md §6.1）
+// 3.2 排队超时被拦下
 // ============================================================================
 // 守门测试：若有人把准入检查改回"只看 stop flag 不看时间"，排队超过 deadline 的
 // 任务会照样发起 I/O —— 下层再写 9~15s，而 caller 早已返回。get_call_count == 0
@@ -471,9 +471,9 @@ TEST_F(SdkTimeoutContractTest, TestDeadlinePropagationIntoSdk) {
 }
 
 // ============================================================================
-// 额外：逐 block 准入（契约 §2(2)）
+// 额外：逐 block 准入
 // ============================================================================
-// fake 模拟"每一块前检查 deadline"的实现（W1/W3 的逐 block/逐 key 行为）：
+// fake 模拟"每一块前检查 deadline"的实现：
 // 块边界发现已过期即停止，不再触碰后续 block。验证中途停下。
 TEST_F(SdkTimeoutContractTest, TestPerBlockAdmissionStopsMidway) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
@@ -545,4 +545,32 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
     ASSERT_TRUE(buffers.BlockBytesEqual(1, 0x00));
     // 慢后端的 in-flight 任务最终自行结束（不阻塞、不取消、不额外写任何东西）。
     ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 5000));
+}
+
+// ============================================================================
+// 跨语言时钟同源
+// ============================================================================
+// connector 用 Python 算 deadline_ms，SDK 用 C++ SteadyClockMs() 比较；两者必须
+// 读同一个内核时钟（CLOCK_MONOTONIC），否则 deadline 全线失效。此处直接取
+// common/utils.py 的 deadline_ms_from_now(0) 与 C++ 读数比对。
+TEST_F(SdkTimeoutContractTest, TestPythonAndCppShareSteadyClock) {
+    const char *kScript = "python3 -c \"import time;print(time.monotonic_ns()//1_000_000)\" 2>/dev/null";
+    const int64_t before_ms = SteadyClockMs();
+    FILE *pipe = popen(kScript, "r");
+    if (pipe == nullptr) {
+        GTEST_SKIP() << "python3 unavailable";
+    }
+    char buf[64] = {0};
+    const bool got = fgets(buf, sizeof(buf), pipe) != nullptr;
+    const int rc = pclose(pipe);
+    if (!got || rc != 0) {
+        GTEST_SKIP() << "python3 unavailable";
+    }
+    const int64_t py_ms = std::strtoll(buf, nullptr, 10);
+    const int64_t after_ms = SteadyClockMs();
+
+    // Python 读数必须落在 C++ 前后两次读数之间（允许进程启动开销带来的上界放宽）。
+    ASSERT_GT(py_ms, 0);
+    EXPECT_GE(py_ms, before_ms) << "python monotonic clock is behind C++ steady_clock";
+    EXPECT_LE(py_ms, after_ms) << "python monotonic clock is ahead of C++ steady_clock";
 }

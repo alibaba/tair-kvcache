@@ -102,15 +102,14 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
 
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {
     CHECK_CLIENT(transfer_client_);
-    // ManagerClient 层不感知 deadline：传 0，由 SdkWrapper 级
-    // timeout_config 兜底（等价 PR280 之前行为）。
-    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0);
+    // 本层不暴露 deadline：沿用 client 配置的静态超时预算。
+    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers);
 }
 
 std::pair<ClientErrorCode, UriStrVec> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                       const BlockBuffers &block_buffers) {
     CHECK_CLIENT_WITH_TYPE(transfer_client_);
-    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers, /*deadline_ms=*/0);
+    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers);
 }
 
 std::unique_ptr<ManagerClient> ManagerClient::Create(const std::string &client_config, InitParams &init_params) {

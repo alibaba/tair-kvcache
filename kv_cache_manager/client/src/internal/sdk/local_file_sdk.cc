@@ -72,12 +72,10 @@ private:
 };
 
 // RAII guard：析构时若仍有在飞的 GPU async copy（cudaMemcpyAsync/musaMemcpyAsync 已入队），
-// 先同步 stream 再返回。目的：hard 契约（docs/design/client_sdk_io_contract.md）—— LocalFileSdk 返回后
+// 先同步 stream 再返回。目的：hard 契约—— LocalFileSdk 返回后
 // 不得再有异步 DMA 写 caller buffer（GPU 显存）。
-//
 // 必须覆盖所有提前返回路径（超时、既有的各种错误分支），因此用 RAII 而不是逐点调用
 // （逐点调用极易漏掉某条 return 路径，重新打开静默数据损坏窗口）。
-//
 // 构造顺序要求：必须在 MmapHelper 之后构造（后构造先析构），保证 stream 同步先于
 // MmapHelper 的 cudaHostUnregister + munmap 执行（否则 async copy 的源/目标地址
 // 可能已被 unmap）。
@@ -308,7 +306,7 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
     auto group_map = SplitByPath(remote_uris, local_buffers);
     size_t done_blocks = 0;
     for (const auto &group : group_map) {
-        // 组级准入（契约 §2 第2条）：deadline 已过则不再为后续组做
+        // 组级准入：deadline 已过则不再为后续组做
         // open/mmap 等准备工作，直接返回超时。
         if (DeadlineExpired(deadline_ms)) {
             LogTimeoutAbort(
@@ -337,7 +335,7 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
-    // 保序契约（契约 §6）：actual_remote_uris[i] 必须对应 remote_uris[i]。
+    // 保序契约：actual_remote_uris[i] 必须对应 remote_uris[i]。
     // 先按总大小 resize，再按 BlockGroup::indices 回填原位；禁止 clear() 后 append
     // （那会依赖 unordered_map 的迭代序，交错多 path 输入必然错位）。
     actual_remote_uris->resize(remote_uris.size());
@@ -370,7 +368,7 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
             group_actual_uris = group.second.remote_uris;
         }
         // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标（下标是 block 的唯一身份）。
-        // 禁止 append 到 actual_remote_uris 末尾 —— 多 path 交错输入会错位（F3 保序）。
+        // 禁止 append 到 actual_remote_uris 末尾 —— 多 path 交错输入会错位。
         for (size_t k = 0; k < group.second.indices.size(); ++k) {
             (*actual_remote_uris)[group.second.indices[k]] = group_actual_uris[k];
         }
@@ -491,7 +489,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     char *src = static_cast<char *>(file_mem);
     // asume that url is sorted by blkid
     for (size_t i = 0; i < remote_uris.size(); ++i) {
-        // 逐 block 准入（契约 §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 逐 block 准入：deadline 已过则停止搬运，不再发起
         // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
         if (DeadlineExpired(deadline_ms)) {
             LogTimeoutAbort("get",
@@ -686,7 +684,7 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
     // url assumed sorted by blkid
     // ASSUMPTION: same as DoGet — all items in a batch must share the same `size`.
     for (size_t i = 0; i < items.size(); ++i) {
-        // 逐 block 准入（契约 §2 第2条）：deadline 已过则停止搬运，不再发起
+        // 逐 block 准入：deadline 已过则停止搬运，不再发起
         // 后续 memcpy/async copy。若已有 GPU async copy 入队，guard 析构会在返回前同步。
         if (DeadlineExpired(deadline_ms)) {
             LogTimeoutAbort("put",

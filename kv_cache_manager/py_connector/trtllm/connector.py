@@ -7,7 +7,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
 import logging
-import time
 import uuid
 import math
 
@@ -141,9 +140,6 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
 
         self.write_timeout_seconds = self.kvcm_config.get("write_timeout_seconds", 30)
 
-        # sdk_get/put_timeout_ms 目前只在 init_kvcm_transfer_client 里作为局部变量
-        # （本文件 :75-76）—— Worker 的 wait_for_save/start_load_kv 需要它们计算
-        # DDL_自律，必须先落到 self 上（connector-dataflow.md 6.3 前置缺口）。
         self.sdk_get_timeout_ms = self.kvcm_config.get("sdk_get_timeout_ms", 15000)
         self.sdk_put_timeout_ms = self.kvcm_config.get("sdk_put_timeout_ms", 15000)
 
@@ -358,9 +354,8 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
             save_indices = self._parse_block_mask(block_mask, len(block_keys))
             assert len(store_locations) == len(save_indices)
 
-            metadata.save.append((store_locations,
-                                  [block_ids[block_pos] for block_pos in save_indices],
-                                  write_session_id))
+            metadata.save.append((store_locations, [block_ids[block_pos]
+                                 for block_pos in save_indices], write_session_id))
         
         logger.info(f"{metadata=}")
 

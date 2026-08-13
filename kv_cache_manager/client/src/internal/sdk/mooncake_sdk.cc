@@ -9,11 +9,7 @@
 namespace kv_cache_manager {
 
 namespace {
-// 超时归因日志（docs/design/client_sdk_io_contract.md 必含字段）：
-//   backend / op / done（已下发、可能仍在飞的 block 数）/ total /
-//   被准入拒绝的 block 下标与 key / caller buffer 地址与 size / elapsed_ms / remaining_ms。
-// 并明确标注本后端是 soft 契约：mooncake 无法取消在飞 RDMA，返回后 caller buffer
-// 仍可能被写入。这些字段是把"静默污染"变成"可归因故障"的唯一手段。
+// 超时归因日志：定位哪个 block/key 被拒、哪块 caller buffer 可能仍在被 DMA 写。
 void LogSoftTimeout(bool is_get,
                     size_t done,
                     size_t total,
@@ -21,12 +17,10 @@ void LogSoftTimeout(bool is_get,
                     const std::string &key,
                     const void *caller_buffer,
                     size_t buffer_size,
-                    int64_t elapsed_ms,
-                    int64_t remaining_ms) {
-    KVCM_LOG_WARN("mooncake %s timeout: backend=mooncake op=%s done=%zu/%zu refused_block_idx=%zu key=%s "
-                  "caller_buffer=%p caller_buffer_size=%zu elapsed_ms=%lld remaining_ms=%lld "
-                  "WARNING: soft-contract backend, mooncake cannot cancel in-flight RDMA; "
-                  "already-issued blocks [0,%zu) may still be written to caller buffer after return",
+                    int64_t elapsed_ms) {
+    KVCM_LOG_WARN("mooncake %s timeout: op=%s done=%zu/%zu refused_block_idx=%zu key=%s "
+                  "caller_buffer=%p caller_buffer_size=%zu elapsed_ms=%lld "
+                  "soft-contract: in-flight RDMA cannot be cancelled, blocks [0,%zu) may still be written",
                   is_get ? "get" : "put",
                   is_get ? "get" : "put",
                   done,
@@ -36,7 +30,6 @@ void LogSoftTimeout(bool is_get,
                   caller_buffer,
                   buffer_size,
                   static_cast<long long>(elapsed_ms),
-                  static_cast<long long>(remaining_ms),
                   done);
 }
 } // namespace
@@ -170,7 +163,7 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
         }
         // ============================================================
         // 逐 key 准入检查（核心）：slices 直接指向 caller 的 iov.base，网卡 DMA 直接
-        // 写 caller 内存，而上游无法取消已下发的传输（契约 §3 三重实证）。
+        // 写 caller 内存，而上游无法取消已下发的传输。
         // 因此在每次 mooncake_client_get 之前检查 deadline_ms：已过期立即返回超时、
         // 不发这次 I/O。效果：超时时刻最多只有 1 个 block 的 DMA 在飞（正在执行的
         // 那次），其余全部未发起 —— 暴露面从 128 个 block 降到 ≤1 个（降两个数量级）。
@@ -197,8 +190,6 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
                            caller_buffer,
                            read_len,
                            elapsed_ms);
-            KVCM_LOG_WARN("mooncake get unsafe return: deadline expired, %zu blocks may still be in flight",
-                          static_cast<size_t>(slices.size() - i));
             return ER_SDK_TIMEOUT;
         }
         ErrorCode_t err = mooncake_client_get(client_, item.key.c_str(), slices.data(), slices.size());
@@ -272,8 +263,6 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                            caller_buffer,
                            write_len,
                            elapsed_ms);
-            KVCM_LOG_WARN("mooncake put unsafe return: deadline expired, %d blocks may still be in flight",
-                          slices.size() - i);
             return ER_SDK_TIMEOUT;
         }
         ReplicateConfig_t cfg;

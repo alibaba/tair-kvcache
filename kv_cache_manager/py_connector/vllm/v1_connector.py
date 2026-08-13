@@ -475,11 +475,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             block_token_indices = self.generate_blocks_idx(load_req.manager_block_idxes, load_req.local_block_ids)
             all_remote_uris = self.get_self_uris(load_req.need_load_locations)
 
-            # 读路径无租约：deadline 只含自律项（DDL_自律 = T_submit + sdk_get_timeout_ms）。
-            # T_submit = 任务提交到 io_executor 的时刻（传输线程池可能排队，deadline 须在
-            # 提交前算好）。time.monotonic_ns() 与 C++ steady_clock 同为 CLOCK_MONOTONIC。
-            load_deadline_ms = deadline_ms_from_now(self._extra_config.sdk_get_timeout_ms)
-
             per_task_size = self._extra_config.block_per_load_task
             task_num = math.ceil(len(block_token_indices) / per_task_size)
             done_callback = self._data_transfer.create_load_done_callback(
@@ -496,7 +491,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = block_token_indices[i:end_idx]
                 self._data_transfer.submit_task(self._data_transfer.load_task, multi_result, task_idx, task_remote_uris,
-                                                task_block_token_indices, load_deadline_ms)
+                                                task_block_token_indices)
                 task_idx += 1
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -533,12 +528,14 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             )
             multi_result = MultiResult(task_num, done_callback)
 
+            # 写路径受 KVCM 租约约束，DDL 须尽可能靠近 start_write_cache 的响应时刻，
+            # 且必须在 worker 进程内计算（避免跨进程时钟问题）。
+            deadline_ms = deadline_ms_from_now(self._extra_config.sdk_put_timeout_ms)
             task_idx = 0
             for i in range(0, len(blocks_idx), per_task_size):
                 end_idx = min(len(blocks_idx), i + per_task_size)
                 task_remote_uris = all_remote_uris[i:end_idx]
                 task_block_token_indices = blocks_idx[i:end_idx]
-                deadline_ms = deadline_ms_from_now(self._extra_config.sdk_put_timeout_ms)
                 self._data_transfer.submit_task(self._data_transfer.save_task, multi_result, task_idx, task_remote_uris,
                                                 task_block_token_indices,
                                                 kvcache_ready_event, deadline_ms)

@@ -70,7 +70,7 @@ bool Hf3fsUsrbioClient::Read(const std::vector<Iov> &iovs, int64_t deadline_ms) 
 }
 
 bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs, int64_t deadline_ms) {
-    // 准入检查（契约 §2）：deadline 已过期则直接返回，不发起 I/O。
+    // 准入检查：deadline 已过期则直接返回，不发起 I/O。
     if (DeadlineExpired(deadline_ms)) {
         KVCM_LOG_WARN("do read skipped, deadline expired, file: %s, iovs size: %zu", filepath_.c_str(), iovs.size());
         return false;
@@ -345,17 +345,21 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
     auto ior = ior_handle.ior;
     const auto ior_entries = ior_handle.ior_entries;
 
-    // 有 deadline 时把 TryRemainingMs 算出的剩余毫秒换算成 abs_timeout 传给
-    // hf3fs_wait_for_ios，使等待有界；无 deadline 时传 nullptr（无限等待）。
-    //
+    // 有 deadline 且未过期：把剩余毫秒换算成 abs_timeout，使等待有界。
+    // 已过期：用 0 超时立即返回（不能传 nullptr，那会变成无限等待）。
+    // 无 deadline：传 nullptr，保持旧的无限等待行为。
     // 时钟基准：hf3fs_wait_for_ios 用 CLOCK_REALTIME 与 abs_timeout 比较（实测
     // libhf3fs_api_shared-1.2.1，deepseek-ai/3FS@f6395e7d）。abs_timeout 必须用
     // CLOCK_REALTIME 计算；deadline_ms 是 CLOCK_MONOTONIC，不能直接作 timespec。
     int64_t remaining_ms = 0;
-    const bool has_remaining = TryRemainingMs(deadline_ms, remaining_ms);
+    const bool has_deadline = deadline_ms > 0;
+    if (has_deadline) {
+        // 已过期时 remaining 为 nullopt → 用 0 立即超时；不能传 nullptr（那是无限等待）。
+        remaining_ms = RemainingMs(deadline_ms).value_or(0);
+    }
     struct timespec abs_timeout{};
     const struct timespec *abs_timeout_ptr = nullptr;
-    if (has_remaining) {
+    if (has_deadline) {
         if (clock_gettime(CLOCK_REALTIME, &abs_timeout) != 0) {
             KVCM_LOG_WARN("wait io skipped abs timeout, clock_gettime failed, errno: %s, file: %s, read: %d, "
                           "submit ios: %d, remaining ms: %lld",

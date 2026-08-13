@@ -76,7 +76,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_PrepIoFail) {
         .WillOnce(testing::Return(-5));
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -155,7 +155,7 @@ TEST_F(Hf3fsUsrbioClientTest, Read_ReturnTrue_Success) {
 // ---------- DoRead ----------
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_SegmentsEmpty) {
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 10, true}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_InitIovIorFail) {
@@ -165,7 +165,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_InitIovIorFail) {
     void *hold = mempool->Alloc(mempool->FreeSize());
     ASSERT_NE(hold, nullptr);
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 256, false}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
     mempool->Free(hold);
 }
 
@@ -183,7 +183,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_ReadFrom3FSFail) {
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
 
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 128, false}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnTrue_Success) {
@@ -205,7 +205,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnTrue_Success) {
 
     std::vector<uint8_t> buf(64, 0);
     std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 64, false}};
-    EXPECT_TRUE(client_->DoRead(iovs));
+    EXPECT_TRUE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 // ---------- ReadFrom3FS ----------
@@ -233,7 +233,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_SubmitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -268,7 +268,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_WaitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -308,7 +308,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnTrue_Success) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_TRUE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_TRUE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -399,7 +399,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_SegmentsEmpty) {
         {MemoryType::CPU, nullptr, 10, true},
         {MemoryType::GPU, nullptr, 20, true},
     };
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_InitIovIorFail_MempoolAlloc) {
@@ -411,7 +411,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_InitIovIorFail_MempoolAlloc) {
 
     auto buf = std::shared_ptr<uint8_t>((uint8_t *)malloc(128), [](void *p) { free(p); });
     std::vector<Iov> iovs{{MemoryType::CPU, buf.get(), 128, false}};
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 
     mempool->Free(hold);
 }
@@ -436,7 +436,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_WriteTo3FSFail_Wait) {
         {MemoryType::CPU, buffer1.get(), 64, false},
         {MemoryType::CPU, buffer2.get(), 64, false},
     };
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnTrue_Success) {
@@ -476,7 +476,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnTrue_Success) {
         {MemoryType::GPU, buffer3, 16, false}, // type change -> multiple segments
 #endif
     };
-    EXPECT_TRUE(client_->DoWrite(iovs));
+    EXPECT_TRUE(client_->DoWrite(iovs, /*deadline_ms=*/0));
     EXPECT_EQ(client_->write_iov_handle_.iov_mempool->AllocatedSize(), 0); // released
 }
 
@@ -499,7 +499,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_PrepIoFail) {
         .WillOnce(testing::Return(-6));
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -531,7 +531,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_SubmitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -565,7 +565,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_WaitIoFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -609,7 +609,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnTrue_Success_WithBatching) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_TRUE(client_->WriteTo3FS(handle, segs));
+    EXPECT_TRUE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);

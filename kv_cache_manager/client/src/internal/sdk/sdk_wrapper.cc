@@ -129,6 +129,8 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
     auto now = std::chrono::steady_clock::now();
     auto internal_deadline = now + std::chrono::milliseconds(timeout_ms);
+    // 双重约束取更早者：内部静态预算（client 配置）与调用方交付 buffer 时给的动态
+    // deadline。deadline_ms=0 表示调用方未指定，仅受静态预算约束（向前兼容）。
     auto deadline =
         (deadline_ms > 0)
             ? std::min(internal_deadline, std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)))
@@ -138,7 +140,7 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
         const auto &group = groups[i];
         tasks.push_back([group, deadline_ms]() { return group.sdk->Get(group.uris, group.buffers, deadline_ms); });
     }
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), deadline, timeout_ms);
+    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), deadline);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
@@ -180,7 +182,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         });
     }
 
-    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), deadline, timeout_ms);
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), deadline);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
         return ec;
@@ -249,8 +251,7 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                                   std::chrono::steady_clock::time_point deadline,
-                                                   int timeout_ms) const {
+                                                   std::chrono::steady_clock::time_point deadline) const {
     if (tasks.empty()) {
         return ER_OK;
     }
@@ -261,7 +262,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     }
 
     const std::string op_str = getOpTypeString(op_type);
-    auto start = deadline - std::chrono::milliseconds(timeout_ms);
+    const auto start = std::chrono::steady_clock::now();
 
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());

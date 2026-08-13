@@ -73,7 +73,7 @@ Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers
         return ER_INVALID_PARAMS;
     }
 
-    // 逐 block 准入检查（契约 §2）：deadline 已过期则不再为后续 block
+    // 逐 block 准入检查：deadline 已过期则不再为后续 block
     // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline（0）时 DeadlineExpired() 恒为 false。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
         if (DeadlineExpired(deadline_ms)) {
@@ -135,7 +135,7 @@ ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         return ER_SDKALLOC_ERROR;
     }
 
-    // 逐 block 准入检查（契约 §2）：deadline 已过期则不再为后续 block
+    // 逐 block 准入检查：deadline 已过期则不再为后续 block
     // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline（0）时 DeadlineExpired() 恒为 false。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
         if (DeadlineExpired(deadline_ms)) {

@@ -414,7 +414,7 @@ TEST_F(MooncakeSdkTest, TestPutSkipsIoWhenDeadlineExpired) {
 }
 
 TEST_F(MooncakeSdkTest, TestPutActualUrisSameOrder) {
-    // 保序契约（docs/design/client_sdk_io_contract.md）：Put 的 actual_remote_uris 由
+    // 保序契约：Put 的 actual_remote_uris 由
     // 末尾的 Alloc 整体赋值（alloc_uris = remote_uris）填充，顺序与 remote_uris 天然
     // 一致。直接测 Alloc（protected，经 -fno-access-control 访问），不需要 mooncake 服务。
     MooncakeSdk sdk;

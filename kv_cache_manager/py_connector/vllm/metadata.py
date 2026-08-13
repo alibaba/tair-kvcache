@@ -45,7 +45,7 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
 
        Args:
            epoch: 当前epoch编号
-        """
+       """
         self.epoch = epoch
         self.requests: list[ReqStateToWorker] = []
         self.to_load_requests: list[LoadRequest] = []
@@ -66,3 +66,4 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
 
     def __repr__(self):
         return f"TairKvCacheConnectorMetadata(requests={self.requests})"
+

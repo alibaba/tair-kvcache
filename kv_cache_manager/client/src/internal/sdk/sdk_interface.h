@@ -12,7 +12,6 @@
 namespace kv_cache_manager {
 
 // 各存储后端 SDK 的统一接口。
-//
 // deadline 语义：int64_t deadline_ms 是绝对时间点（steady_clock 毫秒）。
 // 到达 deadline 后实现方不得再触碰 caller 的 local buffers。能做到固然好，
 // 做不到（soft 级后端）须如实声明。0 表示无 deadline。
