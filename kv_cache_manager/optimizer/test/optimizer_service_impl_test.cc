@@ -17,13 +17,14 @@ protected:
         service_ = std::make_shared<OptimizerServiceImpl>(manager_, nullptr);
     }
 
-    void CreateTestGroup(const std::string &group_name, double capacity_gb = 1.0) {
+    void CreateTestGroup(const std::string &group_name, double capacity_gb = 1.0, int64_t ttl_seconds = 0) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("setup");
         auto *g = req.mutable_instance_group();
         g->set_name(group_name);
         g->add_capacity_gb(capacity_gb);
         g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
+        g->set_ttl_seconds(ttl_seconds);
 
         proto::optimizer::CommonResponse resp;
         RequestContext ctx("setup", nullptr);
@@ -437,6 +438,41 @@ TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryKeepsBlockOnlyCompatibil
     service_->TraceQuery(&ctx, &tq_req, &response);
     EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
     EXPECT_EQ(4, response.input_token_len());
+}
+
+TEST_F(OptimizerServiceImplTest, TraceQueryUsesRequestTimestamp) {
+    CreateTestGroup("grp1", 1.0, 10);
+
+    auto req = MakeRegisterRequest("grp1", "inst1", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::TraceQueryRequest query;
+    query.set_instance_id("inst1");
+    query.set_input_token_len(8);
+    query.add_block_keys(1);
+    query.add_block_keys(2);
+
+    proto::optimizer::TraceQueryResponse response;
+    query.set_timestamp_ns(1000LL * 1000000000);
+    service_->TraceQuery(&ctx, &query, &response);
+    ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+
+    response.Clear();
+    query.set_timestamp_ns(1005LL * 1000000000);
+    service_->TraceQuery(&ctx, &query, &response);
+    ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+    ASSERT_EQ(1, response.capacity_results_size());
+    EXPECT_EQ(2, response.capacity_results(0).cache_hit_count());
+
+    response.Clear();
+    query.set_timestamp_ns(1015LL * 1000000000);
+    service_->TraceQuery(&ctx, &query, &response);
+    ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+    ASSERT_EQ(1, response.capacity_results_size());
+    EXPECT_EQ(0, response.capacity_results(0).cache_hit_count());
 }
 
 TEST_F(OptimizerServiceImplTest, TraceQueryNonExistentInstance) {
