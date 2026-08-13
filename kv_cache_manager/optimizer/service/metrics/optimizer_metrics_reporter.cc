@@ -50,6 +50,8 @@ struct OptimizerMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_capacity_efficiency);
     DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
 
+    std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
+
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
             size_t hash = 0;
@@ -220,6 +222,12 @@ bool OptimizerMetricsReporter::InitMetrics() {
 
     REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
 
+    kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
+    if (!kmon_ctx_->mrc_metrics) {
+        KVCM_LOG_ERROR("failed to register metric:[mrc]");
+        return false;
+    }
+
     KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
     return true;
 }
@@ -264,6 +272,8 @@ bool OptimizerMetricsReporter::InitMetrics() {
 void OptimizerMetricsReporter::ReportInterval() {
     std::vector<InstanceSummary> summaries;
     manager_->ListInstances("", summaries);
+    std::vector<MrcMetricInfo> mrc_metrics;
+    manager_->TakeMrcMetrics(mrc_metrics);
 
     for (const auto &s : summaries) {
         MetricsTags prom_tags = {{"instance_id", s.instance_id}};
@@ -321,6 +331,12 @@ void OptimizerMetricsReporter::ReportInterval() {
         }
     }
 
+    for (const auto &metric : mrc_metrics) {
+        MetricsTags prom_tags = {{"instance_id", metric.instance_id}};
+        Gauge mrc = metrics_registry_->GetGauge("mrc", prom_tags);
+        mrc = static_cast<double>(metric.capacity_bytes);
+    }
+
     // --- Kmonitor ---
     if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
         return;
@@ -342,7 +358,6 @@ void OptimizerMetricsReporter::ReportInterval() {
         REPORT_METRICS(trace, query_memory_usage_bytes, static_cast<double>(s.memory_usage_bytes));
         REPORT_METRICS(trace, query_kv_cache_usage_bytes, static_cast<double>(s.kv_cache_usage_bytes));
         REPORT_METRICS(trace, query_ttl_eviction_count, static_cast<double>(s.ttl_eviction_count));
-
         for (const auto &cap_info : s.per_capacity_hit_rates) {
             std::string cap_str = std::to_string(cap_info.capacity_gb);
             MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
@@ -361,6 +376,12 @@ void OptimizerMetricsReporter::ReportInterval() {
             kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(bucket_tags);
             kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&ktags, bucket.ratio);
         }
+    }
+
+    for (const auto &metric : mrc_metrics) {
+        MetricsTags base_tags = {{"instance_id", metric.instance_id}};
+        kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
+        kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));
     }
 }
 

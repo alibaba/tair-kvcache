@@ -62,6 +62,41 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
     return static_cast<int64_t>(lhs * rhs);
 }
 
+void AccumulateMrc(const RequestFact &fact, InstanceState &state) {
+    for (const auto &segment : fact.hit_curve) {
+        if (segment.run_length == 0) {
+            continue;
+        }
+        const uint64_t end_required_blocks = segment.start_required_blocks + segment.run_length - 1;
+        if (end_required_blocks + 1 >= state.mrc_interval_hit_count_deltas.size()) {
+            state.mrc_interval_hit_count_deltas.resize(static_cast<std::size_t>(end_required_blocks + 2), 0);
+        }
+        ++state.mrc_interval_hit_count_deltas[segment.start_required_blocks];
+        --state.mrc_interval_hit_count_deltas[end_required_blocks + 1];
+        state.mrc_interval_total_hits += segment.run_length;
+    }
+}
+
+uint64_t ComputeMrcRequiredBlocks(const InstanceState &state) {
+    if (state.mrc_interval_total_hits == 0) {
+        return 0;
+    }
+
+    // ceil(total * 0.95), written without multiplication to avoid overflow.
+    const uint64_t target_hits = state.mrc_interval_total_hits - state.mrc_interval_total_hits / 20;
+    uint64_t accumulated_hits = 0;
+    int64_t hits_at_required_blocks = 0;
+    for (std::size_t required_blocks = 0; required_blocks < state.mrc_interval_hit_count_deltas.size();
+         ++required_blocks) {
+        hits_at_required_blocks += state.mrc_interval_hit_count_deltas[required_blocks];
+        accumulated_hits += static_cast<uint64_t>(hits_at_required_blocks);
+        if (accumulated_hits >= target_hits) {
+            return required_blocks;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int64_t OnlineOptimizerManager::ComputeSizeForGroup(const std::vector<LocationSpecInfo> &specs,
@@ -419,30 +454,15 @@ ErrorCode OnlineOptimizerManager::RemoveInstance(const std::string &instance_id)
 
 ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
                                              const std::vector<int64_t> &block_keys,
+                                             int64_t input_token_len,
+                                             int64_t timestamp_ns,
                                              TraceQueryResult &result) {
-    std::shared_ptr<InstanceState> state;
-    {
-        std::shared_lock lock(instances_mutex_);
-        auto it = instances_.find(instance_id);
-        if (it == instances_.end()) {
-            return EC_INSTANCE_NOT_EXIST;
-        }
-        state = it->second;
-    }
-
-    const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
-    if (!block_keys.empty() &&
-        block_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / block_keys.size()) {
+    if (input_token_len < 0 || timestamp_ns < 0) {
         return EC_BADARGS;
     }
-    const int64_t input_token_len = static_cast<int64_t>(block_keys.size() * block_size);
-    return TraceQuery(instance_id, block_keys, input_token_len, result);
-}
+    const int64_t replay_timestamp_ns =
+        timestamp_ns == 0 ? static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000 : timestamp_ns;
 
-ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
-                                             const std::vector<int64_t> &block_keys,
-                                             int64_t input_token_len,
-                                             TraceQueryResult &result) {
     std::shared_ptr<InstanceState> state;
     {
         std::shared_lock lock(instances_mutex_);
@@ -451,6 +471,15 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_INSTANCE_NOT_EXIST;
         }
         state = it->second;
+    }
+
+    if (input_token_len == 0) {
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        if (!block_keys.empty() &&
+            block_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / block_keys.size()) {
+            return EC_BADARGS;
+        }
+        input_token_len = static_cast<int64_t>(block_keys.size() * block_size);
     }
 
     std::lock_guard<std::mutex> guard(state->mutex);
@@ -466,10 +495,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         if (!state->lite_hit) {
             return EC_ERROR;
         }
-        if (input_token_len < 0) {
-            return EC_BADARGS;
-        }
-
         NormalizedRequest normalized;
         try {
             normalized = NormalizeRequest(block_keys,
@@ -482,8 +507,8 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_BADARGS;
         }
 
-        const RequestFact fact =
-            state->lite_hit->ProcessRequest(normalized.block_keys, TimestampUtil::GetCurrentTimeUs() * 1000);
+        const RequestFact fact = state->lite_hit->ProcessRequest(normalized.block_keys, replay_timestamp_ns);
+        AccumulateMrc(fact, *state);
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
@@ -534,9 +559,10 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     // Legacy analyzers keep their algorithm but share the same prefix-hash
     // preprocessing switch.
     if (state->instance_group->enable_prefix_hash()) {
-        state->indexer->ProcessKeys(ApplyPrefixHash(block_keys), hit_count, max_hit_count);
+        state->indexer->ProcessKeysAtTimestamp(
+            ApplyPrefixHash(block_keys), replay_timestamp_ns, hit_count, max_hit_count);
     } else {
-        state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
+        state->indexer->ProcessKeysAtTimestamp(block_keys, replay_timestamp_ns, hit_count, max_hit_count);
     }
 
     state->indexer->PostQueryMaintenance();
@@ -614,7 +640,6 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // separate report.
             s.kv_cache_usage_bytes = SaturatingMultiplyToInt64(state->lite_hit->current_unique_blocks(),
                                                                static_cast<uint64_t>(state->size_full_only));
-
             // Full-attention rates are token based: cumulative hit blocks are
             // converted to tokens with the fixed block size and divided by the
             // cumulative input tokens.
@@ -688,6 +713,28 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
     return EC_OK;
 }
 
+ErrorCode OnlineOptimizerManager::TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics) {
+    std::shared_lock lock(instances_mutex_);
+    metrics.clear();
+    metrics.reserve(instances_.size());
+
+    for (const auto &[id, state] : instances_) {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        if (state->linear_step != 0 || !state->lite_hit) {
+            continue;
+        }
+
+        MrcMetricInfo metric;
+        metric.instance_id = id;
+        metric.capacity_bytes =
+            SaturatingMultiplyToInt64(ComputeMrcRequiredBlocks(*state), static_cast<uint64_t>(state->size_full_only));
+        metrics.push_back(std::move(metric));
+        state->mrc_interval_hit_count_deltas.clear();
+        state->mrc_interval_total_hits = 0;
+    }
+    return EC_OK;
+}
+
 ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::shared_ptr<InstanceState> state;
     {
@@ -727,6 +774,8 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     state->total_input_tokens = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);
     state->total_max_hits = 0;
+    state->mrc_interval_hit_count_deltas.clear();
+    state->mrc_interval_total_hits = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

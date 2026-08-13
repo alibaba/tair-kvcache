@@ -45,6 +45,17 @@ public:
                              int64_t &max_hit_count,
                              std::vector<bool> *key_hits = nullptr) = 0;
 
+    // Process a request at its producer timestamp. Indexers without
+    // time-based behavior use the normal path; TTL wrappers override this so
+    // queueing delay does not shift expiry decisions.
+    virtual void ProcessKeysAtTimestamp(const std::vector<int64_t> &keys,
+                                        int64_t /*timestamp_ns*/,
+                                        std::vector<int64_t> &hit_count,
+                                        int64_t &max_hit_count,
+                                        std::vector<bool> *key_hits = nullptr) {
+        ProcessKeys(keys, hit_count, max_hit_count, key_hits);
+    }
+
     virtual int64_t unique_count() const = 0;
 
     // Number of keys evicted from the indexer.
