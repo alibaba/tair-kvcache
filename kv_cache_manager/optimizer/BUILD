@@ -208,6 +208,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
+        ":kvcm_event_subscriber",
         ":online_optimizer_server_config",
         ":optimizer_metrics_reporter",
         ":optimizer_service_grpc",
