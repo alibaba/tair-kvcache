@@ -12,7 +12,10 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/event_publishers_config.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
+#include "kv_cache_manager/event/optimizer_event_publisher.h"
+#include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
@@ -25,6 +28,7 @@
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
@@ -254,6 +258,9 @@ bool Server::StartRpcServer() {
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
+    if (optimizer_event_service_) {
+        builder.RegisterService(optimizer_event_service_.get());
+    }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
     }
@@ -372,18 +379,46 @@ void Server::CreateAndRegisterEventPublisher() {
         KVCM_LOG_WARN("do not have event manager, skip create and register event publisher.");
         return;
     }
-    auto log_publisher = std::make_shared<LogEventPublisher>();
-    // 这里的logpublisher初始化配置需要修改
-    auto event_publishers_configs = config_.event_publishers_configs();
-    if (!log_publisher->Init(event_publishers_configs)) {
-        KVCM_LOG_ERROR("init log event publisher failed");
+    RegisterEventPublishers(event_manager);
+}
+
+void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_manager) {
+    const auto &event_publishers_configs = config_.event_publishers_configs();
+    EventPublishersConfig publishers_config;
+    if (!event_publishers_configs.empty() && !publishers_config.FromJsonString(event_publishers_configs)) {
+        KVCM_LOG_ERROR("parse event publisher config failed; event publishers disabled");
         return;
     }
-    if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
-        KVCM_LOG_ERROR("add log event publisher failed");
+
+    if (publishers_config.enable_log_event_publisher()) {
+        auto log_publisher = std::make_shared<LogEventPublisher>(publishers_config.log_event_publisher_config());
+        if (!log_publisher->Init("")) {
+            KVCM_LOG_ERROR("init log event publisher failed");
+            return;
+        }
+        if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
+            KVCM_LOG_ERROR("add log event publisher failed");
+            return;
+        }
+        KVCM_LOG_INFO("create and register log event publisher OK");
+    }
+
+    if (!publishers_config.enable_optimizer_event_publisher()) {
         return;
     }
-    KVCM_LOG_INFO("create and register event publisher OK");
+    const auto &config = publishers_config.optimizer_event_publisher_config();
+    auto sink = std::make_shared<SubscriptionEventSink>(config);
+    auto optimizer_publisher = std::make_shared<OptimizerEventPublisher>(sink, config);
+    if (!optimizer_publisher->Init("")) {
+        KVCM_LOG_ERROR("init optimizer event publisher failed; publisher disabled");
+        return;
+    }
+    if (!event_manager->RegisterPublisher("optimizer_event_publisher", optimizer_publisher)) {
+        KVCM_LOG_ERROR("add optimizer event publisher failed; publisher disabled");
+        return;
+    }
+    optimizer_event_service_ = std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_);
+    KVCM_LOG_INFO("create and register optimizer gRPC event publisher OK, rpc_port=%d", config_.GetServiceRpcPort());
 }
 bool Server::CreateLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
