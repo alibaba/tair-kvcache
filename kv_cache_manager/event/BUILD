@@ -15,6 +15,7 @@ cc_library(
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:string_util",
         ":base_event",
+        ":event_publishers_config",
         "//kv_cache_manager/event/spec_events",
     ],
 )
@@ -24,6 +25,19 @@ cc_library(
     srcs = [],
     hdrs = [
         "base_event.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common:jsonizable",
+    ],
+)
+
+cc_library(
+    name = "event_publishers_config",
+    srcs = [
+        "event_publishers_config.cc",
+    ],
+    hdrs = [
+        "event_publishers_config.h",
     ],
     deps = [
         "//kv_cache_manager/common:jsonizable",
