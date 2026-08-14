@@ -1,3 +1,6 @@
+#include <atomic>
+#include <future>
+#include <mutex>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -319,7 +322,20 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
 }
 
 TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
-    auto make_mock_client = []() {
+    std::atomic<int> client_index{0};
+    std::once_flag first_pipeline_call;
+    std::promise<void> first_client_entered_promise;
+    auto first_client_entered = first_client_entered_promise.get_future();
+    std::promise<void> release_first_client_promise;
+    auto release_first_client = release_first_client_promise.get_future().share();
+    std::promise<void> second_client_created_promise;
+    auto second_client_created = second_client_created_promise.get_future();
+
+    auto make_mock_client = [&]() {
+        const int current_client_index = client_index.fetch_add(1);
+        if (current_client_index == 1) {
+            second_client_created_promise.set_value();
+        }
         StandardUri empty_storage_uri;
         auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
@@ -329,8 +345,11 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
             TryExecPipeline(ElementsAre(
                 ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1"), StrEq("f2")),
                 ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f1"), StrEq("f2")))))
-            .WillRepeatedly(Invoke([]() {
-                usleep(5 * 1000); // assume network use 5ms
+            .WillRepeatedly(Invoke([&, current_client_index]() {
+                if (current_client_index == 0) {
+                    std::call_once(first_pipeline_call, [&] { first_client_entered_promise.set_value(); });
+                    release_first_client.wait();
+                }
                 std::vector<ReplyUPtr> get_replies_2;
                 get_replies_2.emplace_back(MakeFakeReplyArrayString({"v1-1", "v1-2"}));
                 get_replies_2.emplace_back(MakeFakeReplyArrayString({"v2-1", "v2-2"}));
@@ -353,14 +372,24 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
                             {EC_OK, EC_OK},
                             {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     };
-    std::vector<std::thread> threads;
-    for (int i = 0; i < 10; ++i) {
-        threads.emplace_back(get_task);
-        usleep(2 * 1000);
+    std::thread first_thread(get_task);
+    const auto first_entered_status = first_client_entered.wait_for(std::chrono::seconds(1));
+
+    std::thread second_thread;
+    std::future_status second_created_status = std::future_status::timeout;
+    if (first_entered_status == std::future_status::ready) {
+        second_thread = std::thread(get_task);
+        second_created_status = second_client_created.wait_for(std::chrono::seconds(1));
     }
-    for (auto &thread : threads) {
-        thread.join();
+
+    release_first_client_promise.set_value();
+    first_thread.join();
+    if (second_thread.joinable()) {
+        second_thread.join();
     }
+
+    ASSERT_EQ(std::future_status::ready, first_entered_status);
+    ASSERT_EQ(std::future_status::ready, second_created_status);
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 

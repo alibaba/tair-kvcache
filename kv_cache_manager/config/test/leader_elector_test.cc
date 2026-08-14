@@ -654,21 +654,32 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    ASSERT_TRUE(elector1->IsLeader() || elector2->IsLeader());
+    const bool is_elector1_leader = elector1->IsLeader();
+    const bool is_elector2_leader = elector2->IsLeader();
+    ASSERT_NE(is_elector1_leader, is_elector2_leader);
 
-    // 从任一 elector 获取 leader node id
-    std::string leader_id = elector1->GetLeaderNodeID();
-    EXPECT_FALSE(leader_id.empty());
+    LeaderElector *leader = is_elector1_leader ? elector1.get() : elector2.get();
+    LeaderElector *follower = is_elector1_leader ? elector2.get() : elector1.get();
+    const std::string leader_id = leader->GetSelfNodeID();
 
-    // 用非 leader 的 elector 读取 leader 的节点信息（模拟从 follower 查询 leader）
-    LeaderElector *follower = elector1->IsLeader() ? elector2.get() : elector1.get();
+    // Election and follower discovery are separate work-loop observations. Wait
+    // until the follower has observed the elected node before querying its info.
     NodeEndpointInfo leader_info;
-    ErrorCode ec = follower->GetNodeInfo(leader_id, leader_info);
+    ErrorCode ec = EC_NOENT;
+    for (int i = 0; i < 100; ++i) {
+        if (follower->GetLeaderNodeID() == leader_id) {
+            ec = follower->GetLeaderNodeInfo(leader_info);
+            if (ec == EC_OK) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     ASSERT_EQ(EC_OK, ec);
 
     // 验证读取到的信息和 leader 的注册信息一致
     EXPECT_EQ(leader_id, leader_info.node_id());
-    if (elector1->IsLeader()) {
+    if (is_elector1_leader) {
         EXPECT_EQ(host1, leader_info.host());
         EXPECT_EQ(8001, leader_info.meta_rpc_port());
         EXPECT_EQ(8002, leader_info.meta_http_port());
