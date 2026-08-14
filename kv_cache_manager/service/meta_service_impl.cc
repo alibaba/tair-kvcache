@@ -711,27 +711,30 @@ void MetaServiceImpl::GetCacheMetaDetail(RequestContext *request_context,
 
     BlockMask block_mask_req;
     ProtoConvert::BlockMaskFromProto(&request->block_mask(), block_mask_req);
-    auto [ec_info, cache_meta_details] =
-        cache_manager_->GetCacheMetaDetail(request_context,
-                                           request->instance_id(),
-                                           std::vector<int64_t>(request->block_keys().begin(),
-                                                                request->block_keys().end()),
-                                           std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
-                                           block_mask_req,
-                                           request->detail_level());
+    auto [ec_info, cache_meta_details] = cache_manager_->GetCacheMetaDetail(
+        request_context,
+        request->instance_id(),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        block_mask_req,
+        request->detail_level());
+
+    size_t item_error_count = 0;
+    for (const auto &cache_meta_detail : cache_meta_details) {
+        item_error_count += cache_meta_detail.error_code != EC_OK;
+        ProtoConvert::CacheKeyMetaDetailToProto(cache_meta_detail, response->add_items());
+    }
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
-        status->set_message("Failed to get cache metadata detail : " +
-                            request_context->error_tracer()->ToJsonString());
-        KVCM_LOG_ERROR("[traceId: %s] GetCacheMetaDetail failed, ec: %d", request->trace_id().c_str(), ec_info);
+        status->set_message("Failed to get cache metadata detail : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetCacheMetaDetail failed, ec: %d, returned %d items with %zu item errors",
+                       request->trace_id().c_str(),
+                       ec_info,
+                       response->items_size(),
+                       item_error_count);
     } else {
-        size_t item_error_count = 0;
-        for (const auto &cache_meta_detail : cache_meta_details) {
-            item_error_count += cache_meta_detail.error_code != EC_OK;
-            ProtoConvert::CacheKeyMetaDetailToProto(cache_meta_detail, response->add_items());
-        }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         if (item_error_count == 0) {
