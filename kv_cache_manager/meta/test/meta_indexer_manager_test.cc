@@ -8,6 +8,7 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
 
@@ -103,6 +104,26 @@ TEST_F(MetaIndexerManagerTest, TestCreateFailed) {
     std::string id_1 = "1";
     ASSERT_EQ(ErrorCode::EC_ERROR, CreateMetaIndexer(id_1, "test"));
     ASSERT_EQ(0, manager_->GetIndexerSize());
+}
+
+TEST_F(MetaIndexerManagerTest, TestConfigureQueryExecutorBeforeCreatingIndexers) {
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(0, 256, 128));
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(65, 256, 128));
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(4, 0, 128));
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(4, 256, 0));
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(4, 128, 256));
+
+    ASSERT_TRUE(manager_->ConfigureQueryExecutor(4, 256, 128));
+    ASSERT_TRUE(manager_->query_executor_);
+    EXPECT_EQ(4u, manager_->query_executor_->worker_count());
+    EXPECT_EQ(256u, manager_->query_executor_->parallel_threshold());
+    EXPECT_EQ(128u, manager_->query_executor_->chunk_size());
+
+    ASSERT_EQ(EC_OK, CreateMetaIndexer("configured", META_LOCAL_BACKEND_TYPE_STR));
+    const auto indexer = manager_->GetMetaIndexer("configured");
+    ASSERT_TRUE(indexer);
+    EXPECT_EQ(manager_->query_executor_, indexer->query_executor_);
+    EXPECT_FALSE(manager_->ConfigureQueryExecutor(2, 64, 32));
 }
 
 TEST_F(MetaIndexerManagerTest, TestDoCleanup) {

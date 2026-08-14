@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
@@ -50,10 +51,6 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(service, error_qps);
     DECLARE_METRICS(service, request_queue_size);
 
-    DECLARE_METRICS(event_report, qps);
-    DECLARE_METRICS(event_report, request_rt_us);
-    DECLARE_METRICS(event_report, error_qps);
-
     // manager metrics metrics
     DECLARE_METRICS(manager, request_key_count);
     DECLARE_METRICS(manager, prefix_match_len);
@@ -72,6 +69,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta searcher metrics
     DECLARE_METRICS(meta_searcher, indexer_get_time_us);
+    DECLARE_METRICS(meta_searcher, host_projection_time_us);
+    DECLARE_METRICS(meta_searcher, host_prefix_reduce_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
     DECLARE_METRICS(meta_searcher, index_serialize_time_us);
@@ -118,6 +117,7 @@ struct KmonitorMetricsReporter::Context {
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
+    DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     DECLARE_METRICS(scheduler_plan_executor, waiting_task_count);
@@ -319,10 +319,6 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_QPS_METRIC(service, error_qps);
     REGISTER_GAUGE_METRIC(service, request_queue_size);
 
-    REGISTER_QPS_METRIC(event_report, qps);
-    REGISTER_GAUGE_METRIC(event_report, request_rt_us);
-    REGISTER_QPS_METRIC(event_report, error_qps);
-
     // manager metrics
     REGISTER_GAUGE_METRIC(manager, request_key_count);
     REGISTER_GAUGE_METRIC(manager, prefix_match_len);
@@ -344,6 +340,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_get_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_projection_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_prefix_reduce_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_block_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_serialize_time_us);
@@ -390,6 +388,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
+    REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     REGISTER_GAUGE_METRIC(scheduler_plan_executor, waiting_task_count);
@@ -541,6 +540,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta searcher metrics
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_get_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_projection_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_prefix_reduce_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
         REPORT_STEAL_METRICS(meta_searcher, index_serialize_time_us);
@@ -574,11 +575,14 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
-        REPORT_METRICS(event_report, qps, 1.0);
-        REPORT_METRICS(event_report, request_rt_us, p->GetRequestRtUsSample());
+        REPORT_METRICS(service, qps, 1.0);
+        REPORT_METRICS(service, query_rt_us, p->GetRequestRtUsSample());
 
         const double error_code = p->GetErrorCodeSample();
-        REPORT_METRICS_WHEN(event_report, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
+        REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
+        if (p->HasRequestKeyCountSample()) {
+            REPORT_METRICS(manager, request_key_count, p->GetRequestKeyCountSample());
+        }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
@@ -634,6 +638,38 @@ void KmonitorMetricsReporter::ReportInterval() {
                 GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                 REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
             }
+        }
+    } while (false);
+
+    do {
+        // for per-storage accumulative dispatched write bytes
+        // the counter is updated in real-time on each backend's DataStorageMetricsCollector
+        // (via DataStorageManager::RecordWriteBytes, covering both normal writes and migration
+        // copies at their dispatch points), so read the current cumulative values and report
+        // them to kmonitor periodically
+        const auto registry_manager = cache_manager_->GetRegistryManager();
+        if (!registry_manager) {
+            break;
+        }
+        const auto data_storage_manager = registry_manager->data_storage_manager();
+        if (!data_storage_manager) {
+            break;
+        }
+
+        const auto storage_names = data_storage_manager->GetAllStorageNames();
+        for (const auto &unique_name : storage_names) {
+            const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
+            if (storage_backend == nullptr) {
+                continue;
+            }
+            const auto collector = storage_backend->GetMetricsCollector();
+            if (collector == nullptr) {
+                continue;
+            }
+            std::uint64_t write_bytes_v;
+            GET_METRICS_(collector, data_storage, write_bytes_dispatched_total, write_bytes_v);
+            const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(collector->GetMetricsTags());
+            REPORT_METRICS(data_storage, write_bytes_dispatched_total, static_cast<double>(write_bytes_v));
         }
     } while (false);
 

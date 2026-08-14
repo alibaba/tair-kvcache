@@ -86,6 +86,9 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetCacheReclaimerWorkerSize(),
                               async_delete_config,
                               config_.GetSchedulePlanMigrationWorkerBudget(),
+                              config_.GetMetaQueryWorkerCount(),
+                              config_.GetMetaQueryParallelThreshold(),
+                              config_.GetMetaQueryChunkSize(),
                               cache_gc_config)) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;

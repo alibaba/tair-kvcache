@@ -352,6 +352,14 @@ class EventReportFunctionalTest(unittest.TestCase):
                 },
                 "location_spec_infos": [
                     {"name": "tp0", "size": 1024},
+                    {"name": "mem_spec", "size": 1024},
+                    {"name": "disk_spec", "size": 1024},
+                    {"name": "spec_4096", "size": 1024},
+                    {"name": "spec_8192", "size": 1024},
+                    {"name": "keep_spec", "size": 1024},
+                    {"name": "drop_spec", "size": 1024},
+                    {"name": "l1p5_spec", "size": 1024},
+                    {"name": "l2_spec", "size": 1024},
                 ],
             })
         except Exception as e:
@@ -1014,9 +1022,13 @@ class EventReportFunctionalTest(unittest.TestCase):
             "10.0.0.3:8080": 1,
         }
         actual = {
-            h["host_ip_port"]: int(h["prefix_match_blocks"])
+            h["host_ip_port"]: int(h["local"])
             for h in resp.get("hosts", [])
         }
+        self.assertNotIn("p2p_1_hit_count", resp)
+        for host_match in resp.get("hosts", []):
+            self.assertIn("p2p_1_fetch", host_match)
+            self.assertIn("p2p_1_total_match", host_match)
         for host, prefix in expected.items():
             self.assertIn(host, actual, f"host {host} not found in response")
             self.assertEqual(actual[host], prefix, f"host {host}: expected prefix={prefix}, got {actual[host]}")

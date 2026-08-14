@@ -65,15 +65,15 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         } while (false);
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
-        Counter request_counter;
-        COPY_METRICS_(p, event_report, request_counter, request_counter);
-        ++request_counter;
+        Counter service_query_counter;
+        COPY_METRICS_(p, service, query_counter, service_query_counter);
+        ++service_query_counter;
 
         const double error_code = p->GetErrorCodeSample();
         if (!CommonUtil::IsZeroDouble(error_code)) {
-            Counter error_counter;
-            COPY_METRICS_(p, event_report, error_counter, error_counter);
-            ++error_counter;
+            Counter service_error_counter;
+            COPY_METRICS_(p, service, error_counter, service_error_counter);
+            ++service_error_counter;
         }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);

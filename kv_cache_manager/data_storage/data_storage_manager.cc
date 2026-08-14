@@ -307,4 +307,23 @@ std::vector<ErrorCode> DataStorageManager::UnLock(const std::string &unique_name
     auto storage_backend = iter->second;
     return storage_backend->UnLock(storage_uris);
 }
+
+void DataStorageManager::RecordWriteBytes(const std::string &unique_name, std::uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    auto iter = storage_map_.find(unique_name); // iter->second 指向 DataStorageBackend 对象
+    if (iter == storage_map_.end() || iter->second == nullptr) {
+        KVCM_LOG_WARN("RecordWriteBytes: storage [%s] not found, drop %llu bytes",
+                      unique_name.c_str(), static_cast<unsigned long long>(bytes));
+        return;
+    }
+    const auto collector = iter->second->GetMetricsCollector(); // 指向 DataStorageMetricsCollector 对象
+    if (collector == nullptr) {
+        return;
+    }
+    collector->AddWriteBytes(bytes);
+}
+
 } // namespace kv_cache_manager

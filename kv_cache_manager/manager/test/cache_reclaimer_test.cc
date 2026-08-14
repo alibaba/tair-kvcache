@@ -4499,10 +4499,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
         DataStorageType::DATA_STORAGE_TYPE_DUMMY,
         1,
         std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_partial/tp0")});
+    // A reporter may use the migration target name as its URI host and carry
+    // the otherwise missing spec. It is not an ordinary cold-tier replica and
+    // must not make the hot location eligible for physical reclamation.
+    auto event_report_loc = std::make_shared<CacheLocation>(
+        "event_report#mem#cold_01:9600",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP1", "event_report://cold_01:9600/mem?size=1")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_full", hot_loc);
     loc_map.emplace("cold_partial", partial_cold_loc);
+    loc_map.emplace("event_report", event_report_loc);
     batch_get_loc_out_maps = {std::move(loc_map)};
     batch_get_loc_result = ErrorCode::EC_OK;
 

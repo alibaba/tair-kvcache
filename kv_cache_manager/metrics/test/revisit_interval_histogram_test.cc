@@ -217,6 +217,46 @@ TEST_F(RevisitIntervalHistogramTest, ManyObservations) {
     EXPECT_EQ(counts[3], 1000); // <= +Inf
 }
 
+TEST_F(RevisitIntervalHistogramTest, ObserveBatchMatchesIndividualObservations) {
+    const std::vector<double> boundaries = {1.0, 5.0, 10.0};
+    RevisitIntervalHistogram individual;
+    RevisitIntervalHistogram batched;
+    ASSERT_TRUE(individual.Init(registry_, boundaries, "individual"));
+    ASSERT_TRUE(batched.Init(registry_, boundaries, "batched"));
+
+    const std::vector<int64_t> intervals = {
+        -1,
+        0,
+        500000,
+        1000000,
+        3000000,
+        5000000,
+        7000000,
+        10000000,
+        50000000,
+    };
+    for (const int64_t interval : intervals) {
+        individual.Observe(interval);
+    }
+    batched.ObserveBatch(intervals);
+
+    EXPECT_EQ(individual.GetBucketCounts(), batched.GetBucketCounts());
+    EXPECT_EQ(individual.GetSum(), batched.GetSum());
+    EXPECT_EQ(individual.GetCount(), batched.GetCount());
+}
+
+TEST_F(RevisitIntervalHistogramTest, ObserveBatchIgnoresEmptyAndNonPositiveBatch) {
+    RevisitIntervalHistogram hist;
+    ASSERT_TRUE(hist.Init(registry_, {1.0, 5.0, 10.0}, "test_instance"));
+
+    hist.ObserveBatch({});
+    hist.ObserveBatch({-100, 0, -1});
+
+    EXPECT_EQ(0u, hist.GetCount());
+    EXPECT_EQ(0u, hist.GetSum());
+    EXPECT_EQ(std::vector<uint64_t>({0, 0, 0, 0}), hist.GetBucketCounts());
+}
+
 // 测试 le 标签格式化（整数边界不含多余零）
 TEST_F(RevisitIntervalHistogramTest, LeLabelFormatting) {
     RevisitIntervalHistogram hist;

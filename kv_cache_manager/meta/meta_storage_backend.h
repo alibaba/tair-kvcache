@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -80,6 +81,27 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
+    // Allocation-light one-location upsert used by pure-local targeted RMW.
+    // The default adapter preserves backend semantics; local memory overrides
+    // it to avoid constructing one temporary unordered_map per key.
+    virtual std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdRefVector &location_ids,
+                                                         const CacheLocationVector &locations) noexcept {
+        if (keys.size() != location_ids.size() || keys.size() != locations.size()) {
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+        CacheLocationMapVector location_maps(keys.size());
+        PropertyMapVector properties(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (location_ids[i] == nullptr) {
+                return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+            }
+            location_maps[i].emplace(*location_ids[i], locations[i]);
+        }
+        return Upsert(request_context, keys, location_maps, properties);
+    }
+
     // 删除整个 key 及其所有 locations 和 properties。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys  待删除的 key 列表
@@ -136,6 +158,62 @@ public:
                                                 const KeyTypeVec &keys,
                                                 CacheLocationMapVector &out_locations) noexcept = 0;
 
+    // Lightweight all-location read for consumers that only need immutable
+    // CacheLocation values and do not need to look them up again by id. The
+    // default implementation preserves every backend's existing behavior by
+    // flattening GetLocations. Local memory overrides it to avoid cloning an
+    // unordered_map (including every location-id string and hash node) per key.
+    virtual std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     LocationsPerKey &out_locations) noexcept {
+        CacheLocationMapVector location_maps;
+        auto results = GetLocations(request_context, keys, location_maps);
+        out_locations.clear();
+        out_locations.resize(keys.size());
+        const std::size_t count = std::min(keys.size(), location_maps.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            auto &values = out_locations[i];
+            values.reserve(location_maps[i].size());
+            for (const auto &[location_id, location] : location_maps[i]) {
+                (void)location_id;
+                values.push_back(location);
+            }
+        }
+        return results;
+    }
+
+    // Range-based compact variant used by very large prefix queries. The
+    // generic fallback preserves backend behavior; the local backend overrides
+    // it so callers avoid both copying the key slice and allocating one vector
+    // per key.
+    virtual std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                            const KeyType *keys,
+                                                            size_t key_count,
+                                                            CompactLocationsPerKey &out_locations) noexcept {
+        if (key_count != 0 && keys == nullptr) {
+            out_locations.Clear(key_count);
+            for (size_t i = 0; i < key_count; ++i) {
+                out_locations.FinishKey();
+            }
+            return std::vector<ErrorCode>(key_count, EC_BADARGS);
+        }
+        KeyTypeVec key_vector;
+        if (key_count != 0) {
+            key_vector.assign(keys, keys + key_count);
+        }
+        LocationsPerKey locations;
+        auto results = GetLocationValues(request_context, key_vector, locations);
+        out_locations.Clear(key_count);
+        const size_t value_count = std::min(key_count, locations.size());
+        for (size_t i = 0; i < key_count; ++i) {
+            if (i < value_count) {
+                out_locations.values.insert(out_locations.values.end(), locations[i].begin(), locations[i].end());
+            }
+            out_locations.FinishKey();
+        }
+        return results;
+    }
+
     // 读取指定 location id 对应的 CacheLocation。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys             待查询的 key 列表
@@ -151,6 +229,107 @@ public:
                                                              const KeyTypeVec &keys,
                                                              const LocationIdsPerKey &location_ids,
                                                              LocationsPerKey &out_locations) noexcept = 0;
+
+    // Read selected locations and preserve the key-level existence result.
+    // A targeted read alone cannot distinguish a missing key from an existing
+    // key that does not contain any requested location. RMW callers need that
+    // distinction to update key_count correctly when an upsert creates a new
+    // block. Backends that can determine both states in one lookup should
+    // override this method. The generic fallback only probes key existence for
+    // ambiguous all-NOENT rows, so existing-location reads remain one request.
+    virtual std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept {
+        auto results = GetLocations(request_context, keys, location_ids, out_locations);
+        out_key_error_codes.assign(keys.size(), EC_MISMATCH);
+        if (results.size() != keys.size() || out_locations.size() != keys.size()) {
+            return results;
+        }
+
+        KeyTypeVec ambiguous_keys;
+        std::vector<size_t> ambiguous_indices;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i].size() != location_ids[i].size() || out_locations[i].size() != location_ids[i].size()) {
+                continue;
+            }
+            bool found_location = false;
+            ErrorCode hard_error = EC_OK;
+            for (const ErrorCode ec : results[i]) {
+                if (ec == EC_OK) {
+                    found_location = true;
+                    break;
+                }
+                if (ec != EC_NOENT && hard_error == EC_OK) {
+                    hard_error = ec;
+                }
+            }
+            if (found_location) {
+                out_key_error_codes[i] = EC_OK;
+            } else if (hard_error != EC_OK) {
+                out_key_error_codes[i] = hard_error;
+            } else {
+                ambiguous_keys.push_back(keys[i]);
+                ambiguous_indices.push_back(i);
+            }
+        }
+
+        if (ambiguous_keys.empty()) {
+            return results;
+        }
+        std::vector<bool> exists;
+        const auto exists_results = Exists(request_context, ambiguous_keys, exists);
+        if (exists_results.size() != ambiguous_keys.size() || exists.size() != ambiguous_keys.size()) {
+            return results;
+        }
+        for (size_t i = 0; i < ambiguous_keys.size(); ++i) {
+            const size_t original_index = ambiguous_indices[i];
+            out_key_error_codes[original_index] =
+                exists_results[i] == EC_OK ? (exists[i] ? EC_OK : EC_NOENT) : exists_results[i];
+        }
+        return results;
+    }
+
+    // Flat one-location form of GetLocationsWithKeyStatus. The default
+    // adapter is deliberately generic; local memory overrides it so the
+    // common ReportEvent shape allocates O(1) vectors per batch instead of
+    // two tiny vectors per key.
+    virtual std::vector<ErrorCode>
+    GetSingleLocationsWithKeyStatus(RequestContext *request_context,
+                                    const KeyTypeVec &keys,
+                                    const LocationIdRefVector &location_ids,
+                                    CacheLocationVector &out_locations,
+                                    std::vector<ErrorCode> &out_key_error_codes) noexcept {
+        out_locations.assign(keys.size(), CacheLocationConstPtr{});
+        out_key_error_codes.assign(keys.size(), EC_BADARGS);
+        if (keys.size() != location_ids.size()) {
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+        LocationIdsPerKey ids_per_key(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (location_ids[i] == nullptr) {
+                return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+            }
+            ids_per_key[i].push_back(*location_ids[i]);
+        }
+        LocationsPerKey locations_per_key;
+        auto nested_results =
+            GetLocationsWithKeyStatus(request_context, keys, ids_per_key, locations_per_key, out_key_error_codes);
+        std::vector<ErrorCode> results(keys.size(), EC_MISMATCH);
+        if (nested_results.size() != keys.size() || locations_per_key.size() != keys.size() ||
+            out_key_error_codes.size() != keys.size()) {
+            return results;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (nested_results[i].size() == 1 && locations_per_key[i].size() == 1) {
+                results[i] = nested_results[i][0];
+                out_locations[i] = std::move(locations_per_key[i][0]);
+            }
+        }
+        return results;
+    }
 
     // 仅获取 key 的 location id 列表（不读取 location body）。
     // @param request_context    请求上下文；可为 nullptr

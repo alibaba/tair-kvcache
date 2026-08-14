@@ -29,7 +29,6 @@ cc_library(
         "event_report_backend.h",
         "hf3fs_backend.h",
         "nfs_backend.h",
-        "snapshot_uri_utils.h",
     ] + select({
         ":enable_mooncake": ["mooncake_backend.h"],
         "//conditions:default": [],
@@ -46,6 +45,7 @@ cc_library(
         # "//3rdparty/3fs:hf3fs",
         "//kv_cache_manager/common/hash",  # for xxph3
         ":common_define",
+        ":snapshot_uri_utils",
         # Internal implementations
         "//stub_source/kv_cache_manager/data_storage:tair_mempool",
     ] + select({
@@ -55,6 +55,16 @@ cc_library(
         ":enable_vcns": ["//stub_source/kv_cache_manager/data_storage:vcns_hf3fs"],
         "//conditions:default": [],
     }),
+)
+
+cc_library(
+    name = "snapshot_uri_utils",
+    hdrs = [
+        "snapshot_uri_utils.h",
+    ],
+    deps = [
+        ":common_define",
+    ],
 )
 
 cc_library(

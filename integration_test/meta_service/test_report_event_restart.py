@@ -138,7 +138,11 @@ def verify(args, client, checks):
     checks.assertEqual(accepted["header"]["status"]["code"], "OK")
     active_version = accepted["committed_snapshot_version"]
     checks.assertEqual(len(active_version), 32)
-    checks.assertFalse(accepted.get("snapshot_required"))
+    # A generation-creating delta is accepted immediately, but its own
+    # response keeps snapshot_required=true so a snapshot-capable caller sees
+    # that the request arrived without a current-process generation. The next
+    # delta reuses the generation and clears the hint.
+    checks.assertTrue(accepted.get("snapshot_required"))
     delta_specs = report_event._wait_for_block_spec_names(
         client,
         args.instance_id,
@@ -159,6 +163,26 @@ def verify(args, client, checks):
         {"linear_0"},
         "restart_verify_delta_keeps_untouched_historical_cache",
     )
+
+    followup = client.report_event(
+        report_event._make_request(
+            args.instance_id,
+            HOST,
+            [report_event._ev_block_add(
+                BLOCK_KEY + 2,
+                "gpu",
+                report_event._make_single_spec(
+                    "gpu_0",
+                    report_event._build_event_report_uri(HOST, "gpu"),
+                ),
+            )],
+            trace_id="restart_verify_followup_delta",
+        )
+    )
+    checks.assertEqual(
+        followup.get("committed_snapshot_version"), active_version
+    )
+    checks.assertFalse(followup.get("snapshot_required"))
 
     after_uri = report_event._build_event_report_uri(
         HOST, "mem", {"source": "after_restart"}

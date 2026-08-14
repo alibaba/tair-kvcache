@@ -14,6 +14,22 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+bool ParseUint32Setting(const std::string &value, uint32_t &out) {
+    try {
+        std::size_t parsed_length = 0;
+        const auto parsed = std::stoull(value, &parsed_length);
+        if (parsed_length != value.size() || parsed > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        out = static_cast<uint32_t>(parsed);
+        return true;
+    } catch (...) { return false; }
+}
+
+} // namespace
+
 std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
     auto boundaries = StringUtil::ParseBucketBoundaries(buckets_str);
     if (!buckets_str.empty() && boundaries.empty()) {
@@ -121,6 +137,18 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          } catch (...) {
              return false;
          }
+     }},
+    {"kvcm.meta_query.worker_count",
+     [](const std::string &value, ServerConfig *config) {
+         return ParseUint32Setting(value, config->meta_query_worker_count_);
+     }},
+    {"kvcm.meta_query.parallel_threshold",
+     [](const std::string &value, ServerConfig *config) {
+         return ParseUint32Setting(value, config->meta_query_parallel_threshold_);
+     }},
+    {"kvcm.meta_query.chunk_size",
+     [](const std::string &value, ServerConfig *config) {
+         return ParseUint32Setting(value, config->meta_query_chunk_size_);
      }},
     {"kvcm.cache_reclaimer.key_sampling_size_total",
      [](const std::string &value, ServerConfig *config) {
@@ -271,6 +299,9 @@ void ServerConfig::UpdateDefaultConfig() {
     leader_elector_loop_interval_ms_ = 100;
     schedule_plan_executor_thread_count_ = 2;
     schedule_plan_migration_worker_budget_ = 1;
+    meta_query_worker_count_ = 4;
+    meta_query_parallel_threshold_ = 256;
+    meta_query_chunk_size_ = 128;
     cache_reclaimer_key_sampling_size_total_ = 1000;
     cache_reclaimer_key_sampling_size_per_task_ = 100;
     cache_reclaimer_del_batch_size_ = 100;
@@ -421,6 +452,13 @@ bool ServerConfig::Check() {
         schedule_plan_migration_worker_budget_ >= static_cast<uint32_t>(schedule_plan_executor_thread_count_)) {
         fprintf(stderr,
                 "SchedulePlanExecutor requires thread_count > 1 and 0 < migration_worker_budget < thread_count\n");
+        return false;
+    }
+
+    if (meta_query_worker_count_ == 0 || meta_query_worker_count_ > 64 || meta_query_parallel_threshold_ == 0 ||
+        meta_query_chunk_size_ == 0 || meta_query_chunk_size_ > meta_query_parallel_threshold_) {
+        fprintf(stderr,
+                "Meta query executor requires 1 <= worker_count <= 64 and 0 < chunk_size <= parallel_threshold\n");
         return false;
     }
 
