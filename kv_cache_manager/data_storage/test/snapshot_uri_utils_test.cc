@@ -122,7 +122,7 @@ TEST_F(SnapshotUriUtilsTest, PrevalidatedStructureStillRejectsProtocolQueryAndBa
 
 TEST_F(SnapshotUriUtilsTest, AddSnapshotVersionRejectsInvalidPortWithoutCanonicalizingItAway) {
     constexpr const char *token = "0123456789abcdef0123456789abcdef";
-    for (const std::string &invalid_uri : {
+    for (const char *invalid_uri : {
              "event_report://physical-cache:not-a-port/mem?size=1",
              "event_report://physical-cache:-1/mem?size=1",
              "event_report://physical-cache:9223372036854775808/mem?size=1",
