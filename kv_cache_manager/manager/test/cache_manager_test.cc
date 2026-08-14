@@ -1079,6 +1079,65 @@ TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {
     }
 }
 
+TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    // 取出统计的写入量
+    auto get_write_bytes = [&]() {
+        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                                             {{"type", ToString(kDefaultStorageType)},
+                                              {"unique_name", "nfs_01"}}).Get();
+    };
+    // 成功写入
+    std::vector<int64_t> keys{1, 2, 3};
+    auto [ec, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+
+    {// 部分写入成功场景，不新增写入量，写入量统计放在 BatchAddLoation 成功之后
+        auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+        ASSERT_TRUE(meta_indexer);
+
+        // 先备份原设置
+        const auto orig_batch_size = meta_indexer->batch_key_size_;
+        const auto orig_max_key_count = meta_indexer->max_key_count_;
+        meta_indexer->batch_key_size_ = 1;
+        meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1;  // 已写入的key_count + 1，确保已经写入的是成功的
+
+        std::vector<int64_t> keys{1001, 1002};
+        while (GetShardIndex(keys[0], meta_indexer->mutex_shard_mask_) ==
+               GetShardIndex(keys[1], meta_indexer->mutex_shard_mask_)) {
+            ++keys[1];
+        }
+
+        auto [ec, start_write_cache_info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
+        EXPECT_EQ(EC_PARTIAL_OK, ec);
+        EXPECT_TRUE(start_write_cache_info.locations().cache_locations_view().empty());
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+
+        // 恢复现场
+        meta_indexer->batch_key_size_ = orig_batch_size;
+        meta_indexer->max_key_count_ = orig_max_key_count;
+    }
+
+    {// 重复写入
+        std::vector<int64_t> keys{1, 2};
+        auto [ec, start_write_cache_info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+    }
+}
+
 // StartWriteCache with min_replica_count > 1 requires n_total >= min_replica_count to skip,
 // whereas min_replica_count=1 (default) skips with any 1 replica.
 // Also tests spec-group-aware filtering with location_spec_group_names.

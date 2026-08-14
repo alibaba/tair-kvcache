@@ -391,6 +391,16 @@ class DataStorageMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(data_storage, copy_keys_qps)
     KVCM_CHRONO_METRICS(data_storage, copy_time_us, DataStorageCopy)
 
+    // Dispatched-view estimate of bytes written to this storage, aggregated per storage.
+    // Incremented when the control plane finishes dispatching a write:
+    //   - normal writes: in StartWriteCache once BatchAddLocation succeeds (locations
+    //     are about to be handed to the client);
+    //   - migration copies: once the copy task is accepted by the schedule plan executor.
+    // This is an upper-bound estimate of bytes actually written to the backend:
+    // abandoned client writes and failed/cancelled copies are still counted, and the
+    // counter is cumulative and never decreases.
+    KVCM_COUNTER_METRICS(data_storage, write_bytes_dispatched_total)
+
 public:
     DataStorageMetricsCollector() = delete;
     explicit DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept;
@@ -398,6 +408,12 @@ public:
     ~DataStorageMetricsCollector() override = default;
 
     bool Init() override;
+
+    // Accumulates dispatched write bytes; see the semantic contract on the
+    // write_bytes_dispatched_total definition above.
+    void AddWriteBytes(std::uint64_t bytes) {
+        data_storage_write_bytes_dispatched_total_metrics_ += bytes;
+    }
 };
 
 /* --------------- DataStorageIntervalMetricsCollector ---------------- */

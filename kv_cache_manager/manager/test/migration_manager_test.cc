@@ -1898,7 +1898,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
         return req;
     };
 
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
     mgr.DebugEnableCopySubmissionsForTest();
     preparing_reservation_stub::Reset();
     preparing_reservation_stub::g_manager = &mgr;
@@ -1927,6 +1927,14 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     EXPECT_NE(std::string::npos,
               preparing_reservation_stub::g_deleted_uris.front().ToUriString().find(
                   StringUtil::Uint64ToHex(block_keys[failed_index])));
+
+    // 统一口径：add 成功项已提交 executor（stub pending future），计入其 4 字节；
+    // add 失败项（EC_NOSPC）已回滚且未提交，不计入。
+    EXPECT_EQ(4u,
+              metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                                            {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
+                                             {"unique_name", "cold_01"}})
+                  .Get());
 }
 
 // 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
@@ -2544,6 +2552,115 @@ TEST_F(MigrationManagerTest, TestMetricsAndEvents) {
     mgr.OnTaskFailed(kInstance, block_key2, ErrorCode::EC_IO_ERROR);
     ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.tasks_completed_total", {{"status", "failed"}}).Get());
     ASSERT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("migration.tasks_active").Get());
+}
+
+TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "m_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "m_cold/"));
+
+    MigrationManager mgr(schedule_plan_executor_,
+                         meta_manager_,
+                         data_storage_manager_,
+                         metrics_registry_,
+                         nullptr);
+
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    auto get_write_bytes = [&]() {
+        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                              {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
+                               {"unique_name", "cold_01"}}).Get();
+    };
+
+    // 场景1：成功复制
+    {
+        int64_t block_key = 1000;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // 统一口径：任务成功提交 executor 即计入（Submit 返回时已发生）
+        ASSERT_EQ(10u, get_write_bytes());
+        mgr.OnTaskSuccess(kInstance, block_key);
+        // 完成回调不再重复计入
+        ASSERT_EQ(10u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
+    }
+
+    // 场景2：取消仍计入
+    {
+        int64_t block_key = 1001;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(20u, get_write_bytes()); // 提交 executor 即计入，累计：场景1的10 + 本次10
+        // copy 进行中用户取消：任务标记 kCancelling，仍留在活跃表
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+        // 完成回调认领到 kWasCancelling：不计入也不走主路径（计数在提交时已发生）
+        mgr.OnTaskSuccess(kInstance, block_key);
+        ASSERT_EQ(20u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 取消不 promote，不涨
+    }
+
+    // 场景3: Copy 失败
+    {
+        int64_t block_key = 1002;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // copy 失败仍计入：任务已提交 executor，失败属于派发未兑现（累计 20 + 10）
+        ASSERT_EQ(30u, get_write_bytes());
+        mgr.OnTaskFailed(kInstance, block_key, ErrorCode::EC_IO_ERROR);
+        ASSERT_EQ(30u, get_write_bytes()); // 失败回调不再影响计数
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
+    }
+
+    // 场景4: 源丢失，仍计入
+    {
+        int64_t block_key = 1003;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(40u, get_write_bytes()); // 提交 executor 即计入，累计：30 + 10
+
+        // 破坏源：把源 location 从 SERVING CAS 成 DELETING，模拟 copy 期间源被回收
+        auto rc = std::make_shared<RequestContext>("break_source");
+        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
+        std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{
+            {MetaSearcher::LocationCASTask{src_loc, CLS_SERVING, CLS_DELETING}}};
+        std::vector<std::vector<ErrorCode>> cas_results;
+        ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas, cas_results));
+
+        // 完成回调：计数已在提交时发生；此处走 source_lost 失败收尾，不再影响计数
+        mgr.OnTaskSuccess(kInstance, block_key);
+        ASSERT_EQ(40u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 源丢失按失败收尾，不涨
+    }
+
 }
 
 // ============ Copy 准入策略：CheckCopyAdmission ============

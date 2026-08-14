@@ -1171,6 +1171,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
             for (const auto &add_result : add_results) {
                 location_ids.push_back(add_result.location_id);
             }
+            RecordWriteBytesForLocations(new_locations);  // 记录写入量
         }
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     }
@@ -2385,6 +2386,40 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
         }
     }
     return EC_OK;
+}
+
+void CacheManager::RecordWriteBytesForLocations(const CacheLocationVector &locations) {
+    if (metrics_registry_ == nullptr) {
+        return;
+    }
+    if (locations.empty()) {
+        return;
+    }
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        return;
+    }
+    std::map<std::string, std::uint64_t> bytes_by_storage;
+    for (const auto &location : locations) {
+        if (location == nullptr) {
+            continue;
+        }
+        for (const auto &spec : location->location_specs()) {
+            const DataStorageUri uri = DataStorageUri::FromUri(spec.uri());
+            if (!uri.Valid() || uri.GetHostName().empty()) {
+                continue;
+            }
+            std::uint64_t size = 0;
+            uri.GetParamAs<std::uint64_t>("size", size);
+            if (size == 0) {
+                continue; // URI 无 size 参数或解析失败时 GetParamAs 保持 0，跳过
+            }
+            bytes_by_storage[uri.GetHostName()] += size;
+        }
+    }
+    for (const auto &[unique_name, bytes] : bytes_by_storage) {
+        data_storage_manager->RecordWriteBytes(unique_name, bytes);
+    }
 }
 
 namespace {

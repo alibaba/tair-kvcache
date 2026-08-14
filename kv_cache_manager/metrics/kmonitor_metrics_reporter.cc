@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
@@ -116,6 +117,7 @@ struct KmonitorMetricsReporter::Context {
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
+    DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     DECLARE_METRICS(scheduler_plan_executor, waiting_task_count);
@@ -386,6 +388,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
+    REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     REGISTER_GAUGE_METRIC(scheduler_plan_executor, waiting_task_count);
@@ -635,6 +638,38 @@ void KmonitorMetricsReporter::ReportInterval() {
                 GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                 REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
             }
+        }
+    } while (false);
+
+    do {
+        // for per-storage accumulative dispatched write bytes
+        // the counter is updated in real-time on each backend's DataStorageMetricsCollector
+        // (via DataStorageManager::RecordWriteBytes, covering both normal writes and migration
+        // copies at their dispatch points), so read the current cumulative values and report
+        // them to kmonitor periodically
+        const auto registry_manager = cache_manager_->GetRegistryManager();
+        if (!registry_manager) {
+            break;
+        }
+        const auto data_storage_manager = registry_manager->data_storage_manager();
+        if (!data_storage_manager) {
+            break;
+        }
+
+        const auto storage_names = data_storage_manager->GetAllStorageNames();
+        for (const auto &unique_name : storage_names) {
+            const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
+            if (storage_backend == nullptr) {
+                continue;
+            }
+            const auto collector = storage_backend->GetMetricsCollector();
+            if (collector == nullptr) {
+                continue;
+            }
+            std::uint64_t write_bytes_v;
+            GET_METRICS_(collector, data_storage, write_bytes_dispatched_total, write_bytes_v);
+            const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(collector->GetMetricsTags());
+            REPORT_METRICS(data_storage, write_bytes_dispatched_total, static_cast<double>(write_bytes_v));
         }
     } while (false);
 
