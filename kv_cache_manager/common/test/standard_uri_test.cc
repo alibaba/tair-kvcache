@@ -370,7 +370,7 @@ TEST_F(StandardUriTest, TestFileUri) {
 }
 
 TEST_F(StandardUriTest, TestSerializeWithExtraParamMatchesCanonicalMutation) {
-    for (const std::string &raw_uri : {
+    for (const char *raw_uri : {
              "event_report://host:8080/mem",
              "event_report://host:8080/mem?block=7&phase=add",
              "event_report://user@host:8080/mem?z=last&a=first",
@@ -414,7 +414,7 @@ TEST_F(StandardUriTest, TestInvalidPort) {
         ASSERT_EQ("127.0.0.1", redis_uri.GetHostName());
         ASSERT_EQ(0, redis_uri.GetPort()); // default 0
     }
-    for (const std::string &invalid_uri : {
+    for (const char *invalid_uri : {
              "redis://user:pw@127.0.0.1:abcd/",
              "redis://user:pw@127.0.0.1:-1/",
              "redis://user:pw@127.0.0.1:-0/",
