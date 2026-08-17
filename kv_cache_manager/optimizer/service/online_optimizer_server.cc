@@ -9,9 +9,9 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
-#include "kv_cache_manager/optimizer/service/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
@@ -62,7 +62,8 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
 
     if (config_.kvcm_event_subscription().enable()) {
-        kvcm_event_subscriber_ = std::make_unique<KvcmEventSubscriber>(config_.kvcm_event_subscription(), manager_);
+        kvcm_event_subscriber_ =
+            std::make_unique<KvcmEventSubscriber>(config_.kvcm_event_subscription(), service_impl_);
         if (!kvcm_event_subscriber_->Init()) {
             KVCM_LOG_ERROR("Failed to init KVCM event subscriber");
             return false;

@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/optimizer/service/kvcm_event_subscriber.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/online_optimizer_server.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
