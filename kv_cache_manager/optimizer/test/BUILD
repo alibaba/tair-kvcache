@@ -298,6 +298,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/optimizer:kvcm_event_subscriber",
         "//kv_cache_manager/optimizer:online_optimizer_server_config",
+        "//kv_cache_manager/optimizer:optimizer_service_impl",
         "//kv_cache_manager/optimizer/config:online_optimizer_config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
