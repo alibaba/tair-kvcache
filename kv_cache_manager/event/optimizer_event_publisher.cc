@@ -102,6 +102,9 @@ bool OptimizerEventPublisher::Convert(const std::shared_ptr<BaseEvent> &event,
     for (const auto key : get_event->get_keys()) {
         out->add_block_keys(key);
     }
+    for (const auto &location_spec_name : get_event->location_spec_names()) {
+        out->add_location_spec_names(location_spec_name);
+    }
     // The event carries microseconds; the replay works in nanoseconds.
     out->set_timestamp_ns(get_event->event_trigger_time_us() * 1000);
 
