@@ -160,6 +160,7 @@ message TraceQueryRequest {
     // kvcm 主动推送事件时会填它：事件在推送队列里可能积压，用服务端收到的
     // 时间会让 TTL 判定偏晚（纯 LRU 只看顺序，不受影响）。
     int64 timestamp_ns = 6;
+    repeated string location_spec_names = 7; // 本次查询指定的 location spec；空表示未指定
 }
 
 message TraceQueryResponse {

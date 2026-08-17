@@ -44,7 +44,8 @@ std::shared_ptr<CacheGetEvent> MakeGetEvent() {
     auto event = std::make_shared<CacheGetEvent>("instance-a");
     event->SetEventTriggerTime();
     event->set_trace_id("trace-grpc-e2e");
-    event->SetAddtionalArgs("prefix_match", {11, 22, 33}, std::vector<std::int64_t>(700, 5), BlockMask(), 0, {});
+    event->SetAddtionalArgs(
+        "prefix_match", {11, 22, 33}, std::vector<std::int64_t>(700, 5), BlockMask(), 0, {"tp0", "tp1"});
     return event;
 }
 
@@ -191,6 +192,8 @@ TEST_F(OptimizerEventServiceGRpcTest, TestPublishesCacheReadOverServerStream) {
     EXPECT_EQ(700, received.input_token_len());
     EXPECT_EQ(event_time_us * 1000, received.timestamp_ns());
     EXPECT_EQ(0, received.token_ids_size());
+    EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}),
+              std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
 
     context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));
