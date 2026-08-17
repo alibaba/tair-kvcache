@@ -565,7 +565,7 @@ TEST_F(OptimizerServiceImplTest, RegisterWithLinearStep) {
     RequestContext ctx("trace1", nullptr);
     service_->RegisterInstance(&ctx, &req, &resp);
     EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
-    EXPECT_EQ(1024, resp.size_full_only());
+    EXPECT_EQ(1024, resp.size_full());
     EXPECT_EQ(1280, resp.size_full_linear());
 }
 

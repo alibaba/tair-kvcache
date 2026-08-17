@@ -18,10 +18,10 @@ TtlCacheIndexerWrapper::TtlCacheIndexerWrapper(std::unique_ptr<CacheIndexer> inn
     , hit_age_bucket_counts_(hit_age_thresholds_.size() + 1, 0) {}
 
 void TtlCacheIndexerWrapper::Init(const std::vector<double> &capacity_gb,
-                                  int64_t size_full_only,
+                                  int64_t size_full,
                                   int64_t size_full_linear,
                                   int32_t linear_step) {
-    inner_->Init(capacity_gb, size_full_only, size_full_linear, linear_step);
+    inner_->Init(capacity_gb, size_full, size_full_linear, linear_step);
 }
 
 void TtlCacheIndexerWrapper::ProcessKeys(const std::vector<int64_t> &keys,
