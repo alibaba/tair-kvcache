@@ -122,7 +122,7 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceBasic) {
 
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
-    EXPECT_EQ(16384, result.size_full_only);
+    EXPECT_EQ(16384, result.size_full);
     EXPECT_EQ(16384, result.size_full_linear);
     EXPECT_EQ(1, result.estimated_capacity_blocks.size());
 }
@@ -134,7 +134,7 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceHybrid) {
 
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
-    EXPECT_EQ(16384, result.size_full_only);
+    EXPECT_EQ(16384, result.size_full);
     EXPECT_EQ(20480, result.size_full_linear);
 }
 
@@ -152,8 +152,18 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceEmptySpecsFails) {
     EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
 }
 
-TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingOptimizerStateInfoFails) {
+TEST_F(OnlineOptimizerManagerTest, RegisterFullOnlyInstanceResolvesItsOnlySpecGroup) {
     OptimizerInstanceInfo info("g1", "i1", 16, MakeSpecs(), MakeGroups());
+    auto group = MakeGroup();
+    RegisterInstanceResult result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, result));
+    ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [](const InstanceState &state) {
+        EXPECT_EQ("full", state.instance_info->optimizer_state_info().full_location_spec_group_name());
+    }));
+}
+
+TEST_F(OnlineOptimizerManagerTest, RegisterFullOnlyInstanceWithoutExplicitStateRejectsMultipleSpecGroups) {
+    OptimizerInstanceInfo info("g1", "i1", 16, MakeHybridSpecs(), MakeHybridGroups());
     auto group = MakeGroup();
     RegisterInstanceResult result;
     EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));

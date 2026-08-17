@@ -117,7 +117,7 @@ message OptimizerRegisterInstanceRequest {
 message OptimizerRegisterInstanceResponse {
     CommonResponseHeader header = 1;
     repeated int64 estimated_capacity_blocks = 2; // 各档容量按 average block size 折算的 block 数
-    int64 size_full_only = 3;           // 仅 full spec 的单 block 字节数
+    int64 size_full = 3;           // 仅 full spec 的单 block 字节数
     int64 size_full_linear = 4;         // full+linear 混合的单 block 字节数
 }
 
