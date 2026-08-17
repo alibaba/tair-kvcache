@@ -141,16 +141,17 @@ class LocationQueryManager:
             else:
                 return QueryCacheStatus.RUNNING, []
 
-    def get_locations_for_query(self, request, computed_manager_block_size: int) -> Tuple[bool, list]:
+    def get_locations_for_query(self, request, computed_manager_block_size: int) -> list | None:
         """
         获取查询的位置信息
-        
+
         Args:
             request: 请求对象
             computed_manager_block_size: 本地已命中的block数量
-            
+
         Returns:
-            (查询是否完成, 位置列表)
+            位置列表；None 表示异步查询在途（调用方下一步重问），
+            空列表表示查询完成且无命中（含查询失败后跳过加载的兜底）。
         """
         # TODO: async get_kvcache_location
         query_key = QueryCacheKey(
@@ -161,9 +162,9 @@ class LocationQueryManager:
         try:
             status, locations = self._try_get_locations_from_local_cache(query_key)
             if status == QueryCacheStatus.RUNNING:
-                return False, []
+                return None
             elif status == QueryCacheStatus.FINISHED:
-                return True, locations
+                return locations
 
             # status == QueryCacheStatus.NOT_FOUND
             # insert new cache
@@ -171,23 +172,20 @@ class LocationQueryManager:
                 self._local_query_cache[query_key] = QueryCacheValue(
                     locations=[], query_time=time.time(), is_done=False)
             if self._async_get_cache_location:
-                future = self._http_executor.submit(self._get_cache_from_manager, request, computed_manager_block_size,
-                                                    query_key)
-                return False, []
+                self._http_executor.submit(self._get_cache_from_manager, request, computed_manager_block_size,
+                                           query_key)
+                return None
             else:
                 self._get_cache_from_manager(request, computed_manager_block_size, query_key)
                 # only sync call need check again
                 status, locations = self._try_get_locations_from_local_cache(query_key)
-                if status == QueryCacheStatus.NOT_FOUND:
-                    # do_get_cache_locations error, bypass load
-                    return True, []
-                elif status == QueryCacheStatus.RUNNING:
-                    return False, []
-                elif status == QueryCacheStatus.FINISHED:
-                    return True, locations
-                else:
-                    logger.warning("unknown local cache query status: %s", status)
-                    return True, []
+                if status == QueryCacheStatus.FINISHED:
+                    return locations
+                if status == QueryCacheStatus.RUNNING:
+                    return None
+                # NOT_FOUND: _get_cache_from_manager failed and dropped the
+                # cache entry -- skip loading this request.
+                return []
         except Exception as e:
             logger.warning("get_locations_for_query error, request_id: %s, error: %s", request.request_id, e)
-            return True, []
+            return []

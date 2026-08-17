@@ -216,6 +216,11 @@ class ReqState:
     sent_saving_count: int = 0
     need_report_after_saving_finished: bool = False
 
+    # True once vLLM allocated blocks for an external hit of this request (the
+    # load itself may have failed). Each request gets one external load; see
+    # get_num_new_matched_tokens for why re-queries fast-fail afterwards.
+    load_attempted: bool = False
+
     @staticmethod
     def create_from_delta(delta: "ReqStateToWorker") -> "ReqState":
         return ReqState(
@@ -966,40 +971,30 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                    for rank in range(self._tp_size)
                    for group_idx in self._state_group_idxs)
 
-    def _truncate_to_state_complete(self, req_id: str, locations: List[dict]) -> List[dict]:
-        """Cut an external match back to the last state-complete block.
-
-        Resuming a hybrid (mamba) model requires the recurrent state at the
-        *end* of the reused prefix; the attention KV of a longer prefix is
-        useless without it. Blocks published without a state must therefore not
-        terminate a match -- loading them would either fail (no URI) or, worse,
-        leave the request running on a state it never had.
-
-        Full-attention models have no state groups, so nothing is truncated.
-        """
-        if not self._state_group_idxs or not locations:
-            return locations
-        keep = 0
-        for i, location in enumerate(locations):
-            if self._location_covers_states(location):
-                keep = i + 1
-        if keep < len(locations):
-            logger.info("req:%s truncated external match from %d to %d blocks: "
-                        "later blocks carry no recurrent state",
-                        req_id, len(locations), keep)
-        return locations[:keep]
-
     def get_num_new_matched_tokens(self, request: "Request",
                                    num_computed_tokens: int) -> Tuple[Optional[int], bool]:
+        """Answer vLLM's per-request question: beyond the ``num_computed_tokens``
+        it already has, how many more tokens can the external KV supply?
+
+        Returns ``(external_tokens, load_kv_async)``:
+
+        * ``None`` -- the manager query is still in flight; vLLM will re-ask
+          next step (this connector never blocks the scheduler loop on IO).
+        * ``0``    -- no external hit (or the request already spent its one
+          external load, see ``load_attempted``).
+        * ``>0``   -- a block-aligned count clamped to a prefix vLLM can
+          safely resume from (``_safe_external_prefix``); the load itself runs
+          on the worker after vLLM allocates blocks for the hit.
+        """
         prev = self._alive_requests.get(request.request_id)
-        if (prev is not None and prev.remote_matched_token_num
-                and prev.block_ids_per_group):
-            # The request already went through an external load (blocks were
-            # allocated) and returned to WAITING -- a KV load failure or a
-            # preemption. The manager may still advertise blocks whose storage
-            # is gone, so re-matching risks an endless fail-reschedule loop;
-            # recompute locally instead. (A pending re-query after a failed
-            # allocation has empty block_ids_per_group and is not affected.)
+        if prev is not None and prev.load_attempted:
+            # vLLM re-asks whenever a request falls back to the waiting queue:
+            # preemption, or a failed load under kv_load_failure_policy=
+            # recompute. This request already spent its one external load, and
+            # the manager still advertises the very blocks whose bytes may be
+            # gone (load failures are not reported back to it) -- matching
+            # them again would loop load-fail-reschedule forever. Whatever is
+            # left, vLLM recomputes locally.
             logger.warning("req:%s re-queried after an external load attempt, "
                            "skip external match", request.request_id)
             prev.local_matched_token_num = num_computed_tokens
@@ -1008,35 +1003,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         computed_blocks = num_computed_tokens // self._manager_block_size
-
-        is_query_done, need_load_locations = (
-            self._location_query_manager.get_locations_for_query(request, computed_blocks))
-        if not is_query_done:
-            # async query in flight; vLLM will ask again
+        need_load_locations = self._location_query_manager.get_locations_for_query(
+            request, computed_blocks)
+        if need_load_locations is None:
             return None, False
 
-        # Hybrid models can only resume from a block that carries the recurrent
-        # state ending it; truncate to the last such block before anything else.
-        need_load_locations = self._truncate_to_state_complete(
-            request.request_id, need_load_locations)
-
-        new_matched_count = len(need_load_locations) * self._manager_block_size
-        # This connector loads synchronously (load_kv_async=False), so vLLM will
-        # schedule num_tokens - num_computed_tokens new tokens and asserts that
-        # count is > 0 (vllm/v1/core/sched/scheduler.py). If the whole prompt is
-        # externally cached, drop trailing blocks so at least one token is
-        # recomputed locally.
-        while new_matched_count and num_computed_tokens + new_matched_count >= request.num_tokens:
-            need_load_locations = need_load_locations[:-1]
-            new_matched_count -= self._manager_block_size
-        # The cap drops trailing blocks without looking at their coverage, so
-        # it can move the match end onto a state-less block -- the very
-        # situation _truncate_to_state_complete exists to prevent (a hybrid
-        # request would load an attention prefix whose ending state was never
-        # written, unreportably under report_failures=False). Re-truncate; it
-        # only ever shrinks the match, so the >= 1-token invariant above holds.
-        need_load_locations = self._truncate_to_state_complete(
-            request.request_id, need_load_locations)
+        need_load_locations = self._safe_external_prefix(
+            request.request_id, need_load_locations,
+            num_computed_tokens, request.num_tokens)
         new_matched_count = len(need_load_locations) * self._manager_block_size
         total_remote_blocks = computed_blocks + len(need_load_locations)
         logger.info("req:%s matched %d external tokens", request.request_id, new_matched_count)
@@ -1048,6 +1022,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 need_load_locations=need_load_locations,
             ))
 
+        # Every request is registered here -- this is the first hook a request
+        # passes through, hit or no hit: build_connector_meta and
+        # request_finished index _alive_requests unconditionally, and
+        # has_saved_block_num anchors the incremental saves that follow.
         self._alive_requests[request.request_id] = ReqState(
             req_id=request.request_id,
             token_ids=copy.copy(request.prompt_token_ids),
@@ -1059,12 +1037,50 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return new_matched_count, new_matched_count > 0
 
+    def _safe_external_prefix(self, req_id: str, locations: List[dict],
+                              num_computed_tokens: int, num_tokens: int) -> List[dict]:
+        """Clamp an external match to the longest prefix vLLM can resume from.
+
+        Two constraints, both only ever trimming the tail, so the answer is
+        the longest prefix satisfying both at once:
+
+        * the match must end on a state-complete block -- a hybrid request
+          resumes from the recurrent state ending the reused prefix, so an
+          ending block without one is unloadable however much attention KV
+          precedes it;
+        * at least one token must stay uncomputed -- logits are not part of
+          the KV cache, so the model still needs one token to sample from,
+          and vLLM's synchronous-load path asserts num_new_tokens > 0
+          (vLLM's own connectors apply the same cap).
+
+        Full-attention models have no state groups and only feel the cap.
+        """
+        # Cap: how many leading blocks may be matched at all.
+        limit = len(locations)
+        while limit and num_computed_tokens + limit * self._manager_block_size >= num_tokens:
+            limit -= 1
+        # Within that allowance the match may only end on a block carrying
+        # the recurrent state: scan for the last one.
+        keep = 0
+        for i, location in enumerate(locations[:limit]):
+            if self._location_covers_states(location):
+                keep = i + 1
+        if keep < len(locations):
+            logger.info("req:%s truncated external match from %d to %d blocks "
+                        "(full-hit cap / no recurrent state at the end)",
+                        req_id, len(locations), keep)
+        return locations[:keep]
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
         req_state = self._alive_requests.get(request.request_id)
         if req_state is None:
             return
         req_state.block_ids_per_group = [list(b) for b in blocks.get_block_ids()]
+        if num_external_tokens:
+            # Blocks were allocated for an external hit: the request is now
+            # spending its one external load.
+            req_state.load_attempted = True
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         meta = TairKvCacheConnectorMetadata(self._epoch)

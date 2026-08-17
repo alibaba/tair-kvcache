@@ -62,7 +62,7 @@ def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None,
     conn._http_executor = MagicMock()
     conn._location_query_manager = MagicMock()
     conn._location_query_manager.get_locations_for_query.return_value = (
-        True, locations if locations is not None else [])
+        locations if locations is not None else [])
     return conn
 
 
@@ -143,6 +143,19 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         self.assertEqual(matched, 0)
         self.assertFalse(async_load)
 
+    def test_query_in_flight_answers_none(self):
+        # The manager query runs async; until it lands the connector answers
+        # None, vLLM re-asks next step instead of blocking the scheduler loop.
+        conn = make_scheduler_connector(mbs=self.MBS)
+        conn._location_query_manager.get_locations_for_query.return_value = None
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, async_load = conn.get_num_new_matched_tokens(req, 0)
+        self.assertIsNone(matched)
+        self.assertFalse(async_load)
+        self.assertEqual(conn._waiting_to_load_requests, [])
+        # Registration happens when the query lands, not while it is pending.
+        self.assertNotIn("r0", conn._alive_requests)
+
     def test_requery_after_load_attempt_skips_external(self):
         # A request that already went through an external load (blocks were
         # allocated) and returned to WAITING -- KV load failure with
@@ -164,6 +177,23 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         state = conn._alive_requests["r0"]
         self.assertEqual(state.remote_matched_token_num, 0)
         self.assertEqual(state.has_saved_block_num, 0)
+
+    def test_load_attempted_flag_tracks_the_one_external_load(self):
+        # The one-shot semantics is explicit state, not inference from other
+        # fields: set exactly when vLLM allocates blocks for an external hit.
+        conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        conn.get_num_new_matched_tokens(req, 0)
+        # Query done, but no allocation yet (vLLM may still re-ask us).
+        self.assertFalse(conn._alive_requests["r0"].load_attempted)
+        # An allocation with no external hit is not a load attempt.
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[100]]), 0)
+        self.assertFalse(conn._alive_requests["r0"].load_attempted)
+        # Blocks allocated for an external hit: the load attempt begins.
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), 2 * self.MBS)
+        self.assertTrue(conn._alive_requests["r0"].load_attempted)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,8 +324,7 @@ class TestExternalHitTruncation(unittest.TestCase):
         locs = hybrid_locations([True, True], tp_size=2, num_state=1)
         locs[1]["location_specs"] = [
             s for s in locs[1]["location_specs"] if s["name"] != "tp1_g1"]
-        conn._location_query_manager.get_locations_for_query.return_value = (
-            True, locs)
+        conn._location_query_manager.get_locations_for_query.return_value = locs
         req = FakeRequest("r0", list(range(6 * self.MBS)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched, self.MBS)
@@ -604,7 +633,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
         """Simulate the scheduler flow for a fresh request: query, alloc, then
         one build_connector_meta step."""
         conn._location_query_manager.get_locations_for_query.return_value = (
-            True, make_locations(num_locations))
+            make_locations(num_locations))
         req = FakeRequest(req_id, list(range(num_tokens)))
         conn.get_num_new_matched_tokens(req, 0)
         block_ids = [list(range(100, 100 + num_blocks))]
