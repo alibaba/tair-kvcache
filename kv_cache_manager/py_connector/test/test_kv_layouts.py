@@ -160,7 +160,7 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def _build(self, kv_caches):
         import unittest.mock as mock
-        import kv_cache_manager.py_connector.vllm.v1_connector as v1c
+        import kv_cache_manager.py_connector.vllm.worker_core as wc
         conn = _make_group_conn()
         captured = []
 
@@ -170,7 +170,7 @@ class TestBuildTransferGroup(unittest.TestCase):
             t.to.return_value = t
             return t
 
-        with mock.patch.object(v1c.torch, "tensor", side_effect=fake_tensor):
+        with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
             g = conn._build_transfer_group(
                 _attn_meta(list(kv_caches.keys())), kv_caches)
         return g, captured

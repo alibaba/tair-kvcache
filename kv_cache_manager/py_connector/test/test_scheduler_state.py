@@ -20,7 +20,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (
-    make_connector, ReqState, GroupMeta)
+    make_connector, make_scheduler_core, ReqState, GroupMeta)
+from kv_cache_manager.py_connector.vllm.vllm_common import parse_groups
 from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
 from kv_cache_manager.py_connector.vllm.metadata import (
     SaveRequest, LoadRequest, TairKvCacheConnectorMetadata)
@@ -46,24 +47,11 @@ class FakeRequest:
 
 def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None,
                              num_groups=1, num_state_groups=0, tp_size=1):
-    """Connector with the scheduler-side state build_connector_meta needs."""
-    conn = make_connector(manager_block_size=mbs, vllm_block_size=vllm_bs,
-                          num_groups=num_groups,
-                          num_state_groups=num_state_groups, tp_size=tp_size)
-    conn._epoch = 0
-    conn._alive_requests = {}
-    conn._waiting_to_load_requests = []
-    import threading
-    conn._waiting_to_save_requests_lock = threading.Lock()
-    conn._waiting_to_save_requests = []
-    conn._waiting_to_finish_requests = []
-    conn._canceled_save_request_ids_lock = threading.Lock()
-    conn._canceled_save_request_ids = []
-    conn._http_executor = MagicMock()
-    conn._location_query_manager = MagicMock()
-    conn._location_query_manager.get_locations_for_query.return_value = (
-        locations if locations is not None else [])
-    return conn
+    """SchedulerCore with the scheduler-loop state and a mocked query manager."""
+    return make_scheduler_core(
+        manager_block_size=mbs, vllm_block_size=vllm_bs,
+        num_groups=num_groups, num_state_groups=num_state_groups,
+        tp_size=tp_size, locations=locations if locations is not None else [])
 
 
 def fake_scheduler_output(new_reqs=(), cached_req_ids=(), num_scheduled=None,
@@ -257,12 +245,12 @@ class TestSpecGroups(unittest.TestCase):
     have no sparsity (byte-identical requests, old-manager compatible)."""
 
     def test_full_attention_declares_no_groups(self):
-        conn = make_connector(num_groups=1, tp_size=2)
-        self.assertEqual(conn._spec_groups, [])
+        conn = make_scheduler_core(num_groups=1, tp_size=2)
+        self.assertEqual(conn._spec_groups(), [])
 
     def test_hybrid_declares_attn_and_full(self):
-        conn = make_connector(num_groups=1, num_state_groups=2, tp_size=2)
-        groups = {g["name"]: g["spec_names"] for g in conn._spec_groups}
+        conn = make_scheduler_core(num_groups=1, num_state_groups=2, tp_size=2)
+        groups = {g["name"]: g["spec_names"] for g in conn._spec_groups()}
         self.assertEqual(sorted(groups), ["attn", "full"])
         # attn: the attention spec of every rank; full: every group of every rank.
         self.assertEqual(groups["attn"], ["tp0_g0", "tp1_g0"])
@@ -282,22 +270,22 @@ class TestStateCompleteMask(unittest.TestCase):
                         remote_matched_token_num=0, vllm_request=None)
 
     def test_full_attention_is_always_complete(self):
-        conn = make_connector(mbs := 16, num_groups=1)
+        conn = make_scheduler_core(manager_block_size=16, num_groups=1)
         req = self._req([[7, 0, 9]])
         self.assertEqual(conn._state_complete_mask(req, range(3)),
                          [True, True, True])
 
     def test_null_state_blocks_are_incomplete(self):
-        conn = make_connector(manager_block_size=16, num_groups=1,
-                              num_state_groups=1)
+        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+                                   num_state_groups=1)
         # State table: blocks 0 and 2 are null (no state), block 1 is real.
         req = self._req([[100, 101, 102], [0, 55, 0]])
         self.assertEqual(conn._state_complete_mask(req, range(3)),
                          [False, True, False])
 
     def test_all_state_groups_must_have_state(self):
-        conn = make_connector(manager_block_size=16, num_groups=1,
-                              num_state_groups=2)
+        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+                                   num_state_groups=2)
         # Block 1 has a state in group 1 but not in group 2 -> incomplete.
         req = self._req([[100, 101], [7, 8], [7, 0]])
         self.assertEqual(conn._state_complete_mask(req, range(2)),
@@ -305,8 +293,8 @@ class TestStateCompleteMask(unittest.TestCase):
 
     def test_short_state_table_is_incomplete(self):
         # A state table that does not reach the block cannot prove a state.
-        conn = make_connector(manager_block_size=16, num_groups=1,
-                              num_state_groups=1)
+        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+                                   num_state_groups=1)
         req = self._req([[100, 101], [55]])
         self.assertEqual(conn._state_complete_mask(req, range(2)),
                          [True, False])
@@ -439,7 +427,7 @@ class TestStartWriteCacheSpecGroups(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestParseBlockMask(unittest.TestCase):
     def setUp(self):
-        self.conn = make_connector()
+        self.conn = make_scheduler_core(manager_block_size=16)
 
     def test_offset_branch(self):
         resp = {"block_mask": {"offset": 2}}
@@ -467,6 +455,9 @@ class TestParseGroups(unittest.TestCase):
     def _kv_cache_config(self, groups):
         return SimpleNamespace(kv_cache_groups=groups)
 
+    def _parse(self, groups, mbs):
+        return parse_groups(self._kv_cache_config(groups), mbs)
+
     def _attn_group(self, layers, block_size=16, page_size_bytes=32768,
                     page_size_padded=None):
         from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -482,9 +473,9 @@ class TestParseGroups(unittest.TestCase):
             kv_cache_spec=MambaSpec(block_size, page_size_bytes))
 
     def test_full_attention_single_group(self):
-        conn = make_connector(manager_block_size=32)
-        metas = conn._parse_groups(self._kv_cache_config(
-            [self._attn_group(["l0", "l1"], block_size=16, page_size_bytes=32768)]))
+        mbs = 32
+        metas = self._parse(
+            [self._attn_group(["l0", "l1"], block_size=16, page_size_bytes=32768)], mbs)
         self.assertEqual(len(metas), 1)
         m = metas[0]
         self.assertTrue(m.is_attention)
@@ -494,12 +485,12 @@ class TestParseGroups(unittest.TestCase):
         self.assertEqual(m.per_block_bytes, 2048 * 32 * 2)
 
     def test_hybrid_multi_group(self):
-        conn = make_connector(manager_block_size=528)
-        metas = conn._parse_groups(self._kv_cache_config([
+        mbs = 528
+        metas = self._parse([
             self._mamba_group(["m0", "m1"], page_size_bytes=1000),
             self._mamba_group(["m2"], page_size_bytes=2000),
             self._attn_group(["a0"], block_size=528, page_size_bytes=528 * 64),
-        ]))
+        ], mbs)
         self.assertEqual([m.group_idx for m in metas], [0, 1, 2])
         self.assertEqual([m.is_attention for m in metas], [False, False, True])
         self.assertEqual(metas[0].per_block_bytes, 1000 * 2)  # page * layers
@@ -507,11 +498,11 @@ class TestParseGroups(unittest.TestCase):
         self.assertEqual(metas[2].per_block_bytes, 64 * 528)  # per_token * mbs
 
     def test_eagle_group_skipped(self):
-        conn = make_connector()
+        mbs = 16
         eagle = self._attn_group(["drafter"])
         eagle.is_eagle_group = True
-        metas = conn._parse_groups(self._kv_cache_config(
-            [eagle, self._attn_group(["a0"])]))
+        metas = self._parse(
+            [eagle, self._attn_group(["a0"])], mbs)
         self.assertEqual(len(metas), 1)
         self.assertEqual(metas[0].layer_names, ["a0"])
         self.assertEqual(metas[0].group_idx, 1)  # group_idx keeps vLLM numbering
@@ -520,30 +511,30 @@ class TestParseGroups(unittest.TestCase):
         # page_size_padded inflates spec.page_size_bytes with an allocation
         # gap the gather kernel never copies; per_block_bytes must come from
         # the compact real_page_size_bytes.
-        conn = make_connector(manager_block_size=16)
-        metas = conn._parse_groups(self._kv_cache_config(
+        mbs = 16
+        metas = self._parse(
             [self._attn_group(["l0", "l1"], block_size=16,
-                              page_size_bytes=32768, page_size_padded=40960)]))
+                              page_size_bytes=32768, page_size_padded=40960)], mbs)
         # per_token = 32768 // 16 = 2048 (not 40960 // 16 = 2560).
         self.assertEqual(metas[0].per_block_bytes, 2048 * 16 * 2)
 
     def test_padded_attention_without_compact_size_raises(self):
         # A padded spec that exposes no real_page_size_bytes cannot be sized
         # correctly -- must refuse, not silently over-allocate.
-        conn = make_connector(manager_block_size=16)
+        mbs = 16
         group = self._attn_group(["l0"], block_size=16,
                                  page_size_bytes=32768, page_size_padded=40960)
         del group.kv_cache_spec.real_page_size_bytes
         with self.assertRaises(NotImplementedError):
-            conn._parse_groups(self._kv_cache_config([group]))
+            self._parse([group], mbs)
 
     def test_unpadded_attention_without_compact_size_falls_back(self):
         # No padding + no real_page_size_bytes: page_size_bytes is already
         # compact, use it.
-        conn = make_connector(manager_block_size=16)
+        mbs = 16
         group = self._attn_group(["l0"], block_size=16, page_size_bytes=32768)
         del group.kv_cache_spec.real_page_size_bytes
-        metas = conn._parse_groups(self._kv_cache_config([group]))
+        metas = self._parse([group], mbs)
         self.assertEqual(metas[0].per_block_bytes, 2048 * 16)
 
     def test_windowed_attention_spec_rejected(self):
@@ -552,40 +543,40 @@ class TestParseGroups(unittest.TestCase):
         # set; such blocks are not full-prefix KV and must be refused.
         for window_field in ("sliding_window", "attention_chunk_size"):
             with self.subTest(field=window_field):
-                conn = make_connector(manager_block_size=16)
+                mbs = 16
                 group = self._attn_group(["l0"])
                 setattr(group.kv_cache_spec, window_field, 1024)
                 with self.assertRaises(NotImplementedError) as cm:
-                    conn._parse_groups(self._kv_cache_config([group]))
+                    self._parse([group], mbs)
                 self.assertIn(window_field, str(cm.exception))
 
     def test_windowed_fields_none_accepted(self):
         # Real FullAttentionSpec objects carry the fields as None; that is the
         # ordinary full-attention case and must still parse.
-        conn = make_connector(manager_block_size=16)
+        mbs = 16
         group = self._attn_group(["l0"])
         group.kv_cache_spec.sliding_window = None
         group.kv_cache_spec.attention_chunk_size = None
-        metas = conn._parse_groups(self._kv_cache_config([group]))
+        metas = self._parse([group], mbs)
         self.assertEqual(len(metas), 1)
 
     def test_unsupported_spec_raises(self):
-        conn = make_connector()
+        mbs = 16
         bad = SimpleNamespace(layer_names=["x"], kv_cache_spec=object())
         with self.assertRaises(NotImplementedError):
-            conn._parse_groups(self._kv_cache_config([bad]))
+            self._parse([bad], mbs)
 
     def test_no_usable_groups_asserts(self):
-        conn = make_connector()
+        mbs = 16
         with self.assertRaises(AssertionError):
-            conn._parse_groups(self._kv_cache_config([]))
+            self._parse([], mbs)
 
 
 # --------------------------------------------------------------------------- #
 # Skipped (EAGLE/MTP drafter) groups: block tables indexed by vLLM group idx
 # --------------------------------------------------------------------------- #
 class TestSkippedGroupIndexing(unittest.TestCase):
-    """When _parse_groups skips a group (EAGLE/MTP drafter), its block table is
+    """When parse_groups skips a group (EAGLE/MTP drafter), its block table is
     still present in block_ids_per_group / all_block_ids at its vLLM group
     index. Consumers must index by GroupMeta.group_idx, never assume the
     transferred groups start at 0 or include every table."""
@@ -593,9 +584,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     MBS = 16
 
     def _skipped_group0_connector(self):
-        """Connector where vLLM group 0 is a skipped drafter and group 1 is the
-        transferred attention group."""
-        conn = make_connector(manager_block_size=self.MBS)
+        """SchedulerCore where vLLM group 0 is a skipped drafter and group 1
+        is the transferred attention group."""
+        conn = make_scheduler_core(manager_block_size=self.MBS)
         conn._group_metas = [GroupMeta(
             group_idx=1, is_attention=True, layer_names=["a0"],
             block_size=self.MBS, per_block_bytes=0)]
@@ -615,7 +606,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     def test_num_allocated_blocks_still_mins_transferred_groups(self):
         # Two transferred groups (1 and 2), one skipped drafter (0): min is
         # taken over the transferred ones only.
-        conn = make_connector(manager_block_size=self.MBS)
+        conn = make_scheduler_core(manager_block_size=self.MBS)
         conn._group_metas = [
             GroupMeta(group_idx=1, is_attention=True, layer_names=["a0"],
                       block_size=self.MBS, per_block_bytes=0),
@@ -638,10 +629,14 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         self.assertEqual(conn._num_allocated_blocks(req), 0)
 
     def test_load_failure_report_uses_transferred_group_table(self):
-        # start_load_kv reports failed loads against the block table of the
-        # single transferred group -- which is group 1 here, not group 0.
-        conn = self._skipped_group0_connector()
-        conn._tp_rank = 0
+        # start_load_kv (worker side) reports failed loads against the block
+        # table of the single transferred group -- which is group 1 here, not
+        # group 0.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [GroupMeta(
+            group_idx=1, is_attention=True, layer_names=["a0"],
+            block_size=self.MBS, per_block_bytes=0)]
+        conn._num_groups = 1
         conn._extra_config = SimpleNamespace(block_per_load_task=8)
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
@@ -652,8 +647,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             # Group 0 (drafter) has a lagging 1-entry table; indexing it would
             # IndexError / report the wrong block ids.
             all_block_ids=[[999], [10, 11]]))
-        conn._connector_metadata = meta
-        conn.start_load_kv(MagicMock())
+        conn.start_load_kv(MagicMock(), meta)
         args, kwargs = conn._data_transfer.create_load_done_callback.call_args
         self.assertEqual(args[3], [10, 11])  # report_ids from group 1's table
         self.assertTrue(kwargs["report_failures"])

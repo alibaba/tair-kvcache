@@ -66,6 +66,7 @@ from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.v1_connector import (
     TairKvCacheConnector, attn_kv_views)
+from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore
 
 CAPTURE_DIR_ENV = "KVCM_E2E_CAPTURE_DIR"
 
@@ -299,6 +300,14 @@ class VerifyingConnector(TairKvCacheConnector):
             kind, manager_block_idx, positions[0], positions[-1], self._tp_rank, path)
 
 
+class MutatedWorkerCore(WorkerCore):
+    """Off-by-one in the attention token translation (see MutatedConnector)."""
+
+    def _attn_token_indices(self, group, manager_block_idxes, block_table):
+        out = super()._attn_token_indices(group, manager_block_idxes, block_table)
+        return [[slot - 1 for slot in block] for block in out]
+
+
 class MutatedConnector(VerifyingConnector):
     """Meta-test connector: injects an off-by-one into the attention token
     translation (every gathered/scattered slot shifted by -1).
@@ -318,6 +327,10 @@ class MutatedConnector(VerifyingConnector):
     injection; never part of the production wheel.
     """
 
-    def _attn_token_indices(self, group, manager_block_idxes, block_table):
-        out = super()._attn_token_indices(group, manager_block_idxes, block_table)
-        return [[slot - 1 for slot in block] for block in out]
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The translation lives on the WorkerCore since the core split; swap
+        # the core instance (state included) for the mutated subclass.
+        mutated = MutatedWorkerCore.__new__(MutatedWorkerCore)
+        mutated.__dict__.update(self._core.__dict__)
+        self._core = mutated

@@ -154,37 +154,88 @@ def _install_stubs():
 _install_stubs()
 
 # Import after stubs are in place.
-from kv_cache_manager.py_connector.vllm.v1_connector import (  # noqa: E402
-    TairKvCacheConnector, GroupMeta, ReqState)
+from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
+    GroupMeta, ReqState)
+from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore  # noqa: E402
+from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore  # noqa: E402
+
+
+def _make_group_metas(num_groups: int, num_state_groups: int,
+                      block_size: int) -> list:
+    """Attention groups first, then mamba-style state groups; group_idx is the
+    vLLM group index (what block tables are indexed by)."""
+    return [
+        GroupMeta(group_idx=i, is_attention=True, layer_names=[f"l{i}"],
+                  block_size=block_size, per_block_bytes=0)
+        for i in range(num_groups)
+    ] + [
+        GroupMeta(group_idx=num_groups + i, is_attention=False,
+                  layer_names=[f"m{i}"], block_size=block_size,
+                  per_block_bytes=0)
+        for i in range(num_state_groups)
+    ]
 
 
 def make_connector(manager_block_size: int = 16,
                    vllm_block_size: Optional[int] = None,
                    num_groups: int = 1,
                    num_state_groups: int = 0,
-                   tp_size: int = 1) -> TairKvCacheConnector:
-    """Build a bare TairKvCacheConnector (no __init__) with the minimal state
-    used by the pure translation / scheduler-side logic under test.
+                   tp_size: int = 1) -> WorkerCore:
+    """Build a bare WorkerCore (no __init__) with the minimal state used by
+    the pure translation logic under test (block index translation, transfer
+    group building).
 
     ``num_state_groups`` appends that many mamba-style (non-attention) groups
     after the ``num_groups`` attention groups, which is what turns on the
     hybrid-only logic (spec groups, per-block state completeness, hit
     truncation)."""
-    conn = TairKvCacheConnector.__new__(TairKvCacheConnector)
+    conn = WorkerCore.__new__(WorkerCore)
     conn._manager_block_size = manager_block_size
     conn._vllm_block_size = vllm_block_size or manager_block_size
     conn._tp_size = tp_size
-    conn._group_metas = [
-        GroupMeta(group_idx=i, is_attention=True, layer_names=[f"l{i}"],
-                  block_size=conn._vllm_block_size, per_block_bytes=0)
-        for i in range(num_groups)
-    ] + [
-        GroupMeta(group_idx=num_groups + i, is_attention=False,
-                  layer_names=[f"m{i}"], block_size=conn._vllm_block_size,
-                  per_block_bytes=0)
-        for i in range(num_state_groups)
-    ]
+    conn._tp_rank = 0
+    conn._self_spec_names = {}
+    conn._device = "cpu"
+    conn._group_metas = _make_group_metas(
+        num_groups, num_state_groups, conn._vllm_block_size)
     conn._num_groups = len(conn._group_metas)
     conn._state_group_idxs = [m.group_idx for m in conn._group_metas
                               if not m.is_attention]
     return conn
+
+
+def make_scheduler_core(manager_block_size: int = 16,
+                        vllm_block_size: Optional[int] = None,
+                        num_groups: int = 1,
+                        num_state_groups: int = 0,
+                        tp_size: int = 1,
+                        locations=None) -> SchedulerCore:
+    """Build a bare SchedulerCore (no __init__) with the scheduler-loop state
+    build_connector_meta and friends need, plus a mocked LocationQueryManager
+    answering ``locations`` (None means "still in flight")."""
+    from unittest.mock import MagicMock
+    core = SchedulerCore.__new__(SchedulerCore)
+    core._manager_block_size = manager_block_size
+    core._vllm_block_size = vllm_block_size or manager_block_size
+    core._tp_size = tp_size
+    core._group_metas = _make_group_metas(
+        num_groups, num_state_groups, core._vllm_block_size)
+    core._num_groups = len(core._group_metas)
+    core._state_group_idxs = [m.group_idx for m in core._group_metas
+                              if not m.is_attention]
+    core._epoch = 0
+    core._alive_requests = {}
+    core._waiting_to_load_requests = []
+    import threading
+    core._waiting_to_save_requests_lock = threading.Lock()
+    core._waiting_to_save_requests = []
+    core._waiting_to_finish_requests = []
+    core._canceled_save_request_ids_lock = threading.Lock()
+    core._canceled_save_request_ids = []
+    core._http_executor = MagicMock()
+    core._manager_client = MagicMock()
+    core._coordinator_client = MagicMock()
+    core._location_query_manager = MagicMock()
+    core._location_query_manager.get_locations_for_query.return_value = (
+        locations if locations is not None else [])
+    return core
