@@ -26,6 +26,24 @@ std::shared_ptr<SdkInterface> SdkFactory::CreateSdk(const DataStorageType &type,
         KVCM_LOG_WARN("sdk_backend_config or storage_config is null");
         return nullptr;
     }
+    auto sdk = CreateSdkInstance(type);
+    if (!sdk) {
+        KVCM_LOG_WARN("unsupported sdk type: %s", ToString(type).c_str());
+        return nullptr;
+    }
+    auto ec = sdk->Init(sdk_backend_config, storage_config);
+    if (ec != ER_OK) {
+        KVCM_LOG_WARN("init sdk failed, type:%s, sdk backend config: %s, storage config: %s, errorcode: %d",
+                      ToString(type).c_str(),
+                      sdk_backend_config->ToJsonString().c_str(),
+                      storage_config->ToString().c_str(),
+                      ec);
+        return nullptr;
+    }
+    return sdk;
+}
+
+std::shared_ptr<SdkInterface> SdkFactory::CreateSdkInstance(const DataStorageType &type) {
     std::shared_ptr<SdkInterface> sdk;
     switch (type) {
 #ifdef ENABLE_HF3FS
@@ -43,6 +61,7 @@ std::shared_ptr<SdkInterface> SdkFactory::CreateSdk(const DataStorageType &type,
 #endif
 #ifdef ENABLE_TAIR_MEMPOOL
     case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
         sdk = std::make_shared<TairMempoolSdk>();
         break;
 #endif
@@ -50,20 +69,6 @@ std::shared_ptr<SdkInterface> SdkFactory::CreateSdk(const DataStorageType &type,
         sdk = std::make_shared<LocalFileSdk>();
         break;
     default:
-        KVCM_LOG_WARN("unsupported sdk type: %s", ToString(type).c_str());
-        return nullptr;
-    }
-    if (!sdk) {
-        KVCM_LOG_WARN("create sdk failed, sdk is null, type:%s", ToString(type).c_str());
-        return nullptr;
-    }
-    auto ec = sdk->Init(sdk_backend_config, storage_config);
-    if (ec != ER_OK) {
-        KVCM_LOG_WARN("init sdk failed, type:%s, sdk backend config: %s, storage config: %s, errorcode: %d",
-                      ToString(type).c_str(),
-                      sdk_backend_config->ToJsonString().c_str(),
-                      storage_config->ToString().c_str(),
-                      ec);
         return nullptr;
     }
     return sdk;

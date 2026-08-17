@@ -12,6 +12,7 @@ py_library(
         "config_server/**/*.py",
         "*.py",
     ]),
+    deps = ["@pip_cpu//requests"],
 )
 
 py_wheel(

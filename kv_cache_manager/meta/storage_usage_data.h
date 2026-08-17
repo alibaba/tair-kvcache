@@ -48,6 +48,7 @@ private:
     // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
     // slot 7: DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 usage data
     // slot 8: DATA_STORAGE_TYPE_EVENT_REPORT_L2 usage data
+    // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD usage data
     array_t_ storage_usage_by_type_;
 };
 

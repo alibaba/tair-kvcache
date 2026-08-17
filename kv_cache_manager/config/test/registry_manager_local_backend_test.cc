@@ -144,12 +144,60 @@ TEST_F(RegistryManagerLocalBackendTest, TestStorageManagement) {
         GetPrivateTestRuntimeDataPath() + "/new_nfs_root/",
         std::dynamic_pointer_cast<NfsStorageSpec>(updated_storage1->GetStorageConfig().storage_spec())->root_path());
 
+    // TairMempool type is persisted in CacheLocation and usage accounting; reject conversion in place.
+    StorageConfig changed_type_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "storage1", nullptr);
+    ASSERT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), changed_type_config, true));
+    updated_storage1 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(updated_storage1);
+    ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, updated_storage1->GetStorageConfig().type());
+
     // Test RemoveStorage
     auto ec_remove = registry_manager_->RemoveStorage(request_context_.get(), "storage2");
     ASSERT_EQ(EC_OK, ec_remove);
 
     storage2 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage2");
     ASSERT_FALSE(storage2);
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
+    const std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_tair_media_test";
+    ASSERT_TRUE(InitRegistryManager("local://" + local_path + "?cluster_name=test"));
+
+    auto verify_media_type_change_rejected = [this](const std::string &storage_name,
+                                                    uint16_t current_media_type,
+                                                    uint16_t requested_media_type) {
+        AddNfsStorage(storage_name, 1);
+        const auto backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
+        ASSERT_TRUE(backend);
+
+        auto current_spec = std::make_shared<TairMemPoolStorageSpec>();
+        current_spec->set_domain("pace.meta");
+        current_spec->set_timeout(5000);
+        current_spec->set_media_type(current_media_type);
+        // This open-source test uses an NFS backend as a configured-backend holder because the
+        // open-source TairMempool backend is intentionally non-functional.
+        backend->config_ =
+            StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
+
+        auto requested_spec = std::make_shared<TairMemPoolStorageSpec>(*current_spec);
+        requested_spec->set_media_type(requested_media_type);
+        StorageConfig requested_config(
+            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
+        ASSERT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), requested_config, true));
+
+        const auto unchanged_backend =
+            registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
+        ASSERT_EQ(backend, unchanged_backend);
+        const auto unchanged_spec =
+            std::dynamic_pointer_cast<TairMemPoolStorageSpec>(unchanged_backend->GetStorageConfig().storage_spec());
+        ASSERT_TRUE(unchanged_spec);
+        ASSERT_EQ(current_media_type, unchanged_spec->media_type());
+    };
+
+    verify_media_type_change_rejected(
+        "pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
+    verify_media_type_change_rejected(
+        "pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupManagement) {

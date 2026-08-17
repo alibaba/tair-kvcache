@@ -150,7 +150,7 @@ private:
 
 class TairMempoolSdkConfig : public SdkBackendConfig {
 public:
-    TairMempoolSdkConfig();
+    explicit TairMempoolSdkConfig(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
@@ -205,6 +205,8 @@ private:
         {DataStorageType::DATA_STORAGE_TYPE_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, std::make_shared<TairMempoolSdkConfig>()},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+         std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)},
         {DataStorageType::DATA_STORAGE_TYPE_NFS, std::make_shared<NfsSdkConfig>()}};
     SdkTimeoutConfig timeout_config_;
 };
