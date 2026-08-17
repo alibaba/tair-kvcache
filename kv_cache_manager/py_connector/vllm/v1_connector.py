@@ -217,9 +217,14 @@ class ReqState:
     need_report_after_saving_finished: bool = False
 
     # True once vLLM allocated blocks for an external hit of this request (the
-    # load itself may have failed). Each request gets one external load; see
-    # get_num_new_matched_tokens for why re-queries fast-fail afterwards.
+    # load itself may have failed). Guards the re-query of hybrid requests,
+    # whose load failures cannot be reported to vLLM -- see
+    # TairKvCacheConnector._external_match_burned.
     load_attempted: bool = False
+    # True once a load failure for this request came back through
+    # update_connector_output (vLLM reports invalid blocks, not requests);
+    # set only when the connector reports failures at all (single-group).
+    load_failed: bool = False
 
     @staticmethod
     def create_from_delta(delta: "ReqStateToWorker") -> "ReqState":
@@ -995,14 +1000,12 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
           on the worker after vLLM allocates blocks for the hit.
         """
         prev = self._alive_requests.get(request.request_id)
-        if prev is not None and prev.load_attempted:
+        if prev is not None and self._external_match_burned(prev):
             # vLLM re-asks whenever a request falls back to the waiting queue:
             # preemption, or a failed load under kv_load_failure_policy=
-            # recompute. This request already spent its one external load, and
-            # the manager still advertises the very blocks whose bytes may be
-            # gone (load failures are not reported back to it) -- matching
-            # them again would loop load-fail-reschedule forever. Whatever is
-            # left, vLLM recomputes locally.
+            # recompute. For this request the external match is burned --
+            # see _external_match_burned for which signal burned it. Whatever
+            # is left, vLLM recomputes locally.
             logger.warning("req:%s re-queried after an external load attempt, "
                            "skip external match", request.request_id)
             prev.local_matched_token_num = num_computed_tokens
@@ -1044,6 +1047,24 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_request=request,
         )
         return new_matched_count, new_matched_count > 0
+
+    def _external_match_burned(self, prev: ReqState) -> bool:
+        """Has this request lost its option of an external match?
+
+        * full-attention (single group): load failures are reported to vLLM
+          (report_failures=True in start_load_kv) and come back as invalid
+          block ids in update_connector_output -- the explicit signal.
+          A mere preemption re-query keeps its match: the loaded KV is
+          healthy, only the scheduling position was lost.
+        * hybrid (multi group): vLLM's invalid-block recovery is single-group
+          only (upstream TODO), so failures cannot be reported and no signal
+          ever comes back. The request instead gets one conservative shot:
+          any allocation for an external hit burns the match, because a
+          failed block cannot be told apart from a healthy one afterwards.
+        """
+        if prev.load_failed:
+            return True
+        return prev.load_attempted and self._num_groups > 1
 
     def _safe_external_prefix(self, req_id: str, locations: List[dict],
                               num_computed_tokens: int, num_tokens: int) -> List[dict]:
@@ -1270,7 +1291,24 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         return 1
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
-        return
+        """Consume the worker's step output: mark requests whose external
+        load failed, at request granularity.
+
+        vLLM reports invalid blocks, not requests; a block id is matched
+        against the block tables recorded in update_state_after_alloc. One
+        failed block is enough -- the request recomputes as a whole, which
+        blocks to recompute exactly is vLLM's decision. Only meaningful on
+        the scheduler instance (vLLM never calls this elsewhere).
+        """
+        invalid = getattr(connector_output, "invalid_block_ids", None)
+        if not invalid:
+            return
+        for req_id, req in self._alive_requests.items():
+            if any(b in invalid
+                   for group_ids in req.block_ids_per_group for b in group_ids):
+                req.load_failed = True
+                logger.warning("req:%s external load failed (invalid blocks "
+                               "reached its block table)", req_id)
 
     def parse_block_mask_to_save_indices(self, response: dict, target_save_num: int) -> List[int]:
         block_mask = response.get("block_mask", {})

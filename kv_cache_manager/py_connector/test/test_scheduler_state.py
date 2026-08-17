@@ -156,19 +156,21 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         # Registration happens when the query lands, not while it is pending.
         self.assertNotIn("r0", conn._alive_requests)
 
-    def test_requery_after_load_attempt_skips_external(self):
-        # A request that already went through an external load (blocks were
-        # allocated) and returned to WAITING -- KV load failure with
-        # policy=recompute, or preemption -- must not re-match: the manager may
-        # still advertise blocks whose storage is gone, and re-matching loops
+    def test_requery_after_load_failure_skips_external(self):
+        # A failed load comes back to the scheduler as invalid block ids
+        # (update_connector_output); the re-query under kv_load_failure_policy
+        # =recompute must not re-match: the manager still advertises the
+        # blocks whose bytes are gone, and re-matching loops
         # fail -> reschedule forever.
         conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched, 2 * self.MBS)
-        # vLLM allocates blocks for the load attempt.
+        # vLLM allocates blocks for the load attempt; the load then fails.
         conn.update_state_after_alloc(
             req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), matched)
+        conn.update_connector_output(SimpleNamespace(invalid_block_ids={101}))
+        self.assertTrue(conn._alive_requests["r0"].load_failed)
         # Retry: same request re-enters the waiting queue with 0 computed.
         matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched2, 0)
@@ -178,9 +180,44 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         self.assertEqual(state.remote_matched_token_num, 0)
         self.assertEqual(state.has_saved_block_num, 0)
 
+    def test_preempted_requery_keeps_external_match(self):
+        # Preemption alone is not a failure: the loaded KV is healthy, only
+        # the scheduling position was lost, so the re-query matches again
+        # (full-attention models only -- hybrid cannot tell failure from
+        # preemption, see test_hybrid_load_attempt_burns_the_match).
+        conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), matched)
+        conn.update_connector_output(SimpleNamespace(invalid_block_ids=set()))
+        matched2, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched2, matched)  # re-matched, not fast-failed
+        self.assertEqual(len(conn._waiting_to_load_requests), 2)
+
+    def test_hybrid_load_attempt_burns_the_match(self):
+        # Hybrid load failures cannot be reported to vLLM (single-group
+        # invalid-block recovery only), so no explicit signal exists: any
+        # allocation for an external hint burns the match conservatively.
+        conn = make_scheduler_connector(
+            mbs=self.MBS, num_groups=1, num_state_groups=1,
+            locations=hybrid_locations([True, True]))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, 2 * self.MBS)
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[100, 101], [50, 51]]),
+            matched)
+        # Even with no failure signal at all, the re-query fast-fails.
+        matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched2, 0)
+        self.assertFalse(async2)
+
     def test_load_attempted_flag_tracks_the_one_external_load(self):
-        # The one-shot semantics is explicit state, not inference from other
-        # fields: set exactly when vLLM allocates blocks for an external hit.
+        # load_attempted is explicit state, not inference from other fields:
+        # set exactly when vLLM allocates blocks for an external hit. It only
+        # burns the re-query for hybrid requests (which get no failure
+        # signal); full-attention requests burn theirs through load_failed.
         conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         conn.get_num_new_matched_tokens(req, 0)
