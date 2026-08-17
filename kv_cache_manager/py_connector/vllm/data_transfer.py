@@ -172,20 +172,32 @@ class DataTransferManager:
         rather than reported as a success.
         """
         n = len(remote_uris)
-        # Three dispositions per block: abstain (this group holds no data for
-        # it by design), transfer, or fail outright.
-        skipped, failed = self._save_dispositions(group, remote_uris, block_ids, n)
-        valid = [i for i in range(n) if i not in skipped and i not in failed]
-        ok_mask = [None if i in skipped else False for i in range(n)]
-        if valid:
-            stage_bytes = len(valid) * group.per_block_bytes
-            self._pinned_budget.acquire(stage_bytes)
-            try:
-                self._save_valid_blocks(group, remote_uris,
-                                        block_token_indices, block_ids,
-                                        ready_event, valid, ok_mask)
-            finally:
-                self._pinned_budget.release(stage_bytes)
+        # Single exit: whatever happens below, the task reports, otherwise the
+        # MultiResult callback never fires (submit_task drops the future, so an
+        # escaping exception is silently swallowed) and the save session hangs.
+        ok_mask = [False] * n
+        try:
+            # Three dispositions per block: abstain (this group holds no data
+            # for it by design), transfer, or fail outright.
+            skipped, failed = self._save_dispositions(group, remote_uris, block_ids, n)
+            valid = [i for i in range(n) if i not in skipped and i not in failed]
+            ok_mask = [None if i in skipped else False for i in range(n)]
+            if valid:
+                stage_bytes = len(valid) * group.per_block_bytes
+                self._pinned_budget.acquire(stage_bytes)
+                try:
+                    self._save_valid_blocks(group, remote_uris,
+                                            block_token_indices, block_ids,
+                                            ready_event, valid, ok_mask)
+                finally:
+                    self._pinned_budget.release(stage_bytes)
+        except Exception:
+            # Fail the whole task: partially transferred blocks are unknown, so
+            # report conservatively -- never publish a block we cannot vouch
+            # for (abstentions included; that only costs hit rate, not truth).
+            logger.exception("save task crashed group=%s blocks=%d, failing them all",
+                             group.spec_name, n)
+            ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
 
     def _save_dispositions(self, group: TransferGroup, remote_uris, block_ids, n):
@@ -339,26 +351,33 @@ class DataTransferManager:
         state is neither needed nor available. Everything else must transfer.
         """
         n = len(remote_uris)
-        skipped = self._load_skipped_blocks(group, remote_uris, block_ids, n)
-        # A block we must restore but nothing was published for cannot be
-        # loaded; fail it without letting it shift the staging batch.
-        failed = {i for i in range(n)
-                  if i not in skipped and remote_uris[i] is None}
-        valid = [i for i in range(n) if i not in skipped and i not in failed]
-        ok_mask = [None if i in skipped else False for i in range(n)]
-        if not valid:
-            multi_result.submit_result(task_idx, ok_mask)
-            return
-        stage_bytes = len(valid) * group.per_block_bytes
-        self._pinned_budget.acquire(stage_bytes)
+        # Single exit, as in save_task: an escaping exception would silently
+        # swallow the MultiResult callback, which under the connector's
+        # synchronous-load contract leaves vLLM believing KV it never received.
+        ok_mask = [False] * n
         try:
-            ok = self._load_valid_blocks(group, remote_uris,
-                                         block_token_indices, block_ids,
-                                         valid)
-        finally:
-            self._pinned_budget.release(stage_bytes)
-        for i in valid:
-            ok_mask[i] = ok
+            skipped = self._load_skipped_blocks(group, remote_uris, block_ids, n)
+            # A block we must restore but nothing was published for cannot be
+            # loaded; fail it without letting it shift the staging batch.
+            failed = {i for i in range(n)
+                      if i not in skipped and remote_uris[i] is None}
+            valid = [i for i in range(n) if i not in skipped and i not in failed]
+            ok_mask = [None if i in skipped else False for i in range(n)]
+            if valid:
+                stage_bytes = len(valid) * group.per_block_bytes
+                self._pinned_budget.acquire(stage_bytes)
+                try:
+                    ok = self._load_valid_blocks(group, remote_uris,
+                                                 block_token_indices, block_ids,
+                                                 valid)
+                finally:
+                    self._pinned_budget.release(stage_bytes)
+                for i in valid:
+                    ok_mask[i] = ok
+        except Exception:
+            logger.exception("load task crashed group=%s blocks=%d, failing them all",
+                             group.spec_name, n)
+            ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
 
     def _load_valid_blocks(self, group, remote_uris, block_token_indices,

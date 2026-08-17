@@ -238,6 +238,45 @@ class TestNullStateBlocks(unittest.TestCase):
         self.assertEqual(failed, {2, 3})
 
 
+class TestTaskCrashReporting(unittest.TestCase):
+    """A task that dies mid-transfer must still report, all-failed.
+
+    submit_task drops the future, so an escaping exception is silently
+    swallowed: the MultiResult callback never fires, the save session hangs
+    (SendBlockFinishedEvent never sent) and -- worse -- a load leaves vLLM
+    believing KV it never received under the connector's synchronous-load
+    contract. Both tasks wrap their body and report every block as failed."""
+
+    _state_group = staticmethod(TestNullStateBlocks._state_group)
+
+    def _run_crashing(self, method):
+        from unittest.mock import patch
+        dtm = _make_dtm()
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        group = self._state_group()
+        kwargs = dict(remote_uris=["u0", "u1"],
+                      block_token_indices=None,
+                      block_ids=[5, 6])
+        crash = "_%s_valid_blocks" % method.split("_")[0]
+        with patch.object(dtm, crash, side_effect=RuntimeError("boom")):
+            if method == "save_task":
+                kwargs["ready_event"] = None
+            getattr(dtm, method)(mr, 0, group, **kwargs)
+        return dtm, results["flat"]
+
+    def test_save_task_crash_reports_all_failed(self):
+        dtm, flat = self._run_crashing("save_task")
+        self.assertEqual(flat, [False, False])
+        # The staging budget must be released even on the crash path.
+        self.assertEqual(dtm._pinned_budget._used, 0)
+
+    def test_load_task_crash_reports_all_failed(self):
+        dtm, flat = self._run_crashing("load_task")
+        self.assertEqual(flat, [False, False])
+        self.assertEqual(dtm._pinned_budget._used, 0)
+
+
 class TestAbstainedVerdicts(unittest.TestCase):
     """A block's verdict is the AND over the groups that carried data for it.
     A group that abstained (None) must neither pass nor fail the block, and a
