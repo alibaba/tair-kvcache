@@ -72,11 +72,12 @@ std::shared_ptr<CacheGetEvent> MakeGetEvent(const std::string &instance_id,
                                             const std::vector<std::int64_t> &keys,
                                             const std::vector<std::int64_t> &tokens,
                                             const std::string &query_type = "prefix_match",
-                                            const std::string &trace_id = "trace-1") {
+                                            const std::string &trace_id = "trace-1",
+                                            const std::vector<std::string> &location_spec_names = {}) {
     auto event = std::make_shared<CacheGetEvent>(instance_id);
     event->SetEventTriggerTime();
     event->set_trace_id(trace_id);
-    event->SetAddtionalArgs(query_type, keys, tokens, BlockMask(), 0, {});
+    event->SetAddtionalArgs(query_type, keys, tokens, BlockMask(), 0, location_spec_names);
     return event;
 }
 
@@ -237,6 +238,17 @@ TEST_F(OptimizerEventPublisherTest, TestTraceIdIsCarriedThrough) {
 
     const auto request = sink_->Events()[0];
     EXPECT_EQ("trace-abc", request.trace_id());
+}
+
+TEST_F(OptimizerEventPublisherTest, TestLocationSpecNamesAreCarriedThrough) {
+    ASSERT_TRUE(publisher_->Init(""));
+    ASSERT_TRUE(publisher_->Publish(
+        MakeGetEvent("instance-a", {1, 2}, {1, 2, 3}, "prefix_match", "trace-abc", {"tp0", "tp1"})));
+    ASSERT_TRUE(WaitForEvents(*sink_, 1));
+
+    const auto request = sink_->Events()[0];
+    EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}),
+              std::vector<std::string>(request.location_spec_names().begin(), request.location_spec_names().end()));
 }
 
 TEST_F(OptimizerEventPublisherTest, TestDoesNotFilterQueryType) {
