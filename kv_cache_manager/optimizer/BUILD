@@ -177,18 +177,17 @@ cc_library(
 cc_library(
     name = "kvcm_event_subscriber",
     srcs = [
-        "service/kvcm_event_subscriber.cc",
+        "service/event_subscriber/kvcm_event_subscriber.cc",
     ],
     hdrs = [
-        "service/kvcm_event_subscriber.h",
+        "service/event_subscriber/kvcm_event_subscriber.h",
     ],
     deps = [
         ":online_optimizer_server_config",
+        ":optimizer_service_impl",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:service_discovery_factory",
-        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
-        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "@grpc//:grpc++",
     ],
