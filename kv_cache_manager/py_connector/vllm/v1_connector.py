@@ -809,16 +809,24 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             # truncates computed tokens at the first invalid block, so this is
             # sufficient for recovery.
             #
-            # UPSTREAM LIMITATION: vLLM's invalid-block recovery
-            # (Scheduler._update_requests_with_invalid_blocks, vllm/v1/core/
-            # sched/scheduler.py) unpacks a single-group block table --
-            # "(req_block_ids,) = ...get_block_ids(req_id)" under
-            # "TODO (davidb): add support for hybrid memory allocator" -- so
-            # for hybrid (multi-group) models a failed load CANNOT be reported
-            # and is only logged; vLLM then decodes from whatever bytes the
-            # partial load left in the paged cache, which can produce corrupt
-            # output. Remove report_failures gating once upstream supports
-            # multi-group invalid-block recovery.
+            # UPSTREAM LIMITATION (contained failure, not silence by choice):
+            # a failed hybrid load cannot be reported because the report path
+            # itself crashes vLLM. Its invalid-block recovery unpacks a
+            # single-group block table:
+            #   (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # https://github.com/vllm-project/vllm/blob/releases/v0.26.0/vllm/v1/core/sched/scheduler.py#L2693
+            # (TODO (davidb): add support for hybrid memory allocator). For a
+            # hybrid model get_block_ids returns one table per group, the
+            # unpack raises ValueError and takes down the scheduler -- every
+            # running request, not just the failed one. Until upstream grows
+            # multi-group recovery there is no "report and recompute": report
+            # = engine crash, silence = this request may decode from partially
+            # loaded KV. We pick the contained failure and log it loudly; the
+            # deterministic variant (a match ending on a never-written state)
+            # is already prevented at scheduling time, so only genuine storage
+            # failures reach here.
+            # TODO: drop report_failures once vLLM supports multi-group
+            # invalid-block recovery upstream.
             report_ids = []
             if self._num_groups == 1:
                 # Index by the transferred group's own vLLM group index: with

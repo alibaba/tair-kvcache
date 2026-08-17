@@ -430,9 +430,14 @@ class DataTransferManager:
         as in the save callback.
 
         block_ids is the block table used to report vLLM-visible invalid block
-        ids. vLLM's invalid-block recovery only understands single-group block
-        tables, so multi-group (hybrid) connectors pass report_failures=False
-        and rely on request rescheduling instead."""
+        ids. vLLM's invalid-block recovery unpacks a single-group block table
+        (https://github.com/vllm-project/vllm/blob/releases/v0.26.0/vllm/v1/core/sched/scheduler.py#L2693,
+        "TODO (davidb): add support for hybrid memory allocator"); for a
+        multi-group (hybrid) model the unpack raises ValueError and crashes
+        the scheduler, so hybrid connectors pass report_failures=False: the
+        failure is logged, vLLM keeps the partially loaded KV, and the request
+        may produce corrupt output -- the contained alternative to an
+        engine-wide crash. See start_load_kv for the full trade-off."""
         def cb(flat):
             merged = [None] * num_blocks
             for i, ok in enumerate(flat):
