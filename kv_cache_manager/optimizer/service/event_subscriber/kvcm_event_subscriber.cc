@@ -1,19 +1,17 @@
-#include "kv_cache_manager/optimizer/service/kvcm_event_subscriber.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 
 #include <algorithm>
 #include <chrono>
 #include <grpcpp/grpcpp.h>
-#include <unordered_set>
+#include <limits>
+#include <random>
 #include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/service_discovery.h"
 #include "kv_cache_manager/common/service_discovery_factory.h"
-#include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
-#include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
-#include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
 
@@ -21,19 +19,19 @@ namespace kv_cache_manager {
 
 namespace {
 
-constexpr std::chrono::milliseconds kReconnectDelay(500);
+constexpr std::chrono::milliseconds kReconnectBaseDelay(500);
+constexpr std::chrono::milliseconds kReconnectMaxDelay(30000);
+constexpr std::chrono::seconds kStableStreamDuration(30);
+constexpr int kReconnectJitterPercent = 20;
+constexpr std::chrono::minutes kKeepaliveTime(6);
+constexpr std::chrono::seconds kKeepaliveTimeout(20);
 constexpr std::chrono::milliseconds kUnaryRpcTimeout(1000);
-constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
-
-bool IsFullLocationSpecGroup(const std::string &name) {
-    return name.rfind("full", 0) == 0 || name.rfind("FULL", 0) == 0;
-}
 
 } // namespace
 
 KvcmEventSubscriber::KvcmEventSubscriber(const KvcmEventSubscriptionConfig &config,
-                                         std::shared_ptr<OnlineOptimizerManager> manager)
-    : config_(config), manager_(std::move(manager)) {}
+                                         std::shared_ptr<OptimizerServiceImpl> optimizer_service)
+    : config_(config), optimizer_service_(std::move(optimizer_service)) {}
 
 KvcmEventSubscriber::~KvcmEventSubscriber() { Stop(); }
 
@@ -41,8 +39,8 @@ bool KvcmEventSubscriber::Init() {
     if (!config_.enable()) {
         return true;
     }
-    if (!manager_) {
-        KVCM_LOG_ERROR("KvcmEventSubscriber: optimizer manager is null");
+    if (!optimizer_service_) {
+        KVCM_LOG_ERROR("KvcmEventSubscriber: optimizer service is null");
         return false;
     }
     service_discovery_ = ServiceDiscoveryFactory::CreateServiceDiscovery(config_.service_discovery_url());
@@ -58,7 +56,7 @@ bool KvcmEventSubscriber::Start() {
     if (!config_.enable()) {
         return true;
     }
-    if (!service_discovery_ || !manager_) {
+    if (!service_discovery_ || !optimizer_service_) {
         return false;
     }
     bool expected = false;
@@ -112,7 +110,9 @@ void KvcmEventSubscriber::RefreshLeader() {
         return;
     }
 
-    SyncConfiguration(leader_endpoint);
+    if (!SyncConfiguration(leader_endpoint)) {
+        return;
+    }
     UpdateWorker(leader_endpoint);
 }
 
@@ -171,98 +171,22 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
         return false;
     }
 
-    auto registry = manager_->registry_manager();
-    if (!registry) {
-        KVCM_LOG_ERROR("KvcmEventSubscriber: optimizer registry manager is null");
+    std::unordered_set<std::string> unsupported_instance_ids;
+    const ErrorCode ec = optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids);
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
+                      leader_endpoint.c_str(),
+                      static_cast<int>(ec));
         return false;
     }
-
-    std::unordered_set<std::string> available_groups;
-    std::size_t created_groups = 0;
-    std::size_t registered_instances = 0;
-    for (const auto &source : response.instance_groups()) {
-        if (source.name().empty() || source.capacity_bytes() <= 0) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: skip invalid KVCM instance group[%s], capacity_bytes=%ld",
-                          source.name().c_str(),
-                          source.capacity_bytes());
-            continue;
-        }
-        if (!registry->GetInstanceGroup(source.name())) {
-            OptimizerInstanceGroup group;
-            group.set_name(source.name());
-            group.set_capacity_gb(
-                {static_cast<double>(static_cast<long double>(source.capacity_bytes()) / kBytesPerGb)});
-            group.set_eviction_policy("lru");
-            group.set_enable_prefix_hash(true);
-            const ErrorCode ec = manager_->CreateInstanceGroup(group);
-            if (ec != EC_OK && ec != EC_DUPLICATE_ENTITY) {
-                KVCM_LOG_WARN("KvcmEventSubscriber: create instance group[%s] failed, ec=%d",
-                              source.name().c_str(),
-                              static_cast<int>(ec));
-                continue;
-            }
-            ++created_groups;
-        }
-        available_groups.insert(source.name());
+    {
+        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
+        unsupported_instance_ids_ = std::move(unsupported_instance_ids);
     }
-
-    for (const auto &source : response.instances()) {
-        if (available_groups.find(source.instance_group_name()) == available_groups.end()) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: skip instance[%s], group[%s] is unavailable",
-                          source.instance_id().c_str(),
-                          source.instance_group_name().c_str());
-            continue;
-        }
-        if (manager_->GetInstanceState(source.instance_id(), [](const InstanceState &) {}) == EC_OK) {
-            continue;
-        }
-
-        std::vector<LocationSpecInfo> spec_infos;
-        spec_infos.reserve(source.location_spec_infos_size());
-        for (const auto &spec : source.location_spec_infos()) {
-            spec_infos.emplace_back(spec.name(), spec.size());
-        }
-
-        std::unordered_set<std::string> full_spec_names;
-        for (const auto &group : source.location_spec_groups()) {
-            if (!IsFullLocationSpecGroup(group.name())) {
-                continue;
-            }
-            full_spec_names.insert(group.spec_names().begin(), group.spec_names().end());
-        }
-        if (full_spec_names.empty()) {
-            for (const auto &spec : spec_infos) {
-                full_spec_names.insert(spec.name());
-            }
-        }
-        std::vector<std::string> full_specs(full_spec_names.begin(), full_spec_names.end());
-        std::sort(full_specs.begin(), full_specs.end());
-
-        OptimizerInstanceInfo instance(source.instance_group_name(),
-                                       source.instance_id(),
-                                       source.block_size(),
-                                       spec_infos,
-                                       {LocationSpecGroup("full", full_specs)},
-                                       0,
-                                       OptimizerStateInfo("full", ""));
-        RegisterInstanceResult result;
-        const ErrorCode ec = manager_->RegisterInstance(instance, result);
-        if (ec != EC_OK) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: register instance[%s] failed, ec=%d",
-                          source.instance_id().c_str(),
-                          static_cast<int>(ec));
-            continue;
-        }
-        ++registered_instances;
-    }
-
-    KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d "
-                  "created_groups=%zu registered_instances=%zu",
+    KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d",
                   leader_endpoint.c_str(),
                   response.instance_groups_size(),
-                  response.instances_size(),
-                  created_groups,
-                  registered_instances);
+                  response.instances_size());
     return true;
 }
 
@@ -294,8 +218,16 @@ void KvcmEventSubscriber::UpdateWorker(const std::string &leader_endpoint) {
 }
 
 void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
+    uint32_t failed_attempts = 0;
     while (running_ && worker->running) {
-        auto channel = grpc::CreateChannel(worker->endpoint, grpc::InsecureChannelCredentials());
+        grpc::ChannelArguments channel_args;
+        channel_args.SetInt(
+            GRPC_ARG_KEEPALIVE_TIME_MS,
+            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(kKeepaliveTime).count()));
+        channel_args.SetInt(
+            GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
+            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(kKeepaliveTimeout).count()));
+        auto channel = grpc::CreateCustomChannel(worker->endpoint, grpc::InsecureChannelCredentials(), channel_args);
         auto stub = proto::optimizer::OptimizerEventStreamService::NewStub(channel);
         grpc::ClientContext context;
         {
@@ -308,9 +240,12 @@ void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
 
         proto::optimizer::OptimizerEventSubscriptionRequest request;
         request.set_consumer_id(config_.consumer_id());
+        const auto stream_started_at = std::chrono::steady_clock::now();
+        bool received_event = false;
         auto reader = stub->SubscribeEvents(&context, request);
         proto::optimizer::TraceQueryRequest event;
         while (running_ && worker->running && reader->Read(&event)) {
+            received_event = true;
             ProcessEvent(event);
         }
         const grpc::Status status = reader->Finish();
@@ -320,11 +255,19 @@ void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
         }
 
         if (running_ && worker->running) {
-            KVCM_LOG_WARN("KvcmEventSubscriber: stream[%s] closed, code=%d message=%s",
+            if (received_event || std::chrono::steady_clock::now() - stream_started_at >= kStableStreamDuration) {
+                failed_attempts = 0;
+            }
+            const auto reconnect_delay = ComputeReconnectDelay(failed_attempts);
+            if (failed_attempts < std::numeric_limits<uint32_t>::max()) {
+                ++failed_attempts;
+            }
+            KVCM_LOG_WARN("KvcmEventSubscriber: stream[%s] closed, code=%d message=%s retry_in_ms=%lld",
                           worker->endpoint.c_str(),
                           static_cast<int>(status.error_code()),
-                          status.error_message().c_str());
-            if (!WaitForStop(kReconnectDelay)) {
+                          status.error_message().c_str(),
+                          static_cast<long long>(reconnect_delay.count()));
+            if (!WaitForReconnect(worker, reconnect_delay)) {
                 break;
             }
         }
@@ -333,6 +276,7 @@ void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
 
 void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
     worker->running = false;
+    wait_cv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(worker->context_mutex);
         if (worker->context) {
@@ -345,15 +289,17 @@ void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
 }
 
 void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event) {
-    std::vector<int64_t> block_keys(event.block_keys().begin(), event.block_keys().end());
-    int64_t input_token_len = event.input_token_len();
-    if (input_token_len == 0 && event.token_ids_size() > 0) {
-        input_token_len = event.token_ids_size();
+    proto::optimizer::TraceQueryResponse response;
+    const ErrorCode ec = optimizer_service_->ExecuteTraceQuery(event, &response);
+    if (ec == EC_INSTANCE_NOT_EXIST) {
+        std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
+        if (unsupported_instance_ids_.find(event.instance_id()) != unsupported_instance_ids_.end()) {
+            KVCM_LOG_DEBUG("KvcmEventSubscriber: ignore unsupported instance event, trace_id=%s instance_id=%s",
+                           event.trace_id().c_str(),
+                           event.instance_id().c_str());
+            return;
+        }
     }
-
-    TraceQueryResult result;
-    const ErrorCode ec =
-        manager_->TraceQuery(event.instance_id(), block_keys, input_token_len, event.timestamp_ns(), result);
     if (ec != EC_OK) {
         KVCM_LOG_WARN("KvcmEventSubscriber: drop event, trace_id=%s instance_id=%s ec=%d",
                       event.trace_id().c_str(),
@@ -380,9 +326,19 @@ bool KvcmEventSubscriber::WaitForSupervisor(std::chrono::milliseconds duration) 
     return running_;
 }
 
-bool KvcmEventSubscriber::WaitForStop(std::chrono::milliseconds duration) {
+bool KvcmEventSubscriber::WaitForReconnect(EndpointWorker *worker, std::chrono::milliseconds duration) {
     std::unique_lock<std::mutex> lock(wait_mutex_);
-    return !wait_cv_.wait_for(lock, duration, [this] { return !running_; });
+    return !wait_cv_.wait_for(lock, duration, [this, worker] { return !running_ || !worker->running; });
+}
+
+std::chrono::milliseconds KvcmEventSubscriber::ComputeReconnectDelay(uint32_t failed_attempts) {
+    constexpr uint32_t kMaxShift = 16;
+    const int64_t multiplier = int64_t{1} << std::min(failed_attempts, kMaxShift);
+    const int64_t nominal_ms = std::min(kReconnectBaseDelay.count() * multiplier, kReconnectMaxDelay.count());
+    const int64_t lower_ms = nominal_ms * (100 - kReconnectJitterPercent) / 100;
+    const int64_t upper_ms = std::min(nominal_ms * (100 + kReconnectJitterPercent) / 100, kReconnectMaxDelay.count());
+    thread_local std::mt19937 generator(std::random_device{}());
+    return std::chrono::milliseconds(std::uniform_int_distribution<int64_t>(lower_ms, upper_ms)(generator));
 }
 
 } // namespace kv_cache_manager

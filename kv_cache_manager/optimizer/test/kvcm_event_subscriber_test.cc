@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -13,8 +14,9 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
-#include "kv_cache_manager/optimizer/service/kvcm_event_subscriber.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
+#include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
 
@@ -102,6 +104,8 @@ public:
         configuration_.CopyFrom(configuration);
     }
 
+    void SetConfigurationAvailable(bool available) { configuration_available_.store(available); }
+
     void Publish(const proto::optimizer::TraceQueryRequest &event) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -116,7 +120,8 @@ public:
         configuration_count_.fetch_add(1);
         std::lock_guard<std::mutex> lock(mutex_);
         response->CopyFrom(configuration_);
-        response->mutable_header()->mutable_status()->set_code(proto::optimizer::OK);
+        response->mutable_header()->mutable_status()->set_code(
+            configuration_available_.load() ? proto::optimizer::OK : proto::optimizer::SERVICE_NOT_READY);
         return grpc::Status::OK;
     }
 
@@ -144,6 +149,7 @@ public:
             if (!writer->Write(event)) {
                 break;
             }
+            delivered_count_.fetch_add(1);
         }
         active_subscribers_.fetch_sub(1);
         return grpc::Status::OK;
@@ -152,7 +158,9 @@ public:
     std::atomic<int> configuration_count_{0};
     std::atomic<int> subscribe_count_{0};
     std::atomic<int> active_subscribers_{0};
+    std::atomic<int> delivered_count_{0};
     std::atomic<bool> received_expected_consumer_id_{false};
+    std::atomic<bool> configuration_available_{true};
 
 private:
     const bool keep_open_;
@@ -207,6 +215,7 @@ protected:
         registry_ = std::make_shared<OptimizerRegistryManager>("");
         ASSERT_TRUE(registry_->Init());
         manager_ = std::make_shared<OnlineOptimizerManager>(registry_);
+        optimizer_service_ = std::make_shared<OptimizerServiceImpl>(manager_, nullptr);
     }
 
     bool IsRegistered(const std::string &instance_id) const {
@@ -226,6 +235,7 @@ protected:
 
     std::shared_ptr<OptimizerRegistryManager> registry_;
     std::shared_ptr<OnlineOptimizerManager> manager_;
+    std::shared_ptr<OptimizerServiceImpl> optimizer_service_;
 };
 
 TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeConsuming) {
@@ -234,7 +244,7 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     seed.meta_service_.SetLeader("127.0.0.1", leader.port());
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
 
-    KvcmEventSubscriber subscriber(MakeConfig(seed.endpoint()), manager_);
+    KvcmEventSubscriber subscriber(MakeConfig(seed.endpoint()), optimizer_service_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
 
@@ -248,6 +258,7 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     ASSERT_EQ(1u, group->capacity_gb().size());
     EXPECT_DOUBLE_EQ(2.0, group->capacity_gb()[0]);
     EXPECT_TRUE(group->enable_prefix_hash());
+    EXPECT_TRUE(group->enable_theoretical_max_cache());
 
     leader.event_service_.Publish(MakeEvent("known", "normal", 1));
     auto short_prompt = MakeEvent("known", "short", 2);
@@ -264,7 +275,7 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
 TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRefresh) {
     TestKvcmServer leader;
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
-    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint(), 5000), manager_);
+    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint(), 5000), optimizer_service_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([this] { return IsRegistered("known"); }));
@@ -289,7 +300,7 @@ TEST_F(KvcmEventSubscriberTest, MovesTheOnlyStreamWhenLeaderChanges) {
     first.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     second.event_service_.SetConfiguration(MakeConfiguration({"known"}));
 
-    KvcmEventSubscriber subscriber(MakeConfig(first.endpoint()), manager_);
+    KvcmEventSubscriber subscriber(MakeConfig(first.endpoint()), optimizer_service_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([&first] { return first.event_service_.active_subscribers_.load() == 1; }));
@@ -307,15 +318,85 @@ TEST_F(KvcmEventSubscriberTest, MovesTheOnlyStreamWhenLeaderChanges) {
     subscriber.Stop();
 }
 
+TEST_F(KvcmEventSubscriberTest, KeepsOldStreamUntilNewLeaderConfigurationSucceeds) {
+    TestKvcmServer first;
+    TestKvcmServer second;
+    first.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+    second.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+    second.event_service_.SetConfigurationAvailable(false);
+
+    KvcmEventSubscriber subscriber(MakeConfig(first.endpoint()), optimizer_service_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.Start());
+    ASSERT_TRUE(WaitUntil([&first] { return first.event_service_.active_subscribers_.load() == 1; }));
+
+    first.meta_service_.SetLeader("127.0.0.1", second.port());
+    ASSERT_TRUE(WaitUntil([&second] { return second.event_service_.configuration_count_.load() > 0; }));
+    EXPECT_EQ(1, first.event_service_.active_subscribers_.load());
+    EXPECT_EQ(0, second.event_service_.subscribe_count_.load());
+
+    first.event_service_.Publish(MakeEvent("known", "old-leader-still-active", 1));
+    ASSERT_TRUE(WaitUntil([this] { return TotalQueries("known") == 1; }));
+
+    second.event_service_.SetConfigurationAvailable(true);
+    ASSERT_TRUE(WaitUntil([&first, &second] {
+        return first.event_service_.active_subscribers_.load() == 0 &&
+               second.event_service_.active_subscribers_.load() == 1;
+    }));
+    subscriber.Stop();
+}
+
+TEST_F(KvcmEventSubscriberTest, SubscribesAndDoesNotRefreshForUnsupportedInstance) {
+    TestKvcmServer leader;
+    auto configuration = MakeConfiguration({});
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("g1");
+    instance->set_instance_id("ambiguous");
+    instance->set_block_size(4);
+    for (const auto *name : {"state-a", "state-b"}) {
+        auto *spec = instance->add_location_spec_infos();
+        spec->set_name(name);
+        spec->set_size(16);
+        auto *spec_group = instance->add_location_spec_groups();
+        spec_group->set_name(std::string("group-") + name);
+        spec_group->add_spec_names(name);
+    }
+    leader.event_service_.SetConfiguration(configuration);
+
+    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint(), 5000), optimizer_service_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.Start());
+    ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
+    EXPECT_FALSE(IsRegistered("ambiguous"));
+    const int configuration_count = leader.event_service_.configuration_count_.load();
+
+    leader.event_service_.Publish(MakeEvent("ambiguous", "unsupported", 1));
+    ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.delivered_count_.load() == 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(configuration_count, leader.event_service_.configuration_count_.load());
+    subscriber.Stop();
+}
+
 TEST_F(KvcmEventSubscriberTest, ReconnectsClosedLeaderStream) {
     TestKvcmServer leader(false);
     leader.event_service_.SetConfiguration(MakeConfiguration({}));
-    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint()), manager_);
+    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint()), optimizer_service_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
 
     ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.subscribe_count_.load() >= 2; }));
     subscriber.Stop();
+}
+
+TEST_F(KvcmEventSubscriberTest, ReconnectDelayUsesCappedExponentialBackoffWithJitter) {
+    constexpr int64_t kMaxDelayMs = 30000;
+    const std::vector<int64_t> nominal_delays_ms = {500, 1000, 2000, 4000, 8000, 16000, 30000, 30000};
+    for (uint32_t attempt = 0; attempt < nominal_delays_ms.size(); ++attempt) {
+        const int64_t nominal_ms = nominal_delays_ms[attempt];
+        const auto delay = KvcmEventSubscriber::ComputeReconnectDelay(attempt);
+        EXPECT_GE(delay.count(), nominal_ms * 80 / 100);
+        EXPECT_LE(delay.count(), std::min(nominal_ms * 120 / 100, kMaxDelayMs));
+    }
 }
 
 } // namespace kv_cache_manager
