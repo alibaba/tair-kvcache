@@ -31,7 +31,7 @@ struct InstanceState {
     // the existing response contract and used as projection slots.
     std::vector<int64_t> lite_hit_capacity_blocks;
 
-    int64_t size_full_only = 0;
+    int64_t size_full = 0;
     int64_t size_full_linear = 0;
     int32_t linear_step = 0;
     std::mutex mutex;
@@ -66,7 +66,7 @@ struct TraceQueryResult {
 
 struct RegisterInstanceResult {
     std::vector<int64_t> estimated_capacity_blocks;
-    int64_t size_full_only = 0;
+    int64_t size_full = 0;
     int64_t size_full_linear = 0;
 };
 

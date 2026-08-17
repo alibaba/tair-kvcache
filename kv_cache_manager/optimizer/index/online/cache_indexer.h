@@ -25,11 +25,11 @@ public:
 
     // Initialize the indexer with capacity and size parameters.
     // capacity_gb: capacity tiers in GB.
-    // size_full_only: byte size of a full-only block.
+    // size_full: byte size of a full-only block.
     // size_full_linear: byte size of a full+linear block.
     // linear_step: linear step factor (>=0).
     virtual void Init(const std::vector<double> &capacity_gb,
-                      int64_t size_full_only,
+                      int64_t size_full,
                       int64_t size_full_linear,
                       int32_t linear_step) = 0;
 
