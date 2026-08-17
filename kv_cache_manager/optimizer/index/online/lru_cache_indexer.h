@@ -14,7 +14,7 @@ public:
     explicit LruCacheIndexer(bool enable_theoretical_max_cache = false);
 
     void Init(const std::vector<double> &capacity_gb,
-              int64_t size_full_only,
+              int64_t size_full,
               int64_t size_full_linear,
               int32_t linear_step) override;
 
@@ -58,7 +58,7 @@ private:
     int64_t unique_count_ = 0;
     int64_t eviction_count_ = 0;
 
-    int64_t size_full_only_ = 0;
+    int64_t size_full_ = 0;
     int64_t size_full_linear_ = 0;
     int32_t linear_step_ = 1;
 

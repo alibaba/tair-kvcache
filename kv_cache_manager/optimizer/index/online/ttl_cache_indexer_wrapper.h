@@ -21,7 +21,7 @@ public:
     TtlCacheIndexerWrapper(std::unique_ptr<CacheIndexer> inner, int64_t ttl_seconds, ClockFunc clock);
 
     void Init(const std::vector<double> &capacity_gb,
-              int64_t size_full_only,
+              int64_t size_full,
               int64_t size_full_linear,
               int32_t linear_step) override;
 
