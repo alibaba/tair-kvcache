@@ -1029,6 +1029,15 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         while new_matched_count and num_computed_tokens + new_matched_count >= request.num_tokens:
             need_load_locations = need_load_locations[:-1]
             new_matched_count -= self._manager_block_size
+        # The cap drops trailing blocks without looking at their coverage, so
+        # it can move the match end onto a state-less block -- the very
+        # situation _truncate_to_state_complete exists to prevent (a hybrid
+        # request would load an attention prefix whose ending state was never
+        # written, unreportably under report_failures=False). Re-truncate; it
+        # only ever shrinks the match, so the >= 1-token invariant above holds.
+        need_load_locations = self._truncate_to_state_complete(
+            request.request_id, need_load_locations)
+        new_matched_count = len(need_load_locations) * self._manager_block_size
         total_remote_blocks = computed_blocks + len(need_load_locations)
         logger.info("req:%s matched %d external tokens", request.request_id, new_matched_count)
 

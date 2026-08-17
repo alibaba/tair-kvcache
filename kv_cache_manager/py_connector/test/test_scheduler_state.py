@@ -315,6 +315,22 @@ class TestExternalHitTruncation(unittest.TestCase):
                                       prompt_len=3 * self.MBS)
         self.assertEqual(matched, 2 * self.MBS)
 
+    def test_full_hit_cap_retruncates_to_state_complete(self):
+        # The cap drops trailing blocks without looking at their coverage, so
+        # it can move the match end onto a state-less block: coverage
+        # [True, False, True] truncates to all 3, the cap (prompt == 3 blocks)
+        # drops block 2, and the new match end (block 1) has no state. The
+        # match must be re-truncated -- loading it would end a hybrid request
+        # on a state nobody wrote, unreportably (report_failures=False).
+        conn, matched = self._matched([True, False, True],
+                                      prompt_len=3 * self.MBS)
+        self.assertEqual(matched, self.MBS)
+        self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes,
+                         [0])
+        end = max(conn._waiting_to_load_requests[0].manager_block_idxes)
+        self.assertTrue(conn._location_covers_states(
+            conn._waiting_to_load_requests[0].need_load_locations[end]))
+
 
 class TestStartWriteCacheSpecGroups(unittest.TestCase):
     """start_write_cache must tell the manager, per key, which specs the block
