@@ -72,8 +72,21 @@ from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 CAPTURE_DIR_ENV = "KVCM_E2E_CAPTURE_DIR"
 
 
+def _worker_attr(name):
+    """Property forwarding to the ConnectorWorker's attributes: the role
+    split moved them off the shell, and the capture hooks run on the
+    worker-role instance."""
+    return property(lambda self: getattr(self.connector_worker, name))
+
+
 class VerifyingConnector(TairKvCacheConnector):
     """Production connector + independent per-group KV capture for e2e."""
+
+    _tp_rank = _worker_attr("_tp_rank")
+    _device_mod = _worker_attr("_device_mod")
+    _device = _worker_attr("_device")
+    _kv_caches = _worker_attr("_kv_caches")
+    _data_transfer = _worker_attr("_data_transfer")
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -182,7 +195,7 @@ class VerifyingConnector(TairKvCacheConnector):
         if getattr(self, "_capture_dir", "") and getattr(self, "_kv_caches", None):
             try:
                 self._capture_refs(meta)
-                self._capture_pending_loaded()
+                self._capture_pending_loaded(meta)
             except Exception as e:  # never break inference for a capture error
                 logger.warning("VerifyingConnector capture failed: %s", e, exc_info=True)
 
@@ -205,7 +218,7 @@ class VerifyingConnector(TairKvCacheConnector):
                 manager_block_idxes=save_req.manager_block_idxes,
             )
 
-    def _capture_pending_loaded(self):
+    def _capture_pending_loaded(self, meta):
         if not self._pending_loaded:
             return
         done = []

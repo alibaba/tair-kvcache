@@ -238,7 +238,7 @@ class DataTransferManager:
                     [block_token_indices[i] for i in valid],
                     list(range(len(valid))), self._manager_block_size,
                     group.per_token_dim,
-                    kv_stride=group.kv_stride, block_stride=group.block_stride,
+                    block_stride=group.block_stride,
                     local_block_size=group.kernel_block_size)
             else:
                 for out_i, i in enumerate(valid):
@@ -348,7 +348,7 @@ class DataTransferManager:
                         [block_token_indices[i] for i in valid],
                         list(range(len(valid))), self._manager_block_size,
                         group.per_token_dim,
-                        kv_stride=group.kv_stride, block_stride=group.block_stride,
+                        block_stride=group.block_stride,
                         local_block_size=group.kernel_block_size)
                 else:
                     for out_i, i in enumerate(valid):

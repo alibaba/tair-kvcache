@@ -44,7 +44,13 @@ from vllm.v1.outputs import KVConnectorOutput
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import TpCoordinatorClient
 from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
-from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
+
+try:
+    # Stamped into the wheel at build time; absent in a source checkout.
+    from kv_cache_manager.py_connector.common._version_info import (
+        FULL_VERSION, GIT_COMMIT, BUILD_TIME)
+except ImportError:
+    FULL_VERSION, GIT_COMMIT, BUILD_TIME = "dev", "source", "source"
 
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler
