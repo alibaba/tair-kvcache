@@ -1,9 +1,11 @@
 """Worker side of the connector: translation and data-plane transfer.
 
-Owns the transfer client, the paged-cache views (TransferGroups) and the
-mirrored ``_alive_requests`` (block tables replayed from the scheduler's
-deltas). Per-step metadata is passed in explicitly by the shell -- the core
-keeps no metadata state of its own.
+Owns the transfer client and the paged-cache views (TransferGroups). Every
+instruction arriving through the metadata is self-contained (LoadRequest /
+SaveRequest carry their own block tables), so the worker keeps no mirrored
+request state -- tp0's per-request save-session ledger is the only
+request-level bookkeeping. Per-step metadata is passed in explicitly by the
+shell.
 """
 
 import copy
@@ -27,7 +29,7 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup,
     TransferPlan)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta, attn_kv_views, spec_name)
+    AttentionGroupMeta, GroupMeta, StateGroupMeta, attn_kv_views, spec_name)
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -48,7 +50,12 @@ class WorkerCore:
         self._tp_size = tp_size
         self._manager_client = manager_client
         self._coordinator_client = coordinator_client
-        self._alive_requests = {}  # mirrored ReqState, replayed from deltas
+
+        # Per-request in-flight save sessions (write_session granularity).
+        # tp0 only; this is the worker's whole request-level state -- there is
+        # no mirrored request table (every instruction is self-contained).
+        self._pending_saves: dict = {}
+        self._finish_pending: set = set()
 
         self._tp_rank = get_tensor_model_parallel_rank()
         self._device_mod = None
@@ -441,14 +448,13 @@ class WorkerCore:
         ready_event.record(self._device_mod.current_stream())
 
         for save_req in meta.to_save_requests:
-            req = self._alive_requests[save_req.req_id]
             num_blocks = len(save_req.manager_block_idxes)
             plans = self._plan_group_transfers(
                 save_req.target_locations, save_req.manager_block_idxes,
-                req.block_ids_per_group)
+                save_req.all_block_ids)
 
             done_cb = self._data_transfer.create_save_done_callback(
-                req.req_id, self._tp_rank, save_req.write_session_id, num_blocks)
+                save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks)
 
             if plans is None:
                 mr = MultiResult(1, done_cb)
@@ -463,7 +469,10 @@ class WorkerCore:
                     self._data_transfer.save_task, multi_result, task_idx,
                     *chunk, ready_event)
             if self._tp_rank == 0:
-                req.scheduled_saving_count += 1
+                # One session in flight; the coordinator's completion event
+                # for this req decrements it (see get_finished).
+                self._pending_saves[save_req.req_id] = \
+                    self._pending_saves.get(save_req.req_id, 0) + 1
 
     def on_save_finished(self, write_session_id: str, save_context: SaveContext):
         for block_idx in range(len(save_context.locations)):
@@ -485,31 +494,36 @@ class WorkerCore:
 
     def get_finished(self, finished_req_ids: set,
                      meta: TairKvCacheConnectorMetadata) -> Tuple[Optional[set], Optional[set]]:
+        """Report request completion to vLLM.
+
+        A request is reported once its last save session has settled on the
+        coordinator (tp0 aggregates the per-rank verdicts into
+        finish_write_cache). The scheduler's FinishRequest -- sent when its
+        own ledger says the request is settled -- either reports immediately
+        or defers until the last session lands."""
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
-                self._alive_requests.pop(finish_req.req_id, None)
+                self._pending_saves.pop(finish_req.req_id, None)
+                self._finish_pending.discard(finish_req.req_id)
             return None, None
 
         finished_saving = []
         finished_saving_tasks, finished_loading_tasks = self._coordinator_server.get_finished_tasks()
         for req_id in finished_saving_tasks:
-            req = self._alive_requests[req_id]
-            req.sent_saving_count += 1
-            assert req.sent_saving_count <= req.scheduled_saving_count
-            if (req.need_report_after_saving_finished and
-                    req.sent_saving_count == req.scheduled_saving_count):
+            remaining = self._pending_saves.get(req_id, 0) - 1
+            if remaining > 0:
+                self._pending_saves[req_id] = remaining
+                continue
+            self._pending_saves.pop(req_id, None)
+            if req_id in self._finish_pending:
+                self._finish_pending.discard(req_id)
                 finished_saving.append(req_id)
-                self._alive_requests.pop(req_id)
 
         for finish_req in meta.to_finish_requests:
-            req = self._alive_requests.get(finish_req.req_id)
-            if req is None:
-                continue
-            if req.sent_saving_count == req.scheduled_saving_count:
-                finished_saving.append(req.req_id)
-                self._alive_requests.pop(req.req_id)
+            if finish_req.req_id not in self._pending_saves:
+                finished_saving.append(finish_req.req_id)
             else:
-                req.need_report_after_saving_finished = True
+                self._finish_pending.add(finish_req.req_id)
         return set(finished_saving), set(finished_loading_tasks)
 
     def get_block_ids_with_load_errors(self) -> set:
@@ -519,18 +533,3 @@ class WorkerCore:
         if failed:
             logger.warning("block_ids_with_load_errors: %s", failed)
         return failed
-
-    def bind_connector_metadata(self, connector_metadata: TairKvCacheConnectorMetadata) -> None:
-        """Replay the scheduler's per-request deltas onto the mirrored state.
-
-        Storage of the metadata itself stays with the vLLM base class on the
-        shell; this core only keeps the request mirror it needs for
-        translation (wait_for_save reads block tables from it).
-        """
-        meta = typing.cast(TairKvCacheConnectorMetadata, connector_metadata)
-        for delta in meta.requests:
-            if not delta.is_delta:
-                self._alive_requests[delta.req_id] = ReqState.create_from_delta(delta)
-            else:
-                assert delta.req_id in self._alive_requests
-                self._alive_requests[delta.req_id].update_from_delta(delta)

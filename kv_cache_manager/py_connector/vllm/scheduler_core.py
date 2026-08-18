@@ -17,7 +17,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMsgSerializer, CoordinateMessage, SendBlockStartEvent, TpCoordinatorClient)
 from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQueryManager
 from kv_cache_manager.py_connector.vllm.metadata import (
-    FinishRequest, LoadRequest, ReqStateToWorker, SaveRequest, TairKvCacheConnectorMetadata)
+    FinishRequest, LoadRequest, SaveRequest, TairKvCacheConnectorMetadata)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, ReqState, StateGroupMeta,
     build_spec_groups, spec_name)
@@ -299,26 +299,18 @@ class SchedulerCore:
 
     def _ingest_scheduled_reqs(self, scheduler_output: "SchedulerOutput",
                                meta: TairKvCacheConnectorMetadata) -> None:
-        """Absorb vLLM's scheduling list into the authoritative request table
-        and emit mirror deltas for the worker.
+        """Absorb vLLM's scheduling list into the authoritative request table.
 
-        The worker owns a mirrored copy of every request's token stream and
-        per-group block tables -- it needs them to translate manager blocks
-        into physical slots when it gathers (save) or scatters (load). New
-        requests get a full snapshot; continuing ones get increments; a
-        preemption resume replaces the whole table (re-allocation maps the
-        same logical blocks to fresh physical slots).
-        """
+        The block tables are the scheduler's ledger: vLLM hands them over
+        once per first allocation (update_state_after_alloc /
+        scheduled_new_reqs), then only as increments (cached_reqs.
+        new_block_ids). Accumulating them here is what lets later stages
+        translate manager blocks into physical slots for the worker's
+        instructions. A preemption resume replaces the whole table
+        (re-allocation maps the same logical blocks to fresh slots)."""
         for vllm_req in scheduler_output.scheduled_new_reqs:
             request = self._alive_requests[vllm_req.req_id]
             request.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
-            meta.add_req_state_to_worker(ReqStateToWorker(
-                req_id=request.req_id,
-                has_saved_block_num=request.has_saved_block_num,
-                new_tokens_ids=request.token_ids,
-                new_block_ids_per_group=request.block_ids_per_group,
-                is_delta=False,
-            ))
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
@@ -329,12 +321,6 @@ class SchedulerCore:
                 num_current_tokens:num_current_tokens + num_new_tokens]
             request.token_ids.extend(new_token_ids)
 
-            delta = ReqStateToWorker(
-                req_id=request.req_id,
-                has_saved_block_num=request.has_saved_block_num,
-                new_tokens_ids=new_token_ids,
-            )
-
             if hasattr(cached_reqs, "resumed_req_ids"):
                 resumed = req_id in cached_reqs.resumed_req_ids
             else:
@@ -343,15 +329,11 @@ class SchedulerCore:
             new_block_ids = cached_reqs.new_block_ids[idx]
             if resumed:
                 request.block_ids_per_group = [list(b) for b in new_block_ids]
-                delta.resumed_from_preemption = True
-                delta.new_block_ids_per_group = request.block_ids_per_group
             elif new_block_ids is not None:
                 # https://github.com/vllm-project/vllm/pull/23262: may be None
-                delta.new_block_ids_per_group = [list(b) for b in new_block_ids]
                 for group_ids, new_ids in zip(request.block_ids_per_group,
-                                              delta.new_block_ids_per_group):
+                                              new_block_ids):
                     group_ids.extend(new_ids)
-            meta.add_req_state_to_worker(delta)
 
     def _dispatch_incremental_saves(self) -> None:
         """Start async StartWriteCache calls for requests whose computed
@@ -410,6 +392,10 @@ class SchedulerCore:
             if req is None:
                 logger.warning("request %s is not alive, skip saving", save_req.req_id)
                 continue
+            # Snapshot the ledger for the worker: the gather translates
+            # manager blocks into physical slots through these tables, and
+            # the worker keeps no mirror of its own.
+            save_req.all_block_ids = [list(b) for b in req.block_ids_per_group]
             meta.add_save_request(save_req)
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and

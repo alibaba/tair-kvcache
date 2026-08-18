@@ -680,11 +680,10 @@ class TestBuildConnectorMeta(unittest.TestCase):
     def test_new_request_full_state(self):
         conn = make_scheduler_connector(mbs=self.MBS)
         req, meta = self._new_request(conn, "r0", 40, 3)
-        self.assertEqual(len(meta.requests), 1)
-        delta = meta.requests[0]
-        self.assertFalse(delta.is_delta)
-        self.assertEqual(delta.new_tokens_ids, list(range(40)))
-        self.assertEqual(delta.new_block_ids_per_group, [[100, 101, 102]])
+        # The ledger absorbed the first allocation's block table.
+        self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
+                         [[100, 101, 102]])
+        self.assertEqual(conn._alive_requests["r0"].token_ids, list(range(40)))
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
@@ -711,18 +710,17 @@ class TestBuildConnectorMeta(unittest.TestCase):
         req.output_token_ids = list(range(1000, 1008))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[None])
-        meta = conn.build_connector_meta(out)
-        delta = meta.requests[0]
-        self.assertTrue(delta.is_delta)
-        self.assertEqual(delta.new_tokens_ids, list(range(1000, 1008)))
-        self.assertEqual(delta.new_block_ids_per_group, [])
+        conn.build_connector_meta(out)
+        self.assertEqual(conn._alive_requests["r0"].token_ids,
+                         list(range(40)) + list(range(1000, 1008)))
         # Step 3: 2 more tokens with a new block -> table grows.
         req.output_token_ids = list(range(1000, 1010))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 2},
             new_block_ids=[[[103]]])
-        meta = conn.build_connector_meta(out)
-        self.assertEqual(meta.requests[0].new_block_ids_per_group, [[103]])
+        conn.build_connector_meta(out)
+        self.assertEqual(conn._alive_requests["r0"].token_ids,
+                         list(range(40)) + list(range(1000, 1010)))
         self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
                          [[100, 101, 102, 103]])
 
@@ -740,9 +738,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             with self.subTest(legacy=use_legacy):
                 conn = make_scheduler_connector(mbs=self.MBS)
                 req, _ = self._new_request(conn, "r0", 40, 3)
-                meta = self._preempted_step(conn, req, use_legacy)
-                delta = meta.requests[0]
-                self.assertTrue(delta.resumed_from_preemption)
+                self._preempted_step(conn, req, use_legacy)
                 # Resume replaces (not extends) the block table.
                 self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
                                  [[200, 201]])

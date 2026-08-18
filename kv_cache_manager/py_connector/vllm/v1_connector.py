@@ -211,8 +211,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._core.register_kv_caches(kv_caches)
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        # The worker consumes each instruction directly from the metadata
+        # (start_load_kv / wait_for_save receive it explicitly); no mirror
+        # to replay here.
         super().bind_connector_metadata(connector_metadata)
-        self._core.bind_connector_metadata(connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self._core.start_load_kv(forward_context, self._get_connector_metadata(), **kwargs)
