@@ -12,11 +12,21 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+// Value 8 is intentionally left unused so the compatibility branch can keep
+// the historical ST_VINEYARD=7 assignment while matching the upstream
+// ST_TAIRMEMPOOL_SSD=9 wire value.
+constexpr std::size_t kReservedStorageTypeIndex = 8;
+
+} // namespace
+
 std::uint64_t StorageUsageData::GetStorageUsage() const noexcept {
     std::uint64_t storage_usage = 0;
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
         if (i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) ||
-            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) ||
+            i == kReservedStorageTypeIndex) {
             continue;
         }
         storage_usage += storage_usage_by_type_.at(i).load();
@@ -98,9 +108,18 @@ std::uint64_t StorageUsageData::SubStorageUsageByType(const DataStorageType &typ
 
 void StorageUsageData::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        if (i == kReservedStorageTypeIndex) {
+            continue;
+        }
         const auto type = static_cast<DataStorageType>(i);
+        const auto usage = storage_usage_by_type_.at(i).load();
+        // Preserve rollback compatibility until the new storage type is
+        // actually used. Older binaries reject unknown persisted JSON keys.
+        if (type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD && usage == 0) {
+            continue;
+        }
         const std::string key = ToString(type);
-        Put(writer, key, storage_usage_by_type_.at(i).load());
+        Put(writer, key, usage);
     }
 }
 

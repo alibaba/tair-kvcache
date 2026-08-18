@@ -168,6 +168,7 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
     case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
         return std::make_shared<MooncakeBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
         return std::make_shared<TairMempoolBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
         return std::make_shared<NfsBackend>(metrics_registry_);

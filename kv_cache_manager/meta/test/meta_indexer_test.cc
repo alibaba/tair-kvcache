@@ -262,7 +262,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
 
     // persist
     meta_indexer_->key_count_.store(3);
-    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700};
+    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 0, 900};
     ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
@@ -298,7 +298,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -310,6 +310,9 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
@@ -328,6 +331,10 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
 
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        ASSERT_EQ(300, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+
         std::uint64_t expect_usage = 0;
         for (const auto &v : expected_usage_vec) {
             expect_usage += v;
@@ -339,7 +346,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
     {
         meta_indexer_->storage_usage_data_.Reset();
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -380,12 +387,20 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
         meta_indexer_->SubStorageUsageByType(type, 1024);         // would underflow
         ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
+
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
     }
 
     // test special case: DATA_STORAGE_TYPE_VCNS_HF3FS behavior as DATA_STORAGE_TYPE_HF3FS
     {
         meta_indexer_->storage_usage_data_.Reset();
-        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0, 0, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0, 0, 0, 0, 0};
 
         meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 128);
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
@@ -420,7 +435,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Successful round-trip: serialize then deserialize
     {
-        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700};
+        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 0, 900};
 
         storage_usage_data.Reset();
         for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
@@ -429,7 +444,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
         std::string serialized = storage_usage_data.Serialize();
         ASSERT_EQ(
-            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"vineyard":700})",
+            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"vineyard":700,"pace_ssd":900})",
             serialized);
 
         storage_usage_data.Reset();
@@ -441,12 +456,12 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Legal input: keys in different order
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 0, 10};
         storage_usage_data.Reset();
         ASSERT_EQ(
             EC_OK,
             storage_usage_data.Deserialize(
-                R"({"vineyard":8,"dummy":7,"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
+                R"({"pace_ssd":10,"vineyard":8,"dummy":7,"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }
@@ -460,18 +475,30 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         ASSERT_EQ(100, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_EQ(200, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
     }
 
+    // Keep persisted metadata readable by older binaries until SSD accounting
+    // is actually used; a zero-valued new field is intentionally omitted.
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 10);
+        EXPECT_EQ(
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"vineyard":0})",
+            storage_usage_data.Serialize());
+    }
+
     // Legal input: whitespace-padded JSON
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 0, 10};
         storage_usage_data.Reset();
         ASSERT_EQ(EC_OK,
                   storage_usage_data.Deserialize("  "
                                                  "{\"unknown\":1,\"hf3fs\":2,\"mooncake\":3,\"pace\":4,\"file\":5,"
-                                                 "\"vcns_hf3fs\":6,\"dummy\":7,\"vineyard\":8}  "));
+                                                 "\"vcns_hf3fs\":6,\"dummy\":7,\"vineyard\":8,"
+                                                 "\"pace_ssd\":10}  "));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }

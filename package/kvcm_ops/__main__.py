@@ -76,6 +76,8 @@ def main():
     disable_storage
     update_storage
     remove_storage
+  storage types (for add_storage/update_storage):
+    nfs / pace / pace_ssd / 3fs / vineyard
   trace:
     trace_key
     trace_uri

@@ -1699,6 +1699,32 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     }
 }
 
+TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevels) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 90);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, 10);
+
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(1000);
+    instance_group->quota_.set_quota_config({
+        QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL),
+        QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD),
+    });
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    key_count = 0;
+    max_key_count = 100;
+
+    cache_reclaimer_->job_state_flag_ = true;
+    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                   instance_group->name(),
+                                                                   instance_group->quota(),
+                                                                   instance_group->cache_config()->reclaim_strategy(),
+                                                                   instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_FALSE(water_level->GetGeneralWaterLevelExceed());
+    EXPECT_TRUE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+}
+
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {

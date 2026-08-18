@@ -286,6 +286,10 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_TAIRMEMPOOL;
         break;
     }
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
+        *proto_data_storage_type = T::ST_TAIRMEMPOOL_SSD;
+        break;
+    }
     case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN: {
         *proto_data_storage_type = T::ST_UNSPECIFIED;
         break;
@@ -332,6 +336,10 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_TAIRMEMPOOL: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+        break;
+    }
+    case T::ST_TAIRMEMPOOL_SSD: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         break;
     }
     case T::ST_NFS: {

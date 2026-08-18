@@ -164,6 +164,8 @@ std::string ToString(const DataStorageType &type) {
         return "mooncake";
     case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
         return "pace";
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+        return "pace_ssd";
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
         return "file";
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
@@ -184,6 +186,8 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
     } else if (type == "pace") {
         return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    } else if (type == "pace_ssd") {
+        return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
     } else if (type == "file") {
         return DataStorageType::DATA_STORAGE_TYPE_NFS;
     } else if (type == "dummy") {
@@ -359,7 +363,7 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         auto tmp = std::make_shared<MooncakeStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
-    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {
+    } else if (IsTairMempoolStorageType(type_)) {
         auto tmp = std::make_shared<TairMemPoolStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
@@ -395,6 +399,13 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     }
     if (storage_spec_ && !storage_spec_->ValidateRequiredFields(local_invalid_fields)) {
         valid = false;
+    }
+    if (type_ == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD) {
+        const auto tair_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(storage_spec_);
+        if (tair_spec == nullptr || tair_spec->media_type() != kTairMemPoolMediaTypeSsd) {
+            valid = false;
+            local_invalid_fields += "{tair_mempool_ssd_requires_media_type_5}";
+        }
     }
     if (!valid) {
         invalid_fields += "{StorageConfig: " + local_invalid_fields + "}";

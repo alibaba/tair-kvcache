@@ -16,9 +16,18 @@ def gen_pace_config_data(args):
     storage_spec = {
         "domain": args.domain,
         "timeout": args.timeout,
-        "service_discovery_url": args.service_discovery_url
+        "service_discovery_url": args.service_discovery_url,
+        "media_type": args.media_type,
     }
     return storage_spec
+
+
+def get_pace_storage_type(media_type):
+    if media_type == 5:
+        return "ST_TAIRMEMPOOL_SSD"
+    if media_type in (0, 2):
+        return "ST_TAIRMEMPOOL"
+    raise ValueError(f"unsupported PACE media type: {media_type}")
 
 
 def gen_3fs_config_data(args):
@@ -55,11 +64,31 @@ def add_nfs_sub_parser(subparsers):
     return parser_nfs
 
 
-def add_pace_sub_parser(subparsers):
-    parser_pace = subparsers.add_parser('pace', help='PACE(tair memory pool) storage options')
-    parser_pace.add_argument('--domain', "-d", required=True, help='pace domain')
-    parser_pace.add_argument('--timeout', "-t", required=True, type=int, help='pace time out config')
-    parser_pace.add_argument(
+def add_pace_sub_parser(subparsers, media_type_default=0):
+    parser = subparsers.add_parser('pace', help='PACE DRAM/legacy storage options')
+    add_pace_common_args(parser)
+    parser.add_argument(
+        '--media_type',
+        type=int,
+        choices=[0, 2],
+        default=media_type_default,
+        help=(
+            'PACE media type: 0=legacy/default, 2=DRAM; '
+            'add defaults to 0, update omission preserves the existing value'))
+    return parser
+
+
+def add_pace_ssd_sub_parser(subparsers):
+    parser = subparsers.add_parser('pace_ssd', help='PACE LocalSSD storage options')
+    add_pace_common_args(parser)
+    parser.set_defaults(media_type=5)
+    return parser
+
+
+def add_pace_common_args(parser):
+    parser.add_argument('--domain', "-d", required=True, help='pace domain')
+    parser.add_argument('--timeout', "-t", required=True, type=int, help='pace time out config')
+    parser.add_argument(
         '--service_discovery_url',
         default="",
         help=(
@@ -69,7 +98,6 @@ def add_pace_sub_parser(subparsers):
             'static://10.0.0.1:8080,10.0.0.2:8080'
         ),
     )
-    return parser_pace
 
 
 def add_3fs_sub_parser(subparsers):
@@ -138,12 +166,15 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs, handle_
     subparsers.required = True
 
     parser_nfs = add_nfs_sub_parser(subparsers)
-    parser_pace = add_pace_sub_parser(subparsers)
+    media_type_default = None if method == "update_storage" else 0
+    parser_pace = add_pace_sub_parser(subparsers, media_type_default=media_type_default)
+    parser_pace_ssd = add_pace_ssd_sub_parser(subparsers)
     parser_3fs = add_3fs_sub_parser(subparsers)
     parser_vineyard = add_vineyard_sub_parser(subparsers)
 
     parser_nfs.set_defaults(func=handle_nfs)
     parser_pace.set_defaults(func=handle_pace)
+    parser_pace_ssd.set_defaults(func=handle_pace)
     parser_3fs.set_defaults(func=handle_3fs)
     parser_vineyard.set_defaults(func=handle_vineyard)
 

@@ -25,8 +25,7 @@ TEST_F(ClientConfigTest, TestClientConfigTairMemPoolSuccess) {
     auto sdk_wrapper_config = client_config.sdk_wrapper_config();
     ASSERT_TRUE(sdk_wrapper_config);
     auto sdk_backend_configs_map = sdk_wrapper_config->sdk_backend_configs_map();
-    // 默认就加了3个
-    ASSERT_EQ(4, sdk_backend_configs_map.size());
+    ASSERT_EQ(5, sdk_backend_configs_map.size());
     auto tair_mempool_config = sdk_backend_configs_map[DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL];
     ASSERT_TRUE(tair_mempool_config);
     ASSERT_EQ("logs/pace_client.log", tair_mempool_config->sdk_log_file_path());

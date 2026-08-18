@@ -151,3 +151,49 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
     EXPECT_EQ(parsed.media_type(), spec.media_type());
 }
+
+TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRoundTripAndValidation) {
+    EXPECT_EQ("pace_ssd", ToString(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, ToDataStorageType("pace_ssd"));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+              ToBaseType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_STREQ("pace", kTairMempoolUriScheme);
+
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    std::string invalid_fields;
+    ASSERT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    const std::string json = config.ToJsonString();
+    EXPECT_NE(std::string::npos, json.find("\"type\":\"pace_ssd\""));
+    EXPECT_NE(std::string::npos, json.find("\"media_type\":5"));
+
+    StorageConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(json));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRequiresSsdMedia) {
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeDram);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    std::string invalid_fields;
+    EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("tair_mempool_ssd_requires_media_type_5"));
+
+    // Legacy TairMempool remains permissive so existing media_type=5
+    // configurations can be read during a rolling upgrade.
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    invalid_fields.clear();
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}

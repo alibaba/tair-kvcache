@@ -18,8 +18,15 @@ class StorageQuota(JsonData):
     
     def check(self) -> bool:
         _type = self._type.upper()
-        if not _type in ["ST_3FS", "ST_TAIRMEMPOOL", "ST_NFS"]:
-            raise RuntimeError(f"storage type {self._type} invalid, support ST_3FS|ST_TAIRMEMPOOL|ST_NFS")
+        supported_types = [
+            "ST_3FS",
+            "ST_TAIRMEMPOOL",
+            "ST_TAIRMEMPOOL_SSD",
+            "ST_NFS",
+        ]
+        if _type not in supported_types:
+            raise RuntimeError(
+                f"storage type {self._type} invalid, support {'|'.join(supported_types)}")
         self._type = _type
         if self._capacity <= 0:
             raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")
@@ -277,8 +284,14 @@ class CacheConfig(JsonData):
     
     def check(self) -> bool:
         _data_storage_strategy = self._data_storage_strategy.upper()
-        if _data_storage_strategy not in ["CPS_ALWAYS_3FS", "CPS_PREFER_3FS", "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL"]:
-            raise RuntimeError(f"data_storage_strategy {_data_storage_strategy} invalid, support CPS_ALWAYS_3FS|CPS_PREFER_3FS|CPS_ALWAYS_TAIR_MEMPOOL|CPS_PREFER_TAIR_MEMPOOL")
+        valid_strategies = [
+            "CPS_ALWAYS_3FS", "CPS_PREFER_3FS",
+            "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL",
+            "CPS_ALWAYS_TAIR_MEMPOOL_SSD", "CPS_PREFER_TAIR_MEMPOOL_SSD",
+        ]
+        if _data_storage_strategy not in valid_strategies:
+            raise RuntimeError(
+                f"data_storage_strategy {_data_storage_strategy} invalid, support { '|'.join(valid_strategies) }")
         self._data_storage_strategy = _data_storage_strategy
         self._reclaim_strategy.check()
         self._meta_indexer_config.check()
@@ -424,8 +437,9 @@ def parse_instance_group_args(is_create: bool):
         "--quota_configs",
         type=split_storage_quotas_value,
         default=[StorageQuota("ST_NFS", 10000000000), StorageQuota("ST_3FS", 10000000000), StorageQuota("ST_TAIRMEMPOOL", 10000000000)] if is_create else argparse.SUPPRESS,
-        help="quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;ST_TAIRMEMPOOL,10000000000"
-    )
+        help=(
+            "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
+            "ST_TAIRMEMPOOL,10000000000;ST_TAIRMEMPOOL_SSD,10000000000"))
 
     parser.add_argument(
         "--reclaim_policy",
@@ -445,7 +459,10 @@ def parse_instance_group_args(is_create: bool):
         "--data_storage_strategy",
         type=str,
         default="CPS_PREFER_3FS" if is_create else argparse.SUPPRESS,
-        help="data_storage_strategy, only support CPS_ALWAYS_3FS|CPS_PREFER_3FS|CPS_ALWAYS_TAIR_MEMPOOL|CPS_PREFER_TAIR_MEMPOOL now"
+        help=(
+            "data_storage_strategy, supports 3FS, TairMempool DRAM "
+            "and TairMempool SSD ALWAYS/PREFER strategies"
+        )
     )
 
     parser.add_argument(

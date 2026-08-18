@@ -20,13 +20,16 @@ curl -g -vvv -X POST http://localhost:56040/api/addStorage \
 '''
 
 def create_add_storage_data(args, storage_type: str, storage_spec: dict):
+    storage = {
+        "global_unique_name": args.unique_name,
+        storage_type: storage_spec,
+        "check_storage_available_when_open": True
+    }
+    if storage_type == "tair_mem_pool":
+        storage["storage_type"] = get_pace_storage_type(args.media_type)
     return {
         "trace_id": args.trace_id,
-        "storage" : {
-            "global_unique_name" : args.unique_name,
-            storage_type : storage_spec,
-            "check_storage_available_when_open": True
-        }
+        "storage": storage
     }
 
 def http_post_and_print(host: str, data: dict, verbose: bool):

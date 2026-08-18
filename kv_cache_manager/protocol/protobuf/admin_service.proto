@@ -44,6 +44,7 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+    ST_TAIRMEMPOOL_SSD = 9;
 }
 
 message LocalStorageSpec {}
@@ -122,6 +123,9 @@ message StorageConfig {
         VineyardStorageSpec vineyard = 10;
     }
     bool check_storage_available_when_open = 8;
+    // TairMempool SSD 与 DRAM 复用同一 storage spec，因此 SSD 配置需要
+    // 显式指定 ST_TAIRMEMPOOL_SSD，并设置 media_type=5。
+    StorageType storage_type = 11;
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -250,6 +254,8 @@ enum CachePreferStrategy {
     CPS_PREFER_TAIR_MEMPOOL = 6;
     CPS_ALWAYS_VCNS_3FS = 7;
     CPS_PREFER_VCNS_3FS = 8;
+    CPS_ALWAYS_TAIR_MEMPOOL_SSD = 9;
+    CPS_PREFER_TAIR_MEMPOOL_SSD = 10;
 }
 
 message MetaStorageBackendConfig {
