@@ -15,7 +15,7 @@ Nothing here is consumed by the sglang connector; per the placement rule
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -90,6 +90,24 @@ class StateTransferGroup(TransferGroup):
     block_view_tensors: List[torch.Tensor] = field(default_factory=list)
     # Bytes per block per state layer (spec.page_size_bytes).
     page_size_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class TransferPlan:
+    """One group's slice of a save (or load): what to move, from/to where.
+
+    Built by the worker from the manager's locations plus the request's
+    block tables; consumed by the transfer tasks. ``uris`` is positionally
+    aligned with the manager blocks and may contain ``None`` where a block
+    carries no data for this group's spec (hybrid sparse coverage) -- what a
+    hole means is the task's disposition logic (see data_transfer)."""
+
+    group: TransferGroup
+    uris: List
+    # Attention groups: flat token slots per manager block (gather/scatter).
+    token_indices: Optional[List[List[int]]] = None
+    # State groups: source/target state block id per manager block.
+    block_ids: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)

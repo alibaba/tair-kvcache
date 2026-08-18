@@ -8,7 +8,6 @@ keeps no metadata state of its own.
 
 import copy
 import json
-import math
 import typing
 from typing import List, Optional, Tuple
 
@@ -25,7 +24,8 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
 from kv_cache_manager.py_connector.vllm.metadata import (
     FinishRequest, TairKvCacheConnectorMetadata)
 from kv_cache_manager.py_connector.vllm.transfer_types import (
-    AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup)
+    AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup,
+    TransferPlan)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta, attn_kv_views, spec_name)
 
@@ -304,19 +304,23 @@ class WorkerCore:
     # ------------------------------------------------------------------ #
     # Load / save
     # ------------------------------------------------------------------ #
-    def _submit_group_tasks(self, task_fn, multi_result, task_idx, group,
-                            uris, token_indices, block_ids, per_task_size, *extra):
-        for i in range(0, len(uris), per_task_size):
-            end = min(len(uris), i + per_task_size)
-            self._data_transfer.submit_task(
-                task_fn, multi_result, task_idx, group, uris[i:end],
-                token_indices[i:end] if token_indices is not None else None,
-                block_ids[i:end] if block_ids is not None else None, *extra)
-            task_idx += 1
-        return task_idx
+    def _iter_task_chunks(self, plans: List[TransferPlan], per_task: int):
+        """Slice each plan's blocks into per-task chunks.
 
-    def _plan_group_transfers(self, locations, manager_block_idxes, block_ids_per_group):
-        """Build (group, uris, token_indices, block_ids) for every group.
+        Pure generator: the task index is the consumer's concern (enumerate
+        there); this only reads the plans."""
+        for plan in plans:
+            n = len(plan.uris)
+            for i in range(0, n, per_task):
+                end = min(n, i + per_task)
+                yield (plan.group,
+                       plan.uris[i:end],
+                       plan.token_indices[i:end] if plan.token_indices is not None else None,
+                       plan.block_ids[i:end] if plan.block_ids is not None else None)
+
+    def _plan_group_transfers(self, locations, manager_block_idxes,
+                              block_ids_per_group) -> Optional[List[TransferPlan]]:
+        """Build the per-group TransferPlans for a set of manager blocks.
 
         ``uris`` is positionally aligned with ``manager_block_idxes`` and may
         contain ``None`` where a block carries no data for that group's spec
@@ -344,12 +348,15 @@ class WorkerCore:
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
             if isinstance(group, AttentionTransferGroup):
-                plans.append((group, uris,
-                              self._attn_token_indices(group, manager_block_idxes, block_table),
-                              None))
+                plans.append(TransferPlan(
+                    group=group, uris=uris,
+                    token_indices=self._attn_token_indices(
+                        group, manager_block_idxes, block_table)))
             else:
-                plans.append((group, uris, None,
-                              self._state_block_ids(group, manager_block_idxes, block_table)))
+                plans.append(TransferPlan(
+                    group=group, uris=uris,
+                    block_ids=self._state_block_ids(
+                        group, manager_block_idxes, block_table)))
         return plans
 
     def _check_block_table_covers(self, block_ids_per_group) -> None:
@@ -413,14 +420,12 @@ class WorkerCore:
                 mr.submit_result(0, [False] * num_blocks * self._num_groups)
                 continue
 
-            per_task = self._extra_config.block_per_load_task
-            task_num = sum(math.ceil(num_blocks / per_task) for _ in plans)
-            multi_result = MultiResult(task_num, done_cb)
-            task_idx = 0
-            for group, uris, token_indices, block_ids in plans:
-                task_idx = self._submit_group_tasks(
-                    self._data_transfer.load_task, multi_result, task_idx,
-                    group, uris, token_indices, block_ids, per_task)
+            chunks = list(self._iter_task_chunks(
+                plans, self._extra_config.block_per_load_task))
+            multi_result = MultiResult(len(chunks), done_cb)
+            for task_idx, chunk in enumerate(chunks):
+                self._data_transfer.submit_task(
+                    self._data_transfer.load_task, multi_result, task_idx, *chunk)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -450,14 +455,13 @@ class WorkerCore:
                 mr.submit_result(0, [False] * num_blocks * self._num_groups)
                 continue
 
-            per_task = self._extra_config.block_per_save_task
-            task_num = sum(math.ceil(num_blocks / per_task) for _ in plans)
-            multi_result = MultiResult(task_num, done_cb)
-            task_idx = 0
-            for group, uris, token_indices, block_ids in plans:
-                task_idx = self._submit_group_tasks(
+            chunks = list(self._iter_task_chunks(
+                plans, self._extra_config.block_per_save_task))
+            multi_result = MultiResult(len(chunks), done_cb)
+            for task_idx, chunk in enumerate(chunks):
+                self._data_transfer.submit_task(
                     self._data_transfer.save_task, multi_result, task_idx,
-                    group, uris, token_indices, block_ids, per_task, ready_event)
+                    *chunk, ready_event)
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
 
