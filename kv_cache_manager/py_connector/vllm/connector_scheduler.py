@@ -395,11 +395,26 @@ class ConnectorScheduler:
         produces surfaces in _collect_save_instructions on a later step.
         """
         for ledger in self._tracked.values():
+            # Count blocks by the key material, not by token_len: during
+            # decode all_token_ids lags token_len by one (the token scheduled
+            # in this step is appended to it only once sampled), so a
+            # token_len-derived count announces blocks whose last token --
+            # and thus cache key -- is not known yet. The manager then
+            # returns one location fewer than announced and the worker's
+            # strict alignment check drops the whole session. The allocated
+            # cap still bounds the other way: under chunked prefill
+            # all_token_ids runs ahead of the computed KV.
             target_save_num = min(
-                ledger.token_len,
+                len(ledger.vllm_request.all_token_ids),
                 self._num_allocated_blocks(ledger) * self._vllm_block_size) \
                 // self._manager_block_size
             if target_save_num > ledger.has_saved_block_num:
+                logger.info("req:%s incremental save: %d -> %d blocks "
+                            "(tokens=%d, allocated=%d)",
+                            ledger.vllm_request.request_id,
+                            ledger.has_saved_block_num, target_save_num,
+                            len(ledger.vllm_request.all_token_ids),
+                            self._num_allocated_blocks(ledger))
                 ledger.scheduled_saving_count += 1
                 # Per-block state completeness must be read here, in the
                 # scheduler loop: it comes from vLLM's block table, which the
@@ -503,6 +518,9 @@ class ConnectorScheduler:
 
         locations = response["locations"]
         write_session_id = response["write_session_id"]
+        logger.info("req:%s save session %s: block_mask=%s locations=%d",
+                    req_id, write_session_id[:8],
+                    response.get("block_mask"), len(locations))
 
         if not locations:
             try:

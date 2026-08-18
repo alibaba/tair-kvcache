@@ -768,6 +768,37 @@ class TestBuildConnectorMeta(unittest.TestCase):
         self.assertEqual(args[3], 3)  # target_save_num
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
 
+    def test_save_threshold_counts_key_material_not_scheduled(self):
+        # During real decode all_token_ids lags the scheduled count by one:
+        # the token scheduled in this step is appended to it only once
+        # sampled. A block whose last token -- and thus cache key -- is not
+        # known yet must not be announced (the manager would return one
+        # location fewer than announced and the worker would drop the whole
+        # session). Regression test: token_len-derived counts did exactly
+        # that.
+        conn = make_scheduler_connector(mbs=self.MBS)
+        req, _ = self._new_request(conn, "r0", 40, 3)  # saved 2 blocks
+        conn._http_executor.submit.reset_mock()
+        # 8 more tokens scheduled (48 total) but only 7 appended to the
+        # request: block 2's last token id is still unknown.
+        req.output_token_ids = list(range(1000, 1007))
+        out = fake_scheduler_output(
+            cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[[[103]]])
+        conn.build_connector_meta(out)
+        conn._http_executor.submit.assert_not_called()
+        self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
+
+        # The lagging token lands one step later: now the third block saves,
+        # with a token list that really holds 48 ids.
+        req.output_token_ids = list(range(1000, 1008))
+        out = fake_scheduler_output(
+            cached_req_ids=["r0"], num_scheduled={"r0": 1}, new_block_ids=[[[]]])
+        conn.build_connector_meta(out)
+        args = conn._http_executor.submit.call_args[0]
+        self.assertEqual(args[3], 3)  # target_save_num
+        self.assertEqual(len(args[2]), 3 * self.MBS)  # token_ids sent
+        self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
+
     def test_save_request_drain_and_finish_paths(self):
         conn = make_scheduler_connector(mbs=self.MBS)
         req, _ = self._new_request(conn, "r0", 40, 3)
