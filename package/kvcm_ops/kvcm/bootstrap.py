@@ -169,15 +169,16 @@ def _positive_query_int(query, name, default, allow_zero=False):
 
 def _parse_storage_uri(uri):
     try:
-        parsed = urlsplit(uri)
+        # KVCM StandardUri treats '#' in user-info as a literal character.
+        # Escape it only in the validation copy so the original URI is passed
+        # unchanged to KVCM and remains compatible with existing deployments.
+        parsed = urlsplit(uri.replace("#", "%23"))
     except ValueError:
         raise BootstrapError("KVCM_META_STORAGE_URI is not a valid URI")
     if parsed.scheme.lower() != "redis":
         raise BootstrapError("KVCM_META_STORAGE_URI scheme must be redis")
     if not parsed.hostname:
         raise BootstrapError("KVCM_META_STORAGE_URI must include a host")
-    if parsed.fragment:
-        raise BootstrapError("KVCM_META_STORAGE_URI must not contain a fragment; URI-encode credentials")
     try:
         port = parsed.port
     except ValueError:

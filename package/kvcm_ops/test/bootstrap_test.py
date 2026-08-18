@@ -127,6 +127,26 @@ class EnvironmentParsingTest(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapError, "power of two"):
             parse_environment(environ)
 
+    def test_raw_hash_in_password_is_supported_and_preserved(self):
+        environ = dict(BASE_ENV)
+        raw_uri = (
+            "redis://user:p#ss@redis.example:6379/?cluster_name=test"
+            "&timeout_ms=1000&max_instance_count=512"
+        )
+        environ["KVCM_META_STORAGE_URI"] = raw_uri
+
+        config = parse_environment(environ)
+        group = _build_new_instance_group(config)
+
+        self.assertEqual("redis.example", config.redis_host)
+        self.assertEqual(6379, config.redis_port)
+        self.assertEqual(raw_uri, config.meta_storage_uri)
+        self.assertEqual(
+            raw_uri,
+            group["cache_config"]["meta_indexer_config"]
+            ["meta_storage_backend_config"]["storage_uri"],
+        )
+
     def test_metadata_backend_mode_is_optional_and_bounded(self):
         config = parse_environment(dict(BASE_ENV))
         self.assertIsNone(config.metadata_backend_mode)
