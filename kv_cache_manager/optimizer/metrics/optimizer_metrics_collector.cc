@@ -1,4 +1,4 @@
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 
 #include "kv_cache_manager/metrics/metrics_registry.h"
 

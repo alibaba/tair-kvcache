@@ -11,8 +11,8 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
 
 namespace kv_cache_manager {
@@ -431,8 +431,6 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
         if (collector) {
             collector->set_instance_id(request->instance_id());
             collector->set_total_blocks(response->total_blocks());
-            collector->set_cache_hit_count(
-                response->capacity_results_size() == 0 ? 0 : response->capacity_results(0).cache_hit_count());
             std::vector<PerCapacityHitInfo> per_cap;
             per_cap.reserve(response->capacity_results_size());
             for (const auto &capacity_result : response->capacity_results()) {

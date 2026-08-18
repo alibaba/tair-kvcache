@@ -11,9 +11,12 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/service_discovery.h"
 #include "kv_cache_manager/common/service_discovery_factory.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
+#include "kv_cache_manager/service/util/common.h"
 
 namespace kv_cache_manager {
 
@@ -30,8 +33,13 @@ constexpr std::chrono::milliseconds kUnaryRpcTimeout(1000);
 } // namespace
 
 KvcmEventSubscriber::KvcmEventSubscriber(const KvcmEventSubscriptionConfig &config,
-                                         std::shared_ptr<OptimizerServiceImpl> optimizer_service)
-    : config_(config), optimizer_service_(std::move(optimizer_service)) {}
+                                         std::shared_ptr<OptimizerServiceImpl> optimizer_service,
+                                         std::shared_ptr<MetricsRegistry> metrics_registry,
+                                         std::shared_ptr<OptimizerMetricsReporter> metrics_reporter)
+    : config_(config)
+    , optimizer_service_(std::move(optimizer_service))
+    , metrics_registry_(std::move(metrics_registry))
+    , metrics_reporter_(std::move(metrics_reporter)) {}
 
 KvcmEventSubscriber::~KvcmEventSubscriber() { Stop(); }
 
@@ -244,9 +252,13 @@ void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
         bool received_event = false;
         auto reader = stub->SubscribeEvents(&context, request);
         proto::optimizer::TraceQueryRequest event;
+        std::string kvcm_ip;
         while (running_ && worker->running && reader->Read(&event)) {
             received_event = true;
-            ProcessEvent(event);
+            if (kvcm_ip.empty()) {
+                kvcm_ip = ExtractIpFromPeer(context.peer());
+            }
+            ProcessEvent(event, kvcm_ip);
         }
         const grpc::Status status = reader->Finish();
         {
@@ -288,9 +300,38 @@ void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
     }
 }
 
-void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event) {
+void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip) {
+    OptimizerServiceMetricsCollector metrics_collector(metrics_registry_);
+    metrics_collector.set_client_ip(kvcm_ip);
+    const bool report_service_metrics = metrics_reporter_ && metrics_collector.Init();
+    if (report_service_metrics) {
+        metrics_collector.set_service_error_code_metrics(0.0);
+    }
+    auto query_scope = report_service_metrics ? metrics_collector.MakeServiceQueryScope() : ChronoScopeGuard{};
     proto::optimizer::TraceQueryResponse response;
     const ErrorCode ec = optimizer_service_->ExecuteTraceQuery(event, &response);
+    if (ec == EC_OK) {
+        metrics_collector.set_instance_id(event.instance_id());
+        metrics_collector.set_total_blocks(response.total_blocks());
+        std::vector<PerCapacityHitInfo> per_capacity_hits;
+        per_capacity_hits.reserve(response.capacity_results_size());
+        for (const auto &capacity_result : response.capacity_results()) {
+            per_capacity_hits.push_back(
+                {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
+        }
+        metrics_collector.set_per_capacity_hits(std::move(per_capacity_hits));
+        metrics_collector.set_max_hit_count(response.theoretical_result().max_hit_count());
+        if (response.theoretical_result().max_hit_count() >= 0) {
+            metrics_collector.set_max_hit_rate(response.theoretical_result().hit_rate());
+        }
+    }
+    query_scope = ChronoScopeGuard{};
+    if (report_service_metrics) {
+        if (ec != EC_OK) {
+            metrics_collector.set_service_error_code_metrics(static_cast<double>(ec));
+        }
+        metrics_reporter_->ReportPerQuery(&metrics_collector);
+    }
     if (ec == EC_INSTANCE_NOT_EXIST) {
         std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
         if (unsupported_instance_ids_.find(event.instance_id()) != unsupported_instance_ids_.end()) {

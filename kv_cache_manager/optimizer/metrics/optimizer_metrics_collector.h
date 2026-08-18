@@ -62,9 +62,6 @@ public:
     void set_total_blocks(int64_t v) { total_blocks_ = v; }
     int64_t total_blocks() const { return total_blocks_; }
 
-    void set_cache_hit_count(int64_t v) { cache_hit_count_ = v; }
-    int64_t cache_hit_count() const { return cache_hit_count_; }
-
     void set_per_capacity_hits(std::vector<PerCapacityHitInfo> v) { per_capacity_hits_ = std::move(v); }
     const std::vector<PerCapacityHitInfo> &per_capacity_hits() const { return per_capacity_hits_; }
 
@@ -81,7 +78,6 @@ private:
     std::string instance_id_;
     std::string client_ip_;
     int64_t total_blocks_ = 0;
-    int64_t cache_hit_count_ = 0;
     std::vector<PerCapacityHitInfo> per_capacity_hits_;
     int64_t max_hit_count_ = -1;
     double max_hit_rate_ = 0.0;

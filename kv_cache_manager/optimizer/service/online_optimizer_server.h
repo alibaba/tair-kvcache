@@ -20,6 +20,7 @@ class OptimizerRegistryManager;
 class OptimizerMetricsReporter;
 class MetricsRegistry;
 class KvcmEventSubscriber;
+class LoopThread;
 
 class OnlineOptimizerServer {
 public:
@@ -41,7 +42,6 @@ private:
     bool InitRpcServer();
     bool InitHttpServer();
     void DoStop();
-    void MetricsReportLoop();
     void RecoveryRetryLoop();
 
     OnlineOptimizerServerConfig config_;
@@ -56,7 +56,7 @@ private:
 
     std::unique_ptr<grpc::Server> grpc_server_;
     std::thread http_thread_;
-    std::thread metrics_thread_;
+    std::shared_ptr<LoopThread> metrics_report_thread_;
     std::thread recovery_thread_;
     std::atomic<bool> running_{false};
     std::once_flag stop_flag_;
