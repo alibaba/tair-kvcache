@@ -98,7 +98,7 @@ private:
     int GetQueueIndexForKey(KeyType key) const noexcept;
 
     using CmdArgs = std::vector<std::string>;
-    void CompileWriteOp(const WriteOp &op, std::vector<CmdArgs> &cmds);
+    void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
 
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;

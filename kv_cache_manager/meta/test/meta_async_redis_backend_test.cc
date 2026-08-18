@@ -1,5 +1,7 @@
 #include <atomic>
+#include <mutex>
 #include <thread>
+#include <utility>
 
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
@@ -17,6 +19,21 @@ namespace kv_cache_manager {
 class MockMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
 public:
     MOCK_METHOD(std::shared_ptr<RedisClient>, CreateRedisClient, (), (const));
+};
+
+class TrackingCacheLocation : public CacheLocation {
+public:
+    TrackingCacheLocation(std::atomic<int> &serialize_count, std::string serialized_value)
+        : serialize_count_(serialize_count), serialized_value_(std::move(serialized_value)) {}
+
+    std::string ToJsonString() const noexcept override {
+        serialize_count_.fetch_add(1, std::memory_order_relaxed);
+        return serialized_value_;
+    }
+
+private:
+    std::atomic<int> &serialize_count_;
+    std::string serialized_value_;
 };
 
 class MetaAsyncRedisBackendTest : public MetaStorageBackendTestBase, public RedisTestBase, public TESTBASE {
@@ -274,40 +291,62 @@ TEST_F(MetaAsyncRedisBackendTest, TestExistsPassthrough) {
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpPut) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
+    std::atomic<int> location_serialize_count{0};
+    std::atomic<int> collision_serialize_count{0};
     WriteOp op;
     op.type = WriteOpType::kPut;
     op.keys = {1, 2};
-    op.field_maps = {{{"f1", "v1"}, {"f2", "v2"}}, {{"f3", "v3"}}};
+    op.field_maps = {{{"property", "value"}}, {{"L#collision", "property-wins"}}};
+    op.locations = {{{"location", std::make_shared<TrackingCacheLocation>(location_serialize_count, "location-json")}},
+                    {{"collision",
+                      std::make_shared<TrackingCacheLocation>(collision_serialize_count, "must-not-serialize")}}};
 
     std::vector<CmdArgs> cmds;
     backend_->CompileWriteOp(op, cmds);
 
-    // kPut: DEL + HSET per key = 4 commands
-    ASSERT_EQ(4, cmds.size());
-    ASSERT_EQ("DEL", cmds[0][0]);
-    ASSERT_TRUE(cmds[0][1].find("test_instance") != std::string::npos);
-    ASSERT_EQ("HSET", cmds[1][0]);
-    ASSERT_EQ(cmds[0][1], cmds[1][1]);
-    ASSERT_EQ(6, cmds[1].size()); // HSET key f1 v1 f2 v2
-    ASSERT_EQ("DEL", cmds[2][0]);
-    ASSERT_EQ("HSET", cmds[3][0]);
-    ASSERT_EQ(4, cmds[3].size()); // HSET key f3 v3
+    EXPECT_THAT(cmds,
+                ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_1"),
+                            ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_1",
+                                        "L#location",
+                                        "location-json",
+                                        "property",
+                                        "value"),
+                            ElementsAre("DEL", "kvcache:instance_test_instance:cache_2"),
+                            ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_2",
+                                        "L#collision",
+                                        "property-wins")));
+    EXPECT_EQ(1, location_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, collision_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_TRUE(op.field_maps.empty());
+    EXPECT_TRUE(op.locations.empty());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsert) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
+    std::atomic<int> serialize_count{0};
     WriteOp op;
     op.type = WriteOpType::kUpsert;
-    op.keys = {20, 30};
-    op.field_maps = {{{"a", "1"}}, {{"b", "2"}}};
+    op.keys = {20};
+    op.field_maps = {{{"property", "value"}}};
+    op.locations = {
+        {{"location", std::make_shared<TrackingCacheLocation>(serialize_count, "upsert-location-json")}}};
 
     std::vector<CmdArgs> cmds;
     backend_->CompileWriteOp(op, cmds);
 
-    ASSERT_EQ(2, cmds.size());
-    ASSERT_EQ("HSET", cmds[0][0]);
-    ASSERT_EQ("HSET", cmds[1][0]);
+    EXPECT_THAT(cmds,
+                ElementsAre(ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_20",
+                                        "L#location",
+                                        "upsert-location-json",
+                                        "property",
+                                        "value")));
+    EXPECT_EQ(1, serialize_count.load(std::memory_order_relaxed));
+    EXPECT_TRUE(op.field_maps.empty());
+    EXPECT_TRUE(op.locations.empty());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
@@ -350,12 +389,111 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpEmptyFieldMaps) {
     op.type = WriteOpType::kPut;
     op.keys = {80};
     op.field_maps = {{}};
+    op.locations = {{}};
 
     std::vector<CmdArgs> cmds;
     backend_->CompileWriteOp(op, cmds);
 
     ASSERT_EQ(1, cmds.size());
     ASSERT_EQ("DEL", cmds[0][0]);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestPutAndUpsertSerializeAfterDequeueWithOwnedSnapshot) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64"
+                           "&async_wait_us=1000&async_max_size=1000&async_sync_timeout_ms=5000");
+
+    std::atomic<int> pipeline_call_count{0};
+    std::atomic<bool> pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+    std::mutex flushed_cmds_mutex;
+    std::vector<CmdArgs> flushed_cmds;
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            if (pipeline_call_count.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                pipeline_entered.store(true, std::memory_order_release);
+                while (!can_proceed.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            } else {
+                std::lock_guard<std::mutex> lock(flushed_cmds_mutex);
+                flushed_cmds.insert(flushed_cmds.end(), cmds.begin(), cmds.end());
+            }
+
+            std::vector<ReplyUPtr> replies;
+            for (size_t i = 0; i < cmds.size(); ++i) {
+                redisReply *reply = (redisReply *)malloc(sizeof(redisReply));
+                memset(reply, 0, sizeof(redisReply));
+                reply->type = REDIS_REPLY_INTEGER;
+                reply->integer = 1;
+                replies.emplace_back(reply, freeReplyObject);
+            }
+            return replies;
+        }));
+        return mock;
+    }));
+
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    CacheLocationMapVector seed_locations(1);
+    PropertyMapVector seed_properties = {{{"seed", "value"}}};
+    EXPECT_THAT(backend_->Put(nullptr, {0}, seed_locations, seed_properties), ElementsAre(EC_OK));
+    while (!pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::atomic<int> put_serialize_count{0};
+    {
+        CacheLocationMapVector locations = {
+            {{"put", std::make_shared<TrackingCacheLocation>(put_serialize_count, "put-location-json")}}};
+        PropertyMapVector properties = {{{"put_property", "put-value"}}};
+        EXPECT_THAT(backend_->Put(nullptr, {101}, locations, properties), ElementsAre(EC_OK));
+        locations[0].clear();
+        properties[0]["put_property"] = "mutated-put-value";
+    }
+
+    std::atomic<int> upsert_serialize_count{0};
+    {
+        CacheLocationMapVector locations = {
+            {{"upsert", std::make_shared<TrackingCacheLocation>(upsert_serialize_count, "upsert-location-json")}}};
+        PropertyMapVector properties = {{{"upsert_property", "upsert-value"}}};
+        EXPECT_THAT(backend_->Upsert(nullptr, {102}, locations, properties), ElementsAre(EC_OK));
+        locations[0].clear();
+        properties[0]["upsert_property"] = "mutated-upsert-value";
+    }
+
+    EXPECT_EQ(0, put_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(0, upsert_serialize_count.load(std::memory_order_relaxed));
+
+    can_proceed.store(true, std::memory_order_release);
+    EXPECT_TRUE(backend_->Sync({101, 102}));
+    EXPECT_EQ(1, put_serialize_count.load(std::memory_order_relaxed));
+    EXPECT_EQ(1, upsert_serialize_count.load(std::memory_order_relaxed));
+
+    std::vector<CmdArgs> actual_cmds;
+    {
+        std::lock_guard<std::mutex> lock(flushed_cmds_mutex);
+        actual_cmds = flushed_cmds;
+    }
+    EXPECT_THAT(actual_cmds,
+                ElementsAre(ElementsAre("DEL", "kvcache:instance_test_instance:cache_101"),
+                            ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_101",
+                                        "L#put",
+                                        "put-location-json",
+                                        "put_property",
+                                        "put-value"),
+                            ElementsAre("HSET",
+                                        "kvcache:instance_test_instance:cache_102",
+                                        "L#upsert",
+                                        "upsert-location-json",
+                                        "upsert_property",
+                                        "upsert-value")));
+    EXPECT_EQ(EC_OK, backend_->Close());
 }
 
 // ==================== Key Routing Tests ====================
