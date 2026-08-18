@@ -65,34 +65,6 @@ class MultiResult:
                 self._callback(flat)
 
 
-class _PinnedBudget:
-    """Byte budget for pinned staging buffers.
-
-    Save/load tasks each stage ``len(valid) * per_block_bytes`` bytes of
-    pinned host memory; with a 32-thread executor and no cap the worst case
-    is GiB-scale pinned allocation. ``acquire`` blocks until the requested
-    bytes fit under the capacity; a request larger than the whole capacity
-    is allowed to run alone (never deadlocks)."""
-
-    def __init__(self, capacity: int):
-        assert capacity > 0
-        self._capacity = capacity
-        self._used = 0
-        self._cond = threading.Condition()
-
-    def acquire(self, nbytes: int):
-        with self._cond:
-            while self._used > 0 and self._used + nbytes > self._capacity:
-                self._cond.wait()
-            self._used += nbytes
-
-    def release(self, nbytes: int):
-        with self._cond:
-            self._used -= nbytes
-            assert self._used >= 0
-            self._cond.notify_all()
-
-
 class DataTransferManager:
     def __init__(self, kvcache_info: KVCacheInfo, manager_block_size: int,
                  transfer_client, coordinator_client: TpCoordinatorClient, extra_config):
@@ -111,25 +83,6 @@ class DataTransferManager:
 
         self._io_executor = ThreadPoolExecutor(
             max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker)
-
-        capacity = self._staging_capacity_bytes(kvcache_info, extra_config)
-        self._pinned_budget = _PinnedBudget(capacity)
-        logger.info("pinned staging budget: %d bytes", capacity)
-
-    @staticmethod
-    def _staging_capacity_bytes(kvcache_info: KVCacheInfo, extra_config) -> int:
-        """Pinned staging budget: explicit staging_buffer_max_bytes wins;
-        otherwise two max-size tasks in flight per group (double buffering:
-        one staging on CPU while another is in SDK I/O), floored at 1 GiB so
-        small-block configs keep enough parallelism."""
-        capacity = extra_config.staging_buffer_max_bytes
-        if capacity > 0:
-            return capacity
-        per_task_blocks = max(extra_config.block_per_save_task,
-                              extra_config.block_per_load_task)
-        per_task_peak = max(g.per_block_bytes for g in kvcache_info.groups) \
-            * per_task_blocks
-        return max(2 * per_task_peak * len(kvcache_info.groups), 1 << 30)
 
     def submit_task(self, func, *args, **kwargs):
         return self._io_executor.submit(func, *args, **kwargs)
@@ -183,14 +136,9 @@ class DataTransferManager:
             valid = [i for i in range(n) if i not in skipped and i not in failed]
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
-                stage_bytes = len(valid) * group.per_block_bytes
-                self._pinned_budget.acquire(stage_bytes)
-                try:
-                    self._save_valid_blocks(group, remote_uris,
-                                            block_token_indices, block_ids,
-                                            ready_event, valid, ok_mask)
-                finally:
-                    self._pinned_budget.release(stage_bytes)
+                self._save_valid_blocks(group, remote_uris,
+                                        block_token_indices, block_ids,
+                                        ready_event, valid, ok_mask)
         except Exception:
             # Fail the whole task: partially transferred blocks are unknown, so
             # report conservatively -- never publish a block we cannot vouch
@@ -364,14 +312,9 @@ class DataTransferManager:
             valid = [i for i in range(n) if i not in skipped and i not in failed]
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
-                stage_bytes = len(valid) * group.per_block_bytes
-                self._pinned_budget.acquire(stage_bytes)
-                try:
-                    ok = self._load_valid_blocks(group, remote_uris,
-                                                 block_token_indices, block_ids,
-                                                 valid)
-                finally:
-                    self._pinned_budget.release(stage_bytes)
+                ok = self._load_valid_blocks(group, remote_uris,
+                                             block_token_indices, block_ids,
+                                             valid)
                 for i in valid:
                     ok_mask[i] = ok
         except Exception:

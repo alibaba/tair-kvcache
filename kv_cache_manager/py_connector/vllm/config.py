@@ -23,11 +23,6 @@ class TairKvCacheConnectorExtraConfig:
         self.block_per_save_task = extra_config.get("block_per_save_task", 128)
         self.block_per_load_task = extra_config.get("block_per_load_task", 128)
 
-        # Cap (bytes) on concurrently allocated pinned staging buffers for
-        # save/load transfers; <= 0 selects a default derived from the task
-        # sizes (see DataTransferManager).
-        self.staging_buffer_max_bytes: int = extra_config.get("staging_buffer_max_bytes", 0)
-
         self.async_get_cache_location = extra_config.get("async_get_cache_location", True)
         # TODO: add async and try wait
         # self.async_get_cache_location_wait_time = extra_config.get("async_get_cache_location_wait_time", 0)
