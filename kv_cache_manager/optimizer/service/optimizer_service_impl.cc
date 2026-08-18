@@ -20,6 +20,7 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
+constexpr int64_t kKvcmAutoGroupTtlSeconds = 24 * 60 * 60;
 
 void SetPbResponseHeader(proto::optimizer::CommonResponseHeader *header, ErrorCode ec) {
     auto *status = header->mutable_status();
@@ -330,6 +331,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
             group.set_eviction_policy("lru");
             group.set_enable_prefix_hash(true);
             group.set_enable_theoretical_max_cache(true);
+            group.set_ttl_seconds(kKvcmAutoGroupTtlSeconds);
 
             std::string invalid_fields;
             if (!group.ValidateRequiredFields(invalid_fields)) {
