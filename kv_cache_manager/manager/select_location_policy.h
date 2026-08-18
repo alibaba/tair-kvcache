@@ -77,6 +77,7 @@ protected:
         static constexpr uint32_t MOONCAKE = 3;
         static constexpr uint32_t THREEFS = 3;
         static constexpr uint32_t TAIR_MEMPOOL = 3;
+        static constexpr uint32_t TAIR_MEMPOOL_SSD = 3;
         static constexpr uint32_t DEFAULT = 1;
         static constexpr uint32_t VCNS_HF3FS = THREEFS;
         static constexpr uint32_t EVENT_REPORT = 10;
@@ -94,6 +95,7 @@ protected:
         StorageTypeWeights::DEFAULT,
         StorageTypeWeights::EVENT_REPORT,
         StorageTypeWeights::EVENT_REPORT,
+        StorageTypeWeights::TAIR_MEMPOOL_SSD,
     };
 
     WeightArray &storage_weights_ = default_storage_weights_;

@@ -107,11 +107,35 @@ TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigGetSdkConfig) {
     auto tair_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     ASSERT_NE(tair_config, nullptr);
 
+    auto tair_ssd_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD);
+    ASSERT_NE(tair_ssd_config, nullptr);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, tair_ssd_config->type());
+
     auto nfs_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_NE(nfs_config, nullptr);
 
     auto unknown_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
     ASSERT_EQ(unknown_config, nullptr);
+}
+
+TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesTairMempoolSsd) {
+    SdkWrapperConfig sdk_wrapper_config;
+    ASSERT_TRUE(sdk_wrapper_config.FromJsonString(R"({
+        "thread_num": 8,
+        "queue_size": 2000,
+        "sdk_backend_configs": [{
+            "type": "pace_ssd",
+            "sdk_log_file_path": "logs/pace_ssd_client.log",
+            "sdk_log_level": "INFO",
+            "spec_byte_sizes_per_block": {}
+        }],
+        "timeout_config": {"put_timeout_ms": 15000, "get_timeout_ms": 15000}
+    })"));
+
+    const auto config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD);
+    ASSERT_NE(nullptr, config);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, config->type());
+    EXPECT_EQ("logs/pace_ssd_client.log", config->sdk_log_file_path());
 }
 
 TEST_F(SdkBackendConfigTest, TestDuplicatedSdkConfig) {

@@ -418,7 +418,7 @@ public:
     // 采样适合回收的 key（通常按 LRU 或 access time 排序）。
     // @param request_context 请求上下文；可为 nullptr
     // @param count    期望采样数量
-    // @param out_keys [out] 采样结果
+    // @param out_keys [out] 采样结果（实际数量可能小于 count）
     // @return EC_OK 成功；EC_ERROR 采样失败
     virtual ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept = 0;

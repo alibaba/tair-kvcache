@@ -29,6 +29,7 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
+#include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
 
 using namespace kv_cache_manager;
 
@@ -278,6 +279,26 @@ TEST_F(DataStorageSelectorTest, TestCopyControl) {
     ASSERT_TRUE(std::is_move_constructible<DataStorageSelector>::value);
     ASSERT_TRUE(std::is_move_assignable<DataStorageSelector>::value);
     ASSERT_TRUE(std::is_swappable<DataStorageSelector>::value);
+}
+
+TEST_F(DataStorageSelectorTest, TestSelectTairMempoolSsdByExactType) {
+    const auto dram = std::make_shared<TairMempoolBackend>(metrics_registry_);
+    dram->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pace_dram", nullptr);
+    const auto ssd = std::make_shared<TairMempoolBackend>(metrics_registry_);
+    ssd->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd", nullptr);
+    const std::vector<std::shared_ptr<DataStorageBackend>> candidates{dram, ssd};
+
+    auto selected = DataStorageSelector::Select(
+        request_context_.get(), candidates, CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL_SSD);
+    ASSERT_EQ(ssd, selected);
+
+    selected =
+        DataStorageSelector::Select(request_context_.get(), {dram}, CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL_SSD);
+    ASSERT_FALSE(selected);
+
+    selected =
+        DataStorageSelector::Select(request_context_.get(), {dram}, CachePreferStrategy::CPS_PREFER_TAIR_MEMPOOL_SSD);
+    ASSERT_EQ(dram, selected);
 }
 
 TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendAbnormal00) {

@@ -99,8 +99,14 @@ std::uint64_t StorageUsageData::SubStorageUsageByType(const DataStorageType &typ
 void StorageUsageData::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
         const auto type = static_cast<DataStorageType>(i);
+        const auto usage = storage_usage_by_type_.at(i).load();
+        // Preserve rollback compatibility until the new storage type is
+        // actually used. Older binaries reject unknown persisted JSON keys.
+        if (type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD && usage == 0) {
+            continue;
+        }
         const std::string key = ToString(type);
-        Put(writer, key, storage_usage_by_type_.at(i).load());
+        Put(writer, key, usage);
     }
 }
 

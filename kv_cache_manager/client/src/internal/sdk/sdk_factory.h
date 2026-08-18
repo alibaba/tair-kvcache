@@ -12,6 +12,9 @@ public:
     static std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
                                                    const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                                    const std::shared_ptr<StorageConfig> &storage_config);
+
+private:
+    static std::shared_ptr<SdkInterface> CreateSdkInstance(const DataStorageType &type);
 };
 
 } // namespace kv_cache_manager

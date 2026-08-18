@@ -51,6 +51,7 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .value("DATA_STORAGE_TYPE_HF3FS", kvcm::DataStorageType::DATA_STORAGE_TYPE_HF3FS)
         .value("DATA_STORAGE_TYPE_MOONCAKE", kvcm::DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)
         .value("DATA_STORAGE_TYPE_TAIR_MEMPOOL", kvcm::DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)
+        .value("DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD", kvcm::DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)
         .value("DATA_STORAGE_TYPE_NFS", kvcm::DataStorageType::DATA_STORAGE_TYPE_NFS)
         .value("DATA_STORAGE_TYPE_VCNS_HF3FS", kvcm::DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)
         .finalize();

@@ -23,7 +23,7 @@ TairMempoolBackend::TairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_
 
 TairMempoolBackend::~TairMempoolBackend() { KVCM_LOG_ERROR("no implementation for TairMempoolBackend"); }
 
-DataStorageType TairMempoolBackend::GetType() { return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL; }
+DataStorageType TairMempoolBackend::GetType() { return config_.type(); }
 
 bool TairMempoolBackend::Available() {
     KVCM_LOG_ERROR("no implementation for TairMempoolBackend");

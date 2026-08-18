@@ -255,4 +255,43 @@ TEST_F(InstanceGroupTest, UnknownProtoStorageTypeFailsClosed) {
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, location.type());
 }
 
+TEST_F(InstanceGroupTest, TairMempoolSsdStorageProtoRoundTripPreservesTypeAndMedia) {
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_service_discovery_url("spectrum://pace-meta");
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    proto::admin::StorageConfig proto_config;
+    ProtoConvert::StorageConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.has_tair_mem_pool());
+    EXPECT_EQ(proto::admin::ST_TAIRMEMPOOL_SSD, proto_config.storage_type());
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, proto_config.tair_mem_pool().media_type());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_config, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+    EXPECT_EQ("spectrum://pace-meta", restored_spec->service_discovery_url());
+}
+
+TEST_F(InstanceGroupTest, LegacyTairMempoolProtoWithoutStorageTypeRemainsDramType) {
+    proto::admin::StorageConfig legacy;
+    legacy.set_global_unique_name("legacy_pace");
+    auto *spec = legacy.mutable_tair_mem_pool();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&legacy, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+}
+
 } // namespace kv_cache_manager
