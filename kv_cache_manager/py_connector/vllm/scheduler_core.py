@@ -276,18 +276,37 @@ class SchedulerCore:
     # Per-step metadata assembly and saving orchestration
     # ------------------------------------------------------------------ #
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> TairKvCacheConnectorMetadata:
+        """Assemble one engine step's envelope (see TairKvCacheConnectorMetadata).
+
+        Two sources feed the envelope: vLLM's scheduling output for this step
+        (mirror deltas for newly scheduled and continuing requests) and the
+        residue of earlier steps' async work (admitted loads, resolved save
+        sessions, retirements). Only the last stage depends on the others:
+        save settlement may retire a request within this step, so finishes
+        flush last.
+        """
         meta = TairKvCacheConnectorMetadata(self._epoch)
         self._epoch += 1
 
-        for load_req in self._waiting_to_load_requests:
-            request = self._alive_requests[load_req.req_id]
-            if not request.block_ids_per_group:
-                # update_state_after_alloc was never called; vLLM will re-query.
-                continue
-            load_req.all_block_ids = [list(b) for b in request.block_ids_per_group]
-            meta.add_load_request(load_req)
-        self._waiting_to_load_requests = []
+        self._ingest_scheduled_reqs(scheduler_output, meta)
+        self._dispatch_incremental_saves()
+        self._collect_load_instructions(meta)
+        self._collect_save_instructions(meta)
+        self._collect_finish_instructions(meta)
+        return meta
 
+    def _ingest_scheduled_reqs(self, scheduler_output: "SchedulerOutput",
+                               meta: TairKvCacheConnectorMetadata) -> None:
+        """Absorb vLLM's scheduling list into the authoritative request table
+        and emit mirror deltas for the worker.
+
+        The worker owns a mirrored copy of every request's token stream and
+        per-group block tables -- it needs them to translate manager blocks
+        into physical slots when it gathers (save) or scatters (load). New
+        requests get a full snapshot; continuing ones get increments; a
+        preemption resume replaces the whole table (re-allocation maps the
+        same logical blocks to fresh physical slots).
+        """
         for vllm_req in scheduler_output.scheduled_new_reqs:
             request = self._alive_requests[vllm_req.req_id]
             request.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
@@ -332,6 +351,15 @@ class SchedulerCore:
                     group_ids.extend(new_ids)
             meta.add_req_state_to_worker(delta)
 
+    def _dispatch_incremental_saves(self) -> None:
+        """Start async StartWriteCache calls for requests whose computed
+        prefix crossed a manager-block boundary since the last step.
+
+        This stage only acquires write locations (the HTTP call resolves tens
+        of ms later, off the scheduler thread); the data itself moves later,
+        gathered by the worker out of HBM. The session the http thread
+        produces surfaces in _collect_save_instructions on a later step.
+        """
         for req in self._alive_requests.values():
             target_save_num = min(
                 len(req.token_ids),
@@ -348,6 +376,30 @@ class SchedulerCore:
                     self._state_complete_mask(req, range(target_save_num)))
             req.has_saved_block_num = target_save_num
 
+    def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Hand the worker the loads admitted by get_num_new_matched_tokens
+        whose blocks have since been allocated (update_state_after_alloc).
+
+        Without an allocation the load cannot be addressed -- the worker would
+        not know which slots to scatter into -- so it is dropped; vLLM will
+        re-query and re-admit it on a later step.
+        """
+        for load_req in self._waiting_to_load_requests:
+            request = self._alive_requests[load_req.req_id]
+            if not request.block_ids_per_group:
+                continue
+            load_req.all_block_ids = [list(b) for b in request.block_ids_per_group]
+            meta.add_load_request(load_req)
+        self._waiting_to_load_requests = []
+
+    def _collect_save_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Hand the worker the save sessions whose write locations have
+        arrived, and settle finished requests whose saving is now complete.
+
+        Canceled sessions (start_write_cache failed on the http thread)
+        settle here too: they count as sent, so a request waiting only on
+        them can be retired.
+        """
         with self._waiting_to_save_requests_lock:
             new_save_reqs = self._waiting_to_save_requests
             self._waiting_to_save_requests = []
@@ -360,15 +412,22 @@ class SchedulerCore:
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and
                     req.scheduled_saving_count == req.sent_saving_count):
-                self._waiting_to_finish_requests.append(FinishRequest(req.req_id))
-                self._alive_requests.pop(req.req_id)
+                self._retire_request(req)
 
         self.handle_canceled_save_req()
 
+    def _collect_finish_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Flush retirements queued since the last step. Runs last on purpose:
+        save settlement above may retire a request within this very step."""
         for finish_req in self._waiting_to_finish_requests:
             meta.add_finish_request(finish_req)
         self._waiting_to_finish_requests = []
-        return meta
+
+    def _retire_request(self, req: ReqState) -> None:
+        """The request's save obligations are settled: tell the worker to drop
+        its mirror and stop tracking the request ourselves."""
+        self._waiting_to_finish_requests.append(FinishRequest(req.req_id))
+        self._alive_requests.pop(req.req_id)
 
     def start_save_kvcache_async(self, req_id, token_ids, target_save_num,
                                  state_complete_mask):
@@ -447,8 +506,7 @@ class SchedulerCore:
             req.sent_saving_count += 1
             if (req.need_report_after_saving_finished and
                     req.scheduled_saving_count == req.sent_saving_count):
-                self._waiting_to_finish_requests.append(FinishRequest(req.req_id))
-                self._alive_requests.pop(req.req_id)
+                self._retire_request(req)
 
     def get_finished_count(self):
         # Only rank0 reports finished requests.
@@ -483,8 +541,7 @@ class SchedulerCore:
                       "remote_matched_token_num": req.remote_matched_token_num}
 
         if req.scheduled_saving_count == req.sent_saving_count:
-            self._waiting_to_finish_requests.append(FinishRequest(req.req_id))
-            self._alive_requests.pop(req.req_id)
+            self._retire_request(req)
             return True, extra_info
 
         # Saves still in flight; delay freeing the blocks until they land.
