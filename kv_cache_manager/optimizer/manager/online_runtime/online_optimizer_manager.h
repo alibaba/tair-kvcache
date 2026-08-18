@@ -14,6 +14,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
 namespace kv_cache_manager {
 
@@ -45,11 +46,7 @@ struct InstanceState {
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
 
-    // Range-add difference array for the current reporting interval's
-    // distribution of minimum LRU capacities required by theoretically
-    // hittable blocks.
-    std::vector<int64_t> mrc_interval_hit_count_deltas;
-    uint64_t mrc_interval_total_hits = 0;
+    MrcWindow mrc_window;
 };
 
 struct TraceQueryResult {
@@ -84,6 +81,7 @@ struct HitAgeBucketRatio {
 
 struct MrcMetricInfo {
     std::string instance_id;
+    uint32_t target_basis_points = 0;
     int64_t capacity_bytes = 0;
 };
 

@@ -15,6 +15,22 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+std::string FormatTargetHitRatePercent(uint32_t target_basis_points) {
+    const uint32_t whole = target_basis_points / 100;
+    const uint32_t fraction = target_basis_points % 100;
+    if (fraction == 0) {
+        return std::to_string(whole);
+    }
+    if (fraction % 10 == 0) {
+        return std::to_string(whole) + "." + std::to_string(fraction / 10);
+    }
+    return std::to_string(whole) + "." + (fraction < 10 ? "0" : "") + std::to_string(fraction);
+}
+
+} // namespace
+
 #define DECLARE_METRICS(group, name) std::unique_ptr<kmonitor::MutableMetric> group##_##name##_metrics;
 
 struct OptimizerMetricsReporter::KmonContext {
@@ -221,7 +237,6 @@ bool OptimizerMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(query, capacity_efficiency);
 
     REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
-
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
         KVCM_LOG_ERROR("failed to register metric:[mrc]");
@@ -332,7 +347,8 @@ void OptimizerMetricsReporter::ReportInterval() {
     }
 
     for (const auto &metric : mrc_metrics) {
-        MetricsTags prom_tags = {{"instance_id", metric.instance_id}};
+        MetricsTags prom_tags = {{"instance_id", metric.instance_id},
+                                 {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         Gauge mrc = metrics_registry_->GetGauge("mrc", prom_tags);
         mrc = static_cast<double>(metric.capacity_bytes);
     }
@@ -379,7 +395,8 @@ void OptimizerMetricsReporter::ReportInterval() {
     }
 
     for (const auto &metric : mrc_metrics) {
-        MetricsTags base_tags = {{"instance_id", metric.instance_id}};
+        MetricsTags base_tags = {{"instance_id", metric.instance_id},
+                                 {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));
     }
