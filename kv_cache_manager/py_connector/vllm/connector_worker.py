@@ -36,7 +36,7 @@ if typing.TYPE_CHECKING:
     from vllm.attention import AttentionMetadata
 
 
-class WorkerCore:
+class ConnectorWorker:
     """State and hooks for the worker-role connector instance (one per TP rank)."""
 
     def __init__(self, extra_config, group_metas: List[GroupMeta],

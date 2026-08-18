@@ -156,8 +156,8 @@ _install_stubs()
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
     AttentionGroupMeta, GroupMeta, StateGroupMeta)
-from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore  # noqa: E402
-from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore  # noqa: E402
+from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler  # noqa: E402
+from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker  # noqa: E402
 
 
 def _make_group_metas(num_groups: int, num_state_groups: int,
@@ -180,8 +180,8 @@ def make_connector(manager_block_size: int = 16,
                    vllm_block_size: Optional[int] = None,
                    num_groups: int = 1,
                    num_state_groups: int = 0,
-                   tp_size: int = 1) -> WorkerCore:
-    """Build a bare WorkerCore (no __init__) with the minimal state used by
+                   tp_size: int = 1) -> ConnectorWorker:
+    """Build a bare ConnectorWorker (no __init__) with the minimal state used by
     the pure translation logic under test (block index translation, transfer
     group building).
 
@@ -189,7 +189,7 @@ def make_connector(manager_block_size: int = 16,
     after the ``num_groups`` attention groups, which is what turns on the
     hybrid-only logic (spec groups, per-block state completeness, hit
     truncation)."""
-    conn = WorkerCore.__new__(WorkerCore)
+    conn = ConnectorWorker.__new__(ConnectorWorker)
     conn._manager_block_size = manager_block_size
     conn._vllm_block_size = vllm_block_size or manager_block_size
     conn._tp_size = tp_size
@@ -234,17 +234,17 @@ class FakeLocationQueries:
         self._stored = None
 
 
-def make_scheduler_core(manager_block_size: int = 16,
+def make_connector_scheduler(manager_block_size: int = 16,
                         vllm_block_size: Optional[int] = None,
                         num_groups: int = 1,
                         num_state_groups: int = 0,
                         tp_size: int = 1,
-                        locations=None) -> SchedulerCore:
-    """Build a bare SchedulerCore (no __init__) with the scheduler-loop state
+                        locations=None) -> ConnectorScheduler:
+    """Build a bare ConnectorScheduler (no __init__) with the scheduler-loop state
     build_connector_meta and friends need, plus a FakeLocationQueries
     answering ``locations`` (None means "still in flight")."""
     from unittest.mock import MagicMock
-    core = SchedulerCore.__new__(SchedulerCore)
+    core = ConnectorScheduler.__new__(ConnectorScheduler)
     core._manager_block_size = manager_block_size
     core._vllm_block_size = vllm_block_size or manager_block_size
     core._tp_size = tp_size

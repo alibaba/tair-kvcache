@@ -22,9 +22,9 @@ import types
 import unittest
 
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
+from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 from kv_cache_manager.py_connector.vllm.v1_connector import (
-    attn_kv_views, ensure_hybrid_supported, GroupMeta,
-    AttentionGroupMeta)
+    attn_kv_views, ensure_hybrid_supported, GroupMeta)
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 
 ITEMSIZE = 2  # bf16/fp16
@@ -165,7 +165,7 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def _build(self, kv_caches):
         import unittest.mock as mock
-        import kv_cache_manager.py_connector.vllm.worker_core as wc
+        import kv_cache_manager.py_connector.vllm.connector_worker as wc
         conn = _make_group_conn()
         captured = []
 

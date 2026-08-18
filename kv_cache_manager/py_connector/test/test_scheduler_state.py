@@ -20,8 +20,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (
-    make_connector, make_scheduler_core, GroupMeta)
-from kv_cache_manager.py_connector.vllm.scheduler_core import RequestLedger
+    make_connector, make_connector_scheduler, GroupMeta)
+from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta, StateGroupMeta, parse_groups)
 from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
@@ -49,8 +49,8 @@ class FakeRequest:
 
 def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None,
                              num_groups=1, num_state_groups=0, tp_size=1):
-    """SchedulerCore with the scheduler-loop state and a mocked query manager."""
-    return make_scheduler_core(
+    """ConnectorScheduler with the scheduler-loop state and a mocked query manager."""
+    return make_connector_scheduler(
         manager_block_size=mbs, vllm_block_size=vllm_bs,
         num_groups=num_groups, num_state_groups=num_state_groups,
         tp_size=tp_size, locations=locations)
@@ -257,11 +257,11 @@ class TestSpecGroups(unittest.TestCase):
     have no sparsity (byte-identical requests, old-manager compatible)."""
 
     def test_full_attention_declares_no_groups(self):
-        conn = make_scheduler_core(num_groups=1, tp_size=2)
+        conn = make_connector_scheduler(num_groups=1, tp_size=2)
         self.assertEqual(conn._spec_groups(), [])
 
     def test_hybrid_declares_attn_and_full(self):
-        conn = make_scheduler_core(num_groups=1, num_state_groups=2, tp_size=2)
+        conn = make_connector_scheduler(num_groups=1, num_state_groups=2, tp_size=2)
         groups = {g["name"]: g["spec_names"] for g in conn._spec_groups()}
         self.assertEqual(sorted(groups), ["attn", "full"])
         # attn: the attention spec of every rank; full: every group of every rank.
@@ -282,13 +282,13 @@ class TestStateCompleteMask(unittest.TestCase):
                              token_len=0, has_saved_block_num=0)
 
     def test_full_attention_is_always_complete(self):
-        conn = make_scheduler_core(manager_block_size=16, num_groups=1)
+        conn = make_connector_scheduler(manager_block_size=16, num_groups=1)
         req = self._req([[7, 0, 9]])
         self.assertEqual(conn._state_complete_mask(req, range(3)),
                          [True, True, True])
 
     def test_null_state_blocks_are_incomplete(self):
-        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+        conn = make_connector_scheduler(manager_block_size=16, num_groups=1,
                                    num_state_groups=1)
         # State table: blocks 0 and 2 are null (no state), block 1 is real.
         req = self._req([[100, 101, 102], [0, 55, 0]])
@@ -296,7 +296,7 @@ class TestStateCompleteMask(unittest.TestCase):
                          [False, True, False])
 
     def test_all_state_groups_must_have_state(self):
-        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+        conn = make_connector_scheduler(manager_block_size=16, num_groups=1,
                                    num_state_groups=2)
         # Block 1 has a state in group 1 but not in group 2 -> incomplete.
         req = self._req([[100, 101], [7, 8], [7, 0]])
@@ -305,7 +305,7 @@ class TestStateCompleteMask(unittest.TestCase):
 
     def test_short_state_table_is_incomplete(self):
         # A state table that does not reach the block cannot prove a state.
-        conn = make_scheduler_core(manager_block_size=16, num_groups=1,
+        conn = make_connector_scheduler(manager_block_size=16, num_groups=1,
                                    num_state_groups=1)
         req = self._req([[100, 101], [55]])
         self.assertEqual(conn._state_complete_mask(req, range(2)),
@@ -444,7 +444,7 @@ class TestStartWriteCacheSpecGroups(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class TestParseBlockMask(unittest.TestCase):
     def setUp(self):
-        self.conn = make_scheduler_core(manager_block_size=16)
+        self.conn = make_connector_scheduler(manager_block_size=16)
 
     def test_offset_branch(self):
         resp = {"block_mask": {"offset": 2}}
@@ -602,9 +602,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     MBS = 16
 
     def _skipped_group0_connector(self):
-        """SchedulerCore where vLLM group 0 is a skipped drafter and group 1
+        """ConnectorScheduler where vLLM group 0 is a skipped drafter and group 1
         is the transferred attention group."""
-        conn = make_scheduler_core(manager_block_size=self.MBS)
+        conn = make_connector_scheduler(manager_block_size=self.MBS)
         conn._group_metas = [AttentionGroupMeta(
             group_idx=1, layer_names=["a0"],
             block_size=self.MBS, per_block_bytes=0)]
@@ -623,7 +623,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     def test_num_allocated_blocks_still_mins_transferred_groups(self):
         # Two transferred groups (1 and 2), one skipped drafter (0): min is
         # taken over the transferred ones only.
-        conn = make_scheduler_core(manager_block_size=self.MBS)
+        conn = make_connector_scheduler(manager_block_size=self.MBS)
         conn._group_metas = [
             AttentionGroupMeta(group_idx=1, layer_names=["a0"],
                                block_size=self.MBS, per_block_bytes=0),

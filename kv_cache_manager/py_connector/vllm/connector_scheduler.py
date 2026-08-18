@@ -11,7 +11,7 @@ never allocated are never tracked.
 Two small side tables carry the external-match discipline: ``_load_failed``
 (requests whose load came back invalid) and ``_load_attempted`` (requests
 that spent an external allocation -- relevant for hybrid models whose load
-failures cannot be reported). The worker side lives in worker_core; both
+failures cannot be reported). The worker side lives in connector_worker; both
 speak the vllm_common vocabulary.
 """
 
@@ -60,7 +60,7 @@ class RequestLedger:
     need_report_after_saving_finished: bool = False
 
 
-class SchedulerCore:
+class ConnectorScheduler:
     """State and hooks for the scheduler-role connector instance."""
 
     def __init__(self, extra_config, group_metas: List[GroupMeta],
