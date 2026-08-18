@@ -298,6 +298,7 @@ KVCM capacity_bytes    -> 一个 capacity_gb 容量点
 eviction_policy        -> lru
 enable_prefix_hash     -> true
 theoretical max        -> true
+ttl_seconds            -> 24 hours
 ```
 
 ### Instance 映射
@@ -333,6 +334,7 @@ OnlineOptimizerManager::RegisterInstance
 - KVCM 自动接入暂不推断 linear state；多 group 的语义不明确时标记为 unsupported 并跳过。
 - Subscriber 收到已知 unsupported Instance 的事件时直接丢弃，不触发配置刷新。
 - KVCM Group quota 被每个 Instance 分别作为完整容量模拟，不是共享 quota。
+- KVCM 自动创建的 Group 固定使用 24 小时 TTL，限制 LiteHit 保留的历史工作集。
 - Group 已存在时不检查 capacity、prefix hash、theoretical flag。
 - Instance 已存在时不检查 block size 和 specs。
 
