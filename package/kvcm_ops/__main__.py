@@ -23,6 +23,8 @@ COMMANDS = {
     "update_storage": "kvcm_ops.kvcm.storage.update_storage",
     "remove_storage": "kvcm_ops.kvcm.storage.remove_storage",
 
+    "bootstrap": "kvcm_ops.kvcm.bootstrap",
+
     "trace_key": "kvcm_ops.trace.trace_key",
     "trace_uri": "kvcm_ops.trace.trace_uri",
 
@@ -79,6 +81,8 @@ def main():
     remove_storage
   storage types (for add_storage/update_storage):
     nfs / pace / pace_ssd / 3fs / event_report_l1p5 / event_report_l2
+  bootstrap:
+    bootstrap
   trace:
     trace_key
     trace_uri
