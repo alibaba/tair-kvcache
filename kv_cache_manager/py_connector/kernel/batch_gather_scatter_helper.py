@@ -1,3 +1,35 @@
+"""Batch gather/scatter between paged KV caches and flat host buffers.
+
+Consumed by the vLLM connector only (the sglang connector moves its data
+through sglang's own hicache path and never touches this module).
+
+Two addressing modes per pointer:
+
+* flat (``block_stride == 0``): kernel pages are contiguous, so a token's
+  element offset is simply ``flat_token_idx * NUM_DIMS_PER_TOKEN``. This is
+  the whole story for the packed 4-D layout (vLLM >= 0.26.0) and the
+  KV-first split layout (vLLM <= 0.22.1), whose halves are flat.
+* strided (``block_stride != 0``): consecutive kernel pages of one pointer
+  are ``block_stride`` elements apart. Two layouts need it: the N-first
+  split layout (vLLM 0.23.0-0.25.x) interleaves K and V per block
+  (``t[:, 0]`` / ``t[:, 1]`` halves), and page_size_padded allocations
+  leave a gap the kernel must skip. The offset decomposes the flat token
+  index into (kernel page, position in page):
+
+      kv_block_idx        = flat_token_idx // local_block_size
+      token_in_kv_block   = flat_token_idx % local_block_size
+      offset              = kv_block_idx * block_stride
+                            + token_in_kv_block * NUM_DIMS_PER_TOKEN
+
+  (local_block_size is the tensor's page size, which may differ from the
+  manager block size on padded allocations.)
+
+Every pointer in the array is its own base (K and V halves included), so
+there is no K->V stride to add. The layout each pointer came from travels
+on AttentionTransferGroup.kv_layout; the GPU test in test/kernel checks
+both modes element-wise against naive torch indexing.
+"""
+
 from typing import List, Optional, Union
 
 import torch
