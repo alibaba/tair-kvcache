@@ -49,16 +49,17 @@ def is_hybrid_model(model_path: str) -> bool:
     except Exception:
         return False
     text_cfg = cfg.get("text_config", cfg)
-    # Best signal first: the architecture names the model family declares
-    # (e.g. Qwen3NextForCausalLM). Fallback heuristics for configs that
-    # only expose layer knobs: hybrid models interleave linear/mamba layers
-    # with full attention via full_attention_interval / linear_* keys.
+    # Any known hybrid marker wins: architecture names cover the families we
+    # know (e.g. Qwen3NextForCausalLM), the layer knobs cover configs that
+    # interleave linear/mamba layers with full attention without naming a
+    # known family (e.g. Qwen3_5ForConditionalGeneration declares its own
+    # architecture). The signals are ORed -- a non-matching architecture
+    # string must never shadow the knobs.
     archs = ", ".join(cfg.get("architectures", []) or [])
-    if archs:
-        hybrid_markers = ("Qwen3Next", "Zamba", "FalconH1", "Samba", "Jamba")
-        return any(m in archs for m in hybrid_markers)
+    arch_markers = ("Qwen3Next", "Zamba", "FalconH1", "Samba", "Jamba")
     return (
-        "full_attention_interval" in text_cfg
+        any(m in archs for m in arch_markers)
+        or "full_attention_interval" in text_cfg
         or "linear_conv_kernel_dim" in text_cfg
         or str(cfg.get("model_type", "")).startswith("qwen3_")
     )

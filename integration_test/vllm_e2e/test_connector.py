@@ -361,7 +361,10 @@ class MutatedConnector(VerifyingConnector):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # The translation lives on the ConnectorWorker since the role split;
-        # swap the role instance (state included) for the mutated subclass.
+        # swap the worker-role instance (state included) for the mutated
+        # subclass. Scheduler-role instances have no worker to mutate.
+        if self.connector_worker is None:
+            return
         mutated = MutatedWorkerCore.__new__(MutatedWorkerCore)
         mutated.__dict__.update(self.connector_worker.__dict__)
         self.connector_worker = mutated
