@@ -21,7 +21,8 @@ from unittest.mock import MagicMock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector, make_scheduler_core, ReqState, GroupMeta)
-from kv_cache_manager.py_connector.vllm.vllm_common import parse_groups
+from kv_cache_manager.py_connector.vllm.vllm_common import (
+    AttentionGroupMeta, StateGroupMeta, parse_groups)
 from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
 from kv_cache_manager.py_connector.vllm.metadata import (
     SaveRequest, LoadRequest, TairKvCacheConnectorMetadata)
@@ -478,7 +479,7 @@ class TestParseGroups(unittest.TestCase):
             [self._attn_group(["l0", "l1"], block_size=16, page_size_bytes=32768)], mbs)
         self.assertEqual(len(metas), 1)
         m = metas[0]
-        self.assertTrue(m.is_attention)
+        self.assertIsInstance(m, AttentionGroupMeta)
         self.assertEqual(m.group_idx, 0)
         self.assertEqual(m.block_size, 16)
         # per_token = 32768 // 16 = 2048; per_block = 2048 * 32 (manager) * 2 layers
@@ -492,7 +493,8 @@ class TestParseGroups(unittest.TestCase):
             self._attn_group(["a0"], block_size=528, page_size_bytes=528 * 64),
         ], mbs)
         self.assertEqual([m.group_idx for m in metas], [0, 1, 2])
-        self.assertEqual([m.is_attention for m in metas], [False, False, True])
+        self.assertEqual([type(m).__name__ for m in metas],
+                         ['StateGroupMeta', 'StateGroupMeta', 'AttentionGroupMeta'])
         self.assertEqual(metas[0].per_block_bytes, 1000 * 2)  # page * layers
         self.assertEqual(metas[1].per_block_bytes, 2000)
         self.assertEqual(metas[2].per_block_bytes, 64 * 528)  # per_token * mbs
@@ -587,8 +589,8 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         """SchedulerCore where vLLM group 0 is a skipped drafter and group 1
         is the transferred attention group."""
         conn = make_scheduler_core(manager_block_size=self.MBS)
-        conn._group_metas = [GroupMeta(
-            group_idx=1, is_attention=True, layer_names=["a0"],
+        conn._group_metas = [AttentionGroupMeta(
+            group_idx=1, layer_names=["a0"],
             block_size=self.MBS, per_block_bytes=0)]
         conn._num_groups = 1
         return conn
@@ -608,10 +610,11 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         # taken over the transferred ones only.
         conn = make_scheduler_core(manager_block_size=self.MBS)
         conn._group_metas = [
-            GroupMeta(group_idx=1, is_attention=True, layer_names=["a0"],
-                      block_size=self.MBS, per_block_bytes=0),
-            GroupMeta(group_idx=2, is_attention=False, layer_names=["m0"],
-                      block_size=self.MBS, per_block_bytes=0),
+            AttentionGroupMeta(group_idx=1, layer_names=["a0"],
+                               block_size=self.MBS, per_block_bytes=0),
+            StateGroupMeta(group_idx=2, layer_names=["m0"],
+                           block_size=self.MBS, per_block_bytes=0,
+                           page_size_bytes=0),
         ]
         conn._num_groups = 2
         req = ReqState(
@@ -633,8 +636,8 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         # table of the single transferred group -- which is group 1 here, not
         # group 0.
         conn = make_connector(manager_block_size=self.MBS)
-        conn._group_metas = [GroupMeta(
-            group_idx=1, is_attention=True, layer_names=["a0"],
+        conn._group_metas = [AttentionGroupMeta(
+            group_idx=1, layer_names=["a0"],
             block_size=self.MBS, per_block_bytes=0)]
         conn._num_groups = 1
         conn._extra_config = SimpleNamespace(block_per_load_task=8)

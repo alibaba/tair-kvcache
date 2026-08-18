@@ -23,7 +23,9 @@ import unittest
 
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
 from kv_cache_manager.py_connector.vllm.v1_connector import (
-    attn_kv_views, ensure_hybrid_supported, GroupMeta)
+    attn_kv_views, ensure_hybrid_supported, GroupMeta,
+    AttentionGroupMeta)
+from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 
 ITEMSIZE = 2  # bf16/fp16
 BASE_PTR = 1 << 20
@@ -91,7 +93,8 @@ def n_first_5d(n=10, b=16, h=4, d=128, base=BASE_PTR):
 
 class TestAttnKvViews(unittest.TestCase):
     def test_packed_4d(self):
-        views = attn_kv_views(packed_4d())
+        views, layout = attn_kv_views(packed_4d())
+        self.assertIs(layout, KVLayout.PACKED_4D)
         self.assertEqual(len(views), 1)
         v = views[0]
         self.assertEqual(v.shape, (10, 16, 4, 256))          # (n, b, h, 2d)
@@ -99,7 +102,8 @@ class TestAttnKvViews(unittest.TestCase):
         self.assertEqual(v.data_ptr(), BASE_PTR)             # storage base
 
     def test_kv_first_5d(self):
-        views = attn_kv_views(kv_first_5d())
+        views, layout = attn_kv_views(kv_first_5d())
+        self.assertIs(layout, KVLayout.SPLIT_KV_5D_KV_FIRST)
         self.assertEqual(len(views), 2)
         k, v = views
         for view in (k, v):
@@ -111,7 +115,8 @@ class TestAttnKvViews(unittest.TestCase):
                          10 * 16 * 4 * 128 * ITEMSIZE)
 
     def test_n_first_5d(self):
-        views = attn_kv_views(n_first_5d())
+        views, layout = attn_kv_views(n_first_5d())
+        self.assertIs(layout, KVLayout.SPLIT_KV_5D_N_FIRST)
         self.assertEqual(len(views), 2)
         k, v = views
         for view in (k, v):
@@ -148,8 +153,8 @@ def _make_group_conn():
 
 
 def _attn_meta(layer_names, block_size=16):
-    return GroupMeta(group_idx=0, is_attention=True, layer_names=layer_names,
-                     block_size=block_size, per_block_bytes=0)
+    return AttentionGroupMeta(group_idx=0, layer_names=layer_names,
+                               block_size=block_size, per_block_bytes=0)
 
 
 class TestBuildTransferGroup(unittest.TestCase):
@@ -171,7 +176,7 @@ class TestBuildTransferGroup(unittest.TestCase):
             return t
 
         with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
-            g = conn._build_transfer_group(
+            g = conn._build_attention_group(
                 _attn_meta(list(kv_caches.keys())), kv_caches)
         return g, captured
 

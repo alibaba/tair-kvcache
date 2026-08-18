@@ -19,7 +19,8 @@ from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQu
 from kv_cache_manager.py_connector.vllm.metadata import (
     FinishRequest, LoadRequest, ReqStateToWorker, SaveRequest, TairKvCacheConnectorMetadata)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, ReqState, build_spec_groups, spec_name)
+    ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, ReqState, StateGroupMeta,
+    build_spec_groups, spec_name)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -37,7 +38,8 @@ class SchedulerCore:
         self._extra_config = extra_config
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
-        self._state_group_idxs = [m.group_idx for m in group_metas if not m.is_attention]
+        self._state_group_idxs = [m.group_idx for m in group_metas
+                                  if isinstance(m, StateGroupMeta)]
         self._manager_block_size = manager_block_size
         self._vllm_block_size = vllm_block_size
         self._tp_size = tp_size

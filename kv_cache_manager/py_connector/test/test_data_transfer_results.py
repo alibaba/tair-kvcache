@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager, MultiResult)
+from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMsgSerializer)
 
@@ -147,19 +148,21 @@ class TestNullStateBlocks(unittest.TestCase):
 
     @staticmethod
     def _state_group():
-        from kv_cache_manager.py_connector.common.types import TransferGroup
-        return TransferGroup(
-            group_idx=0, spec_name="tp0_g0", is_attention=False,
+        from kv_cache_manager.py_connector.vllm.transfer_types import StateTransferGroup
+        return StateTransferGroup(
+            group_idx=0, spec_name="tp0_g0",
             layer_names=["m0"], block_size=528, per_block_bytes=1024,
-            kernel_block_size=528)
+            layer_num=1, block_view_tensors=[], page_size_bytes=1024)
 
     @staticmethod
     def _attn_group():
-        from kv_cache_manager.py_connector.common.types import TransferGroup
-        return TransferGroup(
-            group_idx=1, spec_name="tp0_g1", is_attention=True,
+        from kv_cache_manager.py_connector.vllm.transfer_types import AttentionTransferGroup
+        return AttentionTransferGroup(
+            group_idx=1, spec_name="tp0_g1",
             layer_names=["a0"], block_size=528, per_block_bytes=1024,
-            kernel_block_size=528)
+            layer_num=1, kv_layout=KVLayout.PACKED_4D,
+            kvcache_ptr_tensor_gpu=None, num_kv_ptrs=1, per_token_dim=8,
+            kernel_block_size=528, block_stride=0)
 
     def _run(self, method, **kwargs):
         dtm = _make_dtm()

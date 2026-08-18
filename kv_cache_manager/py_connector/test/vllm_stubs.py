@@ -155,7 +155,7 @@ _install_stubs()
 
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
-    GroupMeta, ReqState)
+    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta)
 from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore  # noqa: E402
 from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore  # noqa: E402
 
@@ -165,13 +165,13 @@ def _make_group_metas(num_groups: int, num_state_groups: int,
     """Attention groups first, then mamba-style state groups; group_idx is the
     vLLM group index (what block tables are indexed by)."""
     return [
-        GroupMeta(group_idx=i, is_attention=True, layer_names=[f"l{i}"],
-                  block_size=block_size, per_block_bytes=0)
+        AttentionGroupMeta(group_idx=i, layer_names=[f"l{i}"],
+                           block_size=block_size, per_block_bytes=0)
         for i in range(num_groups)
     ] + [
-        GroupMeta(group_idx=num_groups + i, is_attention=False,
-                  layer_names=[f"m{i}"], block_size=block_size,
-                  per_block_bytes=0)
+        StateGroupMeta(group_idx=num_groups + i, layer_names=[f"m{i}"],
+                       block_size=block_size, per_block_bytes=0,
+                       page_size_bytes=0)
         for i in range(num_state_groups)
     ]
 
@@ -200,7 +200,7 @@ def make_connector(manager_block_size: int = 16,
         num_groups, num_state_groups, conn._vllm_block_size)
     conn._num_groups = len(conn._group_metas)
     conn._state_group_idxs = [m.group_idx for m in conn._group_metas
-                              if not m.is_attention]
+                              if isinstance(m, StateGroupMeta)]
     return conn
 
 
@@ -222,7 +222,7 @@ def make_scheduler_core(manager_block_size: int = 16,
         num_groups, num_state_groups, core._vllm_block_size)
     core._num_groups = len(core._group_metas)
     core._state_group_idxs = [m.group_idx for m in core._group_metas
-                              if not m.is_attention]
+                              if isinstance(m, StateGroupMeta)]
     core._epoch = 0
     core._alive_requests = {}
     core._waiting_to_load_requests = []

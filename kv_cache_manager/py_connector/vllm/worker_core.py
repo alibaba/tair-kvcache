@@ -20,13 +20,14 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     SaveContext, TpCoordinatorClient, TpCoordinatorServer)
-from kv_cache_manager.py_connector.common.types import KVCacheInfo, TransferGroup
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     MultiResult, DataTransferManager, _get_device_module)
 from kv_cache_manager.py_connector.vllm.metadata import (
     FinishRequest, TairKvCacheConnectorMetadata)
+from kv_cache_manager.py_connector.vllm.transfer_types import (
+    AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    GroupMeta, ReqState, attn_kv_views, spec_name)
+    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta, attn_kv_views, spec_name)
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -121,16 +122,31 @@ class WorkerCore:
     # ------------------------------------------------------------------ #
     # KV cache registration
     # ------------------------------------------------------------------ #
+    @property
+    def is_hybrid(self) -> bool:
+        """True when the model mixes attention and state groups (mamba).
+
+        A semantic projection of the group table: callers care about 'can
+        load failures be reported' / 'are there sparse states', not about
+        the group count itself."""
+        return any(isinstance(m, StateGroupMeta) for m in self._group_metas)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
         first_attn = next(kv_caches[name]
-                          for meta in self._group_metas if meta.is_attention
+                          for meta in self._group_metas
+                          if isinstance(meta, AttentionGroupMeta)
                           for name in meta.layer_names)
         self._dtype = first_attn.dtype
         self._device = first_attn.device
         self._device_mod = _get_device_module(self._device)
 
-        groups = [self._build_transfer_group(meta, kv_caches) for meta in self._group_metas]
+        groups: List[TransferGroup] = []
+        for meta in self._group_metas:
+            if isinstance(meta, AttentionGroupMeta):
+                groups.append(self._build_attention_group(meta, kv_caches))
+            else:
+                groups.append(self._build_state_group(meta, kv_caches))
 
         self._kvcache_info = KVCacheInfo(
             tp_rank=self._tp_rank,
@@ -144,64 +160,66 @@ class WorkerCore:
             self._transfer_client, self._coordinator_client, self._extra_config)
 
         logger.warning("register_kv_caches done: %s", [
-            (g.spec_name, "attn" if g.is_attention else "state",
-             g.layer_num, g.per_block_bytes) for g in groups])
+            (g.spec_name, type(g).__name__, g.layer_num, g.per_block_bytes)
+            for g in groups])
 
-    def _build_transfer_group(self, meta: GroupMeta, kv_caches) -> TransferGroup:
+    def _build_attention_group(self, meta: AttentionGroupMeta,
+                               kv_caches) -> AttentionTransferGroup:
         spec = self._self_spec_names[meta.group_idx]
-        if meta.is_attention:
-            tensors = [kv_caches[name] for name in meta.layer_names]
-            ref = tensors[0]
-            for t in tensors:
-                assert t.shape == ref.shape and t.stride() == ref.stride(), \
-                    "attention layers in one group must share shape/stride"
-            # Normalize the layout into per-pointer token-major views of shape
-            # (num_blocks, kernel_block_size, heads, content_dim); everything
-            # below is layout-independent. Split-K/V layouts (vllm <= 0.25.x)
-            # yield two views (= two transfer pointers) per layer, the packed
-            # layout (vllm >= 0.26.0) yields one.
-            ref_views = attn_kv_views(ref)
-            view = ref_views[0]
-            kernel_block_size = view.shape[1]
-            assert meta.block_size % kernel_block_size == 0, \
-                f"group block size {meta.block_size} not a multiple of kernel " \
-                f"block size {kernel_block_size}"
-            per_token_dim = view.shape[2] * view.shape[3]  # heads * content_dim
-            # The gather/scatter kernel needs token-major memory inside a page:
-            # logical dims (blk, tok, head, dim) contiguous within a block. This
-            # is vLLM's NHD order; HND would interleave heads across tokens.
-            for v in ref_views:
-                assert v.stride()[1:] == (per_token_dim, v.shape[3], 1), \
-                    f"kv cache page not token-major: shape={tuple(v.shape)} " \
-                    f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
-            # Non-flat block layouts (page_size_padded gaps, or split K/V
-            # interleaved per block as in the 5-D N-first layout) go through the
-            # kernel's strided path. Stride 0 = fast flat indexing.
-            flat = view.stride(0) == kernel_block_size * per_token_dim
-            block_stride = 0 if flat else view.stride(0)
-            # Pointer array ordered [K0, V0, K1, V1, ...] for split layouts and
-            # [L0, L1, ...] for the packed layout; each view's data_ptr() is its
-            # own storage base, so the kernel never adds a K->V offset.
-            ptrs = [v.data_ptr() for t in tensors for v in attn_kv_views(t)]
-            ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cpu").to(self._device)
-            return TransferGroup(
-                group_idx=meta.group_idx,
-                spec_name=spec,
-                is_attention=True,
-                layer_names=meta.layer_names,
-                block_size=meta.block_size,
-                per_block_bytes=meta.per_block_bytes,
-                kvcache_ptr_tensor_gpu=ptr_tensor,
-                layer_num=len(meta.layer_names),
-                num_kv_ptrs=len(ptrs),
-                per_token_dim=per_token_dim,
-                kernel_block_size=kernel_block_size,
-                kv_stride=0,
-                block_stride=block_stride,
-            )
+        tensors = [kv_caches[name] for name in meta.layer_names]
+        ref = tensors[0]
+        for t in tensors:
+            assert t.shape == ref.shape and t.stride() == ref.stride(), \
+                "attention layers in one group must share shape/stride"
+        # Normalize the layout into per-pointer token-major views of shape
+        # (num_blocks, kernel_block_size, heads, content_dim); everything
+        # below is layout-independent. Split-K/V layouts (vllm <= 0.25.x)
+        # yield two views (= two transfer pointers) per layer, the packed
+        # layout (vllm >= 0.26.0) yields one.
+        ref_views, kv_layout = attn_kv_views(ref)
+        view = ref_views[0]
+        kernel_block_size = view.shape[1]
+        assert meta.block_size % kernel_block_size == 0, \
+            f"group block size {meta.block_size} not a multiple of kernel " \
+            f"block size {kernel_block_size}"
+        per_token_dim = view.shape[2] * view.shape[3]  # heads * content_dim
+        # The gather/scatter kernel needs token-major memory inside a page:
+        # logical dims (blk, tok, head, dim) contiguous within a block. This
+        # is vLLM's NHD order; HND would interleave heads across tokens.
+        for v in ref_views:
+            assert v.stride()[1:] == (per_token_dim, v.shape[3], 1), \
+                f"kv cache page not token-major: shape={tuple(v.shape)} " \
+                f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
+        # Non-flat block layouts (page_size_padded gaps, or split K/V
+        # interleaved per block as in the 5-D N-first layout) go through the
+        # kernel's strided path. Stride 0 = fast flat indexing.
+        flat = view.stride(0) == kernel_block_size * per_token_dim
+        block_stride = 0 if flat else view.stride(0)
+        # Pointer array ordered [K0, V0, K1, V1, ...] for split layouts and
+        # [L0, L1, ...] for the packed layout; each view's data_ptr() is its
+        # own storage base, so the kernel never adds a K->V offset.
+        ptrs = [v.data_ptr() for t in tensors for v in attn_kv_views(t)[0]]
+        ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cpu").to(self._device)
+        return AttentionTransferGroup(
+            group_idx=meta.group_idx,
+            spec_name=spec,
+            layer_names=meta.layer_names,
+            block_size=meta.block_size,
+            per_block_bytes=meta.per_block_bytes,
+            layer_num=len(meta.layer_names),
+            kv_layout=kv_layout,
+            kvcache_ptr_tensor_gpu=ptr_tensor,
+            num_kv_ptrs=len(ptrs),
+            per_token_dim=per_token_dim,
+            kernel_block_size=kernel_block_size,
+            block_stride=block_stride,
+        )
 
+    def _build_state_group(self, meta: StateGroupMeta,
+                           kv_caches) -> StateTransferGroup:
         # Mamba/state group: each layer is a list[Tensor] sharing one storage;
         # rebuild a (num_blocks, page_size_bytes) byte view for opaque copy.
+        spec = self._self_spec_names[meta.group_idx]
         block_views = []
         for name in meta.layer_names:
             states = kv_caches[name]
@@ -217,10 +235,9 @@ class WorkerCore:
                 f"state layer {name}: storage {storage.nbytes()} < {need}"
             byte_view = torch.tensor([], dtype=torch.uint8, device=self._device).set_(storage)
             block_views.append(byte_view[:need].view(num_blocks, meta.page_size_bytes))
-        return TransferGroup(
+        return StateTransferGroup(
             group_idx=meta.group_idx,
             spec_name=spec,
-            is_attention=False,
             layer_names=meta.layer_names,
             block_size=meta.block_size,
             per_block_bytes=meta.per_block_bytes,
@@ -232,7 +249,7 @@ class WorkerCore:
     # ------------------------------------------------------------------ #
     # Block index translation
     # ------------------------------------------------------------------ #
-    def _attn_token_indices(self, group: TransferGroup, manager_block_idxes,
+    def _attn_token_indices(self, group: AttentionTransferGroup, manager_block_idxes,
                             block_table) -> List[List[int]]:
         """Map manager blocks to flat token slots of one attention group.
 
@@ -260,7 +277,7 @@ class WorkerCore:
             out.append(idxs)
         return out
 
-    def _state_block_ids(self, group: TransferGroup, manager_block_idxes,
+    def _state_block_ids(self, group: StateTransferGroup, manager_block_idxes,
                          block_table) -> List[int]:
         """Map manager blocks to block ids of a state (mamba) group.
 
@@ -283,26 +300,6 @@ class WorkerCore:
                 f"group block {logical} out of range (len={len(block_table)})")
             out.append(block_table[logical])
         return out
-
-    def _self_uris(self, locations, spec_name_: str) -> List[Optional[str]]:
-        """This rank's URI for ``spec_name`` in every location, positionally.
-
-        ``None`` marks a block that carries no data for this spec: hybrid
-        models publish per-block spec coverage (see ``build_spec_groups``),
-        so a block saved without a recurrent state has no URI for the state
-        specs. Positional alignment with the block list is what makes that
-        legible -- a flat list of "the URIs that exist" would silently shift
-        blocks.
-        """
-        uris: List[Optional[str]] = []
-        for location in locations:
-            uri = None
-            for spec in location.get("location_specs", []):
-                if spec["name"] == spec_name_:
-                    uri = spec["uri"]
-                    break
-            uris.append(uri)
-        return uris
 
     # ------------------------------------------------------------------ #
     # Load / save
@@ -334,12 +331,19 @@ class WorkerCore:
             logger.warning("%d locations for %d blocks, skip transfer",
                            len(locations), num_blocks)
             return None
+        # One pass over the locations: per block, map spec name -> uri. The
+        # per-group extraction below then reads by name instead of rescanning
+        # every location's spec list for every group.
+        per_block_uri_maps = [
+            {s["name"]: s["uri"] for s in location.get("location_specs", [])}
+            for location in locations]
+        self._check_block_table_covers(block_ids_per_group)
         plans = []
         for group in self._kvcache_info.groups:
-            uris = self._self_uris(locations, group.spec_name)
+            uris = [m.get(group.spec_name) for m in per_block_uri_maps]
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
-            if group.is_attention:
+            if isinstance(group, AttentionTransferGroup):
                 plans.append((group, uris,
                               self._attn_token_indices(group, manager_block_idxes, block_table),
                               None))
@@ -347,6 +351,21 @@ class WorkerCore:
                 plans.append((group, uris, None,
                               self._state_block_ids(group, manager_block_idxes, block_table)))
         return plans
+
+    def _check_block_table_covers(self, block_ids_per_group) -> None:
+        """``block_ids_per_group`` is indexed by the raw vLLM group index --
+        a guarantee vLLM provides today
+        (https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/core/sched/output.py,
+        CachedRequestData.new_block_ids: one entry per kv cache group) but
+        that we must not silently rely on. Fail loudly when the table cannot
+        address every transferred group."""
+        if not block_ids_per_group:
+            return
+        need = max(m.group_idx for m in self._group_metas)
+        assert len(block_ids_per_group) > need, (
+            f"block table has {len(block_ids_per_group)} groups but the "
+            f"connector transfers vLLM group {need}; the group-index "
+            f"alignment between vLLM and this connector is broken")
 
     def start_load_kv(self, forward_context: "ForwardContext",
                       meta: TairKvCacheConnectorMetadata, **kwargs) -> None:
@@ -374,7 +393,7 @@ class WorkerCore:
             # output. Remove report_failures gating once upstream supports
             # multi-group invalid-block recovery.
             report_ids = []
-            if self._num_groups == 1:
+            if not self.is_hybrid:
                 # Index by the transferred group's own vLLM group index: with
                 # skipped groups (EAGLE/MTP drafters) the single transferred
                 # group is not necessarily group 0.
@@ -386,7 +405,7 @@ class WorkerCore:
             done_cb = self._data_transfer.create_load_done_callback(
                 load_req.req_id, self._tp_rank, meta.epoch,
                 copy.copy(report_ids), num_blocks,
-                report_failures=self._num_groups == 1)
+                report_failures=not self.is_hybrid)
 
             if plans is None:
                 # Nothing submitted; report the whole load as failed.

@@ -25,7 +25,8 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     SendBlockFinishedEvent, LoadBlockFinishedEvent,
 )
 from kv_cache_manager.py_connector.common.logger import logger
-from kv_cache_manager.py_connector.common.types import KVCacheInfo, TransferGroup
+from kv_cache_manager.py_connector.vllm.transfer_types import (
+    AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup)
 from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
 
 
@@ -163,7 +164,7 @@ class DataTransferManager:
 
         Attention KV is never sparse, so a missing location simply fails.
         """
-        if group.is_attention:
+        if isinstance(group, AttentionTransferGroup):
             failed = {i for i in range(n) if remote_uris[i] is None}
             if failed:
                 logger.warning("save group %s: %d/%d attention blocks have no "
@@ -203,7 +204,7 @@ class DataTransferManager:
         target with nothing published -- is a genuine failure: the request would
         run on an unwritten state.
         """
-        if group.is_attention:
+        if isinstance(group, AttentionTransferGroup):
             missing = sum(uri is None for uri in remote_uris)
             if missing:
                 logger.warning("load group %s: %d/%d attention blocks have no "
@@ -228,7 +229,7 @@ class DataTransferManager:
             ready_event.wait()
             gpu_buffer = torch.empty(len(valid) * group.per_block_bytes,
                                      dtype=torch.uint8, device=self._device)
-            if group.is_attention:
+            if isinstance(group, AttentionTransferGroup):
                 view = gpu_buffer.view(self._info.dtype).view(
                     len(valid), group.num_kv_ptrs,
                     self._manager_block_size, group.per_token_dim)
@@ -338,7 +339,7 @@ class DataTransferManager:
         if ok:
             with self._device_mod.stream(self._load_stream):
                 gpu_buffer = cpu_buffer.to(self._device, non_blocking=True)
-                if group.is_attention:
+                if isinstance(group, AttentionTransferGroup):
                     view = gpu_buffer.view(self._info.dtype).view(
                         len(valid), group.num_kv_ptrs,
                         self._manager_block_size, group.per_token_dim)

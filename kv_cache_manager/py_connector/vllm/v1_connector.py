@@ -53,8 +53,8 @@ from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMeta
 from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore
 from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    GroupMeta, ReqState, attn_kv_views, build_spec_groups, ensure_hybrid_supported,
-    parse_groups, spec_name)
+    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta, attn_kv_views,
+    build_spec_groups, ensure_hybrid_supported, parse_groups, spec_name)
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -122,7 +122,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._group_metas = parse_groups(kv_cache_config, manager_block_size)
         self._num_groups = len(self._group_metas)
         self._state_group_idxs = [m.group_idx for m in self._group_metas
-                                  if not m.is_attention]
+                                  if isinstance(m, StateGroupMeta)]
 
         deployment = {
             "model_name": model_config.served_model_name,

@@ -16,6 +16,9 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.vllm.transfer_types import (
+    KVLayout,
+)
 
 # Spec group names advertised at registration and used per key in
 # start_write_cache. See build_spec_groups for the semantics.
@@ -48,12 +51,13 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     groups at all, which keeps their requests byte-identical to before (and
     compatible with managers that predate spec groups).
     """
-    state_groups = [m for m in group_metas if not m.is_attention]
+    state_groups = [m for m in group_metas if isinstance(m, StateGroupMeta)]
     if not state_groups:
         return []
     attn_specs = sorted(
         spec_name(rank, meta.group_idx)
-        for rank in range(tp_size) for meta in group_metas if meta.is_attention)
+        for rank in range(tp_size)
+        for meta in group_metas if isinstance(meta, AttentionGroupMeta))
     all_specs = sorted(
         spec_name(rank, meta.group_idx)
         for rank in range(tp_size) for meta in group_metas)
@@ -61,20 +65,33 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
             {"name": FULL_SPEC_GROUP, "spec_names": all_specs}]
 
 
-@dataclass
+@dataclass(frozen=True)
 class GroupMeta:
-    """Static description of one kv_cache_group, derived from KVCacheConfig.
-
-    Available in both scheduler and worker roles (before tensors exist)."""
+    """Static description of one kv_cache_group, derived from KVCacheConfig
+    (see parse_groups). Available in both scheduler and worker roles (before
+    tensors exist). Kind-specific subclasses carry the kind-specific sizing."""
 
     group_idx: int
-    is_attention: bool
     layer_names: List[str]
     # The group's block table granularity in tokens (spec.block_size).
     block_size: int
     # Bytes stored per manager block for the whole group.
     per_block_bytes: int
-    # Mamba only: bytes per block per layer (page_size_bytes of the spec).
+
+
+@dataclass(frozen=True)
+class AttentionGroupMeta(GroupMeta):
+    """FullAttentionSpec group: token-granular KV, re-blockable to the
+    manager block size. Sizing derives from the *compact* page size (see
+    parse_groups)."""
+
+
+@dataclass(frozen=True)
+class StateGroupMeta(GroupMeta):
+    """MambaSpec group: one opaque state per block, verbatim byte copies.
+    page_size_bytes is per layer; per_block_bytes = page_size_bytes * layers."""
+
+    # Bytes per block per state layer (spec.page_size_bytes).
     page_size_bytes: int = 0
 
 
@@ -134,7 +151,10 @@ class ReqState:
 
 
 def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
-    """Derive the transferable GroupMeta list from vLLM's KVCacheConfig."""
+    """Derive the transferable GroupMeta list from vLLM's KVCacheConfig
+    (https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/kv_cache_interface.py#L952:
+    kv_cache_groups holds one KVCacheGroupSpec per block table, each with its
+    kv_cache_spec -- FullAttentionSpec at L227, MambaSpec at L690)."""
     metas = []
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
         if getattr(group, "is_eagle_group", False):
@@ -142,9 +162,8 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
             continue
         spec = group.kv_cache_spec
         if isinstance(spec, MambaSpec):
-            metas.append(GroupMeta(
+            metas.append(StateGroupMeta(
                 group_idx=idx,
-                is_attention=False,
                 layer_names=list(group.layer_names),
                 block_size=spec.block_size,
                 per_block_bytes=spec.page_size_bytes * len(group.layer_names),
@@ -180,9 +199,8 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
                         f"size; padded attention layouts are unsupported here")
                 compact_page_bytes = spec.page_size_bytes
             per_token_bytes = compact_page_bytes // spec.block_size
-            metas.append(GroupMeta(
+            metas.append(AttentionGroupMeta(
                 group_idx=idx,
-                is_attention=True,
                 layer_names=list(group.layer_names),
                 block_size=spec.block_size,
                 per_block_bytes=per_token_bytes * manager_block_size * len(group.layer_names),
@@ -194,12 +212,12 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
     return metas
 
 
-def attn_kv_views(ref: torch.Tensor) -> List[torch.Tensor]:
+def attn_kv_views(ref: torch.Tensor) -> tuple:
     """Normalize one attention layer's paged KV cache into per-pointer views.
 
     vLLM's flash_attn backend changed ``get_kv_cache_shape`` twice; the three
-    layouts are detected from the tensor shape itself (never from version
-    strings):
+    layouts (see KVLayout for the per-version source links) are detected from
+    the tensor shape itself (never from version strings):
 
     * 4-D ``(num_blocks, H, block, 2*D)``  -- K/V packed into the content dim
       (vLLM >= 0.26.0). One transfer pointer per layer.
@@ -208,15 +226,16 @@ def attn_kv_views(ref: torch.Tensor) -> List[torch.Tensor]:
     * 5-D ``(2, num_blocks, block, H, D)`` -- KV-first split K/V
       (vLLM <= 0.22.1). Two pointers per layer: ``t[0]`` / ``t[1]``.
 
-    Every returned view has the logical shape
+    Returns ``(views, layout)``. Every view has the logical shape
     ``(num_blocks, kernel_block_size, heads, content_dim)`` matching the NHD
     memory order, so all downstream math (per-token dim, token-major check,
-    block stride, data_ptr) is layout-independent. Unrecognized layouts raise.
+    block stride, data_ptr) is layout-independent -- the layout travels along
+    only for traceability. Unrecognized layouts raise.
     """
     if ref.dim() == 4:
         # Packed content dim; permute to token-major logical order. The permuted
         # view shares storage, data_ptr() is the storage base.
-        return [ref.permute(0, 2, 1, 3)]
+        return [ref.permute(0, 2, 1, 3)], KVLayout.PACKED_4D
     if ref.dim() == 5:
         kv_first = ref.shape[0] == 2
         n_first = ref.shape[1] == 2
@@ -225,9 +244,9 @@ def attn_kv_views(ref: torch.Tensor) -> List[torch.Tensor]:
                 f"ambiguous kv layout {tuple(ref.shape)}: cannot tell the K/V "
                 f"dim from a num_blocks dim of size 2")
         if kv_first:
-            return [ref[0], ref[1]]
+            return [ref[0], ref[1]], KVLayout.SPLIT_KV_5D_KV_FIRST
         if n_first:
-            return [ref[:, 0], ref[:, 1]]
+            return [ref[:, 0], ref[:, 1]], KVLayout.SPLIT_KV_5D_N_FIRST
     raise NotImplementedError(
         f"unrecognized kv cache layout {tuple(ref.shape)}; expected the packed "
         f"4-D (vllm >= 0.26.0) or one of the split K/V 5-D layouts "
