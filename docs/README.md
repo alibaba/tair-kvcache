@@ -6,6 +6,7 @@
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
+- [KVCM 环境变量启动与自动初始化](design/kvcm_env_startup_bootstrap.md) - 环境变量配置、Storage/Instance Group 映射及参数变化后的更新行为
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 
