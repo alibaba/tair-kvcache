@@ -2,8 +2,8 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 
 namespace kv_cache_manager {
 
@@ -128,7 +128,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryWritesToRegistry) {
     collector->set_instance_id("inst1");
     collector->set_client_ip("10.0.0.1");
     collector->set_total_blocks(10);
-    collector->set_cache_hit_count(7);
     collector->set_per_capacity_hits({
         {1.0, 7},
         {0.5, 3},
@@ -159,7 +158,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryMaxHitMetrics) {
     collector->set_instance_id("inst1");
     collector->set_client_ip("10.0.0.2");
     collector->set_total_blocks(10);
-    collector->set_cache_hit_count(7);
     collector->set_per_capacity_hits({{1.0, 7}});
     collector->set_max_hit_count(8);
     collector->set_max_hit_rate(0.8);
@@ -182,7 +180,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryCapacityEfficiency) {
         collector->set_instance_id("inst1");
         collector->set_client_ip("10.0.0.3");
         collector->set_total_blocks(10);
-        collector->set_cache_hit_count(6);
         collector->set_per_capacity_hits({{1.0, 6}, {5.0, 8}});
         collector->set_max_hit_count(8);
         collector->set_max_hit_rate(0.8);
@@ -205,7 +202,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryCapacityEfficiency) {
         collector->set_instance_id("inst2");
         collector->set_client_ip("10.0.0.4");
         collector->set_total_blocks(10);
-        collector->set_cache_hit_count(5);
         collector->set_per_capacity_hits({{1.0, 5}});
         // max_hit_rate defaults to 0.0
 
@@ -223,7 +219,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryMaxHitNotApplicable) {
 
     collector->set_instance_id("inst1");
     collector->set_total_blocks(10);
-    collector->set_cache_hit_count(7);
     collector->set_per_capacity_hits({{1.0, 7}});
 
     reporter_->ReportPerQuery(collector.get());
@@ -239,7 +234,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryZeroBlocksSkips) {
 
     collector->set_instance_id("inst1");
     collector->set_total_blocks(0);
-    collector->set_cache_hit_count(0);
 
     reporter_->ReportPerQuery(collector.get());
 }
