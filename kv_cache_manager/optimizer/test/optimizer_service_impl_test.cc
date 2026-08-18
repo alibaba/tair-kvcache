@@ -433,6 +433,7 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     EXPECT_DOUBLE_EQ(2.0, stored_group->capacity_gb().front());
     EXPECT_TRUE(stored_group->enable_prefix_hash());
     EXPECT_TRUE(stored_group->enable_theoretical_max_cache());
+    EXPECT_EQ(24 * 60 * 60, stored_group->ttl_seconds());
 
     ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
         EXPECT_EQ("kvcm-group", state.instance_info->instance_group_name());

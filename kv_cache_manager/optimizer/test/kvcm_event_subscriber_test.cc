@@ -266,6 +266,7 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     EXPECT_DOUBLE_EQ(2.0, group->capacity_gb()[0]);
     EXPECT_TRUE(group->enable_prefix_hash());
     EXPECT_TRUE(group->enable_theoretical_max_cache());
+    EXPECT_EQ(24 * 60 * 60, group->ttl_seconds());
 
     leader.event_service_.Publish(MakeEvent("known", "normal", 1));
     auto short_prompt = MakeEvent("known", "short", 2);
