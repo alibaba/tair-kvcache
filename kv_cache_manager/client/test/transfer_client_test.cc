@@ -1,11 +1,19 @@
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <unistd.h>
 
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
+
+static_assert(offsetof(RegistSpan, base) == 0);
+static_assert(offsetof(RegistSpan, size) == sizeof(void *));
+static_assert(sizeof(RegistSpan) == sizeof(void *) + sizeof(size_t));
 
 class TransferClientTest : public TESTBASE {
 public:
@@ -92,6 +100,55 @@ TEST_F(TransferClientTest, TestCreate) {
         auto client = TransferClient::Create(invalid_config, init_params_);
         EXPECT_EQ(client, nullptr);
     }
+}
+
+TEST_F(TransferClientTest, TestCreateWithSharedMemory) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    SharedMemoryRegistration registration;
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = fileno(file);
+
+    auto client = TransferClient::Create(client_config_, init_params_, registration);
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_EQ(fclose(file), 0);
+    client.reset();
+}
+
+TEST_F(TransferClientTest, TestCreateWithDisabledSharedMemory) {
+    SharedMemoryRegistration registration;
+    auto client = TransferClient::Create(client_config_, init_params_, registration);
+    EXPECT_NE(client, nullptr);
+}
+
+TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    SharedMemoryRegistration registration;
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = -1;
+    EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
+
+    registration.fd = fileno(file);
+    registration.base = nullptr;
+    EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
+
+    registration.base = init_params_.regist_span->base;
+    registration.size = 0;
+    EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
+
+    registration.size = init_params_.regist_span->size;
+    registration.base = reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max());
+    EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
+
+    ASSERT_EQ(fclose(file), 0);
 }
 
 TEST_F(TransferClientTest, TestCreateWithEmptySelfLocationSpecName) {

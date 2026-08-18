@@ -15,6 +15,10 @@ class TransferClient {
 public:
     virtual ~TransferClient() = default;
     static std::unique_ptr<TransferClient> Create(const std::string &client_config, const InitParams &init_params);
+    static std::unique_ptr<TransferClient>
+    Create(const std::string &client_config,
+           const InitParams &init_params,
+           const SharedMemoryRegistration &shared_memory_registration);
 
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
