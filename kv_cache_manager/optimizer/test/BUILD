@@ -274,6 +274,16 @@ cc_test(
 )
 
 cc_test(
+    name = "MrcWindowTest",
+    srcs = ["mrc_window_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+        "//kv_cache_manager/optimizer/metrics:mrc_window",
+    ],
+)
+
+cc_test(
     name = "OnlineOptimizerServerConfigTest",
     srcs = [
         "online_optimizer_server_config_test.cc",

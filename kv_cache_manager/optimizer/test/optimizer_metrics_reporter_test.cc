@@ -281,7 +281,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMaxHitRate) {
 }
 
 TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
-    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 0, true));
 
     std::vector<int64_t> keys;
     for (int64_t key = 1; key <= 20; ++key) {
@@ -293,16 +293,25 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
 
     reporter_->ReportInterval();
 
-    MetricsTags tags = {{"instance_id", "inst1"}};
-    Gauge mrc = registry_->GetGauge("mrc", tags);
-    EXPECT_DOUBLE_EQ(19.0 * 1024.0, mrc.Get());
+    const std::vector<std::pair<std::string, double>> expected = {
+        {"60", 12.0}, {"80", 16.0}, {"90", 18.0}, {"95", 19.0}, {"99", 20.0}, {"99.5", 20.0}};
+    for (const auto &[target, blocks] : expected) {
+        MetricsTags tags = {{"instance_id", "inst1"}, {"target_hit_rate_percent", target}};
+        EXPECT_DOUBLE_EQ(blocks * 1024.0, registry_->GetGauge("mrc", tags).Get());
+    }
 
     manager_->TraceQuery("inst1", {1}, 0, 0, result);
     reporter_->ReportInterval();
-    EXPECT_DOUBLE_EQ(1.0 * 1024.0, mrc.Get());
+    for (const auto &entry : expected) {
+        MetricsTags tags = {{"instance_id", "inst1"}, {"target_hit_rate_percent", entry.first}};
+        EXPECT_DOUBLE_EQ(1.0 * 1024.0, registry_->GetGauge("mrc", tags).Get());
+    }
 
     reporter_->ReportInterval();
-    EXPECT_DOUBLE_EQ(0.0, mrc.Get());
+    for (const auto &entry : expected) {
+        MetricsTags tags = {{"instance_id", "inst1"}, {"target_hit_rate_percent", entry.first}};
+        EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("mrc", tags).Get());
+    }
 }
 
 TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiency) {
