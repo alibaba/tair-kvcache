@@ -6,6 +6,8 @@ py_library(
     name = "e2e_lib",
     srcs = [
         "e2e_lib.py",
+        "lib_utils.py",
+        "servers.py",
         "test_connector.py",
     ],
     imports = ["."],

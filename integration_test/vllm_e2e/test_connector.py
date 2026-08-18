@@ -66,7 +66,8 @@ from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.v1_connector import (
     TairKvCacheConnector, attn_kv_views)
-from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore
+from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker
+from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 
 CAPTURE_DIR_ENV = "KVCM_E2E_CAPTURE_DIR"
 
@@ -89,14 +90,14 @@ class VerifyingConnector(TairKvCacheConnector):
         # kernel_block_size). kernel_block_size is read straight off the tensor.
         self._cap_groups = []
         for meta in self._group_metas:
-            if meta.is_attention:
+            if isinstance(meta, AttentionGroupMeta):
                 ref = kv_caches[meta.layer_names[0]]
-                kernel_bs = attn_kv_views(ref)[0].shape[1]
+                kernel_bs = attn_kv_views(ref)[0][0].shape[1]
             else:
                 kernel_bs = 0
             self._cap_groups.append(
-                (meta.group_idx, meta.is_attention, list(meta.layer_names),
-                 meta.block_size, kernel_bs))
+                (meta.group_idx, isinstance(meta, AttentionGroupMeta),
+                 list(meta.layer_names), meta.block_size, kernel_bs))
 
         # Track completion of async load scatters. The parent's load task already
         # CPU-synchronizes its own scatter before reporting the task result, so a
@@ -158,6 +159,21 @@ class VerifyingConnector(TairKvCacheConnector):
                 len(load_reqs))
 
     # ------------------------------------------------------------------ #
+    # Scheduler-side: ship token snapshots for the worker's captures
+    # ------------------------------------------------------------------ #
+    def build_connector_meta(self, scheduler_output):
+        meta = super().build_connector_meta(scheduler_output)
+        # The captures below identify a block by its token content; the
+        # worker no longer mirrors token streams (self-contained
+        # instructions), so hand it the live streams from the ledger.
+        scheduler = self.connector_scheduler
+        meta.token_snapshots = {
+            req_id: ledger.vllm_request.all_token_ids
+            for req_id, ledger in scheduler._tracked.items()
+        }
+        return meta
+
+    # ------------------------------------------------------------------ #
     # Save hook: reference captures + emit pending loaded captures
     # ------------------------------------------------------------------ #
     def wait_for_save(self):
@@ -177,14 +193,15 @@ class VerifyingConnector(TairKvCacheConnector):
             return
         # Make all forward-pass KV writes visible before reading the paged cache.
         self._device_mod.synchronize()
+        tokens = getattr(meta, "token_snapshots", {})
         for save_req in meta.to_save_requests:
-            req = self._alive_requests.get(save_req.req_id)
-            if req is None or not req.block_ids_per_group:
+            token_ids = tokens.get(save_req.req_id)
+            if token_ids is None or not save_req.all_block_ids:
                 continue
             self._capture_range(
                 kind="ref",
-                token_ids=req.token_ids,
-                block_ids_per_group=req.block_ids_per_group,
+                token_ids=token_ids,
+                block_ids_per_group=save_req.all_block_ids,
                 manager_block_idxes=save_req.manager_block_idxes,
             )
 
@@ -192,9 +209,10 @@ class VerifyingConnector(TairKvCacheConnector):
         if not self._pending_loaded:
             return
         done = []
+        tokens = getattr(meta, "token_snapshots", {})
         for req_id, (mbis, bpg) in self._pending_loaded.items():
-            req = self._alive_requests.get(req_id)
-            if req is None:
+            token_ids = tokens.get(req_id)
+            if token_ids is None:
                 # token ids have not arrived on this worker yet; wait for a
                 # later step in which the request is scheduled.
                 continue
@@ -205,7 +223,7 @@ class VerifyingConnector(TairKvCacheConnector):
             self._device_mod.synchronize()
             self._capture_range(
                 kind="loaded",
-                token_ids=req.token_ids,
+                token_ids=token_ids,
                 block_ids_per_group=bpg,
                 manager_block_idxes=mbis,
             )
@@ -269,7 +287,7 @@ class VerifyingConnector(TairKvCacheConnector):
                     # concatenated on the content dim, so a capture is
                     # comparable across save/load within one run.
                     parts = []
-                    for v in attn_kv_views(kv_cache):
+                    for v in attn_kv_views(kv_cache)[0]:
                         blk = slot_tensor // kernel_bs
                         tok = slot_tensor % kernel_bs
                         parts.append(v[blk, tok].reshape(len(slots), -1))
@@ -300,7 +318,7 @@ class VerifyingConnector(TairKvCacheConnector):
             kind, manager_block_idx, positions[0], positions[-1], self._tp_rank, path)
 
 
-class MutatedWorkerCore(WorkerCore):
+class MutatedWorkerCore(ConnectorWorker):
     """Off-by-one in the attention token translation (see MutatedConnector)."""
 
     def _attn_token_indices(self, group, manager_block_idxes, block_table):
@@ -329,8 +347,8 @@ class MutatedConnector(VerifyingConnector):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # The translation lives on the WorkerCore since the core split; swap
-        # the core instance (state included) for the mutated subclass.
+        # The translation lives on the ConnectorWorker since the role split;
+        # swap the role instance (state included) for the mutated subclass.
         mutated = MutatedWorkerCore.__new__(MutatedWorkerCore)
-        mutated.__dict__.update(self._core.__dict__)
-        self._core = mutated
+        mutated.__dict__.update(self.connector_worker.__dict__)
+        self.connector_worker = mutated
