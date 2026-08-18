@@ -20,7 +20,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (
-    make_connector, make_scheduler_core, ReqState, GroupMeta)
+    make_connector, make_scheduler_core, GroupMeta)
+from kv_cache_manager.py_connector.vllm.scheduler_core import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta, StateGroupMeta, parse_groups)
 from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
@@ -52,7 +53,7 @@ def make_scheduler_connector(mbs=16, vllm_bs=None, locations=None,
     return make_scheduler_core(
         manager_block_size=mbs, vllm_block_size=vllm_bs,
         num_groups=num_groups, num_state_groups=num_state_groups,
-        tp_size=tp_size, locations=locations if locations is not None else [])
+        tp_size=tp_size, locations=locations)
 
 
 def fake_scheduler_output(new_reqs=(), cached_req_ids=(), num_scheduled=None,
@@ -85,6 +86,14 @@ def make_locations(n):
             for i in range(n)]
 
 
+def alloc(conn, req, ext_tokens, blocks):
+    """Simulate update_state_after_alloc: vLLM allocated blocks (per group)
+    for a match of ext_tokens."""
+    conn.update_state_after_alloc(
+        req, SimpleNamespace(get_block_ids=lambda: [list(b) for b in blocks]),
+        ext_tokens)
+
+
 # --------------------------------------------------------------------------- #
 # get_num_new_matched_tokens
 # --------------------------------------------------------------------------- #
@@ -94,6 +103,7 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
     def _run(self, prompt_len, num_computed, num_locations):
         conn = make_scheduler_connector(
             mbs=self.MBS, locations=make_locations(num_locations))
+        conn._location_query_manager.last_computed_blocks = num_computed // self.MBS
         req = FakeRequest("r0", list(range(prompt_len)))
         matched, async_load = conn.get_num_new_matched_tokens(req, num_computed)
         return conn, matched, async_load
@@ -102,23 +112,32 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         conn, matched, async_load = self._run(4 * self.MBS + 5, 0, 4)
         self.assertEqual(matched, 4 * self.MBS)
         self.assertTrue(async_load)  # a pending load is reported as async
+        self.assertEqual(conn._waiting_to_load_requests, [])
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        alloc(conn, req, matched, [[100, 101, 102, 103]])
         self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes,
                          [0, 1, 2, 3])
+        self.assertEqual(conn._waiting_to_load_requests[0].all_block_ids,
+                         [[100, 101, 102, 103]])
 
     def test_full_hit_capped_to_leave_one_token(self):
         # Prompt is exactly 4 manager blocks, all externally cached: the last
         # block must be dropped so vLLM still schedules >= 1 new token.
         conn, matched, _ = self._run(4 * self.MBS, 0, 4)
         self.assertEqual(matched, 3 * self.MBS)
+        req = FakeRequest("r0", list(range(4 * self.MBS)))
+        alloc(conn, req, matched, [[100, 101, 102]])
         self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes,
                          [0, 1, 2])
-        # has_saved_block_num counts only the blocks actually treated as hit.
-        self.assertEqual(conn._alive_requests["r0"].has_saved_block_num, 3)
+        # The ledger counts only the blocks actually treated as hit.
+        self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
 
     def test_full_hit_with_local_prefix(self):
         # 2 blocks locally computed + 2 remote = whole prompt -> drop one remote.
         conn, matched, _ = self._run(4 * self.MBS, 2 * self.MBS, 2)
         self.assertEqual(matched, self.MBS)
+        req = FakeRequest("r0", list(range(4 * self.MBS)))
+        alloc(conn, req, matched, [[100, 101, 102]])
         self.assertEqual(conn._waiting_to_load_requests[0].manager_block_idxes, [2])
 
     def test_single_block_full_hit_degrades_to_zero(self):
@@ -135,15 +154,15 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
     def test_query_in_flight_answers_none(self):
         # The manager query runs async; until it lands the connector answers
         # None, vLLM re-asks next step instead of blocking the scheduler loop.
-        conn = make_scheduler_connector(mbs=self.MBS)
-        conn._location_query_manager.get_locations_for_query.return_value = None
+        conn = make_scheduler_connector(mbs=self.MBS, locations=None)  # in flight
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         matched, async_load = conn.get_num_new_matched_tokens(req, 0)
         self.assertIsNone(matched)
         self.assertFalse(async_load)
         self.assertEqual(conn._waiting_to_load_requests, [])
-        # Registration happens when the query lands, not while it is pending.
-        self.assertNotIn("r0", conn._alive_requests)
+        # No request state exists while the query is pending: the match hook
+        # is a pure query now; the ledger starts at the first allocation.
+        self.assertNotIn("r0", conn._tracked)
 
     def test_requery_after_load_failure_skips_external(self):
         # A failed load comes back to the scheduler as invalid block ids
@@ -156,18 +175,14 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched, 2 * self.MBS)
         # vLLM allocates blocks for the load attempt; the load then fails.
-        conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), matched)
+        alloc(conn, req, matched, [[100, 101, 102]])
         conn.update_connector_output(SimpleNamespace(invalid_block_ids={101}))
-        self.assertTrue(conn._alive_requests["r0"].load_failed)
+        self.assertIn("r0", conn._load_failed)
         # Retry: same request re-enters the waiting queue with 0 computed.
         matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched2, 0)
         self.assertFalse(async2)
         self.assertEqual(len(conn._waiting_to_load_requests), 1)  # no new load
-        state = conn._alive_requests["r0"]
-        self.assertEqual(state.remote_matched_token_num, 0)
-        self.assertEqual(state.has_saved_block_num, 0)
 
     def test_preempted_requery_keeps_external_match(self):
         # Preemption alone is not a failure: the loaded KV is healthy, only
@@ -177,11 +192,11 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
-        conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), matched)
+        alloc(conn, req, matched, [[100, 101, 102]])
         conn.update_connector_output(SimpleNamespace(invalid_block_ids=set()))
         matched2, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched2, matched)  # re-matched, not fast-failed
+        alloc(conn, req, matched2, [[100, 101, 102]])
         self.assertEqual(len(conn._waiting_to_load_requests), 2)
 
     def test_hybrid_load_attempt_burns_the_match(self):
@@ -194,9 +209,7 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched, 2 * self.MBS)
-        conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: [[100, 101], [50, 51]]),
-            matched)
+        alloc(conn, req, matched, [[100, 101], [50, 51]])
         # Even with no failure signal at all, the re-query fast-fails.
         matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched2, 0)
@@ -211,15 +224,13 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         conn.get_num_new_matched_tokens(req, 0)
         # Query done, but no allocation yet (vLLM may still re-ask us).
-        self.assertFalse(conn._alive_requests["r0"].load_attempted)
+        self.assertNotIn("r0", conn._load_attempted)
         # An allocation with no external hit is not a load attempt.
-        conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: [[100]]), 0)
-        self.assertFalse(conn._alive_requests["r0"].load_attempted)
+        alloc(conn, req, 0, [[100]])
+        self.assertNotIn("r0", conn._load_attempted)
         # Blocks allocated for an external hit: the load attempt begins.
-        conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: [[100, 101, 102]]), 2 * self.MBS)
-        self.assertTrue(conn._alive_requests["r0"].load_attempted)
+        alloc(conn, req, 2 * self.MBS, [[100, 101, 102]])
+        self.assertIn("r0", conn._load_attempted)
 
 
 # --------------------------------------------------------------------------- #
@@ -266,9 +277,9 @@ class TestStateCompleteMask(unittest.TestCase):
     none. This mask is what start_write_cache announces per key."""
 
     def _req(self, tables):
-        return ReqState(req_id="r0", token_ids=[], block_ids_per_group=tables,
-                        has_saved_block_num=0, local_matched_token_num=0,
-                        remote_matched_token_num=0, vllm_request=None)
+        return RequestLedger(vllm_request=FakeRequest("r0", []),
+                             block_ids_per_group=tables,
+                             token_len=0, has_saved_block_num=0)
 
     def test_full_attention_is_always_complete(self):
         conn = make_scheduler_core(manager_block_size=16, num_groups=1)
@@ -317,6 +328,9 @@ class TestExternalHitTruncation(unittest.TestCase):
         req = FakeRequest("r0", list(range(prompt_len or
                                           (len(coverage) + 2) * self.MBS)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        if matched:
+            alloc(conn, req, matched, [[100 + i for i in range(
+                matched // self.MBS + 1)]])
         return conn, matched
 
     def test_truncates_to_last_state_complete_block(self):
@@ -336,6 +350,7 @@ class TestExternalHitTruncation(unittest.TestCase):
     def test_no_state_anywhere_drops_the_match(self):
         conn, matched = self._matched([False, False, False])
         self.assertEqual(matched, 0)
+        alloc(conn, FakeRequest("r0", list(range(5 * 16))), 0, [[100]])
         self.assertEqual(conn._waiting_to_load_requests, [])
 
     def test_all_complete_is_untouched(self):
@@ -350,7 +365,8 @@ class TestExternalHitTruncation(unittest.TestCase):
         locs = hybrid_locations([True, True], tp_size=2, num_state=1)
         locs[1]["location_specs"] = [
             s for s in locs[1]["location_specs"] if s["name"] != "tp1_g1"]
-        conn._location_query_manager.get_locations_for_query.return_value = locs
+        conn._location_query_manager.locations = locs
+        conn._location_query_manager.in_flight = False
         req = FakeRequest("r0", list(range(6 * self.MBS)))
         matched, _ = conn.get_num_new_matched_tokens(req, 0)
         self.assertEqual(matched, self.MBS)
@@ -597,13 +613,12 @@ class TestSkippedGroupIndexing(unittest.TestCase):
 
     def test_num_allocated_blocks_ignores_skipped_group(self):
         conn = self._skipped_group0_connector()
-        req = ReqState(
-            req_id="r0", token_ids=list(range(64)),
+        ledger = RequestLedger(
+            vllm_request=FakeRequest("r0", list(range(64))),
             # Drafter table (group 0) lags with 1 block; attention has 4.
             block_ids_per_group=[[100], [200, 201, 202, 203]],
-            has_saved_block_num=0, local_matched_token_num=0,
-            remote_matched_token_num=0, vllm_request=None)
-        self.assertEqual(conn._num_allocated_blocks(req), 4)
+            token_len=64, has_saved_block_num=0)
+        self.assertEqual(conn._num_allocated_blocks(ledger), 4)
 
     def test_num_allocated_blocks_still_mins_transferred_groups(self):
         # Two transferred groups (1 and 2), one skipped drafter (0): min is
@@ -617,19 +632,18 @@ class TestSkippedGroupIndexing(unittest.TestCase):
                            page_size_bytes=0),
         ]
         conn._num_groups = 2
-        req = ReqState(
-            req_id="r0", token_ids=[], block_ids_per_group=[[9], [1, 2, 3], [4, 5]],
-            has_saved_block_num=0, local_matched_token_num=0,
-            remote_matched_token_num=0, vllm_request=None)
-        self.assertEqual(conn._num_allocated_blocks(req), 2)
+        ledger = RequestLedger(
+            vllm_request=FakeRequest("r0", []),
+            block_ids_per_group=[[9], [1, 2, 3], [4, 5]],
+            token_len=0, has_saved_block_num=0)
+        self.assertEqual(conn._num_allocated_blocks(ledger), 2)
 
     def test_num_allocated_blocks_empty(self):
         conn = self._skipped_group0_connector()
-        req = ReqState(
-            req_id="r0", token_ids=[], block_ids_per_group=[],
-            has_saved_block_num=0, local_matched_token_num=0,
-            remote_matched_token_num=0, vllm_request=None)
-        self.assertEqual(conn._num_allocated_blocks(req), 0)
+        ledger = RequestLedger(vllm_request=FakeRequest("r0", []),
+                               block_ids_per_group=[],
+                               token_len=0, has_saved_block_num=0)
+        self.assertEqual(conn._num_allocated_blocks(ledger), 0)
 
     def test_load_failure_report_uses_transferred_group_table(self):
         # start_load_kv (worker side) reports failed loads against the block
@@ -666,13 +680,13 @@ class TestBuildConnectorMeta(unittest.TestCase):
                      num_locations=0):
         """Simulate the scheduler flow for a fresh request: query, alloc, then
         one build_connector_meta step."""
-        conn._location_query_manager.get_locations_for_query.return_value = (
-            make_locations(num_locations))
+        conn._location_query_manager.locations = make_locations(num_locations)
+        conn._location_query_manager.in_flight = False
         req = FakeRequest(req_id, list(range(num_tokens)))
-        conn.get_num_new_matched_tokens(req, 0)
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
         block_ids = [list(range(100, 100 + num_blocks))]
         conn.update_state_after_alloc(
-            req, SimpleNamespace(get_block_ids=lambda: block_ids), 0)
+            req, SimpleNamespace(get_block_ids=lambda: block_ids), matched)
         out = fake_scheduler_output(
             new_reqs=[SimpleNamespace(req_id=req_id, block_ids=block_ids)])
         return req, conn.build_connector_meta(out)
@@ -681,9 +695,9 @@ class TestBuildConnectorMeta(unittest.TestCase):
         conn = make_scheduler_connector(mbs=self.MBS)
         req, meta = self._new_request(conn, "r0", 40, 3)
         # The ledger absorbed the first allocation's block table.
-        self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
+        self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                          [[100, 101, 102]])
-        self.assertEqual(conn._alive_requests["r0"].token_ids, list(range(40)))
+        self.assertEqual(conn._tracked["r0"].token_len, 40)
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
@@ -691,7 +705,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # scheduler loop, and handed to the http thread: it is read off vLLM's
         # block table, which later steps mutate.
         self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
-        self.assertEqual(conn._alive_requests["r0"].has_saved_block_num, 2)
+        self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):
         conn = make_scheduler_connector(mbs=self.MBS)
@@ -711,17 +725,15 @@ class TestBuildConnectorMeta(unittest.TestCase):
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[None])
         conn.build_connector_meta(out)
-        self.assertEqual(conn._alive_requests["r0"].token_ids,
-                         list(range(40)) + list(range(1000, 1008)))
+        self.assertEqual(conn._tracked["r0"].token_len, 48)
         # Step 3: 2 more tokens with a new block -> table grows.
         req.output_token_ids = list(range(1000, 1010))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 2},
             new_block_ids=[[[103]]])
         conn.build_connector_meta(out)
-        self.assertEqual(conn._alive_requests["r0"].token_ids,
-                         list(range(40)) + list(range(1000, 1010)))
-        self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
+        self.assertEqual(conn._tracked["r0"].token_len, 50)
+        self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                          [[100, 101, 102, 103]])
 
     def _preempted_step(self, conn, req, use_legacy):
@@ -740,7 +752,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
                 req, _ = self._new_request(conn, "r0", 40, 3)
                 self._preempted_step(conn, req, use_legacy)
                 # Resume replaces (not extends) the block table.
-                self.assertEqual(conn._alive_requests["r0"].block_ids_per_group,
+                self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                                  [[200, 201]])
 
     def test_save_threshold_grows_incrementally(self):
@@ -754,19 +766,19 @@ class TestBuildConnectorMeta(unittest.TestCase):
         conn.build_connector_meta(out)
         args = conn._http_executor.submit.call_args[0]
         self.assertEqual(args[3], 3)  # target_save_num
-        self.assertEqual(conn._alive_requests["r0"].has_saved_block_num, 3)
+        self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
 
     def test_save_request_drain_and_finish_paths(self):
         conn = make_scheduler_connector(mbs=self.MBS)
         req, _ = self._new_request(conn, "r0", 40, 3)
-        state = conn._alive_requests["r0"]
+        state = conn._tracked["r0"]
         self.assertEqual(state.scheduled_saving_count, 1)
 
         # Finish while the save is still in flight: request must stay alive.
         keep, extra = conn.request_finished(req, [])
         self.assertTrue(keep)
         self.assertTrue(state.need_report_after_saving_finished)
-        self.assertIn("r0", conn._alive_requests)
+        self.assertIn("r0", conn._tracked)
 
         # The async save lands: drained into to_save_requests and, because the
         # request already finished, a FinishRequest is emitted and state dropped.
@@ -776,7 +788,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
         meta = conn.build_connector_meta(fake_scheduler_output())
         self.assertEqual(len(meta.to_save_requests), 1)
         self.assertEqual([f.req_id for f in meta.to_finish_requests], ["r0"])
-        self.assertNotIn("r0", conn._alive_requests)
+        self.assertNotIn("r0", conn._tracked)
 
     def test_request_finished_when_saves_landed(self):
         conn = make_scheduler_connector(mbs=self.MBS)
@@ -787,7 +799,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
         conn.build_connector_meta(fake_scheduler_output())
         keep, extra = conn.request_finished(req, [])
         self.assertTrue(keep)
-        self.assertNotIn("r0", conn._alive_requests)
+        self.assertNotIn("r0", conn._tracked)
         meta = conn.build_connector_meta(fake_scheduler_output())
         self.assertEqual([f.req_id for f in meta.to_finish_requests], ["r0"])
 
@@ -807,7 +819,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             conn._canceled_save_request_ids.append("r0")
         meta = conn.build_connector_meta(fake_scheduler_output())
         self.assertEqual([f.req_id for f in meta.to_finish_requests], ["r0"])
-        self.assertNotIn("r0", conn._alive_requests)
+        self.assertNotIn("r0", conn._tracked)
 
 
 if __name__ == "__main__":

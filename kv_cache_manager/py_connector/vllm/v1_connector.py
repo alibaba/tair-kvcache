@@ -10,7 +10,7 @@ parsing, manager registration) and delegates every hook to the role's core:
 * ``WorkerCore`` -- block translation and data-plane transfer
   (worker_core.py).
 
-Shared vocabulary (GroupMeta / ReqState / spec naming / KV layout
+Shared vocabulary (GroupMeta / spec naming / KV layout
 normalization / hybrid gate) lives in vllm_common.py. Compatibility
 re-exports below keep external import paths (tests, e2e harness) stable.
 """
@@ -53,7 +53,7 @@ from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMeta
 from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore
 from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta, attn_kv_views,
+    AttentionGroupMeta, GroupMeta, StateGroupMeta, attn_kv_views,
     build_spec_groups, ensure_hybrid_supported, parse_groups, spec_name)
 
 if typing.TYPE_CHECKING:
@@ -67,7 +67,7 @@ if typing.TYPE_CHECKING:
 # v1_connector (their original home before the core split).
 __all__ = [
     "TairKvCacheConnector", "attn_kv_views", "ensure_hybrid_supported",
-    "GroupMeta", "ReqState", "spec_name", "build_spec_groups", "parse_groups",
+    "GroupMeta", "spec_name", "build_spec_groups", "parse_groups",
 ]
 
 

@@ -1,7 +1,7 @@
 """Shared vocabulary between the scheduler side and the worker side.
 
 Everything here is role-agnostic: the data model both cores speak
-(GroupMeta / ReqState), the spec naming scheme shared with the manager
+(GroupMeta), the spec naming scheme shared with the manager
 registration, the KV layout normalization, the hybrid capability gate and
 the kv_cache_config parsing. The two cores (scheduler_core / worker_core)
 and the thin connector shell (v1_connector) build on this module; nothing
@@ -93,61 +93,6 @@ class StateGroupMeta(GroupMeta):
 
     # Bytes per block per state layer (spec.page_size_bytes).
     page_size_bytes: int = 0
-
-
-@dataclass
-class ReqState:
-    """Tracks one request. Lives in the scheduler and (mirrored) in workers."""
-
-    req_id: str
-    token_ids: list
-    # Per kv_cache_group block table (same length across groups).
-    block_ids_per_group: List[List[int]]
-    has_saved_block_num: int
-    local_matched_token_num: int
-    remote_matched_token_num: int
-
-    # vllm_request only available in scheduler
-    vllm_request: Optional["object"] = None
-
-    # Saving progress counters; only meaningful in scheduler and tp0 worker.
-    scheduled_saving_count: int = 0
-    sent_saving_count: int = 0
-    need_report_after_saving_finished: bool = False
-
-    # True once vLLM allocated blocks for an external hit of this request (the
-    # load itself may have failed). Guards the re-query of hybrid requests,
-    # whose load failures cannot be reported to vLLM -- see
-    # SchedulerCore._external_match_burned.
-    load_attempted: bool = False
-    # True once a load failure for this request came back through
-    # update_connector_output (vLLM reports invalid blocks, not requests);
-    # set only when the connector reports failures at all (single-group).
-    load_failed: bool = False
-
-    @staticmethod
-    def create_from_delta(delta) -> "ReqState":
-        return ReqState(
-            req_id=delta.req_id,
-            token_ids=list(delta.new_tokens_ids),
-            block_ids_per_group=[list(b) for b in delta.new_block_ids_per_group],
-            has_saved_block_num=delta.has_saved_block_num,
-            local_matched_token_num=0,
-            remote_matched_token_num=0,
-            vllm_request=None,
-        )
-
-    def update_from_delta(self, delta):
-        self.token_ids.extend(delta.new_tokens_ids)
-        if not delta.new_block_ids_per_group:
-            return
-        if delta.resumed_from_preemption:
-            self.block_ids_per_group = [list(b) for b in delta.new_block_ids_per_group]
-        else:
-            if not self.block_ids_per_group:
-                self.block_ids_per_group = [[] for _ in delta.new_block_ids_per_group]
-            for group_ids, new_ids in zip(self.block_ids_per_group, delta.new_block_ids_per_group):
-                group_ids.extend(new_ids)
 
 
 def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:

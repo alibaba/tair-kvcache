@@ -155,7 +155,7 @@ _install_stubs()
 
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
-    AttentionGroupMeta, GroupMeta, ReqState, StateGroupMeta)
+    AttentionGroupMeta, GroupMeta, StateGroupMeta)
 from kv_cache_manager.py_connector.vllm.scheduler_core import SchedulerCore  # noqa: E402
 from kv_cache_manager.py_connector.vllm.worker_core import WorkerCore  # noqa: E402
 
@@ -204,6 +204,36 @@ def make_connector(manager_block_size: int = 16,
     return conn
 
 
+class FakeLocationQueries:
+    """Test double for LocationQueryManager: same produce/consume contract.
+
+    ``locations`` is the manager's answer (None = in flight). The match
+    hook's clamped result (store_result) is what the allocation consumes;
+    the offset recorded at get time travels with it."""
+
+    def __init__(self, locations=None):
+        self.locations = locations
+        self.in_flight = locations is None
+        self._stored = None
+        self.last_computed_blocks = 0
+
+    def get_locations_for_query(self, request, computed_blocks):
+        self.last_computed_blocks = computed_blocks
+        return None if self.in_flight else list(self.locations)
+
+    def store_result(self, req_id, locations):
+        self._stored = list(locations)
+
+    def consume_locations(self, req_id):
+        if self.in_flight or self._stored is None:
+            return None
+        result, self._stored = self._stored, None
+        return result, self.last_computed_blocks
+
+    def invalidate(self, req_id):
+        self._stored = None
+
+
 def make_scheduler_core(manager_block_size: int = 16,
                         vllm_block_size: Optional[int] = None,
                         num_groups: int = 1,
@@ -211,7 +241,7 @@ def make_scheduler_core(manager_block_size: int = 16,
                         tp_size: int = 1,
                         locations=None) -> SchedulerCore:
     """Build a bare SchedulerCore (no __init__) with the scheduler-loop state
-    build_connector_meta and friends need, plus a mocked LocationQueryManager
+    build_connector_meta and friends need, plus a FakeLocationQueries
     answering ``locations`` (None means "still in flight")."""
     from unittest.mock import MagicMock
     core = SchedulerCore.__new__(SchedulerCore)
@@ -224,7 +254,9 @@ def make_scheduler_core(manager_block_size: int = 16,
     core._state_group_idxs = [m.group_idx for m in core._group_metas
                               if isinstance(m, StateGroupMeta)]
     core._epoch = 0
-    core._alive_requests = {}
+    core._tracked = {}
+    core._load_failed = set()
+    core._load_attempted = set()
     core._waiting_to_load_requests = []
     import threading
     core._waiting_to_save_requests_lock = threading.Lock()
@@ -235,7 +267,5 @@ def make_scheduler_core(manager_block_size: int = 16,
     core._http_executor = MagicMock()
     core._manager_client = MagicMock()
     core._coordinator_client = MagicMock()
-    core._location_query_manager = MagicMock()
-    core._location_query_manager.get_locations_for_query.return_value = (
-        locations if locations is not None else [])
+    core._location_query_manager = FakeLocationQueries(locations)
     return core

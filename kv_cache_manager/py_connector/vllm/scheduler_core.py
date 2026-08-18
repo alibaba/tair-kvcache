@@ -1,16 +1,25 @@
 """Scheduler side of the connector: matching, saving orchestration, finishing.
 
-Owns the authoritative ``_alive_requests`` (the scheduler's view of every
-request's token stream and per-group block tables) and answers the vLLM
-scheduler hooks. The worker side lives in worker_core; both speak the
-vllm_common vocabulary.
+The scheduler role owns the request ledger (``_tracked``): per-request state
+that compensates for information vLLM only provides inside hooks -- the
+accumulated block tables (only increments arrive after the first
+allocation), the save water-mark and the save-session ledger that decides
+when a finished request's blocks may be freed. Entries are created on the
+request's first allocation and dropped at retirement; requests that were
+never allocated are never tracked.
+
+Two small side tables carry the external-match discipline: ``_load_failed``
+(requests whose load came back invalid) and ``_load_attempted`` (requests
+that spent an external allocation -- relevant for hybrid models whose load
+failures cannot be reported). The worker side lives in worker_core; both
+speak the vllm_common vocabulary.
 """
 
-import copy
 import threading
 import time
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.tp_coordinator import (
@@ -19,7 +28,7 @@ from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQu
 from kv_cache_manager.py_connector.vllm.metadata import (
     FinishRequest, LoadRequest, SaveRequest, TairKvCacheConnectorMetadata)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, ReqState, StateGroupMeta,
+    ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, StateGroupMeta,
     build_spec_groups, spec_name)
 
 if TYPE_CHECKING:
@@ -27,6 +36,28 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+
+@dataclass
+class RequestLedger:
+    """Per-request scheduler state, created on the request's first allocation.
+
+    ``vllm_request`` is the live vLLM Request object; the token stream is
+    read from it on demand (all_token_ids) and only its length is tracked
+    here. ``has_saved_block_num`` anchors the incremental saves: blocks are
+    saved once as the computed prefix crosses manager-block boundaries."""
+    vllm_request: "Request"
+    # Per kv_cache_group block table, in each group's own block_size units.
+    block_ids_per_group: List[List[int]]
+    # Tokens accounted for by the ledger (prompt + scheduled decode steps).
+    token_len: int
+    # Manager blocks already saved (or covered by an external hit).
+    has_saved_block_num: int
+    # Save-session ledger: sessions started vs sessions handed to the worker.
+    scheduled_saving_count: int = 0
+    sent_saving_count: int = 0
+    # Set when the request finished while sessions were still in flight.
+    need_report_after_saving_finished: bool = False
 
 
 class SchedulerCore:
@@ -52,13 +83,25 @@ class SchedulerCore:
             manager_client, self._http_executor, extra_config.instance_id,
             extra_config.async_get_cache_location)
 
-        self._alive_requests: dict[str, ReqState] = {}
+        self._tracked: Dict[str, RequestLedger] = {}
         self._waiting_to_load_requests: List[LoadRequest] = []
         self._waiting_to_save_requests_lock = threading.Lock()
         self._waiting_to_save_requests: List[SaveRequest] = []
         self._waiting_to_finish_requests: List[FinishRequest] = []
         self._canceled_save_request_ids_lock = threading.Lock()
         self._canceled_save_request_ids: List[str] = []
+        # External-match discipline; cleaned at retirement.
+        self._load_failed: set = set()
+        self._load_attempted: set = set()
+
+    @property
+    def is_hybrid(self) -> bool:
+        """True when the model mixes attention and state groups (mamba).
+
+        A semantic projection of the group table: callers care about 'can
+        load failures be reported' / 'are there sparse states', not the
+        group count."""
+        return bool(self._state_group_idxs)
 
     def shutdown(self):
         self._location_query_manager.shutdown()
@@ -77,7 +120,7 @@ class SchedulerCore:
                 return meta.block_size
         raise KeyError(f"no such transferred group: {group_idx}")
 
-    def _state_complete_mask(self, req: ReqState, manager_block_idxes) -> List[bool]:
+    def _state_complete_mask(self, ledger: RequestLedger, manager_block_idxes) -> List[bool]:
         """Per manager block: does *every* state group hold a real state?
 
         vLLM's block table is the ground truth: in "align" mode a manager block
@@ -91,7 +134,7 @@ class SchedulerCore:
         for mb in manager_block_idxes:
             complete = True
             for group_idx in self._state_group_idxs:
-                table = req.block_ids_per_group[group_idx]
+                table = ledger.block_ids_per_group[group_idx]
                 # State covers the prefix ending at the block's last token.
                 logical = ((mb + 1) * mbs - 1) // self._group_block_size(group_idx)
                 if logical >= len(table) or table[logical] == 0:
@@ -100,16 +143,16 @@ class SchedulerCore:
             mask.append(complete)
         return mask
 
-    def _num_allocated_blocks(self, req: ReqState) -> int:
+    def _num_allocated_blocks(self, ledger: RequestLedger) -> int:
         """Min allocated block-table length across the *transferred* groups.
 
         ``block_ids_per_group`` is indexed by the vLLM group index and includes
         groups skipped by ``parse_groups`` (EAGLE/MTP drafters). A drafter's
         block table can lag behind the target model's, so including it in the
         min would permanently understate how many blocks are saveable."""
-        if not req.block_ids_per_group:
+        if not ledger.block_ids_per_group:
             return 0
-        return min(len(req.block_ids_per_group[meta.group_idx])
+        return min(len(ledger.block_ids_per_group[meta.group_idx])
                    for meta in self._group_metas)
 
     # ------------------------------------------------------------------ #
@@ -128,71 +171,7 @@ class SchedulerCore:
                    for rank in range(self._tp_size)
                    for group_idx in self._state_group_idxs)
 
-    def get_num_new_matched_tokens(self, request: "Request",
-                                   num_computed_tokens: int) -> Tuple[Optional[int], bool]:
-        """Answer vLLM's per-request question: beyond the ``num_computed_tokens``
-        it already has, how many more tokens can the external KV supply?
-
-        Returns ``(external_tokens, load_kv_async)``:
-
-        * ``None`` -- the manager query is still in flight; vLLM will re-ask
-          next step (this connector never blocks the scheduler loop on IO).
-        * ``0``    -- no external hit (or the request's external match is
-          burned, see ``_external_match_burned``).
-        * ``>0``   -- a block-aligned count clamped to a prefix vLLM can
-          safely resume from (``_safe_external_prefix``); the load itself runs
-          on the worker after vLLM allocates blocks for the hit.
-        """
-        prev = self._alive_requests.get(request.request_id)
-        if prev is not None and self._external_match_burned(prev):
-            # vLLM re-asks whenever a request falls back to the waiting queue:
-            # preemption, or a failed load under kv_load_failure_policy=
-            # recompute. For this request the external match is burned --
-            # see _external_match_burned for which signal burned it. Whatever
-            # is left, vLLM recomputes locally.
-            logger.warning("req:%s re-queried after an external load attempt, "
-                           "skip external match", request.request_id)
-            prev.local_matched_token_num = num_computed_tokens
-            prev.remote_matched_token_num = 0
-            prev.has_saved_block_num = num_computed_tokens // self._manager_block_size
-            return 0, False
-
-        computed_blocks = num_computed_tokens // self._manager_block_size
-        need_load_locations = self._location_query_manager.get_locations_for_query(
-            request, computed_blocks)
-        if need_load_locations is None:
-            return None, False
-
-        need_load_locations = self._safe_external_prefix(
-            request.request_id, need_load_locations,
-            num_computed_tokens, request.num_tokens)
-        new_matched_count = len(need_load_locations) * self._manager_block_size
-        total_remote_blocks = computed_blocks + len(need_load_locations)
-        logger.info("req:%s matched %d external tokens", request.request_id, new_matched_count)
-
-        if new_matched_count:
-            self._waiting_to_load_requests.append(LoadRequest(
-                req_id=request.request_id,
-                manager_block_idxes=list(range(computed_blocks, total_remote_blocks)),
-                need_load_locations=need_load_locations,
-            ))
-
-        # Every request is registered here -- this is the first hook a request
-        # passes through, hit or no hit: build_connector_meta and
-        # request_finished index _alive_requests unconditionally, and
-        # has_saved_block_num anchors the incremental saves that follow.
-        self._alive_requests[request.request_id] = ReqState(
-            req_id=request.request_id,
-            token_ids=copy.copy(request.prompt_token_ids),
-            block_ids_per_group=[],
-            has_saved_block_num=total_remote_blocks,
-            local_matched_token_num=num_computed_tokens,
-            remote_matched_token_num=new_matched_count,
-            vllm_request=request,
-        )
-        return new_matched_count, new_matched_count > 0
-
-    def _external_match_burned(self, prev: ReqState) -> bool:
+    def _external_match_burned(self, req_id: str) -> bool:
         """Has this request lost its option of an external match?
 
         * full-attention (single group): load failures are reported to vLLM
@@ -206,9 +185,52 @@ class SchedulerCore:
           any allocation for an external hit burns the match, because a
           failed block cannot be told apart from a healthy one afterwards.
         """
-        if prev.load_failed:
+        if req_id in self._load_failed:
             return True
-        return prev.load_attempted and self._num_groups > 1
+        return req_id in self._load_attempted and self.is_hybrid
+
+    def get_num_new_matched_tokens(self, request: "Request",
+                                   num_computed_tokens: int) -> Tuple[Optional[int], bool]:
+        """Answer vLLM's per-request question: beyond the ``num_computed_tokens``
+        it already has, how many more tokens can the external KV supply?
+
+        A pure query: it never blocks (an in-flight manager query returns
+        None and vLLM re-asks next step) and never mutates request state.
+        The answer is cached per request; ``update_state_after_alloc``
+        consumes it and turns it into the LoadRequest once vLLM allocates
+        blocks for the hit.
+
+        Returns ``(external_tokens, load_kv_async)``: ``None`` while the
+        query is in flight; ``0`` when there is no hit, or the request's
+        match is burned (see ``_external_match_burned``); ``>0`` for a
+        block-aligned count clamped to a prefix vLLM can safely resume from
+        (``_safe_external_prefix``).
+        """
+        req_id = request.request_id
+        if self._external_match_burned(req_id):
+            # vLLM re-asks whenever a request falls back to the waiting queue:
+            # preemption, or a failed load under kv_load_failure_policy=
+            # recompute. For this request the external match is burned --
+            # see _external_match_burned for which signal burned it. Whatever
+            # is left, vLLM recomputes locally.
+            logger.warning("req:%s re-queried after an external load attempt, "
+                           "skip external match", req_id)
+            return 0, False
+
+        computed_blocks = num_computed_tokens // self._manager_block_size
+        need_load_locations = self._location_query_manager.get_locations_for_query(
+            request, computed_blocks)
+        if need_load_locations is None:
+            return None, False
+
+        need_load_locations = self._safe_external_prefix(
+            req_id, need_load_locations,
+            num_computed_tokens, request.num_tokens)
+        # Cache the clamped answer: the allocation consumes exactly this.
+        self._location_query_manager.store_result(req_id, need_load_locations)
+        new_matched_count = len(need_load_locations) * self._manager_block_size
+        logger.info("req:%s matched %d external tokens", req_id, new_matched_count)
+        return new_matched_count, new_matched_count > 0
 
     def _safe_external_prefix(self, req_id: str, locations: List[dict],
                               num_computed_tokens: int, num_tokens: int) -> List[dict]:
@@ -246,14 +268,43 @@ class SchedulerCore:
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        req_state = self._alive_requests.get(request.request_id)
-        if req_state is None:
+        """First (or re-) allocation: record the ledger and ship the load.
+
+        The block tables arrive here whole, once per allocation; increments
+        come later through the scheduling output. When vLLM allocated for an
+        external hit, the query the match hook cached is consumed and turned
+        into the LoadRequest -- at this point, and only here, both halves of
+        its address are known (manager locations + physical slots)."""
+        req_id = request.request_id
+        ledger = self._tracked.get(req_id)
+        if ledger is None:
+            ledger = RequestLedger(
+                vllm_request=request,
+                block_ids_per_group=[],
+                token_len=len(request.prompt_token_ids),
+                has_saved_block_num=0,
+            )
+            self._tracked[req_id] = ledger
+        ledger.block_ids_per_group = [list(b) for b in blocks.get_block_ids()]
+
+        if num_external_tokens <= 0:
             return
-        req_state.block_ids_per_group = [list(b) for b in blocks.get_block_ids()]
-        if num_external_tokens:
-            # Blocks were allocated for an external hit: the request is now
-            # spending its one external load.
-            req_state.load_attempted = True
+        locations, computed_blocks = self._location_query_manager.consume_locations(req_id)
+        if locations is None and computed_blocks is None:
+            return
+        # Blocks were allocated for an external hit: the request is now
+        # spending its external load (burns hybrid re-queries).
+        self._load_attempted.add(req_id)
+        if not locations:
+            return
+        total_remote_blocks = computed_blocks + len(locations)
+        ledger.has_saved_block_num = total_remote_blocks
+        self._waiting_to_load_requests.append(LoadRequest(
+            req_id=req_id,
+            manager_block_idxes=list(range(computed_blocks, total_remote_blocks)),
+            need_load_locations=locations,
+            all_block_ids=[list(b) for b in ledger.block_ids_per_group],
+        ))
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """Consume the worker's step output: mark requests whose external
@@ -267,10 +318,10 @@ class SchedulerCore:
         invalid = getattr(connector_output, "invalid_block_ids", None)
         if not invalid:
             return
-        for req_id, req in self._alive_requests.items():
+        for req_id, ledger in self._tracked.items():
             if any(b in invalid
-                   for group_ids in req.block_ids_per_group for b in group_ids):
-                req.load_failed = True
+                   for group_ids in ledger.block_ids_per_group for b in group_ids):
+                self._load_failed.add(req_id)
                 logger.warning("req:%s external load failed (invalid blocks "
                                "reached its block table)", req_id)
 
@@ -281,25 +332,24 @@ class SchedulerCore:
         """Assemble one engine step's envelope (see TairKvCacheConnectorMetadata).
 
         Two sources feed the envelope: vLLM's scheduling output for this step
-        (mirror deltas for newly scheduled and continuing requests) and the
-        residue of earlier steps' async work (admitted loads, resolved save
-        sessions, retirements). Only the last stage depends on the others:
-        save settlement may retire a request within this step, so finishes
-        flush last.
+        (block-table increments for continuing requests) and the residue of
+        earlier steps' async work (admitted loads, resolved save sessions,
+        retirements). Only the last stage depends on the others: save
+        settlement may retire a request within this step, so finishes flush
+        last.
         """
         meta = TairKvCacheConnectorMetadata(self._epoch)
         self._epoch += 1
 
-        self._ingest_scheduled_reqs(scheduler_output, meta)
+        self._ingest_scheduled_reqs(scheduler_output)
         self._dispatch_incremental_saves()
         self._collect_load_instructions(meta)
         self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
         return meta
 
-    def _ingest_scheduled_reqs(self, scheduler_output: "SchedulerOutput",
-                               meta: TairKvCacheConnectorMetadata) -> None:
-        """Absorb vLLM's scheduling list into the authoritative request table.
+    def _ingest_scheduled_reqs(self, scheduler_output: "SchedulerOutput") -> None:
+        """Absorb vLLM's scheduling list into the request ledger.
 
         The block tables are the scheduler's ledger: vLLM hands them over
         once per first allocation (update_state_after_alloc /
@@ -309,17 +359,17 @@ class SchedulerCore:
         instructions. A preemption resume replaces the whole table
         (re-allocation maps the same logical blocks to fresh slots)."""
         for vllm_req in scheduler_output.scheduled_new_reqs:
-            request = self._alive_requests[vllm_req.req_id]
-            request.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
+            ledger = self._tracked.get(vllm_req.req_id)
+            if ledger is None:
+                continue  # never allocated (defensive): nothing to record
+            ledger.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
-            request = self._alive_requests[req_id]
-            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_current_tokens = len(request.token_ids)
-            new_token_ids = request.vllm_request.all_token_ids[
-                num_current_tokens:num_current_tokens + num_new_tokens]
-            request.token_ids.extend(new_token_ids)
+            ledger = self._tracked.get(req_id)
+            if ledger is None:
+                continue
+            ledger.token_len += scheduler_output.num_scheduled_tokens[req_id]
 
             if hasattr(cached_reqs, "resumed_req_ids"):
                 resumed = req_id in cached_reqs.resumed_req_ids
@@ -328,10 +378,10 @@ class SchedulerCore:
 
             new_block_ids = cached_reqs.new_block_ids[idx]
             if resumed:
-                request.block_ids_per_group = [list(b) for b in new_block_ids]
+                ledger.block_ids_per_group = [list(b) for b in new_block_ids]
             elif new_block_ids is not None:
                 # https://github.com/vllm-project/vllm/pull/23262: may be None
-                for group_ids, new_ids in zip(request.block_ids_per_group,
+                for group_ids, new_ids in zip(ledger.block_ids_per_group,
                                               new_block_ids):
                     group_ids.extend(new_ids)
 
@@ -344,35 +394,30 @@ class SchedulerCore:
         gathered by the worker out of HBM. The session the http thread
         produces surfaces in _collect_save_instructions on a later step.
         """
-        for req in self._alive_requests.values():
+        for ledger in self._tracked.values():
             target_save_num = min(
-                len(req.token_ids),
-                self._num_allocated_blocks(req) * self._vllm_block_size) // self._manager_block_size
-            if target_save_num > req.has_saved_block_num:
-                req.scheduled_saving_count += 1
+                ledger.token_len,
+                self._num_allocated_blocks(ledger) * self._vllm_block_size) \
+                // self._manager_block_size
+            if target_save_num > ledger.has_saved_block_num:
+                ledger.scheduled_saving_count += 1
                 # Per-block state completeness must be read here, in the
                 # scheduler loop: it comes from vLLM's block table, which the
                 # http_executor thread would race against later steps.
                 self._http_executor.submit(
-                    self.start_save_kvcache_async, req.req_id,
-                    req.token_ids[:target_save_num * self._manager_block_size],
+                    self.start_save_kvcache_async, ledger.vllm_request.request_id,
+                    ledger.vllm_request.all_token_ids[:target_save_num * self._manager_block_size],
                     target_save_num,
-                    self._state_complete_mask(req, range(target_save_num)))
-            req.has_saved_block_num = target_save_num
+                    self._state_complete_mask(ledger, range(target_save_num)))
+            ledger.has_saved_block_num = target_save_num
 
     def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
-        """Hand the worker the loads admitted by get_num_new_matched_tokens
-        whose blocks have since been allocated (update_state_after_alloc).
+        """Hand the worker the loads whose blocks were allocated.
 
-        Without an allocation the load cannot be addressed -- the worker would
-        not know which slots to scatter into -- so it is dropped; vLLM will
-        re-query and re-admit it on a later step.
-        """
+        LoadRequests are built by update_state_after_alloc, at the moment
+        both halves of their address (manager locations + physical slots)
+        became known; this stage only moves them into the envelope."""
         for load_req in self._waiting_to_load_requests:
-            request = self._alive_requests[load_req.req_id]
-            if not request.block_ids_per_group:
-                continue
-            load_req.all_block_ids = [list(b) for b in request.block_ids_per_group]
             meta.add_load_request(load_req)
         self._waiting_to_load_requests = []
 
@@ -388,19 +433,19 @@ class SchedulerCore:
             new_save_reqs = self._waiting_to_save_requests
             self._waiting_to_save_requests = []
         for save_req in new_save_reqs:
-            req = self._alive_requests.get(save_req.req_id)
-            if req is None:
-                logger.warning("request %s is not alive, skip saving", save_req.req_id)
+            ledger = self._tracked.get(save_req.req_id)
+            if ledger is None:
+                logger.warning("request %s is not tracked, skip saving", save_req.req_id)
                 continue
             # Snapshot the ledger for the worker: the gather translates
             # manager blocks into physical slots through these tables, and
             # the worker keeps no mirror of its own.
-            save_req.all_block_ids = [list(b) for b in req.block_ids_per_group]
+            save_req.all_block_ids = [list(b) for b in ledger.block_ids_per_group]
             meta.add_save_request(save_req)
-            req.sent_saving_count += 1
-            if (req.need_report_after_saving_finished and
-                    req.scheduled_saving_count == req.sent_saving_count):
-                self._retire_request(req)
+            ledger.sent_saving_count += 1
+            if (ledger.need_report_after_saving_finished and
+                    ledger.scheduled_saving_count == ledger.sent_saving_count):
+                self._retire_request(save_req.req_id)
 
         self.handle_canceled_save_req()
 
@@ -411,11 +456,14 @@ class SchedulerCore:
             meta.add_finish_request(finish_req)
         self._waiting_to_finish_requests = []
 
-    def _retire_request(self, req: ReqState) -> None:
+    def _retire_request(self, req_id: str) -> None:
         """The request's save obligations are settled: tell the worker to drop
-        its mirror and stop tracking the request ourselves."""
-        self._waiting_to_finish_requests.append(FinishRequest(req.req_id))
-        self._alive_requests.pop(req.req_id)
+        its bookkeeping and stop tracking the request ourselves."""
+        self._waiting_to_finish_requests.append(FinishRequest(req_id))
+        self._tracked.pop(req_id, None)
+        self._load_failed.discard(req_id)
+        self._load_attempted.discard(req_id)
+        self._location_query_manager.invalidate(req_id)
 
     def start_save_kvcache_async(self, req_id, token_ids, target_save_num,
                                  state_complete_mask):
@@ -487,14 +535,14 @@ class SchedulerCore:
         for req_id in canceled:
             # Cancellations come from http_executor threads; the request may
             # already have been finished and removed by the scheduler loop.
-            req = self._alive_requests.get(req_id)
-            if req is None:
+            ledger = self._tracked.get(req_id)
+            if ledger is None:
                 logger.warning("canceled save for unknown request %s, skip", req_id)
                 continue
-            req.sent_saving_count += 1
-            if (req.need_report_after_saving_finished and
-                    req.scheduled_saving_count == req.sent_saving_count):
-                self._retire_request(req)
+            ledger.sent_saving_count += 1
+            if (ledger.need_report_after_saving_finished and
+                    ledger.scheduled_saving_count == ledger.sent_saving_count):
+                self._retire_request(req_id)
 
     def get_finished_count(self):
         # Only rank0 reports finished requests.
@@ -520,18 +568,17 @@ class SchedulerCore:
         return self._finish_request(request)
 
     def _finish_request(self, request: "Request") -> Tuple[bool, Optional[dict]]:
-        req = self._alive_requests.get(request.request_id)
-        if req is None:
-            logger.info("request_finished for unknown request: %s", request.request_id)
-            return False, {}
+        req_id = request.request_id
+        ledger = self._tracked.get(req_id)
+        if ledger is None:
+            logger.info("request_finished for untracked request: %s", req_id)
+            self._location_query_manager.invalidate(req_id)
+            return False, None
 
-        extra_info = {"local_matched_token_num": req.local_matched_token_num,
-                      "remote_matched_token_num": req.remote_matched_token_num}
-
-        if req.scheduled_saving_count == req.sent_saving_count:
-            self._retire_request(req)
-            return True, extra_info
+        if ledger.scheduled_saving_count == ledger.sent_saving_count:
+            self._retire_request(req_id)
+            return True, None
 
         # Saves still in flight; delay freeing the blocks until they land.
-        req.need_report_after_saving_finished = True
-        return True, extra_info
+        ledger.need_report_after_saving_finished = True
+        return True, None
