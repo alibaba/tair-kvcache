@@ -19,6 +19,9 @@ py_wheel(
     name = "kvcm_ops_wheel",
     distribution = "kvcm_ops",
     python_tag = "py3",
+    requires = [
+        "requests>=2.31.0,<3",
+    ],
     strip_path_prefixes = ["package"],
     version = "0.1.0",
     deps = [":kvcm_ops_lib"],
