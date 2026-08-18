@@ -617,6 +617,11 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             12,
             "the delayed reclaim batch should still complete",
         )
+        self.assertEqual(
+            self._metric_value("cache_reclaimer.delete_submit_count"),
+            1,
+            "fresh credit should prevent admission of a second batch",
+        )
 
     def _wait_metric_value(
         self, metric_name, expected_value, tags=None, timeout_s=2
