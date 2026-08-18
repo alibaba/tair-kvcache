@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "mrc_window",
+    srcs = ["mrc_window.cc"],
+    hdrs = ["mrc_window.h"],
+    deps = [
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+    ],
+)
+
+cc_library(
     name = "optimizer_metrics_collector",
     srcs = ["optimizer_metrics_collector.cc"],
     hdrs = ["optimizer_metrics_collector.h"],

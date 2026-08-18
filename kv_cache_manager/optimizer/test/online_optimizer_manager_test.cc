@@ -310,7 +310,7 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
 
 TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     auto info = MakeInfo("i1", "g1", 4, 0);
-    auto group = MakeGroup("g1", {FullCapacityGb(20)});
+    auto group = MakeGroup("g1", {FullCapacityGb(20)}, "lru", true);
     RegisterInstanceResult reg_result;
     ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
 
@@ -324,11 +324,16 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
 
     std::vector<MrcMetricInfo> metrics;
     ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
-    ASSERT_EQ(1, metrics.size());
-    EXPECT_EQ("i1", metrics[0].instance_id);
+    ASSERT_EQ(6, metrics.size());
     // The second query has one theoretical hit at each required capacity
-    // 1..20. Retaining 19/20 hits therefore needs 19 blocks.
-    EXPECT_EQ(19 * 16384, metrics[0].capacity_bytes);
+    // 1..20. Each target takes the corresponding percentile capacity.
+    const std::vector<uint32_t> expected_targets = {6000, 8000, 9000, 9500, 9900, 9950};
+    const std::vector<int64_t> expected_blocks = {12, 16, 18, 19, 20, 20};
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        EXPECT_EQ("i1", metrics[i].instance_id);
+        EXPECT_EQ(expected_targets[i], metrics[i].target_basis_points);
+        EXPECT_EQ(expected_blocks[i] * 16384, metrics[i].capacity_bytes);
+    }
     std::vector<InstanceSummary> summaries;
     ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
     ASSERT_EQ(1, summaries.size());
@@ -336,19 +341,40 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
 
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 0, result));
     ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
-    ASSERT_EQ(1, metrics.size());
+    ASSERT_EQ(6, metrics.size());
     // The new reporting window contains only this immediately reusable hit.
-    EXPECT_EQ(1 * 16384, metrics[0].capacity_bytes);
+    for (const auto &metric : metrics) {
+        EXPECT_EQ(1 * 16384, metric.capacity_bytes);
+    }
 
     ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
-    ASSERT_EQ(1, metrics.size());
-    EXPECT_EQ(0, metrics[0].capacity_bytes);
+    ASSERT_EQ(6, metrics.size());
+    for (const auto &metric : metrics) {
+        EXPECT_EQ(0, metric.capacity_bytes);
+    }
 
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 0, result));
     ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
     ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
-    ASSERT_EQ(1, metrics.size());
-    EXPECT_EQ(0, metrics[0].capacity_bytes);
+    ASSERT_EQ(6, metrics.size());
+    for (const auto &metric : metrics) {
+        EXPECT_EQ(0, metric.capacity_bytes);
+    }
+}
+
+TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcRequiresTheoreticalMetrics) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(20)}, "lru", false);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 0, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 0, result));
+
+    std::vector<MrcMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
+    EXPECT_TRUE(metrics.empty());
 }
 
 TEST_F(OnlineOptimizerManagerTest, FullAttentionRequiresConsistentInputTokenLength) {
