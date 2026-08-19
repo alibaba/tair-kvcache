@@ -341,6 +341,7 @@ public: // Function definitions expected as parameter to ShardedCache
     // The caller must hold an external reference to `handle`.
     // Does NOT trigger eviction even if usage exceeds capacity.
     void AdjustCharge(LRUHandle *handle, ssize_t delta);
+    bool AdjustChargeAndRelease(LRUHandle *handle, ssize_t delta);
 
     // Although in some platforms the update of size_t is atomic, to make sure
     // GetUsage() and GetPinnedUsage() work correctly under any platform, we'll
@@ -386,6 +387,9 @@ public: // other function definitions
 
 private:
     friend class LRUCache;
+    void AdjustChargeLocked(LRUHandle *handle, ssize_t delta);
+    bool ReleaseLocked(LRUHandle *handle, bool erase_if_last_ref, bool &was_in_cache);
+    void FreeReleasedHandle(LRUHandle *handle, bool was_in_cache, bool erase_if_last_ref);
     // Insert an item into the hash table and, if handle is null, insert into
     // the LRU list. Older items are evicted as necessary. Frees `item` on
     // non-OK status.
@@ -518,6 +522,7 @@ public:
                                 BatchOperationScratch *scratch) override;
     void ReleaseBatch(Handle *const *handles, size_t count) override;
     void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override;
+    bool AdjustChargeAndRelease(Handle *handle, ssize_t delta) override;
 
     void ApplyToHandle(Cache *cache,
                        Handle *handle,

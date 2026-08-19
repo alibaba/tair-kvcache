@@ -25,8 +25,7 @@ namespace kv_cache_manager {
 class MetaIndexerConfig;
 class MetaSearchCache;
 class RequestContext;
-class MetricsCollector;
-class MetricsRegistry;
+class ServiceMetricsCollector;
 
 class MetaIndexer {
 public:
@@ -253,6 +252,7 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result,
+                                                 ServiceMetricsCollector *metrics_collector,
                                                  bool preserve_existing_updates_when_full = false) noexcept;
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
@@ -260,9 +260,11 @@ private:
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
-                                                 Result &result) noexcept;
-    void
-    EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
+                                                 Result &result,
+                                                 ServiceMetricsCollector *metrics_collector) noexcept;
+    void EmitRmwMetrics(ServiceMetricsCollector *metrics_collector,
+                        const RmwStats &stats,
+                        size_t total_key_count) const noexcept;
 
 private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;

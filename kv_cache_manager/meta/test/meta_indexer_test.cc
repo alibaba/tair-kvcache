@@ -718,9 +718,13 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
     auto batches = meta_indexer_->MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
 
     std::vector<int32_t> covered_indexs;
+    std::vector<int32_t> emitted_shards;
     for (const auto &batch : batches) {
         std::set<int32_t> shards_in_batch(batch.batch_shard_indexs.begin(), batch.batch_shard_indexs.end());
         ASSERT_EQ(shards_in_batch.size(), batch.batch_shard_indexs.size()) << "duplicate shard in one batch";
+        EXPECT_TRUE(std::is_sorted(batch.batch_shard_indexs.begin(), batch.batch_shard_indexs.end()));
+        emitted_shards.insert(
+            emitted_shards.end(), batch.batch_shard_indexs.begin(), batch.batch_shard_indexs.end());
         ASSERT_EQ(batch.batch_keys.size(), batch.batch_indexs.size());
         for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
             const int32_t origin_idx = batch.batch_indexs[j];
@@ -738,6 +742,18 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
     std::vector<int32_t> expected_indexs(keys.size());
     std::iota(expected_indexs.begin(), expected_indexs.end(), 0);
     ASSERT_EQ(expected_indexs, covered_indexs);
+    EXPECT_TRUE(std::is_sorted(emitted_shards.begin(), emitted_shards.end()));
+
+    // Reuse the thread-local planner with a disjoint request. No shard or
+    // global index from the previous build may leak into the next result.
+    const KeyVector next_keys = {12345};
+    auto next_batches =
+        meta_indexer_->MakeBatches(next_keys, empty_location_ids, empty_locations, empty_properties);
+    ASSERT_EQ(1u, next_batches.size());
+    EXPECT_EQ((KeyVector{12345}), next_batches[0].batch_keys);
+    EXPECT_EQ((std::vector<int32_t>{0}), next_batches[0].batch_indexs);
+    EXPECT_EQ((std::vector<int32_t>{meta_indexer_->GetMutexShardIndex(12345)}),
+              next_batches[0].batch_shard_indexs);
 }
 
 TEST_F(MetaIndexerTest, TestPureLocalMutexShardsReuseLruHashSeed) {

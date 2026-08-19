@@ -4,7 +4,6 @@
 #include <chrono>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
@@ -223,14 +222,25 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
     }
     const int64_t enqueue_begin_us = TimestampUtil::GetSteadyTimeUs();
 
-    std::unordered_map<int, std::vector<size_t>> queue_to_indices;
+    thread_local std::vector<std::vector<size_t>> queue_indices;
+    const size_t queue_count = static_cast<size_t>(queue_count_);
+    if (queue_indices.size() < queue_count) {
+        queue_indices.resize(queue_count);
+    }
+    for (size_t qi = 0; qi < queue_count; ++qi) {
+        queue_indices[qi].clear();
+    }
     for (size_t i = 0; i < op.keys.size(); ++i) {
-        queue_to_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
+        queue_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
     }
 
     int64_t enqueue_timeout_key_count = 0;
     std::vector<ErrorCode> error_codes(op.keys.size(), EC_OK);
-    for (auto &[qi, indices] : queue_to_indices) {
+    for (int qi = 0; qi < queue_count_; ++qi) {
+        auto &indices = queue_indices[qi];
+        if (indices.empty()) {
+            continue;
+        }
         WriteOp sub_op;
         sub_op.type = op.type;
         sub_op.keys.reserve(indices.size());

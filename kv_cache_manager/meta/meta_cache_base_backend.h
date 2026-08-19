@@ -60,6 +60,17 @@ public:
                                           const PropertyMapVector &properties,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 
+    // Same conditional semantics as Upsert. Implementations may consume
+    // locations/properties entries whose previous result is EC_OK; skipped
+    // entries remain untouched.
+    virtual std::vector<ErrorCode> UpsertConsume(RequestContext *request_context,
+                                                 const KeyTypeVec &keys,
+                                                 CacheLocationMapVector &locations,
+                                                 PropertyMapVector &properties,
+                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept {
+        return Upsert(request_context, keys, locations, properties, previous_error_codes);
+    }
+
     virtual std::vector<ErrorCode> Delete(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;

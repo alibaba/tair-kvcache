@@ -520,6 +520,15 @@ public: // functions
     // Does NOT trigger eviction even if usage exceeds capacity after adjustment.
     virtual void AdjustCharge(Handle * /*handle*/, ssize_t /*delta*/) {}
 
+    // Adjust charge and release a referenced handle. Implementations may
+    // combine both operations under one shard lock.
+    virtual bool AdjustChargeAndRelease(Handle *handle, ssize_t delta) {
+        if (delta != 0) {
+            AdjustCharge(handle, delta);
+        }
+        return Release(handle);
+    }
+
     // Apply a callback to a cache handle. The Cache must ensure the lifetime
     // of the key passed to the callback is valid for the duration of the
     // callback. The handle may not belong to the cache, but is guaranteed to
@@ -716,6 +725,12 @@ public:
 
     void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override {
         target_->ReleaseBatchWithScratch(handles, count, scratch);
+    }
+
+    void AdjustCharge(Handle *handle, ssize_t delta) override { target_->AdjustCharge(handle, delta); }
+
+    bool AdjustChargeAndRelease(Handle *handle, ssize_t delta) override {
+        return target_->AdjustChargeAndRelease(handle, delta);
     }
 
     ObjectPtr Value(Handle *handle) override { return target_->Value(handle); }

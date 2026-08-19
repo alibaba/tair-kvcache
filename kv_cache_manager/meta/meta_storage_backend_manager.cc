@@ -572,7 +572,9 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         return persistent_results;
     }
     const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-    auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    auto results = typeid(*cache_backend_) == typeid(MetaLocalBackend)
+                       ? cache_backend_->UpsertConsume(request_context, keys, locations, properties, persistent_results)
+                       : cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -1030,10 +1032,23 @@ MetaStorageBackendManager::GetLocationValuesCompact(RequestContext *request_cont
         return persistent_backend_->GetLocationValuesCompact(request_context, keys, key_count, out_locations);
     }
 
-    // Cached mode must retain its recovery/fallback behavior. The large-query
-    // compact fast path is deliberately restricted to the single local backend,
-    // so use the existing manager API when this method is reached in another
-    // configuration.
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        auto results = cache_backend_->GetLocationValuesCompact(request_context, keys, key_count, out_locations);
+        if (results.size() != key_count || !out_locations.IsValid(key_count)) {
+            KVCM_LOG_ERROR("cache compact location values results[%lu] mismatch keys[%lu]",
+                           results.size(),
+                           key_count);
+            results.assign(key_count, EC_ERROR);
+            out_locations.Clear(key_count);
+            for (size_t i = 0; i < key_count; ++i) {
+                out_locations.FinishKey();
+            }
+        }
+        return results;
+    }
+
+    // During recovery, retain cache-miss fallback and positional result
+    // merging through the existing manager API.
     KeyVector key_vector;
     if (key_count != 0) {
         if (keys == nullptr) {
@@ -1344,8 +1359,11 @@ void MetaStorageBackendManager::GetSingleLocationViewsWithKeyStatusInto(RequestC
 }
 
 bool MetaStorageBackendManager::SupportsConcurrentLocationValueReads() const noexcept {
-    return !cache_backend_ && persistent_backend_ &&
-           persistent_backend_->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
+    if (!cache_backend_) {
+        return persistent_backend_ && persistent_backend_->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
+    }
+    return recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning &&
+           typeid(*cache_backend_) == typeid(MetaLocalBackend);
 }
 
 bool MetaStorageBackendManager::SupportsSingleLocationRmw() const noexcept {
@@ -1354,7 +1372,7 @@ bool MetaStorageBackendManager::SupportsSingleLocationRmw() const noexcept {
     // decorator/subclass that overrides those generic methods for additional
     // semantics (fault injection, auditing, admission, etc.) is not bypassed.
     // Such backends retain correctness through the generic targeted RMW.
-    return SupportsConcurrentLocationValueReads() && typeid(*persistent_backend_) == typeid(MetaLocalBackend);
+    return !cache_backend_ && persistent_backend_ && typeid(*persistent_backend_) == typeid(MetaLocalBackend);
 }
 
 bool MetaStorageBackendManager::GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept {

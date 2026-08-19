@@ -96,7 +96,6 @@ struct SingleLocationRmwScratch {
     std::vector<std::string_view> key_views;
     std::vector<Cache::Handle *> handles;
     CacheLocationVector retired_locations;
-    Cache::BatchOperationScratch cache_batch;
     Cache *retained_handle_owner = nullptr;
 };
 
@@ -169,6 +168,11 @@ public:
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> UpsertConsume(RequestContext *request_context,
+                                         const KeyTypeVec &keys,
+                                         CacheLocationMapVector &locations,
+                                         PropertyMapVector &properties,
+                                         const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
@@ -275,21 +279,42 @@ private:
 
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
     ErrorCode
-    CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    CreateAndInsert(std::string_view key_sv,
+                    const CacheLocationMap &locations,
+                    const PropertyMap &properties,
+                    int64_t access_time_us);
+    ErrorCode CreateAndInsertConsume(std::string_view key_sv,
+                                     CacheLocationMap &locations,
+                                     PropertyMap &properties,
+                                     int64_t access_time_us);
     ErrorCode
-    CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode
-    UpdateHandleInPlace(Cache::Handle *handle, const CacheLocationMap &locations, const PropertyMap &properties);
+    CreateAndInsertIfAbsent(std::string_view key_sv,
+                            const CacheLocationMap &locations,
+                            const PropertyMap &properties,
+                            int64_t access_time_us);
+    ErrorCode UpdateHandleInPlace(Cache::Handle *handle,
+                                  const CacheLocationMap &locations,
+                                  const PropertyMap &properties,
+                                  int64_t access_time_us);
+    ErrorCode UpdateHandleInPlaceConsume(Cache::Handle *handle,
+                                         CacheLocationMap &locations,
+                                         PropertyMap &properties,
+                                         int64_t access_time_us);
     ErrorCode UpdateHandleInPlaceSingleLocation(Cache::Handle *handle,
                                                 const LocationId &location_id,
                                                 CacheLocationConstPtr location,
-                                                CacheLocationVector *retired_locations = nullptr);
-    ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+                                                int64_t access_time_us,
+                                                CacheLocationVector *retired_locations = nullptr,
+                                                bool release_handle = false);
+    ErrorCode UpdateInPlace(std::string_view key_sv,
+                            const CacheLocationMap &locations,
+                            const PropertyMap &properties,
+                            int64_t access_time_us);
     ErrorCode CreateAndInsertSingleLocation(std::string_view key_sv,
                                             const LocationId &location_id,
-                                            CacheLocationConstPtr location);
-    ErrorCode
-    UpsertSingleLocationForOneKey(KeyType key, const LocationId &location_id, const CacheLocationConstPtr &location);
+                                            CacheLocationConstPtr location,
+                                            int64_t access_time_us,
+                                            CacheLocationVector *retired_locations = nullptr);
     void GetSingleLocationsWithKeyStatusIntoImpl(RequestContext *request_context,
                                                  const KeyTypeVec &keys,
                                                  const LocationIdRefVector &location_ids,
@@ -299,9 +324,18 @@ private:
                                                  std::vector<ErrorCode> &out_results,
                                                  SingleLocationRmwScratch &scratch,
                                                  bool retain_handles) noexcept;
-    ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpsertForOneKey(KeyType key,
+                              const CacheLocationMap &locations,
+                              const PropertyMap &properties,
+                              int64_t access_time_us);
+    ErrorCode UpsertConsumeForOneKey(KeyType key,
+                                     CacheLocationMap &locations,
+                                     PropertyMap &properties,
+                                     int64_t access_time_us);
     ErrorCode DeleteForOneKey(KeyType key);
-    ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);
+    ErrorCode DeleteLocationsForOneKey(KeyType key,
+                                       const std::vector<LocationId> &location_ids,
+                                       int64_t access_time_us);
     // Unified read helper. Fetches data from cache for a single key.
     // Pass nullptr for any output you don't need.
     // - field_names: if non-null, only these properties are returned; otherwise all properties

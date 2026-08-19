@@ -11,6 +11,40 @@
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
 namespace kv_cache_manager {
+
+class BatchCountingCache : public CacheWrapper {
+public:
+    explicit BatchCountingCache(std::shared_ptr<Cache> target) : CacheWrapper(std::move(target)) {}
+
+    const char *Name() const override { return "BatchCountingCache"; }
+
+    void LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) override {
+        ++lookup_batch_calls;
+        CacheWrapper::LookupBatch(keys, count, out_handles);
+    }
+
+    void LookupBatchWithScratch(const std::string_view *keys,
+                                size_t count,
+                                Handle **out_handles,
+                                BatchOperationScratch *scratch) override {
+        ++lookup_batch_calls;
+        CacheWrapper::LookupBatchWithScratch(keys, count, out_handles, scratch);
+    }
+
+    void ReleaseBatch(Handle *const *handles, size_t count) override {
+        ++release_batch_calls;
+        CacheWrapper::ReleaseBatch(handles, count);
+    }
+
+    void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override {
+        ++release_batch_calls;
+        CacheWrapper::ReleaseBatchWithScratch(handles, count, scratch);
+    }
+
+    size_t lookup_batch_calls = 0;
+    size_t release_batch_calls = 0;
+};
+
 class MetaLocalBackendTest : public MetaStorageBackendTestBase, public TESTBASE {
 public:
     void SetUp() override;
@@ -120,6 +154,109 @@ TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
     EXPECT_FALSE(selected[1][0]);
     ASSERT_EQ(1u, selected[2].size());
     EXPECT_FALSE(selected[2][0]);
+}
+
+TEST_F(MetaLocalBackendTest, TestCacheLocationEstimateMemUsageCacheInvalidation) {
+    CacheLocation location;
+    location.set_id("location");
+    location.set_location_specs({LocationSpec("name", "uri")});
+
+    const size_t initial_usage = location.EstimateMemUsage();
+    EXPECT_GT(location.estimated_mem_usage_state_.load(std::memory_order_relaxed), 1u);
+    EXPECT_EQ(initial_usage, location.EstimateMemUsage());
+
+    auto &specs = location.mutable_location_specs();
+    EXPECT_EQ(1u, location.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    specs.emplace_back("longer-name", "longer-uri");
+    const size_t updated_usage = location.EstimateMemUsage();
+    EXPECT_GT(updated_usage, initial_usage);
+    EXPECT_EQ(1u, location.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+
+    CacheLocation copied(location);
+    EXPECT_EQ(0u, copied.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, copied.EstimateMemUsage());
+
+    CacheLocation cached_move_source(copied);
+    (void)cached_move_source.EstimateMemUsage();
+    CacheLocation cached_moved(std::move(cached_move_source));
+    EXPECT_EQ(0u, cached_move_source.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, cached_moved.EstimateMemUsage());
+
+    CacheLocation moved(std::move(location));
+    EXPECT_EQ(1u, moved.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, moved.EstimateMemUsage());
+    EXPECT_EQ(1u, location.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+
+    CacheLocation copy_assigned;
+    (void)copy_assigned.mutable_location_specs();
+    copy_assigned = copied;
+    EXPECT_EQ(1u, copy_assigned.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, copy_assigned.EstimateMemUsage());
+
+    CacheLocation move_assigned;
+    (void)move_assigned.EstimateMemUsage();
+    move_assigned = std::move(moved);
+    EXPECT_EQ(1u, move_assigned.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, move_assigned.EstimateMemUsage());
+    EXPECT_EQ(1u, moved.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+
+    CacheLocation cached_move_assign_source(copied);
+    (void)cached_move_assign_source.EstimateMemUsage();
+    CacheLocation cached_move_assigned;
+    cached_move_assigned = std::move(cached_move_assign_source);
+    EXPECT_EQ(0u, cached_move_assign_source.estimated_mem_usage_state_.load(std::memory_order_relaxed));
+    EXPECT_EQ(updated_usage, cached_move_assigned.EstimateMemUsage());
+}
+
+TEST_F(MetaLocalBackendTest, TestUpsertConsumeMovesOnlySuccessfulEntries) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("consume_upsert", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto *backend = GetLocalBackend();
+
+    auto old_location = std::make_shared<CacheLocation>();
+    old_location->set_id("location");
+    CacheLocationMapVector initial_locations(1);
+    initial_locations[0].emplace("location", old_location);
+    PropertyMapVector initial_properties(1);
+    initial_properties[0].emplace("property", "old");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend->Put(nullptr, {1}, initial_locations, initial_properties));
+
+    auto replacement = std::make_shared<CacheLocation>();
+    replacement->set_id("location");
+    auto inserted = std::make_shared<CacheLocation>();
+    inserted->set_id("inserted");
+    auto skipped = std::make_shared<CacheLocation>();
+    skipped->set_id("skipped");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("location", replacement);
+    locations[0].emplace("inserted", inserted);
+    locations[1].emplace("skipped", skipped);
+    PropertyMapVector properties(2);
+    properties[0].emplace("property", "new");
+    properties[0].emplace("inserted_property", "value");
+    properties[1].emplace("skipped_property", "value");
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_TIMEOUT}),
+              backend->UpsertConsume(nullptr, {1, 2}, locations, properties, {EC_OK, EC_TIMEOUT}));
+
+    ASSERT_EQ(1u, locations[0].size());
+    EXPECT_EQ(old_location, locations[0].at("location"));
+    ASSERT_EQ(1u, properties[0].size());
+    EXPECT_EQ("old", properties[0].at("property"));
+    EXPECT_EQ(skipped, locations[1].at("skipped"));
+    EXPECT_EQ("value", properties[1].at("skipped_property"));
+
+    CacheLocationMapVector out_locations;
+    PropertyMapVector out_properties;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+              backend->Get(nullptr, {1, 2}, out_locations, out_properties));
+    EXPECT_EQ(replacement, out_locations[0].at("location"));
+    EXPECT_EQ(inserted, out_locations[0].at("inserted"));
+    EXPECT_EQ("new", out_properties[0].at("property"));
+    EXPECT_EQ("value", out_properties[0].at("inserted_property"));
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
 TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathPreservesKeyStatusAndMetadata) {
@@ -508,8 +645,10 @@ TEST_F(MetaLocalBackendTest, TestBatchedUpsertShapesMatchSequentialReference) {
         PropertyMapVector reference_properties;
         SplitFieldMaps(fields, reference_locations, reference_properties);
         std::vector<ErrorCode> reference_results(keys.size(), EC_OK);
+        const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
         for (size_t i = 0; i < keys.size(); ++i) {
-            reference_results[i] = reference->UpsertForOneKey(keys[i], reference_locations[i], reference_properties[i]);
+            reference_results[i] = reference->UpsertForOneKey(
+                keys[i], reference_locations[i], reference_properties[i], access_time_us);
         }
         EXPECT_EQ(reference_results, UpsertWithFieldMaps(optimized.get(), keys, fields));
         observed_keys.insert(keys.begin(), keys.end());
@@ -1392,6 +1531,48 @@ TEST_F(MetaLocalBackendTest, TestGetLocationValuesCompactPreservesOffsetsAndCanB
     EXPECT_TRUE(compact[0].empty());
     EXPECT_TRUE(compact[1].empty());
 
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestSparseReadAndSingleLocationRmwAvoidDenseCacheBatch) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("sparse_lru_paths", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto *backend = GetLocalBackend();
+    auto counting_cache = std::make_shared<BatchCountingCache>(backend->cache_);
+    backend->cache_ = counting_cache;
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("location");
+    CacheLocationMapVector locations(1);
+    locations[0].emplace("location", location);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put(nullptr, {1}, locations, PropertyMapVector(1)));
+
+    const KeyType compact_keys[] = {1, 2};
+    CompactLocationsPerKey compact;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+              backend->GetLocationValuesCompact(nullptr, compact_keys, std::size(compact_keys), compact));
+
+    LocationsPerKey targeted;
+    std::vector<ErrorCode> key_ecs;
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_NOENT}}),
+              backend->GetLocationsWithKeyStatus(
+                  nullptr, {1, 2}, {{"location"}, {"location"}}, targeted, key_ecs));
+
+    const LocationId location_id = "location";
+    const LocationIdRefVector location_ids = {&location_id, &location_id};
+    SingleLocationRmwScratch scratch;
+    backend->PrepareSingleLocationRmwScratch(2, scratch);
+    CacheLocationViewVector views;
+    std::vector<ErrorCode> results;
+    backend->GetSingleLocationViewsWithKeyStatusInto(
+        nullptr, {1, 2}, location_ids, views, key_ecs, results, scratch);
+    scratch.ReleaseRetainedHandles();
+
+    CacheLocationVector replacements = {location, location};
+    backend->UpsertSingleLocationsInto(nullptr, {1, 2}, location_ids, replacements, results, scratch);
+
+    EXPECT_EQ(0u, counting_cache->lookup_batch_calls);
+    EXPECT_EQ(0u, counting_cache->release_batch_calls);
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 

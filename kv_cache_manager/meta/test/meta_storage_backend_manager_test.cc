@@ -557,7 +557,11 @@ TEST_F(MetaStorageBackendManagerTest, TestConcurrentLocationValueReadsAreLocalOn
     EXPECT_TRUE(mgr.SupportsSingleLocationRmw());
 
     mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
     EXPECT_FALSE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
     EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
 
     mgr.cache_backend_.reset();

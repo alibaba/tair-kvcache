@@ -7,7 +7,6 @@
 #include <exception>
 #include <limits>
 #include <optional>
-#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -23,7 +22,6 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
-#include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
 #define PREFIX_INDEXER_LOG(LEVEL, format, args...)                                                                     \
@@ -37,10 +35,9 @@ static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete
 static constexpr const char *kDeleteMetaOperation = "delete";
 static constexpr const char *kExistMetaOperation = "exist";
 static constexpr const char *kGetMetaOperation = "get";
-// Pure-local prefix scans first inspect a bounded window so a short prefix can
-// cancel a million-key suffix promptly. Once that probe succeeds, larger
-// ranges amortize the 1024-shard LRU's lookup/release locks while preserving
-// enough independent work for the query executor.
+// Local-backed prefix scans first inspect a bounded window so a short prefix
+// can cancel a million-key suffix promptly. Once that probe succeeds, larger
+// ranges preserve enough independent work for the query executor.
 static constexpr size_t kLocalPrefixProbeKeyCount = 4096;
 static constexpr size_t kLocalPrefixParallelReadChunkSize = 16384;
 static constexpr size_t kPrefixStateWordBits = 64;
@@ -83,6 +80,163 @@ private:
     std::optional<PrefixLocationScratch> local_;
     PrefixLocationScratch *scratch_ = nullptr;
     bool uses_thread_local_ = false;
+};
+
+struct ShardBatch {
+    std::vector<int32_t> shard_indices;
+    std::vector<int32_t> global_indices;
+};
+
+struct ShardBatchScratch {
+    std::vector<int32_t> heads;
+    std::vector<int32_t> tails;
+    std::vector<int32_t> next_index;
+    std::vector<uint64_t> occupied;
+};
+
+thread_local ShardBatchScratch tls_shard_batch_scratch;
+
+std::vector<ShardBatch> BuildShardBatches(const KeyVector &keys,
+                                          size_t shard_mask,
+                                          uint64_t hash_seed,
+                                          size_t batch_key_size) {
+    std::vector<ShardBatch> batches;
+    if (keys.empty()) {
+        return batches;
+    }
+
+    const size_t shard_count = shard_mask + 1;
+    auto &scratch = tls_shard_batch_scratch;
+    if (scratch.heads.size() != shard_count) {
+        scratch.heads.assign(shard_count, -1);
+        scratch.tails.assign(shard_count, -1);
+        scratch.occupied.resize((shard_count + 63) / 64);
+    }
+    std::fill(scratch.occupied.begin(), scratch.occupied.end(), uint64_t{0});
+    scratch.next_index.resize(keys.size());
+
+    for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
+        const int32_t shard = GetShardIndex(keys[i], shard_mask, hash_seed);
+        scratch.next_index[i] = -1;
+        if (scratch.heads[shard] == -1) {
+            scratch.heads[shard] = i;
+            scratch.tails[shard] = i;
+            scratch.occupied[static_cast<size_t>(shard) / 64] |= uint64_t{1} << (shard % 64);
+        } else {
+            scratch.next_index[scratch.tails[shard]] = i;
+            scratch.tails[shard] = i;
+        }
+    }
+
+    ShardBatch current;
+    size_t current_batch_size = 0;
+    for (size_t word_index = 0; word_index < scratch.occupied.size(); ++word_index) {
+        uint64_t bits = scratch.occupied[word_index];
+        while (bits != 0) {
+            const unsigned bit = static_cast<unsigned>(__builtin_ctzll(bits));
+            const int32_t shard = static_cast<int32_t>(word_index * 64 + bit);
+            current.shard_indices.push_back(shard);
+            for (int32_t index = scratch.heads[shard]; index != -1; index = scratch.next_index[index]) {
+                current.global_indices.push_back(index);
+                ++current_batch_size;
+            }
+            scratch.heads[shard] = -1;
+            scratch.tails[shard] = -1;
+            bits &= bits - 1;
+
+            if (current_batch_size >= batch_key_size) {
+                batches.push_back(std::move(current));
+                current = ShardBatch{};
+                current_batch_size = 0;
+            }
+        }
+    }
+    if (!current.global_indices.empty()) {
+        batches.push_back(std::move(current));
+    }
+    return batches;
+}
+
+void ClearBatchPayload(BatchMetaData &batch) {
+    batch.batch_indexs.clear();
+    batch.batch_keys.clear();
+    batch.batch_locations.clear();
+    batch.batch_location_ids.clear();
+    batch.batch_properties.clear();
+}
+
+struct BlockRmwScratch {
+    LocationIdsPerKey location_ids;
+    std::vector<ErrorCode> get_ecs;
+    BatchMetaData upsert_batch;
+    BatchMetaData delete_batch;
+    std::vector<int32_t> put_global_indices;
+
+    void Prepare(size_t count) {
+        location_ids.resize(count);
+        upsert_batch.batch_indexs.reserve(count);
+        upsert_batch.batch_keys.reserve(count);
+        upsert_batch.batch_locations.reserve(count);
+        upsert_batch.batch_properties.reserve(count);
+        delete_batch.batch_indexs.reserve(count);
+        delete_batch.batch_keys.reserve(count);
+        put_global_indices.reserve(count);
+    }
+
+    void Reset() {
+        for (auto &ids : location_ids) {
+            ids.clear();
+        }
+        std::vector<ErrorCode>().swap(get_ecs);
+        ClearBatchPayload(upsert_batch);
+        ClearBatchPayload(delete_batch);
+        put_global_indices.clear();
+    }
+};
+
+struct LocationRmwScratch {
+    LocationsPerKey locations;
+    std::vector<ErrorCode> key_get_ecs;
+    std::vector<ErrorCode> refresh_results;
+    std::vector<std::vector<ErrorCode>> get_ecs;
+    BatchMetaData upsert_batch;
+    BatchMetaData delete_batch;
+    std::vector<int32_t> put_global_indices;
+
+    void Prepare(size_t count) {
+        locations.resize(count);
+        key_get_ecs.reserve(count);
+        upsert_batch.batch_indexs.reserve(count);
+        upsert_batch.batch_keys.reserve(count);
+        upsert_batch.batch_locations.reserve(count);
+        upsert_batch.batch_properties.reserve(count);
+        delete_batch.batch_indexs.reserve(count);
+        delete_batch.batch_keys.reserve(count);
+        delete_batch.batch_location_ids.reserve(count);
+        put_global_indices.reserve(count);
+    }
+
+    void Reset() {
+        for (auto &values : locations) {
+            values.clear();
+        }
+        key_get_ecs.clear();
+        std::vector<ErrorCode>().swap(refresh_results);
+        std::vector<std::vector<ErrorCode>>().swap(get_ecs);
+        ClearBatchPayload(upsert_batch);
+        ClearBatchPayload(delete_batch);
+        put_global_indices.clear();
+    }
+};
+
+template <typename Scratch>
+class ScratchResetGuard {
+public:
+    explicit ScratchResetGuard(Scratch &scratch) : scratch_(scratch) {}
+    ~ScratchResetGuard() { scratch_.Reset(); }
+
+private:
+    Scratch &scratch_;
 };
 } // namespace
 
@@ -297,6 +451,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
                                                           Result &result,
+                                                          ServiceMetricsCollector *service_metrics_collector,
                                                           bool preserve_existing_updates_when_full) noexcept {
     if (upsert_batch.batch_keys.empty()) {
         return {0, 0};
@@ -347,16 +502,28 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                 existing_update_positions.push_back(i);
                 existing_update_batch.batch_keys.push_back(upsert_batch.batch_keys[i]);
                 existing_update_batch.batch_indexs.push_back(global_index);
-                existing_update_batch.batch_locations.push_back(upsert_batch.batch_locations[i]);
-                existing_update_batch.batch_properties.push_back(upsert_batch.batch_properties[i]);
+                existing_update_batch.batch_locations.push_back(std::move(upsert_batch.batch_locations[i]));
+                existing_update_batch.batch_properties.push_back(std::move(upsert_batch.batch_properties[i]));
             }
             backend_batch = &existing_update_batch;
         }
     }
     if (upsert_ecs.empty() || !existing_update_positions.empty()) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_searcher, index_serialize_time_us, 0);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, 0);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, 0);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, 0);
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch);
         stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
+        for (size_t i = 0; i < existing_update_positions.size(); ++i) {
+            const size_t original_position = existing_update_positions[i];
+            upsert_batch.batch_locations[original_position].swap(existing_update_batch.batch_locations[i]);
+            upsert_batch.batch_properties[original_position].swap(existing_update_batch.batch_properties[i]);
+        }
         if (existing_update_positions.empty()) {
             upsert_ecs = std::move(backend_ecs);
         } else if (backend_ecs.size() != existing_update_positions.size()) {
@@ -373,7 +540,6 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
             }
         }
         int64_t v = 0;
-        auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, v);
         stats.index_serialize_time_us += v;
         v = 0;
@@ -410,12 +576,17 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
                                                           const BatchMetaData &delete_batch,
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
-                                                          Result &result) noexcept {
+                                                          Result &result,
+                                                          ServiceMetricsCollector *service_metrics_collector) noexcept {
     if (delete_batch.batch_keys.empty()) {
         return {0, 0};
     }
     stats.delete_key_count += static_cast<int64_t>(delete_batch.batch_keys.size());
 
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, 0);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, 0);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, 0);
     const int64_t begin = TimestampUtil::GetCurrentTimeUs();
     std::vector<ErrorCode> delete_ecs;
     int32_t reclaimed_count = 0;
@@ -427,7 +598,6 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     }
     stats.delete_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
     int64_t v = 0;
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, v);
     stats.async_enqueue_timeout_key_count += v;
     v = 0;
@@ -446,10 +616,9 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     return {error_count, delete_success_count};
 }
 
-void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
+void MetaIndexer::EmitRmwMetrics(ServiceMetricsCollector *service_metrics_collector,
                                  const RmwStats &stats,
                                  size_t total_key_count) const noexcept {
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(metrics_collector);
     const bool has_upsert = stats.put_key_count + stats.update_key_count > 0;
     const bool has_delete = stats.delete_key_count > 0;
 
@@ -509,12 +678,6 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     const auto &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    std::shared_ptr<MetricsRegistry> ephemeral_metrics_registry = std::make_shared<MetricsRegistry>();
-    std::shared_ptr<MetricsCollector> ephemeral_metrics_collector =
-        std::make_shared<ServiceMetricsCollector>(ephemeral_metrics_registry);
-    ephemeral_metrics_collector->Init();
-    auto ephemeral_request_context =
-        std::make_shared<RequestContext>("read_modify_write_block", ephemeral_metrics_collector);
 
     static LocationIdsPerKey empty_location_ids;
     static CacheLocationMapVector empty_locations;
@@ -525,16 +688,26 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     Result result(keys.size());
     int32_t error_count = 0;
     RmwStats stats;
+    BlockRmwScratch scratch;
     for (auto &batch : batches) {
+        scratch.Prepare(batch.batch_keys.size());
+        ScratchResetGuard<BlockRmwScratch> reset_guard(scratch);
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
 
         // 1. Read each key's existing location id list (no value deserialization)
         const auto &batch_keys = batch.batch_keys;
-        LocationIdsPerKey batch_location_ids;
+        auto &batch_location_ids = scratch.location_ids;
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> get_ecs =
-            backend_manager_->GetLocationIds(ephemeral_request_context.get(), batch_keys, batch_location_ids);
+        scratch.get_ecs = backend_manager_->GetLocationIds(request_context, batch_keys, batch_location_ids);
+        const auto &get_ecs = scratch.get_ecs;
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+        int64_t deserialize_time_us = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(
+            service_metrics_collector, meta_searcher, index_deserialize_time_us, deserialize_time_us);
+        stats.index_deserialize_time_us += deserialize_time_us;
+        stats.has_index_deserialize = true;
         if (get_ecs.size() != batch_keys.size() || batch_location_ids.size() != batch_keys.size()) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWrite GetLocationIds result size mismatch, keys[%lu], ecs[%lu], ids[%lu]",
@@ -550,9 +723,9 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         }
 
         // 2. Modify -> bucket each key into upsert_batch / delete_batch.
-        BatchMetaData upsert_batch;
-        BatchMetaData delete_batch;
-        std::vector<int32_t> put_global_indexs; // brand-new keys (subset of upsert_batch)
+        auto &upsert_batch = scratch.upsert_batch;
+        auto &delete_batch = scratch.delete_batch;
+        auto &put_global_indexs = scratch.put_global_indices; // brand-new keys (subset of upsert_batch)
         for (size_t i = 0; i < batch_keys.size(); ++i) {
             const KeyType key = batch_keys[i];
 
@@ -590,14 +763,14 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
 
         // 3. Dispatch upsert and delete sub-batches.
         const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(
-            trace_id, ephemeral_request_context.get(), upsert_batch, put_global_indexs, keys, stats, result);
-        const auto [delete_errs, delete_success_count] =
-            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, result);
+            trace_id, request_context, upsert_batch, put_global_indexs, keys, stats, result, service_metrics_collector);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(
+            trace_id, request_context, delete_batch, keys, stats, result, service_metrics_collector);
         error_count += upsert_errs + delete_errs;
         AdjustKeyCountMeta(put_success_count - delete_success_count);
     }
 
-    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    EmitRmwMetrics(service_metrics_collector, stats, keys.size());
     ProcessErrorResult(trace_id, kRmwMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -645,13 +818,6 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    std::shared_ptr<MetricsRegistry> ephemeral_metrics_registry = std::make_shared<MetricsRegistry>();
-    std::shared_ptr<MetricsCollector> ephemeral_metrics_collector =
-        std::make_shared<ServiceMetricsCollector>(ephemeral_metrics_registry);
-    ephemeral_metrics_collector->Init();
-    auto ephemeral_request_context = std::make_shared<RequestContext>(
-        track_created_key_count ? "read_modify_write_target_locations" : "read_modify_write_location",
-        ephemeral_metrics_collector);
 
     static CacheLocationMapVector empty_locations;
     static PropertyMapVector empty_properties;
@@ -668,39 +834,41 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     // responses still fail closed without changing that established contract.
     std::vector<bool> key_level_failures(keys.size(), false);
     RmwStats stats;
+    LocationRmwScratch scratch;
     for (auto &batch : batches) {
+        scratch.Prepare(batch.batch_keys.size());
+        ScratchResetGuard<LocationRmwScratch> reset_guard(scratch);
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
         const auto &batch_keys = batch.batch_keys;
-        LocationsPerKey batch_locations_per_key;
-        std::vector<ErrorCode> batch_key_get_ecs;
+        auto &batch_locations_per_key = scratch.locations;
+        auto &batch_key_get_ecs = scratch.key_get_ecs;
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_searcher, index_deserialize_time_us, 0);
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> refresh_results;
+        auto &refresh_results = scratch.refresh_results;
         if (refresh_cache_from_persistent) {
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
-            refresh_results =
-                backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(request_context, batch_keys);
         }
-        std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
-            get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
-                                                                          batch_keys,
-                                                                          batch.batch_location_ids,
-                                                                          batch_locations_per_key,
-                                                                          batch_key_get_ecs);
+            scratch.get_ecs = backend_manager_->GetLocationsWithKeyStatus(request_context,
+                                                                           batch_keys,
+                                                                           batch.batch_location_ids,
+                                                                           batch_locations_per_key,
+                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = backend_manager_->GetLocations(
-                ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
+            scratch.get_ecs = backend_manager_->GetLocations(
+                request_context, batch_keys, batch.batch_location_ids, batch_locations_per_key);
         }
+        auto &get_ecs_per_key = scratch.get_ecs;
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
-        auto *ephemeral_service_metrics_collector =
-            dynamic_cast<ServiceMetricsCollector *>(ephemeral_request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_GET_METRICS(
-            ephemeral_service_metrics_collector, meta_searcher, index_deserialize_time_us, v);
+            service_metrics_collector, meta_searcher, index_deserialize_time_us, v);
         stats.index_deserialize_time_us += v;
         stats.has_index_deserialize = true;
 
@@ -733,9 +901,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         }
 
         // 2. Per-key modifier dispatch -> bucket each key into the upsert sub-batch or the delete sub-batch.
-        BatchMetaData upsert_batch;
-        BatchMetaData delete_batch;
-        std::vector<int32_t> put_global_indexs;
+        auto &upsert_batch = scratch.upsert_batch;
+        auto &delete_batch = scratch.delete_batch;
+        auto &put_global_indexs = scratch.put_global_indices;
         for (size_t i = 0; i < batch_keys.size(); ++i) {
             const int32_t global_idx = batch.batch_indexs[i];
             const KeyType key = batch_keys[i];
@@ -862,12 +1030,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         // 3. Dispatch upsert and delete sub-batches.
         const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(trace_id,
-                                                                       ephemeral_request_context.get(),
+                                                                       request_context,
                                                                        upsert_batch,
                                                                        put_global_indexs,
                                                                        keys,
                                                                        stats,
                                                                        rmw_result,
+                                                                       service_metrics_collector,
                                                                        track_created_key_count);
         (void)upsert_errs;
         for (const auto &global_index : upsert_batch.batch_indexs) {
@@ -880,8 +1049,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 }
             }
         }
-        const auto [delete_errs, delete_success_count] =
-            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(
+            trace_id, request_context, delete_batch, keys, stats, rmw_result, service_metrics_collector);
         (void)delete_errs;
         for (const auto &global_index : delete_batch.batch_indexs) {
             if (rmw_result.error_codes[global_index] != EC_OK) {
@@ -896,7 +1065,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));
     }
 
-    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    EmitRmwMetrics(service_metrics_collector, stats, keys.size());
     const size_t failed_key_count =
         static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
     if (failed_key_count == keys.size()) {
@@ -956,39 +1125,8 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
 
-    // Preserve MakeBatches' observable ordering and capacity behavior: shards
-    // are visited in ascending order, indices within one shard retain request
-    // order, and a whole shard is appended before the soft limit is checked.
-    struct SingleLocationBatch {
-        std::vector<int32_t> shard_indices;
-        std::vector<int32_t> global_indices;
-    };
-    std::vector<std::vector<int32_t>> indices_by_shard(mutex_shards_.size());
-    for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
-        indices_by_shard[GetMutexShardIndex(keys[i])].push_back(i);
-    }
-    std::vector<SingleLocationBatch> batches;
-    batches.reserve(indices_by_shard.size());
-    SingleLocationBatch current_batch;
-    size_t current_batch_size = 0;
-    size_t nonempty_shards_remaining = static_cast<size_t>(std::count_if(
-        indices_by_shard.begin(), indices_by_shard.end(), [](const auto &indices) { return !indices.empty(); }));
-    for (size_t shard_index = 0; shard_index < indices_by_shard.size(); ++shard_index) {
-        const auto &indices = indices_by_shard[shard_index];
-        if (indices.empty()) {
-            continue;
-        }
-        current_batch.shard_indices.push_back(static_cast<int32_t>(shard_index));
-        current_batch.global_indices.reserve(current_batch.global_indices.size() + indices.size());
-        current_batch.global_indices.insert(current_batch.global_indices.end(), indices.begin(), indices.end());
-        current_batch_size += indices.size();
-        --nonempty_shards_remaining;
-        if (current_batch_size >= batch_key_size_ || nonempty_shards_remaining == 0) {
-            batches.push_back(std::move(current_batch));
-            current_batch = SingleLocationBatch{};
-            current_batch_size = 0;
-        }
-    }
+    std::vector<ShardBatch> batches =
+        BuildShardBatches(keys, mutex_shard_mask_, mutex_shard_hash_seed_, batch_key_size_);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     // Prepare backend-owned lookup/release workspace once, before acquiring
@@ -1053,10 +1191,6 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
             batch_keys.push_back(keys[global_index]);
             batch_location_ids.push_back(location_ids[global_index]);
         }
-        // Allocate all request-shaped scratch vectors before taking metadata
-        // shard locks. Large ReportEvent requests otherwise extend every lock
-        // hold with allocator work and can amplify allocator futex contention.
-        backend_scratch.retired_locations.clear();
         // Construct this guard before the shard lock. Reverse destruction
         // releases the lock first, then drops replaced CacheLocations and
         // their URI strings outside the metadata critical section.
@@ -1191,6 +1325,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                     const int32_t global_index = upsert_global_indices[i];
                     result.error_codes[global_index] = EC_NOSPC;
                     key_level_failures[global_index] = true;
+                    backend_scratch.retired_locations.push_back(std::move(upsert_locations[i]));
                 }
             }
             size_t existing_count = 0;
@@ -1270,7 +1405,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         AdjustKeyCountMeta(successful_new_keys);
     }
 
-    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    EmitRmwMetrics(service_metrics_collector, stats, keys.size());
     const size_t failed_key_count =
         static_cast<size_t>(std::count(key_level_failures.begin(), key_level_failures.end(), true));
     if (failed_key_count == keys.size()) {
@@ -1447,8 +1582,8 @@ MetaIndexer::PrefixLocationResult MetaIndexer::VisitLocationValuesForPrefix(
         return prefix_result;
     }
 
-    // Preserve every non-local backend's existing batching/recovery behavior.
-    // Only the pure-local path below performs progressive concurrent reads.
+    // Preserve existing batching and recovery behavior for backends that
+    // cannot serve authoritative concurrent local reads.
     if (!backend_manager_->SupportsConcurrentLocationValueReads()) {
         LocationsPerKey locations;
         auto result = GetLocationValues(request_context, keys, locations);
@@ -1926,27 +2061,23 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
                                                     CacheLocationMapVector &locations,
                                                     PropertyMapVector &properties) const noexcept {
     std::vector<BatchMetaData> result;
-
-    std::map<int32_t, std::vector<int32_t>> shard_map;
-    for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
-        const int32_t shard_idx = GetMutexShardIndex(keys[i]);
-        shard_map[shard_idx].push_back(i);
-    }
-    if (shard_map.empty()) {
-        return result;
-    }
-
-    BatchMetaData current;
-    size_t current_batch_size = 0;
-    size_t shards_emitted = 0;
-    const size_t total_shards = shard_map.size();
-
-    for (auto &shard_kv : shard_map) {
-        const int32_t shard_index = shard_kv.first;
-        const auto &index_list = shard_kv.second;
-
-        current.batch_shard_indexs.emplace_back(shard_index);
-        for (const int32_t idx : index_list) {
+    auto shard_batches = BuildShardBatches(keys, mutex_shard_mask_, mutex_shard_hash_seed_, batch_key_size_);
+    result.reserve(shard_batches.size());
+    for (auto &shard_batch : shard_batches) {
+        BatchMetaData current;
+        current.batch_shard_indexs = std::move(shard_batch.shard_indices);
+        current.batch_indexs.reserve(shard_batch.global_indices.size());
+        current.batch_keys.reserve(shard_batch.global_indices.size());
+        if (!properties.empty()) {
+            current.batch_properties.reserve(shard_batch.global_indices.size());
+        }
+        if (!locations.empty()) {
+            current.batch_locations.reserve(shard_batch.global_indices.size());
+        }
+        if (!location_ids.empty()) {
+            current.batch_location_ids.reserve(shard_batch.global_indices.size());
+        }
+        for (const int32_t idx : shard_batch.global_indices) {
             current.batch_indexs.emplace_back(idx);
             current.batch_keys.emplace_back(keys[idx]);
             if (!properties.empty()) {
@@ -1962,15 +2093,7 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
                 current.batch_location_ids.emplace_back(location_ids[idx]);
             }
         }
-        current_batch_size += index_list.size();
-        ++shards_emitted;
-
-        // Flush on soft-limit, or after the last shard so the tail batch is kept.
-        if (current_batch_size >= batch_key_size_ || shards_emitted == total_shards) {
-            result.emplace_back(std::move(current));
-            current = BatchMetaData{};
-            current_batch_size = 0;
-        }
+        result.emplace_back(std::move(current));
     }
     return result;
 }

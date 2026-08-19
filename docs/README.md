@@ -6,6 +6,7 @@
 - [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
 - [MetaAsyncRedisBackend 消费者侧序列化优化设计](design/meta_async_redis_consumer_serialization.md) - 将 Location JSON 序列化移出 metadata shard mutex 临界区，复用现有异步队列、barrier 与 Redis pipeline
+- [Local Metadata Get/RMW 热路径优化设计](design/meta_local_async_redis_hot_path_optimization.md) - 区分 Async Redis + Local 与纯 Local，面向 32768 LRU shard 优化 compact/targeted Get、RMW scratch、local Upsert、queue fan-out 与 shard batch plan
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期

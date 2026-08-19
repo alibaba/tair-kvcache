@@ -47,6 +47,62 @@ CacheLocation::CacheLocation(const CacheLocation &other)
     }
 }
 
+CacheLocation &CacheLocation::operator=(const CacheLocation &other) {
+    if (this == &other) {
+        return *this;
+    }
+    const bool remains_uncacheable =
+        estimated_mem_usage_state_.load(std::memory_order_relaxed) == kUncacheableEstimatedMemUsage;
+    estimated_mem_usage_state_.store(remains_uncacheable ? kUncacheableEstimatedMemUsage : kUnknownEstimatedMemUsage,
+                                     std::memory_order_relaxed);
+    validated_total_size_ = kUnknownValidatedTotalSize;
+    id_ = other.id_;
+    status_ = other.status_;
+    type_ = other.type_;
+    spec_size_ = other.spec_size_;
+    create_time_ = other.create_time_;
+    location_specs_ = other.location_specs_;
+    validated_total_size_ = other.validated_total_size_;
+    return *this;
+}
+
+CacheLocation::CacheLocation(CacheLocation &&other) noexcept
+    : id_(std::move(other.id_))
+    , status_(other.status_)
+    , type_(other.type_)
+    , spec_size_(other.spec_size_)
+    , create_time_(other.create_time_)
+    , location_specs_(std::move(other.location_specs_))
+    , validated_total_size_(other.validated_total_size_)
+    , estimated_mem_usage_state_(other.estimated_mem_usage_state_.load(std::memory_order_relaxed) ==
+                                         kUncacheableEstimatedMemUsage
+                                     ? kUncacheableEstimatedMemUsage
+                                     : kUnknownEstimatedMemUsage) {
+    other.InvalidateEstimatedMemUsage();
+    other.validated_total_size_ = kUnknownValidatedTotalSize;
+}
+
+CacheLocation &CacheLocation::operator=(CacheLocation &&other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    const bool remains_uncacheable =
+        estimated_mem_usage_state_.load(std::memory_order_relaxed) == kUncacheableEstimatedMemUsage ||
+        other.estimated_mem_usage_state_.load(std::memory_order_relaxed) == kUncacheableEstimatedMemUsage;
+    id_ = std::move(other.id_);
+    status_ = other.status_;
+    type_ = other.type_;
+    spec_size_ = other.spec_size_;
+    create_time_ = other.create_time_;
+    location_specs_ = std::move(other.location_specs_);
+    validated_total_size_ = other.validated_total_size_;
+    estimated_mem_usage_state_.store(remains_uncacheable ? kUncacheableEstimatedMemUsage : kUnknownEstimatedMemUsage,
+                                     std::memory_order_relaxed);
+    other.InvalidateEstimatedMemUsage();
+    other.validated_total_size_ = kUnknownValidatedTotalSize;
+    return *this;
+}
+
 CacheLocation::CacheLocation(DataStorageType type, size_t spec_size, const std::vector<LocationSpec> &location_specs)
     : type_(type), spec_size_(spec_size), location_specs_(location_specs) {}
 

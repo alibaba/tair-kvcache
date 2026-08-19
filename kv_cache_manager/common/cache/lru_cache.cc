@@ -507,6 +507,10 @@ bool LRUCacheShard::Ref(LRUHandle *e) {
 
 void LRUCacheShard::AdjustCharge(LRUHandle *e, ssize_t delta) {
     std::lock_guard<std::mutex> l(mutex_);
+    AdjustChargeLocked(e, delta);
+}
+
+void LRUCacheShard::AdjustChargeLocked(LRUHandle *e, ssize_t delta) {
     assert(e->HasRefs());
     assert(e->InCache());
     if (delta > 0) {
@@ -519,6 +523,25 @@ void LRUCacheShard::AdjustCharge(LRUHandle *e, ssize_t delta) {
         e->total_charge -= decrease;
         usage_ -= decrease;
     }
+}
+
+bool LRUCacheShard::AdjustChargeAndRelease(LRUHandle *e, ssize_t delta) {
+    if (e == nullptr) {
+        return false;
+    }
+    bool was_in_cache = false;
+    bool must_free = false;
+    {
+        std::lock_guard<std::mutex> l(mutex_);
+        if (delta != 0) {
+            AdjustChargeLocked(e, delta);
+        }
+        must_free = ReleaseLocked(e, false, was_in_cache);
+    }
+    if (must_free) {
+        FreeReleasedHandle(e, was_in_cache, false);
+    }
+    return must_free;
 }
 
 void LRUCacheShard::SetHighPriorityPoolRatio(double high_pri_pool_ratio) {
@@ -540,49 +563,47 @@ bool LRUCacheShard::Release(LRUHandle *e, bool /*useful*/, bool erase_if_last_re
         return false;
     }
     bool must_free;
-    bool was_in_cache;
+    bool was_in_cache = false;
     {
         std::lock_guard<std::mutex> l(mutex_);
-        must_free = e->Unref();
-        was_in_cache = e->InCache();
-        if (must_free && was_in_cache) {
-            // The item is still in cache, and nobody else holds a reference to it.
-            if (erase_if_last_ref || (!no_evict_on_insert_ && usage_ > capacity_)) {
-                // When no_evict_on_insert_ is false: usage > capacity means the
-                // LRU list must be empty (EvictFromLRU drained it on Insert).
-                // When no_evict_on_insert_ is true: skip opportunistic eviction
-                // to avoid silently dropping entries whose charge grew in-place
-                // (via AdjustCharge).
-                assert(lru_.next == &lru_ || erase_if_last_ref);
-                // Take this opportunity and remove the item.
-                table_.Remove(e->key(), e->hash);
-                e->SetInCache(false);
-            } else {
-                // Put the item back on the LRU list, and don't free it.
-                LRU_Insert(e);
-                must_free = false;
-            }
-        }
-        // If about to be freed, then decrement the cache usage.
-        if (must_free) {
-            assert(usage_ >= e->total_charge);
-            usage_ -= e->total_charge;
-        }
+        must_free = ReleaseLocked(e, erase_if_last_ref, was_in_cache);
     }
 
-    // Free the entry here outside of mutex for performance reasons.
     if (must_free) {
-        // Only call eviction callback if we're sure no one requested erasure
-        // FIXME: disabled because of test churn
-        if (false && was_in_cache && !erase_if_last_ref && eviction_callback_ &&
-            eviction_callback_(e->key(), static_cast<Cache::Handle *>(e), e->HasHit())) {
-            // Callback took ownership of obj; just free handle
-            free(e);
-        } else {
-            e->Free(table_.GetAllocator());
-        }
+        FreeReleasedHandle(e, was_in_cache, erase_if_last_ref);
     }
     return must_free;
+}
+
+bool LRUCacheShard::ReleaseLocked(LRUHandle *e, bool erase_if_last_ref, bool &was_in_cache) {
+    bool must_free = e->Unref();
+    was_in_cache = e->InCache();
+    if (must_free && was_in_cache) {
+        if (erase_if_last_ref || (!no_evict_on_insert_ && usage_ > capacity_)) {
+            assert(lru_.next == &lru_ || erase_if_last_ref);
+            table_.Remove(e->key(), e->hash);
+            e->SetInCache(false);
+        } else {
+            LRU_Insert(e);
+            must_free = false;
+        }
+    }
+    if (must_free) {
+        assert(usage_ >= e->total_charge);
+        usage_ -= e->total_charge;
+    }
+    return must_free;
+}
+
+void LRUCacheShard::FreeReleasedHandle(LRUHandle *e, bool was_in_cache, bool erase_if_last_ref) {
+    // Only call eviction callback if we're sure no one requested erasure.
+    // FIXME: disabled because of test churn.
+    if (false && was_in_cache && !erase_if_last_ref && eviction_callback_ &&
+        eviction_callback_(e->key(), static_cast<Cache::Handle *>(e), e->HasHit())) {
+        free(e);
+    } else {
+        e->Free(table_.GetAllocator());
+    }
 }
 
 void LRUCacheShard::ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count) {
@@ -957,6 +978,14 @@ void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, Bat
         const auto *entry = static_cast<const LRUHandle *>(handles[ordered_indices[begin]]);
         GetShard(entry->GetHash()).ReleaseBatch(handles, ordered_indices.data() + begin, end - begin);
     }
+}
+
+bool LRUCache::AdjustChargeAndRelease(Handle *handle, ssize_t delta) {
+    if (handle == nullptr) {
+        return false;
+    }
+    auto *entry = static_cast<LRUHandle *>(handle);
+    return GetShard(entry->GetHash()).AdjustChargeAndRelease(entry, delta);
 }
 
 void LRUCache::ApplyToHandle(

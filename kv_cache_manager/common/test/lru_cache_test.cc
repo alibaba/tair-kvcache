@@ -204,6 +204,24 @@ TEST_F(LRUCacheTest, BatchReleaseFreesEntryErasedWhilePinned) {
     ValidateLRUList({"b"}, 0, 1);
 }
 
+TEST_F(LRUCacheTest, AdjustChargeAndReleaseUpdatesUsageAndReleasesHandle) {
+    NewCache(100);
+    Insert("a", Cache::Priority::LOW, 10);
+
+    auto *handle = cache_->Lookup("a", 0, nullptr, nullptr, Cache::Priority::LOW, nullptr);
+    ASSERT_NE(nullptr, handle);
+    EXPECT_EQ(10u, cache_->GetUsage());
+    EXPECT_FALSE(cache_->AdjustChargeAndRelease(handle, 7));
+    EXPECT_EQ(17u, cache_->GetUsage());
+    ValidateLRUList({"a"}, 0, 1);
+
+    handle = cache_->Lookup("a", 0, nullptr, nullptr, Cache::Priority::LOW, nullptr);
+    ASSERT_NE(nullptr, handle);
+    EXPECT_FALSE(cache_->AdjustChargeAndRelease(handle, -5));
+    EXPECT_EQ(12u, cache_->GetUsage());
+    ValidateLRUList({"a"}, 0, 1);
+}
+
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
     // Allocate 2 cache entries to high-pri pool and 3 to low-pri pool.
     NewCache(5, /* high_pri_pool_ratio */ 0.40, /* low_pri_pool_ratio */ 0.60);

@@ -163,9 +163,9 @@ public:
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
 
-    // Only the single local backend is safe and useful to fan out: its cache
-    // and items are independently sharded/locked and it ignores RequestContext.
-    // Redis and cached modes retain their existing batched request semantics.
+    // Local backends are safe to fan out because cache shards and items are
+    // independently locked. Cached mode enables this only after recovery has
+    // completed and the production local cache is authoritative for reads.
     bool SupportsConcurrentLocationValueReads() const noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
     bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;

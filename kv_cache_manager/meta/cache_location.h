@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -94,9 +95,9 @@ class CacheLocation : public Jsonizable {
 public:
     CacheLocation();
     CacheLocation(const CacheLocation &other);
-    CacheLocation &operator=(const CacheLocation &) = default;
-    CacheLocation(CacheLocation &&) noexcept = default;
-    CacheLocation &operator=(CacheLocation &&) noexcept = default;
+    CacheLocation &operator=(const CacheLocation &other);
+    CacheLocation(CacheLocation &&other) noexcept;
+    CacheLocation &operator=(CacheLocation &&other) noexcept;
     CacheLocation(DataStorageType type, size_t spec_size, const std::vector<LocationSpec> &location_specs);
     CacheLocation(const std::string &id,
                   CacheLocationStatus status,
@@ -133,6 +134,7 @@ public:
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         std::string id;
+        InvalidateEstimatedMemUsage();
         validated_total_size_ = kUnknownValidatedTotalSize;
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "id", id, std::string(""));
         id_ = std::move(id);
@@ -146,9 +148,16 @@ public:
 
     void set_status(CacheLocationStatus status) { status_ = status; }
     void set_type(DataStorageType type) { type_ = type; }
-    void set_id(const std::string &id) { id_ = id; }
-    void set_id(std::string &&id) noexcept { id_ = std::move(id); }
+    void set_id(const std::string &id) {
+        InvalidateEstimatedMemUsage();
+        id_ = id;
+    }
+    void set_id(std::string &&id) noexcept {
+        InvalidateEstimatedMemUsage();
+        id_ = std::move(id);
+    }
     void set_id(InternedLocationId id) noexcept {
+        InvalidateEstimatedMemUsage();
         if (id) {
             id_ = std::move(id);
         } else {
@@ -158,10 +167,12 @@ public:
     void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) {
+        InvalidateEstimatedMemUsage();
         validated_total_size_ = kUnknownValidatedTotalSize;
         location_specs_.push_back(std::move(location_spec));
     }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) {
+        InvalidateEstimatedMemUsage();
         validated_total_size_ = kUnknownValidatedTotalSize;
         location_specs_ = std::move(location_specs);
     }
@@ -179,6 +190,7 @@ public:
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
+        estimated_mem_usage_state_.store(kUncacheableEstimatedMemUsage, std::memory_order_relaxed);
         validated_total_size_ = kUnknownValidatedTotalSize;
         return location_specs_;
     }
@@ -198,15 +210,30 @@ public:
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
     [[nodiscard]] int64_t create_time() const { return create_time_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
+        const size_t cached = estimated_mem_usage_state_.load(std::memory_order_relaxed);
+        if (cached > kUncacheableEstimatedMemUsage) {
+            return cached;
+        }
         size_t usage = sizeof(CacheLocation) + id().size();
         for (const auto &spec : location_specs_) {
             usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+        }
+        if (cached == kUnknownEstimatedMemUsage) {
+            estimated_mem_usage_state_.store(usage, std::memory_order_relaxed);
         }
         return usage;
     }
 
 private:
     static constexpr std::uint64_t kUnknownValidatedTotalSize = std::numeric_limits<std::uint64_t>::max();
+    static constexpr size_t kUnknownEstimatedMemUsage = 0;
+    static constexpr size_t kUncacheableEstimatedMemUsage = 1;
+
+    void InvalidateEstimatedMemUsage() noexcept {
+        if (estimated_mem_usage_state_.load(std::memory_order_relaxed) != kUncacheableEstimatedMemUsage) {
+            estimated_mem_usage_state_.store(kUnknownEstimatedMemUsage, std::memory_order_relaxed);
+        }
+    }
 
     std::variant<std::string, InternedLocationId> id_;
     CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
@@ -221,6 +248,7 @@ private:
     // retained specs are also proven valid. It is intentionally not
     // serialized, so recovered values fail closed and validate again.
     std::uint64_t validated_total_size_ = kUnknownValidatedTotalSize;
+    mutable std::atomic<size_t> estimated_mem_usage_state_{kUnknownEstimatedMemUsage};
 };
 
 using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;
