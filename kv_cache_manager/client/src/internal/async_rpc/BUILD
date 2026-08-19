@@ -46,3 +46,25 @@ cc_library(
         "@grpc//:grpc++",
     ],
 )
+
+cc_library(
+    name = "http_client",
+    srcs = ["http_client.cc"],
+    hdrs = ["http_client.h"],
+    copts = ASYNC_RPC_COPTS,
+    deps = [
+        ":core",
+        "@yalantinglibs//:ylt",
+    ],
+)
+
+cc_library(
+    name = "async_rpc_client",
+    srcs = ["provider.cc"],
+    copts = ASYNC_RPC_COPTS,
+    deps = [
+        ":core",
+        ":grpc_client",
+        ":http_client",
+    ],
+)
