@@ -1,0 +1,157 @@
+{
+  "behaviors": [
+    {
+      "config": {
+        "groups": [
+          {
+            "block_size": 16,
+            "id": "full-0",
+            "kind": "full_attention",
+            "lookup_selector": "prefix",
+            "object_size": 4096
+          },
+          {
+            "block_size": 32,
+            "id": "full-1",
+            "kind": "full_attention",
+            "lookup_selector": "coverage",
+            "object_size": 8192
+          },
+          {
+            "block_size": 64,
+            "id": "mamba-0",
+            "key_presence_rate": 0.35,
+            "kind": "mamba",
+            "object_size": 1024
+          }
+        ],
+        "heartbeat_interval": "2s",
+        "instance_group": "placeholder",
+        "instance_id": "placeholder",
+        "leader_poll_interval": "3s",
+        "limits": {
+          "max_active_sessions": 256
+        },
+        "local_cache": {
+          "capacity_bytes": 2433024
+        },
+        "min_replica_count": 2,
+        "process_count": 3,
+        "process_startup_interval": {
+          "max": "10ms",
+          "min": "0ms"
+        },
+        "session_affinity": 0.6,
+        "session_arrival": {
+          "mode": "poisson",
+          "rate": 12
+        },
+        "session_classes": [
+          {
+            "initial_tokens": {
+              "max": 384,
+              "min": 192
+            },
+            "name": "chat",
+            "new_tokens_per_turn": {
+              "max": 96,
+              "min": 32
+            },
+            "rewrite_tail_tokens": {
+              "max": 24,
+              "min": 0
+            },
+            "shared_prefix_probability": 0.65,
+            "turn_interval": {
+              "max": "120ms",
+              "min": "50ms"
+            },
+            "turns": {
+              "max": 8,
+              "min": 3
+            },
+            "weight": 0.7
+          },
+          {
+            "initial_tokens": {
+              "max": 900,
+              "min": 512
+            },
+            "name": "long_context",
+            "new_tokens_per_turn": {
+              "max": 64,
+              "min": 32
+            },
+            "rewrite_tail_tokens": {
+              "max": 16,
+              "min": 0
+            },
+            "shared_prefix_probability": 0.3,
+            "turn_interval": {
+              "max": "160ms",
+              "min": "80ms"
+            },
+            "turns": {
+              "max": 4,
+              "min": 2
+            },
+            "weight": 0.3
+          }
+        ],
+        "shared_prefix_pool": {
+          "prefix_tokens": {
+            "max": 160,
+            "min": 96
+          },
+          "root_count": 6
+        }
+      },
+      "id": "v6d-a",
+      "transport": "http",
+      "type": "v6d_deployment"
+    },
+    {
+      "config": {
+        "interval": "500ms",
+        "probe_deadline": "2s",
+        "streams": 2
+      },
+      "id": "health-a",
+      "transport": "http",
+      "type": "health_probe"
+    }
+  ],
+  "evidence": {
+    "markdown_summary": "summary.md",
+    "output_json": "report.json",
+    "violations_jsonl": "violations.jsonl"
+  },
+  "name": "v6d-normal",
+  "runtime": {
+    "drain_timeout": "20s",
+    "grpc_completion_queues": 2,
+    "limits": {
+      "http_connections_per_endpoint": 6,
+      "http_control_connections_per_endpoint": 2,
+      "max_in_flight_business_rpcs": 256,
+      "max_in_flight_control_rpcs": 32
+    },
+    "reactor_threads": 2,
+    "steady": "10s",
+    "warmup": "3s",
+    "workers": 2
+  },
+  "seed": 20260819,
+  "target": {
+    "endpoints": {
+      "admin_http": "http://127.0.0.1:3",
+      "meta_grpc": "127.0.0.1:2",
+      "meta_http": "http://127.0.0.1:1"
+    },
+    "instance_groups": {
+      "placeholder": {
+        "quota_bytes": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "behaviors": [
+    {
+      "config": {
+        "interval": "300ms",
+        "probe_deadline": "2s",
+        "streams": 3
+      },
+      "id": "health-a",
+      "transport": "http",
+      "type": "health_probe"
+    }
+  ],
+  "evidence": {
+    "markdown_summary": "summary.md",
+    "output_json": "report.json",
+    "violations_jsonl": "violations.jsonl"
+  },
+  "name": "health-probe-only",
+  "runtime": {
+    "drain_timeout": "4s",
+    "grpc_completion_queues": 2,
+    "limits": {
+      "http_connections_per_endpoint": 6,
+      "http_control_connections_per_endpoint": 2,
+      "max_in_flight_business_rpcs": 256,
+      "max_in_flight_control_rpcs": 32
+    },
+    "reactor_threads": 2,
+    "steady": "4s",
+    "warmup": "1s",
+    "workers": 2
+  },
+  "seed": 20260819,
+  "target": {
+    "endpoints": {
+      "admin_http": "http://127.0.0.1:3",
+      "meta_grpc": "127.0.0.1:2",
+      "meta_http": "http://127.0.0.1:1"
+    },
+    "instance_groups": {
+      "placeholder": {
+        "quota_bytes": 1
+      }
+    }
+  }
+}

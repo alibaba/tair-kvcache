@@ -1,0 +1,50 @@
+{
+  "exact_report_values": {
+    "run.metadata_only": true
+  },
+  "forbid_generator_saturation": true,
+  "max_latency_p99_ms": {
+    "CheckHealth": 2000
+  },
+  "max_report_values": {
+    "behaviors.health-a.deadline_exceeded": 0,
+    "behaviors.health-a.failed": 0
+  },
+  "min_report_values": {
+    "behaviors.health-a.probes": 20,
+    "behaviors.health-a.responded": 20
+  },
+  "min_rpc_samples": {
+    "CheckHealth": 20
+  },
+  "min_success_rate": {
+    "CheckHealth": 1.0
+  },
+  "name": "health-probe-only",
+  "require_apis_exercised": [
+    "CheckHealth"
+  ],
+  "require_drain_complete": true,
+  "require_exit_code": 0,
+  "require_preflight_pass": true,
+  "require_report_sections": [
+    "run",
+    "run_config",
+    "phases",
+    "runtime",
+    "behaviors",
+    "rpc",
+    "transport",
+    "cache",
+    "invariants",
+    "workload_shape",
+    "usage_observations",
+    "limitations",
+    "cleanup"
+  ],
+  "required_checks": {
+    "C5_health_probe_bounded_response": {
+      "min_checked": 20
+    }
+  }
+}

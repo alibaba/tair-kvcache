@@ -1,0 +1,95 @@
+{
+  "exact_report_values": {
+    "cleanup.behaviors.v6d-a.remove_cache_called": false,
+    "run.metadata_only": true
+  },
+  "forbid_generator_saturation": true,
+  "max_latency_p99_ms": {
+    "CheckHealth": 2000,
+    "GetCacheLocationsByBackend": 3000,
+    "ReportEvent": 3000,
+    "StartWriteCache": 3000
+  },
+  "max_report_values": {
+    "behaviors.v6d-a.expected_locations.cold_unknown": 0,
+    "behaviors.v6d-a.expected_locations.hot_unknown": 0,
+    "behaviors.v6d-a.sessions.aborted": 0,
+    "behaviors.v6d-a.turns.cold_lookup_failures": 0,
+    "behaviors.v6d-a.turns.hot_lookup_failures": 0,
+    "behaviors.v6d-a.turns.insert_failed_backpressure": 0,
+    "behaviors.v6d-a.turns.turn_capacity_timeouts": 0,
+    "cache.v6d-a.backpressure_timeouts": 0,
+    "cleanup.behaviors.v6d-a.protected_uncertain_operations": 0,
+    "cleanup.behaviors.v6d-a.unflushed_local_objects": 0
+  },
+  "min_report_values": {
+    "behaviors.v6d-a.sessions.admitted": 30,
+    "behaviors.v6d-a.turns.turns": 50,
+    "cleanup.behaviors.v6d-a.host_down_succeeded": 4,
+    "runtime.admission.business.in_flight_peak": 3
+  },
+  "min_rpc_samples": {
+    "CheckHealth": 10,
+    "FinishWriteCache": 5,
+    "GetCacheLocationsByBackend": 60,
+    "GetClusterInfo": 3,
+    "RegisterInstance": 3,
+    "ReportEvent": 40,
+    "StartWriteCache": 5
+  },
+  "min_success_rate": {
+    "__all__": 1.0
+  },
+  "name": "v6d-async-pressure",
+  "non_gating_checks": [
+    "C4_server_metric_cross_check"
+  ],
+  "require_apis_exercised": [
+    "RegisterInstance",
+    "ReportEvent",
+    "GetCacheLocationsByBackend",
+    "StartWriteCache",
+    "FinishWriteCache",
+    "GetClusterInfo",
+    "CheckHealth",
+    "RemoveCache"
+  ],
+  "require_drain_complete": true,
+  "require_exit_code": 0,
+  "require_preflight_pass": true,
+  "require_report_sections": [
+    "run",
+    "run_config",
+    "phases",
+    "runtime",
+    "behaviors",
+    "rpc",
+    "transport",
+    "cache",
+    "invariants",
+    "workload_shape",
+    "usage_observations",
+    "limitations",
+    "cleanup"
+  ],
+  "required_checks": {
+    "C1a_selector_soundness": {
+      "min_checked": 20
+    },
+    "C1b_remote_availability": {
+      "min_checked": 3
+    },
+    "C2_batch_response_shape": {
+      "min_checked": 100
+    },
+    "C3_capacity_pressure_eviction": {
+      "min_checked": 5,
+      "min_counters": {
+        "write_sessions_closed": 5
+      }
+    },
+    "C5_health_probe_bounded_response": {
+      "min_checked": 20
+    }
+  }
+}
