@@ -89,7 +89,13 @@ class LocationQueryManager:
         req_id = request.request_id
         with self._lock:
             entry = self._entries.get(req_id)
-            if entry is not None and not entry.in_flight:
+            if entry is not None and entry.in_flight:
+                # A query for this request is already running (this offset or
+                # an older one); re-issuing on every scheduler re-ask would
+                # fan out one full getCacheLocation per engine step while the
+                # answer is in flight. Wait for the running one instead.
+                return None
+            if entry is not None:
                 if entry.computed_blocks == computed_blocks:
                     return entry.locations
                 # Stale answer for an older offset: re-issue below.

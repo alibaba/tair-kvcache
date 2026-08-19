@@ -41,3 +41,10 @@ py_test(
     tags = ["no-remote-exec"],
     deps = [":vllm_stubs"],
 )
+
+py_test(
+    name = "test_location_query",
+    srcs = ["test_location_query.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
