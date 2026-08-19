@@ -11,10 +11,11 @@ namespace {
 TEST(RegistryTest, DefaultRegistryExposesExactlyTheShippedBehaviors) {
     const BehaviorRegistry registry = MakeDefaultRegistry();
     const std::vector<std::string> types = registry.Types();
-    ASSERT_EQ(types.size(), 1u);
+    ASSERT_EQ(types.size(), 2u);
     EXPECT_EQ(types[0], "health_probe");
+    EXPECT_EQ(types[1], "v6d_deployment");
+    EXPECT_NE(registry.Find("v6d_deployment"), nullptr);
     EXPECT_NE(registry.Find("health_probe"), nullptr);
-    EXPECT_EQ(registry.Find("v6d_deployment"), nullptr);
     // event_reporter will arrive as its own top-level behavior, not as a mode.
     EXPECT_EQ(registry.Find("event_reporter"), nullptr);
 }

@@ -1,6 +1,7 @@
 #include "tools/kvcm_swarm/clients/registry.h"
 
 #include "tools/kvcm_swarm/clients/health/health_probe.h"
+#include "tools/kvcm_swarm/clients/v6d/deployment.h"
 
 namespace kvcm_swarm {
 
@@ -24,6 +25,7 @@ std::vector<std::string> BehaviorRegistry::Types() const {
 
 BehaviorRegistry MakeDefaultRegistry() {
     BehaviorRegistry registry;
+    registry.Register("v6d_deployment", MakeV6dDeploymentFactory());
     registry.Register("health_probe", MakeHealthProbeFactory());
     return registry;
 }

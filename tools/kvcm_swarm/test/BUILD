@@ -50,6 +50,39 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "checks_test",
+    size = "small",
+    srcs = ["checks_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:v6d_behavior",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "v6d_protocol_test",
+    size = "small",
+    srcs = ["v6d_protocol_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:protocol",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "loader_test",
+    size = "small",
+    srcs = ["loader_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:scenario_loader",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "fake_behavior",
     testonly = True,
@@ -70,6 +103,17 @@ cc_test(
     deps = [
         ":fake_behavior",
         "//tools/kvcm_swarm:registry",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "session_manager_test",
+    size = "medium",
+    srcs = ["session_manager_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:v6d_behavior",
         "@com_google_googletest//:gtest_main",
     ],
 )

@@ -161,6 +161,28 @@ cc_library(
 )
 
 cc_library(
+    name = "v6d_behavior",
+    srcs = [
+        "clients/v6d/checks.cc",
+        "clients/v6d/deployment.cc",
+        "clients/v6d/process.cc",
+        "clients/v6d/session_manager.cc",
+    ],
+    hdrs = [
+        "clients/v6d/checks.h",
+        "clients/v6d/deployment.h",
+        "clients/v6d/process.h",
+        "clients/v6d/session_manager.h",
+    ],
+    copts = SWARM_COPTS,
+    deps = [
+        ":behavior_api",
+        ":protocol",
+        ":v6d_model",
+    ],
+)
+
+cc_library(
     name = "registry",
     srcs = ["clients/registry.cc"],
     hdrs = ["clients/registry.h"],
@@ -169,6 +191,7 @@ cc_library(
         ":behavior_api",
         ":health_probe",
         ":protocol",
+        ":v6d_behavior",
     ],
 )
 
