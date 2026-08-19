@@ -606,4 +606,63 @@ TEST_F(JsonizableTest, TestNestedContainer) {
     }
 }
 
+TEST_F(JsonizableTest, TestStrictObjectFields) {
+    class StrictJsonClass : public Jsonizable {
+    public:
+        bool FromRapidValue(const rapidjson::Value &rapid_value) override {
+            errors.clear();
+            GetRequired(rapid_value, "name", name, &errors);
+            GetOptional(rapid_value, "alias", alias, &errors);
+            GetOptional(rapid_value, "retries", retries, uint32_t{3}, &errors);
+            CheckUnknownFields(rapid_value, {"name", "alias", "retries"}, &errors);
+            return errors.empty();
+        }
+
+        void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+            Put(writer, "name", name);
+            Put(writer, "alias", alias);
+            Put(writer, "retries", retries);
+        }
+
+        std::string name;
+        std::optional<std::string> alias;
+        uint32_t retries = 0;
+        std::vector<std::string> errors;
+    };
+
+    StrictJsonClass value;
+    ASSERT_TRUE(value.FromJsonString(R"({"name":"worker"})"));
+    EXPECT_EQ(value.name, "worker");
+    EXPECT_FALSE(value.alias.has_value());
+    EXPECT_EQ(value.retries, 3u);
+    EXPECT_EQ(value.ToJsonString(), R"({"name":"worker","alias":null,"retries":3})");
+
+    ASSERT_TRUE(value.FromJsonString(R"({"name":"worker","alias":"primary","retries":5})"));
+    ASSERT_TRUE(value.alias.has_value());
+    EXPECT_EQ(*value.alias, "primary");
+    EXPECT_EQ(value.retries, 5u);
+
+    EXPECT_FALSE(value.FromJsonString(R"({"retries":2,"mystery":true})"));
+    ASSERT_EQ(value.errors.size(), 2u);
+    EXPECT_EQ(value.errors[0], "name: required field is missing");
+    EXPECT_EQ(value.errors[1], "unknown field 'mystery'");
+
+    EXPECT_FALSE(value.FromJsonString(R"({"name":"worker","alias":null})"));
+    ASSERT_EQ(value.errors.size(), 1u);
+    EXPECT_EQ(value.errors[0], "alias: has an invalid type or value");
+}
+
+TEST_F(JsonizableTest, TestDetailedParseError) {
+    class EmptyJsonClass : public Jsonizable {
+    public:
+        bool FromRapidValue(const rapidjson::Value &rapid_value) override { return rapid_value.IsObject(); }
+        void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> & /*writer*/) const noexcept override {}
+    };
+
+    EmptyJsonClass value;
+    std::string error;
+    EXPECT_FALSE(value.FromJsonString("{\"name\":", &error));
+    EXPECT_NE(error.find("JSON parse error at offset"), std::string::npos);
+}
+
 } // namespace kv_cache_manager

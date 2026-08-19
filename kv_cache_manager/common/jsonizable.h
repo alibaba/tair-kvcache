@@ -1,7 +1,9 @@
 #pragma once
 
+#include <initializer_list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -28,6 +30,7 @@ namespace kv_cache_manager {
 class Jsonizable {
 public:
     virtual bool FromJsonString(const std::string &str);
+    bool FromJsonString(const std::string &str, std::string *error);
     virtual std::string ToJsonString() const noexcept;
 
     virtual bool FromRapidValue(const rapidjson::Value &rapid_value) { return false; };
@@ -47,6 +50,34 @@ public:
 
 protected:
     static bool Parse(rapidjson::Document &doc, const std::string &str);
+    static bool Parse(rapidjson::Document &doc, const std::string &str, std::string *error);
+
+    // Strict object-field helpers for configuration-style JSON. The legacy
+    // Get() helpers intentionally keep their historical semantics, where a
+    // missing field succeeds and leaves the destination unchanged. New code
+    // that distinguishes required and optional fields should use these APIs.
+    template <typename T>
+    static bool GetRequired(const rapidjson::Value &rapid_value,
+                            std::string_view key,
+                            T &value,
+                            std::vector<std::string> *errors = nullptr);
+
+    template <typename T>
+    static bool GetOptional(const rapidjson::Value &rapid_value,
+                            std::string_view key,
+                            std::optional<T> &value,
+                            std::vector<std::string> *errors = nullptr);
+
+    template <typename T>
+    static bool GetOptional(const rapidjson::Value &rapid_value,
+                            std::string_view key,
+                            T &value,
+                            const T &default_value,
+                            std::vector<std::string> *errors = nullptr);
+
+    static bool CheckUnknownFields(const rapidjson::Value &rapid_value,
+                                   std::initializer_list<std::string_view> known_fields,
+                                   std::vector<std::string> *errors = nullptr);
 
     // read
     template <typename T>
@@ -99,6 +130,9 @@ private:
 
     inline static bool FromRapidValue(const rapidjson::Value &rapid_value, std::string &value);
 
+    template <typename T>
+    inline static bool FromRapidValue(const rapidjson::Value &rapid_value, std::optional<T> &value);
+
     template <typename T, typename A>
     static bool FromRapidValue(const rapidjson::Value &rapid_value, std::vector<T, A> &values);
 
@@ -136,6 +170,9 @@ private:
 
     inline static void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer,
                                      const std::string &value) noexcept;
+
+    template <typename T>
+    inline static void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer, const std::optional<T> &value);
 
     template <typename T>
     inline static void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer, const T *value);
@@ -297,6 +334,20 @@ bool Jsonizable::FromRapidValue(const rapidjson::Value &rapid_value, std::string
 }
 
 template <typename T>
+bool Jsonizable::FromRapidValue(const rapidjson::Value &rapid_value, std::optional<T> &value) {
+    if (rapid_value.IsNull()) {
+        value.reset();
+        return true;
+    }
+    T parsed_value;
+    if (!FromRapidValue(rapid_value, parsed_value)) {
+        return false;
+    }
+    value = std::move(parsed_value);
+    return true;
+}
+
+template <typename T>
 bool Jsonizable::FromRapidValue(const rapidjson::Value &rapid_value, T *&value) {
     if (rapid_value.IsNull()) {
         value = nullptr;
@@ -366,6 +417,15 @@ void Jsonizable::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &write
 }
 
 template <typename T>
+void Jsonizable::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer, const std::optional<T> &value) {
+    if (value.has_value()) {
+        ToRapidWriter(writer, *value);
+    } else {
+        writer.Null();
+    }
+}
+
+template <typename T>
 void Jsonizable::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer, const T *value) {
     if (value) {
         ToRapidWriter(writer, *value);
@@ -405,6 +465,87 @@ void Jsonizable::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &write
         ToRapidWriter(writer, item.second);
     }
     writer.EndObject();
+}
+
+template <typename T>
+bool Jsonizable::GetRequired(const rapidjson::Value &rapid_value,
+                             std::string_view key,
+                             T &value,
+                             std::vector<std::string> *errors) {
+    if (!rapid_value.IsObject()) {
+        if (errors != nullptr) {
+            errors->push_back("expected a JSON object");
+        }
+        return false;
+    }
+    const auto iter = rapid_value.FindMember(rapidjson::StringRef(key.data(), key.size()));
+    if (iter == rapid_value.MemberEnd()) {
+        if (errors != nullptr) {
+            errors->push_back(std::string(key) + ": required field is missing");
+        }
+        return false;
+    }
+    if (!FromRapidValue(iter->value, value)) {
+        if (errors != nullptr) {
+            errors->push_back(std::string(key) + ": has an invalid type or value");
+        }
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+bool Jsonizable::GetOptional(const rapidjson::Value &rapid_value,
+                             std::string_view key,
+                             std::optional<T> &value,
+                             std::vector<std::string> *errors) {
+    if (!rapid_value.IsObject()) {
+        if (errors != nullptr) {
+            errors->push_back("expected a JSON object");
+        }
+        return false;
+    }
+    const auto iter = rapid_value.FindMember(rapidjson::StringRef(key.data(), key.size()));
+    if (iter == rapid_value.MemberEnd()) {
+        value.reset();
+        return true;
+    }
+    // A present null is not the same as an omitted configuration field.
+    T parsed_value;
+    if (!FromRapidValue(iter->value, parsed_value)) {
+        if (errors != nullptr) {
+            errors->push_back(std::string(key) + ": has an invalid type or value");
+        }
+        return false;
+    }
+    value = std::move(parsed_value);
+    return true;
+}
+
+template <typename T>
+bool Jsonizable::GetOptional(const rapidjson::Value &rapid_value,
+                             std::string_view key,
+                             T &value,
+                             const T &default_value,
+                             std::vector<std::string> *errors) {
+    if (!rapid_value.IsObject()) {
+        if (errors != nullptr) {
+            errors->push_back("expected a JSON object");
+        }
+        return false;
+    }
+    const auto iter = rapid_value.FindMember(rapidjson::StringRef(key.data(), key.size()));
+    if (iter == rapid_value.MemberEnd()) {
+        value = default_value;
+        return true;
+    }
+    if (!FromRapidValue(iter->value, value)) {
+        if (errors != nullptr) {
+            errors->push_back(std::string(key) + ": has an invalid type or value");
+        }
+        return false;
+    }
+    return true;
 }
 
 template <typename T>
