@@ -90,23 +90,24 @@ cc_library(
 cc_library(
     name = "scenario_config",
     srcs = [
-        "scenario/config_node.cc",
-        "scenario/config_reader.cc",
+        "scenario/duration.cc",
+        "scenario/json_config.cc",
     ],
     hdrs = [
-        "scenario/config_node.h",
-        "scenario/config_reader.h",
+        "scenario/duration.h",
+        "scenario/json_config.h",
     ],
     copts = SWARM_COPTS,
     deps = [
-        ":evidence",
         ":runtime",
+        "//kv_cache_manager/common:jsonizable",
         "@rapidjson",
     ],
 )
 
 cc_library(
     name = "behavior_api",
+    srcs = ["scenario/config.cc"],
     hdrs = [
         "clients/client_behavior.h",
         "scenario/config.h",

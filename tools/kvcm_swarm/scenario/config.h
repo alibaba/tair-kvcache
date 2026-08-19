@@ -10,15 +10,15 @@
 #include <string>
 #include <vector>
 
+#include "kv_cache_manager/common/jsonizable.h"
 #include "tools/kvcm_swarm/clients/client_behavior.h"
 #include "tools/kvcm_swarm/runtime/admission.h"
 #include "tools/kvcm_swarm/runtime/clock.h"
-#include "tools/kvcm_swarm/scenario/config_node.h"
 #include "tools/kvcm_swarm/transport/transport.h"
 
 namespace kvcm_swarm {
 
-struct RuntimeConfig {
+struct RuntimeConfig : public kv_cache_manager::Jsonizable {
     Duration warmup = std::chrono::seconds(5);
     Duration steady = std::chrono::seconds(30);
     Duration drain_timeout = std::chrono::seconds(20);
@@ -28,22 +28,30 @@ struct RuntimeConfig {
     uint32_t reactor_threads = 2;
     uint32_t grpc_completion_queues = 2;
     TransportLimits transport;
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 };
 
-struct InstanceGroupTarget {
+struct InstanceGroupTarget : public kv_cache_manager::Jsonizable {
     std::string name;
     uint64_t quota_bytes = 0;
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 };
 
-struct TargetConfig {
+struct TargetConfig : public kv_cache_manager::Jsonizable {
     EndpointSet endpoints;
     std::map<std::string, InstanceGroupTarget> instance_groups;
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 };
 
-struct EvidenceConfig {
+struct EvidenceConfig : public kv_cache_manager::Jsonizable {
     std::string output_json;
     std::string violations_jsonl;
     std::string markdown_summary;
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 };
 
 struct ScenarioConfig {
@@ -54,8 +62,6 @@ struct ScenarioConfig {
     std::vector<BehaviorSpec> behaviors;
     EvidenceConfig evidence;
     bool preflight_enabled = true;
-    // Raw configuration document, echoed into the report.
-    ConfigNode document;
 };
 
 } // namespace kvcm_swarm

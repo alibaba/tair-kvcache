@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 #include "tools/kvcm_swarm/evidence/json_writer.h"
-#include "tools/kvcm_swarm/scenario/config_reader.h"
+#include "tools/kvcm_swarm/scenario/duration.h"
 
 namespace kvcm_swarm {
 namespace {
@@ -116,45 +116,9 @@ std::string BuildRunReportJson(const RunReportInput &input) {
     writer.KeyString("name", input.config->name);
     writer.KeyUint("seed", input.config->seed);
     writer.Key("runtime");
-    writer.BeginObject();
-    writer.KeyString("warmup", FormatDuration(input.config->runtime.warmup));
-    writer.KeyString("steady", FormatDuration(input.config->runtime.steady));
-    writer.KeyString("drain_timeout", FormatDuration(input.config->runtime.drain_timeout));
-    writer.KeyUint("workers", input.config->runtime.workers);
-    writer.KeyUint("reactor_threads", input.config->runtime.reactor_threads);
-    writer.KeyUint("grpc_completion_queues", input.config->runtime.grpc_completion_queues);
-    writer.Key("limits");
-    writer.BeginObject();
-    writer.KeyUint("max_in_flight_business_rpcs", input.config->runtime.limits.max_in_flight_business_rpcs);
-    writer.KeyUint("max_in_flight_control_rpcs", input.config->runtime.limits.max_in_flight_control_rpcs);
-    writer.KeyString("business_permit_wait_threshold",
-                     FormatDuration(input.config->runtime.limits.business_permit_wait_threshold));
-    writer.KeyUint("http_connections_per_endpoint", input.config->runtime.transport.http_connections_per_endpoint);
-    writer.KeyUint("http_control_connections_per_endpoint",
-                   input.config->runtime.transport.http_control_connections_per_endpoint);
-    writer.KeyString("connect_timeout", FormatDuration(input.config->runtime.transport.connect_timeout));
-    writer.KeyString("default_rpc_timeout", FormatDuration(input.config->runtime.transport.default_rpc_timeout));
-    writer.EndObject();
-    writer.EndObject();
+    writer.RawValue(input.config->runtime.ToJsonString());
     writer.Key("target");
-    writer.BeginObject();
-    writer.Key("endpoints");
-    writer.BeginObject();
-    writer.KeyString("meta_http", input.config->target.endpoints.meta_http);
-    writer.KeyString("meta_grpc", input.config->target.endpoints.meta_grpc);
-    writer.KeyString("admin_http", input.config->target.endpoints.admin_http);
-    writer.KeyString("admin_grpc", input.config->target.endpoints.admin_grpc);
-    writer.EndObject();
-    writer.Key("instance_groups");
-    writer.BeginObject();
-    for (const auto &entry : input.config->target.instance_groups) {
-        writer.Key(entry.first);
-        writer.BeginObject();
-        writer.KeyUint("quota_bytes", entry.second.quota_bytes);
-        writer.EndObject();
-    }
-    writer.EndObject();
-    writer.EndObject();
+    writer.RawValue(input.config->target.ToJsonString());
     writer.KeyBool("preflight", input.config->preflight_enabled);
     writer.Key("behaviors");
     writer.BeginObject();
@@ -168,11 +132,7 @@ std::string BuildRunReportJson(const RunReportInput &input) {
     }
     writer.EndObject();
     writer.Key("evidence");
-    writer.BeginObject();
-    writer.KeyString("output_json", input.config->evidence.output_json);
-    writer.KeyString("violations_jsonl", input.config->evidence.violations_jsonl);
-    writer.KeyString("markdown_summary", input.config->evidence.markdown_summary);
-    writer.EndObject();
+    writer.RawValue(input.config->evidence.ToJsonString());
     writer.EndObject();
 
     // ---- phases ----

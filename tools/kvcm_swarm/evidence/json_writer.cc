@@ -74,11 +74,4 @@ void JsonWriter::RawValue(std::string_view json) {
 
 std::string JsonWriter::Take() { return std::string(impl_->buffer.GetString(), impl_->buffer.GetSize()); }
 
-std::string JsonQuote(std::string_view value) {
-    rapidjson::StringBuffer buffer;
-    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-    writer.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
-    return std::string(buffer.GetString(), buffer.GetSize());
-}
-
 } // namespace kvcm_swarm

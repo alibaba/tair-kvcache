@@ -16,7 +16,6 @@
 #include "tools/kvcm_swarm/runtime/admission.h"
 #include "tools/kvcm_swarm/runtime/executor.h"
 #include "tools/kvcm_swarm/runtime/rng.h"
-#include "tools/kvcm_swarm/scenario/config_node.h"
 #include "tools/kvcm_swarm/transport/transport.h"
 #include "tools/kvcm_swarm/transport/transport_provider.h"
 
@@ -26,7 +25,9 @@ struct BehaviorSpec {
     std::string id;
     std::string type;
     TransportKind transport = TransportKind::kHttp;
-    ConfigNode config;
+    // The common loader validates the behavior envelope and preserves this
+    // object for the registered factory's Jsonizable configuration type.
+    std::string config_json;
 };
 
 struct RuntimeServices {

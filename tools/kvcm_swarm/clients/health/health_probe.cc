@@ -4,7 +4,7 @@
 
 #include "tools/kvcm_swarm/evidence/json_writer.h"
 #include "tools/kvcm_swarm/protocol/proto_alias.h"
-#include "tools/kvcm_swarm/scenario/config_reader.h"
+#include "tools/kvcm_swarm/scenario/duration.h"
 
 namespace kvcm_swarm {
 namespace {
@@ -132,13 +132,7 @@ void HealthProbe::WriteReport(JsonWriter &writer) const {
     writer.EndObject();
 }
 
-void HealthProbe::WriteEffectiveConfig(JsonWriter &writer) const {
-    writer.BeginObject();
-    writer.KeyString("interval", FormatDuration(config_.interval));
-    writer.KeyString("probe_deadline", FormatDuration(config_.probe_deadline));
-    writer.KeyUint("streams", config_.streams);
-    writer.EndObject();
-}
+void HealthProbe::WriteEffectiveConfig(JsonWriter &writer) const { writer.RawValue(config_.ToJsonString()); }
 
 std::vector<InvariantObservation> HealthProbe::Invariants() const {
     std::lock_guard<std::mutex> lock(mutex_);

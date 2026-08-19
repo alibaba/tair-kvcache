@@ -9,6 +9,7 @@
 #include "tools/kvcm_swarm/clients/client_behavior.h"
 #include "tools/kvcm_swarm/runtime/clock.h"
 #include "tools/kvcm_swarm/runtime/sample_spec.h"
+#include "tools/kvcm_swarm/scenario/json_config.h"
 
 namespace kvcm_swarm {
 
@@ -29,7 +30,7 @@ const char *CacheGroupKindName(CacheGroupKind kind);
 const char *FullSelectorName(FullSelector selector);
 const char *ArrivalModeName(ArrivalMode mode);
 
-struct CacheGroupSpec {
+struct CacheGroupSpec : public JsonConfig {
     std::string group_id;
     CacheGroupKind kind = CacheGroupKind::kFullAttention;
     uint32_t block_size_tokens = 16;
@@ -39,9 +40,21 @@ struct CacheGroupSpec {
     // COVERAGE and must not carry the field.
     std::optional<FullSelector> lookup_selector;
     double key_presence_rate = 1.0; // Mamba only
+
+    bool FromRapidValue(const rapidjson::Value &value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool Validate(std::string_view path, std::vector<std::string> *errors);
+    bool has_valid_kind() const { return kind_valid_; }
+
+private:
+    std::string kind_json_;
+    uint64_t block_size_json_ = 0;
+    std::optional<std::string> lookup_selector_json_;
+    std::optional<double> key_presence_rate_json_;
+    bool kind_valid_ = false;
 };
 
-struct SessionClass {
+struct SessionClass : public JsonConfig {
     std::string name;
     double weight = 1.0;
     IntSpec turns{1};
@@ -50,14 +63,25 @@ struct SessionClass {
     IntSpec new_tokens_per_turn{32};
     IntSpec rewrite_tail_tokens{0};
     double shared_prefix_probability = 0.0;
+
+    bool FromRapidValue(const rapidjson::Value &value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool Validate(std::string_view path, std::vector<std::string> *errors) const;
 };
 
-struct SharedPrefixPool {
+struct SharedPrefixPool : public JsonConfig {
     uint32_t root_count = 0;
     IntSpec prefix_tokens{0};
+
+    bool FromRapidValue(const rapidjson::Value &value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool Validate(std::string_view path, std::vector<std::string> *errors);
+
+private:
+    uint64_t root_count_json_ = 0;
 };
 
-struct V6dConfig {
+struct V6dConfig : public JsonConfig {
     uint32_t process_count = 1;
     DurationSpec process_startup_interval{Duration::zero()};
     std::string instance_group;
@@ -96,6 +120,18 @@ struct V6dConfig {
     // on every object it uses, so the per-process cache must be able to hold
     // this much or the turn could never complete.
     uint64_t WorstCaseTurnWorkingSetBytes() const;
+
+    bool FromRapidValue(const rapidjson::Value &value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool Validate(std::vector<std::string> *errors);
+
+private:
+    uint64_t process_count_json_ = 0;
+    std::string arrival_mode_json_;
+    uint64_t max_active_sessions_json_ = 0;
+    uint64_t min_replica_count_json_ = 2;
+    uint64_t eviction_batch_size_json_ = 128;
+    uint64_t process_port_base_json_ = 40000;
 };
 
 bool ParseV6dConfig(const BehaviorSpec &spec, V6dConfig *config, std::vector<std::string> *errors);

@@ -29,7 +29,7 @@ bazel build //tools/kvcm_swarm
 
 ```text
 app/        run coordinator (phases, stop, report) and preflight
-scenario/   JSON configuration model, strict loader and typed reader
+scenario/   Jsonizable configuration objects, strict loading and validation
 runtime/    executor, timers, RNG, admission lanes, async primitives
 protocol/   aliases of the project-level async RPC protocol types
 transport/  admission/evidence adapter over the project-level async RPC client

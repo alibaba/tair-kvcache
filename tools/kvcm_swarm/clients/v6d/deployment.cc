@@ -3,13 +3,21 @@
 #include <algorithm>
 #include <set>
 
-#include "tools/kvcm_swarm/scenario/config_node.h"
-#include "tools/kvcm_swarm/scenario/config_reader.h"
+#include "tools/kvcm_swarm/scenario/duration.h"
+#include "tools/kvcm_swarm/scenario/json_config.h"
 
 namespace kvcm_swarm {
 namespace {
 
 constexpr size_t kMaxEventsPerReport = 128;
+
+class StorageConfigJson final : public kv_cache_manager::Jsonizable {
+public:
+    bool FromRapidValue(const rapidjson::Value &value) override { return GetRequired(value, "type", type); }
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> & /*writer*/) const noexcept override {}
+
+    std::string type;
+};
 
 meta::StorageType StorageTypeFromName(const std::string &name) {
     if (name == "hf3fs")
@@ -53,22 +61,16 @@ void V6dDeployment::SetStorageConfigs(const std::string &json) {
     storage_configs_json_ = json;
     // Cold-tier backends are derived from the registration response instead of
     // being hard-coded, so the cold lookup matches the actual deployment.
-    std::string error;
-    ConfigNode root = ConfigNode::Parse(json.empty() ? "[]" : json, &error);
+    std::vector<StorageConfigJson> storage_configs;
+    kv_cache_manager::Jsonizable::FromJsonString(json.empty() ? "[]" : json, storage_configs);
     std::set<int> seen;
-    if (root.IsArray()) {
-        for (const ConfigNode &item : root.Items()) {
-            std::string type_name;
-            if (!item.Get("type").AsString(&type_name)) {
-                continue;
-            }
-            const meta::StorageType type = StorageTypeFromName(type_name);
-            if (type == meta::ST_UNSPECIFIED) {
-                continue;
-            }
-            if (seen.insert(static_cast<int>(type)).second) {
-                cold_backends_.push_back(type);
-            }
+    for (const StorageConfigJson &item : storage_configs) {
+        const meta::StorageType type = StorageTypeFromName(item.type);
+        if (type == meta::ST_UNSPECIFIED) {
+            continue;
+        }
+        if (seen.insert(static_cast<int>(type)).second) {
+            cold_backends_.push_back(type);
         }
     }
     std::sort(cold_backends_.begin(), cold_backends_.end());
@@ -977,104 +979,7 @@ bool V6dDeployment::WriteCleanupReport(JsonWriter &writer) const {
     return true;
 }
 
-void V6dDeployment::WriteEffectiveConfig(JsonWriter &writer) const {
-    writer.BeginObject();
-    writer.KeyUint("process_count", config_.process_count);
-    writer.Key("process_startup_interval");
-    writer.BeginObject();
-    writer.KeyString("min", FormatDuration(config_.process_startup_interval.min));
-    writer.KeyString("max", FormatDuration(config_.process_startup_interval.max));
-    writer.EndObject();
-    writer.KeyString("instance_group", config_.instance_group);
-    writer.KeyString("instance_id", config_.instance_id);
-    writer.KeyString("process_host_ip", config_.process_host_ip);
-    writer.KeyUint("process_port_base", config_.process_port_base);
-    writer.Key("local_cache");
-    writer.BeginObject();
-    writer.KeyUint("capacity_bytes", config_.local_cache_capacity_bytes);
-    writer.KeyUint("worst_case_turn_working_set_bytes", config_.WorstCaseTurnWorkingSetBytes());
-    writer.EndObject();
-    writer.Key("session_arrival");
-    writer.BeginObject();
-    writer.KeyDouble("rate", config_.session_arrival_rate);
-    writer.KeyString("mode", ArrivalModeName(config_.arrival_mode));
-    writer.EndObject();
-    writer.KeyDouble("session_affinity", config_.session_affinity);
-    writer.Key("limits");
-    writer.BeginObject();
-    writer.KeyUint("max_active_sessions", config_.max_active_sessions);
-    writer.EndObject();
-    writer.KeyString("heartbeat_interval", FormatDuration(config_.heartbeat_interval));
-    writer.KeyInt("min_replica_count", config_.min_replica_count);
-    writer.KeyString("leader_poll_interval", FormatDuration(config_.leader_poll_interval));
-    writer.KeyString("write_timeout", FormatDuration(config_.write_timeout));
-    writer.KeyString("turn_deadline", FormatDuration(config_.turn_deadline));
-    writer.KeyString("rpc_timeout", FormatDuration(config_.rpc_timeout));
-    writer.KeyString("host_down_timeout", FormatDuration(config_.host_down_timeout));
-    writer.KeyUint("eviction_batch_size", config_.eviction_batch_size);
-    writer.Key("shared_prefix_pool");
-    writer.BeginObject();
-    writer.KeyUint("root_count", config_.shared_prefix_pool.root_count);
-    writer.Key("prefix_tokens");
-    writer.BeginObject();
-    writer.KeyUint("min", config_.shared_prefix_pool.prefix_tokens.min);
-    writer.KeyUint("max", config_.shared_prefix_pool.prefix_tokens.max);
-    writer.EndObject();
-    writer.EndObject();
-    writer.Key("groups");
-    writer.BeginArray();
-    for (const auto &group : config_.groups) {
-        writer.BeginObject();
-        writer.KeyString("id", group.group_id);
-        writer.KeyString("kind", CacheGroupKindName(group.kind));
-        writer.KeyUint("block_size", group.block_size_tokens);
-        writer.KeyUint("object_size", group.object_size_bytes);
-        writer.KeyString("spec_name", group.spec_name);
-        if (group.kind == CacheGroupKind::kFullAttention) {
-            writer.KeyString("lookup_selector", FullSelectorName(*group.lookup_selector));
-        } else {
-            writer.KeyDouble("key_presence_rate", group.key_presence_rate);
-        }
-        writer.EndObject();
-    }
-    writer.EndArray();
-    writer.Key("session_classes");
-    writer.BeginArray();
-    for (const auto &session_class : config_.session_classes) {
-        writer.BeginObject();
-        writer.KeyString("name", session_class.name);
-        writer.KeyDouble("weight", session_class.weight);
-        writer.Key("turns");
-        writer.BeginObject();
-        writer.KeyUint("min", session_class.turns.min);
-        writer.KeyUint("max", session_class.turns.max);
-        writer.EndObject();
-        writer.Key("turn_interval");
-        writer.BeginObject();
-        writer.KeyString("min", FormatDuration(session_class.turn_interval.min));
-        writer.KeyString("max", FormatDuration(session_class.turn_interval.max));
-        writer.EndObject();
-        writer.Key("initial_tokens");
-        writer.BeginObject();
-        writer.KeyUint("min", session_class.initial_tokens.min);
-        writer.KeyUint("max", session_class.initial_tokens.max);
-        writer.EndObject();
-        writer.Key("new_tokens_per_turn");
-        writer.BeginObject();
-        writer.KeyUint("min", session_class.new_tokens_per_turn.min);
-        writer.KeyUint("max", session_class.new_tokens_per_turn.max);
-        writer.EndObject();
-        writer.Key("rewrite_tail_tokens");
-        writer.BeginObject();
-        writer.KeyUint("min", session_class.rewrite_tail_tokens.min);
-        writer.KeyUint("max", session_class.rewrite_tail_tokens.max);
-        writer.EndObject();
-        writer.KeyDouble("shared_prefix_probability", session_class.shared_prefix_probability);
-        writer.EndObject();
-    }
-    writer.EndArray();
-    writer.EndObject();
-}
+void V6dDeployment::WriteEffectiveConfig(JsonWriter &writer) const { writer.RawValue(config_.ToJsonString()); }
 
 namespace {
 

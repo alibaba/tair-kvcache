@@ -61,7 +61,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Escapes a string as a JSON string literal (including the quotes).
-std::string JsonQuote(std::string_view value);
-
 } // namespace kvcm_swarm

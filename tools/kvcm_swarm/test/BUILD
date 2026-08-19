@@ -79,7 +79,9 @@ cc_test(
     copts = SWARM_TEST_COPTS,
     deps = [
         "//tools/kvcm_swarm:scenario_loader",
+        "//tools/kvcm_swarm:v6d_model",
         "@com_google_googletest//:gtest_main",
+        "@rapidjson",
     ],
 )
 

@@ -1,10 +1,12 @@
 // Loader tests: local validation is pure and rejects every configuration
 // problem the design requires it to catch.
 #include <gtest/gtest.h>
+#include <rapidjson/document.h>
 #include <string>
 
 #include "tools/kvcm_swarm/clients/registry.h"
-#include "tools/kvcm_swarm/scenario/config_reader.h"
+#include "tools/kvcm_swarm/clients/v6d/config.h"
+#include "tools/kvcm_swarm/scenario/duration.h"
 #include "tools/kvcm_swarm/scenario/loader.h"
 
 namespace kvcm_swarm {
@@ -106,6 +108,24 @@ TEST(LoaderTest, UnknownFieldsAreRejected) {
         LoadScenarioFromJson(Mutate("\"process_count\": 2,", "\"process_count\": 2, \"spill_rate\": 1.4,"), registry);
     EXPECT_FALSE(behavior.ok);
     EXPECT_TRUE(HasError(behavior, "spill_rate")) << "removed knobs must not be silently accepted";
+
+    LoadResult nested =
+        LoadScenarioFromJson(Mutate("\"block_size\": 16,", "\"block_size\": 16, \"group_knob\": true,"), registry);
+    EXPECT_FALSE(nested.ok);
+    EXPECT_TRUE(HasError(nested, "unknown configuration field: groups[0].group_knob"));
+
+    LoadResult health = LoadScenarioFromJson(
+        Mutate("\"config\": {\"interval\": \"1s\"}", "\"config\": {\"interval\": \"1s\", \"probe_knob\": true}"),
+        registry);
+    EXPECT_FALSE(health.ok);
+    EXPECT_TRUE(HasError(health, "unknown configuration field: probe_knob"));
+}
+
+TEST(LoaderTest, NestedTypeErrorsRetainTheirObjectPath) {
+    const BehaviorRegistry registry = MakeDefaultRegistry();
+    const LoadResult result = LoadScenarioFromJson(Mutate("\"kind\": \"full_attention\"", "\"kind\": 7"), registry);
+    EXPECT_FALSE(result.ok);
+    EXPECT_TRUE(HasError(result, "groups[0].kind: has an invalid type or value"));
 }
 
 TEST(LoaderTest, TlsTransportsAreRejectedAndNeverDowngraded) {
@@ -255,7 +275,32 @@ TEST(LoaderTest, MalformedJsonIsReportedWithAnOffset) {
     EXPECT_TRUE(HasError(result, "JSON parse error at offset"));
 }
 
-TEST(ConfigReaderTest, DurationParsingCoversEveryUnit) {
+TEST(LoaderTest, V6dEffectiveConfigIsSerializedFromTheValidatedObject) {
+    const BehaviorRegistry registry = MakeDefaultRegistry();
+    const LoadResult result = LoadScenarioFromJson(kBaseConfig, registry);
+    ASSERT_TRUE(result.ok) << (result.errors.empty() ? "" : result.errors.front());
+
+    V6dConfig config;
+    std::vector<std::string> errors;
+    ASSERT_TRUE(ParseV6dConfig(result.config.behaviors.front(), &config, &errors));
+    ASSERT_TRUE(errors.empty());
+
+    rapidjson::Document effective;
+    const std::string effective_json = config.ToJsonString();
+    effective.Parse(effective_json.data(), effective_json.size());
+    ASSERT_FALSE(effective.HasParseError());
+    ASSERT_TRUE(effective.IsObject());
+    EXPECT_EQ(effective["process_count"].GetUint(), 2u);
+    EXPECT_STREQ(effective["process_startup_interval"]["min"].GetString(), "0ms");
+    EXPECT_STREQ(effective["process_startup_interval"]["max"].GetString(), "0ms");
+    EXPECT_EQ(effective["min_replica_count"].GetInt(), 2);
+    EXPECT_STREQ(effective["groups"][0]["spec_name"].GetString(), "v6d_4096");
+    EXPECT_TRUE(effective["session_classes"][0]["turns"].IsObject());
+    EXPECT_EQ(effective["session_classes"][0]["turns"]["min"].GetUint64(), 2u);
+    EXPECT_EQ(effective["session_classes"][0]["turns"]["max"].GetUint64(), 4u);
+}
+
+TEST(DurationTest, ParsingCoversEveryUnit) {
     Duration value{};
     std::string error;
     ASSERT_TRUE(ParseDuration("250ns", &value, &error));

@@ -3,14 +3,50 @@
 #include <mutex>
 
 #include "tools/kvcm_swarm/evidence/json_writer.h"
-#include "tools/kvcm_swarm/scenario/config_reader.h"
+#include "tools/kvcm_swarm/scenario/duration.h"
+#include "tools/kvcm_swarm/scenario/json_config.h"
 
 namespace kvcm_swarm {
 namespace {
 
-struct FakeConfig {
+bool DecodeDuration(const rapidjson::Value &value, Duration *out, std::string *error) {
+    if (!value.IsString()) {
+        *error = "must be a duration string";
+        return false;
+    }
+    return ParseDuration(std::string(value.GetString(), value.GetStringLength()), out, error);
+}
+
+struct FakeConfig : public JsonConfig {
     Duration tick_interval = std::chrono::milliseconds(10);
+
+    bool FromRapidValue(const rapidjson::Value &value) override {
+        if (!BeginObject(value, {"tick_interval"})) {
+            return false;
+        }
+        OptionalCustom(value, "tick_interval", tick_interval, Duration(std::chrono::milliseconds(10)), DecodeDuration);
+        return true;
+    }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        const std::string text = FormatDuration(tick_interval);
+        writer.Key("tick_interval");
+        writer.String(text.data(), static_cast<rapidjson::SizeType>(text.size()), false);
+    }
 };
+
+bool ParseFakeConfig(const BehaviorSpec &spec, FakeConfig *config, std::vector<std::string> *errors) {
+    std::string parse_error;
+    if (!config->FromJsonString(spec.config_json, &parse_error)) {
+        if (!parse_error.empty()) {
+            errors->push_back(parse_error);
+        }
+        config->AppendJsonErrors("", errors);
+        return false;
+    }
+    config->AppendJsonErrors("", errors);
+    return errors->empty();
+}
 
 class FakeBehavior : public ClientBehavior {
 public:
@@ -51,11 +87,7 @@ public:
         writer.EndObject();
     }
 
-    void WriteEffectiveConfig(JsonWriter &writer) const override {
-        writer.BeginObject();
-        writer.KeyString("tick_interval", FormatDuration(config_.tick_interval));
-        writer.EndObject();
-    }
+    void WriteEffectiveConfig(JsonWriter &writer) const override { writer.RawValue(config_.ToJsonString()); }
 
     std::vector<InvariantObservation> Invariants() const override {
         InvariantObservation observation;
@@ -100,14 +132,9 @@ public:
 
     ValidationResult Validate(const BehaviorSpec &spec) const override {
         ValidationResult result;
+        FakeConfig config;
         std::vector<std::string> errors;
-        ConfigReader reader(spec.config, &errors);
-        reader.OptionalDuration("tick_interval", std::chrono::milliseconds(10));
-        std::vector<std::string> unknown;
-        spec.config.CollectUnknown(&unknown);
-        for (const auto &key : unknown) {
-            result.Fail("unknown configuration field: " + key);
-        }
+        ParseFakeConfig(spec, &config, &errors);
         for (const auto &error : errors) {
             result.Fail(error);
         }
@@ -116,10 +143,8 @@ public:
 
     std::unique_ptr<ClientBehavior> Create(const BehaviorSpec &spec, RuntimeServices services) const override {
         std::vector<std::string> errors;
-        ConfigReader reader(spec.config, &errors);
         FakeConfig config;
-        config.tick_interval = reader.OptionalDuration("tick_interval", std::chrono::milliseconds(10));
-        if (!errors.empty()) {
+        if (!ParseFakeConfig(spec, &config, &errors)) {
             return nullptr;
         }
         return std::make_unique<FakeBehavior>(spec, config, services);

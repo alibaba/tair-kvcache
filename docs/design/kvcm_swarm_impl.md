@@ -234,7 +234,7 @@ struct BehaviorSpec {
     std::string id;
     std::string type;
     TransportKind transport;
-    ConfigNode config;
+    std::string config_json;
 };
 
 struct RuntimeServices {
@@ -262,6 +262,11 @@ public:
     Create(const BehaviorSpec&, RuntimeServices&) const = 0;
 };
 ```
+
+公共 loader 只解析 behavior envelope，并将 `config` 对象保留为 JSON 交给相应 factory。
+每个 behavior 使用自己的 `Jsonizable` 配置类型直接反序列化：字段缺失、类型错误和未知字段属于
+JSON 结构校验，范围、枚举和跨字段约束由配置对象的 `Validate()` 完成。运行时使用的同一个配置
+对象也负责输出 effective config，避免解析模型、运行时模型和报告模型各维护一套字段映射。
 
 `StartTraffic` 启动由 timer 驱动的长期 operation，不阻塞调用线程。warmup 到 steady 只改变
 `RunCoordinator` 的 phase，不重新调用 `StartTraffic`、不重建 behavior。`Drain` 必须可重复调用。

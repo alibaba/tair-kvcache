@@ -63,7 +63,13 @@ void ViolationLog::Record(const std::string &check_name, const std::string &deta
         preview.push_back(detail_json);
     }
     if (file_) {
-        const std::string line = "{\"check\":" + JsonQuote(check_name) + ",\"detail\":" + detail_json + "}\n";
+        JsonWriter writer(false);
+        writer.BeginObject();
+        writer.KeyString("check", check_name);
+        writer.Key("detail");
+        writer.RawValue(detail_json);
+        writer.EndObject();
+        const std::string line = writer.Take() + "\n";
         if (std::fwrite(line.data(), 1, line.size(), file_.get()) != line.size()) {
             failed_ = true;
         }

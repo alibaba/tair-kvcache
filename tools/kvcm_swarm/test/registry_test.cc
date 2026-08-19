@@ -32,9 +32,7 @@ TEST(RegistryTest, FakeBehaviorRunsThroughTheCommonRuntimeOnly) {
     spec.id = "fake-a";
     spec.type = "fake_behavior";
     spec.transport = TransportKind::kHttp;
-    std::string error;
-    spec.config = ConfigNode::Parse("{\"tick_interval\": \"5ms\"}", &error);
-    ASSERT_TRUE(spec.config.valid()) << error;
+    spec.config_json = "{\"tick_interval\": \"5ms\"}";
     EXPECT_TRUE(factory->Validate(spec).ok);
     const BehaviorIdentityClaims claims = factory->Claims(spec);
     ASSERT_EQ(claims.exclusive_names.size(), 1u);

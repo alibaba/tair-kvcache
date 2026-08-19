@@ -135,6 +135,8 @@ TEST_F(ReportTest, StableSchemaContainsEveryRequiredSection) {
     // The effective configuration is echoed, including advanced defaults.
     EXPECT_TRUE(document["run_config"]["runtime"]["limits"].HasMember("http_connections_per_endpoint"));
     EXPECT_STREQ(document["run_config"]["target"]["endpoints"]["admin_grpc"].GetString(), "127.0.0.1:2");
+    EXPECT_STREQ(document["run_config"]["behaviors"]["health-a"]["config"]["probe_deadline"].GetString(), "1000ms");
+    EXPECT_EQ(document["run_config"]["behaviors"]["health-a"]["config"]["streams"].GetUint(), 1u);
     EXPECT_TRUE(document["cleanup"]["preflight"]["passed"].GetBool());
 }
 
