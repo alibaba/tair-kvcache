@@ -205,3 +205,35 @@ cc_library(
         ":scenario_config",
     ],
 )
+
+cc_library(
+    name = "app",
+    srcs = [
+        "app/preflight.cc",
+        "app/run_coordinator.cc",
+        "evidence/report.cc",
+    ],
+    hdrs = [
+        "app/preflight.h",
+        "app/run_coordinator.h",
+        "evidence/report.h",
+    ],
+    copts = SWARM_COPTS,
+    deps = [
+        ":registry",
+        ":scenario_loader",
+        ":v6d_model",
+    ],
+)
+
+cc_binary(
+    name = "kvcm_swarm",
+    srcs = ["main.cc"],
+    copts = SWARM_COPTS,
+    linkopts = ["-pthread"],
+    deps = [
+        ":app",
+        ":registry",
+        ":scenario_loader",
+    ],
+)

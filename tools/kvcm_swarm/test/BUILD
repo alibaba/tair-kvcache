@@ -117,3 +117,15 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "report_test",
+    size = "small",
+    srcs = ["report_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:app",
+        "@com_google_googletest//:gtest_main",
+        "@rapidjson",
+    ],
+)
