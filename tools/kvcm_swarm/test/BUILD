@@ -17,6 +17,39 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "workload_test",
+    size = "small",
+    srcs = ["workload_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:v6d_model",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "local_cache_test",
+    size = "small",
+    srcs = ["local_cache_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:v6d_model",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "expected_locations_test",
+    size = "small",
+    srcs = ["expected_locations_test.cc"],
+    copts = SWARM_TEST_COPTS,
+    deps = [
+        "//tools/kvcm_swarm:v6d_model",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "fake_behavior",
     testonly = True,

@@ -138,6 +138,29 @@ cc_library(
 )
 
 cc_library(
+    name = "v6d_model",
+    srcs = [
+        "clients/v6d/config.cc",
+        "clients/v6d/expected_locations.cc",
+        "clients/v6d/key_mapper.cc",
+        "clients/v6d/local_cache.cc",
+        "clients/v6d/workload.cc",
+    ],
+    hdrs = [
+        "clients/v6d/config.h",
+        "clients/v6d/expected_locations.h",
+        "clients/v6d/key_mapper.h",
+        "clients/v6d/local_cache.h",
+        "clients/v6d/workload.h",
+    ],
+    copts = SWARM_COPTS,
+    deps = [
+        ":behavior_api",
+        ":protocol",
+    ],
+)
+
+cc_library(
     name = "registry",
     srcs = ["clients/registry.cc"],
     hdrs = ["clients/registry.h"],
