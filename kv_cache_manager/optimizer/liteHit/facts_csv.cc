@@ -184,30 +184,43 @@ bool ParsePairArray(const std::string &field, std::vector<std::pair<uint64_t, ui
     return true;
 }
 
-constexpr const char *kMambaCurvePrefix = "mamba:";
+constexpr const char *kByteStepPrefix = "bytes:";
+constexpr const char *kFullRlePrefix = "rle:";
+constexpr const char *kLegacyMambaPrefix = "mamba:";
 
 bool ParseHitCurveField(const std::string &field, LiteHitFactRecord &record, std::string &error) {
     std::vector<std::pair<uint64_t, uint64_t>> pairs;
-    if (field.rfind(kMambaCurvePrefix, 0) == 0) {
-        record.is_mamba = true;
-        if (!ParsePairArray(field.substr(std::string(kMambaCurvePrefix).size()), pairs, error)) {
+    std::size_t byte_prefix_size = 0;
+    if (field.rfind(kByteStepPrefix, 0) == 0) {
+        byte_prefix_size = std::string(kByteStepPrefix).size();
+    } else if (field.rfind(kLegacyMambaPrefix, 0) == 0) {
+        byte_prefix_size = std::string(kLegacyMambaPrefix).size();
+    }
+    if (byte_prefix_size > 0) {
+        record.is_full_rle = false;
+        record.full_rle_fact.hit_curve.clear();
+        if (!ParsePairArray(field.substr(byte_prefix_size), pairs, error)) {
             return false;
         }
-        record.mamba_fact.points.clear();
-        record.mamba_fact.points.reserve(pairs.size());
+        record.fact.points.clear();
+        record.fact.points.reserve(pairs.size());
         for (const auto &[capacity, hits] : pairs) {
-            record.mamba_fact.points.push_back(MambaCurvePoint{capacity, hits});
+            record.fact.points.push_back(ByteStepPoint{capacity, hits});
         }
         return true;
     }
-    record.is_mamba = false;
-    if (!ParsePairArray(field, pairs, error)) {
+
+    record.is_full_rle = true;
+    record.fact.points.clear();
+    const std::string rle_field =
+        field.rfind(kFullRlePrefix, 0) == 0 ? field.substr(std::string(kFullRlePrefix).size()) : field;
+    if (!ParsePairArray(rle_field, pairs, error)) {
         return false;
     }
-    record.fact.hit_curve.clear();
-    record.fact.hit_curve.reserve(pairs.size());
+    record.full_rle_fact.hit_curve.clear();
+    record.full_rle_fact.hit_curve.reserve(pairs.size());
     for (const auto &[start, length] : pairs) {
-        record.fact.hit_curve.push_back(HitCurveSegment{start, length});
+        record.full_rle_fact.hit_curve.push_back(HitCurveSegment{start, length});
     }
     return true;
 }
@@ -216,10 +229,10 @@ bool ParseHitCurveField(const std::string &field, LiteHitFactRecord &record, std
 
 std::string SerializeLiteHitFactRow(const LiteHitFactRecord &record) {
     std::ostringstream curve;
-    if (record.is_mamba) {
-        curve << "mamba:[";
-        for (std::size_t i = 0; i < record.mamba_fact.points.size(); ++i) {
-            const MambaCurvePoint &point = record.mamba_fact.points[i];
+    if (!record.is_full_rle) {
+        curve << kByteStepPrefix << '[';
+        for (std::size_t i = 0; i < record.fact.points.size(); ++i) {
+            const ByteStepPoint &point = record.fact.points[i];
             if (i > 0) {
                 curve << ',';
             }
@@ -227,9 +240,9 @@ std::string SerializeLiteHitFactRow(const LiteHitFactRecord &record) {
         }
         curve << ']';
     } else {
-        curve << '[';
-        for (std::size_t i = 0; i < record.fact.hit_curve.size(); ++i) {
-            const HitCurveSegment &segment = record.fact.hit_curve[i];
+        curve << kFullRlePrefix << '[';
+        for (std::size_t i = 0; i < record.full_rle_fact.hit_curve.size(); ++i) {
+            const HitCurveSegment &segment = record.full_rle_fact.hit_curve[i];
             if (i > 0) {
                 curve << ',';
             }

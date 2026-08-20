@@ -10,10 +10,8 @@ namespace kv_cache_manager {
 
 // One row of the facts CSV. The row is a capacity-independent, recomputable
 // fact: any capacity can be projected from hit_curve afterwards without
-// replaying the trace. Full-attention rows carry the arithmetic-run RLE in
-// block units; Mamba (linear-attention) rows carry the explicit step curve
-// on the total byte-capacity axis, tagged with a "mamba:" prefix in the
-// hit_curve column so one file can mix both instance kinds.
+// replaying the trace. The default fact is an explicit byte-step curve;
+// Full-only rows use the smaller arithmetic-run RLE on the block axis.
 struct LiteHitFactRecord {
     std::string trace_id;
     std::string instance_id;
@@ -22,12 +20,12 @@ struct LiteHitFactRecord {
     uint64_t block_size_tokens = 0;
     // Per-block byte charge used at projection boundaries. Recording it per
     // row keeps facts self-describing so a corrected charge estimate can
-    // still reproject historical facts. For Mamba rows this is the Full
-    // object charge; the curve itself is already on the byte axis.
+    // still reproject historical facts. For byte-step rows this is the Full
+    // object charge for observability; projection already uses the byte axis.
     uint64_t block_bytes = 0;
-    bool is_mamba = false;
-    RequestFact fact;            // full-attention rows
-    MambaRequestFact mamba_fact; // Mamba rows
+    bool is_full_rle = false;
+    RequestFact fact;              // default byte-step rows
+    FullRequestFact full_rle_fact; // Full-only rows
 };
 
 inline constexpr const char *kLiteHitFactsCsvHeader =
@@ -37,8 +35,9 @@ inline constexpr const char *kLiteHitFactsFileName = "litehit_facts.csv";
 
 // Serializes one record to a CSV line (without trailing newline). String
 // fields are quoted and escaped when needed; hit_curve is always a quoted
-// JSON array of [start_required_blocks, run_length] segments, prefixed with
-// "mamba:" for Mamba rows ([min_total_capacity_bytes, hit_blocks] points).
+// JSON array. New rows use "bytes:" for byte-step facts and "rle:" for
+// Full-only facts. The parser also accepts legacy "mamba:" byte steps and
+// unprefixed Full RLE rows.
 std::string SerializeLiteHitFactRow(const LiteHitFactRecord &record);
 
 // Parses one CSV line produced by SerializeLiteHitFactRow. Returns false on
