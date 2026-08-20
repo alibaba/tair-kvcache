@@ -20,30 +20,28 @@ struct HitCurveSegment {
     }
 };
 
-// Capacity-independent facts of one request replay. An empty curve means no
-// capacity can hit this request (cold prefix head).
-struct RequestFact {
+// Full-only compact representation. Equal Full charges make consecutive byte
+// thresholds an arithmetic run on the block axis.
+struct FullRequestFact {
     std::vector<HitCurveSegment> hit_curve;
 };
 
-// One breakpoint of a Mamba (linear-attention) request curve. Unlike the
-// full-attention arithmetic runs, recovery jumps checkpoint-by-checkpoint, so
-// the curve is an explicit step function on the TOTAL byte-capacity axis:
-// once min_total_capacity_bytes fits both the Full prefix and the checkpoint
-// state, the request hits hit_blocks blocks.
-struct MambaCurvePoint {
+// One breakpoint of the core's default byte-axis request curve. Linear
+// attention jumps between Linear states; Full-only produces one point per
+// covered block before optionally being encoded as FullRequestFact.
+struct ByteStepPoint {
     uint64_t min_total_capacity_bytes = 0;
     uint64_t hit_blocks = 0;
 
-    bool operator==(const MambaCurvePoint &other) const {
+    bool operator==(const ByteStepPoint &other) const {
         return min_total_capacity_bytes == other.min_total_capacity_bytes && hit_blocks == other.hit_blocks;
     }
 };
 
 // Points are strictly increasing in both fields (monotone envelope). Empty
-// means no capacity can recover any checkpoint of this request.
-struct MambaRequestFact {
-    std::vector<MambaCurvePoint> points;
+// means no byte capacity can recover this request.
+struct RequestFact {
+    std::vector<ByteStepPoint> points;
 };
 
 // Stateless projection from capacity-independent facts to hit blocks for a
@@ -51,23 +49,18 @@ struct MambaRequestFact {
 // this projector; no other component may reimplement the boundary logic.
 class HitCurveProjector {
 public:
-    // Hit blocks when the cache holds exactly capacity_blocks blocks.
-    static uint64_t ProjectBlocks(const RequestFact &fact, uint64_t capacity_blocks);
+    // Default byte-step curve: largest hit_blocks whose threshold fits.
+    static uint64_t ProjectBytes(const RequestFact &fact, uint64_t total_capacity_bytes);
 
-    // Hit blocks for a byte capacity; the capacity is floor-converted with the
-    // per-block byte charge before projection. block_bytes must be positive.
-    static uint64_t ProjectBytes(const RequestFact &fact, uint64_t capacity_bytes, uint64_t block_bytes);
-
-    // Hit blocks with unbounded capacity: cold misses remain, capacity misses
-    // disappear, so this is the total run length of the curve.
     static uint64_t ProjectInfinite(const RequestFact &fact);
 
-    // Mamba step curve: largest hit_blocks whose threshold fits into the
-    // total byte capacity.
-    static uint64_t ProjectMambaBytes(const MambaRequestFact &fact, uint64_t total_capacity_bytes);
+    // Full-only RLE projection on the block axis.
+    static uint64_t ProjectFullBlocks(const FullRequestFact &fact, uint64_t capacity_blocks);
 
-    // Unbounded capacity recovers the furthest resident checkpoint.
-    static uint64_t ProjectMambaInfinite(const MambaRequestFact &fact);
+    // Full-only byte projection. block_bytes must be positive.
+    static uint64_t ProjectFullBytes(const FullRequestFact &fact, uint64_t capacity_bytes, uint64_t block_bytes);
+
+    static uint64_t ProjectFullInfinite(const FullRequestFact &fact);
 };
 
 } // namespace kv_cache_manager

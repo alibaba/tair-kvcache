@@ -49,11 +49,18 @@ cc_library(
 )
 
 cc_library(
-    name = "lite_hit_mamba",
-    srcs = ["lite_hit_mamba.cc"],
-    hdrs = ["lite_hit_mamba.h"],
+    name = "lite_hit_linear",
+    srcs = ["lite_hit_linear.cc"],
+    hdrs = ["lite_hit_linear.h"],
+    deps = [":weighted_lru_pool"],
+)
+
+cc_library(
+    name = "lite_hit_ttl",
+    srcs = ["lite_hit_ttl.cc"],
+    hdrs = ["lite_hit_ttl.h"],
     deps = [
-        ":hit_curve",
+        ":lite_hit",
         ":weighted_lru_pool",
     ],
 )
@@ -63,8 +70,8 @@ cc_library(
     srcs = ["lite_hit.cc"],
     hdrs = ["lite_hit.h"],
     deps = [
-        ":dynamic_fenwick_tree",
         ":hit_curve",
+        ":lite_hit_linear",
+        ":weighted_lru_pool",
     ],
 )
-
