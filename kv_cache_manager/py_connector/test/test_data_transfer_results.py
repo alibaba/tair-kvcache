@@ -322,9 +322,10 @@ if __name__ == "__main__":
 class TestStagingPool(unittest.TestCase):
     """_StagingPool: contiguous-run slot management with backpressure.
 
-    The pool replaced per-task torch.empty staging (VRAM OOM under load);
-    these tests pin the run bookkeeping: exact fit, fragmentation and
-    re-merge on release, blocking acquire, and the capacity guard.
+    The pool stages transfers in pinned host memory only (the kernel reaches
+    it directly over PCIe); these tests pin the run bookkeeping: exact fit,
+    fragmentation and re-merge on release, blocking acquire, and the capacity
+    guard.
     """
 
     def _pool(self, max_blocks=8, block_bytes=16):
@@ -373,8 +374,22 @@ class TestStagingPool(unittest.TestCase):
     def test_views_slice_the_same_run(self):
         pool = self._pool(max_blocks=8, block_bytes=16)
         start = pool.acquire(3)
-        cpu, gpu = pool.cpu_view(start, 3), pool.gpu_view(start, 3)
+        cpu = pool.cpu_view(start, 3)
         self.assertEqual(cpu.numel(), 48)
-        self.assertEqual(gpu.numel(), 48)
         cpu.zero_()
         self.assertTrue(bool((pool._cpu[0:48] == 0).all()))
+
+    def test_pool_allocates_host_memory_only(self):
+        """Zero-VRAM regression guard: even for a CUDA device the pool makes
+        exactly one allocation, and it is pinned host memory -- no device-side
+        mirror may come back."""
+        from unittest.mock import patch
+        from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
+        with patch("torch.empty") as empty:
+            _StagingPool(torch.device("cuda"), block_bytes=16, max_blocks=8)
+        self.assertEqual(empty.call_count, 1,
+                         "pool must own exactly one backing allocation")
+        kwargs = empty.call_args.kwargs
+        self.assertEqual(kwargs.get("device"), "cpu")
+        self.assertTrue(kwargs.get("pin_memory"),
+                        "pool backing memory must be pinned for zero-copy")

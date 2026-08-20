@@ -8,9 +8,14 @@ Each ``TransferGroup`` is an independent transfer unit:
 * Mamba/linear/gdn groups store per-block opaque state; a manager block maps to a
   single logical block whose raw bytes are copied verbatim.
 
-The transport itself is layout-agnostic: for every manager block we hand the SDK a
-``BlockBuffer`` (a pinned CPU region) and the block's remote URI. Save gathers HBM
--> CPU then ``SaveKvCaches``; load ``LoadKvCaches`` -> CPU then scatters CPU -> HBM.
+The transport itself is layout-agnostic and **zero-VRAM**: for every manager
+block we hand the SDK a ``BlockBuffer`` (a pinned CPU region) and the block's
+remote URI. Save gathers HBM -> pinned host directly and ``SaveKvCaches``;
+load ``LoadKvCaches`` -> pinned host, then scatters pinned -> HBM directly.
+The gather/scatter kernel addresses host pinned memory over PCIe (UVA
+zero-copy), and state-group copies use plain ``copy_`` between the GPU tensors
+and the pinned slices -- no device-side staging buffer exists anywhere on the
+data path, so the connector competes with the engine for exactly zero HBM.
 """
 
 import threading
@@ -44,15 +49,21 @@ def _get_device_module(device=None):
 
 
 class _StagingPool:
-    """Bounded, pre-allocated staging slots for one TransferGroup.
+    """Bounded, pre-allocated *pinned host* slots for one TransferGroup.
 
-    Save and load share one pool. Replaces per-task ``torch.empty``: the GPU
-    side becomes a fixed, configurable HBM reservation instead of unbounded
-    dynamic allocation that competes with the engine (VRAM OOM under load on
-    low-headroom GPUs), and an exhausted pool blocks the acquiring task --
+    Save and load share one pool. The slots are both the SDK's I/O buffers
+    and the kernel's gather/scatter target: the strided kernel and plain
+    ``copy_`` read/write host pinned memory directly over PCIe (UVA
+    zero-copy), so the pool needs no device-side mirror and the connector
+    reserves zero HBM. An exhausted pool blocks the acquiring task --
     backpressure -- instead of failing. Slots are handed out as *contiguous*
-    runs because the bulk D2H/H2D copies and the kernel views need one piece
-    of memory.
+    runs because the kernel view needs one piece of memory.
+
+    Slots are reused once their task reports. This is the historical
+    origin/main behaviour: after an SDK timeout/error a background DMA may
+    still touch the buffer for a while (the deadline contract is not
+    upstream yet), and a slot reused in that window can be scribbled on --
+    an accepted trade-off for removing the GPU staging copy.
     """
 
     def __init__(self, device, per_block_bytes: int, max_blocks: int):
@@ -66,7 +77,6 @@ class _StagingPool:
         # CPU-only runs) fall back to pageable memory.
         self._cpu = torch.empty(total, dtype=torch.uint8, device="cpu",
                                 pin_memory=(device.type == "cuda"))
-        self._gpu = torch.empty(total, dtype=torch.uint8, device=device)
         # Free runs as [start, start+len) block ranges, kept sorted by start.
         self._runs = [[0, max_blocks]]
 
@@ -115,10 +125,6 @@ class _StagingPool:
         b = self.block_bytes
         return self._cpu[start * b:(start + n) * b]
 
-    def gpu_view(self, start: int, n: int) -> torch.Tensor:
-        b = self.block_bytes
-        return self._gpu[start * b:(start + n) * b]
-
 
 class MultiResult:
     """Collect the per-block success flags of several async tasks and fire a
@@ -165,16 +171,16 @@ class DataTransferManager:
                 f"largest task batch ({need}); one task stages its whole "
                 f"batch contiguously, so the pool must cover it")
         # One pool per group: block shapes differ between attention and state
-        # groups. The GPU side is the HBM this connector permanently reserves.
+        # groups. The pool is pinned host memory only -- the kernel reaches it
+        # over PCIe -- so the connector's device-memory footprint is zero.
         self._pools = {
             g.spec_name: _StagingPool(self._device, g.per_block_bytes, pool_blocks)
             for g in kvcache_info.groups}
         for name, pool in self._pools.items():
             logger.info("staging pool %s: %d blocks x %d bytes "
-                        "(pinned %.1f MiB + GPU %.1f MiB)",
+                        "(pinned %.1f MiB, GPU 0)",
                         name, pool.max_blocks,
                         pool.block_bytes,
-                        pool.max_blocks * pool.block_bytes / 2**20,
                         pool.max_blocks * pool.block_bytes / 2**20)
 
         def _init_worker():
@@ -322,15 +328,16 @@ class DataTransferManager:
             f"group {group.spec_name}: save batch contains a block without a " \
             f"location; _save_dispositions must have failed it"
         pool = self._pools[group.spec_name]
-        with self._device_mod.stream(self._save_stream):
-            ready_event.wait()
-            start = pool.acquire(len(valid))
+        start = pool.acquire(len(valid))
         try:
             cpu_buffer = pool.cpu_view(start, len(valid))
-            gpu_buffer = pool.gpu_view(start, len(valid))
             with self._device_mod.stream(self._save_stream):
+                # Gather straight into the pinned host slot: the kernel
+                # (attention) and copy_ (state) write host pinned memory
+                # directly over PCIe; no device-side staging copy exists.
+                ready_event.wait()
                 if isinstance(group, AttentionTransferGroup):
-                    view = gpu_buffer.view(self._info.dtype).view(
+                    view = cpu_buffer.view(self._info.dtype).view(
                         len(valid), group.num_kv_ptrs,
                         self._manager_block_size, group.per_token_dim)
                     batch_gather_scatter_helper.batch_gather_kv_caches(
@@ -344,9 +351,9 @@ class DataTransferManager:
                     for out_i, i in enumerate(valid):
                         for layer_idx in range(group.layer_num):
                             dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                            gpu_buffer[dst:dst + group.page_size_bytes].copy_(
-                                group.block_view_tensors[layer_idx][block_ids[i]])
-                cpu_buffer.copy_(gpu_buffer, non_blocking=True)
+                            cpu_buffer[dst:dst + group.page_size_bytes].copy_(
+                                group.block_view_tensors[layer_idx][block_ids[i]],
+                                non_blocking=True)
                 done = self._device_mod.Event()
                 done.record(self._save_stream)
             done.synchronize()
@@ -447,10 +454,11 @@ class DataTransferManager:
             ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
             if ok:
                 with self._device_mod.stream(self._load_stream):
-                    gpu_buffer = pool.gpu_view(start, len(valid))
-                    gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+                    # Scatter straight out of the pinned host slot: the
+                    # kernel (attention) and copy_ (state) read host pinned
+                    # memory directly over PCIe; no device-side staging copy.
                     if isinstance(group, AttentionTransferGroup):
-                        view = gpu_buffer.view(self._info.dtype).view(
+                        view = cpu_buffer.view(self._info.dtype).view(
                             len(valid), group.num_kv_ptrs,
                             self._manager_block_size, group.per_token_dim)
                         batch_gather_scatter_helper.batch_scatter_kv_caches(
@@ -465,7 +473,8 @@ class DataTransferManager:
                             for layer_idx in range(group.layer_num):
                                 src = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
                                 group.block_view_tensors[layer_idx][block_ids[i]].copy_(
-                                    gpu_buffer[src:src + group.page_size_bytes])
+                                    cpu_buffer[src:src + group.page_size_bytes],
+                                    non_blocking=True)
                     done = self._device_mod.Event()
                     done.record(self._load_stream)
                 done.synchronize()
