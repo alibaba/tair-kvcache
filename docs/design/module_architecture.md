@@ -69,6 +69,25 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 
 数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
 
+### 测试与验证工具（不属于服务端依赖链）
+
+| 模块 | 目录 | 职责 |
+|---|---|---|
+| **kvcm_swarm** | `tools/kvcm_swarm/` | 独立的 C++ 客户端行为运行器与证据系统。读取一份 JSON，模拟具有独立身份、连接、会话、本地缓存和生命周期的客户端（当前为 `v6d_deployment` 与 `health_probe`），对真实 KVCM 发出 metadata-only 的 HTTP/gRPC 流量，并输出稳定的事实报告。只调用公开 API，不创建或修改 Storage / Instance Group，也不读取服务端内部状态。 |
+| **swarm 集成编排** | `integration_test/swarm/` | CI 侧的环境准备与判定：fixture 创建隔离的 event-report storage、instance group 与 quota 并生成 effective config，runner 启动同一个 C++ 二进制，evaluator 在进程外按 expectations 判定 PASS/FAIL，结束后 teardown。不进入 RPC 热路径。 |
+
+Swarm 使用 `kv_cache_manager/client/src/internal/async_rpc/` 提供的项目级异步 RPC 客户端。
+该内部库统一协议表、JSON 编解码、取消语义、gRPC 和 HTTP transport，不包含 Swarm 的流量
+调度、证据记录或 V6D 状态，也不进入 `kv_cache_manager_client.so` 的公开接口。Swarm 的
+transport adapter 在它外层增加 admission lane、客户端身份和 observation 记录。
+
+依赖方向：`kvcm_swarm → internal async_rpc → protocol/第三方 transport`；服务端核心链路
+**不依赖** Swarm。`integration_test/swarm/` 只依赖 `integration_test/testlib` 与该二进制，
+不被链接进 C++ 生成器。设计见
+[KVCM Swarm 功能设计](kvcm_swarm.md) 与 [KVCM Swarm 实现设计](kvcm_swarm_impl.md)。
+
+---
+
 client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点）只创建 `MetaClient` 做元数据匹配与写地址申请；**WORKER**（推理节点）只创建 `TransferClient` 做数据搬运；**HYBRID** 两者都有。WORKER 的存储配置由 `MetaClient::GetStorageConfig()` 从 KVCM 下发获得，保证与服务端一致。
 
 ---

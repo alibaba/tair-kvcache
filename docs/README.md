@@ -8,6 +8,13 @@
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
+- [KVCM Swarm 功能设计](design/kvcm_swarm.md) - metadata-only 客户端行为模拟、第一版范围、正确性契约、后续 event_reporter 扩展与验收口径
+- [KVCM Swarm 实现设计](design/kvcm_swarm_impl.md) - 可注册 Client Behavior、通用运行时、event_reporter 接入边界、状态所有权、证据模型与测试策略
+
+### 测试与验证工具
+- [kvcm_swarm 运行器](../tools/kvcm_swarm/README.md) - 独立 C++ 客户端行为运行器：JSON 配置、运行阶段、退出码与目录结构
+- [swarm 集成编排](../integration_test/swarm/README.md) - CI fixture、runner、scenario evaluator 与各集成测试覆盖点
+- [swarm 大规模部署验证](../integration_test/swarm/scale/README.md) - 三个规模点的运行方式与容量结论口径
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
