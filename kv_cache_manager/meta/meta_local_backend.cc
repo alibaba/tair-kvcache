@@ -982,11 +982,18 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
         values.clear();
     }
 
+    std::vector<std::string_view> key_views(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+
     const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
 
-        Cache::Handle *handle = cache_->Lookup(KeyToView(keys[i]));
+        Cache::Handle *handle = handles[i];
         if (!handle) {
             out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
@@ -1008,8 +1015,8 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
                 }
             }
         }
-        cache_->Release(handle);
     }
+    cache_->ReleaseBatch(handles.data(), handles.size());
     return results;
 }
 

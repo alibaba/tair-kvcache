@@ -1534,7 +1534,7 @@ TEST_F(MetaLocalBackendTest, TestGetLocationValuesCompactPreservesOffsetsAndCanB
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestSparseReadAndSingleLocationRmwAvoidDenseCacheBatch) {
+TEST_F(MetaLocalBackendTest, TestOnlyTargetedReadUsesCacheBatch) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("sparse_lru_paths", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     auto *backend = GetLocalBackend();
@@ -1551,12 +1551,16 @@ TEST_F(MetaLocalBackendTest, TestSparseReadAndSingleLocationRmwAvoidDenseCacheBa
     CompactLocationsPerKey compact;
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
               backend->GetLocationValuesCompact(nullptr, compact_keys, std::size(compact_keys), compact));
+    EXPECT_EQ(0u, counting_cache->lookup_batch_calls);
+    EXPECT_EQ(0u, counting_cache->release_batch_calls);
 
     LocationsPerKey targeted;
     std::vector<ErrorCode> key_ecs;
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_NOENT}}),
               backend->GetLocationsWithKeyStatus(
                   nullptr, {1, 2}, {{"location"}, {"location"}}, targeted, key_ecs));
+    EXPECT_EQ(1u, counting_cache->lookup_batch_calls);
+    EXPECT_EQ(1u, counting_cache->release_batch_calls);
 
     const LocationId location_id = "location";
     const LocationIdRefVector location_ids = {&location_id, &location_id};
@@ -1571,8 +1575,8 @@ TEST_F(MetaLocalBackendTest, TestSparseReadAndSingleLocationRmwAvoidDenseCacheBa
     CacheLocationVector replacements = {location, location};
     backend->UpsertSingleLocationsInto(nullptr, {1, 2}, location_ids, replacements, results, scratch);
 
-    EXPECT_EQ(0u, counting_cache->lookup_batch_calls);
-    EXPECT_EQ(0u, counting_cache->release_batch_calls);
+    EXPECT_EQ(1u, counting_cache->lookup_batch_calls);
+    EXPECT_EQ(1u, counting_cache->release_batch_calls);
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
