@@ -56,6 +56,10 @@ public:
     std::shared_ptr<Subscription> Subscribe(const std::string &consumer_id);
     void Unsubscribe(const std::shared_ptr<Subscription> &subscription);
 
+    void EnableSubscriptions();
+    void DisableSubscriptions();
+    bool accepting_subscriptions() const { return accepting_subscriptions_.load(); }
+
     bool Send(const proto::optimizer::TraceQueryRequest &event) override;
     void Stop() override;
     std::size_t DroppedCount() const;
@@ -67,6 +71,7 @@ private:
     OptimizerEventPublisherConfig config_;
     mutable std::mutex subscriptions_mutex_;
     std::vector<std::shared_ptr<Subscription>> subscriptions_;
+    std::atomic<bool> accepting_subscriptions_{true};
     std::atomic<bool> stopped_{false};
     std::atomic<std::size_t> dropped_{0};
 };

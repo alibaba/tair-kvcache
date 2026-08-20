@@ -149,11 +149,17 @@ void Server::OnBecomeLeader() {
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
+    if (optimizer_event_service_) {
+        optimizer_event_service_->EnableSubscriptions();
+    }
     KVCM_LOG_INFO("recover end");
 }
 
 void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
+    if (optimizer_event_service_) {
+        optimizer_event_service_->DisableSubscriptions();
+    }
     cache_manager_->RequestStopCacheGarbageCollector();
     cache_manager_->PauseReclaimer();
 
@@ -393,14 +399,13 @@ void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_
     if (publishers_config.enable_log_event_publisher()) {
         auto log_publisher = std::make_shared<LogEventPublisher>(publishers_config.log_event_publisher_config());
         if (!log_publisher->Init("")) {
-            KVCM_LOG_ERROR("init log event publisher failed");
-            return;
+            KVCM_LOG_ERROR("init log event publisher failed; log publisher disabled");
+        } else if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
+            KVCM_LOG_ERROR("add log event publisher failed; log publisher disabled");
+            log_publisher->Stop();
+        } else {
+            KVCM_LOG_INFO("create and register log event publisher OK");
         }
-        if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
-            KVCM_LOG_ERROR("add log event publisher failed");
-            return;
-        }
-        KVCM_LOG_INFO("create and register log event publisher OK");
     }
 
     if (!publishers_config.enable_optimizer_event_publisher()) {
@@ -415,9 +420,10 @@ void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_
     }
     if (!event_manager->RegisterPublisher("optimizer_event_publisher", optimizer_publisher)) {
         KVCM_LOG_ERROR("add optimizer event publisher failed; publisher disabled");
+        optimizer_publisher->Stop();
         return;
     }
-    optimizer_event_service_ = std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_);
+    optimizer_event_service_ = std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_, leader_elector_);
     KVCM_LOG_INFO("create and register optimizer gRPC event publisher OK, rpc_port=%d", config_.GetServiceRpcPort());
 }
 bool Server::CreateLeaderElector() {
@@ -483,6 +489,9 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (optimizer_event_service_) {
+        optimizer_event_service_->DisableSubscriptions();
+    }
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
