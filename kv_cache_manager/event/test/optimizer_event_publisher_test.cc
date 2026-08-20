@@ -201,8 +201,9 @@ TEST_F(OptimizerEventPublisherTest, TestSinkRefusalIsNotCountedAsForwarded) {
     EXPECT_EQ(0u, publisher_->ForwardedCount());
 }
 
-// The queue is the boundary that protects serving threads: it must refuse, not
-// grow and not block.
+// The queue is the boundary that protects serving threads: it must drop, not
+// grow and not block. Expected best-effort drops are handled without surfacing
+// a publisher failure to EventManager.
 TEST_F(OptimizerEventPublisherTest, TestFullQueueDropsInsteadOfBlocking) {
     sink_->set_accept(false);
     const auto config = MakePublisherConfig(4);
@@ -211,13 +212,9 @@ TEST_F(OptimizerEventPublisherTest, TestFullQueueDropsInsteadOfBlocking) {
     publisher->InitBasicQueue(config.queue_size());
     publisher->running_ = true;
 
-    int accepted = 0;
     for (int i = 0; i < 50; ++i) {
-        if (publisher->Publish(MakeGetEvent("instance-a", {i}, {1}))) {
-            ++accepted;
-        }
+        EXPECT_TRUE(publisher->Publish(MakeGetEvent("instance-a", {i}, {1})));
     }
-    EXPECT_EQ(4, accepted);
     EXPECT_EQ(46u, publisher->DroppedCount());
     publisher->running_ = false;
 }
