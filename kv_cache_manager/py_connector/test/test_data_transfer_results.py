@@ -8,8 +8,12 @@ hand-computed expectations.
 """
 
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
+
+import torch
 
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 from kv_cache_manager.py_connector.vllm.data_transfer import (
@@ -313,3 +317,64 @@ class TestAbstainedVerdicts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStagingPool(unittest.TestCase):
+    """_StagingPool: contiguous-run slot management with backpressure.
+
+    The pool replaced per-task torch.empty staging (VRAM OOM under load);
+    these tests pin the run bookkeeping: exact fit, fragmentation and
+    re-merge on release, blocking acquire, and the capacity guard.
+    """
+
+    def _pool(self, max_blocks=8, block_bytes=16):
+        from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
+        return _StagingPool(torch.device("cpu"), block_bytes, max_blocks)
+
+    def test_roundtrip_and_merge(self):
+        pool = self._pool()
+        a = pool.acquire(3)
+        b = pool.acquire(5)          # exact fit of the remainder
+        self.assertEqual((a, b), (0, 3))
+        pool.release(a, 3)
+        pool.release(b, 5)           # neighbours must merge back to one run
+        self.assertEqual(pool._runs, [[0, 8]])
+        self.assertEqual(pool.acquire(8), 0)  # full capacity usable again
+
+    def test_fragmentation_blocks_then_merge_wakes(self):
+        pool = self._pool()
+        a, b, c = pool.acquire(2), pool.acquire(2), pool.acquire(2)
+        self.assertEqual((a, b, c), (0, 2, 4))
+        pool.release(a, 2)           # free: [0,2) and [6,8)
+        pool.release(c, 2)
+        # 5 free blocks in total but no contiguous run of 5: blocks.
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(pool.acquire, 5)
+            time.sleep(0.2)
+            self.assertFalse(fut.done(), "fragmented pool must block")
+            pool.release(b, 2)       # glues [0,8) back together
+            self.assertEqual(fut.result(timeout=5), 0)
+
+    def test_blocking_acquire_wakes_on_release(self):
+        pool = self._pool(max_blocks=4)
+        held = pool.acquire(3)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(pool.acquire, 3)
+            time.sleep(0.2)
+            self.assertFalse(fut.done(), "acquire must block while exhausted")
+            pool.release(held, 3)
+            self.assertEqual(fut.result(timeout=5), 0)
+
+    def test_oversized_acquire_raises(self):
+        pool = self._pool(max_blocks=4)
+        with self.assertRaises(ValueError):
+            pool.acquire(5)
+
+    def test_views_slice_the_same_run(self):
+        pool = self._pool(max_blocks=8, block_bytes=16)
+        start = pool.acquire(3)
+        cpu, gpu = pool.cpu_view(start, 3), pool.gpu_view(start, 3)
+        self.assertEqual(cpu.numel(), 48)
+        self.assertEqual(gpu.numel(), 48)
+        cpu.zero_()
+        self.assertTrue(bool((pool._cpu[0:48] == 0).all()))

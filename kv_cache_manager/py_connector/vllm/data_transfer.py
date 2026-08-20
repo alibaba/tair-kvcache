@@ -43,6 +43,83 @@ def _get_device_module(device=None):
     return torch.cuda
 
 
+class _StagingPool:
+    """Bounded, pre-allocated staging slots for one TransferGroup.
+
+    Save and load share one pool. Replaces per-task ``torch.empty``: the GPU
+    side becomes a fixed, configurable HBM reservation instead of unbounded
+    dynamic allocation that competes with the engine (VRAM OOM under load on
+    low-headroom GPUs), and an exhausted pool blocks the acquiring task --
+    backpressure -- instead of failing. Slots are handed out as *contiguous*
+    runs because the bulk D2H/H2D copies and the kernel views need one piece
+    of memory.
+    """
+
+    def __init__(self, device, per_block_bytes: int, max_blocks: int):
+        if max_blocks <= 0:
+            raise ValueError("staging pool must have at least one block slot")
+        self.block_bytes = per_block_bytes
+        self.max_blocks = max_blocks
+        self._cond = threading.Condition()
+        total = max_blocks * per_block_bytes
+        # Pinned host memory needs a CUDA context; on other devices (tests,
+        # CPU-only runs) fall back to pageable memory.
+        self._cpu = torch.empty(total, dtype=torch.uint8, device="cpu",
+                                pin_memory=(device.type == "cuda"))
+        self._gpu = torch.empty(total, dtype=torch.uint8, device=device)
+        # Free runs as [start, start+len) block ranges, kept sorted by start.
+        self._runs = [[0, max_blocks]]
+
+    def acquire(self, n: int) -> int:
+        """Block until a contiguous run of ``n`` block slots is free; return
+        its starting block index."""
+        if n <= 0:
+            raise ValueError("must acquire at least one block slot")
+        if n > self.max_blocks:
+            raise ValueError(
+                f"staging task of {n} blocks exceeds the pool capacity "
+                f"{self.max_blocks}; raise staging_pool_blocks or shrink "
+                f"block_per_save_task/block_per_load_task")
+        with self._cond:
+            while True:
+                for i, (start, length) in enumerate(self._runs):
+                    if length >= n:
+                        rest = length - n
+                        if rest:
+                            self._runs[i] = [start + n, rest]
+                        else:
+                            self._runs.pop(i)
+                        return start
+                self._cond.wait()
+
+    def release(self, start: int, n: int) -> None:
+        with self._cond:
+            pos, run = 0, [start, n]
+            for pos, (s, _len) in enumerate(self._runs):
+                if s > start:
+                    break
+            else:
+                pos = len(self._runs)
+            self._runs.insert(pos, run)
+            # Merge with the neighbours the release just glued together.
+            merged = []
+            for s, l in self._runs:
+                if merged and merged[-1][0] + merged[-1][1] == s:
+                    merged[-1][1] += l
+                else:
+                    merged.append([s, l])
+            self._runs = merged
+            self._cond.notify_all()
+
+    def cpu_view(self, start: int, n: int) -> torch.Tensor:
+        b = self.block_bytes
+        return self._cpu[start * b:(start + n) * b]
+
+    def gpu_view(self, start: int, n: int) -> torch.Tensor:
+        b = self.block_bytes
+        return self._gpu[start * b:(start + n) * b]
+
+
 class MultiResult:
     """Collect the per-block success flags of several async tasks and fire a
     callback once every task has reported. Each result is a list[bool] aligned
@@ -78,6 +155,27 @@ class DataTransferManager:
         self._device_mod = _get_device_module(self._device)
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
+
+        pool_blocks = extra_config.staging_pool_blocks
+        need = max(extra_config.block_per_save_task,
+                   extra_config.block_per_load_task)
+        if pool_blocks < need:
+            raise ValueError(
+                f"staging_pool_blocks={pool_blocks} is smaller than the "
+                f"largest task batch ({need}); one task stages its whole "
+                f"batch contiguously, so the pool must cover it")
+        # One pool per group: block shapes differ between attention and state
+        # groups. The GPU side is the HBM this connector permanently reserves.
+        self._pools = {
+            g.spec_name: _StagingPool(self._device, g.per_block_bytes, pool_blocks)
+            for g in kvcache_info.groups}
+        for name, pool in self._pools.items():
+            logger.info("staging pool %s: %d blocks x %d bytes "
+                        "(pinned %.1f MiB + GPU %.1f MiB)",
+                        name, pool.max_blocks,
+                        pool.block_bytes,
+                        pool.max_blocks * pool.block_bytes / 2**20,
+                        pool.max_blocks * pool.block_bytes / 2**20)
 
         def _init_worker():
             self._device_mod.set_device(self._device)
@@ -223,43 +321,52 @@ class DataTransferManager:
         assert all(uri is not None for uri in uris), \
             f"group {group.spec_name}: save batch contains a block without a " \
             f"location; _save_dispositions must have failed it"
-        cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
-                                 device="cpu", pin_memory=True)
+        pool = self._pools[group.spec_name]
         with self._device_mod.stream(self._save_stream):
             ready_event.wait()
-            gpu_buffer = torch.empty(len(valid) * group.per_block_bytes,
-                                     dtype=torch.uint8, device=self._device)
-            if isinstance(group, AttentionTransferGroup):
-                view = gpu_buffer.view(self._info.dtype).view(
-                    len(valid), group.num_kv_ptrs,
-                    self._manager_block_size, group.per_token_dim)
-                batch_gather_scatter_helper.batch_gather_kv_caches(
-                    group.kvcache_ptr_tensor_gpu, view,
-                    [block_token_indices[i] for i in valid],
-                    list(range(len(valid))), self._manager_block_size,
-                    group.per_token_dim,
-                    block_stride=group.block_stride,
-                    local_block_size=group.kernel_block_size)
-            else:
-                for out_i, i in enumerate(valid):
-                    for layer_idx in range(group.layer_num):
-                        dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                        gpu_buffer[dst:dst + group.page_size_bytes].copy_(
-                            group.block_view_tensors[layer_idx][block_ids[i]])
-            cpu_buffer.copy_(gpu_buffer, non_blocking=True)
-            done = self._device_mod.Event()
-            done.record(self._save_stream)
-        done.synchronize()
+            start = pool.acquire(len(valid))
+        try:
+            cpu_buffer = pool.cpu_view(start, len(valid))
+            gpu_buffer = pool.gpu_view(start, len(valid))
+            with self._device_mod.stream(self._save_stream):
+                if isinstance(group, AttentionTransferGroup):
+                    view = gpu_buffer.view(self._info.dtype).view(
+                        len(valid), group.num_kv_ptrs,
+                        self._manager_block_size, group.per_token_dim)
+                    batch_gather_scatter_helper.batch_gather_kv_caches(
+                        group.kvcache_ptr_tensor_gpu, view,
+                        [block_token_indices[i] for i in valid],
+                        list(range(len(valid))), self._manager_block_size,
+                        group.per_token_dim,
+                        block_stride=group.block_stride,
+                        local_block_size=group.kernel_block_size)
+                else:
+                    for out_i, i in enumerate(valid):
+                        for layer_idx in range(group.layer_num):
+                            dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
+                            gpu_buffer[dst:dst + group.page_size_bytes].copy_(
+                                group.block_view_tensors[layer_idx][block_ids[i]])
+                cpu_buffer.copy_(gpu_buffer, non_blocking=True)
+                done = self._device_mod.Event()
+                done.record(self._save_stream)
+            done.synchronize()
 
-        buffers = self._make_block_buffers(
-            cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
-        result = self._transfer_client.SaveKvCaches(uris, buffers)
-        ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
-        if not ok:
-            logger.warning("save task failed group=%s uris=%d result=%s",
-                           group.spec_name, len(uris), result)
-        for i in valid:
-            ok_mask[i] = ok
+            buffers = self._make_block_buffers(
+                cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
+            result = self._transfer_client.SaveKvCaches(uris, buffers)
+            ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+            if not ok:
+                logger.warning("save task failed group=%s uris=%d result=%s",
+                               group.spec_name, len(uris), result)
+            for i in valid:
+                ok_mask[i] = ok
+        except BaseException:
+            # Drain the stream before the slots go back: a failed task may
+            # have left kernel/copy work enqueued against the staging views.
+            self._save_stream.synchronize()
+            raise
+        finally:
+            pool.release(start, len(valid))
 
     def create_save_done_callback(self, req_id, tp_rank, write_session_id, num_blocks):
         """block success = AND across all groups that had data for the block.
@@ -326,43 +433,52 @@ class DataTransferManager:
 
     def _load_valid_blocks(self, group, remote_uris, block_token_indices,
                            block_ids, valid) -> bool:
-        cpu_buffer = torch.empty(len(valid) * group.per_block_bytes, dtype=torch.uint8,
-                                 device="cpu", pin_memory=True)
-        buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
-                                           group.per_block_bytes, len(valid))
-        uris = [remote_uris[i] for i in valid]
-        assert all(uri is not None for uri in uris), \
-            f"group {group.spec_name}: load batch contains a block without a " \
-            f"location; load_task must have failed it"
-        result = self._transfer_client.LoadKvCaches(uris, buffers)
-        ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
-        if ok:
-            with self._device_mod.stream(self._load_stream):
-                gpu_buffer = cpu_buffer.to(self._device, non_blocking=True)
-                if isinstance(group, AttentionTransferGroup):
-                    view = gpu_buffer.view(self._info.dtype).view(
-                        len(valid), group.num_kv_ptrs,
-                        self._manager_block_size, group.per_token_dim)
-                    batch_gather_scatter_helper.batch_scatter_kv_caches(
-                        group.kvcache_ptr_tensor_gpu, view,
-                        [block_token_indices[i] for i in valid],
-                        list(range(len(valid))), self._manager_block_size,
-                        group.per_token_dim,
-                        block_stride=group.block_stride,
-                        local_block_size=group.kernel_block_size)
-                else:
-                    for out_i, i in enumerate(valid):
-                        for layer_idx in range(group.layer_num):
-                            src = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                            group.block_view_tensors[layer_idx][block_ids[i]].copy_(
-                                gpu_buffer[src:src + group.page_size_bytes])
-                done = self._device_mod.Event()
-                done.record(self._load_stream)
-            done.synchronize()
-        else:
-            logger.warning("load task failed group=%s uris=%d result=%s",
-                           group.spec_name, len(uris), result)
-        return ok
+        pool = self._pools[group.spec_name]
+        start = pool.acquire(len(valid))
+        try:
+            cpu_buffer = pool.cpu_view(start, len(valid))
+            buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
+                                               group.per_block_bytes, len(valid))
+            uris = [remote_uris[i] for i in valid]
+            assert all(uri is not None for uri in uris), \
+                f"group {group.spec_name}: load batch contains a block without a " \
+                f"location; load_task must have failed it"
+            result = self._transfer_client.LoadKvCaches(uris, buffers)
+            ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
+            if ok:
+                with self._device_mod.stream(self._load_stream):
+                    gpu_buffer = pool.gpu_view(start, len(valid))
+                    gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+                    if isinstance(group, AttentionTransferGroup):
+                        view = gpu_buffer.view(self._info.dtype).view(
+                            len(valid), group.num_kv_ptrs,
+                            self._manager_block_size, group.per_token_dim)
+                        batch_gather_scatter_helper.batch_scatter_kv_caches(
+                            group.kvcache_ptr_tensor_gpu, view,
+                            [block_token_indices[i] for i in valid],
+                            list(range(len(valid))), self._manager_block_size,
+                            group.per_token_dim,
+                            block_stride=group.block_stride,
+                            local_block_size=group.kernel_block_size)
+                    else:
+                        for out_i, i in enumerate(valid):
+                            for layer_idx in range(group.layer_num):
+                                src = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
+                                group.block_view_tensors[layer_idx][block_ids[i]].copy_(
+                                    gpu_buffer[src:src + group.page_size_bytes])
+                    done = self._device_mod.Event()
+                    done.record(self._load_stream)
+                done.synchronize()
+            else:
+                logger.warning("load task failed group=%s uris=%d result=%s",
+                               group.spec_name, len(uris), result)
+            return ok
+        except BaseException:
+            # Drain the stream before the slots go back (as in save).
+            self._load_stream.synchronize()
+            raise
+        finally:
+            pool.release(start, len(valid))
 
     def create_load_done_callback(self, req_id, tp_rank, epoch, block_ids, num_blocks,
                                   report_failures=True):

@@ -36,6 +36,17 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     block_per_save_task: int = 128
     block_per_load_task: int = 128
 
+    # --- Staging buffers ---
+    # Pre-allocated contiguous staging slots per transfer group (shared by
+    # save and load). GPU side is a *fixed* HBM reservation of
+    # staging_pool_blocks * per_block_bytes per group; per-task dynamic
+    # allocation instead competes with the engine's own memory and OOMs it
+    # under load on low-headroom GPUs. An exhausted pool blocks the task
+    # (backpressure). Must be >= max(block_per_save_task, block_per_load_task)
+    # because one task stages its whole batch contiguously; shrink both
+    # together on small cards.
+    staging_pool_blocks: int = 128
+
     # --- Manager queries ---
     async_get_cache_location: bool = True
 
