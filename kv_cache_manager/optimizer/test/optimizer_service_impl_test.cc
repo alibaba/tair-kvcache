@@ -66,7 +66,7 @@ protected:
                                                                            int32_t linear_step = -1,
                                                                            int64_t extra_spec_size = 0) {
         // linear_step counts tokens; -1 = auto: linear instances (with an
-        // extra Mamba spec) default to one block per checkpoint, plain
+        // extra Linear spec) default to one Linear state per block, plain
         // instances stay full-attention.
         if (linear_step < 0) {
             linear_step = extra_spec_size > 0 ? block_size : 0;
@@ -574,7 +574,7 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenA
         EXPECT_EQ("full", full_group.name());
         EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}), full_group.spec_names());
         EXPECT_EQ("full", state.instance_info->optimizer_state_info().full_location_spec_group_name());
-        EXPECT_EQ(48, state.size_full);
+        EXPECT_EQ(48, state.full_charge_bytes);
     }));
 }
 

@@ -20,7 +20,7 @@
   -> KvcmEventSubscriber::ProcessEvent
   -> OptimizerServiceImpl::ExecuteTraceQuery
   -> OnlineOptimizerManager::TraceQuery
-  -> LiteHit / CacheIndexer
+  -> TtlLiteHit（Full / Linear 共用）
   -> 累计查询统计和 MRC 窗口
   -> OptimizerMetricsReporter::ReportInterval
   -> MetricsRegistry / KMonitor
@@ -355,6 +355,7 @@ OnlineOptimizerManager::RegisterInstance
 - [`manager/online_runtime/online_optimizer_manager.cc`](../manager/online_runtime/online_optimizer_manager.cc)
 - [`config/optimizer_registry_manager.cc`](../config/optimizer_registry_manager.cc)
 - [`liteHit/lite_hit.cc`](../liteHit/lite_hit.cc)
+- [`liteHit/lite_hit_ttl.cc`](../liteHit/lite_hit_ttl.cc)
 
 `OnlineOptimizerManager::RegisterInstance()` 执行：
 
@@ -363,11 +364,10 @@ OnlineOptimizerManager::RegisterInstance
   -> 无显式 full group 且仅有一个 group 时，RegisterInstance 直接补齐 full-only 状态
   -> 持久化 OptimizerInstanceInfo（启用 registry 时）
   -> RegisterInstanceInternal
-  -> 计算 size_full
-  -> capacity_gb 换算为 capacity blocks
+  -> 计算 Full / Linear object charge
+  -> capacity_gb 换算为 capacity bytes（同时生成兼容展示用 block 数）
   -> 创建 InstanceState
-  -> linear_step == 0：创建 LiteHit
-  -> linear_step > 0：创建 CacheIndexer
+  -> 创建 TtlLiteHit；linear_step 决定是否启用 Linear 状态
   -> 写入 instances_[instance_id]
 ```
 
@@ -495,8 +495,8 @@ EC_INSTANCE_NOT_EXIST
   -> input_token_len == 0 时按完整 block 推算
   -> 加 InstanceState mutex
   -> NormalizeRequest / prefix hash
-  -> LiteHit::ProcessRequest
-  -> 生成 RequestFact.hit_curve
+  -> TtlLiteHit::ProcessFullRequest
+  -> 生成 FullRequestFact.hit_curve
   -> MrcWindow::Record
   -> 投影各容量命中率
   -> 按需计算理论无限容量命中
@@ -507,7 +507,7 @@ EC_INSTANCE_NOT_EXIST
 
 - producer timestamp 非零时，TTL 使用生产时间。
 - 时间戳为零时回退到 Optimizer 到达时间。
-- LiteHit 和 legacy TTL indexer 对乱序时间做单调保护。
+- TtlLiteHit 对 Full / Linear 两种模式统一应用 TTL，并对乱序时间做单调保护。
 - 纯 LRU 只依赖事件顺序。
 
 理论结果只有 `enable_theoretical_max_cache=true` 时才计算。
@@ -646,9 +646,8 @@ running = false
 | `config/optimizer_registry_manager.h/cc` | Group / Instance 配置及持久化 |
 | `manager/online_runtime/online_optimizer_manager.h/cc` | InstanceState、TraceQuery 和累计统计 |
 | `metrics/mrc_window.h/cc` | MRC 容量曲线累计、快照和清空 |
-| `liteHit/lite_hit.h/cc` | full-attention 容量无关 LRU replay |
-| `index/online/cache_indexer.h` | legacy indexer 和 producer timestamp 入口 |
-| `index/online/ttl_cache_indexer_wrapper.h/cc` | legacy TTL 时间处理 |
+| `liteHit/lite_hit.h/cc` | Full / Linear 共用的容量无关 LRU replay 核心 |
+| `liteHit/lite_hit_ttl.h/cc` | Full / Linear 共用的 TTL 装饰层和 producer timestamp 入口 |
 | `metrics/optimizer_metrics_collector.h/cc` | 单次请求和查询结果采集 |
 | `metrics/optimizer_metrics_reporter.h/cc` | per-query 和 interval metrics 上报 |
 | `service/http/optimizer_service_http.h/cc` | HTTP API 和 Prometheus `/metrics` |

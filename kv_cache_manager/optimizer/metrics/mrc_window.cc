@@ -26,7 +26,7 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 
 } // namespace
 
-void MrcWindow::Record(const RequestFact &fact) {
+void MrcWindow::Record(const FullRequestFact &fact) {
     uint64_t request_hits = 0;
     for (const auto &segment : fact.hit_curve) {
         if (segment.run_length == 0) {
