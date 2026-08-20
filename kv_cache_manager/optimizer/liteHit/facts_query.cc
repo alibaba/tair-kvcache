@@ -138,14 +138,13 @@ bool RunLiteHitFactsQuery(const std::string &facts_csv_path,
         }
         for (std::size_t i = 0; i < slots.size(); ++i) {
             uint64_t hits = 0;
-            if (record.is_mamba) {
-                hits = slots[i].infinite
-                           ? HitCurveProjector::ProjectMambaInfinite(record.mamba_fact)
-                           : HitCurveProjector::ProjectMambaBytes(record.mamba_fact, slots[i].capacity_bytes);
+            if (record.is_full_rle) {
+                hits = slots[i].infinite ? HitCurveProjector::ProjectFullInfinite(record.full_rle_fact)
+                                         : HitCurveProjector::ProjectFullBytes(
+                                               record.full_rle_fact, slots[i].capacity_bytes, record.block_bytes);
             } else {
-                hits = slots[i].infinite
-                           ? HitCurveProjector::ProjectInfinite(record.fact)
-                           : HitCurveProjector::ProjectBytes(record.fact, slots[i].capacity_bytes, record.block_bytes);
+                hits = slots[i].infinite ? HitCurveProjector::ProjectInfinite(record.fact)
+                                         : HitCurveProjector::ProjectBytes(record.fact, slots[i].capacity_bytes);
             }
             hit_blocks[i] = hits;
             const uint64_t hit_tokens = hits * record.block_size_tokens;
