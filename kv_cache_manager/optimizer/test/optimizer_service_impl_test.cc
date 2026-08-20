@@ -36,7 +36,7 @@ protected:
                                                                            int32_t linear_step = -1,
                                                                            int64_t extra_spec_size = 0) {
         // linear_step counts tokens; -1 = auto: linear instances (with an
-        // extra Mamba spec) default to one block per checkpoint, plain
+        // extra Linear spec) default to one Linear state per block, plain
         // instances stay full-attention.
         if (linear_step < 0) {
             linear_step = extra_spec_size > 0 ? block_size : 0;

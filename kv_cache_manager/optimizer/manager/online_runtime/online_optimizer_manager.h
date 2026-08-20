@@ -12,8 +12,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
-#include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
-#include "kv_cache_manager/optimizer/liteHit/lite_hit_mamba.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit_ttl.h"
 
 namespace kv_cache_manager {
 
@@ -23,27 +22,22 @@ struct InstanceState {
     std::shared_ptr<const OptimizerInstanceInfo> instance_info;
     std::shared_ptr<const OptimizerInstanceGroup> instance_group;
 
-    // Exactly one analyzer is active: full-attention uses LiteHit, linear
-    // attention uses LiteHitMamba.
-    std::unique_ptr<LiteHit> lite_hit;
-    std::unique_ptr<LiteHitMamba> lite_hit_mamba;
-    // Full-attention projection slots: the configured capacities floored to
-    // whole blocks. Exact, because every block costs the same charge.
-    std::vector<int64_t> lite_hit_capacity_blocks;
-    // Mamba projection slots: the TOTAL byte capacity of each tier. Full
-    // blocks and Mamba checkpoints share this one budget, so the projector
-    // always sees the total.
-    std::vector<uint64_t> total_capacity_bytes;
+    // TTL decorator around one shared LiteHit core. With ttl_seconds == 0 the
+    // decorator is a timestamp-free pass-through.
+    std::unique_ptr<TtlLiteHit> lite_hit;
+    // Configured capacity slots in bytes for both Full-only and Linear
+    // instances. Full RLE performs its block-size floor only at projection.
+    std::vector<uint64_t> capacity_bytes;
 
-    // Byte charges of the two object types. A Full block always costs
-    // full_charge_bytes; a checkpoint additionally stores a Mamba state of
-    // mamba_charge_bytes (0 for full-attention instances).
+    // Byte charges of the two object types. A Full block costs
+    // full_charge_bytes; a Linear state costs linear_charge_bytes
+    // (0 for full-attention instances).
     int64_t full_charge_bytes = 0;
-    int64_t mamba_charge_bytes = 0;
+    int64_t linear_charge_bytes = 0;
     // Configured token interval (0 = full-attention only). Reported as-is.
     int32_t linear_step = 0;
     // linear_step converted to whole blocks (linear_step / block_size); it is
-    // the checkpoint interval and feeds the bytes-per-block estimation.
+    // the Linear-state interval used by the Mamba policy.
     int32_t linear_step_blocks = 0;
     std::mutex mutex;
 
@@ -70,9 +64,11 @@ struct TraceQueryResult {
 };
 
 struct RegisterInstanceResult {
+    // Compatibility/display estimate derived from capacity_bytes. Runtime
+    // projection never reads this field.
     std::vector<int64_t> estimated_capacity_blocks;
     int64_t full_charge_bytes = 0;
-    int64_t mamba_charge_bytes = 0;
+    int64_t linear_charge_bytes = 0;
 };
 
 struct PerCapacityHitRateInfo {
@@ -91,7 +87,9 @@ struct InstanceSummary {
     int64_t total_max_hits = 0;
     double max_hit_rate = 0.0;
     int64_t unique_keys = 0;
-    int64_t bytes_per_block = 0;
+    // Full-attention: exact configured Full block charge. Mamba: current
+    // resident Full+Mamba working-set bytes divided by resident Full blocks.
+    double bytes_per_block = 0.0;
     int32_t linear_step = 0;
     int64_t eviction_count = 0;
     int64_t memory_usage_bytes = 0;

@@ -113,10 +113,14 @@ protected:
     std::shared_ptr<OptimizerRegistryManager> registry_;
     std::shared_ptr<OnlineOptimizerManager> mgr_;
 
-    static double FullCapacityGb(int64_t capacity_blocks) {
+    static double CapacityGbForBytes(uint64_t capacity_bytes) {
         constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
-        constexpr double kFullBlockChargeBytes = 16384.0;
-        return static_cast<double>(capacity_blocks) * kFullBlockChargeBytes / kBytesPerGb;
+        return static_cast<double>(capacity_bytes) / kBytesPerGb;
+    }
+
+    static double FullCapacityGb(int64_t capacity_blocks) {
+        constexpr uint64_t kFullBlockChargeBytes = 16384;
+        return CapacityGbForBytes(static_cast<uint64_t>(capacity_blocks) * kFullBlockChargeBytes);
     }
 };
 
@@ -128,12 +132,12 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceBasic) {
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
     EXPECT_EQ(16384, result.full_charge_bytes);
-    EXPECT_EQ(0, result.mamba_charge_bytes);
+    EXPECT_EQ(0, result.linear_charge_bytes);
     EXPECT_EQ(1, result.estimated_capacity_blocks.size());
 }
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceHybrid) {
-    // 48 tokens / 16 tokens-per-block = one checkpoint every 3 blocks.
+    // 48 tokens / 16 tokens-per-block = one Linear state every 3 blocks.
     auto info = MakeHybridInfo("i1", "g1", 16, 48);
     auto group = MakeGroup("g1", {1.0});
     RegisterInstanceResult result;
@@ -141,7 +145,7 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceHybrid) {
     ErrorCode ec = RegisterInstance(info, group, result);
     EXPECT_EQ(EC_OK, ec);
     EXPECT_EQ(16384, result.full_charge_bytes);
-    EXPECT_EQ(4096, result.mamba_charge_bytes);
+    EXPECT_EQ(4096, result.linear_charge_bytes);
     // Estimate only (hits run on the byte axis): a shared pool spends
     // 3 * 16384 + 4096 = 53248 bytes per 3 blocks, so 1 GB holds about
     // floor(1073741824 * 3 / 53248) blocks.
@@ -280,6 +284,26 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
     EXPECT_EQ(100, result.hit_count_per_capacity[1]);
 }
 
+TEST_F(OnlineOptimizerManagerTest, FullAttentionStoresCapacityInBytes) {
+    constexpr uint64_t kFullChargeBytes = 16384;
+    constexpr uint64_t kCapacityBytes = 2 * kFullChargeBytes - 1;
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {CapacityGbForBytes(kCapacityBytes)});
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+    EXPECT_EQ((std::vector<int64_t>{1}), reg_result.estimated_capacity_blocks);
+
+    ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
+        EXPECT_EQ((std::vector<uint64_t>{kCapacityBytes}), state.capacity_bytes);
+    }));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, result));
+    EXPECT_EQ((std::vector<int64_t>{1}), result.hit_count_per_capacity);
+    EXPECT_EQ((std::vector<int64_t>{1}), result.unique_keys_per_capacity);
+}
+
 TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     auto info = MakeInfo("i1", "g1", 4, 0);
     auto group = MakeGroup("g1", {FullCapacityGb(2), FullCapacityGb(3)}, "lru", true);
@@ -322,14 +346,22 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);
 }
 
-TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
-    // block_size 16, linear_step 48 tokens -> one checkpoint every 3 blocks
+TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesSharedLiteHit) {
+    // block_size 16, linear_step 48 tokens -> one Linear state every 3 blocks
     // plus the forced last block. Hybrid specs: full charge 16384, mamba
-    // charge 4096 per checkpoint.
+    // charge 4096 per Linear state.
     auto info = MakeHybridInfo("i1", "g1", 16, 48);
     auto group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/true);
     RegisterInstanceResult reg_result;
     ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    // An empty working set has no per-resident-block average yet.
+    {
+        std::vector<InstanceSummary> empty_summaries;
+        ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", empty_summaries));
+        ASSERT_EQ(1u, empty_summaries.size());
+        EXPECT_DOUBLE_EQ(0.0, empty_summaries[0].bytes_per_block);
+    }
 
     TraceQueryResult first;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, first));
@@ -339,7 +371,7 @@ TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
 
     TraceQueryResult second;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, second));
-    // 1 GB covers everything: the forced last checkpoint (position 3)
+    // 1 GB covers everything: the forced tail Linear state (position 3)
     // recovers all 4 complete blocks.
     EXPECT_EQ(4, second.hit_count_per_capacity[0]);
     EXPECT_DOUBLE_EQ(64.0 / 70.0, second.hit_rate_per_capacity[0]);
@@ -350,8 +382,9 @@ TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
     bool checked_state = false;
     ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [&](const InstanceState &state) {
         checked_state = true;
-        EXPECT_EQ(nullptr, state.lite_hit);
-        EXPECT_NE(nullptr, state.lite_hit_mamba);
+        ASSERT_NE(nullptr, state.lite_hit);
+        EXPECT_TRUE(state.lite_hit->uses_linear());
+        EXPECT_EQ((std::vector<uint64_t>{1ULL << 30}), state.capacity_bytes);
     }));
     EXPECT_TRUE(checked_state);
 
@@ -361,8 +394,9 @@ TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
     EXPECT_EQ(2, summaries[0].total_queries);
     EXPECT_EQ(140, summaries[0].total_input_tokens);
     EXPECT_EQ(4, summaries[0].unique_keys);
-    // Working set: 4 Full * 16384 + 2 checkpoints (positions 2 and 3) * 4096.
+    // Working set: 4 Full * 16384 + 2 Linear states (positions 2 and 3) * 4096.
     EXPECT_EQ(4 * 16384 + 2 * 4096, summaries[0].kv_cache_usage_bytes);
+    EXPECT_DOUBLE_EQ(static_cast<double>(4 * 16384 + 2 * 4096) / 4, summaries[0].bytes_per_block);
     ASSERT_EQ(1, summaries[0].per_capacity_hit_rates.size());
     EXPECT_EQ(4, summaries[0].per_capacity_hit_rates[0].total_hits);
     EXPECT_DOUBLE_EQ(64.0 / 140.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
@@ -371,6 +405,40 @@ TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesLiteHitMamba) {
     TraceQueryResult after_reset;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, after_reset));
     EXPECT_EQ(0, after_reset.hit_count_per_capacity[0]);
+}
+
+TEST_F(OnlineOptimizerManagerTest, MambaCountsHistoricalForcedTailLinearState) {
+    // block_size 16, linear_step 48 -> periodic Linear states every 3 blocks.
+    auto info = MakeHybridInfo("i1", "g1", 16, 48);
+    auto group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 32, first));
+    EXPECT_EQ(0, first.hit_count_per_capacity[0]);
+    EXPECT_EQ(0, first.max_hit_count);
+
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 64, second));
+    // key 2 has a Linear state solely as the first request's forced tail. It is
+    // not scheduled in this request, but remains a valid
+    // restore point and must contribute two hit blocks to both statistics.
+    EXPECT_EQ(2, second.hit_count_per_capacity[0]);
+    EXPECT_DOUBLE_EQ(0.5, second.hit_rate_per_capacity[0]);
+    EXPECT_EQ(2, second.max_hit_count);
+    EXPECT_DOUBLE_EQ(0.5, second.max_hit_rate);
+
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1u, summaries.size());
+    EXPECT_EQ(2, summaries[0].per_capacity_hit_rates[0].total_hits);
+    EXPECT_DOUBLE_EQ(32.0 / 96.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
+    EXPECT_DOUBLE_EQ(32.0 / 96.0, summaries[0].max_hit_rate);
+    // 4 Full blocks plus current Linear states 3/4 and historical forced-tail
+    // Linear state 2: the real working-set average is (4F + 3M) / 4.
+    EXPECT_EQ(4 * 16384 + 3 * 4096, summaries[0].kv_cache_usage_bytes);
+    EXPECT_DOUBLE_EQ(static_cast<double>(4 * 16384 + 3 * 4096) / 4, summaries[0].bytes_per_block);
 }
 
 TEST_F(OnlineOptimizerManagerTest, FullAttentionRequiresConsistentInputTokenLength) {
@@ -419,17 +487,30 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
     EXPECT_EQ(EC_BADARGS, RegisterInstance(bad_info, bad_group, reg_result));
 }
 
-TEST_F(OnlineOptimizerManagerTest, RejectsLinearInstanceInTtlGroup) {
-    // The Mamba core carries no time axis yet, so a linear instance in a TTL
-    // group has no analyzer to run on and must be rejected at registration.
+TEST_F(OnlineOptimizerManagerTest, LinearInstanceLayersGroupTtlOntoSharedCore) {
     auto info = MakeHybridInfo("i1", "g1", 16, 48);
     auto ttl_group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/false, /*ttl=*/300);
     RegisterInstanceResult reg_result;
-    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, ttl_group, reg_result));
+    ASSERT_EQ(EC_OK, RegisterInstance(info, ttl_group, reg_result));
 
-    // The very same instance registers fine without a group TTL.
-    auto group = MakeGroup("g1", {1.0});
-    EXPECT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+    TraceQueryResult first;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 16, first));
+    EXPECT_EQ(0, first.hit_count_per_capacity.at(0));
+    TraceQueryResult second;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 16, second));
+    EXPECT_EQ(1, second.hit_count_per_capacity.at(0));
+
+    // Drive the shared watermark past the deadline without waiting in the UT.
+    ASSERT_EQ(EC_OK,
+              mgr_->GetInstanceState("i1", [](const InstanceState &state) { state.lite_hit->AdvanceTime(LLONG_MAX); }));
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1u, summaries.size());
+    EXPECT_EQ(0, summaries[0].unique_keys);
+    EXPECT_EQ(0, summaries[0].kv_cache_usage_bytes);
+    EXPECT_DOUBLE_EQ(0.0, summaries[0].bytes_per_block);
+    EXPECT_EQ(1, summaries[0].ttl_eviction_count); // Full objects only
+    EXPECT_EQ(summaries[0].ttl_eviction_count, summaries[0].eviction_count);
 }
 
 TEST_F(OnlineOptimizerManagerTest, ResetStatsResetsFullAttentionLiteHit) {
