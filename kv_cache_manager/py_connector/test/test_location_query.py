@@ -105,10 +105,10 @@ class LocationQueryFanoutTest(unittest.TestCase):
 
         self.client.get_cache_location = boom
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
-        deadline = time.time() + 10
-        while time.time() < deadline:  # failure pops the entry asynchronously
+        deadline = time.time() + 10  # failure pops the entry asynchronously
+        while time.time() < deadline:
             with lqm._lock:
-                if not lqm._entries:
+                if not lqm._entries.get("r1"):
                     break
             time.sleep(0.01)
         # The next ask re-issues instead of waiting forever on a dead entry.
@@ -125,6 +125,42 @@ class LocationQueryFanoutTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(result, ["loc0", "loc1"])
+
+
+    def test_grown_offset_query_is_not_blocked_by_inflight_older_offset(self):
+        """Different offsets are different queries (origin/main's key): a
+        re-ask at a grown offset must issue its own RPC immediately instead
+        of waiting behind an older offset's in-flight query."""
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # RPC #1
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # RPC #2, own key
+        self.assertEqual(self.client.calls, 2)
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # same key: dedup
+        self.assertEqual(self.client.calls, 2)
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # same key: dedup
+        self.assertEqual(self.client.calls, 2)
+
+    def test_consume_returns_last_answered_and_empties(self):
+        self.client.gate.set()
+        lqm = self._manager()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if lqm.get_locations_for_query(self.req, 0) is not None:
+                break
+            time.sleep(0.01)
+        # The hook clamps the answer before the allocation consumes it.
+        lqm.store_result("r1", ["loc0"])
+        self.assertEqual(lqm.consume_locations("r1"), (["loc0"], 0))
+        self.assertIsNone(lqm.consume_locations("r1"))
+
+    def test_invalidate_drops_all_offsets(self):
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))
+        lqm.invalidate("r1")
+        with lqm._lock:
+            self.assertNotIn("r1", lqm._entries)
+            self.assertNotIn("r1", lqm._last_answered)
 
 
 if __name__ == "__main__":
