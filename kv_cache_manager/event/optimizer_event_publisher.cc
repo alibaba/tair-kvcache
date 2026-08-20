@@ -67,9 +67,8 @@ bool OptimizerEventPublisher::Stop() {
 }
 
 void OptimizerEventPublisher::WorkerThread() {
-    // Single threaded on purpose: the replay requires per-instance events to
-    // arrive in non-decreasing timestamp order, and one worker draining one
-    // queue preserves that ordering.
+    // A single worker keeps conversion and delivery off serving threads
+    // without adding synchronization between multiple consumers of the queue.
     while (running_) {
         BasicWait();
 

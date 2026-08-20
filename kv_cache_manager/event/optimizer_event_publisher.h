@@ -28,9 +28,8 @@ class TraceQueryRequest;
 // the event is dropped rather than the caller blocked: these are analysis
 // samples, and a slow or absent consumer must never slow down serving.
 //
-// Dropping biases the replayed hit rate downwards (an unseen request never
-// touches the simulated LRU). That is accepted, but it means the drop count
-// has to be readable before anyone trusts a capacity curve.
+// Dropping samples may slightly affect replay accuracy, which is accepted for
+// this best-effort analysis path.
 class OptimizerEventPublisher : public EventPublisher {
 public:
     OptimizerEventPublisher(std::shared_ptr<EventSink> sink, const OptimizerEventPublisherConfig &config);

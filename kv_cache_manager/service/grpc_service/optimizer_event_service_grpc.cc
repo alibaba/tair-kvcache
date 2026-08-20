@@ -7,22 +7,46 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 
 namespace kv_cache_manager {
 
 OptimizerEventServiceGRpc::OptimizerEventServiceGRpc(std::shared_ptr<SubscriptionEventSink> sink,
-                                                     std::shared_ptr<RegistryManager> registry_manager)
-    : sink_(std::move(sink)), registry_manager_(std::move(registry_manager)) {}
+                                                     std::shared_ptr<RegistryManager> registry_manager,
+                                                     std::shared_ptr<LeaderElector> leader_elector)
+    : sink_(std::move(sink))
+    , registry_manager_(std::move(registry_manager))
+    , leader_elector_(std::move(leader_elector)) {
+    DisableSubscriptions();
+}
+
+void OptimizerEventServiceGRpc::EnableSubscriptions() {
+    if (sink_) {
+        sink_->EnableSubscriptions();
+    }
+}
+
+void OptimizerEventServiceGRpc::DisableSubscriptions() {
+    if (sink_) {
+        sink_->DisableSubscriptions();
+    }
+}
+
+bool OptimizerEventServiceGRpc::IsAvailable() const {
+    return leader_elector_ && leader_elector_->GetRoleState() == RoleState::LEADER &&
+           leader_elector_->IsStableState() && registry_manager_ && registry_manager_->IsRecoverComplete() && sink_ &&
+           sink_->accepting_subscriptions() && !sink_->stopped();
+}
 
 grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
                                                          const proto::optimizer::KvcmConfigurationRequest *request,
                                                          proto::optimizer::KvcmConfigurationResponse *response) {
     auto *status = response->mutable_header()->mutable_status();
-    if (!registry_manager_) {
+    if (!IsAvailable()) {
         status->set_code(proto::optimizer::SERVICE_NOT_READY);
-        status->set_message("KVCM registry manager is unavailable");
+        status->set_message("KVCM is unavailable");
         return grpc::Status::OK;
     }
 
@@ -76,17 +100,18 @@ grpc::Status
 OptimizerEventServiceGRpc::SubscribeEvents(grpc::ServerContext *context,
                                            const proto::optimizer::OptimizerEventSubscriptionRequest *request,
                                            grpc::ServerWriter<proto::optimizer::TraceQueryRequest> *writer) {
-    if (!sink_ || sink_->stopped()) {
-        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "optimizer event publisher is unavailable");
+    if (!IsAvailable()) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "KVCM is unavailable");
     }
     auto subscription = sink_->Subscribe(request->consumer_id());
     if (!subscription) {
-        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "optimizer subscriber limit reached");
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "KVCM is unavailable");
     }
 
     KVCM_LOG_INFO("OptimizerEventServiceGRpc: stream opened, consumer_id=%s, peer=%s",
                   subscription->consumer_id().c_str(),
                   context->peer().c_str());
+    bool subscription_closed = false;
     while (!context->IsCancelled()) {
         proto::optimizer::TraceQueryRequest event;
         const auto result = subscription->WaitNext(&event, std::chrono::milliseconds(100));
@@ -94,6 +119,7 @@ OptimizerEventServiceGRpc::SubscribeEvents(grpc::ServerContext *context,
             continue;
         }
         if (result == SubscriptionEventSink::Subscription::WaitResult::kClosed) {
+            subscription_closed = true;
             break;
         }
         if (!writer->Write(event)) {
@@ -102,6 +128,9 @@ OptimizerEventServiceGRpc::SubscribeEvents(grpc::ServerContext *context,
     }
     sink_->Unsubscribe(subscription);
     KVCM_LOG_INFO("OptimizerEventServiceGRpc: stream closed, consumer_id=%s", subscription->consumer_id().c_str());
+    if (subscription_closed) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "KVCM is unavailable");
+    }
     return grpc::Status::OK;
 }
 

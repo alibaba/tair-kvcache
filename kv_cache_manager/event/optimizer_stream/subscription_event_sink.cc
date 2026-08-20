@@ -58,7 +58,7 @@ SubscriptionEventSink::~SubscriptionEventSink() { Stop(); }
 
 std::shared_ptr<SubscriptionEventSink::Subscription> SubscriptionEventSink::Subscribe(const std::string &consumer_id) {
     std::lock_guard<std::mutex> lock(subscriptions_mutex_);
-    if (stopped_ || subscriptions_.size() >= config_.max_subscribers()) {
+    if (stopped_ || !accepting_subscriptions_ || subscriptions_.size() >= config_.max_subscribers()) {
         return nullptr;
     }
     auto subscription = std::shared_ptr<Subscription>(
@@ -87,15 +87,33 @@ void SubscriptionEventSink::Unsubscribe(const std::shared_ptr<Subscription> &sub
                   subscribers);
 }
 
-bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
-    if (stopped_) {
-        dropped_.fetch_add(1);
-        return false;
+void SubscriptionEventSink::EnableSubscriptions() {
+    std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+    if (!stopped_) {
+        accepting_subscriptions_ = true;
     }
+}
 
+void SubscriptionEventSink::DisableSubscriptions() {
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        accepting_subscriptions_ = false;
+        subscriptions.swap(subscriptions_);
+    }
+    for (const auto &subscription : subscriptions) {
+        subscription->Close();
+    }
+}
+
+bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
+    std::vector<std::shared_ptr<Subscription>> subscriptions;
+    {
+        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        if (stopped_ || !accepting_subscriptions_) {
+            dropped_.fetch_add(1);
+            return false;
+        }
         subscriptions = subscriptions_;
     }
     if (subscriptions.empty()) {
@@ -118,6 +136,7 @@ void SubscriptionEventSink::Stop() {
     if (stopped_.exchange(true)) {
         return;
     }
+    accepting_subscriptions_ = false;
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
