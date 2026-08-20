@@ -36,8 +36,10 @@ bool OptimizerEventPublisher::Publish(const std::shared_ptr<BaseEvent> &event) {
         return false;
     }
     // Runs on a serving thread: enqueue and return, nothing else. A full queue
-    // drops the event (counted by the base class) rather than blocking.
-    return BasicEnqueue(event);
+    // drops the event (counted by the base class) without surfacing an expected
+    // best-effort drop as a publish failure and triggering a warning per request.
+    BasicEnqueue(event);
+    return true;
 }
 
 bool OptimizerEventPublisher::Stop() {
