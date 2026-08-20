@@ -167,7 +167,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/optimizer/liteHit:hit_curve",
-        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit_ttl",
     ],
 )
 
@@ -184,15 +184,16 @@ cc_test(
 )
 
 cc_test(
-    name = "LiteHitMambaTest",
+    name = "LiteHitLinearTest",
     srcs = [
-        "lite_hit_mamba_test.cc",
+        "lite_hit_linear_test.cc",
     ],
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/optimizer/liteHit:hit_curve",
-        "//kv_cache_manager/optimizer/liteHit:lite_hit_mamba",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit",
+        "//kv_cache_manager/optimizer/liteHit:lite_hit_ttl",
     ],
 )
 
