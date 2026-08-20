@@ -56,6 +56,7 @@ cc_test(
         "//kv_cache_manager/event:optimizer_event_publisher",
         "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
         "//kv_cache_manager/service",
+        "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
     ],
 )
 
@@ -69,6 +70,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/event:event_publishers_config",
         "//kv_cache_manager/event:optimizer_event_publisher",
         "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",

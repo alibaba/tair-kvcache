@@ -77,6 +77,27 @@ TEST_F(SubscriptionEventSinkTest, TestRejectsExcessSubscribers) {
     EXPECT_EQ(nullptr, sink.Subscribe("second"));
 }
 
+TEST_F(SubscriptionEventSinkTest, TestDisableClosesSubscribersAndEnableAcceptsNewOnes) {
+    SubscriptionEventSink sink(MakeSinkConfig(1, 1));
+    auto subscription = sink.Subscribe("optimizer");
+    ASSERT_NE(nullptr, subscription);
+
+    sink.DisableSubscriptions();
+    proto::optimizer::TraceQueryRequest event;
+    EXPECT_EQ(SubscriptionEventSink::Subscription::WaitResult::kClosed,
+              subscription->WaitNext(&event, std::chrono::milliseconds(10)));
+    EXPECT_EQ(nullptr, sink.Subscribe("disabled"));
+    EXPECT_FALSE(sink.Send(MakeRequest("disabled")));
+
+    sink.EnableSubscriptions();
+    auto resumed = sink.Subscribe("resumed");
+    ASSERT_NE(nullptr, resumed);
+    EXPECT_TRUE(sink.Send(MakeRequest("resumed")));
+    EXPECT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              resumed->WaitNext(&event, std::chrono::milliseconds(10)));
+    EXPECT_EQ("resumed", event.trace_id());
+}
+
 TEST_F(SubscriptionEventSinkTest, TestStopWakesSubscriberAndIsIdempotent) {
     SubscriptionEventSink sink(MakeSinkConfig(1, 1));
     auto subscription = sink.Subscribe("optimizer");
