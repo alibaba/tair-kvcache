@@ -6,7 +6,7 @@
 
 namespace kv_cache_manager {
 
-struct RequestFact;
+struct FullRequestFact;
 
 struct MrcWindowPoint {
     // Relative percentage of this window's theoretical maximum hit count,
@@ -22,7 +22,7 @@ struct MrcWindowPoint {
 // Synchronization is provided by the owning InstanceState mutex.
 class MrcWindow {
 public:
-    void Record(const RequestFact &fact);
+    void Record(const FullRequestFact &fact);
     std::vector<MrcWindowPoint> Take();
     void Reset();
 

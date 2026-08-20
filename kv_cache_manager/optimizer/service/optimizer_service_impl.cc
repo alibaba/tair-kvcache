@@ -238,7 +238,7 @@ void OptimizerServiceImpl::RegisterInstance(RequestContext *request_context,
 
     if (ec == EC_OK) {
         // Clear stale Prometheus series before the next ReportInterval writes
-        // new labels (e.g. different capacity_gb tiers or age buckets).
+        // new labels (e.g. different capacity_gb tiers).
         if (metrics_reporter_) {
             metrics_reporter_->RemoveInstanceMetrics(instance_info.instance_id());
         }
@@ -246,9 +246,9 @@ void OptimizerServiceImpl::RegisterInstance(RequestContext *request_context,
             response->add_estimated_capacity_blocks(cap);
         }
         // The response contract keeps the fused wording: size_full_linear is
-        // the byte size of a block that also stores a Mamba checkpoint.
+        // the byte size of one Full block plus one Linear state.
         response->set_size_full(result.full_charge_bytes);
-        response->set_size_full_linear(result.full_charge_bytes + result.mamba_charge_bytes);
+        response->set_size_full_linear(result.full_charge_bytes + result.linear_charge_bytes);
     }
 }
 

@@ -8,7 +8,7 @@ class MrcWindowTest : public TESTBASE {};
 
 TEST_F(MrcWindowTest, TakesConfiguredCapacityCurve) {
     MrcWindow window;
-    RequestFact fact;
+    FullRequestFact fact;
     fact.hit_curve.push_back({1, 200});
 
     window.Record(fact);
@@ -31,11 +31,11 @@ TEST_F(MrcWindowTest, TakesConfiguredCapacityCurve) {
 
 TEST_F(MrcWindowTest, AppliesTargetsAfterAggregatingAllRequestsInWindow) {
     MrcWindow window;
-    RequestFact large_request;
+    FullRequestFact large_request;
     large_request.hit_curve.push_back({1, 100});
-    RequestFact high_capacity_request;
+    FullRequestFact high_capacity_request;
     high_capacity_request.hit_curve.push_back({1000, 1});
-    RequestFact cold_request;
+    FullRequestFact cold_request;
 
     window.Record(large_request);
     window.Record(high_capacity_request);
@@ -44,30 +44,30 @@ TEST_F(MrcWindowTest, AppliesTargetsAfterAggregatingAllRequestsInWindow) {
 
     const std::vector<uint64_t> expected_required_blocks = {61, 81, 91, 96, 100, 1000};
     ASSERT_EQ(expected_required_blocks.size(), curve.size());
-    const uint64_t total_theoretical_hits = HitCurveProjector::ProjectInfinite(large_request) +
-                                            HitCurveProjector::ProjectInfinite(high_capacity_request) +
-                                            HitCurveProjector::ProjectInfinite(cold_request);
+    const uint64_t total_theoretical_hits = HitCurveProjector::ProjectFullInfinite(large_request) +
+                                            HitCurveProjector::ProjectFullInfinite(high_capacity_request) +
+                                            HitCurveProjector::ProjectFullInfinite(cold_request);
     ASSERT_EQ(101, total_theoretical_hits);
 
     for (size_t i = 0; i < curve.size(); ++i) {
         EXPECT_EQ(expected_required_blocks[i], curve[i].required_blocks);
         const uint64_t target_hits = (total_theoretical_hits * curve[i].target_basis_points + 9999) / 10000;
         const uint64_t achieved_hits =
-            HitCurveProjector::ProjectBlocks(large_request, curve[i].required_blocks) +
-            HitCurveProjector::ProjectBlocks(high_capacity_request, curve[i].required_blocks);
+            HitCurveProjector::ProjectFullBlocks(large_request, curve[i].required_blocks) +
+            HitCurveProjector::ProjectFullBlocks(high_capacity_request, curve[i].required_blocks);
         EXPECT_GE(achieved_hits, target_hits);
 
         const uint64_t smaller_capacity = curve[i].required_blocks - 1;
         const uint64_t smaller_capacity_hits =
-            HitCurveProjector::ProjectBlocks(large_request, smaller_capacity) +
-            HitCurveProjector::ProjectBlocks(high_capacity_request, smaller_capacity);
+            HitCurveProjector::ProjectFullBlocks(large_request, smaller_capacity) +
+            HitCurveProjector::ProjectFullBlocks(high_capacity_request, smaller_capacity);
         EXPECT_LT(smaller_capacity_hits, target_hits);
     }
 }
 
 TEST_F(MrcWindowTest, UsesSparseRequiredCapacityPoints) {
     MrcWindow window;
-    RequestFact fact;
+    FullRequestFact fact;
     fact.hit_curve.push_back({1000000000, 1});
 
     window.Record(fact);
@@ -81,7 +81,7 @@ TEST_F(MrcWindowTest, UsesSparseRequiredCapacityPoints) {
 
 TEST_F(MrcWindowTest, TakeClearsReportingWindow) {
     MrcWindow window;
-    RequestFact fact;
+    FullRequestFact fact;
     fact.hit_curve.push_back({1, 1});
     window.Record(fact);
     window.Take();
