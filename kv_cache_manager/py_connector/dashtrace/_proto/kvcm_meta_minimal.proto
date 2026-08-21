@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.meta;
+
+enum ErrorCode {
+  UNSPECIFIED = 0;
+  OK = 1;
+}
+
+message Status {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message CommonResponseHeader {
+  Status status = 1;
+  string request_id = 2;
+  string tracer_result = 3;
+}
+
+message BoolMasksType { repeated bool values = 1; }
+
+message BlockMask {
+  oneof info {
+    int32 offset = 1;
+    BoolMasksType bool_masks = 2;
+  }
+}
+
+enum QueryType {
+  QT_UNSPECIFIED = 0;
+  QT_BATCH_GET = 1;
+  QT_PREFIX_MATCH = 2;
+}
+
+message GetCacheLocationRequest {
+  string trace_id = 1;
+  string instance_id = 2;
+  QueryType query_type = 3;
+  repeated int64 block_keys = 4;
+  repeated int64 token_ids = 5;
+  BlockMask block_mask = 6;
+  int32 sw_size = 7;
+  repeated string location_spec_names = 8;
+}
+
+message GetCacheLocationResponse { CommonResponseHeader header = 1; }
+
+service MetaService {
+  rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
+}

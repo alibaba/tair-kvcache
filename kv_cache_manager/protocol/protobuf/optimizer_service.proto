@@ -159,6 +159,8 @@ message TraceQueryRequest {
     // 时间会让 TTL 判定偏晚（纯 LRU 只看顺序，不受影响）。
     int64 timestamp_ns = 6;
     repeated string location_spec_names = 7; // 本次查询指定的 location spec；空表示未指定
+    string producer_id = 8;       // 可选：上游观测进程标识，用于定位丢失/重启边界
+    uint64 source_sequence = 9;   // 可选：producer 内单调递增序号
 }
 
 message TraceQueryResponse {
@@ -263,6 +265,29 @@ message KvcmConfigurationResponse {
     repeated KvcmInstanceConfiguration instances = 3;
 }
 
+// DashTrace 的轻量观测入口。KVCM 只负责按正式 instance block_size
+// 生成与 CacheManager 一致的 block keys，并按 batch 内顺序送入 Optimizer
+// 事件流；不会执行真实 CacheLocation 查询，也不影响推理请求。
+message TraceObservation {
+    uint64 sequence = 1;
+    string trace_id = 2;
+    string instance_id = 3;
+    repeated int64 token_ids = 4;
+    int64 timestamp_ns = 5;
+    repeated string location_spec_names = 6;
+}
+
+message TraceObservationBatchRequest {
+    string producer_id = 1;
+    repeated TraceObservation observations = 2;
+}
+
+message TraceObservationBatchResponse {
+    CommonResponseHeader header = 1;
+    uint64 accepted_count = 2;
+    uint64 last_accepted_sequence = 3;
+}
+
 service OptimizerService {
     // InstanceGroup 管理
     rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
@@ -286,5 +311,6 @@ service OptimizerService {
 // KVCM 再通过 response stream 单向写入缓存访问事件。
 service OptimizerEventStreamService {
     rpc GetConfiguration(KvcmConfigurationRequest) returns (KvcmConfigurationResponse);
+    rpc ReportTraceBatch(TraceObservationBatchRequest) returns (TraceObservationBatchResponse);
     rpc SubscribeEvents(OptimizerEventSubscriptionRequest) returns (stream TraceQueryRequest);
 }

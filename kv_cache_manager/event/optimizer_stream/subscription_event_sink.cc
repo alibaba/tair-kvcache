@@ -40,6 +40,27 @@ bool SubscriptionEventSink::Subscription::Enqueue(const proto::optimizer::TraceQ
     return true;
 }
 
+bool SubscriptionEventSink::Subscription::EnqueueBatch(
+    const std::vector<proto::optimizer::TraceQueryRequest> &events) {
+    if (events.empty()) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ || events.size() > queue_size_ - std::min(queue_.size(), queue_size_)) {
+            return false;
+        }
+        queue_.insert(queue_.end(), events.begin(), events.end());
+    }
+    cv_.notify_one();
+    return true;
+}
+
+std::size_t SubscriptionEventSink::Subscription::QueueSize() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queue_.size();
+}
+
 void SubscriptionEventSink::Subscription::Close() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -88,8 +109,15 @@ void SubscriptionEventSink::Unsubscribe(const std::shared_ptr<Subscription> &sub
 }
 
 bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
+    return SendBatch({event});
+}
+
+bool SubscriptionEventSink::SendBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events) {
+    if (events.empty()) {
+        return true;
+    }
     if (stopped_) {
-        dropped_.fetch_add(1);
+        dropped_.fetch_add(events.size());
         return false;
     }
 
@@ -99,16 +127,16 @@ bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &even
         subscriptions = subscriptions_;
     }
     if (subscriptions.empty()) {
-        dropped_.fetch_add(1);
+        dropped_.fetch_add(events.size());
         return false;
     }
 
     bool delivered = false;
     for (const auto &subscription : subscriptions) {
-        if (subscription->Enqueue(event)) {
+        if (subscription->EnqueueBatch(events)) {
             delivered = true;
         } else {
-            dropped_.fetch_add(1);
+            dropped_.fetch_add(events.size());
         }
     }
     return delivered;
@@ -134,6 +162,19 @@ std::size_t SubscriptionEventSink::DroppedCount() const { return dropped_.load()
 std::size_t SubscriptionEventSink::SubscriberCount() const {
     std::lock_guard<std::mutex> lock(subscriptions_mutex_);
     return subscriptions_.size();
+}
+
+std::size_t SubscriptionEventSink::QueuedCount() const {
+    std::vector<std::shared_ptr<Subscription>> subscriptions;
+    {
+        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        subscriptions = subscriptions_;
+    }
+    std::size_t queued = 0;
+    for (const auto &subscription : subscriptions) {
+        queued += subscription->QueueSize();
+    }
+    return queued;
 }
 
 } // namespace kv_cache_manager
