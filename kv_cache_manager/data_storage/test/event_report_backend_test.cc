@@ -246,6 +246,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.3:8080", {"mem"}));
+    const uint64_t registered_generation = backend.GetNodeGeneration("test_inst", "10.0.0.3:8080");
 
     int64_t initial_hb = 0;
     {
@@ -258,6 +259,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
 
     std::this_thread::sleep_for(20ms);
     ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {{"version", "er-0.18"}}));
+    ASSERT_EQ(registered_generation, backend.GetNodeGeneration("test_inst", "10.0.0.3:8080"));
     {
         auto &host_map = backend.instance_nodes_["test_inst"];
         auto it = host_map.find("10.0.0.3:8080");
@@ -268,6 +270,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     backend.SetNodeUnavailable("test_inst", "10.0.0.3:8080");
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.3:8080"));
     ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {}));
+    ASSERT_GT(backend.GetNodeGeneration("test_inst", "10.0.0.3:8080"), registered_generation);
     {
         auto &host_map = backend.instance_nodes_["test_inst"];
         auto it = host_map.find("10.0.0.3:8080");
@@ -281,6 +284,50 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     ASSERT_EQ(backend.instance_nodes_["test_inst"]["99.99.99.99:8080"]->last_system_status.at("x"), "y");
 
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, SteadyHeartbeatDoesNotRejectConcurrentLifecycleMutationLease) {
+    EventReportBackend backend(metrics_registry_);
+    const ReporterSnapshotKey reporter_key{"heartbeat-mutation-lease", "10.0.0.32:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    const uint64_t generation = backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
+
+    auto &node = *backend.instance_nodes_[reporter_key.instance_id][reporter_key.host_ip_port];
+    node.last_heartbeat_ms.store(0, std::memory_order_relaxed);
+
+    // Pin HEARTBEAT after it refreshes the timestamp but before it publishes
+    // system status. At that point it still holds its lifecycle lease, so the
+    // concurrent mutation below exercises the exact production overlap
+    // without relying on scheduler timing or sleeps.
+    std::unique_lock<std::mutex> status_gate(node.status_mutex);
+    auto heartbeat = std::async(std::launch::async, [&] {
+        return backend.OnHeartbeat(reporter_key.instance_id, reporter_key.host_ip_port, {{"load", "1"}});
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (node.last_heartbeat_ms.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool heartbeat_reached_status_gate = node.last_heartbeat_ms.load(std::memory_order_acquire) != 0;
+    if (!heartbeat_reached_status_gate) {
+        status_gate.unlock();
+        EXPECT_EQ(EC_OK, heartbeat.get());
+        FAIL() << "heartbeat did not reach the status publication gate";
+    }
+
+    // A steady heartbeat is a lifecycle reader, not an unfenced operation:
+    // lifecycle writers must still wait until its status publication ends.
+    const auto lifecycle_fence = backend.GetOrCreateLifecycleFence(reporter_key);
+    std::unique_lock<std::shared_mutex> lifecycle_writer(lifecycle_fence->mutex, std::try_to_lock);
+    EXPECT_FALSE(lifecycle_writer.owns_lock());
+
+    EventReportBackend::LifecycleMutationLease mutation_lease;
+    const ErrorCode mutation_ec = backend.AcquireLifecycleMutationLease(reporter_key, generation, mutation_lease);
+
+    mutation_lease.reset();
+    status_gate.unlock();
+    EXPECT_EQ(EC_OK, heartbeat.get());
+    EXPECT_EQ(EC_OK, mutation_ec);
 }
 
 TEST_F(EventReportBackendTest, DataMutationsDoNotRefreshHeartbeat) {

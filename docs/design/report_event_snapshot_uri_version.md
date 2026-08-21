@@ -384,8 +384,14 @@ snapshot replace + commit/abort
   lifecycle 写入；BatchMerge 的 block-create 与 targeted-location 两个 RMW 阶段之间同样释放并
   重新获取 lease；
 - mutation 在已经持有 metadata 锁时只做上述非阻塞的 per-reporter lifecycle lease 获取，
-  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转；不同 reporter 使用独立 fence，
-  不会因其他 host 的 HEARTBEAT/REGISTER 产生假失败；
+  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转。lifecycle fence 不存在、reporter
+  已注销、generation 不匹配，或 `try_lock` 与 REGISTER、HOST_DOWN、unavailable recovery 等
+  unique lifecycle writer 冲突时，返回 `NODE_NOT_REGISTERED`；不同 reporter 使用独立 fence；
+- 已注册且可用的 steady HEARTBEAT 不改变 registration/generation，因此持有 shared lifecycle
+  lease 完成心跳时间、状态与指标发布；同 generation 的 ADD/DELETE 可以同时取得 shared lease，
+  REGISTER、HOST_DOWN 和 unavailable recovery 等 lifecycle transition 则持有 unique lease；
+- 同一 reporter 的 HEARTBEAT 应保持 single-flight。曾评估在等待 status 锁前释放 node-table 锁，
+  但这会允许重叠 HEARTBEAT 乱序发布完整 status snapshot，因此未采用；
 - liveness unregister 的 generation 比较与节点删除在同一把锁内完成；
 - 显式 HOST_DOWN 的 generation 捕获与节点删除同样在同一把锁内完成，Heartbeat/REGISTER
   只能在线性化的 HOST_DOWN 之前或之后生效，不能在中间恢复后又被旧请求删除；

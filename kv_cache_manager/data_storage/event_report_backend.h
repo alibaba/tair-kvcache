@@ -188,6 +188,21 @@ private:
         MetricsTags metrics_tags;
     };
 
+    // Caller holds the reporter lifecycle lease and nodes_mutex_. Publishes
+    // and returns true only when HEARTBEAT does not change lifecycle. Success
+    // releases nodes_lock; failure leaves it held.
+    bool TryPublishSteadyHeartbeatLocked(const ReporterSnapshotKey &reporter_key,
+                                         const LifecycleFence &lifecycle_fence,
+                                         const std::map<std::string, std::string> &system_status,
+                                         std::unique_lock<std::shared_mutex> &nodes_lock);
+
+    // Caller holds the reporter lifecycle lease and nodes_mutex_. This method
+    // hands protection to status_mutex, releases the global node-table lock,
+    // and publishes status and metrics while the lifecycle lease pins NodeInfo.
+    void PublishHeartbeatStatus(NodeInfo &info,
+                                const std::map<std::string, std::string> &system_status,
+                                std::unique_lock<std::shared_mutex> &nodes_lock);
+
     void LivenessCheckerLoop();
     void ClearNodeGauges(const NodeInfo &info);
     static int64_t NowMillis() {

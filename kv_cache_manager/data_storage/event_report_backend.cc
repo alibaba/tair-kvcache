@@ -511,11 +511,29 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
     }
     const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
     const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
+
+    // Fast path: a steady HEARTBEAT does not change lifecycle state. Use a
+    // shared lease so same-generation ADD/DELETE can proceed; it still pins
+    // NodeInfo and excludes REGISTER/HOST_DOWN writers.
+    {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
+        if (!AcceptingReports()) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        std::unique_lock<std::shared_mutex> nodes_lock(nodes_mutex_);
+        if (TryPublishSteadyHeartbeatLocked(reporter_key, *lifecycle_fence, system_status, nodes_lock)) {
+            return EC_OK;
+        }
+    }
+
+    // Slow path: HEARTBEAT may create or recover a node and change lifecycle
+    // state. Drop the shared lease, acquire it exclusively, and revalidate
+    // because shared_mutex has no atomic lock upgrade.
     std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    std::unique_lock<std::shared_mutex> nodes_lock(nodes_mutex_);
     auto &host_map = instance_nodes_[instance_id];
     auto it = host_map.find(host_ip_port);
     if (it == host_map.end()) {
@@ -563,16 +581,47 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
     }
     lifecycle_fence->generation = node_generation_[instance_id][host_ip_port];
     lifecycle_fence->registered = true;
+    PublishHeartbeatStatus(info, system_status, nodes_lock);
+    return EC_OK;
+}
+
+bool EventReportBackend::TryPublishSteadyHeartbeatLocked(const ReporterSnapshotKey &reporter_key,
+                                                         const LifecycleFence &lifecycle_fence,
+                                                         const std::map<std::string, std::string> &system_status,
+                                                         std::unique_lock<std::shared_mutex> &nodes_lock) {
+    if (!lifecycle_fence.registered) {
+        return false;
+    }
+    const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
+    const auto generation_it = node_generation_.find(reporter_key.instance_id);
+    if (instance_it == instance_nodes_.end() || generation_it == node_generation_.end()) {
+        return false;
+    }
+    const auto node_it = instance_it->second.find(reporter_key.host_ip_port);
+    const auto host_generation_it = generation_it->second.find(reporter_key.host_ip_port);
+    if (node_it == instance_it->second.end() || !node_it->second || host_generation_it == generation_it->second.end() ||
+        lifecycle_fence.generation != host_generation_it->second ||
+        !node_it->second->available.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    auto &info = *node_it->second;
+    info.last_heartbeat_ms.store(NowMillis(), std::memory_order_release);
+    PublishHeartbeatStatus(info, system_status, nodes_lock);
+    return true;
+}
+
+void EventReportBackend::PublishHeartbeatStatus(NodeInfo &info,
+                                                const std::map<std::string, std::string> &system_status,
+                                                std::unique_lock<std::shared_mutex> &nodes_lock) {
     std::unique_lock<std::mutex> status_lock(info.status_mutex);
     const std::map<std::string, std::string> previous_system_status = info.last_system_status;
     info.last_system_status = system_status;
     const auto metrics_tags = info.metrics_tags;
 
-    // The per-reporter lifecycle writer keeps NodeInfo alive and prevents
-    // HOST_DOWN/REGISTER from crossing gauge publication. The status lock
-    // serializes SetNodeUnavailable's gauge reset. Release the global node
-    // table lock so metric work for one reporter does not block all others.
-    lock.unlock();
+    // Lock handoff: status_mutex now serializes this publication with
+    // SetNodeUnavailable's gauge reset, while the lifecycle lease pins
+    // NodeInfo. Release the global node-table lock before slower metric work.
+    nodes_lock.unlock();
     if (metrics_registry_) {
         const auto parse_gauge = [](const std::string &value, double &out) {
             if (value.empty()) {
@@ -607,7 +656,6 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
             }
         }
     }
-    return EC_OK;
 }
 
 void EventReportBackend::SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) {
@@ -1126,6 +1174,9 @@ ErrorCode EventReportBackend::AcquireLifecycleMutationLease(const ReporterSnapsh
     if (!lifecycle_fence) {
         return EC_NODE_NOT_REGISTERED;
     }
+    // ADD/DELETE mutate metadata, not reporter lifecycle. This shared lease
+    // pins and validates the current registration/generation while the
+    // metadata RMW is in progress.
     auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
     if (!lease->owns_lock()) {
         // Do not wait behind a lifecycle writer while the caller may already
@@ -1151,10 +1202,11 @@ ErrorCode EventReportBackend::CommitSnapshotVersionIfGeneration(const ReporterSn
         return EC_NODE_NOT_REGISTERED;
     }
     // Commit runs after the metadata RMW has released its shard locks, so it
-    // can safely wait for a transient HEARTBEAT writer. Using the mutation
+    // can safely wait for a transient lifecycle writer. Using the mutation
     // path's try-lock here would turn harmless lock contention into a failed
-    // snapshot. REGISTER/HOST_DOWN still serialize first and are rejected by
-    // the generation/registered check below.
+    // snapshot. REGISTER/HOST_DOWN and a lifecycle-changing HEARTBEAT still
+    // serialize first and are rejected by the generation/registered check
+    // below.
     std::shared_lock<std::shared_mutex> lifecycle_lease(lifecycle_fence->mutex);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
@@ -1197,9 +1249,9 @@ ErrorCode EventReportBackend::AcquireSnapshotCleanupLease(const ReporterSnapshot
         return EC_MISMATCH;
     }
     // Cleanup acquires this lease before taking metadata locks. It can block
-    // behind a short-lived HEARTBEAT/REGISTER writer without creating the
-    // lifecycle->metadata / metadata->lifecycle inversion that forces delta
-    // mutations to use try_lock.
+    // behind a short-lived REGISTER or lifecycle-changing HEARTBEAT writer
+    // without creating the lifecycle->metadata / metadata->lifecycle
+    // inversion that forces delta mutations to use try_lock.
     auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex);
     if (!AcceptingReports() || !lifecycle_fence->registered || lifecycle_fence->generation != expected_generation) {
         return EC_MISMATCH;
