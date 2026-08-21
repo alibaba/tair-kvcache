@@ -390,6 +390,8 @@ snapshot replace + commit/abort
 - 已注册且可用的 steady HEARTBEAT 不改变 registration/generation，因此持有 shared lifecycle
   lease 完成心跳时间、状态与指标发布；同 generation 的 ADD/DELETE 可以同时取得 shared lease，
   REGISTER、HOST_DOWN 和 unavailable recovery 等 lifecycle transition 则持有 unique lease；
+- 同一 reporter 的 HEARTBEAT 应保持 single-flight。曾评估在等待 status 锁前释放 node-table 锁，
+  但这会允许重叠 HEARTBEAT 乱序发布完整 status snapshot，因此未采用；
 - liveness unregister 的 generation 比较与节点删除在同一把锁内完成；
 - 显式 HOST_DOWN 的 generation 捕获与节点删除同样在同一把锁内完成，Heartbeat/REGISTER
   只能在线性化的 HOST_DOWN 之前或之后生效，不能在中间恢复后又被旧请求删除；
