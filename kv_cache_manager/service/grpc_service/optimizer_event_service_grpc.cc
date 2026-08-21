@@ -92,6 +92,14 @@ grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
         }
     }
 
+    if (!IsAvailable()) {
+        response->clear_instance_groups();
+        response->clear_instances();
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("KVCM is unavailable");
+        return grpc::Status::OK;
+    }
+
     status->set_code(proto::optimizer::OK);
     return grpc::Status::OK;
 }
