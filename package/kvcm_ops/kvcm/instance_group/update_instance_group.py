@@ -60,6 +60,8 @@ def main():
         current._extra_info = json.dumps(existing, ensure_ascii=False)
     if hasattr(args, "event_report_storage_candidates"):
         current._event_report_storage_candidates = args.event_report_storage_candidates
+    if hasattr(args, "revisit_interval_buckets"):
+        current._revisit_interval_buckets = args.revisit_interval_buckets
     current.check()
     current_version = current._version
     current._version += 1
