@@ -514,9 +514,14 @@ EC_INSTANCE_NOT_EXIST
 MRC 当前定义：
 
 ```text
-最近一个上报窗口内，分别达到理论无限容量命中 block 数
-60%、80%、90%、95%、99%、99.5% 所需的最小 LRU 容量，单位 byte
+窗口目标命中量 = 窗口理论无限容量最大可命中 block 数 × target_hit_rate_percent
+
+MRC = 最近一个上报窗口内，保留上述目标命中量所需的最小 LRU 容量，单位 byte
 ```
+
+`target_hit_rate_percent` 是相对于理论最大可命中量的比例，不是绝对请求命中率。例如窗口理论最大
+命中率为 68.6% 时，`target_hit_rate_percent=95` 对应的绝对命中率目标约为
+`68.6% × 95% = 65.17%`，而不是 95%。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。
 
 MRC 窗口使用 required blocks 的稀疏差分点，避免大 reuse distance 直接扩张出同等长度的数组。
 
@@ -568,7 +573,7 @@ PrometheusExporter::Expose
 | `trace_query_total` | 启动以来累计 |
 | `trace_query_hit_rate` | 启动以来累计 |
 | `trace_query_max_hit_rate` | 启动以来累计 |
-| `mrc{target_hit_rate_percent=...}` | 最近一个上报窗口的六个容量需求点 |
+| `mrc{target_hit_rate_percent=...}` | 最近一个上报窗口中，相对理论最大可命中量的六个容量需求点 |
 
 单次实时理论命中率继续由 Collector 上报为 `query_max_hit_rate`；MRC 只负责容量曲线。
 
