@@ -112,9 +112,6 @@ curl -g -vvv -X POST http://localhost:6492/api/listStorage \
 ```
 
 ## Create Instance Group
-
-Optional field `revisit_interval_buckets`: comma-separated, strictly increasing positive numbers in seconds (e.g. `"1,5,30,60"`), customizing bucket boundaries for instance revisit-interval statistics. If omitted or empty, the server-side default boundaries are used. In `updateInstanceGroup`, an omitted field keeps the existing server-side value; an empty string clears it back to the default.
-
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
   -H "Content-Type: application/json" \
@@ -162,7 +159,6 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
             }
         },
         "user_data": "test user data",
-        "revisit_interval_buckets": "1,5,30,60",
         "version": 1
     }
 }'
@@ -270,7 +266,6 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
             }
         },
         "user_data": "test user data",
-        "revisit_interval_buckets": "1,5,30,60",
         "version": 2
     },
     "current_version": 1
