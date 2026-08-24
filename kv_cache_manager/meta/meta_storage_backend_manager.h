@@ -17,6 +17,8 @@ namespace kv_cache_manager {
 
 class MetaStorageBackendConfig;
 class RequestContext;
+class MetaLocalBackend;
+struct TargetedLocationReadScratch;
 struct SingleLocationRmwScratch;
 
 // Backend orchestrator with two modes (auto-selected at Init):
@@ -59,6 +61,7 @@ public:
                                    const CacheLocationVector &locations,
                                    std::vector<ErrorCode> &out_results,
                                    SingleLocationRmwScratch &scratch) noexcept;
+    // Internal fast path; MetaIndexer has already validated aligned inputs and read indices.
     void UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext *request_context,
                                                        const KeyVector &keys,
                                                        const LocationIdRefVector &location_ids,
@@ -99,6 +102,15 @@ public:
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
+    void PrepareTargetedLocationReadScratch(size_t max_count, TargetedLocationReadScratch &scratch) noexcept;
+    // Internal targeted read; MetaIndexer owns request-shape validation.
+    void GetLocationsWithKeyStatusInto(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids,
+                                       LocationsPerKey &out_locations,
+                                       std::vector<std::vector<ErrorCode>> &out_results,
+                                       std::vector<ErrorCode> &out_key_error_codes,
+                                       TargetedLocationReadScratch &scratch) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
                                                                   const KeyVector &keys,
                                                                   const LocationIdsPerKey &location_ids,
@@ -171,6 +183,12 @@ public:
     bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
 private:
+    MetaLocalBackend *GetAuthoritativeLocalBackend() const noexcept;
+    MetaLocalBackend *GetSingleLocationRmwLocalBackend() const noexcept;
+    std::vector<ErrorCode> UpsertPrepared(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          CacheLocationMapVector &locations,
+                                          PropertyMapVector &properties) noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,

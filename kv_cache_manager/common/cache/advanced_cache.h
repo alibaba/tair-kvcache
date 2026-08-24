@@ -48,10 +48,13 @@ public: // types hidden from API client
     // release. The fields are intentionally generic storage owned by Cache;
     // callers only prepare and pass the object back to the same cache.
     struct BatchOperationScratch {
+        enum class PlanKind { kNone, kDirect, kGrouped };
         std::vector<uint32_t> hashes;
         std::vector<size_t> shard_offsets;
         std::vector<size_t> cursors;
         std::vector<size_t> ordered_indices;
+        std::vector<size_t> occupied_shards;
+        PlanKind plan_kind = PlanKind::kNone;
     };
 
 public: // types hidden from Cache implementation
@@ -368,6 +371,14 @@ public: // functions
                 Release(handles[i]);
             }
         }
+    }
+
+    // Releases handles from the matching scratch-aware lookup. Implementations
+    // may reuse the lookup shard plan; the default preserves existing behavior.
+    virtual void ReleaseBatchUsingLookupPlan(Handle *const *handles,
+                                             size_t count,
+                                             BatchOperationScratch *lookup_scratch) {
+        ReleaseBatchWithScratch(handles, count, lookup_scratch);
     }
 
     virtual void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch * /*scratch*/) {
@@ -722,6 +733,12 @@ public:
     }
 
     void ReleaseBatch(Handle *const *handles, size_t count) override { target_->ReleaseBatch(handles, count); }
+
+    void ReleaseBatchUsingLookupPlan(Handle *const *handles,
+                                     size_t count,
+                                     BatchOperationScratch *lookup_scratch) override {
+        target_->ReleaseBatchUsingLookupPlan(handles, count, lookup_scratch);
+    }
 
     void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override {
         target_->ReleaseBatchWithScratch(handles, count, scratch);

@@ -45,12 +45,12 @@ using PropertyMapVector = std::vector<PropertyMap>;
 // ---------- Location primitives ----------
 using LocationId = std::string;
 using LocationIdVector = std::vector<LocationId>;
-// Borrowed ids used by the pure-local one-location RMW fast path. The owner
+// Borrowed ids used by the concrete-local one-location RMW fast path. The owner
 // (normally a MetaSearcher task vector) must outlive the synchronous call.
 using LocationIdRefVector = std::vector<const LocationId *>;
 using LocationIdsPerKey = std::vector<LocationIdVector>;
 using LocationsPerKey = std::vector<CacheLocationVector>;
-// Non-owning immutable values used only by the synchronous pure-local RMW
+// Non-owning immutable values used only by the synchronous concrete-local RMW
 // path. The retained cache handles and metadata shard locks keep the backing
 // MetaMemCacheItem (and its location map) alive until the matching write or
 // explicit handle release. These views must never escape that interval.

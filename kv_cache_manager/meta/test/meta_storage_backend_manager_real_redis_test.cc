@@ -7,9 +7,12 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/meta/types.h"
 
@@ -414,6 +417,112 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     Cleanup(mgr, k7);
     ASSERT_EQ(EC_OK, mgr.Close());
 }
+
+TEST_F(MetaStorageBackendManagerRealRedisTest, TestAsyncCachedSingleLocationRmw) {
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_async_single_rmw", MakeAsyncDualConfig()));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+    ASSERT_TRUE(mgr.SupportsSingleLocationRmw());
+
+    const KeyVector keys = {80401, 80402};
+    Cleanup(mgr, keys);
+    auto seed = MakeBatch(KeyVector{keys[0]});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), seed));
+
+    const LocationId existing_id = "loc_80401";
+    const LocationId new_id = "loc_80402";
+    const LocationIdRefVector location_ids = {&existing_id, &new_id};
+    SingleLocationRmwScratch scratch;
+    mgr.PrepareSingleLocationRmwScratch(keys.size(), scratch);
+    CacheLocationViewVector current_locations;
+    std::vector<ErrorCode> key_ecs;
+    std::vector<ErrorCode> results;
+    mgr.GetSingleLocationViewsWithKeyStatusInto(request_context_.get(),
+                                                 keys,
+                                                 location_ids,
+                                                 current_locations,
+                                                 key_ecs,
+                                                 results,
+                                                 scratch);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), results);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), key_ecs);
+    ASSERT_TRUE(scratch.HasRetainedHandles());
+
+    CacheLocationVector replacements = {MakeLocation(existing_id, "uri_updated"),
+                                        MakeLocation(new_id, "uri_new")};
+    mgr.UpsertSingleLocationsUsingRetainedHandlesInto(request_context_.get(),
+                                                       keys,
+                                                       location_ids,
+                                                       replacements,
+                                                       {0, 1},
+                                                       results,
+                                                       scratch);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), results);
+    ASSERT_FALSE(scratch.HasRetainedHandles());
+
+    LocationsPerKey local_locations;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_OK}}),
+              mgr.GetLocations(request_context_.get(), keys, {{existing_id}, {new_id}}, local_locations));
+    ASSERT_EQ("uri_updated", local_locations[0][0]->location_specs().front().uri());
+    ASSERT_EQ("uri_new", local_locations[1][0]->location_specs().front().uri());
+
+    ASSERT_TRUE(mgr.Sync(keys));
+    LocationsPerKey persistent_locations;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_OK}}),
+              mgr.persistent_backend_->GetLocations(
+                  request_context_.get(), keys, {{existing_id}, {new_id}}, persistent_locations));
+    ASSERT_EQ("uri_updated", persistent_locations[0][0]->location_specs().front().uri());
+    ASSERT_EQ("uri_new", persistent_locations[1][0]->location_specs().front().uri());
+
+    Cleanup(mgr, keys);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerRealRedisTest, TestAsyncCachedIndexerSingleLocationRmw) {
+    auto indexer_config =
+        std::make_shared<MetaIndexerConfig>(100, 8, 64, MakeAsyncDualConfig());
+    MetaIndexer indexer;
+    ASSERT_EQ(EC_OK, indexer.Init("inst_async_indexer_single_rmw", indexer_config));
+    for (int i = 0; i < 200 && !indexer.SupportsSingleLocationRmw(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(indexer.SupportsSingleLocationRmw());
+
+    const KeyVector seed_keys = {80501};
+    CacheLocationMapVector seed_locations(1);
+    seed_locations[0].emplace("target", MakeLocation("target", "uri_old"));
+    PropertyMapVector seed_properties(1);
+    ASSERT_EQ(EC_OK, indexer.Put(request_context_.get(), seed_keys, seed_locations, seed_properties).ec);
+
+    const KeyVector keys = {80501, 80502};
+    const LocationId target_id = "target";
+    const LocationIdRefVector location_ids = {&target_id, &target_id};
+    const auto rmw_result = indexer.ReadModifyWriteSingleTargetLocations(
+        request_context_.get(),
+        keys,
+        location_ids,
+        [](ErrorCode get_ec,
+           const LocationId &location_id,
+           size_t key_index,
+           const CacheLocation *existing_location,
+           CacheLocationConstPtr &out_location) {
+            EXPECT_EQ(key_index == 0 ? EC_OK : EC_NOENT, get_ec);
+            EXPECT_EQ(key_index == 0, existing_location != nullptr);
+            out_location = MakeLocation(location_id, key_index == 0 ? "uri_updated" : "uri_new");
+            return ModifierResult{MA_OK, EC_OK};
+        });
+    ASSERT_EQ(EC_OK, rmw_result.ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), rmw_result.error_codes);
+
+    CacheLocationMapVector stored_locations;
+    ASSERT_EQ(EC_OK, indexer.GetLocations(request_context_.get(), keys, stored_locations).ec);
+    ASSERT_EQ("uri_updated", stored_locations[0].at(target_id)->location_specs().front().uri());
+    ASSERT_EQ("uri_new", stored_locations[1].at(target_id)->location_specs().front().uri());
+    ASSERT_TRUE(indexer.Sync(keys));
+    ASSERT_EQ(EC_OK, indexer.Delete(request_context_.get(), keys).ec);
+}
+
 
 // --- Dual-backend: Put + GetLocations round-trip against real redis ----------
 

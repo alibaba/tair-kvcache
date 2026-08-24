@@ -81,7 +81,7 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
-    // Allocation-light one-location upsert used by pure-local targeted RMW.
+    // Allocation-light one-location upsert used by local targeted RMW.
     // The default adapter preserves backend semantics; local memory overrides
     // it to avoid constructing one temporary unordered_map per key.
     virtual std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,

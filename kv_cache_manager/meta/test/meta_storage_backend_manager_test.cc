@@ -10,6 +10,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
@@ -563,6 +564,12 @@ TEST_F(MetaStorageBackendManagerTest, TestConcurrentLocationValueReadsAreLocalOn
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
     EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
     EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+    mgr.persistent_backend_ = std::make_unique<MetaAsyncRedisBackend>();
+    EXPECT_TRUE(mgr.SupportsConcurrentLocationValueReads());
+    EXPECT_TRUE(mgr.SupportsSingleLocationRmw());
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_FALSE(mgr.SupportsSingleLocationRmw());
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
 
     mgr.cache_backend_.reset();
     mgr.persistent_backend_ = std::make_unique<MalformedMetaCacheBackend>();

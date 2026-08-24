@@ -15,6 +15,7 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -521,6 +522,29 @@ int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
     return backfilled_count;
 }
 
+MetaLocalBackend *MetaStorageBackendManager::GetAuthoritativeLocalBackend() const noexcept {
+    if (!cache_backend_) {
+        if (!persistent_backend_ || typeid(*persistent_backend_) != typeid(MetaLocalBackend)) {
+            return nullptr;
+        }
+        return static_cast<MetaLocalBackend *>(persistent_backend_.get());
+    }
+    if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning ||
+        typeid(*cache_backend_) != typeid(MetaLocalBackend)) {
+        return nullptr;
+    }
+    return static_cast<MetaLocalBackend *>(cache_backend_.get());
+}
+
+MetaLocalBackend *MetaStorageBackendManager::GetSingleLocationRmwLocalBackend() const noexcept {
+    MetaLocalBackend *local_backend = GetAuthoritativeLocalBackend();
+    if (!local_backend ||
+        (cache_backend_ && (!persistent_backend_ || typeid(*persistent_backend_) != typeid(MetaAsyncRedisBackend)))) {
+        return nullptr;
+    }
+    return local_backend;
+}
+
 std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_context, BatchMetaData &batch) noexcept {
     const KeyVector &keys = batch.batch_keys;
     batch.EnsureLocationsAndPropertiesResized();
@@ -552,16 +576,21 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
                                                          BatchMetaData &batch) noexcept {
     const KeyVector &keys = batch.batch_keys;
     batch.EnsureLocationsAndPropertiesResized();
-    CacheLocationMapVector &locations = batch.batch_locations;
-    PropertyMapVector &properties = batch.batch_properties;
 
     // Upsert may touch only a subset of fields, so Recover-time hydration
     // is needed to avoid overwriting unmentioned fields with empty values.
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        if (!EnsureKeyInCache(request_context, keys)) {
-            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-        }
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover &&
+        !EnsureKeyInCache(request_context, keys)) {
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
+    return UpsertPrepared(request_context, keys, batch.batch_locations, batch.batch_properties);
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::UpsertPrepared(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    CacheLocationMapVector &locations,
+    PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> persistent_results =
         persistent_backend_->Upsert(request_context, keys, locations, properties);
     if (persistent_results.size() != keys.size()) {
@@ -587,38 +616,58 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     return results;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::UpsertSingleLocations(RequestContext *request_context,
-                                                                        const KeyVector &keys,
-                                                                        const LocationIdRefVector &location_ids,
-                                                                        const CacheLocationVector &locations) noexcept {
-    if (!SupportsSingleLocationRmw()) {
-        KVCM_LOG_ERROR("single-location upsert requires a pure local metadata backend");
-        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
-    }
-    return persistent_backend_->UpsertSingleLocations(request_context, keys, location_ids, locations);
+std::vector<ErrorCode> MetaStorageBackendManager::UpsertSingleLocations(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdRefVector &location_ids,
+    const CacheLocationVector &locations) noexcept {
+    SingleLocationRmwScratch scratch;
+    PrepareSingleLocationRmwScratch(keys.size(), scratch);
+    std::vector<ErrorCode> results;
+    UpsertSingleLocationsInto(request_context, keys, location_ids, locations, results, scratch);
+    return results;
 }
 
-void MetaStorageBackendManager::PrepareSingleLocationRmwScratch(size_t max_count,
-                                                                SingleLocationRmwScratch &scratch) noexcept {
-    if (!SupportsSingleLocationRmw()) {
-        return;
+void MetaStorageBackendManager::PrepareSingleLocationRmwScratch(
+    size_t max_count, SingleLocationRmwScratch &scratch) noexcept {
+    if (auto *local_backend = GetSingleLocationRmwLocalBackend()) {
+        local_backend->PrepareSingleLocationRmwScratch(max_count, scratch);
     }
-    static_cast<MetaLocalBackend *>(persistent_backend_.get())->PrepareSingleLocationRmwScratch(max_count, scratch);
 }
 
-void MetaStorageBackendManager::UpsertSingleLocationsInto(RequestContext *request_context,
-                                                          const KeyVector &keys,
-                                                          const LocationIdRefVector &location_ids,
-                                                          const CacheLocationVector &locations,
-                                                          std::vector<ErrorCode> &out_results,
-                                                          SingleLocationRmwScratch &scratch) noexcept {
-    if (!SupportsSingleLocationRmw()) {
-        KVCM_LOG_ERROR("single-location upsert requires a pure local metadata backend");
+void MetaStorageBackendManager::UpsertSingleLocationsInto(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdRefVector &location_ids,
+    const CacheLocationVector &locations,
+    std::vector<ErrorCode> &out_results,
+    SingleLocationRmwScratch &scratch) noexcept {
+    MetaLocalBackend *local_backend = GetSingleLocationRmwLocalBackend();
+    if (!local_backend) {
+        KVCM_LOG_ERROR("single-location upsert requires an authoritative local metadata backend");
         out_results.assign(keys.size(), EC_UNIMPLEMENTED);
         return;
     }
-    static_cast<MetaLocalBackend *>(persistent_backend_.get())
-        ->UpsertSingleLocationsInto(request_context, keys, location_ids, locations, out_results, scratch);
+    if (!cache_backend_) {
+        local_backend->UpsertSingleLocationsInto(
+            request_context, keys, location_ids, locations, out_results, scratch);
+        return;
+    }
+    if (keys.size() != location_ids.size() || keys.size() != locations.size()) {
+        out_results.assign(keys.size(), EC_BADARGS);
+        return;
+    }
+    scratch.write_locations.resize(keys.size());
+    scratch.write_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        scratch.write_locations[i].clear();
+        if (location_ids[i] == nullptr || !locations[i] || locations[i]->id() != *location_ids[i]) {
+            out_results.assign(keys.size(), EC_BADARGS);
+            return;
+        }
+        scratch.write_locations[i].emplace(*location_ids[i], locations[i]);
+    }
+    out_results = UpsertPrepared(request_context, keys, scratch.write_locations, scratch.write_properties);
 }
 
 void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
@@ -629,15 +678,29 @@ void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
     const std::vector<size_t> &read_indices,
     std::vector<ErrorCode> &out_results,
     SingleLocationRmwScratch &scratch) noexcept {
-    if (!SupportsSingleLocationRmw()) {
-        KVCM_LOG_ERROR("retained-handle single-location upsert requires a pure local metadata backend");
+    MetaLocalBackend *local_backend = GetSingleLocationRmwLocalBackend();
+    if (!local_backend) {
+        KVCM_LOG_ERROR("retained-handle single-location upsert requires an authoritative local metadata backend");
         out_results.assign(keys.size(), EC_UNIMPLEMENTED);
         scratch.ReleaseRetainedHandles();
         return;
     }
-    static_cast<MetaLocalBackend *>(persistent_backend_.get())
-        ->UpsertSingleLocationsUsingRetainedHandlesInto(
+    if (!cache_backend_) {
+        local_backend->UpsertSingleLocationsUsingRetainedHandlesInto(
             request_context, keys, location_ids, locations, read_indices, out_results, scratch);
+        return;
+    }
+
+    // Borrowed views are dead after modifier evaluation. Release the matching
+    // lookup plan before persistent enqueue can wait for queue capacity.
+    scratch.ReleaseRetainedHandles();
+    scratch.write_locations.resize(keys.size());
+    scratch.write_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        scratch.write_locations[i].clear();
+        scratch.write_locations[i].emplace(*location_ids[i], std::move(locations[i]));
+    }
+    out_results = UpsertPrepared(request_context, keys, scratch.write_locations, scratch.write_properties);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -1198,6 +1261,35 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
     return results;
 }
 
+void MetaStorageBackendManager::PrepareTargetedLocationReadScratch(
+    size_t max_count, TargetedLocationReadScratch &scratch) noexcept {
+    if (auto *local_backend = GetAuthoritativeLocalBackend()) {
+        local_backend->PrepareTargetedLocationReadScratch(max_count, scratch);
+    }
+}
+
+void MetaStorageBackendManager::GetLocationsWithKeyStatusInto(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdsPerKey &location_ids,
+    LocationsPerKey &out_locations,
+    std::vector<std::vector<ErrorCode>> &out_results,
+    std::vector<ErrorCode> &out_key_error_codes,
+    TargetedLocationReadScratch &scratch) noexcept {
+    if (auto *local_backend = GetAuthoritativeLocalBackend()) {
+        local_backend->GetLocationsWithKeyStatusInto(request_context,
+                                                     keys,
+                                                     location_ids,
+                                                     out_locations,
+                                                     out_results,
+                                                     out_key_error_codes,
+                                                     scratch);
+        return;
+    }
+    out_results = GetLocationsWithKeyStatus(
+        request_context, keys, location_ids, out_locations, out_key_error_codes);
+}
+
 std::vector<std::vector<ErrorCode>>
 MetaStorageBackendManager::GetLocationsWithKeyStatus(RequestContext *request_context,
                                                      const KeyVector &keys,
@@ -1304,58 +1396,61 @@ MetaStorageBackendManager::GetSingleLocationsWithKeyStatus(RequestContext *reque
                                                            const LocationIdRefVector &location_ids,
                                                            CacheLocationVector &out_locations,
                                                            std::vector<ErrorCode> &out_key_error_codes) noexcept {
-    if (!SupportsSingleLocationRmw()) {
+    MetaLocalBackend *local_backend = GetSingleLocationRmwLocalBackend();
+    if (!local_backend) {
         out_locations.assign(keys.size(), CacheLocationConstPtr{});
         out_key_error_codes.assign(keys.size(), EC_UNIMPLEMENTED);
         return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
     }
-    return persistent_backend_->GetSingleLocationsWithKeyStatus(
+    return local_backend->GetSingleLocationsWithKeyStatus(
         request_context, keys, location_ids, out_locations, out_key_error_codes);
 }
 
-void MetaStorageBackendManager::GetSingleLocationsWithKeyStatusInto(RequestContext *request_context,
-                                                                    const KeyVector &keys,
-                                                                    const LocationIdRefVector &location_ids,
-                                                                    CacheLocationVector &out_locations,
-                                                                    std::vector<ErrorCode> &out_key_error_codes,
-                                                                    std::vector<ErrorCode> &out_results,
-                                                                    SingleLocationRmwScratch &scratch,
-                                                                    bool retain_handles) noexcept {
-    if (!SupportsSingleLocationRmw()) {
+void MetaStorageBackendManager::GetSingleLocationsWithKeyStatusInto(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdRefVector &location_ids,
+    CacheLocationVector &out_locations,
+    std::vector<ErrorCode> &out_key_error_codes,
+    std::vector<ErrorCode> &out_results,
+    SingleLocationRmwScratch &scratch,
+    bool retain_handles) noexcept {
+    MetaLocalBackend *local_backend = GetSingleLocationRmwLocalBackend();
+    if (!local_backend) {
         out_locations.assign(keys.size(), CacheLocationConstPtr{});
         out_key_error_codes.assign(keys.size(), EC_UNIMPLEMENTED);
         out_results.assign(keys.size(), EC_UNIMPLEMENTED);
         scratch.ReleaseRetainedHandles();
         return;
     }
-    static_cast<MetaLocalBackend *>(persistent_backend_.get())
-        ->GetSingleLocationsWithKeyStatusInto(request_context,
-                                              keys,
-                                              location_ids,
-                                              out_locations,
-                                              out_key_error_codes,
-                                              out_results,
-                                              scratch,
-                                              retain_handles);
+    local_backend->GetSingleLocationsWithKeyStatusInto(request_context,
+                                                       keys,
+                                                       location_ids,
+                                                       out_locations,
+                                                       out_key_error_codes,
+                                                       out_results,
+                                                       scratch,
+                                                       retain_handles);
 }
 
-void MetaStorageBackendManager::GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,
-                                                                        const KeyVector &keys,
-                                                                        const LocationIdRefVector &location_ids,
-                                                                        CacheLocationViewVector &out_locations,
-                                                                        std::vector<ErrorCode> &out_key_error_codes,
-                                                                        std::vector<ErrorCode> &out_results,
-                                                                        SingleLocationRmwScratch &scratch) noexcept {
-    if (!SupportsSingleLocationRmw()) {
+void MetaStorageBackendManager::GetSingleLocationViewsWithKeyStatusInto(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdRefVector &location_ids,
+    CacheLocationViewVector &out_locations,
+    std::vector<ErrorCode> &out_key_error_codes,
+    std::vector<ErrorCode> &out_results,
+    SingleLocationRmwScratch &scratch) noexcept {
+    MetaLocalBackend *local_backend = GetSingleLocationRmwLocalBackend();
+    if (!local_backend) {
         out_locations.assign(keys.size(), nullptr);
         out_key_error_codes.assign(keys.size(), EC_UNIMPLEMENTED);
         out_results.assign(keys.size(), EC_UNIMPLEMENTED);
         scratch.ReleaseRetainedHandles();
         return;
     }
-    static_cast<MetaLocalBackend *>(persistent_backend_.get())
-        ->GetSingleLocationViewsWithKeyStatusInto(
-            request_context, keys, location_ids, out_locations, out_key_error_codes, out_results, scratch);
+    local_backend->GetSingleLocationViewsWithKeyStatusInto(
+        request_context, keys, location_ids, out_locations, out_key_error_codes, out_results, scratch);
 }
 
 bool MetaStorageBackendManager::SupportsConcurrentLocationValueReads() const noexcept {
@@ -1367,12 +1462,10 @@ bool MetaStorageBackendManager::SupportsConcurrentLocationValueReads() const noe
 }
 
 bool MetaStorageBackendManager::SupportsSingleLocationRmw() const noexcept {
-    // The allocation-light operations bypass the older generic virtual
-    // methods. Restrict the fast path to the concrete production backend so a
-    // decorator/subclass that overrides those generic methods for additional
-    // semantics (fault injection, auditing, admission, etc.) is not bypassed.
-    // Such backends retain correctness through the generic targeted RMW.
-    return !cache_backend_ && persistent_backend_ && typeid(*persistent_backend_) == typeid(MetaLocalBackend);
+    // Concrete-only capability prevents decorators from being bypassed.
+    // Cached mode additionally requires the production async Redis writer so
+    // the flat adapter preserves persistent-first/local-second semantics.
+    return GetSingleLocationRmwLocalBackend() != nullptr;
 }
 
 bool MetaStorageBackendManager::GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept {

@@ -205,6 +205,7 @@ struct LocationRmwScratch {
 
     void Prepare(size_t count) {
         locations.resize(count);
+        get_ecs.resize(count);
         key_get_ecs.reserve(count);
         upsert_batch.batch_indexs.reserve(count);
         upsert_batch.batch_keys.reserve(count);
@@ -221,8 +222,10 @@ struct LocationRmwScratch {
             values.clear();
         }
         key_get_ecs.clear();
-        std::vector<ErrorCode>().swap(refresh_results);
-        std::vector<std::vector<ErrorCode>>().swap(get_ecs);
+        refresh_results.clear();
+        for (auto &errors : get_ecs) {
+            errors.clear();
+        }
         ClearBatchPayload(upsert_batch);
         ClearBatchPayload(delete_batch);
         put_global_indices.clear();
@@ -444,6 +447,31 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     return result;
 }
 
+void MetaIndexer::ResetRmwUpsertMetrics(ServiceMetricsCollector *metrics_collector) const noexcept {
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics_collector, meta_searcher, index_serialize_time_us, 0);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        metrics_collector, meta_indexer, async_enqueue_timeout_key_count, 0);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics_collector, meta_indexer, async_enqueue_time_us, 0);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(metrics_collector, meta_indexer, cache_backend_upsert_time_us, 0);
+}
+
+void MetaIndexer::AccumulateRmwUpsertMetrics(ServiceMetricsCollector *metrics_collector,
+                                              RmwStats &stats) const noexcept {
+    int64_t value = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(metrics_collector, meta_searcher, index_serialize_time_us, value);
+    stats.index_serialize_time_us += value;
+    value = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(
+        metrics_collector, meta_indexer, async_enqueue_timeout_key_count, value);
+    stats.async_enqueue_timeout_key_count += value;
+    value = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(metrics_collector, meta_indexer, async_enqueue_time_us, value);
+    stats.async_enqueue_time_us += value;
+    value = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(metrics_collector, meta_indexer, cache_backend_upsert_time_us, value);
+    stats.cache_backend_upsert_time_us += value;
+}
+
 std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &trace_id,
                                                           RequestContext *request_context,
                                                           BatchMetaData &upsert_batch,
@@ -509,13 +537,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
         }
     }
     if (upsert_ecs.empty() || !existing_update_positions.empty()) {
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_searcher, index_serialize_time_us, 0);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, 0);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, 0);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, 0);
+        ResetRmwUpsertMetrics(service_metrics_collector);
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch);
         stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
@@ -539,18 +561,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                 upsert_ecs[existing_update_positions[i]] = backend_ecs[i];
             }
         }
-        int64_t v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, v);
-        stats.index_serialize_time_us += v;
-        v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, v);
-        stats.async_enqueue_timeout_key_count += v;
-        v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, v);
-        stats.async_enqueue_time_us += v;
-        v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, v);
-        stats.cache_backend_upsert_time_us += v;
+        AccumulateRmwUpsertMetrics(service_metrics_collector, stats);
     }
 
     const int32_t error_count =
@@ -835,6 +846,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     std::vector<bool> key_level_failures(keys.size(), false);
     RmwStats stats;
     LocationRmwScratch scratch;
+    const size_t max_batch_size =
+        std::max_element(batches.begin(), batches.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.batch_keys.size() < rhs.batch_keys.size();
+        })->batch_keys.size();
+    TargetedLocationReadScratch targeted_read_scratch;
+    backend_manager_->PrepareTargetedLocationReadScratch(max_batch_size, targeted_read_scratch);
     for (auto &batch : batches) {
         scratch.Prepare(batch.batch_keys.size());
         ScratchResetGuard<LocationRmwScratch> reset_guard(scratch);
@@ -855,11 +872,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             refresh_results = backend_manager_->RefreshCacheFromPersistent(request_context, batch_keys);
         }
         if (track_created_key_count) {
-            scratch.get_ecs = backend_manager_->GetLocationsWithKeyStatus(request_context,
-                                                                           batch_keys,
-                                                                           batch.batch_location_ids,
-                                                                           batch_locations_per_key,
-                                                                           batch_key_get_ecs);
+            backend_manager_->GetLocationsWithKeyStatusInto(request_context,
+                                                            batch_keys,
+                                                            batch.batch_location_ids,
+                                                            batch_locations_per_key,
+                                                            scratch.get_ecs,
+                                                            batch_key_get_ecs,
+                                                            targeted_read_scratch);
         } else {
             scratch.get_ecs = backend_manager_->GetLocations(
                 request_context, batch_keys, batch.batch_location_ids, batch_locations_per_key);
@@ -1092,35 +1111,6 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     if (keys.empty()) {
         return SingleLocationResult(EC_OK);
     }
-    if (keys.size() != location_ids.size() || !modifier ||
-        std::any_of(location_ids.begin(), location_ids.end(), [](const LocationId *id) {
-            return id == nullptr || id->empty();
-        })) {
-        PREFIX_INDEXER_LOG(
-            ERROR, "single target RMW invalid inputs, keys[%lu], location ids[%lu]", keys.size(), location_ids.size());
-        return SingleLocationResult(EC_BADARGS);
-    }
-    bool has_duplicate_keys = false;
-    if (std::is_sorted(keys.begin(), keys.end())) {
-        has_duplicate_keys = std::adjacent_find(keys.begin(), keys.end()) != keys.end();
-    } else {
-        std::unordered_set<KeyType> seen_keys;
-        seen_keys.reserve(keys.size());
-        for (const KeyType key : keys) {
-            if (!seen_keys.insert(key).second) {
-                has_duplicate_keys = true;
-                break;
-            }
-        }
-    }
-    if (has_duplicate_keys) {
-        PREFIX_INDEXER_LOG(ERROR, "single target RMW requires unique keys");
-        return SingleLocationResult(EC_BADARGS);
-    }
-    if (!SupportsSingleLocationRmw()) {
-        PREFIX_INDEXER_LOG(ERROR, "single target RMW requires a pure local metadata backend");
-        return SingleLocationResult(EC_UNIMPLEMENTED);
-    }
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
@@ -1168,8 +1158,8 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     upsert_read_indices.reserve(max_batch_size);
 
     struct DeferredLocationRelease {
-        CacheLocationVector &locations;
-        ~DeferredLocationRelease() { locations.clear(); }
+        SingleLocationRmwScratch &scratch;
+        ~DeferredLocationRelease() { scratch.ClearWritePayload(); }
     };
 
     for (const auto &batch : batches) {
@@ -1194,11 +1184,11 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         // Construct this guard before the shard lock. Reverse destruction
         // releases the lock first, then drops replaced CacheLocations and
         // their URI strings outside the metadata critical section.
-        DeferredLocationRelease deferred_location_release{backend_scratch.retired_locations};
+        DeferredLocationRelease deferred_location_release{backend_scratch};
         ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us);
 
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        backend_manager_->GetSingleLocationViewsWithKeyStatusInto(nullptr,
+        backend_manager_->GetSingleLocationViewsWithKeyStatusInto(request_context,
                                                                   batch_keys,
                                                                   batch_location_ids,
                                                                   batch_existing_locations,
@@ -1297,11 +1287,12 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
 
         const bool capacity_exceeded = new_key_count + GetKeyCount() > max_key_count_;
         if (!capacity_exceeded) {
+            ResetRmwUpsertMetrics(service_metrics_collector);
             const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
             // The read result is dead after modifier evaluation. Reuse its
             // capacity for writer status instead of allocating another
             // request-sized vector under the metadata lock.
-            backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(nullptr,
+            backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(request_context,
                                                                             upsert_keys,
                                                                             upsert_location_ids,
                                                                             upsert_locations,
@@ -1309,6 +1300,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                                                                             batch_get_ecs,
                                                                             backend_scratch);
             stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
+            AccumulateRmwUpsertMetrics(service_metrics_collector, stats);
         } else {
             PREFIX_INDEXER_LOG(ERROR,
                                "single target RMW put keys count[%lu] + current key count[%lu] > max key count[%lu]",
@@ -1349,10 +1341,11 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
             upsert_read_indices.resize(existing_count);
 
             if (existing_count > 0) {
+                ResetRmwUpsertMetrics(service_metrics_collector);
                 const int64_t begin_upsert = TimestampUtil::GetCurrentTimeUs();
                 // The get result vector is dead after modifier evaluation and
                 // already has sufficient capacity, so reuse it for writes.
-                backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(nullptr,
+                backend_manager_->UpsertSingleLocationsUsingRetainedHandlesInto(request_context,
                                                                                 upsert_keys,
                                                                                 upsert_location_ids,
                                                                                 upsert_locations,
@@ -1360,6 +1353,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                                                                                 batch_get_ecs,
                                                                                 backend_scratch);
                 stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
+                AccumulateRmwUpsertMetrics(service_metrics_collector, stats);
                 if (batch_get_ecs.size() != existing_count) {
                     batch_get_ecs.assign(existing_count, EC_MISMATCH);
                 }

@@ -874,9 +874,11 @@ void LRUCache::PrepareBatchOperationScratch(size_t max_count, BatchOperationScra
     }
     scratch->hashes.reserve(max_count);
     scratch->ordered_indices.reserve(max_count);
-    const size_t shard_slots = GetNumShards() + 1;
+    const size_t shard_count = GetNumShards();
+    const size_t shard_slots = shard_count + 1;
     scratch->shard_offsets.reserve(shard_slots);
     scratch->cursors.reserve(shard_slots);
+    scratch->occupied_shards.reserve(std::min(max_count, shard_count));
 }
 
 void LRUCache::LookupBatchWithScratch(const std::string_view *keys,
@@ -894,16 +896,57 @@ void LRUCache::LookupBatchWithScratch(const std::string_view *keys,
 
     const size_t shard_count = GetNumShards();
     scratch->hashes.resize(count);
-    scratch->shard_offsets.assign(shard_count + 1, 0);
     auto &hashes = scratch->hashes;
-    auto &shard_offsets = scratch->shard_offsets;
+
     for (size_t i = 0; i < count; ++i) {
         hashes[i] = LRUCacheShard::ComputeHash(keys[i], hash_seed_);
+    }
+
+    // Sparse batches avoid dense shard scans, while a small evenly spread shard sample keeps
+    // hotspot/repeated-key batches on the grouped plan to avoid lock churn.
+    constexpr size_t kDirectPlanShardRatio = 16;
+    constexpr size_t kShardSampleSize = 64;
+    bool use_direct_plan = false;
+    if (count <= shard_count / kDirectPlanShardRatio) {
+        size_t sampled_shards[kShardSampleSize];
+        const size_t sample_count = std::min(count, kShardSampleSize);
+        size_t unique_sampled_shards = 0;
+        for (size_t i = 0; i < sample_count; ++i) {
+            const size_t sample_index = sample_count == 1 ? 0 : i * (count - 1) / (sample_count - 1);
+            const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[sample_index]) & shard_mask_;
+            size_t j = 0;
+            while (j < unique_sampled_shards && sampled_shards[j] != shard) {
+                ++j;
+            }
+            if (j == unique_sampled_shards) {
+                sampled_shards[unique_sampled_shards++] = shard;
+            }
+        }
+        use_direct_plan = unique_sampled_shards * 4 >= sample_count * 3;
+    }
+    if (use_direct_plan) {
+        scratch->plan_kind = BatchOperationScratch::PlanKind::kDirect;
+        scratch->occupied_shards.clear();
+        for (size_t i = 0; i < count; ++i) {
+            out_handles[i] = GetShard(hashes[i]).Lookup(
+                keys[i], hashes[i], nullptr, nullptr, Priority::LOW, nullptr);
+        }
+        return;
+    }
+
+    scratch->plan_kind = BatchOperationScratch::PlanKind::kGrouped;
+    scratch->shard_offsets.assign(shard_count + 1, 0);
+    scratch->occupied_shards.clear();
+    auto &shard_offsets = scratch->shard_offsets;
+    for (size_t i = 0; i < count; ++i) {
         const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
         ++shard_offsets[shard + 1];
     }
     for (size_t shard = 0; shard < shard_count; ++shard) {
         shard_offsets[shard + 1] += shard_offsets[shard];
+        if (shard_offsets[shard + 1] != shard_offsets[shard]) {
+            scratch->occupied_shards.push_back(shard);
+        }
     }
 
     scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
@@ -914,12 +957,9 @@ void LRUCache::LookupBatchWithScratch(const std::string_view *keys,
         const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
         ordered_indices[cursors[shard]++] = i;
     }
-    for (size_t shard = 0; shard < shard_count; ++shard) {
+    for (const size_t shard : scratch->occupied_shards) {
         const size_t begin = shard_offsets[shard];
         const size_t end = shard_offsets[shard + 1];
-        if (begin == end) {
-            continue;
-        }
         GetShard(hashes[ordered_indices[begin]])
             .LookupBatch(keys, hashes.data(), ordered_indices.data() + begin, end - begin, out_handles);
     }
@@ -929,6 +969,42 @@ void LRUCache::ReleaseBatch(Handle *const *handles, size_t count) {
     BatchOperationScratch scratch;
     PrepareBatchOperationScratch(count, &scratch);
     ReleaseBatchWithScratch(handles, count, &scratch);
+}
+
+void LRUCache::ReleaseBatchUsingLookupPlan(Handle *const *handles,
+                                           size_t count,
+                                           BatchOperationScratch *lookup_scratch) {
+    if (count == 0) {
+        return;
+    }
+    if (!lookup_scratch) {
+        ReleaseBatch(handles, count);
+        return;
+    }
+
+    if (lookup_scratch->plan_kind == BatchOperationScratch::PlanKind::kDirect) {
+        const auto &hashes = lookup_scratch->hashes;
+        for (size_t i = 0; i < count; ++i) {
+            if (handles[i] != nullptr) {
+                GetShard(hashes[i]).Release(static_cast<LRUHandle *>(handles[i]), true, false);
+            }
+        }
+        return;
+    }
+    if (lookup_scratch->plan_kind != BatchOperationScratch::PlanKind::kGrouped) {
+        ReleaseBatchWithScratch(handles, count, lookup_scratch);
+        return;
+    }
+
+    const auto &hashes = lookup_scratch->hashes;
+    const auto &shard_offsets = lookup_scratch->shard_offsets;
+    const auto &ordered_indices = lookup_scratch->ordered_indices;
+    for (const size_t shard : lookup_scratch->occupied_shards) {
+        const size_t begin = shard_offsets[shard];
+        const size_t end = shard_offsets[shard + 1];
+        GetShard(hashes[ordered_indices[begin]])
+            .ReleaseBatch(handles, ordered_indices.data() + begin, end - begin);
+    }
 }
 
 void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) {
@@ -942,6 +1018,7 @@ void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, Bat
 
     const size_t shard_count = GetNumShards();
     scratch->shard_offsets.assign(shard_count + 1, 0);
+    scratch->occupied_shards.clear();
     auto &shard_offsets = scratch->shard_offsets;
     size_t non_null_count = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -955,6 +1032,9 @@ void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, Bat
     }
     for (size_t shard = 0; shard < shard_count; ++shard) {
         shard_offsets[shard + 1] += shard_offsets[shard];
+        if (shard_offsets[shard + 1] != shard_offsets[shard]) {
+            scratch->occupied_shards.push_back(shard);
+        }
     }
 
     scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
@@ -969,12 +1049,9 @@ void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, Bat
         const size_t shard = LRUCacheShard::HashPieceForSharding(entry->GetHash()) & shard_mask_;
         ordered_indices[cursors[shard]++] = i;
     }
-    for (size_t shard = 0; shard < shard_count; ++shard) {
+    for (const size_t shard : scratch->occupied_shards) {
         const size_t begin = shard_offsets[shard];
         const size_t end = shard_offsets[shard + 1];
-        if (begin == end) {
-            continue;
-        }
         const auto *entry = static_cast<const LRUHandle *>(handles[ordered_indices[begin]]);
         GetShard(entry->GetHash()).ReleaseBatch(handles, ordered_indices.data() + begin, end - begin);
     }

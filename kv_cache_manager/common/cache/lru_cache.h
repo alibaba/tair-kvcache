@@ -521,6 +521,9 @@ public:
                                 Handle **out_handles,
                                 BatchOperationScratch *scratch) override;
     void ReleaseBatch(Handle *const *handles, size_t count) override;
+    void ReleaseBatchUsingLookupPlan(Handle *const *handles,
+                                     size_t count,
+                                     BatchOperationScratch *lookup_scratch) override;
     void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override;
     bool AdjustChargeAndRelease(Handle *handle, ssize_t delta) override;
 

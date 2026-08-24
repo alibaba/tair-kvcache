@@ -134,6 +134,81 @@ private:
     Cache::EvictionCallback eviction_callback_;
 };
 
+namespace {
+std::shared_ptr<Cache> NewBatchTestCache(int shard_bits) {
+    LRUCacheOptions options;
+    options.capacity = 1 << 20;
+    options.num_shard_bits = shard_bits;
+    options.metadata_charge_policy = kDontChargeCacheMetadata;
+    options.hash_seed = 0;
+    return options.MakeSharedCache();
+}
+
+void InsertBatchTestKey(const std::shared_ptr<Cache> &cache, const std::string &key) {
+    ASSERT_EQ(EC_OK, cache->Insert(key, nullptr, &kNoopCacheItemHelper, 1));
+}
+} // namespace
+
+TEST(LRUCacheBatchPlanTest, DirectLookupPlanReleasesMixedAndDuplicateHandles) {
+    auto cache = NewBatchTestCache(8);
+    InsertBatchTestKey(cache, "a");
+    InsertBatchTestKey(cache, "b");
+
+    const std::string_view keys[] = {"a", "missing", "b", "a"};
+    Cache::Handle *handles[std::size(keys)] = {};
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(std::size(keys), &scratch);
+    cache->LookupBatchWithScratch(keys, std::size(keys), handles, &scratch);
+
+    EXPECT_EQ(Cache::BatchOperationScratch::PlanKind::kDirect, scratch.plan_kind);
+    ASSERT_NE(nullptr, handles[0]);
+    EXPECT_EQ(nullptr, handles[1]);
+    ASSERT_NE(nullptr, handles[2]);
+    EXPECT_EQ(handles[0], handles[3]);
+    cache->ReleaseBatchUsingLookupPlan(handles, std::size(handles), &scratch);
+
+    auto *handle = cache->Lookup("a");
+    ASSERT_NE(nullptr, handle);
+    cache->Release(handle);
+}
+
+TEST(LRUCacheBatchPlanTest, SparseHotspotBatchUsesGroupedPlan) {
+    auto cache = NewBatchTestCache(8);
+    InsertBatchTestKey(cache, "hot");
+
+    const std::string_view keys[] = {"hot", "hot", "hot", "hot"};
+    Cache::Handle *handles[std::size(keys)] = {};
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(std::size(keys), &scratch);
+    cache->LookupBatchWithScratch(keys, std::size(keys), handles, &scratch);
+
+    EXPECT_EQ(Cache::BatchOperationScratch::PlanKind::kGrouped, scratch.plan_kind);
+    EXPECT_EQ(1u, scratch.occupied_shards.size());
+    cache->ReleaseBatchUsingLookupPlan(handles, std::size(handles), &scratch);
+}
+
+TEST(LRUCacheBatchPlanTest, GroupedLookupPlanReusesOccupiedShardPlanForRelease) {
+    auto cache = NewBatchTestCache(4);
+    const std::vector<std::string> key_storage = {"a", "b", "c", "d", "e", "f", "g", "missing"};
+    for (size_t i = 0; i + 1 < key_storage.size(); ++i) {
+        InsertBatchTestKey(cache, key_storage[i]);
+    }
+    std::vector<std::string_view> keys(key_storage.begin(), key_storage.end());
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(keys.size(), &scratch);
+    cache->LookupBatchWithScratch(keys.data(), keys.size(), handles.data(), &scratch);
+
+    EXPECT_EQ(Cache::BatchOperationScratch::PlanKind::kGrouped, scratch.plan_kind);
+    EXPECT_FALSE(scratch.occupied_shards.empty());
+    EXPECT_EQ(nullptr, handles.back());
+    cache->ReleaseBatchUsingLookupPlan(handles.data(), handles.size(), &scratch);
+
+    auto *handle = cache->Lookup("g");
+    ASSERT_NE(nullptr, handle);
+    cache->Release(handle);
+}
+
 TEST_F(LRUCacheTest, BasicLRU) {
     NewCache(5);
     for (char ch = 'a'; ch <= 'e'; ch++) {

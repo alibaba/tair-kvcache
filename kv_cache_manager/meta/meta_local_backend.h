@@ -79,11 +79,16 @@ private:
     std::atomic<int64_t> last_access_time_{0};
 };
 
-// Caller-owned workspace for the pure-local one-location RMW path. It is
-// prepared before MetaIndexer acquires metadata shard locks, then reused by
-// both the read and write halves of the operation. The fused path may retain
-// read handles until its matching write call; the destructor is a final guard
-// that releases every handle on early returns.
+// Caller-owned workspace reused by concrete-local targeted reads. It is
+// prepared before MetaIndexer acquires metadata shard locks.
+struct TargetedLocationReadScratch {
+    std::vector<std::string_view> key_views;
+    std::vector<Cache::Handle *> handles;
+    Cache::BatchOperationScratch cache_batch;
+};
+
+// Workspace for the one-location RMW path. Retained handles keep borrowed
+// locations alive through modifier evaluation and are released on every exit.
 struct SingleLocationRmwScratch {
     SingleLocationRmwScratch() = default;
     ~SingleLocationRmwScratch();
@@ -91,11 +96,15 @@ struct SingleLocationRmwScratch {
     SingleLocationRmwScratch &operator=(const SingleLocationRmwScratch &) = delete;
 
     void ReleaseRetainedHandles() noexcept;
+    void ClearWritePayload() noexcept;
     [[nodiscard]] bool HasRetainedHandles() const noexcept { return retained_handle_owner != nullptr; }
 
     std::vector<std::string_view> key_views;
     std::vector<Cache::Handle *> handles;
+    Cache::BatchOperationScratch cache_batch;
     CacheLocationVector retired_locations;
+    CacheLocationMapVector write_locations;
+    PropertyMapVector write_properties;
     Cache *retained_handle_owner = nullptr;
 };
 
@@ -140,6 +149,7 @@ public:
                                    const CacheLocationVector &locations,
                                    std::vector<ErrorCode> &out_results,
                                    SingleLocationRmwScratch &scratch) noexcept;
+    // MetaIndexer owns input-shape and location-id validation for this retained fast path.
     void UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext *request_context,
                                                        const KeyTypeVec &keys,
                                                        const LocationIdRefVector &location_ids,
@@ -200,6 +210,14 @@ public:
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept override;
+    void PrepareTargetedLocationReadScratch(size_t max_count, TargetedLocationReadScratch &scratch) noexcept;
+    void GetLocationsWithKeyStatusInto(RequestContext *request_context,
+                                       const KeyTypeVec &keys,
+                                       const LocationIdsPerKey &location_ids,
+                                       LocationsPerKey &out_locations,
+                                       std::vector<std::vector<ErrorCode>> &out_results,
+                                       std::vector<ErrorCode> &out_key_error_codes,
+                                       TargetedLocationReadScratch &scratch) noexcept;
     std::vector<std::vector<ErrorCode>>
     GetLocationsWithKeyStatus(RequestContext *request_context,
                               const KeyTypeVec &keys,
@@ -220,7 +238,7 @@ public:
                                              std::vector<ErrorCode> &out_results,
                                              SingleLocationRmwScratch &scratch,
                                              bool retain_handles = false) noexcept;
-    // Pure-local RMW-only variant: borrows immutable location values without
+    // Concrete-local RMW variant: borrows immutable location values without
     // incrementing one shared_ptr control block per key. Callers must retain
     // the handles and consume every view before the matching write/release.
     void GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,

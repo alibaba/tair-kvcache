@@ -674,20 +674,6 @@ TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemant
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), skip_result.error_codes);
     EXPECT_EQ(1u, skip_calls);
     EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
-
-    size_t duplicate_modifier_calls = 0;
-    const auto duplicate_result = meta_indexer_->ReadModifyWriteSingleTargetLocations(
-        request_context_.get(),
-        {4, 4},
-        LocationIdRefVector{&target_id, &target_id},
-        [&duplicate_modifier_calls](
-            ErrorCode, const LocationId &, size_t, const CacheLocation *, CacheLocationConstPtr &) {
-            ++duplicate_modifier_calls;
-            return ModifierResult{MA_SKIP, EC_OK};
-        });
-    EXPECT_EQ(EC_BADARGS, duplicate_result.ec);
-    EXPECT_TRUE(duplicate_result.error_codes.empty());
-    EXPECT_EQ(0u, duplicate_modifier_calls);
 }
 
 // Verifies the invariants of MakeBatches() that callers rely on, regardless

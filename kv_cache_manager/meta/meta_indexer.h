@@ -117,10 +117,12 @@ public:
                                                   const KeyVector &keys,
                                                   const LocationIdsPerKey &location_ids,
                                                   const LocationModifierFunc &modifier) noexcept;
-    // Pure-local fast path for one target location per unique key. It keeps
+    // Inputs are prevalidated by MetaSearcher: keys are unique, location IDs
+    // are aligned/non-empty, and the backend capability is already selected.
+    // Concrete-local fast path for one target location per unique key. It keeps
     // ids and results flat, avoids per-key temporary maps/vectors, and retains
     // the same metadata shard locking and key-count semantics as the generic
-    // targeted RMW.
+    // targeted RMW for pure-local and cached Running backends.
     SingleLocationResult ReadModifyWriteSingleTargetLocations(RequestContext *request_context,
                                                               const KeyVector &keys,
                                                               const LocationIdRefVector &location_ids,
@@ -262,6 +264,8 @@ private:
                                                  RmwStats &stats,
                                                  Result &result,
                                                  ServiceMetricsCollector *metrics_collector) noexcept;
+    void ResetRmwUpsertMetrics(ServiceMetricsCollector *metrics_collector) const noexcept;
+    void AccumulateRmwUpsertMetrics(ServiceMetricsCollector *metrics_collector, RmwStats &stats) const noexcept;
     void EmitRmwMetrics(ServiceMetricsCollector *metrics_collector,
                         const RmwStats &stats,
                         size_t total_key_count) const noexcept;

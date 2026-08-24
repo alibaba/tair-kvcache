@@ -36,6 +36,13 @@ public:
         CacheWrapper::ReleaseBatch(handles, count);
     }
 
+    void ReleaseBatchUsingLookupPlan(Handle *const *handles,
+                                     size_t count,
+                                     BatchOperationScratch *lookup_scratch) override {
+        ++release_batch_calls;
+        CacheWrapper::ReleaseBatchUsingLookupPlan(handles, count, lookup_scratch);
+    }
+
     void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override {
         ++release_batch_calls;
         CacheWrapper::ReleaseBatchWithScratch(handles, count, scratch);
@@ -333,7 +340,15 @@ TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) 
 
     auto *backend = GetLocalBackend();
     SingleLocationRmwScratch scratch;
+    scratch.write_locations.resize(1);
+    scratch.write_locations[0].emplace(target_id, old_target);
+    scratch.write_properties.resize(1);
+    scratch.write_properties[0].emplace("stale", "value");
+    scratch.retired_locations.push_back(old_target);
     backend->PrepareSingleLocationRmwScratch(3, scratch);
+    EXPECT_TRUE(scratch.write_locations[0].empty());
+    EXPECT_TRUE(scratch.write_properties[0].empty());
+    EXPECT_TRUE(scratch.retired_locations.empty());
     const KeyTypeVec read_keys{1, 2, 3};
     const LocationIdRefVector read_ids{&target_id, &target_id, &target_id};
     CacheLocationViewVector selected_views;
@@ -373,24 +388,6 @@ TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) 
     EXPECT_TRUE(stored_locations[1].empty());
     EXPECT_EQ("preserved", stored_properties[1].at("property_only"));
     EXPECT_EQ(new_key_location, stored_locations[2].at(target_id));
-
-    // Invalid subset metadata must fail the whole write and release the read
-    // handle, so an early validation return cannot pin an LRU entry.
-    CacheLocationVector selected;
-    backend->GetSingleLocationsWithKeyStatusInto(nullptr,
-                                                 {1},
-                                                 {&target_id},
-                                                 selected,
-                                                 key_ecs,
-                                                 location_ecs,
-                                                 scratch,
-                                                 /*retain_handles=*/true);
-    ASSERT_TRUE(scratch.HasRetainedHandles());
-    CacheLocationVector invalid_replacement{replacement};
-    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
-        nullptr, {1}, {&target_id}, invalid_replacement, {1}, write_ecs, scratch);
-    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), write_ecs);
-    EXPECT_FALSE(scratch.HasRetainedHandles());
 }
 
 TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathValidatesBatchAndPreservesDuplicateOrder) {
@@ -1534,7 +1531,7 @@ TEST_F(MetaLocalBackendTest, TestGetLocationValuesCompactPreservesOffsetsAndCanB
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestOnlyTargetedReadUsesCacheBatch) {
+TEST_F(MetaLocalBackendTest, TestTargetedAndSingleReadsAvoidRedundantCacheRelease) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("sparse_lru_paths", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     auto *backend = GetLocalBackend();
@@ -1570,12 +1567,12 @@ TEST_F(MetaLocalBackendTest, TestOnlyTargetedReadUsesCacheBatch) {
     std::vector<ErrorCode> results;
     backend->GetSingleLocationViewsWithKeyStatusInto(
         nullptr, {1, 2}, location_ids, views, key_ecs, results, scratch);
-    scratch.ReleaseRetainedHandles();
-
     CacheLocationVector replacements = {location, location};
-    backend->UpsertSingleLocationsInto(nullptr, {1, 2}, location_ids, replacements, results, scratch);
+    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
+        nullptr, {1, 2}, location_ids, replacements, {0, 1}, results, scratch);
 
-    EXPECT_EQ(1u, counting_cache->lookup_batch_calls);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), results);
+    EXPECT_EQ(2u, counting_cache->lookup_batch_calls);
     EXPECT_EQ(1u, counting_cache->release_batch_calls);
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }

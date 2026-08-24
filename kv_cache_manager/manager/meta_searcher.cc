@@ -2591,7 +2591,7 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_cont
         single_location_ids.reserve(keys.size());
     }
     // Keep the incoming and final usage in one request-shaped allocation.
-    // The dominant pure-local ReportEvent shape has exactly one location per
+    // The dominant single-location ReportEvent shape has exactly one location per
     // key, so its usage index is the key index and needs no offsets array.
     // Multi-location callers retain the generic flattened-offset layout.
     std::vector<size_t> usage_offsets(use_single_location_fast_path ? 0 : keys.size() + 1, 0);
