@@ -43,7 +43,9 @@ public:                                                                         
 
 class OptimizerServiceMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(service, query_counter)
+    KVCM_COUNTER_METRICS(service, input_tokens_total)
     KVCM_CHRONO_METRICS(service, query_rt_us, ServiceQuery)
+    KVCM_COUNTER_METRICS(service, query_rt_us_total)
     KVCM_GAUGE_METRICS(service, error_code)
     KVCM_COUNTER_METRICS(service, error_counter)
 
@@ -62,6 +64,9 @@ public:
     void set_total_blocks(int64_t v) { total_blocks_ = v; }
     int64_t total_blocks() const { return total_blocks_; }
 
+    void set_input_token_len(int64_t v) { input_token_len_ = v; }
+    int64_t input_token_len() const { return input_token_len_; }
+
     void set_per_capacity_hits(std::vector<PerCapacityHitInfo> v) { per_capacity_hits_ = std::move(v); }
     const std::vector<PerCapacityHitInfo> &per_capacity_hits() const { return per_capacity_hits_; }
 
@@ -78,6 +83,7 @@ private:
     std::string instance_id_;
     std::string client_ip_;
     int64_t total_blocks_ = 0;
+    int64_t input_token_len_ = 0;
     std::vector<PerCapacityHitInfo> per_capacity_hits_;
     int64_t max_hit_count_ = -1;
     double max_hit_rate_ = 0.0;

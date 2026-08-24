@@ -18,6 +18,7 @@ class OptimizerServiceGRpc;
 class OptimizerServiceHttp;
 class OptimizerRegistryManager;
 class OptimizerMetricsReporter;
+class OptimizerKmonitorMetricsReporter;
 class MetricsRegistry;
 class KvcmEventSubscriber;
 class LoopThread;
@@ -51,6 +52,7 @@ private:
     std::shared_ptr<OptimizerServiceHttp> http_service_;
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
+    std::shared_ptr<OptimizerKmonitorMetricsReporter> kmonitor_metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::unique_ptr<KvcmEventSubscriber> kvcm_event_subscriber_;
 

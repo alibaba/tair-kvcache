@@ -1,16 +1,15 @@
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 
 #include <cmath>
-#include <shared_mutex>
-#include <unordered_map>
+#include <limits>
+#include <utility>
+#include <vector>
 
-#include "kmonitor/client/KMonitorFactory.h"
-#include "kmonitor/client/MetricsReporter.h"
 #include "kv_cache_manager/common/common_util.h"
-#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/metrics/kmon_param.h"
+#include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 
 namespace kv_cache_manager {
@@ -29,498 +28,186 @@ std::string FormatTargetHitRatePercent(uint32_t target_basis_points) {
     return std::to_string(whole) + "." + (fraction < 10 ? "0" : "") + std::to_string(fraction);
 }
 
-} // namespace
-
-#define DECLARE_METRICS(group, name) std::unique_ptr<kmonitor::MutableMetric> group##_##name##_metrics;
-
-struct OptimizerMetricsReporter::KmonContext {
-    kmonitor::KMonitor *kmonitor = nullptr;
-
-    // per-query service metrics
-    DECLARE_METRICS(service, qps);
-    DECLARE_METRICS(service, query_rt_us);
-    DECLARE_METRICS(service, error_qps);
-
-    // per-query optimizer business metrics
-    DECLARE_METRICS(query, hit_rate);
-    DECLARE_METRICS(query, hit_count);
-    DECLARE_METRICS(query, total_blocks);
-
-    // intervallic metrics
-    DECLARE_METRICS(trace, query_total);
-    DECLARE_METRICS(trace, query_blocks_total);
-    DECLARE_METRICS(trace, query_max_hit_rate);
-    DECLARE_METRICS(trace, query_unique_keys);
-    DECLARE_METRICS(trace, query_bytes_per_block);
-    DECLARE_METRICS(trace, query_linear_step);
-    DECLARE_METRICS(trace, query_eviction_count);
-    DECLARE_METRICS(trace, query_memory_usage_bytes);
-    DECLARE_METRICS(trace, query_kv_cache_usage_bytes);
-    DECLARE_METRICS(trace, query_ttl_eviction_count);
-    DECLARE_METRICS(trace, query_hit_rate);
-
-    DECLARE_METRICS(query, max_hit_count);
-    DECLARE_METRICS(query, max_hit_rate);
-    DECLARE_METRICS(query, capacity_efficiency);
-
-    DECLARE_METRICS(trace, query_capacity_efficiency);
-    DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
-
-    std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
-
-    struct MapHashFunc {
-        size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
-            size_t hash = 0;
-            for (const auto &pair : m) {
-                hash ^= (std::hash<std::string>()(pair.first) ^ (std::hash<std::string>()(pair.second) << 1));
-            }
-            return hash;
-        }
-    };
-
-    mutable std::shared_mutex mutex_;
-    std::unordered_map<MetricsTags, kmonitor::MetricsTags, MapHashFunc> tag_cache_;
-
-    kmonitor::MetricsTags GetKmonitorTags(const MetricsTags &base_tags) {
-        {
-            std::shared_lock read_guard(mutex_);
-            auto iter = tag_cache_.find(base_tags);
-            if (iter != tag_cache_.end()) {
-                return iter->second;
-            }
-        }
-        {
-            std::unique_lock write_guard(mutex_);
-            auto iter = tag_cache_.find(base_tags);
-            if (iter != tag_cache_.end()) {
-                return iter->second;
-            }
-            kmonitor::MetricsTags tags(base_tags);
-            tag_cache_[base_tags] = tags;
-            return tags;
-        }
+std::string ResolveInstanceGroup(const std::shared_ptr<OnlineOptimizerManager> &manager,
+                                 const std::string &instance_id) {
+    if (!manager || instance_id.empty()) {
+        return {};
     }
-};
+    auto registry = manager->registry_manager();
+    if (!registry) {
+        return {};
+    }
+    auto instance_info = registry->GetInstanceInfo(instance_id);
+    return instance_info ? instance_info->instance_group_name() : std::string{};
+}
 
-#undef DECLARE_METRICS
+} // namespace
 
 OptimizerMetricsReporter::OptimizerMetricsReporter(std::shared_ptr<OnlineOptimizerManager> manager,
                                                    std::shared_ptr<MetricsRegistry> metrics_registry,
-                                                   const std::string &prefix)
-    : manager_(std::move(manager)), metrics_registry_(std::move(metrics_registry)), prefix_(prefix) {}
+                                                   std::shared_ptr<OptimizerKmonitorMetricsReporter> kmonitor_reporter)
+    : manager_(std::move(manager))
+    , metrics_registry_(std::move(metrics_registry))
+    , kmonitor_reporter_(std::move(kmonitor_reporter)) {}
 
 OptimizerMetricsReporter::~OptimizerMetricsReporter() = default;
-
-bool OptimizerMetricsReporter::InitKmonitor() {
-    kmon_ctx_ = std::make_unique<KmonContext>();
-
-    KmonParam param;
-    param.Init();
-
-    if (!param.kmonitor_metrics_reporter_cache_limit.empty()) {
-        size_t limit = std::atoll(param.kmonitor_metrics_reporter_cache_limit.c_str());
-        if (limit > 0) {
-            kmonitor::MetricsReporter::setMetricsReporterCacheLimit(limit);
-            KVCM_LOG_INFO("OptimizerMetricsReporter: set metrics reporter cache limit [%lu].", limit);
-        }
-    }
-
-    if (param.kmonitor_normal_sample_period > 0) {
-        KVCM_LOG_INFO("OptimizerMetricsReporter: set kmonitor normal sample period [%d] seconds.",
-                      param.kmonitor_normal_sample_period);
-        kmonitor::MetricLevelConfig level_config;
-        level_config.period[kmonitor::FATAL] = static_cast<unsigned int>(param.kmonitor_normal_sample_period);
-        kmonitor::MetricLevelManager::SetGlobalLevelConfig(level_config);
-    }
-
-    kmonitor::MetricsConfig config;
-    config.set_tenant_name(param.kmonitor_tenant);
-    config.set_service_name(param.kmonitor_service_name);
-
-    std::string sink_address = param.kmonitor_sink_address;
-    if (!param.kmonitor_port.empty()) {
-        sink_address += ":" + param.kmonitor_port;
-    }
-    config.set_sink_address(sink_address.c_str());
-
-    config.set_enable_log_file_sink(param.kmonitor_enable_log_file_sink);
-    config.set_manually_mode(param.kmonitor_manually_mode);
-    config.set_inited(true);
-
-    config.AddGlobalTag("hippo_slave_ip", param.hippo_slave_ip);
-
-    for (const auto &pair : param.kmonitor_tags) {
-        config.AddGlobalTag(pair.first, pair.second);
-    }
-
-    if (std::getenv("HIPPO_ROLE")) {
-        auto host_ip = EnvUtil::GetEnv("HIPPO_SLAVE_IP", "");
-        config.AddGlobalTag("host_ip", host_ip);
-        config.AddGlobalTag("container_ip", EnvUtil::GetEnv("RequestedIP", host_ip));
-        config.AddGlobalTag("hippo_role", EnvUtil::GetEnv("HIPPO_ROLE", ""));
-        config.AddGlobalTag("hippo_app", EnvUtil::GetEnv("HIPPO_APP", ""));
-        config.AddGlobalTag("hippo_group", EnvUtil::GetEnv("HIPPO_SERVICE_NAME", ""));
-    }
-
-    if (!kmonitor::KMonitorFactory::Init(config)) {
-        KVCM_LOG_ERROR("OptimizerMetricsReporter: KMonitorFactory::Init failed");
-        kmon_ctx_.reset();
-        return false;
-    }
-
-    kmonitor::KMonitorFactory::registerBuildInMetrics(nullptr, param.kmonitor_metrics_prefix);
-    KVCM_LOG_INFO("OptimizerMetricsReporter: registerBuildInMetrics finished");
-
-    kmonitor::KMonitorFactory::Start();
-
-    return InitMetrics();
-}
-
-#define REGISTER_QPS_METRIC(group, name)                                                                               \
-    do {                                                                                                               \
-        std::string metric_name = #group "." #name;                                                                    \
-        kmon_ctx_->group##_##name##_metrics.reset(                                                                     \
-            reporter->RegisterMetric(metric_name, kmonitor::QPS, kmonitor::FATAL));                                    \
-        if (nullptr == kmon_ctx_->group##_##name##_metrics) {                                                          \
-            KVCM_LOG_ERROR("failed to register metric:[%s]", metric_name.c_str());                                     \
-            return false;                                                                                              \
-        }                                                                                                              \
-    } while (0)
-
-#define REGISTER_GAUGE_METRIC(group, name)                                                                             \
-    do {                                                                                                               \
-        std::string metric_name = #group "." #name;                                                                    \
-        kmon_ctx_->group##_##name##_metrics.reset(                                                                     \
-            reporter->RegisterMetric(metric_name, kmonitor::GAUGE, kmonitor::FATAL));                                  \
-        if (nullptr == kmon_ctx_->group##_##name##_metrics) {                                                          \
-            KVCM_LOG_ERROR("failed to register metric:[%s]", metric_name.c_str());                                     \
-            return false;                                                                                              \
-        }                                                                                                              \
-    } while (0)
-
-bool OptimizerMetricsReporter::InitMetrics() {
-    kmon_ctx_->kmonitor = kmonitor::KMonitorFactory::GetKMonitor(prefix_);
-    if (!kmon_ctx_->kmonitor) {
-        KVCM_LOG_ERROR("OptimizerMetricsReporter: GetKMonitor failed for prefix[%s]", prefix_.c_str());
-        kmon_ctx_.reset();
-        return false;
-    }
-
-    auto *reporter = kmon_ctx_->kmonitor;
-
-    // service metrics
-    REGISTER_QPS_METRIC(service, qps);
-    REGISTER_GAUGE_METRIC(service, query_rt_us);
-    REGISTER_QPS_METRIC(service, error_qps);
-
-    // optimizer business metrics
-    REGISTER_GAUGE_METRIC(query, hit_rate);
-    REGISTER_GAUGE_METRIC(query, hit_count);
-    REGISTER_GAUGE_METRIC(query, total_blocks);
-
-    // intervallic metrics
-    REGISTER_GAUGE_METRIC(trace, query_total);
-    REGISTER_GAUGE_METRIC(trace, query_blocks_total);
-    REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
-    REGISTER_GAUGE_METRIC(trace, query_unique_keys);
-    REGISTER_GAUGE_METRIC(trace, query_bytes_per_block);
-    REGISTER_GAUGE_METRIC(trace, query_linear_step);
-    REGISTER_GAUGE_METRIC(trace, query_eviction_count);
-    REGISTER_GAUGE_METRIC(trace, query_memory_usage_bytes);
-    REGISTER_GAUGE_METRIC(trace, query_kv_cache_usage_bytes);
-    REGISTER_GAUGE_METRIC(trace, query_ttl_eviction_count);
-    REGISTER_GAUGE_METRIC(trace, query_hit_rate);
-    REGISTER_GAUGE_METRIC(trace, query_capacity_efficiency);
-
-    REGISTER_GAUGE_METRIC(query, max_hit_count);
-    REGISTER_GAUGE_METRIC(query, max_hit_rate);
-    REGISTER_GAUGE_METRIC(query, capacity_efficiency);
-
-    REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
-    kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
-    if (!kmon_ctx_->mrc_metrics) {
-        KVCM_LOG_ERROR("failed to register metric:[mrc]");
-        return false;
-    }
-
-    KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
-    return true;
-}
-
-#undef REGISTER_QPS_METRIC
-#undef REGISTER_GAUGE_METRIC
-
-#define REPORT_METRICS(group, name, value)                                                                             \
-    do {                                                                                                               \
-        kmon_ctx_->group##_##name##_metrics->Report(&tags, value);                                                     \
-    } while (0)
-
-#define REPORT_METRICS_WHEN(group, name, value, pred)                                                                  \
-    do {                                                                                                               \
-        if (pred) {                                                                                                    \
-            REPORT_METRICS(group, name, value);                                                                        \
-        }                                                                                                              \
-    } while (0)
-
-#define REPORT_COLLECTED_METRICS(group, name)                                                                          \
-    do {                                                                                                               \
-        double v;                                                                                                      \
-        GET_METRICS_(p, group, name, v);                                                                               \
-        REPORT_METRICS(group, name, v);                                                                                \
-    } while (0)
-
-#define REPORT_STEAL_METRICS(group, name)                                                                              \
-    do {                                                                                                               \
-        Gauge gauge;                                                                                                   \
-        COPY_METRICS_(p, group, name, gauge);                                                                          \
-        const auto raw_metrics_value = gauge.GetRaw();                                                                 \
-        if (raw_metrics_value == nullptr || !raw_metrics_value->touched.load(std::memory_order_relaxed)) {             \
-            break;                                                                                                     \
-        }                                                                                                              \
-        double v;                                                                                                      \
-        STEAL_METRICS_(p, group, name, v);                                                                             \
-        if (!(std::isnan(v))) {                                                                                        \
-            REPORT_METRICS(group, name, v);                                                                            \
-        }                                                                                                              \
-    } while (0)
 
 void OptimizerMetricsReporter::ReportInterval() {
     std::vector<InstanceSummary> summaries;
     manager_->ListInstances("", summaries);
+    std::vector<IntervalMetricInfo> interval_metrics;
+    manager_->TakeIntervalMetrics(interval_metrics);
     std::vector<MrcMetricInfo> mrc_metrics;
     manager_->TakeMrcMetrics(mrc_metrics);
 
-    for (const auto &s : summaries) {
-        MetricsTags prom_tags = {{"instance_id", s.instance_id}};
+    for (const auto &summary : summaries) {
+        MetricsTags instance_tags = {{"instance_group", summary.instance_group}, {"instance_id", summary.instance_id}};
 
-        Gauge query_total = metrics_registry_->GetGauge("trace_query_total", prom_tags);
-        query_total = static_cast<double>(s.total_queries);
+        metrics_registry_->GetGauge("trace_query_total", instance_tags) = static_cast<double>(summary.total_queries);
+        metrics_registry_->GetGauge("trace_query_blocks_total", instance_tags) =
+            static_cast<double>(summary.total_blocks_queried);
+        if (summary.max_hit_rate >= 0) {
+            metrics_registry_->GetGauge("trace_query_max_hit_rate", instance_tags) = summary.max_hit_rate;
+        }
+        metrics_registry_->GetGauge("trace_query_unique_keys", instance_tags) =
+            static_cast<double>(summary.unique_keys);
+        metrics_registry_->GetGauge("trace_query_bytes_per_block", instance_tags) =
+            static_cast<double>(summary.bytes_per_block);
+        metrics_registry_->GetGauge("trace_query_linear_step", instance_tags) =
+            static_cast<double>(summary.linear_step);
+        metrics_registry_->GetGauge("trace_query_eviction_count", instance_tags) =
+            static_cast<double>(summary.eviction_count);
+        metrics_registry_->GetGauge("trace_query_memory_usage_bytes", instance_tags) =
+            static_cast<double>(summary.memory_usage_bytes);
+        metrics_registry_->GetGauge("trace_query_kv_cache_usage_bytes", instance_tags) =
+            static_cast<double>(summary.kv_cache_usage_bytes);
+        metrics_registry_->GetGauge("trace_query_ttl_eviction_count", instance_tags) =
+            static_cast<double>(summary.ttl_eviction_count);
 
-        Gauge blocks_total = metrics_registry_->GetGauge("trace_query_blocks_total", prom_tags);
-        blocks_total = static_cast<double>(s.total_blocks_queried);
-
-        if (s.max_hit_rate >= 0) {
-            Gauge max_hit_rate = metrics_registry_->GetGauge("trace_query_max_hit_rate", prom_tags);
-            max_hit_rate = s.max_hit_rate;
+        for (const auto &capacity : summary.per_capacity_hit_rates) {
+            MetricsTags capacity_tags = instance_tags;
+            capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+            metrics_registry_->GetGauge("trace_query_hit_rate", capacity_tags) = capacity.hit_rate;
+            metrics_registry_->GetGauge("trace_query_capacity_efficiency", capacity_tags) =
+                summary.max_hit_rate > 0 ? capacity.hit_rate / summary.max_hit_rate
+                                         : std::numeric_limits<double>::quiet_NaN();
         }
 
-        Gauge unique_keys = metrics_registry_->GetGauge("trace_query_unique_keys", prom_tags);
-        unique_keys = static_cast<double>(s.unique_keys);
-
-        Gauge bytes_per_block_gauge = metrics_registry_->GetGauge("trace_query_bytes_per_block", prom_tags);
-        bytes_per_block_gauge = static_cast<double>(s.bytes_per_block);
-
-        Gauge linear_step = metrics_registry_->GetGauge("trace_query_linear_step", prom_tags);
-        linear_step = static_cast<double>(s.linear_step);
-
-        Gauge eviction_count = metrics_registry_->GetGauge("trace_query_eviction_count", prom_tags);
-        eviction_count = static_cast<double>(s.eviction_count);
-
-        Gauge memory_usage = metrics_registry_->GetGauge("trace_query_memory_usage_bytes", prom_tags);
-        memory_usage = static_cast<double>(s.memory_usage_bytes);
-
-        Gauge kv_cache_usage = metrics_registry_->GetGauge("trace_query_kv_cache_usage_bytes", prom_tags);
-        kv_cache_usage = static_cast<double>(s.kv_cache_usage_bytes);
-
-        Gauge ttl_eviction = metrics_registry_->GetGauge("trace_query_ttl_eviction_count", prom_tags);
-        ttl_eviction = static_cast<double>(s.ttl_eviction_count);
-
-        for (const auto &cap_info : s.per_capacity_hit_rates) {
-            std::string cap_str = std::to_string(cap_info.capacity_gb);
-            MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
-            Gauge rate = metrics_registry_->GetGauge("trace_query_hit_rate", cap_tags);
-            rate = cap_info.hit_rate;
-
-            if (s.max_hit_rate > 0) {
-                Gauge achievement = metrics_registry_->GetGauge("trace_query_capacity_efficiency", cap_tags);
-                achievement = cap_info.hit_rate / s.max_hit_rate;
-            }
-        }
-
-        for (const auto &bucket : s.hit_age_bucket_ratios) {
-            std::string bucket_label =
+        for (const auto &bucket : summary.hit_age_bucket_ratios) {
+            const std::string bucket_label =
                 bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
-            Gauge bucket_ratio = metrics_registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags);
-            bucket_ratio = bucket.ratio;
+            MetricsTags bucket_tags = instance_tags;
+            bucket_tags["age_bucket"] = bucket_label;
+            metrics_registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags) = bucket.ratio;
+        }
+    }
+
+    for (const auto &metric : interval_metrics) {
+        MetricsTags interval_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        if (metric.has_theoretical_max_hit_rate) {
+            metrics_registry_->GetGauge("interval.query_max_hit_rate", interval_tags) = metric.max_hit_rate;
+        }
+        for (const auto &capacity : metric.per_capacity_hit_rates) {
+            MetricsTags capacity_tags = interval_tags;
+            capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+            metrics_registry_->GetGauge("interval.query_hit_rate", capacity_tags) = capacity.hit_rate;
+            metrics_registry_->GetGauge("interval.query_capacity_efficiency", capacity_tags) =
+                metric.has_theoretical_max_hit_rate && metric.max_hit_rate > 0
+                    ? capacity.hit_rate / metric.max_hit_rate
+                    : std::numeric_limits<double>::quiet_NaN();
         }
     }
 
     for (const auto &metric : mrc_metrics) {
-        MetricsTags prom_tags = {{"instance_id", metric.instance_id},
-                                 {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
-        Gauge mrc = metrics_registry_->GetGauge("mrc", prom_tags);
-        mrc = static_cast<double>(metric.capacity_bytes);
+        MetricsTags tags = {{"instance_group", metric.instance_group},
+                            {"instance_id", metric.instance_id},
+                            {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
+        metrics_registry_->GetGauge("mrc", tags) = static_cast<double>(metric.capacity_bytes);
     }
 
-    // --- Kmonitor ---
-    if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
-        return;
-    }
-
-    for (const auto &s : summaries) {
-        MetricsTags base_tags = {{"instance_id", s.instance_id}};
-        kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
-
-        REPORT_METRICS(trace, query_total, static_cast<double>(s.total_queries));
-        REPORT_METRICS(trace, query_blocks_total, static_cast<double>(s.total_blocks_queried));
-        if (s.max_hit_rate >= 0) {
-            REPORT_METRICS(trace, query_max_hit_rate, s.max_hit_rate);
-        }
-        REPORT_METRICS(trace, query_unique_keys, static_cast<double>(s.unique_keys));
-        REPORT_METRICS(trace, query_bytes_per_block, static_cast<double>(s.bytes_per_block));
-        REPORT_METRICS(trace, query_linear_step, static_cast<double>(s.linear_step));
-        REPORT_METRICS(trace, query_eviction_count, static_cast<double>(s.eviction_count));
-        REPORT_METRICS(trace, query_memory_usage_bytes, static_cast<double>(s.memory_usage_bytes));
-        REPORT_METRICS(trace, query_kv_cache_usage_bytes, static_cast<double>(s.kv_cache_usage_bytes));
-        REPORT_METRICS(trace, query_ttl_eviction_count, static_cast<double>(s.ttl_eviction_count));
-        for (const auto &cap_info : s.per_capacity_hit_rates) {
-            std::string cap_str = std::to_string(cap_info.capacity_gb);
-            MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
-            kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(cap_tags);
-            kmon_ctx_->trace_query_hit_rate_metrics->Report(&ktags, cap_info.hit_rate);
-
-            if (s.max_hit_rate > 0) {
-                kmon_ctx_->trace_query_capacity_efficiency_metrics->Report(&ktags, cap_info.hit_rate / s.max_hit_rate);
-            }
-        }
-
-        for (const auto &bucket : s.hit_age_bucket_ratios) {
-            std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
-            kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(bucket_tags);
-            kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&ktags, bucket.ratio);
-        }
-    }
-
-    for (const auto &metric : mrc_metrics) {
-        MetricsTags base_tags = {{"instance_id", metric.instance_id},
-                                 {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
-        kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
-        kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));
+    if (kmonitor_reporter_) {
+        kmonitor_reporter_->ReportInterval(summaries, mrc_metrics);
     }
 }
 
 void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
-    if (!collector) {
-        return;
-    }
-
     auto *p = dynamic_cast<OptimizerServiceMetricsCollector *>(collector);
     if (!p) {
         return;
     }
 
-    const auto &client_ip = p->client_ip();
+    Counter query_counter;
+    COPY_METRICS_(p, service, query_counter, query_counter);
+    ++query_counter;
 
-    // --- Prometheus: increment service counters ---
-    {
-        Counter query_counter;
-        COPY_METRICS_(p, service, query_counter, query_counter);
-        ++query_counter;
-
-        double error_code_v;
-        GET_METRICS_(p, service, error_code, error_code_v);
-        if (!std::isnan(error_code_v) && !CommonUtil::IsZeroDouble(error_code_v)) {
-            Counter error_counter;
-            COPY_METRICS_(p, service, error_counter, error_counter);
-            ++error_counter;
-        }
+    if (p->input_token_len() > 0) {
+        Counter input_tokens_total;
+        COPY_METRICS_(p, service, input_tokens_total, input_tokens_total);
+        input_tokens_total += static_cast<uint64_t>(p->input_token_len());
     }
 
-    // --- Prometheus: per-capacity hit metrics ---
-    if (metrics_registry_ && p->total_blocks() > 0) {
-        const auto &per_cap = p->per_capacity_hits();
-        const auto &instance_id = p->instance_id();
+    double query_rt_us;
+    GET_METRICS_(p, service, query_rt_us, query_rt_us);
+    Counter query_rt_total;
+    COPY_METRICS_(p, service, query_rt_us_total, query_rt_total);
+    if (!std::isnan(query_rt_us)) {
+        query_rt_total += static_cast<uint64_t>(query_rt_us);
+    }
 
-        for (const auto &info : per_cap) {
-            double hit_rate = info.hit_rate >= 0.0
-                                  ? info.hit_rate
-                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
-            std::string cap_str = std::to_string(info.capacity_gb);
+    double error_code;
+    GET_METRICS_(p, service, error_code, error_code);
+    if (!std::isnan(error_code) && !CommonUtil::IsZeroDouble(error_code)) {
+        Counter error_counter;
+        COPY_METRICS_(p, service, error_counter, error_counter);
+        ++error_counter;
+    }
 
-            MetricsTags prom_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
+    const std::string instance_group = ResolveInstanceGroup(manager_, p->instance_id());
+    MetricsTags service_tags = p->GetMetricsTags();
+    MetricsTags query_tags = {
+        {"instance_group", instance_group}, {"instance_id", p->instance_id()}, {"client_ip", p->client_ip()}};
+    if (metrics_registry_ && !p->instance_id().empty()) {
+        service_tags = {{"instance_group", instance_group}, {"instance_id", p->instance_id()}};
 
-            Gauge rate_gauge = metrics_registry_->GetGauge("query_hit_rate", prom_tags);
-            rate_gauge = hit_rate;
+        ++metrics_registry_->GetCounter("service.query_counter", service_tags);
+        if (p->input_token_len() > 0) {
+            metrics_registry_->GetCounter("service.input_tokens_total", service_tags) +=
+                static_cast<uint64_t>(p->input_token_len());
+        }
+        metrics_registry_->GetGauge("service.query_rt_us", service_tags) = query_rt_us;
+        if (!std::isnan(query_rt_us)) {
+            metrics_registry_->GetCounter("service.query_rt_us_total", service_tags) +=
+                static_cast<uint64_t>(query_rt_us);
+        }
+        metrics_registry_->GetGauge("service.error_code", service_tags) = error_code;
+        if (!std::isnan(error_code) && !CommonUtil::IsZeroDouble(error_code)) {
+            ++metrics_registry_->GetCounter("service.error_counter", service_tags);
+        }
 
-            Gauge hit_gauge = metrics_registry_->GetGauge("query_hit_count", prom_tags);
-            hit_gauge = static_cast<double>(info.hit_count);
+        if (p->total_blocks() > 0) {
+            for (const auto &capacity : p->per_capacity_hits()) {
+                const double hit_rate = capacity.hit_rate >= 0.0 ? capacity.hit_rate
+                                                                 : static_cast<double>(capacity.hit_count) /
+                                                                       static_cast<double>(p->total_blocks());
+                MetricsTags capacity_tags = query_tags;
+                capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+                metrics_registry_->GetGauge("query_hit_rate", capacity_tags) = hit_rate;
+                metrics_registry_->GetGauge("query_hit_count", capacity_tags) = static_cast<double>(capacity.hit_count);
+                metrics_registry_->GetGauge("query_capacity_efficiency", capacity_tags) =
+                    p->max_hit_rate() > 0 ? hit_rate / p->max_hit_rate() : std::numeric_limits<double>::quiet_NaN();
+            }
 
-            if (p->max_hit_rate() > 0) {
-                Gauge eff_gauge = metrics_registry_->GetGauge("query_capacity_efficiency", prom_tags);
-                eff_gauge = hit_rate / p->max_hit_rate();
+            metrics_registry_->GetGauge("query_total_blocks", query_tags) = static_cast<double>(p->total_blocks());
+            if (p->max_hit_count() >= 0) {
+                metrics_registry_->GetGauge("query_max_hit_count", query_tags) =
+                    static_cast<double>(p->max_hit_count());
+                metrics_registry_->GetGauge("query_max_hit_rate", query_tags) = p->max_hit_rate();
             }
         }
-
-        MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}};
-        Gauge blocks_gauge = metrics_registry_->GetGauge("query_total_blocks", base_tags);
-        blocks_gauge = static_cast<double>(p->total_blocks());
-
-        if (p->max_hit_count() >= 0) {
-            Gauge max_hit_gauge = metrics_registry_->GetGauge("query_max_hit_count", base_tags);
-            max_hit_gauge = static_cast<double>(p->max_hit_count());
-            Gauge max_rate_gauge = metrics_registry_->GetGauge("query_max_hit_rate", base_tags);
-            max_rate_gauge = p->max_hit_rate();
-        }
     }
 
-    // --- Kmonitor ---
-    if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
-        return;
-    }
-
-    const kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(p->GetMetricsTags());
-
-    // service metrics
-    REPORT_METRICS(service, qps, 1.0);
-    REPORT_STEAL_METRICS(service, query_rt_us);
-    double service_error_code_v;
-    STEAL_METRICS_(p, service, error_code, service_error_code_v);
-    REPORT_METRICS_WHEN(
-        service, error_qps, 1.0, !std::isnan(service_error_code_v) && !CommonUtil::IsZeroDouble(service_error_code_v));
-
-    // optimizer business metrics
-    if (p->total_blocks() > 0) {
-        const auto &per_cap = p->per_capacity_hits();
-        const auto &instance_id = p->instance_id();
-
-        for (const auto &info : per_cap) {
-            double hit_rate = info.hit_rate >= 0.0
-                                  ? info.hit_rate
-                                  : static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
-            std::string cap_str = std::to_string(info.capacity_gb);
-
-            MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
-            kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
-
-            REPORT_METRICS(query, hit_rate, hit_rate);
-            REPORT_METRICS(query, hit_count, static_cast<double>(info.hit_count));
-            REPORT_METRICS_WHEN(query, capacity_efficiency, hit_rate / p->max_hit_rate(), p->max_hit_rate() > 0);
-        }
-
-        MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}};
-        kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
-        REPORT_METRICS(query, total_blocks, static_cast<double>(p->total_blocks()));
-
-        if (p->max_hit_count() >= 0) {
-            REPORT_METRICS(query, max_hit_count, static_cast<double>(p->max_hit_count()));
-            REPORT_METRICS(query, max_hit_rate, p->max_hit_rate());
-        }
-    }
-}
-
-#undef REPORT_METRICS
-#undef REPORT_METRICS_WHEN
-#undef REPORT_COLLECTED_METRICS
-#undef REPORT_STEAL_METRICS
-
-void OptimizerMetricsReporter::ShutdownKmonitor() {
-    if (kmon_ctx_) {
-        kmonitor::KMonitorFactory::Shutdown();
-        kmon_ctx_.reset();
-        KVCM_LOG_INFO("OptimizerMetricsReporter: KMonitor shutdown complete");
+    if (kmonitor_reporter_) {
+        kmonitor_reporter_->ReportPerQuery(p, service_tags, query_tags);
     }
 }
 
@@ -529,7 +216,7 @@ void OptimizerMetricsReporter::RemoveInstanceMetrics(const std::string &instance
         return;
     }
     MetricsTags filter = {{"instance_id", instance_id}};
-    auto removed = metrics_registry_->RemoveByTagFilter(filter);
+    const auto removed = metrics_registry_->RemoveByTagFilter(filter);
     if (removed > 0) {
         KVCM_LOG_INFO("OptimizerMetricsReporter: removed %zu metrics for instance[%s]", removed, instance_id.c_str());
     }

@@ -218,7 +218,7 @@ protected:
         ASSERT_TRUE(registry_->Init());
         manager_ = std::make_shared<OnlineOptimizerManager>(registry_);
         metrics_registry_ = std::make_shared<MetricsRegistry>();
-        metrics_reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, "test_opt");
+        metrics_reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_);
         optimizer_service_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
     }
 
@@ -300,9 +300,15 @@ TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRef
 
     leader.event_service_.Publish(MakeEvent("new-instance", "accepted", 2));
     ASSERT_TRUE(WaitUntil([this] { return TotalQueries("new-instance") == 1; }));
-    ASSERT_TRUE(WaitUntil([this] {
+    const MetricsTags unknown_instance_tags = {{"instance_group", ""}, {"instance_id", "new-instance"}};
+    const MetricsTags known_instance_tags = {{"instance_group", "g1"}, {"instance_id", "new-instance"}};
+    ASSERT_TRUE(WaitUntil([this, &unknown_instance_tags, &known_instance_tags] {
         return metrics_registry_->GetCounter("service.query_counter").Get() == 2u &&
-               metrics_registry_->GetCounter("service.error_counter").Get() == 1u;
+               metrics_registry_->GetCounter("service.error_counter").Get() == 1u &&
+               metrics_registry_->GetCounter("service.query_counter", unknown_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.error_counter", unknown_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.query_counter", known_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.error_counter", known_instance_tags).Get() == 0u;
     }));
     subscriber.Stop();
 }
@@ -317,9 +323,11 @@ TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
     ASSERT_TRUE(WaitUntil([this] { return IsRegistered("known"); }));
     ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
 
-    const MetricsTags base_tags = {{"instance_id", "known"}, {"client_ip", "127.0.0.1"}};
-    const MetricsTags capacity_tags = {
-        {"instance_id", "known"}, {"client_ip", "127.0.0.1"}, {"capacity_gb", std::to_string(2.0)}};
+    const MetricsTags base_tags = {{"instance_group", "g1"}, {"instance_id", "known"}, {"client_ip", "127.0.0.1"}};
+    const MetricsTags capacity_tags = {{"instance_group", "g1"},
+                                       {"instance_id", "known"},
+                                       {"client_ip", "127.0.0.1"},
+                                       {"capacity_gb", std::to_string(2.0)}};
 
     leader.event_service_.Publish(MakeEvent("known", "miss", 1));
     ASSERT_TRUE(WaitUntil(
@@ -331,9 +339,10 @@ TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
     ASSERT_TRUE(WaitUntil(
         [this, &capacity_tags] { return metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get() == 1.0; }));
     EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("query_hit_rate", capacity_tags).Get());
-    EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter").Get());
-    EXPECT_EQ(0u, metrics_registry_->GetCounter("service.error_counter").Get());
-    EXPECT_GE(metrics_registry_->GetGauge("service.query_rt_us").Get(), 0.0);
+    const MetricsTags service_instance_tags = {{"instance_group", "g1"}, {"instance_id", "known"}};
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", service_instance_tags).Get());
+    EXPECT_EQ(0u, metrics_registry_->GetCounter("service.error_counter", service_instance_tags).Get());
+    EXPECT_GE(metrics_registry_->GetGauge("service.query_rt_us", service_instance_tags).Get(), 0.0);
 
     subscriber.Stop();
 }

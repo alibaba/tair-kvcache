@@ -433,6 +433,7 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
         if (collector) {
             collector->set_instance_id(request->instance_id());
             collector->set_total_blocks(response->total_blocks());
+            collector->set_input_token_len(response->input_token_len());
             std::vector<PerCapacityHitInfo> per_cap;
             per_cap.reserve(response->capacity_results_size());
             for (const auto &capacity_result : response->capacity_results()) {

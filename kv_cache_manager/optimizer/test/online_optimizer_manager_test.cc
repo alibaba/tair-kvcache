@@ -1,4 +1,5 @@
 #include <climits>
+#include <cmath>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -308,6 +309,33 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);
 }
 
+TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2), FullCapacityGb(3)}, "lru", true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 0, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 0, result));
+
+    std::vector<IntervalMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
+    ASSERT_EQ(1, metrics.size());
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ("g1", metrics[0].instance_group);
+    EXPECT_TRUE(metrics[0].has_theoretical_max_hit_rate);
+    EXPECT_DOUBLE_EQ(12.0 / 26.0, metrics[0].max_hit_rate);
+    ASSERT_EQ(2, metrics[0].per_capacity_hit_rates.size());
+    EXPECT_DOUBLE_EQ(8.0 / 26.0, metrics[0].per_capacity_hit_rates[0].hit_rate);
+    EXPECT_DOUBLE_EQ(12.0 / 26.0, metrics[0].per_capacity_hit_rates[1].hit_rate);
+
+    ASSERT_EQ(EC_OK, mgr_->TakeIntervalMetrics(metrics));
+    ASSERT_EQ(1, metrics.size());
+    EXPECT_TRUE(std::isnan(metrics[0].max_hit_rate));
+    EXPECT_TRUE(std::isnan(metrics[0].per_capacity_hit_rates[0].hit_rate));
+}
+
 TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     auto info = MakeInfo("i1", "g1", 4, 0);
     auto group = MakeGroup("g1", {FullCapacityGb(20)}, "lru", true);
@@ -331,6 +359,7 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     const std::vector<int64_t> expected_blocks = {12, 16, 18, 19, 20, 20};
     for (size_t i = 0; i < metrics.size(); ++i) {
         EXPECT_EQ("i1", metrics[i].instance_id);
+        EXPECT_EQ("g1", metrics[i].instance_group);
         EXPECT_EQ(expected_targets[i], metrics[i].target_basis_points);
         EXPECT_EQ(expected_blocks[i] * 16384, metrics[i].capacity_bytes);
     }
