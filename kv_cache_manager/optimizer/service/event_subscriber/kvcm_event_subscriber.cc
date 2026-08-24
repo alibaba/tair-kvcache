@@ -9,10 +9,12 @@
 #include <vector>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/service_discovery.h"
 #include "kv_cache_manager/common/service_discovery_factory.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
@@ -301,36 +303,45 @@ void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
 }
 
 void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip) {
-    OptimizerServiceMetricsCollector metrics_collector(metrics_registry_);
-    metrics_collector.set_client_ip(kvcm_ip);
-    const bool report_service_metrics = metrics_reporter_ && metrics_collector.Init();
-    if (report_service_metrics) {
-        metrics_collector.set_service_error_code_metrics(0.0);
+    std::shared_ptr<OptimizerServiceMetricsCollector> collector;
+    if (metrics_registry_) {
+        collector = std::make_shared<OptimizerServiceMetricsCollector>(metrics_registry_);
+        if (!collector->Init()) {
+            collector.reset();
+        } else {
+            collector->set_instance_id(event.instance_id());
+            collector->set_service_error_code_metrics(static_cast<double>(EC_OK));
+        }
     }
-    auto query_scope = report_service_metrics ? metrics_collector.MakeServiceQueryScope() : ChronoScopeGuard{};
+
+    RequestContext request_context(event.trace_id(), collector);
+    request_context.set_api_name("TraceQuery");
+    request_context.set_client_ip(kvcm_ip);
+
     proto::optimizer::TraceQueryResponse response;
-    const ErrorCode ec = optimizer_service_->ExecuteTraceQuery(event, &response);
-    if (ec == EC_OK) {
-        metrics_collector.set_instance_id(event.instance_id());
-        metrics_collector.set_total_blocks(response.total_blocks());
-        std::vector<PerCapacityHitInfo> per_capacity_hits;
-        per_capacity_hits.reserve(response.capacity_results_size());
-        for (const auto &capacity_result : response.capacity_results()) {
-            per_capacity_hits.push_back(
-                {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
+    ErrorCode ec = EC_OK;
+    {
+        OptimizerCallGuard guard(&request_context, metrics_reporter_.get());
+        ec = optimizer_service_->ExecuteTraceQuery(event, &response);
+        request_context.set_status_code(static_cast<int>(ec));
+        if (ec == EC_OK) {
+            if (collector) {
+                collector->set_total_blocks(response.total_blocks());
+                std::vector<PerCapacityHitInfo> per_capacity_hits;
+                per_capacity_hits.reserve(response.capacity_results_size());
+                for (const auto &capacity_result : response.capacity_results()) {
+                    per_capacity_hits.push_back(
+                        {capacity_result.capacity_gb(), capacity_result.cache_hit_count(), capacity_result.hit_rate()});
+                }
+                collector->set_per_capacity_hits(std::move(per_capacity_hits));
+                collector->set_max_hit_count(response.theoretical_result().max_hit_count());
+                if (response.theoretical_result().max_hit_count() >= 0) {
+                    collector->set_max_hit_rate(response.theoretical_result().hit_rate());
+                }
+            }
+        } else if (collector) {
+            collector->set_service_error_code_metrics(static_cast<double>(ec));
         }
-        metrics_collector.set_per_capacity_hits(std::move(per_capacity_hits));
-        metrics_collector.set_max_hit_count(response.theoretical_result().max_hit_count());
-        if (response.theoretical_result().max_hit_count() >= 0) {
-            metrics_collector.set_max_hit_rate(response.theoretical_result().hit_rate());
-        }
-    }
-    query_scope = ChronoScopeGuard{};
-    if (report_service_metrics) {
-        if (ec != EC_OK) {
-            metrics_collector.set_service_error_code_metrics(static_cast<double>(ec));
-        }
-        metrics_reporter_->ReportPerQuery(&metrics_collector);
     }
     if (ec == EC_INSTANCE_NOT_EXIST) {
         std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);

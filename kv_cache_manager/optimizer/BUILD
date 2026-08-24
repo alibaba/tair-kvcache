@@ -151,9 +151,11 @@ cc_library(
     ],
     deps = [
         ":online_optimizer_server_config",
+        ":optimizer_call_guard",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
         ":optimizer_service_impl",
+        "//kv_cache_manager/common",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:service_discovery_factory",
