@@ -32,7 +32,7 @@ jobs:
       matrix:
         include:
           - name: normal_test
-            test_target: "//kv_cache_manager/... //integration_test/..."
+            test_target: "//kv_cache_manager/... //integration_test/... //package/kvcm_ops/..."
             test_args: ""
           - name: asan_test
             test_target: "//kv_cache_manager/... //integration_test/..."
