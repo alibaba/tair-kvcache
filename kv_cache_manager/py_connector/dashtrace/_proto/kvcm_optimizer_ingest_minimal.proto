@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+// Keep the minimal Python descriptor namespace private. The forwarder uses the
+// official gRPC method path explicitly; wire compatibility depends on field
+// numbers, not this local package name.
+package kv_cache_manager.dashtrace.optimizer;
+
+enum ErrorCode {
+  UNSPECIFIED = 0;
+  OK = 1;
+  UNSUPPORTED = 2;
+  INTERNAL_ERROR = 3;
+  SERVICE_NOT_READY = 4;
+  INVALID_ARGUMENT = 5;
+  DUPLICATE_ENTITY = 6;
+  REACH_MAX_ENTITY_CAPACITY = 7;
+  INSTANCE_NOT_EXIST = 8;
+}
+
+message Status {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message CommonResponseHeader {
+  Status status = 1;
+  string request_id = 2;
+  string tracer_result = 3;
+}
+
+message TraceObservation {
+  uint64 sequence = 1;
+  string trace_id = 2;
+  string instance_id = 3;
+  repeated int64 token_ids = 4;
+  int64 timestamp_ns = 5;
+  repeated string location_spec_names = 6;
+}
+
+message TraceObservationBatchRequest {
+  string producer_id = 1;
+  repeated TraceObservation observations = 2;
+}
+
+message TraceObservationBatchResponse {
+  CommonResponseHeader header = 1;
+  uint64 accepted_count = 2;
+  uint64 last_accepted_sequence = 3;
+}
+
+service OptimizerEventStreamService {
+  rpc ReportTraceBatch(TraceObservationBatchRequest) returns (TraceObservationBatchResponse);
+}

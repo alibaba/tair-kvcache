@@ -1,7 +1,9 @@
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 
 #include <chrono>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -10,8 +12,38 @@
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
+#include "kv_cache_manager/manager/hash_util.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+// Bounds one RPC so a producer cannot pin a subscriber queue with a single
+// oversized batch; DashTrace batches well below this.
+constexpr int kMaxTraceObservationBatchSize = 256;
+
+// Mirrors CacheManager's prefix chaining: block i's key hashes the running
+// prefix hash together with block i's tokens, so keys stay comparable with
+// the ones produced by real GetCacheLocation traffic. A trailing partial
+// block is dropped, matching complete-block semantics.
+std::vector<std::int64_t> GenTraceBlockKeys(const google::protobuf::RepeatedField<std::int64_t> &tokens,
+                                            std::int32_t block_size) {
+    std::vector<std::int64_t> block_keys;
+    if (block_size <= 0) {
+        return block_keys;
+    }
+    const auto total_blocks = tokens.size() / block_size;
+    block_keys.reserve(total_blocks);
+    std::int64_t hash = 0;
+    for (int index = 0; index < total_blocks; ++index) {
+        const auto offset = index * block_size;
+        hash = hashInt64Array(hash, tokens.data() + offset, tokens.data() + offset + block_size);
+        block_keys.push_back(hash);
+    }
+    return block_keys;
+}
+
+} // namespace
 
 OptimizerEventServiceGRpc::OptimizerEventServiceGRpc(std::shared_ptr<SubscriptionEventSink> sink,
                                                      std::shared_ptr<RegistryManager> registry_manager,
@@ -100,6 +132,78 @@ grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
         return grpc::Status::OK;
     }
 
+    status->set_code(proto::optimizer::OK);
+    return grpc::Status::OK;
+}
+
+grpc::Status OptimizerEventServiceGRpc::ReportTraceBatch(grpc::ServerContext *,
+                                                         const proto::optimizer::TraceObservationBatchRequest *request,
+                                                         proto::optimizer::TraceObservationBatchResponse *response) {
+    auto *status = response->mutable_header()->mutable_status();
+    if (!IsAvailable()) {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("KVCM is unavailable");
+        return grpc::Status::OK;
+    }
+    if (request->producer_id().empty() || request->observations_size() == 0 ||
+        request->observations_size() > kMaxTraceObservationBatchSize) {
+        status->set_code(proto::optimizer::INVALID_ARGUMENT);
+        status->set_message("producer_id and 1..256 observations are required");
+        return grpc::Status::OK;
+    }
+
+    // A producer numbers its own observations, so a non-increasing sequence
+    // means the batch is malformed rather than merely late.
+    std::uint64_t previous_sequence = 0;
+    bool has_previous_sequence = false;
+    for (const auto &observation : request->observations()) {
+        if (observation.trace_id().empty() || observation.instance_id().empty() ||
+            observation.token_ids().empty() ||
+            (has_previous_sequence && observation.sequence() <= previous_sequence)) {
+            status->set_code(proto::optimizer::INVALID_ARGUMENT);
+            status->set_message("invalid observation or non-increasing sequence");
+            return grpc::Status::OK;
+        }
+        previous_sequence = observation.sequence();
+        has_previous_sequence = true;
+    }
+
+    std::vector<proto::optimizer::TraceQueryRequest> events;
+    events.reserve(request->observations_size());
+    for (const auto &observation : request->observations()) {
+        RequestContext request_context(observation.trace_id());
+        const auto instance_info = registry_manager_->GetInstanceInfo(&request_context, observation.instance_id());
+        if (!instance_info || instance_info->block_size() <= 0) {
+            status->set_code(proto::optimizer::INSTANCE_NOT_EXIST);
+            status->set_message("instance metadata is unavailable");
+            return grpc::Status::OK;
+        }
+
+        auto &event = events.emplace_back();
+        event.set_trace_id(observation.trace_id());
+        event.set_instance_id(observation.instance_id());
+        event.set_input_token_len(observation.token_ids_size());
+        event.set_timestamp_ns(observation.timestamp_ns());
+        event.set_producer_id(request->producer_id());
+        event.set_source_sequence(observation.sequence());
+        for (const auto key : GenTraceBlockKeys(observation.token_ids(), instance_info->block_size())) {
+            event.add_block_keys(key);
+        }
+        for (const auto &name : observation.location_spec_names()) {
+            event.add_location_spec_names(name);
+        }
+    }
+
+    // All-or-nothing admission: a subscriber must never observe a partial
+    // batch, otherwise the replayed request order silently loses a suffix.
+    std::lock_guard<std::mutex> report_lock(report_trace_mutex_);
+    if (!sink_->SendBatch(events)) {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("optimizer subscriber queue is unavailable or full");
+        return grpc::Status::OK;
+    }
+    response->set_accepted_count(events.size());
+    response->set_last_accepted_sequence(request->observations(request->observations_size() - 1).sequence());
     status->set_code(proto::optimizer::OK);
     return grpc::Status::OK;
 }

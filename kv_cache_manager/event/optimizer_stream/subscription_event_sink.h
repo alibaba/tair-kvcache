@@ -37,11 +37,13 @@ public:
 
         Subscription(std::string consumer_id, std::size_t queue_size);
         bool Enqueue(const proto::optimizer::TraceQueryRequest &event);
+        bool EnqueueBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events);
+        std::size_t QueueSize() const;
         void Close();
 
         const std::string consumer_id_;
         const std::size_t queue_size_;
-        std::mutex mutex_;
+        mutable std::mutex mutex_;
         std::condition_variable cv_;
         std::deque<proto::optimizer::TraceQueryRequest> queue_;
         bool closed_ = false;
@@ -61,10 +63,14 @@ public:
     bool accepting_subscriptions() const { return accepting_subscriptions_.load(); }
 
     bool Send(const proto::optimizer::TraceQueryRequest &event) override;
+    // Enqueue a complete batch or nothing for each subscriber. This prevents
+    // a saturated Optimizer connection from seeing an arbitrary batch prefix.
+    bool SendBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events);
     void Stop() override;
     std::size_t DroppedCount() const;
 
     std::size_t SubscriberCount() const;
+    std::size_t QueuedCount() const;
     bool stopped() const { return stopped_.load(); }
 
 private:

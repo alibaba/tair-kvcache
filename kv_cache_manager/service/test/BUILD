@@ -75,6 +75,7 @@ cc_test(
         "//kv_cache_manager/event:optimizer_event_publisher",
         "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
         "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/manager:hash_util",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "//kv_cache_manager/service:grpc_wrapper",

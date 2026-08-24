@@ -71,6 +71,24 @@ TEST_F(SubscriptionEventSinkTest, TestDropsWithoutSubscriberAndAtQueueLimit) {
     EXPECT_EQ("queued", event.trace_id());
 }
 
+TEST_F(SubscriptionEventSinkTest, TestBatchAdmissionIsAtomicPerSubscriber) {
+    SubscriptionEventSink sink(MakeSinkConfig(1, 2));
+    auto subscription = sink.Subscribe("optimizer");
+    ASSERT_NE(nullptr, subscription);
+
+    ASSERT_TRUE(sink.Send(MakeRequest("queued")));
+    EXPECT_FALSE(sink.SendBatch({MakeRequest("batch-1"), MakeRequest("batch-2")}));
+    EXPECT_EQ(2u, sink.DroppedCount());
+    EXPECT_EQ(1u, sink.QueuedCount());
+
+    proto::optimizer::TraceQueryRequest event;
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              subscription->WaitNext(&event, std::chrono::milliseconds(10)));
+    EXPECT_EQ("queued", event.trace_id());
+    EXPECT_EQ(SubscriptionEventSink::Subscription::WaitResult::kTimeout,
+              subscription->WaitNext(&event, std::chrono::milliseconds(10)));
+}
+
 TEST_F(SubscriptionEventSinkTest, TestRejectsExcessSubscribers) {
     SubscriptionEventSink sink(MakeSinkConfig(1, 1));
     ASSERT_NE(nullptr, sink.Subscribe("first"));
