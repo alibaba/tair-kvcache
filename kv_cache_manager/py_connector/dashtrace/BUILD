@@ -17,6 +17,10 @@ py_library(
         "request_observer.py",
         "trace_recorder.py",
     ],
+    deps = [
+        "//kv_cache_manager:grpcio",
+        "//kv_cache_manager:protobuf",
+    ],
 )
 
 py_test(

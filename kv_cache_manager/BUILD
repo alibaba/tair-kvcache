@@ -39,7 +39,9 @@ bundle_files(
 )
 
 requirement([
+    "grpcio",
     "grpcio-tools",
+    "protobuf",
     "setuptools",
 ])
 
