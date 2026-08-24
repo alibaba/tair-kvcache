@@ -10,6 +10,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
@@ -54,11 +55,15 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     }
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
-    metrics_reporter_ =
-        std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, config_.prometheus_prefix());
-    if (!metrics_reporter_->InitKmonitor()) {
-        KVCM_LOG_WARN("KMonitor init failed, kmonitor metrics disabled");
+    if (config_.metrics_reporter_type() == "kmonitor") {
+        kmonitor_metrics_reporter_ = std::make_shared<OptimizerKmonitorMetricsReporter>(config_.prometheus_prefix());
+        if (!kmonitor_metrics_reporter_->Init()) {
+            KVCM_LOG_WARN("KMonitor init failed, kmonitor metrics disabled");
+            kmonitor_metrics_reporter_.reset();
+        }
     }
+    metrics_reporter_ =
+        std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, kmonitor_metrics_reporter_);
 
     service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
 
@@ -195,8 +200,9 @@ void OnlineOptimizerServer::DoStop() {
         metrics_report_thread_->Stop();
         metrics_report_thread_.reset();
     }
-    if (metrics_reporter_) {
-        metrics_reporter_->ShutdownKmonitor();
+    if (kmonitor_metrics_reporter_) {
+        kmonitor_metrics_reporter_->Shutdown();
+        kmonitor_metrics_reporter_.reset();
     }
     KVCM_LOG_INFO("OnlineOptimizerServer stopped");
 }

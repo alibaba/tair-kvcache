@@ -181,6 +181,7 @@ cc_library(
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         ":kvcm_event_subscriber",
         ":online_optimizer_server_config",
+        "//kv_cache_manager/optimizer/metrics:optimizer_kmonitor_metrics_reporter",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
         ":optimizer_service_grpc",
         ":optimizer_service_http",

@@ -327,6 +327,7 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
         if (ec == EC_OK) {
             if (collector) {
                 collector->set_total_blocks(response.total_blocks());
+                collector->set_input_token_len(response.input_token_len());
                 std::vector<PerCapacityHitInfo> per_capacity_hits;
                 per_capacity_hits.reserve(response.capacity_results_size());
                 for (const auto &capacity_result : response.capacity_results()) {
