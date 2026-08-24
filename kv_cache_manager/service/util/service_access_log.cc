@@ -12,7 +12,7 @@ ServiceAccessLog::~ServiceAccessLog() {
     // TODO  show request and response in debug mode
     // TODO Data Masking in request and response maybe
     std::string begin_time_str = TimestampUtil::FormatTimestampUs(request_context_->request_begin_time_us());
-    auto cost_us = TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us();
+    auto cost_us = TimestampUtil::GetSteadyTimeUs() - request_context_->request_begin_steady_time_us();
     std::string json_log = "{"
                            "\"request_begin_time\":\"" +
                            begin_time_str +

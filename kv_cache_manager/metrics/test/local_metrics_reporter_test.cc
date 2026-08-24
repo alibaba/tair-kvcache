@@ -262,6 +262,10 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    EXPECT_TRUE(request_context.has_service_latency());
+    EXPECT_GT(request_context.service_query_rt_us(), 0);
+    EXPECT_GE(request_context.service_request_context_rt_us(), request_context.service_query_rt_us());
+    EXPECT_EQ(1, service_collector->get_service_query_counter_metrics());
     EXPECT_GT(snapshot_collector->get_service_query_rt_us_metrics(), 0.);
     EXPECT_DOUBLE_EQ(1., snapshot_collector->get_service_error_code_metrics());
     EXPECT_EQ(1, snapshot_collector->get_service_query_counter_metrics());

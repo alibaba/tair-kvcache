@@ -26,7 +26,7 @@ public:
     ChronoScopeGuard() noexcept = default;
 
     explicit ChronoScopeGuard(Gauge *g, bool auto_finish = true) noexcept
-        : gauge_(g), begin_us_(g ? TimestampUtil::GetCurrentTimeUs() : 0), auto_finish_(auto_finish) {}
+        : gauge_(g), begin_us_(g ? TimestampUtil::GetSteadyTimeUs() : 0), auto_finish_(auto_finish) {}
 
     ChronoScopeGuard(const ChronoScopeGuard &) = delete;
     ChronoScopeGuard &operator=(const ChronoScopeGuard &) = delete;
@@ -53,14 +53,17 @@ public:
         }
     }
 
-private:
-    void Finish() noexcept {
-        if (gauge_) {
-            *gauge_ = static_cast<double>(TimestampUtil::GetCurrentTimeUs() - begin_us_);
-            gauge_ = nullptr;
+    std::uint64_t Finish() noexcept {
+        if (!gauge_) {
+            return 0;
         }
+        const auto elapsed_us = static_cast<std::uint64_t>(TimestampUtil::GetSteadyTimeUs() - begin_us_);
+        *gauge_ = static_cast<double>(elapsed_us);
+        gauge_ = nullptr;
+        return elapsed_us;
     }
 
+private:
     Gauge *gauge_ = nullptr;
     std::int64_t begin_us_ = 0;
     bool auto_finish_ = false;
@@ -249,6 +252,16 @@ public:                                                                         
     std::dynamic_pointer_cast<ServiceMetricsCollector>(KVCM_METRICS_COLLECTOR_(name))
 #endif
 
+struct HttpRequestLatency {
+    bool has_service_latency{false};
+    std::uint64_t service_query_rt_us{0};
+    std::uint64_t request_context_rt_us{0};
+    std::uint64_t request_parse_time_us{0};
+    std::uint64_t service_callback_time_us{0};
+    std::uint64_t response_serialize_time_us{0};
+    std::uint64_t handler_time_us{0};
+};
+
 class ServiceMetricsCollector final : public MetricsCollector {
     // service metrics
     // no need for gauge metrics (service, qps) since the value always be 1.0
@@ -258,6 +271,16 @@ class ServiceMetricsCollector final : public MetricsCollector {
     // no need for gauge metrics (service, error_qps) since the value always be 1.0
     KVCM_COUNTER_METRICS(service, error_counter) // for local metrics registry
     KVCM_GAUGE_METRICS(service, request_queue_size)
+
+    // HTTP stage sums use request_counter; guarded service sums use service_query_counter.
+    KVCM_COUNTER_METRICS(http, request_counter)
+    KVCM_COUNTER_METRICS(http, service_query_counter)
+    KVCM_COUNTER_METRICS(http, service_query_rt_us_sum)
+    KVCM_COUNTER_METRICS(http, request_context_rt_us_sum)
+    KVCM_COUNTER_METRICS(http, request_parse_time_us_sum)
+    KVCM_COUNTER_METRICS(http, service_callback_time_us_sum)
+    KVCM_COUNTER_METRICS(http, response_serialize_time_us_sum)
+    KVCM_COUNTER_METRICS(http, handler_time_us_sum)
 
     // manager metrics
     KVCM_GAUGE_METRICS(manager, request_key_count)
@@ -318,6 +341,7 @@ public:
     ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
     ~ServiceMetricsCollector() override = default;
 
+    void RecordHttpRequestLatency(const HttpRequestLatency &latency) noexcept;
     bool Init() override;
 };
 

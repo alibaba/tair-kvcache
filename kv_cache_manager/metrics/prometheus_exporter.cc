@@ -1,6 +1,7 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 #include <cmath>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -114,6 +115,9 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     // If every series in a family is untouched, the # HELP / # TYPE
     // header is omitted as well.
     //
+    // Request-scoped Gauges are consumed per exporter scrape, so a later
+    // scrape without a new write does not repeat an obsolete request sample.
+    //
     // Histogram families are identified via explicit metric→family mapping
     // registered by RevisitIntervalHistogram::Init(). The exporter queries
     // the registry — no suffix-based guessing.
@@ -126,6 +130,15 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
             continue;
+        }
+        const bool steal_on_expose = val->steal_on_prometheus_expose.load(std::memory_order_relaxed);
+        double consumed_gauge_value = 0.;
+        if (steal_on_expose) {
+            consumed_gauge_value = val->prometheus_gauge_value.exchange(
+                std::numeric_limits<double>::quiet_NaN(), std::memory_order_acq_rel);
+            if (std::isnan(consumed_gauge_value)) {
+                continue;
+            }
         }
 
         std::string prom_name = SanitizeName(prefix, name);
@@ -172,7 +185,9 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
                 ss << ' ' << raw;
             }
         } else if (std::holds_alternative<GaugeValue>(val->value)) {
-            double gv = std::get<GaugeValue>(val->value).load(std::memory_order_relaxed);
+            const double gv = steal_on_expose
+                                  ? consumed_gauge_value
+                                  : std::get<GaugeValue>(val->value).load(std::memory_order_relaxed);
             if (std::isnan(gv)) {
                 ss << " NaN";
             } else if (std::isinf(gv)) {

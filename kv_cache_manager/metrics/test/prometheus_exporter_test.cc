@@ -81,6 +81,37 @@ TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsReuseServiceTagsAndValu
     EXPECT_EQ(output.find("kvcm_event_report_request_counter"), std::string::npos) << output;
 }
 
+TEST_F(PrometheusExporterTest, RequestGaugeIsConsumedWhileStateGaugePersists) {
+    ServiceMetricsCollector request_collector(registry_);
+    ASSERT_TRUE(request_collector.Init());
+    SET_METRICS_(&request_collector, service, query_rt_us, 321.);
+    SET_METRICS_(&request_collector, service, request_queue_size, 7.);
+
+    const std::string first = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(first.find("kvcm_service_query_rt_us 321"), std::string::npos) << first;
+    EXPECT_NE(first.find("kvcm_service_request_queue_size 7"), std::string::npos) << first;
+
+    const std::string second = PrometheusExporter::Expose(*registry_);
+    EXPECT_EQ(second.find("kvcm_service_query_rt_us"), std::string::npos) << second;
+    EXPECT_NE(second.find("kvcm_service_request_queue_size 7"), std::string::npos) << second;
+
+    SET_METRICS_(&request_collector, service, query_rt_us, 654.);
+    const std::string third = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(third.find("kvcm_service_query_rt_us 654"), std::string::npos) << third;
+}
+
+TEST_F(PrometheusExporterTest, PrometheusConsumptionDoesNotRaceGaugeSteal) {
+    Gauge gauge = registry_->GetStealGauge("service.query_rt_us");
+    gauge = 123.;
+
+    EXPECT_DOUBLE_EQ(123., gauge.Steal());
+    const std::string first = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(first.find("kvcm_service_query_rt_us 123"), std::string::npos) << first;
+
+    const std::string second = PrometheusExporter::Expose(*registry_);
+    EXPECT_EQ(second.find("kvcm_service_query_rt_us"), std::string::npos) << second;
+}
+
 TEST_F(PrometheusExporterTest, MultipleTagSets) {
     MetricsTags tags_a = {{"instance_group", "group_a"}};
     MetricsTags tags_b = {{"instance_group", "group_b"}};
@@ -170,6 +201,7 @@ TEST_F(PrometheusExporterTest, MultipleMetricFamilies) {
 
     std::string output = PrometheusExporter::Expose(*registry_);
     EXPECT_NE(output.find("# TYPE kvcm_meta_indexer_total_key_count gauge"), std::string::npos);
+    EXPECT_NE(output.find("kvcm_meta_indexer_total_key_count 42000"), std::string::npos);
     EXPECT_NE(output.find("# TYPE kvcm_service_query_counter counter"), std::string::npos);
 }
 

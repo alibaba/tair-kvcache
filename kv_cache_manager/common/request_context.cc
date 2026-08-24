@@ -15,6 +15,7 @@ RequestContext::RequestContext(const std::string &trace_id, std::shared_ptr<Metr
     : trace_id_(trace_id), metrics_collector_(std::move(metrics_collector)) {
     request_id_ = trace_id + "_" + std::to_string(TimestampUtil::GetCurrentTimeUs());
     request_begin_time_us_ = TimestampUtil::GetCurrentTimeUs();
+    request_begin_steady_time_us_ = TimestampUtil::GetSteadyTimeUs();
     query_tracer_.reset(new QueryTracer);
     need_span_tracer_ = StringUtil::EndsWith(trace_id, "__kvcm_need_span_tracer");
     if (need_span_tracer_) {

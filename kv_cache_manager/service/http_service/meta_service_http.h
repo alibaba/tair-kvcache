@@ -61,7 +61,8 @@ public:
 
     void ReportEvent(coro_http::coro_http_connection *http_conn,
                      proto::meta::ReportEventRequest *request,
-                     proto::meta::ReportEventResponse *response);
+                     proto::meta::ReportEventResponse *response,
+                     HttpRequestMetricsSample *http_metrics_sample);
 
     void GetHostCacheState(coro_http::coro_http_connection *http_conn,
                            proto::meta::GetHostCacheStateRequest *request,

@@ -226,7 +226,8 @@ TEST_F(MetricsCollectorTest, ManagerMetricsTest) {
 
 // Test Service metrics functionality
 TEST_F(MetricsCollectorTest, ServiceMetricsTest) {
-    metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    metrics_collector_ =
+        std::make_shared<ServiceMetricsCollector>(metrics_registry_, MetricsTags{{"api_name", "ReportEvent"}});
     metrics_collector_->Init();
 
     auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
@@ -252,6 +253,22 @@ TEST_F(MetricsCollectorTest, ServiceMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, service, error_code), 404.);
     EXPECT_DOUBLE_EQ(GET(p, service, request_queue_size), 10.);
 
+    p->RecordHttpRequestLatency({true, 100, 130, 10, 20, 30, 60});
+    EXPECT_EQ(GET(p, http, request_counter), 1);
+    EXPECT_EQ(GET(p, http, service_query_counter), 1);
+    EXPECT_EQ(GET(p, http, service_query_rt_us_sum), 100);
+    EXPECT_EQ(GET(p, http, request_context_rt_us_sum), 130);
+    EXPECT_EQ(GET(p, http, request_parse_time_us_sum), 10);
+    EXPECT_EQ(GET(p, http, service_callback_time_us_sum), 20);
+    EXPECT_EQ(GET(p, http, response_serialize_time_us_sum), 30);
+    EXPECT_EQ(GET(p, http, handler_time_us_sum), 60);
+
+    p->RecordHttpRequestLatency({false, 0, 0, 1, 2, 3, 4});
+    EXPECT_EQ(GET(p, http, request_counter), 2);
+    EXPECT_EQ(GET(p, http, service_query_counter), 1);
+    EXPECT_EQ(GET(p, http, service_query_rt_us_sum), 100);
+    EXPECT_EQ(GET(p, http, request_context_rt_us_sum), 130);
+    EXPECT_EQ(GET(p, http, handler_time_us_sum), 64);
     // Test time measurement
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, ServiceQuery);
     usleep(1000); // 1ms

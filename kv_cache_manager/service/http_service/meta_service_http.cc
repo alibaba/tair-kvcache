@@ -181,9 +181,11 @@ void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
 
 void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
-                                  proto::meta::ReportEventResponse *response) {
+                                  proto::meta::ReportEventResponse *response,
+                                  HttpRequestMetricsSample *http_metrics_sample) {
     std::string metrics_type;
     auto metrics_collector = ResolveReportEventMetricsCollector(*request, metrics_type);
+    http_metrics_sample->collector = std::static_pointer_cast<ServiceMetricsCollector>(metrics_collector);
     API_CONTEXT_INIT(metrics_collector, GetHttpClientIp, http_conn)
     std::string first_event_type = "N/A";
     std::string first_block_key = "N/A";
@@ -210,6 +212,9 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                    first_block_key.c_str());
     AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
+    http_metrics_sample->latency.service_query_rt_us = request_context->service_query_rt_us();
+    http_metrics_sample->latency.request_context_rt_us = request_context->service_request_context_rt_us();
+    http_metrics_sample->latency.has_service_latency = request_context->has_service_latency();
 }
 
 void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,

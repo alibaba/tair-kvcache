@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -38,6 +39,10 @@ public:
     const std::string &trace_id() const { return trace_id_; }
     const std::string &request_id() const { return request_id_; }
     const int64_t request_begin_time_us() const { return request_begin_time_us_; }
+    const int64_t request_begin_steady_time_us() const { return request_begin_steady_time_us_; }
+    std::uint64_t service_query_rt_us() const { return service_query_rt_us_; }
+    std::uint64_t service_request_context_rt_us() const { return service_request_context_rt_us_; }
+    bool has_service_latency() const { return has_service_latency_; }
     const std::string &api_name() const { return api_name_; }
     const std::string &client_ip() const { return client_ip_; }
     const int status_code() const { return status_code_; }
@@ -49,6 +54,11 @@ public:
     void set_api_name(const std::string &value) { api_name_ = value; }
     void set_client_ip(const std::string &value) { client_ip_ = value; }
     void set_status_code(int value) { status_code_ = value; }
+    void set_service_latency(std::uint64_t query_rt_us, std::uint64_t request_context_rt_us) {
+        service_query_rt_us_ = query_rt_us;
+        service_request_context_rt_us_ = request_context_rt_us;
+        has_service_latency_ = true;
+    }
     void set_request_debug(const std::string &value) { request_debug_ = value; }
     void set_response_debug(const std::string &value) { response_debug_ = value; }
     void set_parent_span_tracer(SpanTracer *tracer) const { parent_span_tracer_ = tracer; }
@@ -59,6 +69,10 @@ private:
     std::string trace_id_;   // 用户传递的trace_id
     std::string request_id_; // 为每一次请求生成的request_id
     int64_t request_begin_time_us_;
+    int64_t request_begin_steady_time_us_;
+    std::uint64_t service_query_rt_us_{0};
+    std::uint64_t service_request_context_rt_us_{0};
+    bool has_service_latency_{false};
     std::string api_name_; // 调用的接口名称
     std::string client_ip_;
     int status_code_{0};

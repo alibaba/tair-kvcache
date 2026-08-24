@@ -20,6 +20,7 @@ class MetricsRegistry;
 //     escaped per the exposition format).
 //   - CounterValue metrics are emitted with TYPE counter.
 //   - GaugeValue   metrics are emitted with TYPE gauge.
+//   - Request-scoped Gauges are consumed by a scrape; state Gauges persist.
 class PrometheusExporter {
 public:
     // Serialize all metrics in |registry| to Prometheus text format.
