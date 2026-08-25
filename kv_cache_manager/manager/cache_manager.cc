@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <charconv>
 #include <chrono>
 #include <cinttypes>
 #include <limits>
@@ -90,6 +91,39 @@ namespace kv_cache_manager {
     } while (0)
 
 namespace {
+struct ReporterIdentityView {
+    std::string_view base_host;
+    std::optional<uint64_t> engine_rank;
+};
+
+bool ParseReporterIdentity(std::string_view host_ip_port, ReporterIdentityView &out) {
+    out = {};
+    if (host_ip_port.empty()) {
+        return false;
+    }
+    const size_t separator = host_ip_port.find('@');
+    if (separator == std::string_view::npos) {
+        out.base_host = host_ip_port;
+        return true;
+    }
+    if (separator == 0 || separator + 1 >= host_ip_port.size() ||
+        host_ip_port.find('@', separator + 1) != std::string_view::npos) {
+        return false;
+    }
+    const std::string_view rank_text = host_ip_port.substr(separator + 1);
+    if (rank_text.size() > 1 && rank_text.front() == '0') {
+        return false;
+    }
+    uint64_t rank = 0;
+    const auto [end, ec] = std::from_chars(rank_text.data(), rank_text.data() + rank_text.size(), rank);
+    if (ec != std::errc{} || end != rank_text.data() + rank_text.size()) {
+        return false;
+    }
+    out.base_host = host_ip_port.substr(0, separator);
+    out.engine_rank = rank;
+    return true;
+}
+
 CacheManager::KeyVector GenKeyVector(const CacheManager::TokenIdsVector &tokens, int64_t block_size) {
     std::vector<int64_t> block_keys;
     size_t total_blocks = tokens.size() / block_size;
@@ -2641,7 +2675,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     const std::string &host_ip_port = request->host_ip_port();
     auto *response_status = response->mutable_header()->mutable_status();
 
-    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port)) {
+    ReporterIdentityView reporter_identity;
+    if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port) ||
+        !ParseReporterIdentity(host_ip_port, reporter_identity)) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: invalid instance_id or host_ip_port", trace_id.c_str());
         response_status->set_code(proto::meta::INVALID_ARGUMENT);
         response_status->set_message("invalid instance_id or host_ip_port");
@@ -4577,6 +4613,7 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
     struct EventVisibilitySnapshot {
         std::shared_ptr<EventReportBackend> backend;
         EventReportBackend::QueryVisibilitySnapshot reporters;
+        std::map<std::string, std::vector<std::string>, std::less<>> logical_hosts_by_reporter;
     };
     struct EventVisibilitySnapshots {
         std::once_flag initialize_once;
@@ -4607,6 +4644,42 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
             snapshot.backend = std::move(event_backend);
             snapshot.backend->GetQueryVisibilitySnapshot(instance_id, snapshot.reporters);
             event_snapshots->by_storage_type.emplace(storage_type, std::move(snapshot));
+        }
+
+        std::map<std::string, std::vector<std::string>, std::less<>> ranked_hosts_by_base;
+        const auto l1p5_it = event_snapshots->by_storage_type.find(
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        if (l1p5_it != event_snapshots->by_storage_type.end()) {
+            for (const auto &[reporter, state] : l1p5_it->second.reporters) {
+                (void)state;
+                ReporterIdentityView identity;
+                if (ParseReporterIdentity(reporter, identity) && identity.engine_rank.has_value()) {
+                    ranked_hosts_by_base[std::string(identity.base_host)].push_back(reporter);
+                }
+            }
+        }
+        for (auto &[base, ranked_hosts] : ranked_hosts_by_base) {
+            (void)base;
+            std::sort(ranked_hosts.begin(), ranked_hosts.end());
+            ranked_hosts.erase(std::unique(ranked_hosts.begin(), ranked_hosts.end()), ranked_hosts.end());
+        }
+        for (auto &[storage_type, snapshot] : event_snapshots->by_storage_type) {
+            for (const auto &[reporter, state] : snapshot.reporters) {
+                (void)state;
+                auto &logical_hosts = snapshot.logical_hosts_by_reporter[reporter];
+                ReporterIdentityView identity;
+                const bool parsed = ParseReporterIdentity(reporter, identity);
+                if (parsed && storage_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
+                    !identity.engine_rank.has_value()) {
+                    const auto ranked_it = ranked_hosts_by_base.find(identity.base_host);
+                    if (ranked_it != ranked_hosts_by_base.end()) {
+                        logical_hosts = ranked_it->second;
+                    }
+                }
+                if (logical_hosts.empty()) {
+                    logical_hosts.push_back(reporter);
+                }
+            }
         }
     };
 
@@ -4642,6 +4715,10 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         out_info.has_reporter_identity = true;
         out_info.reporter_medium = reporter_medium;
         out_info.reporter_host = reporter_host;
+        const auto logical_hosts_it = snapshot_it->second.logical_hosts_by_reporter.find(reporter_host);
+        if (logical_hosts_it != snapshot_it->second.logical_hosts_by_reporter.end()) {
+            out_info.logical_hosts = &logical_hosts_it->second;
+        }
         return true;
     };
 }
