@@ -307,7 +307,7 @@ class TestStateCompleteMask(unittest.TestCase):
     def _req(self, tables):
         return RequestLedger(vllm_request=FakeRequest("r0", []),
                              block_ids_per_group=tables,
-                             token_len=0, has_saved_block_num=0)
+                             has_saved_block_num=0)
 
     def test_full_attention_is_always_complete(self):
         conn = make_connector_scheduler(manager_block_size=16, num_groups=1)
@@ -645,7 +645,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             vllm_request=FakeRequest("r0", list(range(64))),
             # Drafter table (group 0) lags with 1 block; attention has 4.
             block_ids_per_group=[[100], [200, 201, 202, 203]],
-            token_len=64, has_saved_block_num=0)
+            has_saved_block_num=0)
         self.assertEqual(conn._num_allocated_blocks(ledger), 4)
 
     def test_num_allocated_blocks_still_mins_transferred_groups(self):
@@ -663,14 +663,14 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         ledger = RequestLedger(
             vllm_request=FakeRequest("r0", []),
             block_ids_per_group=[[9], [1, 2, 3], [4, 5]],
-            token_len=0, has_saved_block_num=0)
+            has_saved_block_num=0)
         self.assertEqual(conn._num_allocated_blocks(ledger), 2)
 
     def test_num_allocated_blocks_empty(self):
         conn = self._skipped_group0_connector()
         ledger = RequestLedger(vllm_request=FakeRequest("r0", []),
                                block_ids_per_group=[],
-                               token_len=0, has_saved_block_num=0)
+                               has_saved_block_num=0)
         self.assertEqual(conn._num_allocated_blocks(ledger), 0)
 
     def test_single_group_reports_failures_against_group0_table(self):
@@ -797,7 +797,6 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # The ledger absorbed the first allocation's block table.
         self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                          [[100, 101, 102]])
-        self.assertEqual(conn._tracked["r0"].token_len, 40)
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
@@ -825,14 +824,12 @@ class TestBuildConnectorMeta(unittest.TestCase):
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[None])
         conn.build_connector_meta(out)
-        self.assertEqual(conn._tracked["r0"].token_len, 48)
         # Step 3: 2 more tokens with a new block -> table grows.
         req.output_token_ids = list(range(1000, 1010))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 2},
             new_block_ids=[[[103]]])
         conn.build_connector_meta(out)
-        self.assertEqual(conn._tracked["r0"].token_len, 50)
         self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                          [[100, 101, 102, 103]])
 
@@ -895,8 +892,8 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # sampled. A block whose last token -- and thus cache key -- is not
         # known yet must not be announced (the manager would return one
         # location fewer than announced and the worker would drop the whole
-        # session). Regression test: token_len-derived counts did exactly
-        # that.
+        # session). Regression test: the scheduled-count-derived block
+        # count (a since-removed ledger field) did exactly that.
         conn = make_scheduler_connector(mbs=self.MBS)
         req, _ = self._new_request(conn, "r0", 40, 3)  # saved 2 blocks
         conn._http_executor.submit.reset_mock()

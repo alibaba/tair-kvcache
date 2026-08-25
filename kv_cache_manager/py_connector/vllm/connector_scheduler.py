@@ -49,8 +49,6 @@ class RequestLedger:
     vllm_request: "Request"
     # Per kv_cache_group block table, in each group's own block_size units.
     block_ids_per_group: List[List[int]]
-    # Tokens accounted for by the ledger (prompt + scheduled decode steps).
-    token_len: int
     # Manager blocks already saved (or covered by an external hit).
     has_saved_block_num: int
     # Save-session ledger: sessions started vs sessions handed to the worker.
@@ -288,7 +286,6 @@ class ConnectorScheduler:
             ledger = RequestLedger(
                 vllm_request=request,
                 block_ids_per_group=[],
-                token_len=len(request.prompt_token_ids),
                 has_saved_block_num=0,
             )
             self._tracked[req_id] = ledger
@@ -380,15 +377,31 @@ class ConnectorScheduler:
         for vllm_req in scheduler_output.scheduled_new_reqs:
             ledger = self._tracked.get(vllm_req.req_id)
             if ledger is None:
-                continue  # never allocated (defensive): nothing to record
+                # update_state_after_alloc creates the ledger before vLLM
+                # can schedule the request, so this only fires on a broken
+                # hook-order contract: log it loudly instead of silently
+                # dropping the block table.
+                logger.warning(
+                    "scheduled new req %s has no ledger (hook-order "
+                    "contract broken?); its block table is not recorded",
+                    vllm_req.req_id)
+                continue
             ledger.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, req_id in enumerate(cached_reqs.req_ids):
             ledger = self._tracked.get(req_id)
             if ledger is None:
+                if hasattr(cached_reqs, "resumed_req_ids"):
+                    resumed = req_id in cached_reqs.resumed_req_ids
+                else:
+                    resumed = cached_reqs.resumed_from_preemption[idx]
+                logger.warning(
+                    "scheduled cached req %s has no ledger (resumed=%s, "
+                    "scheduled_tokens=%d); its block increments are not "
+                    "recorded", req_id, resumed,
+                    scheduler_output.num_scheduled_tokens[req_id])
                 continue
-            ledger.token_len += scheduler_output.num_scheduled_tokens[req_id]
 
             if hasattr(cached_reqs, "resumed_req_ids"):
                 resumed = req_id in cached_reqs.resumed_req_ids
@@ -419,15 +432,16 @@ class ConnectorScheduler:
         produces surfaces in _collect_save_instructions on a later step.
         """
         for ledger in self._tracked.values():
-            # Count blocks by the key material, not by token_len: during
-            # decode all_token_ids lags token_len by one (the token scheduled
-            # in this step is appended to it only once sampled), so a
-            # token_len-derived count announces blocks whose last token --
-            # and thus cache key -- is not known yet. The manager then
-            # returns one location fewer than announced and the worker's
-            # strict alignment check drops the whole session. The allocated
-            # cap still bounds the other way: under chunked prefill
-            # all_token_ids runs ahead of the computed KV.
+            # Count blocks by the key material (all_token_ids), never by the
+            # scheduled token count: during decode all_token_ids lags one
+            # token behind (the token scheduled in this step is appended only
+            # once sampled), so a scheduled-count-derived block count
+            # announces blocks whose last token -- and thus cache key -- is
+            # not known yet. The manager then returns one location fewer
+            # than announced and the worker's strict alignment check drops
+            # the whole session. The allocated cap still bounds the other
+            # way: under chunked prefill all_token_ids runs ahead of the
+            # computed KV.
             target_save_num = min(
                 len(ledger.vllm_request.all_token_ids),
                 self._num_allocated_blocks(ledger) * self._vllm_block_size) \
@@ -542,9 +556,19 @@ class ConnectorScheduler:
 
         locations = response["locations"]
         write_session_id = response["write_session_id"]
-        logger.info("req:%s save session %s: block_mask=%s locations=%d",
-                    req_id, write_session_id[:8],
-                    response.get("block_mask"), len(locations))
+        mask = response.get("block_mask") or {}
+        if "bool_masks" in mask:
+            values = mask["bool_masks"].get("values", [])
+            mask_summary = (f"bool_masks offset={mask['bool_masks'].get('offset')} "
+                            f"total={len(values)} "
+                            f"existing={sum(1 for v in values if v)}")
+        else:
+            mask_summary = f"offset={mask.get('offset')}"
+        logger.info("req:%s save session %s: block_mask %s locations=%d",
+                    req_id, write_session_id[:8], mask_summary, len(locations))
+        logger.debug("req:%s save session %s: block_mask=%s locations=%d",
+                     req_id, write_session_id[:8],
+                     response.get("block_mask"), len(locations))
 
         if not locations:
             try:
