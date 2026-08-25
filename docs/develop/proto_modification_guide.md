@@ -153,6 +153,12 @@ bazel test //kv_cache_manager/xxxx:xxxx
 - RTP-LLM C++客户端: kv_cache_manager/client
 - vLLM等Python客户端：kv_cache_manager/py_connector
 
+### 8. （如果是修改AdminService）同步适配 kvcm_ops 运维 CLI
+
+- 工具位置：`package/kvcm_ops`
+- 若 InstanceGroup / Storage 等管理对象新增或变更字段，需同步更新对应的 Python 模型（如 `kvcm/instance_group/util.py`）的构造、校验与 JSON 序列化/反序列化，以及相关 create/update 命令参数。
+- 否则 kvcm_ops 的 update 流程（GET → 整体 PUT）会静默丢弃服务端已有字段，导致配置被意外清空。
+
 ## 注意事项
 
 1. **字段编号**：在proto文件中添加新字段时，使用递增的字段编号，避免重复使用已存在的编号。

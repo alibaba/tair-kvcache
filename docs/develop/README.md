@@ -168,6 +168,10 @@ grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
 
 githooks中已经添加了C++等语言的格式化脚本，请确保开发环境安装了clang-format、autopep8、buildifier。（开发镜像均已预装）。
 
+## Proto 修改
+
+修改 `kv_cache_manager/protocol/protobuf` 下的 proto 定义时，请遵循 [Proto 文件修改指南](proto_modification_guide.md)，并同步完成其中列出的适配步骤（例如修改 AdminService 接口定义时需适配 `package/kvcm_ops` 运维 CLI）。
+
 ## 提交要求
 
 提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。

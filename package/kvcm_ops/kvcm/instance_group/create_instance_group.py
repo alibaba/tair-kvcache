@@ -92,7 +92,8 @@ def create_instance_group(args) -> InstanceGroup:
                                    user_data=args.user_data,
                                    version=1,
                                    extra_info=args.extra_info,
-                                   event_report_storage_candidates=args.event_report_storage_candidates)
+                                   event_report_storage_candidates=args.event_report_storage_candidates,
+                                   revisit_interval_buckets=args.revisit_interval_buckets)
     return instance_group
 
 
