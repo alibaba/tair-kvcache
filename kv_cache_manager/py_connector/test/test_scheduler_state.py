@@ -187,7 +187,7 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
     def test_preempted_requery_keeps_external_match(self):
         # Preemption alone is not a failure: the loaded KV is healthy, only
         # the scheduling position was lost, so the re-query matches again
-        # (full-attention models only -- hybrid cannot tell failure from
+        # (single-table shapes only -- multi-table cannot tell failure from
         # preemption, see test_hybrid_load_attempt_burns_the_match).
         conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
@@ -215,11 +215,39 @@ class TestGetNumNewMatchedTokens(unittest.TestCase):
         self.assertEqual(matched2, 0)
         self.assertFalse(async2)
 
+    def test_skipped_drafter_shape_burns_the_match(self):
+        # A skipped drafter group leaves two vLLM block tables even for an
+        # attention-only model: failures cannot be reported (single-group
+        # recovery unpack), so the conservative one-shot burn applies by
+        # block-table shape, not by hybridness.
+        conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, 2 * self.MBS)
+        # Two tables: group 0 (skipped drafter) + group 1 (transferred).
+        alloc(conn, req, matched, [[900], [100, 101, 102]])
+        matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched2, 0)
+        self.assertFalse(async2)
+
+    def test_multi_attention_group_shape_burns_the_match(self):
+        # Two transferred attention groups: the same multi-table shape, the
+        # same one-shot burn, despite the model being attention-only.
+        conn = make_scheduler_connector(
+            mbs=self.MBS, num_groups=2, locations=make_locations(2))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        matched, _ = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched, 2 * self.MBS)
+        alloc(conn, req, matched, [[100, 101], [200, 201]])
+        matched2, async2 = conn.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(matched2, 0)
+        self.assertFalse(async2)
+
     def test_load_attempted_flag_tracks_the_one_external_load(self):
         # load_attempted is explicit state, not inference from other fields:
         # set exactly when vLLM allocates blocks for an external hit. It only
-        # burns the re-query for hybrid requests (which get no failure
-        # signal); full-attention requests burn theirs through load_failed.
+        # burns the re-query for multi-table shapes (which get no failure
+        # signal); single-table requests burn theirs through load_failed.
         conn = make_scheduler_connector(mbs=self.MBS, locations=make_locations(2))
         req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
         conn.get_num_new_matched_tokens(req, 0)
@@ -645,10 +673,28 @@ class TestSkippedGroupIndexing(unittest.TestCase):
                                token_len=0, has_saved_block_num=0)
         self.assertEqual(conn._num_allocated_blocks(ledger), 0)
 
-    def test_load_failure_report_uses_transferred_group_table(self):
-        # start_load_kv (worker side) reports failed loads against the block
-        # table of the single transferred group -- which is group 1 here, not
-        # group 0.
+    def test_single_group_reports_failures_against_group0_table(self):
+        # Exactly one vLLM block table: the transferred group is 0 and the
+        # failure report maps manager blocks into its table.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(LoadRequest(
+            req_id="r0", manager_block_idxes=[0, 1],
+            need_load_locations=[{"location_specs": []}] * 2,
+            all_block_ids=[[10, 11, 12]]))
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [10, 11])  # report_ids from group 0's table
+        self.assertTrue(kwargs["report_failures"])
+
+    def test_skipped_drafter_shape_disables_failure_reporting(self):
+        # Two vLLM block tables (skipped drafter group 0 + transferred
+        # attention group 1): upstream recovery unpacks exactly one table,
+        # so reporting would crash the scheduler. Failures must NOT be
+        # reported for this shape even though the model is attention-only.
         conn = make_connector(manager_block_size=self.MBS)
         conn._group_metas = [AttentionGroupMeta(
             group_idx=1, layer_names=["a0"],
@@ -661,13 +707,67 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         meta.add_load_request(LoadRequest(
             req_id="r0", manager_block_idxes=[0, 1],
             need_load_locations=[{"location_specs": []}] * 2,
-            # Group 0 (drafter) has a lagging 1-entry table; indexing it would
-            # IndexError / report the wrong block ids.
+            # Group 0 (drafter) has a lagging 1-entry table.
             all_block_ids=[[999], [10, 11]]))
         conn.start_load_kv(MagicMock(), meta)
         args, kwargs = conn._data_transfer.create_load_done_callback.call_args
-        self.assertEqual(args[3], [10, 11])  # report_ids from group 1's table
-        self.assertTrue(kwargs["report_failures"])
+        self.assertEqual(args[3], [])  # no report ids when not reporting
+        self.assertFalse(kwargs["report_failures"])
+
+    def test_multi_attention_group_shape_disables_failure_reporting(self):
+        # Two transferred attention groups (e.g. unmerged sw + full): two
+        # vLLM block tables, attention-only, still breaks the single-table
+        # recovery unpack -- must not be reported.
+        conn = make_connector(manager_block_size=self.MBS, num_groups=2)
+        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(LoadRequest(
+            req_id="r0", manager_block_idxes=[0],
+            need_load_locations=[{"location_specs": []}],
+            all_block_ids=[[10], [20]]))
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+
+    def test_hybrid_shape_disables_failure_reporting(self):
+        # Attention + mamba: two vLLM block tables, the original hybrid case.
+        conn = make_connector(manager_block_size=self.MBS,
+                              num_groups=1, num_state_groups=1)
+        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(LoadRequest(
+            req_id="r0", manager_block_idxes=[0],
+            need_load_locations=[{"location_specs": []}],
+            all_block_ids=[[10], [20]]))
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+
+    def test_lone_state_group_refuses_to_report(self):
+        # A single vLLM block table that is not attention (pure mamba): the
+        # token-granular recovery math upstream cannot consume state block
+        # ids; the worker must fail loudly instead of reporting nonsense.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [StateGroupMeta(
+            group_idx=0, layer_names=["m0"],
+            block_size=self.MBS, per_block_bytes=0, page_size_bytes=0)]
+        conn._num_groups = 1
+        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(LoadRequest(
+            req_id="r0", manager_block_idxes=[0],
+            need_load_locations=[{"location_specs": []}],
+            all_block_ids=[[10]]))
+        with self.assertRaises(AssertionError):
+            conn.start_load_kv(MagicMock(), meta)
 
 
 # --------------------------------------------------------------------------- #

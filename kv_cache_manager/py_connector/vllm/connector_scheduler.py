@@ -94,15 +94,6 @@ class ConnectorScheduler:
         self._load_failed: set = set()
         self._load_attempted: set = set()
 
-    @property
-    def is_hybrid(self) -> bool:
-        """True when the model mixes attention and state groups (mamba).
-
-        A semantic projection of the group table: callers care about 'can
-        load failures be reported' / 'are there sparse states', not the
-        group count."""
-        return bool(self._state_group_idxs)
-
     def shutdown(self):
         self._location_query_manager.shutdown()
         self._http_executor.shutdown(wait=False)
@@ -174,20 +165,36 @@ class ConnectorScheduler:
     def _external_match_burned(self, req_id: str) -> bool:
         """Has this request lost its option of an external match?
 
-        * full-attention (single group): load failures are reported to vLLM
+        * single-group block table: load failures are reported to vLLM
           (report_failures=True in the worker's start_load_kv) and come back
           as invalid block ids in update_connector_output -- the explicit
           signal. A mere preemption re-query keeps its match: the loaded KV
           is healthy, only the scheduling position was lost.
-        * hybrid (multi group): vLLM's invalid-block recovery is single-group
-          only (upstream TODO), so failures cannot be reported and no signal
-          ever comes back. The request instead gets one conservative shot:
-          any allocation for an external hit burns the match, because a
-          failed block cannot be told apart from a healthy one afterwards.
+        * multi-group block table (hybrid, or a skipped EAGLE/MTP drafter
+          group alongside the transferred attention group): vLLM's
+          invalid-block recovery unpacks a single group (upstream TODO), so
+          failures cannot be reported and no signal ever comes back. The
+          request instead gets one conservative shot: any allocation for an
+          external hit burns the match, because a failed block cannot be
+          told apart from a healthy one afterwards.
+
+        The shape is read from the block-table snapshot recorded at
+        allocation time (``ledger.block_ids_per_group``): it mirrors
+        kv_cache_manager.get_block_ids, the tuple the recovery path unpacks,
+        and its length -- the group count -- is model-static.
         """
         if req_id in self._load_failed:
             return True
-        return req_id in self._load_attempted and self.is_hybrid
+        if req_id not in self._load_attempted:
+            return False
+        ledger = self._tracked.get(req_id)
+        if ledger is None or not ledger.block_ids_per_group:
+            # Defensive: every load attempt is recorded through
+            # update_state_after_alloc, which snapshots the block table.
+            # Without a snapshot the recovery shape is unknown; keep the
+            # match rather than burn it blindly.
+            return False
+        return len(ledger.block_ids_per_group) > 1
 
     def get_num_new_matched_tokens(self, request: "Request",
                                    num_computed_tokens: int) -> Tuple[Optional[int], bool]:

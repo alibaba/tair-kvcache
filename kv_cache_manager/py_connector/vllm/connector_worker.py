@@ -129,15 +129,6 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # KV cache registration
     # ------------------------------------------------------------------ #
-    @property
-    def is_hybrid(self) -> bool:
-        """True when the model mixes attention and state groups (mamba).
-
-        A semantic projection of the group table: callers care about 'can
-        load failures be reported' / 'are there sparse states', not about
-        the group count itself."""
-        return any(isinstance(m, StateGroupMeta) for m in self._group_metas)
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._kv_caches = kv_caches
         first_attn = next(kv_caches[name]
@@ -401,25 +392,43 @@ class ConnectorWorker:
             # sched/scheduler.py) unpacks a single-group block table --
             # "(req_block_ids,) = ...get_block_ids(req_id)" under
             # "TODO (davidb): add support for hybrid memory allocator" -- so
-            # for hybrid (multi-group) models a failed load CANNOT be reported
+            # for multi-group models (hybrid attn+mamba, or any model whose
+            # vLLM block table has more than one entry -- skipped EAGLE/MTP
+            # drafter groups still count) a failed load CANNOT be reported
             # and is only logged; vLLM then decodes from whatever bytes the
             # partial load left in the paged cache, which can produce corrupt
-            # output. Remove report_failures gating once upstream supports
-            # multi-group invalid-block recovery.
+            # output. Gate on the block-table shape (all_block_ids is the
+            # snapshot of kv_cache_manager.get_block_ids -- the very table
+            # the recovery path unpacks), not on is_hybrid: a multi-group
+            # attention-only model is not hybrid yet still breaks the unpack.
+            # Remove the gating once upstream supports multi-group
+            # invalid-block recovery.
             report_ids = []
-            if not self.is_hybrid:
-                # Index by the transferred group's own vLLM group index: with
-                # skipped groups (EAGLE/MTP drafters) the single transferred
-                # group is not necessarily group 0.
+            report_failures = len(load_req.all_block_ids) == 1
+            if report_failures:
+                # With exactly one vLLM block table the transferred group is
+                # group 0, and it must be an attention group: a lone state
+                # group would feed state block ids into upstream's
+                # token-granular recovery math (it divides by block_size).
+                # Both hold for every supported single-group model today;
+                # assert so a future unsupported shape fails loudly instead
+                # of reporting nonsense.
                 only = self._group_metas[0]
-                table = load_req.all_block_ids[only.group_idx]
+                assert isinstance(only, AttentionGroupMeta), (
+                    f"single vLLM block table but the transferred group is "
+                    f"{type(only).__name__}, not attention; cannot report "
+                    f"invalid blocks")
+                assert only.group_idx == 0, (
+                    f"single vLLM block table but the transferred group is "
+                    f"group {only.group_idx}; group-index alignment broken")
+                table = load_req.all_block_ids[0]
                 gbs = only.block_size
                 report_ids = [table[(mb * self._manager_block_size) // gbs]
                               for mb in load_req.manager_block_idxes]
             done_cb = self._data_transfer.create_load_done_callback(
                 load_req.req_id, self._tp_rank, meta.epoch,
                 copy.copy(report_ids), num_blocks,
-                report_failures=not self.is_hybrid)
+                report_failures=report_failures)
 
             if plans is None:
                 # Nothing submitted; report the whole load as failed.
