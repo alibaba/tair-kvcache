@@ -42,10 +42,19 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     # scatter kernel and the state copies reach it directly over PCIe, so
     # the connector's device-memory footprint is zero and this knob sizes
     # host RAM, not VRAM. An exhausted pool blocks the task (backpressure).
-    # Must be >= max(block_per_save_task, block_per_load_task) because one
-    # task stages its whole batch contiguously; shrink both together when
-    # host RAM is tight.
-    staging_pool_blocks: int = 128
+    #
+    # The pool is the *concurrency* of staging: tasks hold their slots for
+    # gather + the synchronous SDK transfer, so the pool size caps how many
+    # tasks feed the SDK at once. At 128 (one full task) the SDK transfer
+    # serializes and burst loads queue behind saves: measured -3.5% ab
+    # throughput and +54% vs +65% TP2 hit throughput against a 512-block
+    # pool (perf 2026-08-20, doc protocol). 1024 restores origin/main's
+    # concurrency (8 full tasks) for ~896 MiB pinned host RAM per attention
+    # group -- host RAM is cheap, and the old 1024-slot behaviour is what
+    # the merge-base AB baseline ran. Shrink only together with
+    # block_per_save_task/block_per_load_task (must be >= the larger one,
+    # one task stages its whole batch contiguously).
+    staging_pool_blocks: int = 1024
 
     # --- Manager queries ---
     async_get_cache_location: bool = True

@@ -169,7 +169,9 @@ class DataTransferManager:
             raise ValueError(
                 f"staging_pool_blocks={pool_blocks} is smaller than the "
                 f"largest task batch ({need}); one task stages its whole "
-                f"batch contiguously, so the pool must cover it")
+                f"batch contiguously, so the pool must cover it -- raise "
+                f"staging_pool_blocks or shrink block_per_save_task/"
+                f"block_per_load_task")
         # One pool per group: block shapes differ between attention and state
         # groups. The pool is pinned host memory only -- the kernel reaches it
         # over PCIe -- so the connector's device-memory footprint is zero.
@@ -327,6 +329,11 @@ class DataTransferManager:
         assert all(uri is not None for uri in uris), \
             f"group {group.spec_name}: save batch contains a block without a " \
             f"location; _save_dispositions must have failed it"
+        # Wait for the engine's forward pass *before* taking a pool slot:
+        # the slot is needed only for the gather + SDK transfer, so holding
+        # it while the model still runs only extends the pool occupancy and
+        # queues concurrent loads behind a save that is not even staging.
+        ready_event.wait()
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
         try:
@@ -335,7 +342,6 @@ class DataTransferManager:
                 # Gather straight into the pinned host slot: the kernel
                 # (attention) and copy_ (state) write host pinned memory
                 # directly over PCIe; no device-side staging copy exists.
-                ready_event.wait()
                 if isinstance(group, AttentionTransferGroup):
                     view = cpu_buffer.view(self._info.dtype).view(
                         len(valid), group.num_kv_ptrs,
