@@ -1,10 +1,14 @@
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <fcntl.h>
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
@@ -129,6 +133,127 @@ TEST_F(SdkWrapperTest, TestInitWithInvalidStorageConfigs) {
     InitParams init_params = init_params_;
     init_params.storage_configs = "[invalid json]";
     ASSERT_EQ(ER_INVALID_STORAGE_CONFIG, sdk_wrapper.Init(client_config_, init_params));
+}
+
+TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    SharedMemoryRegistration registration;
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = fileno(file);
+
+    SdkWrapper sdk_wrapper;
+    SharedMemoryRegistration prepared_registration;
+    ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+    EXPECT_NE(prepared_registration.fd, registration.fd);
+    const int fd_flags = fcntl(prepared_registration.fd, F_GETFD);
+    ASSERT_GE(fd_flags, 0);
+    EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
+
+    ASSERT_EQ(fclose(file), 0);
+    struct stat file_stat{};
+    EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
+}
+
+TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    SharedMemoryRegistration registration;
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = fileno(file);
+
+    auto sdk_wrapper = std::make_unique<SdkWrapper>();
+    SharedMemoryRegistration prepared_registration;
+    ASSERT_EQ(ER_OK, sdk_wrapper->PrepareSharedMemoryRegistration(registration, prepared_registration));
+    const int owned_fd = prepared_registration.fd;
+
+    sdk_wrapper->wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(1, 1, "SdkWrapperTestPool");
+    ASSERT_TRUE(sdk_wrapper->wait_task_thread_pool_->start());
+
+    std::promise<void> task_started;
+    auto task_started_future = task_started.get_future();
+    std::promise<void> allow_task_finish;
+    auto allow_task_finish_future = allow_task_finish.get_future().share();
+    std::atomic<bool> fd_valid_in_task{false};
+    auto task_result = sdk_wrapper->wait_task_thread_pool_->async([&]() {
+        task_started.set_value();
+        allow_task_finish_future.wait();
+        struct stat file_stat{};
+        fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
+        return ER_OK;
+    });
+    ASSERT_EQ(task_started_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+
+    std::promise<void> destructor_started;
+    auto destructor_started_future = destructor_started.get_future();
+    std::thread destroyer([&]() {
+        destructor_started.set_value();
+        sdk_wrapper.reset();
+    });
+    EXPECT_EQ(destructor_started_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    allow_task_finish.set_value();
+    destroyer.join();
+
+    EXPECT_EQ(task_result.get(), ER_OK);
+    EXPECT_TRUE(fd_valid_in_task.load());
+    EXPECT_EQ(fcntl(owned_fd, F_GETFD), -1);
+    ASSERT_EQ(fclose(file), 0);
+}
+
+TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationRejectsInvalidValues) {
+    SdkWrapper sdk_wrapper;
+    SharedMemoryRegistration prepared_registration;
+    SharedMemoryRegistration registration;
+
+    registration.fd = 0;
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+
+    registration = SharedMemoryRegistration();
+    registration.base = init_params_.regist_span->base;
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    registration = SharedMemoryRegistration();
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = fileno(file);
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+    ASSERT_EQ(fclose(file), 0);
+}
+
+TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
+    FILE *file = tmpfile();
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+
+    SharedMemoryRegistration registration;
+    registration.base = init_params_.regist_span->base;
+    registration.size = init_params_.regist_span->size;
+    registration.fd = fileno(file);
+
+    SdkWrapper sdk_wrapper;
+    SharedMemoryRegistration prepared_registration;
+    ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+
+    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        auto config = std::make_shared<TairMempoolSdkConfig>(type);
+        ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &prepared_registration));
+        EXPECT_EQ(config->shm_fd(), prepared_registration.fd);
+        EXPECT_EQ(config->shm_size(), registration.size);
+        EXPECT_EQ(config->client_base(), registration.base);
+    }
+
+    ASSERT_EQ(fclose(file), 0);
 }
 
 // TODO: mock mooncake

@@ -22,6 +22,7 @@ class StorageQuota(JsonData):
         supported_types = [
             "ST_3FS",
             "ST_TAIRMEMPOOL",
+            "ST_TAIRMEMPOOL_SSD",
             "ST_NFS",
             "ST_EVENT_REPORT_L1P5",
             "ST_EVENT_REPORT_L2",
@@ -311,6 +312,7 @@ class CacheConfig(JsonData):
         valid_strategies = [
             "CPS_ALWAYS_3FS", "CPS_PREFER_3FS",
             "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL",
+            "CPS_ALWAYS_TAIR_MEMPOOL_SSD", "CPS_PREFER_TAIR_MEMPOOL_SSD",
             "CPS_ALWAYS_VCNS_3FS", "CPS_PREFER_VCNS_3FS",
         ]
         if _data_storage_strategy not in valid_strategies:
@@ -474,7 +476,9 @@ def parse_instance_group_args(is_create: bool):
             StorageQuota(
                 "ST_TAIRMEMPOOL",
                 10000000000)] if is_create else argparse.SUPPRESS,
-        help="quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;ST_TAIRMEMPOOL,10000000000")
+        help=(
+            "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
+            "ST_TAIRMEMPOOL,10000000000;ST_TAIRMEMPOOL_SSD,10000000000"))
 
     parser.add_argument(
         "--reclaim_policy",
@@ -494,7 +498,10 @@ def parse_instance_group_args(is_create: bool):
         "--data_storage_strategy",
         type=str,
         default="CPS_PREFER_3FS" if is_create else argparse.SUPPRESS,
-        help="data_storage_strategy, only support CPS_ALWAYS_3FS|CPS_PREFER_3FS|CPS_ALWAYS_TAIR_MEMPOOL|CPS_PREFER_TAIR_MEMPOOL now"
+        help=(
+            "data_storage_strategy, supports 3FS, VCNS_3FS, TairMempool DRAM "
+            "and TairMempool SSD ALWAYS/PREFER strategies"
+        )
     )
 
     parser.add_argument(

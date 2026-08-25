@@ -99,6 +99,16 @@ kvcm.schedule_plan_executor_thread_count=8
 # 0 < migration_worker_budget < executor_thread_count
 kvcm.schedule_plan_migration_worker_budget=3
 
+# GetHostCacheState 大请求使用的独立有界 metadata query executor。
+# worker_count 包含当前 RPC caller；默认 4 表示 caller + 3 个后台线程，设为 1 可禁用并行。
+kvcm.meta_query.worker_count=4
+
+# key/投影元素数达到该阈值才进入并行路径；小请求保持串行。
+kvcm.meta_query.parallel_threshold=256
+
+# 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
+kvcm.meta_query.chunk_size=128
+
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
@@ -167,6 +177,25 @@ executor_thread_count > 1
 新增迁移策略，因此不能根据启动时的策略状态放宽校验。`2/1`、`8/3` 是合法配置，`1/1`、`8/8` 和 `8/0`
 会导致 `ServerConfig::Check` 或 `CacheManager::Init` 失败。已有单线程自定义配置需要至少调整为 `2/1`。
 
+### GetHostCacheState metadata query executor
+
+`kvcm.meta_query.*` 控制独立于 `SchedulePlanExecutor` 的进程级有界查询池，仅服务大规模
+GetHostCacheState metadata read 和 host 投影/归约。线程不会按 instance 或请求创建：所有 MetaIndexer
+共享一个 executor，RPC caller 始终参与工作，因此 `worker_count=4` 只创建 3 个后台线程。队列饱和时
+请求由 caller 继续执行，不会无限堆积任务。
+
+只有单一 `local` metadata backend 的大批 key 读取会并发；`redis`、`cached` 和其他 backend 保持原有
+batch 调用。CPU 投影使用同一有界池。参数约束为：
+
+```TEXT
+1 <= worker_count <= 64
+0 < chunk_size <= parallel_threshold
+```
+
+默认值是 `4/256/128`。`worker_count=1` 是线上回退开关；调大 worker 前应同时对比单请求和并发请求
+p99、CPU 与 ReportEvent RT。设计、指标含义、测试命令见
+[`design/report_event_performance.md`](design/report_event_performance.md)。
+
 同一个 `migration_config` 中，`strategies` 的 `(source_storage_name, target_storage_name)` 组合必须唯一。
 相同 source 迁移到不同 target、不同 source 迁移到相同 target，以及 `hot -> warm -> cold` 级联均可配置；只有
 完全相同的 source/target route 会被拒绝。重复 route 无法明确选择各自的 threshold、method、retention 和 Mark
@@ -177,7 +206,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 ```TEXT
 {
     "storage_config": {
-        "type": "file", # 后端类型，可选值file,pace,mooncake,hf3fs,vcns_hf3fs
+        "type": "file", # 后端类型，可选值file,pace,pace_ssd,mooncake,hf3fs,vcns_hf3fs
         "global_unique_name": "nfs_01", # storage backend的名字，需要全局唯一
         "storage_spec": { # storage spec 需根据不同backend类型相应配置，TODO：具体每个type的spec配置文档
             "root_path": "/tmp/nfs/",
@@ -205,6 +234,10 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 {
                     "storage_type": "pace",
                     "capacity": 10000000000
+                },
+                {
+                    "storage_type": "pace_ssd",
+                    "capacity": 10000000000
                 }
             ]
         },
@@ -227,6 +260,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
             # CPS_PREFER_TAIR_MEMPOOL = 6,
             # CPS_ALWAYS_VCNS_3FS = 7,
             # CPS_PREFER_VCNS_3FS = 8,
+            # CPS_ALWAYS_TAIR_MEMPOOL_SSD = 9,
+            # CPS_PREFER_TAIR_MEMPOOL_SSD = 10,
             # };
             "cache_prefer_strategy": 2,
             "meta_indexer_config": {
@@ -253,6 +288,28 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
+`pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage
+仍使用 `pace://` 数据面 URI，但 quota、类型水位和迁移触发用量分别统计。旧的
+`ST_TAIRMEMPOOL + media_type=5` 配置仍可读取，迁移到新类型后才能获得独立 SSD 水位。
+
+启用独立 SSD 类型时还需遵守以下配置约束：
+
+- 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有
+  `pace` Storage 原地更新为 `pace_ssd`。Storage 类型会写入 CacheLocation 和用量账本，
+  服务端会拒绝同名 Storage 的类型变更。
+- Instance Group 的 `quota.quota_config` 必须同时为 `pace` 和 `pace_ssd` 配置正容量。
+  类型水位只遍历这里显式出现的类型；缺少 `pace_ssd` 时不会形成 SSD 类型水位和容量上限，
+  缺少迁移源 `pace` 时迁移规则不会触发。
+- SSD 仅作为迁移目标时，不要求放入 `storage_candidates`；迁移规则按
+  `target_storage_name` 精确选择它。若需要把普通新写入直接落到 SSD，则必须把 SSD Storage
+  放入 `storage_candidates`，并使用 `CPS_ALWAYS_TAIR_MEMPOOL_SSD` 或
+  `CPS_PREFER_TAIR_MEMPOOL_SSD`。
+- `pace` 和 `pace_ssd` 的数据面 URI scheme 都是 `pace://`。`pace_ssd` 只用于配置、计量
+  和选择，不能生成 `pace_ssd://` URI。
+
+详细升级顺序和回滚限制见 [Breaking Changes](BREAK_CHANGE.md#tairmempool-ssd-独立-storage-type)。
 
 ## Logger Config
 

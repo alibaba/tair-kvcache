@@ -58,6 +58,16 @@ cc_test(
 )
 
 cc_test(
+    name = "SdkFactoryTest",
+    srcs = ["sdk_factory_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "SdkTimeoutContractTest",
     srcs = [
         "fake_slow_sdk.h",

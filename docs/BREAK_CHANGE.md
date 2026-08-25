@@ -2,6 +2,64 @@
 
 本文档记录需要调用方、部署配置或持久化状态协同升级的不兼容变更。升级前必须按对应条目的前置条件处理，不能仅替换 KVCM 二进制。
 
+## TairMempool SSD 独立 Storage Type
+
+Introduced by: PR #293
+
+TairMempool DRAM 继续使用 `ST_TAIRMEMPOOL`/`pace`，LocalSSD 新增
+`ST_TAIRMEMPOOL_SSD`/`pace_ssd`。两者仍共享 `pace://` 数据面协议，但 KVCM 从此分别统计
+quota 和类型水位，使 DRAM 高水位能够触发到 SSD 的自动迁移。
+
+### 不兼容内容
+
+- Proto/领域枚举新增 `ST_TAIRMEMPOOL_SSD = 9`，配置 JSON 新增持久化类型字符串
+  `"pace_ssd"`，写入策略新增 `CPS_ALWAYS_TAIR_MEMPOOL_SSD = 9` 和
+  `CPS_PREFER_TAIR_MEMPOOL_SSD = 10`。
+- 老 Worker Client 不认识 `pace_ssd`。Manager 把新 Storage 配置下发给老 Worker 后，老
+  Client 会把它解析为 UNKNOWN，并可能以 `ER_INVALID_SDKBACKEND_CONFIG` 结束整个
+  TransferClient 初始化，而不只是跳过 SSD backend。
+- 老 KVCM Server 不认识 Registry 中的 `"type":"pace_ssd"`。直接回滚旧二进制会导致该
+  Storage backend 恢复失败，Registry recovery 无法完成并持续重试。
+- Storage 类型属于持久化 CacheLocation 和用量账本的一部分，不支持同名 Storage 从
+  `pace` 原地改成 `pace_ssd`。服务端现在拒绝涉及 TairMempool DRAM/SSD 的原地类型变更；
+  修改 timeout、domain 等同类型参数仍可使用 `update_storage`。
+- 开源占位 backend 已按 `StorageConfig.type()` 返回类型。实际部署使用的 PACE backend 也
+  必须返回配置中的类型，并在构造 URI 时固定使用 `pace` scheme；若仍硬编码
+  `ST_TAIRMEMPOOL` 或使用 `ToString(GetType())` 构造 scheme，独立计量会静默失效或生成
+  不兼容的 `pace_ssd://` URI。
+
+### 启用前置条件和顺序
+
+1. 先升级所有 Worker Client，使其能够解析类型 9、创建对应 TairMempool SDK，并继续识别
+   `pace://` URI。在确认集群不存在老 Client 后再进入下一步。
+2. 升级全部 KVCM Server 和实际 PACE backend，确认 backend 的 `GetType()` 等于
+   `StorageConfig.type()`，DRAM/SSD 生成的 URI scheme 均为 `pace`。
+3. 为 SSD **新建不同名称**的 `pace_ssd` Storage。不要对已有 `pace` Storage 执行类型更新。
+   `kvcm_ops` 中 `add_storage pace` 只接受 media type 0/2；`pace_ssd` 子命令固定使用 media
+   type 5。`update_storage pace` 未指定 media type 时会读取并保留原 Storage 的 type/media，
+   包括旧的 `ST_TAIRMEMPOOL + media_type=5`，不会在修改 timeout 时静默改变介质或类型。
+   `pace` 与 `pace_ssd` 只能更新各自类型的 Storage，子命令与已注册类型不匹配时直接拒绝。
+4. 在每个启用迁移的 Instance Group 中，为 `pace` 与 `pace_ssd` 分别配置正数
+   `quota_config.capacity`。类型水位只遍历显式 quota；缺少源类型 quota 时迁移不会触发，
+   缺少 SSD quota 时 SSD 没有独立水位和类型容量保护。
+5. 迁移规则继续以 DRAM Storage 为 `source_storage_name`、新 SSD Storage 为
+   `target_storage_name`。SSD 只作迁移目标时无需加入 `storage_candidates`；直接写 SSD 时
+   才加入候选并选用 SSD 专用 CachePreferStrategy。
+6. 用空 Instance Group 或测试 Instance 验证一次 DRAM 写入与 DRAM→SSD 迁移：新 Location
+   分别记录 type 3/type 9，DRAM 用量下降、SSD 用量上升，且 Worker 能读写 `pace://` URI。
+
+旧的 `ST_TAIRMEMPOOL + media_type=5` 配置仍可读取并继续按旧类型计量，但不能通过原地改类型
+获得独立水位。迁移方式是新建 `pace_ssd` Storage，将新迁移流量切到它；旧 Storage 必须保留
+到历史 Location 排空，避免 GC/读取找不到原 backend。
+
+### 回滚说明
+
+创建任何 `pace_ssd` Registry 配置前，可以直接回滚，因为新类型尚未进入持久化状态。创建后
+不能直接换回不认识类型 9 的旧 Server/Client。回滚前必须停止新写入和迁移，删除或排空所有
+type 9 CacheLocation，确认其物理数据已清理，再删除 `pace_ssd` Storage 与相关 quota/迁移配置；
+之后才能回滚二进制。仅把新 Storage 改名或原地改回 `pace` 不能修复已有 Location 的类型和
+用量，且服务端会拒绝这种类型更新。
+
 ## Vineyard 事件上报升级为 EventReportBackend
 
 Introduced by: PR #249

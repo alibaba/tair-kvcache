@@ -148,9 +148,15 @@ ServiceCallGuard::~ServiceCallGuard() {
                 // event samples from this request's private context instead,
                 // and write immediately before reporting to minimize the shared
                 // registry gauge race window.
-                SET_METRICS_(event_metrics_collector, event_report, request_rt_us, request_rt_us);
-                SET_METRICS_(event_metrics_collector, event_report, error_code, error_code);
+                SET_METRICS_(event_metrics_collector, service, query_rt_us, request_rt_us);
+                SET_METRICS_(event_metrics_collector, service, error_code, error_code);
                 event_metrics_collector->SetRequestSample(request_rt_us, error_code);
+                if (event_metrics_collector->HasRequestKeyCountSample()) {
+                    SET_METRICS_(event_metrics_collector,
+                                 manager,
+                                 request_key_count,
+                                 event_metrics_collector->GetRequestKeyCountSample());
+                }
             }
             metrics_reporter_->ReportPerQuery(mc.get());
         }

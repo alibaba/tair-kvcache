@@ -27,6 +27,19 @@ TransferClientImpl::TransferClientImpl() {}
 TransferClientImpl::~TransferClientImpl() {}
 
 ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const InitParams &init_params) {
+    return InitInternal(client_config, init_params, nullptr);
+}
+
+ClientErrorCode
+TransferClientImpl::InitWithSharedMemory(const std::string &client_config,
+                                         const InitParams &init_params,
+                                         const SharedMemoryRegistration &shared_memory_registration) {
+    return InitInternal(client_config, init_params, &shared_memory_registration);
+}
+
+ClientErrorCode TransferClientImpl::InitInternal(const std::string &client_config,
+                                                 const InitParams &init_params,
+                                                 const SharedMemoryRegistration *shared_memory_registration) {
     {
         std::shared_lock read_guard(config_mutex_);
         if (client_config_ != nullptr) {
@@ -70,7 +83,7 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
                       init_params_.regist_span,
                       init_params_.self_location_spec_name.c_str(),
                       init_params_.storage_configs.c_str());
-        ec = sdk_wrapper_->Init(client_config_, init_params_);
+        ec = sdk_wrapper_->Init(client_config_, init_params_, shared_memory_registration);
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("init sdk wrapper failed");
             client_config_.reset();
@@ -218,6 +231,20 @@ std::unique_ptr<TransferClient> TransferClient::Create(const std::string &client
         return client;
     }
     KVCM_LOG_ERROR("create transfer client failed with errocode: %d", ec);
+    return nullptr;
+}
+
+std::unique_ptr<TransferClient>
+TransferClient::Create(const std::string &client_config,
+                       const InitParams &init_params,
+                       const SharedMemoryRegistration &shared_memory_registration) {
+    LoggerBroker::InitLoggerForClientOnce();
+    auto client = std::make_unique<TransferClientImpl>();
+    auto ec = client->InitWithSharedMemory(client_config, init_params, shared_memory_registration);
+    if (ec == ER_OK) {
+        return client;
+    }
+    KVCM_LOG_ERROR("create transfer client with shared memory failed with errocode: %d", ec);
     return nullptr;
 }
 

@@ -46,6 +46,12 @@ struct MetaMemCacheItem {
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
+    void TouchAccessTime(int64_t access_time_us) {
+        int64_t current = last_access_time_.load(std::memory_order_relaxed);
+        while (current < access_time_us &&
+               !last_access_time_.compare_exchange_weak(
+                   current, access_time_us, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    }
 
     static MetaMemCacheItem *Create(const CacheLocationMap &locations, const PropertyMap &properties) {
         auto *item = new MetaMemCacheItem();
@@ -59,6 +65,11 @@ struct MetaMemCacheItem {
         item->properties_ = std::move(properties);
         return item;
     }
+    static MetaMemCacheItem *CreateSingleLocation(const LocationId &location_id, CacheLocationConstPtr location) {
+        auto *item = new MetaMemCacheItem();
+        item->locations_.emplace(location_id, std::move(location));
+        return item;
+    }
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 
 private:
@@ -66,6 +77,27 @@ private:
     CacheLocationMap locations_;
     PropertyMap properties_;
     std::atomic<int64_t> last_access_time_{0};
+};
+
+// Caller-owned workspace for the pure-local one-location RMW path. It is
+// prepared before MetaIndexer acquires metadata shard locks, then reused by
+// both the read and write halves of the operation. The fused path may retain
+// read handles until its matching write call; the destructor is a final guard
+// that releases every handle on early returns.
+struct SingleLocationRmwScratch {
+    SingleLocationRmwScratch() = default;
+    ~SingleLocationRmwScratch();
+    SingleLocationRmwScratch(const SingleLocationRmwScratch &) = delete;
+    SingleLocationRmwScratch &operator=(const SingleLocationRmwScratch &) = delete;
+
+    void ReleaseRetainedHandles() noexcept;
+    [[nodiscard]] bool HasRetainedHandles() const noexcept { return retained_handle_owner != nullptr; }
+
+    std::vector<std::string_view> key_views;
+    std::vector<Cache::Handle *> handles;
+    CacheLocationVector retired_locations;
+    Cache::BatchOperationScratch cache_batch;
+    Cache *retained_handle_owner = nullptr;
 };
 
 class MetaLocalBackend : public MetaCacheBaseBackend {
@@ -98,6 +130,24 @@ public:
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                 const KeyTypeVec &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 const CacheLocationVector &locations) noexcept override;
+    void PrepareSingleLocationRmwScratch(size_t max_count, SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsInto(RequestContext *request_context,
+                                   const KeyTypeVec &keys,
+                                   const LocationIdRefVector &location_ids,
+                                   const CacheLocationVector &locations,
+                                   std::vector<ErrorCode> &out_results,
+                                   SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const LocationIdRefVector &location_ids,
+                                                       CacheLocationVector &locations,
+                                                       const std::vector<size_t> &read_indices,
+                                                       std::vector<ErrorCode> &out_results,
+                                                       SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
                                            const KeyTypeVec &keys,
@@ -135,10 +185,47 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                    const KeyType *keys,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept override;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override;
+    std::vector<ErrorCode>
+    GetSingleLocationsWithKeyStatus(RequestContext *request_context,
+                                    const KeyTypeVec &keys,
+                                    const LocationIdRefVector &location_ids,
+                                    CacheLocationVector &out_locations,
+                                    std::vector<ErrorCode> &out_key_error_codes) noexcept override;
+    void GetSingleLocationsWithKeyStatusInto(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             const LocationIdRefVector &location_ids,
+                                             CacheLocationVector &out_locations,
+                                             std::vector<ErrorCode> &out_key_error_codes,
+                                             std::vector<ErrorCode> &out_results,
+                                             SingleLocationRmwScratch &scratch,
+                                             bool retain_handles = false) noexcept;
+    // Pure-local RMW-only variant: borrows immutable location values without
+    // incrementing one shared_ptr control block per key. Callers must retain
+    // the handles and consume every view before the matching write/release.
+    void GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,
+                                                 const KeyTypeVec &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 CacheLocationViewVector &out_locations,
+                                                 std::vector<ErrorCode> &out_key_error_codes,
+                                                 std::vector<ErrorCode> &out_results,
+                                                 SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept override;
@@ -174,6 +261,7 @@ public:
 
     size_t GetMemUsage() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
+    bool GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
 private:
     static std::string_view KeyToView(const KeyType &key) {
@@ -190,7 +278,27 @@ private:
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
     CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode
+    UpdateHandleInPlace(Cache::Handle *handle, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpdateHandleInPlaceSingleLocation(Cache::Handle *handle,
+                                                const LocationId &location_id,
+                                                CacheLocationConstPtr location,
+                                                CacheLocationVector *retired_locations = nullptr);
     ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode CreateAndInsertSingleLocation(std::string_view key_sv,
+                                            const LocationId &location_id,
+                                            CacheLocationConstPtr location);
+    ErrorCode
+    UpsertSingleLocationForOneKey(KeyType key, const LocationId &location_id, const CacheLocationConstPtr &location);
+    void GetSingleLocationsWithKeyStatusIntoImpl(RequestContext *request_context,
+                                                 const KeyTypeVec &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 CacheLocationVector *out_owned_locations,
+                                                 CacheLocationViewVector *out_borrowed_locations,
+                                                 std::vector<ErrorCode> &out_key_error_codes,
+                                                 std::vector<ErrorCode> &out_results,
+                                                 SingleLocationRmwScratch &scratch,
+                                                 bool retain_handles) noexcept;
     ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);

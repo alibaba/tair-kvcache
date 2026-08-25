@@ -21,6 +21,9 @@ public:
 
 protected:
     SdkFactory() = default;
+
+private:
+    static std::shared_ptr<SdkInterface> CreateSdkInstance(const DataStorageType &type);
 };
 
 } // namespace kv_cache_manager

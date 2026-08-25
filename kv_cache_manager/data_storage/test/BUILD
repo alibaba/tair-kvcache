@@ -78,3 +78,13 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "SnapshotUriUtilsTest",
+    srcs = [
+        "snapshot_uri_utils_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/data_storage:snapshot_uri_utils",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

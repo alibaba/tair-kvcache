@@ -42,6 +42,7 @@ enum StorageType {
     ST_DUMMY = 6;
     ST_EVENT_REPORT_L1P5 = 7;
     ST_EVENT_REPORT_L2 = 8;
+    ST_TAIRMEMPOOL_SSD = 9;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析

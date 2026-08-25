@@ -15,6 +15,10 @@ class TransferClient {
 public:
     virtual ~TransferClient() = default;
     static std::unique_ptr<TransferClient> Create(const std::string &client_config, const InitParams &init_params);
+    static std::unique_ptr<TransferClient>
+    Create(const std::string &client_config,
+           const InitParams &init_params,
+           const SharedMemoryRegistration &shared_memory_registration);
 
     // deadline_ms: 绝对时间点（steady_clock 毫秒），到点后本次调用不再触碰 block_buffers；
     // 0 = 调用方不施加 deadline，退回 client 配置的静态超时预算。

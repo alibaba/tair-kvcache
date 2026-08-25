@@ -127,15 +127,30 @@ TEST_F(EventReportBackendTest, OpenStartsLivenessLoopAndCloseStops) {
     ASSERT_TRUE(backend.liveness_checker_running_.load());
     ASSERT_TRUE(backend.liveness_checker_thread_.joinable());
 
-    backend.SetAvailable(false);
+    DataStorageBackend &backend_base = backend;
+    backend_base.SetAvailable(false);
     ASSERT_FALSE(backend.Available());
-    backend.SetAvailable(true);
+    backend_base.SetAvailable(true);
     ASSERT_TRUE(backend.Available());
+    EXPECT_NE(EC_OK, backend.Open(MakeConfig(), "duplicate_open"));
+    EXPECT_TRUE(backend.Available());
 
     ASSERT_EQ(EC_OK, backend.Close());
     ASSERT_FALSE(backend.Available());
+    EXPECT_NE(EC_OK, backend.Open(MakeConfig(), "reopen_retired_backend"));
+    EXPECT_FALSE(backend.Available());
     ASSERT_FALSE(backend.liveness_checker_running_.load());
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, CloseInterruptsLongLivenessWait) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 60000), "trace"));
+
+    const auto close_begin = std::chrono::steady_clock::now();
+    ASSERT_EQ(EC_OK, backend.Close());
+    const auto close_elapsed = std::chrono::steady_clock::now() - close_begin;
+    EXPECT_LT(close_elapsed, 2s);
 }
 
 // (2) RegisterNode / UnregisterNode
@@ -217,6 +232,12 @@ TEST_F(EventReportBackendTest, MightExistTracksRegisteredNodeAvailability) {
     ASSERT_EQ(1u, result.size());
     EXPECT_TRUE(result[0]);
 
+    backend.SetAvailable(false);
+    EXPECT_EQ((std::vector<bool>{false}), backend.MightExist({available_uri}));
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, backend.EnsureNodeRegistered(instance_id, available_host, {"mem"}));
+    backend.SetAvailable(true);
+    EXPECT_EQ((std::vector<bool>{true}), backend.MightExist({available_uri}));
+
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
@@ -225,6 +246,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.3:8080", {"mem"}));
+    const uint64_t registered_generation = backend.GetNodeGeneration("test_inst", "10.0.0.3:8080");
 
     int64_t initial_hb = 0;
     {
@@ -237,6 +259,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
 
     std::this_thread::sleep_for(20ms);
     ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {{"version", "er-0.18"}}));
+    ASSERT_EQ(registered_generation, backend.GetNodeGeneration("test_inst", "10.0.0.3:8080"));
     {
         auto &host_map = backend.instance_nodes_["test_inst"];
         auto it = host_map.find("10.0.0.3:8080");
@@ -247,6 +270,7 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     backend.SetNodeUnavailable("test_inst", "10.0.0.3:8080");
     ASSERT_FALSE(backend.IsNodeAvailable("test_inst", "10.0.0.3:8080"));
     ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {}));
+    ASSERT_GT(backend.GetNodeGeneration("test_inst", "10.0.0.3:8080"), registered_generation);
     {
         auto &host_map = backend.instance_nodes_["test_inst"];
         auto it = host_map.find("10.0.0.3:8080");
@@ -260,6 +284,50 @@ TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     ASSERT_EQ(backend.instance_nodes_["test_inst"]["99.99.99.99:8080"]->last_system_status.at("x"), "y");
 
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, SteadyHeartbeatDoesNotRejectConcurrentLifecycleMutationLease) {
+    EventReportBackend backend(metrics_registry_);
+    const ReporterSnapshotKey reporter_key{"heartbeat-mutation-lease", "10.0.0.32:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    const uint64_t generation = backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
+
+    auto &node = *backend.instance_nodes_[reporter_key.instance_id][reporter_key.host_ip_port];
+    node.last_heartbeat_ms.store(0, std::memory_order_relaxed);
+
+    // Pin HEARTBEAT after it refreshes the timestamp but before it publishes
+    // system status. At that point it still holds its lifecycle lease, so the
+    // concurrent mutation below exercises the exact production overlap
+    // without relying on scheduler timing or sleeps.
+    std::unique_lock<std::mutex> status_gate(node.status_mutex);
+    auto heartbeat = std::async(std::launch::async, [&] {
+        return backend.OnHeartbeat(reporter_key.instance_id, reporter_key.host_ip_port, {{"load", "1"}});
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (node.last_heartbeat_ms.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool heartbeat_reached_status_gate = node.last_heartbeat_ms.load(std::memory_order_acquire) != 0;
+    if (!heartbeat_reached_status_gate) {
+        status_gate.unlock();
+        EXPECT_EQ(EC_OK, heartbeat.get());
+        FAIL() << "heartbeat did not reach the status publication gate";
+    }
+
+    // A steady heartbeat is a lifecycle reader, not an unfenced operation:
+    // lifecycle writers must still wait until its status publication ends.
+    const auto lifecycle_fence = backend.GetOrCreateLifecycleFence(reporter_key);
+    std::unique_lock<std::shared_mutex> lifecycle_writer(lifecycle_fence->mutex, std::try_to_lock);
+    EXPECT_FALSE(lifecycle_writer.owns_lock());
+
+    EventReportBackend::LifecycleMutationLease mutation_lease;
+    const ErrorCode mutation_ec = backend.AcquireLifecycleMutationLease(reporter_key, generation, mutation_lease);
+
+    mutation_lease.reset();
+    status_gate.unlock();
+    EXPECT_EQ(EC_OK, heartbeat.get());
+    EXPECT_EQ(EC_OK, mutation_ec);
 }
 
 TEST_F(EventReportBackendTest, DataMutationsDoNotRefreshHeartbeat) {
@@ -303,8 +371,8 @@ TEST_F(EventReportBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     std::atomic<int> cleanup_calls{0};
     std::string cleanup_host;
     backend.SetCleanupCallback([&](const std::string & /*instance_id*/, const std::string &host, uint64_t /*gen*/) {
-        ++cleanup_calls;
         cleanup_host = host;
+        cleanup_calls.fetch_add(1, std::memory_order_release);
     });
 
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.4:8080", {"mem"}));
@@ -319,12 +387,13 @@ TEST_F(EventReportBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     EXPECT_EQ(cleanup_calls.load(), 0);
 
     const auto cleanup_deadline = std::chrono::steady_clock::now() + 1s;
-    while (backend.IsNodeRegistered("test_inst", "10.0.0.4:8080") &&
+    while ((backend.IsNodeRegistered("test_inst", "10.0.0.4:8080") ||
+            cleanup_calls.load(std::memory_order_acquire) == 0) &&
            std::chrono::steady_clock::now() < cleanup_deadline) {
         std::this_thread::yield();
     }
     ASSERT_FALSE(backend.IsNodeRegistered("test_inst", "10.0.0.4:8080"));
-    EXPECT_GE(cleanup_calls.load(), 1);
+    EXPECT_GE(cleanup_calls.load(std::memory_order_acquire), 1);
     EXPECT_EQ(cleanup_host, "10.0.0.4:8080");
 
     ASSERT_EQ(EC_OK, backend.Close());
@@ -351,7 +420,7 @@ TEST_F(EventReportBackendTest, HeartbeatWithinGraceWindowRecovers) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportBackendTest, HeartbeatRecoveryFencesCleanupAlreadySelectedByLivenessLoop) {
+TEST_F(EventReportBackendTest, LivenessUnregistersBeforeCleanupAndHeartbeatCannotReviveOldSnapshot) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 100, /*grace*/ 50, /*tick*/ 5), "trace"));
     backend.SetSnapshotMinIntervalMsForTest(0);
@@ -388,19 +457,22 @@ TEST_F(EventReportBackendTest, HeartbeatRecoveryFencesCleanupAlreadySelectedByLi
     EXPECT_FALSE(backend.IsNodeAvailable(instance_id, host));
     EXPECT_EQ((std::vector<bool>{false}), backend.MightExist({DataStorageUri(uri)}));
 
-    // The callback has selected the old generation but has not started
-    // deleting. A successful heartbeat must invalidate that cleanup before
-    // it is allowed to continue.
-    EXPECT_EQ(EC_OK, backend.OnHeartbeat(instance_id, host, {}));
-    EXPECT_GT(backend.GetNodeGeneration(instance_id, host), initial_generation);
-    EXPECT_TRUE(backend.IsNodeAvailable(instance_id, host));
-    EXPECT_EQ((std::vector<bool>{true}), backend.MightExist({DataStorageUri(uri)}));
+    // Expiry is linearized before the callback can delete metadata. A heartbeat
+    // arriving while cleanup is running must observe the tombstone instead of
+    // reviving a committed version whose metadata may already be gone.
+    EXPECT_FALSE(backend.IsNodeRegistered(instance_id, host));
+    EXPECT_EQ(initial_generation, backend.GetNodeGeneration(instance_id, host));
+    EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
+    EXPECT_EQ(EC_NODE_NOT_REGISTERED, backend.OnHeartbeat(instance_id, host, {}));
 
     release_cleanup.set_value();
     ASSERT_EQ(std::future_status::ready, cleanup_returned.get_future().wait_for(1s));
-    EXPECT_TRUE(backend.IsNodeRegistered(instance_id, host));
-    EXPECT_TRUE(backend.IsNodeAvailable(instance_id, host));
-    EXPECT_EQ((std::vector<bool>{true}), backend.MightExist({DataStorageUri(uri)}));
+    EXPECT_FALSE(backend.IsNodeRegistered(instance_id, host));
+    EXPECT_EQ((std::vector<bool>{false}), backend.MightExist({DataStorageUri(uri)}));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"mem"}));
+    EXPECT_GT(backend.GetNodeGeneration(instance_id, host), initial_generation);
+    EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
@@ -453,6 +525,12 @@ TEST_F(EventReportBackendTest, CleanupLeaseFencesReregisterThroughFinalDeleteSta
     const uint64_t cleanup_generation = backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
 
     EventReportBackend::LifecycleMutationLease cleanup_lease;
+    EXPECT_EQ(EC_MISMATCH, backend.AcquireLifecycleCleanupLease(reporter_key, cleanup_generation, cleanup_lease));
+    uint64_t unregistered_generation = 0;
+    ASSERT_EQ(EC_OK,
+              backend.UnregisterNodeForHostDown(
+                  reporter_key.instance_id, reporter_key.host_ip_port, unregistered_generation));
+    ASSERT_EQ(cleanup_generation, unregistered_generation);
     ASSERT_EQ(EC_OK, backend.AcquireLifecycleCleanupLease(reporter_key, cleanup_generation, cleanup_lease));
     auto reregister = std::async(std::launch::async, [&] {
         return backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"disk"});
@@ -474,6 +552,11 @@ TEST_F(EventReportBackendTest, LifecycleCleanupLeaseDoesNotBlockUnrelatedReporte
     ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_b.instance_id, reporter_b.host_ip_port, {"mem"}));
 
     const uint64_t generation_a = backend.GetNodeGeneration(reporter_a.instance_id, reporter_a.host_ip_port);
+    uint64_t unregistered_generation_a = 0;
+    ASSERT_EQ(
+        EC_OK,
+        backend.UnregisterNodeForHostDown(reporter_a.instance_id, reporter_a.host_ip_port, unregistered_generation_a));
+    ASSERT_EQ(generation_a, unregistered_generation_a);
     EventReportBackend::LifecycleMutationLease cleanup_lease_a;
     ASSERT_EQ(EC_OK, backend.AcquireLifecycleCleanupLease(reporter_a, generation_a, cleanup_lease_a));
 
@@ -495,6 +578,35 @@ TEST_F(EventReportBackendTest, EnsureNodeRegisteredMergesNewMediums) {
     ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered("medium-merge", "10.0.0.91:8080", {"disk", "mem"}));
     EXPECT_EQ(generation, backend.GetNodeGeneration("medium-merge", "10.0.0.91:8080"));
     ASSERT_EQ(2u, backend.instance_nodes_["medium-merge"]["10.0.0.91:8080"]->mediums.size());
+}
+
+TEST_F(EventReportBackendTest, EnsureNodeRegisteredHandlesConcurrentKnownAndNewMediums) {
+    EventReportBackend backend(metrics_registry_);
+    const std::string instance_id = "medium-concurrency";
+    const std::string host = "10.0.0.95:8080";
+    ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered(instance_id, host, {"mem"}));
+    const uint64_t generation = backend.GetNodeGeneration(instance_id, host);
+
+    std::atomic<size_t> failures{0};
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < 12; ++worker) {
+        workers.emplace_back([&, worker] {
+            const std::string medium = worker % 2 == 0 ? "mem" : "disk";
+            for (size_t iteration = 0; iteration < 200; ++iteration) {
+                if (backend.EnsureNodeRegistered(instance_id, host, {medium}) != EC_OK) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(0u, failures.load(std::memory_order_relaxed));
+    EXPECT_EQ(generation, backend.GetNodeGeneration(instance_id, host));
+    const auto &mediums = backend.instance_nodes_[instance_id][host]->mediums;
+    EXPECT_EQ((std::set<std::string>{"disk", "mem"}), (std::set<std::string>(mediums.begin(), mediums.end())));
 }
 
 // (7) Re-registration after cleanup
@@ -641,6 +753,19 @@ TEST_F(EventReportBackendTest, OnHeartbeatPublishesMetricsGauges) {
     auto new_gauge = new_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(42.0, new_gauge.Get());
     ASSERT_DOUBLE_EQ(0.90, gauge.Get());
+    EXPECT_FALSE(leases_data->GetGauge(expected_tags).has_value());
+
+    // A non-numeric replacement is also a full-snapshot removal rather than
+    // leaving the prior numeric sample visible forever.
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.10:9600", {{"hit_rate", "unknown"}}));
+    EXPECT_FALSE(hit_rate_data->GetGauge(expected_tags).has_value());
+
+    // strtod accepts these spellings, but non-finite values are not valid
+    // operational gauges and must not poison downstream metric aggregation.
+    ASSERT_EQ(EC_OK,
+              backend.OnHeartbeat("test_inst", "10.0.0.10:9600", {{"nan_metric", "nan"}, {"inf_metric", "inf"}}));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("event_report.nan_metric"));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("event_report.inf_metric"));
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
@@ -871,6 +996,119 @@ TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
     backend.EndDeltaMutation(scope);
 }
 
+TEST(EventReportBackendSnapshotTest, SnapshotCommitRejectsChangedLifecycleGeneration) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-commit-fence", "10.0.0.71:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string candidate;
+    uint64_t retry_after_ms = 0;
+    uint64_t admitted_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms, &admitted_generation));
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
+    ASSERT_NE(0u, admitted_generation);
+
+    // An explicit REGISTER is a lifecycle boundary. A snapshot admitted by
+    // the previous lifecycle must not publish after that boundary even if its
+    // metadata phase already completed.
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    ASSERT_NE(admitted_generation, backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port));
+    EXPECT_EQ(EC_NODE_NOT_REGISTERED,
+              backend.CommitSnapshotVersionIfGeneration(reporter_key, candidate, admitted_generation));
+    EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
+    backend.AbortSnapshotVersion(reporter_key, candidate);
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotCleanupLeaseFencesLaterAttemptAdmission) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-cleanup-fence", "10.0.0.72:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string committed;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, committed, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, committed));
+    const uint64_t cleanup_generation = backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
+    const uint64_t cleanup_attempt_epoch = backend.GetSnapshotAttemptEpoch(reporter_key);
+
+    EventReportBackend::LifecycleMutationLease cleanup_lease;
+    ASSERT_EQ(EC_OK,
+              backend.AcquireSnapshotCleanupLease(
+                  reporter_key, cleanup_generation, committed, cleanup_attempt_epoch, cleanup_lease));
+
+    std::promise<void> attempt_started;
+    std::string next_candidate;
+    auto next_attempt = std::async(std::launch::async, [&] {
+        attempt_started.set_value();
+        uint64_t retry_ms = 0;
+        return backend.BeginSnapshot(reporter_key, next_candidate, retry_ms);
+    });
+    attempt_started.get_future().wait();
+    EXPECT_EQ(std::future_status::timeout, next_attempt.wait_for(20ms));
+
+    // Releasing the old cleanup's final-delete lease lets the next attempt
+    // publish its epoch. The same cleanup identity must then be rejected even
+    // though the reporter lifecycle generation itself has not changed.
+    cleanup_lease.reset();
+    ASSERT_EQ(std::future_status::ready, next_attempt.wait_for(1s));
+    ASSERT_EQ(EC_OK, next_attempt.get());
+    ASSERT_GT(backend.GetSnapshotAttemptEpoch(reporter_key), cleanup_attempt_epoch);
+
+    EventReportBackend::LifecycleMutationLease stale_cleanup_lease;
+    EXPECT_EQ(EC_MISMATCH,
+              backend.AcquireSnapshotCleanupLease(
+                  reporter_key, cleanup_generation, committed, cleanup_attempt_epoch, stale_cleanup_lease));
+    EXPECT_FALSE(stale_cleanup_lease);
+    backend.AbortSnapshotVersion(reporter_key, next_candidate);
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotCommitAndCleanupWaitForTransientLifecycleWriter) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-transient-writer", "10.0.0.74:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string candidate;
+    uint64_t retry_after_ms = 0;
+    uint64_t lifecycle_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms, &lifecycle_generation));
+    const auto lifecycle_fence = backend.GetOrCreateLifecycleFence(reporter_key);
+    ASSERT_TRUE(lifecycle_fence);
+
+    {
+        std::unique_lock<std::shared_mutex> transient_writer(lifecycle_fence->mutex);
+        std::promise<void> call_started;
+        auto commit = std::async(std::launch::async, [&] {
+            call_started.set_value();
+            return backend.CommitSnapshotVersionIfGeneration(reporter_key, candidate, lifecycle_generation);
+        });
+        call_started.get_future().wait();
+        EXPECT_EQ(std::future_status::timeout, commit.wait_for(20ms));
+        transient_writer.unlock();
+        ASSERT_EQ(std::future_status::ready, commit.wait_for(1s));
+        EXPECT_EQ(EC_OK, commit.get());
+    }
+
+    const uint64_t attempt_epoch = backend.GetSnapshotAttemptEpoch(reporter_key);
+    {
+        std::unique_lock<std::shared_mutex> transient_writer(lifecycle_fence->mutex);
+        std::promise<void> call_started;
+        auto cleanup = std::async(std::launch::async, [&] {
+            call_started.set_value();
+            EventReportBackend::LifecycleMutationLease lease;
+            return backend.AcquireSnapshotCleanupLease(
+                reporter_key, lifecycle_generation, candidate, attempt_epoch, lease);
+        });
+        call_started.get_future().wait();
+        EXPECT_EQ(std::future_status::timeout, cleanup.wait_for(20ms));
+        transient_writer.unlock();
+        ASSERT_EQ(std::future_status::ready, cleanup.wait_for(1s));
+        EXPECT_EQ(EC_OK, cleanup.get());
+    }
+}
+
 TEST(EventReportBackendSnapshotTest, QueryVisibilityIsStrictOnlyAfterSuccessfulSnapshot) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
@@ -910,6 +1148,44 @@ TEST(EventReportBackendSnapshotTest, QueryVisibilityIsStrictOnlyAfterSuccessfulS
     ASSERT_TRUE(backend.GetQueryVisibilityState(reporter_key, strict, committed));
     EXPECT_TRUE(strict);
     EXPECT_EQ(recovered, committed);
+}
+
+TEST(EventReportBackendSnapshotTest, QueryVisibilitySnapshotIsInstanceScopedAndExcludesUnavailableReporters) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey soft_reporter{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey strict_reporter{"instance-a", "10.0.0.2:8080"};
+    const ReporterSnapshotKey other_instance{"instance-b", "10.0.0.3:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(soft_reporter.instance_id, soft_reporter.host_ip_port, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(strict_reporter.instance_id, strict_reporter.host_ip_port, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(other_instance.instance_id, other_instance.host_ip_port, {"mem"}));
+
+    std::string soft_version;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(soft_reporter, soft_version));
+    backend.EndDeltaMutation(soft_reporter);
+    std::string strict_version;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(strict_reporter, strict_version, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(strict_reporter, strict_version));
+
+    EventReportBackend::QueryVisibilitySnapshot snapshot;
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    ASSERT_EQ(2u, snapshot.size());
+    EXPECT_FALSE(snapshot.at(soft_reporter.host_ip_port).strict);
+    EXPECT_EQ(soft_version, snapshot.at(soft_reporter.host_ip_port).committed_version);
+    EXPECT_TRUE(snapshot.at(strict_reporter.host_ip_port).strict);
+    EXPECT_EQ(strict_version, snapshot.at(strict_reporter.host_ip_port).committed_version);
+    EXPECT_EQ(0u, snapshot.count(other_instance.host_ip_port));
+
+    backend.SetNodeUnavailable(soft_reporter.instance_id, soft_reporter.host_ip_port);
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    ASSERT_EQ(1u, snapshot.size());
+    EXPECT_EQ(0u, snapshot.count(soft_reporter.host_ip_port));
+    EXPECT_EQ(1u, snapshot.count(strict_reporter.host_ip_port));
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(strict_reporter.instance_id, strict_reporter.host_ip_port));
+    backend.GetQueryVisibilitySnapshot("instance-a", snapshot);
+    EXPECT_TRUE(snapshot.empty());
 }
 
 TEST(EventReportBackendSnapshotTest, SnapshotTokensAreNeverReusedAcrossAttempts) {
@@ -1509,6 +1785,32 @@ TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterLetsFirstDeltaCreat
     EXPECT_TRUE(backend.CommitSnapshotVersion(scope, second_token));
 }
 
+TEST(EventReportBackendSnapshotTest, StaleDeltaEndCannotDrainReregisteredLifecycle) {
+    EventReportBackend backend(nullptr);
+    const ReporterSnapshotKey reporter_key{"delta-incarnation", "10.0.0.73:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string old_token;
+    uint64_t old_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, old_token, &old_generation));
+    ASSERT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(reporter_key.instance_id, reporter_key.host_ip_port));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    std::string new_token;
+    uint64_t new_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, new_token, &new_generation));
+    ASSERT_NE(old_token, new_token);
+    ASSERT_NE(old_generation, new_generation);
+    ASSERT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+
+    backend.EndDeltaMutation(reporter_key, old_generation, old_token);
+    EXPECT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+
+    backend.EndDeltaMutation(reporter_key, new_generation, new_token);
+    EXPECT_EQ(0u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+}
+
 TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {
     EventReportBackend backend(nullptr);
     ASSERT_EQ(EC_OK, backend.Open(EventReportBackendTest::MakeConfig(), "snapshot_location_test"));
@@ -1854,7 +2156,7 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         ASSERT_EQ(std::future_status::timeout, waiting_snapshot.wait_for(0ms));
         ASSERT_EQ(EC_OK, backend.Close());
         ASSERT_EQ(std::future_status::ready, waiting_snapshot.wait_for(1s));
-        EXPECT_EQ(EC_SNAPSHOT_REQUIRED, waiting_snapshot.get());
+        EXPECT_EQ(EC_INSTANCE_NOT_EXIST, waiting_snapshot.get());
         backend.EndDeltaMutation(reporter_key);
     }
 
@@ -1881,8 +2183,59 @@ TEST(EventReportBackendSnapshotTest, CloseUnblocksSnapshotAndDeltaWaiters) {
         ASSERT_EQ(std::future_status::timeout, waiting_delta.wait_for(20ms));
         ASSERT_EQ(EC_OK, backend.Close());
         ASSERT_EQ(std::future_status::ready, waiting_delta.wait_for(1s));
-        EXPECT_EQ(EC_SNAPSHOT_REQUIRED, waiting_delta.get());
+        EXPECT_EQ(EC_INSTANCE_NOT_EXIST, waiting_delta.get());
     }
+}
+
+TEST_F(EventReportBackendTest, DisableWhileSnapshotDrainsAbortsCandidateAndReopensGate) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK,
+              backend.Open(MakeConfig(/*hb*/ 5000,
+                                      /*grace*/ 10000,
+                                      /*tick*/ 60000,
+                                      DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                      /*snapshot_min_interval*/ 0),
+                           "disable_while_snapshot_drains"));
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-disable", "10.0.0.72:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+    std::string committed;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+
+    std::string candidate;
+    auto waiting_snapshot = std::async(std::launch::async, [&] {
+        uint64_t retry_ms = 0;
+        return backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+    });
+    std::string observed_committed;
+    std::string observed_in_flight;
+    const auto in_flight_deadline = std::chrono::steady_clock::now() + 1s;
+    do {
+        backend.GetSnapshotVersionTokens(reporter_key, observed_committed, observed_in_flight);
+        if (!observed_in_flight.empty()) {
+            break;
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < in_flight_deadline);
+    ASSERT_FALSE(observed_in_flight.empty());
+
+    DataStorageBackend &backend_base = backend;
+    backend_base.SetAvailable(false);
+    ASSERT_EQ(std::future_status::ready, waiting_snapshot.wait_for(1s));
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, waiting_snapshot.get());
+    EXPECT_TRUE(candidate.empty());
+
+    backend_base.SetAvailable(true);
+    backend.EndDeltaMutation(reporter_key);
+    std::string after_reenable;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, after_reenable));
+    EXPECT_EQ(first, after_reenable);
+    backend.EndDeltaMutation(reporter_key);
+    ASSERT_EQ(EC_OK, backend.Close());
 }
 
 TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBoundaries) {

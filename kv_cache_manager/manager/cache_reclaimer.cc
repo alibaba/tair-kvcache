@@ -191,6 +191,9 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS usage data
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
+    // slot 7: DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 usage data
+    // slot 8: DATA_STORAGE_TYPE_EVENT_REPORT_L2 usage data
+    // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD usage data
     array_t_ grp_storage_usage_by_type_;
 };
 
@@ -1488,6 +1491,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             if (!loc_ptr) {
                 continue;
             }
+            // Reporter-owned locations are not reclaim candidates, but still
+            // keep the metadata key alive after all ordinary locations have
+            // been removed. Count them before filtering so key-count credit is
+            // only granted when the deletion can actually remove the key.
             ++valid_location_count;
             const auto &loc = *loc_ptr;
             if (IsEventReportStorageType(loc.type())) {

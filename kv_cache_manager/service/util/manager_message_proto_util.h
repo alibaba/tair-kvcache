@@ -288,6 +288,10 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_TAIRMEMPOOL;
         break;
     }
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
+        *proto_data_storage_type = T::ST_TAIRMEMPOOL_SSD;
+        break;
+    }
     case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN: {
         *proto_data_storage_type = T::ST_UNSPECIFIED;
         break;
@@ -319,6 +323,10 @@ template <typename T>
 void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, DataStorageType &data_storage_type_info) {
     static_assert(std::is_same_v<T, proto::meta::StorageType> || std::is_same_v<T, proto::admin::StorageType>,
                   "T must be either proto::meta::DataStorage or proto::admin::DataStorage");
+    // Protobuf enums are open on the wire. Always initialize the output so an
+    // unknown numeric value fails closed instead of leaving callers with an
+    // indeterminate DataStorageType.
+    data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     switch (proto_data_storage_type) {
     case T::ST_UNSPECIFIED: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
@@ -338,6 +346,10 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_TAIRMEMPOOL: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+        break;
+    }
+    case T::ST_TAIRMEMPOOL_SSD: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         break;
     }
     case T::ST_NFS: {

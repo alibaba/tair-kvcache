@@ -17,6 +17,14 @@ from kv_cache_manager.py_connector.common.service_discovery_factory import (
 _LEADER_DISCOVERY_TIMEOUT_SECONDS = 5.0
 
 
+class KvCacheManagerHTTPError(requests.HTTPError, AssertionError):
+    """A non-200 Manager response, compatible with the legacy assertion API."""
+
+
+class KvCacheManagerProtocolError(requests.RequestException, AssertionError):
+    """The Manager returned HTTP 200 with a malformed API envelope."""
+
+
 class KvCacheManagerClient:
     @classmethod
     def from_connector_config(
@@ -60,40 +68,43 @@ class KvCacheManagerClient:
 
         self.session = requests.Session()
         self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        self._resource_lock = threading.Lock()
+        self._session_close_claimed = False
+        self._service_discovery_close_claimed = False
+        self._service_discovery_close_deferred = False
+        self._refresh_worker_cleanup_reached = False
+        # Constructor rollback uses the normal close path, so initialize its
+        # synchronization fields before invoking any discovery plugin code.
+        self._refresh_event = threading.Event()
+        self._closed = threading.Event()
+        self._refresh_thread = None
 
         # Resolve service-discovery URLs before issuing any HTTP requests. Keep the
         # discovery object alive so each leader refresh can start from a fresh endpoint.
         self._service_discovery: Optional[ServiceDiscovery] = None
         resolved_url = base_url
-        if not self._is_http_url(base_url):
-            self._service_discovery = create_service_discovery(base_url)
-            if self._service_discovery is None:
-                self.session.close()
-                raise ValueError(
-                    f"failed to create service discovery from manager address {base_url!r}"
-                )
-
-            try:
+        try:
+            if not self._is_http_url(base_url):
+                self._service_discovery = create_service_discovery(base_url)
+                if self._service_discovery is None:
+                    raise ValueError(
+                        f"failed to create service discovery from manager address {base_url!r}"
+                    )
                 endpoint = self._service_discovery.get_one_endpoint()
-            except Exception as e:
-                self._close_service_discovery()
-                self.session.close()
-                raise RuntimeError(
-                    f"failed to resolve manager endpoints from {base_url!r}"
-                ) from e
-            if endpoint is None:
-                self._close_service_discovery()
-                self.session.close()
-                raise RuntimeError(
-                    f"service discovery returned no manager endpoints for {base_url!r}"
-                )
+                if endpoint is None:
+                    raise RuntimeError(
+                        f"service discovery returned no manager endpoints for {base_url!r}"
+                    )
 
-            resolved_url = self._endpoint_url(endpoint)
-            logger.info(
-                "Service discovery (%s) resolved manager endpoint: %s",
-                self._service_discovery.get_type(),
-                resolved_url,
-            )
+                resolved_url = self._endpoint_url(endpoint)
+                logger.info(
+                    "Service discovery (%s) resolved manager endpoint: %s",
+                    self._service_discovery.get_type(),
+                    resolved_url,
+                )
+        except BaseException:
+            self._rollback_construction()
+            raise
 
         self.base_url = resolved_url.rstrip('/')
 
@@ -109,10 +120,7 @@ class KvCacheManagerClient:
         self._min_discover_interval = min_discover_interval_seconds
 
         self._route_lock = threading.Lock()
-        self._refresh_event = threading.Event()
-        self._closed = threading.Event()
         self._last_route_refresh_time = 0.0  # time.monotonic()
-        self._refresh_thread = None
 
         if self._auto_discover_leader:
             try:
@@ -124,10 +132,16 @@ class KvCacheManagerClient:
         # One route-refresh thread serves both modes. Leader discovery wakes
         # periodically; service-discovery-only mode waits for transport failures.
         if self._auto_discover_leader or self._service_discovery is not None:
-            self._refresh_thread = threading.Thread(
-                target=self._route_refresh_loop, daemon=True,
-                name="kvcm-route-refresh")
-            self._refresh_thread.start()
+            try:
+                self._refresh_thread = threading.Thread(
+                    target=self._route_refresh_loop, daemon=True,
+                    name="kvcm-route-refresh")
+                self._refresh_thread.start()
+            except BaseException:
+                # The caller cannot close an object whose constructor failed.
+                # Roll back both resources even when OS thread admission fails.
+                self._rollback_construction()
+                raise
 
     @staticmethod
     def _is_http_url(url):
@@ -239,29 +253,32 @@ class KvCacheManagerClient:
 
     def _route_refresh_loop(self):
         """Background daemon for periodic leader and event-driven route refresh."""
-        while not self._closed.is_set():
-            timeout = (
-                self._discovery_refresh_interval
-                if self._auto_discover_leader
-                else None
-            )
-            refresh_requested = self._refresh_event.wait(timeout=timeout)
-            self._refresh_event.clear()
-            if self._closed.is_set():
-                break
-            # Min interval protection: wait remaining time instead of skipping
-            remaining = self._min_discover_interval - (
-                time.monotonic() - self._last_route_refresh_time
-            )
-            if remaining > 0:
-                if self._closed.wait(timeout=remaining):
-                    break
-            try:
-                self._refresh_manager_route(
-                    force_service_refresh=refresh_requested,
+        try:
+            while not self._closed.is_set():
+                timeout = (
+                    self._discovery_refresh_interval
+                    if self._auto_discover_leader
+                    else None
                 )
-            except Exception as e:
-                logger.warning("Background manager route refresh failed: %s", e)
+                refresh_requested = self._refresh_event.wait(timeout=timeout)
+                self._refresh_event.clear()
+                if self._closed.is_set():
+                    break
+                # Min interval protection: wait remaining time instead of skipping
+                remaining = self._min_discover_interval - (
+                    time.monotonic() - self._last_route_refresh_time
+                )
+                if remaining > 0:
+                    if self._closed.wait(timeout=remaining):
+                        break
+                try:
+                    self._refresh_manager_route(
+                        force_service_refresh=refresh_requested,
+                    )
+                except Exception as e:
+                    logger.warning("Background manager route refresh failed: %s", e)
+        finally:
+            self._close_deferred_service_discovery()
 
     def _make_request(self, method, endpoint, data=None):
         """Helper method to make HTTP requests to the service"""
@@ -286,17 +303,34 @@ class KvCacheManagerClient:
 
         return response
 
-    def _check_response(self, endpoint, response, response_data):
-        """Validate API response, raise AssertionError on failure."""
+    def _check_response(self, endpoint, response, response_data,
+                        check_business_status=True):
+        """Validate transport/envelope and optionally the Manager status."""
         if response.status_code != 200:
-            raise AssertionError(f"Request to {endpoint} failed with status code {response.status_code}")
+            raise KvCacheManagerHTTPError(
+                f"Request to {endpoint} failed with status code {response.status_code}",
+                response=response,
+            )
 
-        if 'header' not in response_data:
-            raise AssertionError(f"Response from {endpoint} missing 'header' field")
+        if not isinstance(response_data, dict):
+            raise KvCacheManagerProtocolError(
+                f"Response from {endpoint} is not a JSON object"
+            )
+        header = response_data.get('header')
+        if not isinstance(header, dict):
+            raise KvCacheManagerProtocolError(
+                f"Response from {endpoint} missing a valid 'header' field"
+            )
+        status = header.get('status')
+        if not isinstance(status, dict) or not status.get('code'):
+            raise KvCacheManagerProtocolError(
+                f"Response from {endpoint} missing a valid 'header.status' field"
+            )
 
-        if response_data['header']['status']['code'] != "OK":
+        if check_business_status and status['code'] != "OK":
             raise AssertionError(
-                f"Request to {endpoint} failed with error: {response_data['header']['status']['message']}")
+                f"Request to {endpoint} failed with error: "
+                f"{status.get('message', '')}")
 
     def _make_api_request(self, endpoint, data=None, check_response=True):
         """Helper method to make POST requests to API endpoints and optionally validate response"""
@@ -319,6 +353,16 @@ class KvCacheManagerClient:
                 raise
 
             response_data = response.json()
+
+            # Validate transport and the common envelope before inspecting the
+            # status for leader routing. This remains mandatory even when callers
+            # ask to receive a non-OK business status verbatim.
+            self._check_response(
+                endpoint,
+                response,
+                response_data,
+                check_business_status=False,
+            )
 
             # SERVER_NOT_LEADER handling: rediscover leader and retry with backoff
             if self._auto_discover_leader and self._get_status_code(response_data) == 'SERVER_NOT_LEADER':
@@ -389,11 +433,75 @@ class KvCacheManagerClient:
         """Get cluster info including leader endpoint (leader discovery API)"""
         return self._make_api_request('/api/getClusterInfo', data, check_response)
 
+    def _close_session_once(self):
+        with self._resource_lock:
+            if self._session_close_claimed:
+                return
+            self._session_close_claimed = True
+        self.session.close()
+
+    def _rollback_construction(self):
+        try:
+            self.close()
+        except BaseException:
+            logger.error(
+                "Failed to release a partially constructed manager client",
+                exc_info=True,
+            )
+
+    def _request_service_discovery_close(self, refresh_thread):
+        discovery = None
+        with self._resource_lock:
+            if (
+                self._service_discovery_close_claimed
+                or self._service_discovery_close_deferred
+            ):
+                return
+            if (
+                refresh_thread is not None
+                and refresh_thread.is_alive()
+                and not self._refresh_worker_cleanup_reached
+            ):
+                self._service_discovery_close_deferred = True
+                return
+            self._service_discovery_close_claimed = True
+            discovery = self._service_discovery
+            self._service_discovery = None
+        if discovery is not None:
+            discovery.close()
+
+    def _close_deferred_service_discovery(self):
+        discovery = None
+        with self._resource_lock:
+            self._refresh_worker_cleanup_reached = True
+            if (
+                not self._service_discovery_close_deferred
+                or self._service_discovery_close_claimed
+            ):
+                return
+            self._service_discovery_close_deferred = False
+            self._service_discovery_close_claimed = True
+            discovery = self._service_discovery
+            self._service_discovery = None
+        if discovery is not None:
+            try:
+                discovery.close()
+            except Exception:
+                logger.error(
+                    "Failed to close service discovery after route-refresh exit",
+                    exc_info=True,
+                )
+
     def close(self):
         """Close the HTTP session, discovery client, and background refresh thread."""
         self._closed.set()
         self._refresh_event.set()
-        if self._refresh_thread and self._refresh_thread.is_alive():
-            self._refresh_thread.join(timeout=5)
-        self.session.close()
-        self._close_service_discovery()
+        refresh_thread = self._refresh_thread
+        if (
+            refresh_thread is not None
+            and refresh_thread is not threading.current_thread()
+            and refresh_thread.is_alive()
+        ):
+            refresh_thread.join(timeout=5)
+        self._close_session_once()
+        self._request_service_discovery_close(refresh_thread)

@@ -1,15 +1,23 @@
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <set>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -18,6 +26,64 @@
 #include "kv_cache_manager/meta/utils.h"
 
 using namespace kv_cache_manager;
+
+static_assert(std::is_nothrow_move_constructible_v<LocationSpec>);
+static_assert(std::is_nothrow_move_assignable_v<LocationSpec>);
+static_assert(std::is_nothrow_move_constructible_v<CacheLocation>);
+static_assert(std::is_nothrow_move_assignable_v<CacheLocation>);
+
+TEST(CacheLocationMoveTest, SetAndMoveLocationSpecsTransferVectorStorage) {
+    std::vector<LocationSpec> specs;
+    specs.reserve(2);
+    specs.emplace_back("tp0", "event_report://move-test:8080/mem?payload=" + std::string(128, 'a'));
+    specs.emplace_back("tp1", "event_report://move-test:8080/mem?payload=" + std::string(128, 'b'));
+    const LocationSpec *const original_storage = specs.data();
+
+    CacheLocation location;
+    location.set_location_specs(std::move(specs));
+    ASSERT_EQ(original_storage, location.location_specs().data());
+    ASSERT_EQ(2u, location.location_specs().size());
+
+    CacheLocation moved(std::move(location));
+    EXPECT_EQ(original_storage, moved.location_specs().data());
+    EXPECT_EQ("tp0", moved.location_specs()[0].name());
+    EXPECT_EQ("tp1", moved.location_specs()[1].name());
+}
+
+TEST(CacheLocationMoveTest, ValidatedTotalSizeHintFollowsLocationSpecs) {
+    CacheLocation location;
+    std::uint64_t size = 0;
+    EXPECT_FALSE(location.GetValidatedTotalSize(size));
+    EXPECT_FALSE(location.HasValidatedLocationSpecs());
+
+    location.set_location_specs({LocationSpec("tp0", "event_report://size-hint:8080/mem?size=17")});
+    location.set_validated_total_size(17);
+    ASSERT_TRUE(location.GetValidatedTotalSize(size));
+    EXPECT_TRUE(location.HasValidatedLocationSpecs());
+    EXPECT_EQ(17u, size);
+
+    CacheLocation copied = location;
+    size = 0;
+    ASSERT_TRUE(copied.GetValidatedTotalSize(size));
+    EXPECT_EQ(17u, size);
+
+    copied.mutable_location_specs().front().set_uri("event_report://size-hint:8080/mem?size=23");
+    EXPECT_FALSE(copied.GetValidatedTotalSize(size));
+    EXPECT_FALSE(copied.HasValidatedLocationSpecs());
+    copied.set_validated_total_size(23);
+    CacheLocation moved = std::move(copied);
+    ASSERT_TRUE(moved.GetValidatedTotalSize(size));
+    EXPECT_EQ(23u, size);
+
+    CacheLocation restored;
+    ASSERT_TRUE(restored.FromJsonString(moved.ToJsonString()));
+    EXPECT_FALSE(restored.GetValidatedTotalSize(size));
+    EXPECT_FALSE(restored.HasValidatedLocationSpecs());
+
+    moved.push_location_spec(LocationSpec("tp1", "event_report://size-hint:8080/mem?size=29"));
+    EXPECT_FALSE(moved.GetValidatedTotalSize(size));
+    EXPECT_FALSE(moved.HasValidatedLocationSpecs());
+}
 
 namespace {
 // Helper class to create test data
@@ -46,21 +112,26 @@ SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &,
                                            bool) -> void {};
 
-class FaultyGetLocationIdsBackend : public MetaLocalBackend {
+class FaultyTargetedLocationBackend : public MetaLocalBackend {
 public:
     void SetFailedKey(KeyType key) { failed_key_ = key; }
 
-    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          LocationIdsPerKey &out_location_ids) noexcept override {
-        auto results = MetaLocalBackend::GetLocationIds(request_context, keys, out_location_ids);
+    std::vector<std::vector<ErrorCode>>
+    GetLocationsWithKeyStatus(RequestContext *request_context,
+                              const KeyTypeVec &keys,
+                              const LocationIdsPerKey &location_ids,
+                              LocationsPerKey &out_locations,
+                              std::vector<ErrorCode> &out_key_error_codes) noexcept override {
+        auto results = MetaLocalBackend::GetLocationsWithKeyStatus(
+            request_context, keys, location_ids, out_locations, out_key_error_codes);
         if (!failed_key_.has_value()) {
             return results;
         }
         for (size_t i = 0; i < keys.size(); ++i) {
             if (keys[i] == failed_key_.value()) {
-                results[i] = EC_ERROR;
-                out_location_ids[i].clear();
+                out_key_error_codes[i] = EC_ERROR;
+                results[i].assign(location_ids[i].size(), EC_ERROR);
+                out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
             }
         }
         return results;
@@ -137,6 +208,81 @@ private:
     std::optional<KeyType> get_locations_failed_key_;
 };
 
+class RecordingGetLocationsBackend : public MetaLocalBackend {
+public:
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyTypeVec &keys,
+                                        CacheLocationMapVector &out_locations) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requested_key_batches_.push_back(keys);
+        }
+        return MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+    }
+
+    void ResetReadLog() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        requested_key_batches_.clear();
+    }
+
+    std::vector<KeyTypeVec> RequestedKeyBatches() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return requested_key_batches_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<KeyTypeVec> requested_key_batches_;
+};
+
+class PrefixReadBackend : public MetaLocalBackend {
+public:
+    void SetFailedKey(std::optional<KeyType> key) { failed_key_ = key; }
+
+    void ResetReadCounts() {
+        location_value_read_count_.store(0, std::memory_order_relaxed);
+        compact_read_count_.store(0, std::memory_order_relaxed);
+    }
+
+    size_t LocationValueReadCount() const { return location_value_read_count_.load(std::memory_order_relaxed); }
+    size_t CompactReadCount() const { return compact_read_count_.load(std::memory_order_relaxed); }
+
+    std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             LocationsPerKey &out_locations) noexcept override {
+        location_value_read_count_.fetch_add(keys.size(), std::memory_order_relaxed);
+        auto results = MetaLocalBackend::GetLocationValues(request_context, keys, out_locations);
+        InjectFailure(keys.data(), keys.size(), results);
+        return results;
+    }
+
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                    const KeyType *keys,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept override {
+        compact_read_count_.fetch_add(key_count, std::memory_order_relaxed);
+        auto results = MetaLocalBackend::GetLocationValuesCompact(request_context, keys, key_count, out_locations);
+        InjectFailure(keys, key_count, results);
+        return results;
+    }
+
+private:
+    void InjectFailure(const KeyType *keys, size_t key_count, std::vector<ErrorCode> &results) const {
+        if (!failed_key_.has_value()) {
+            return;
+        }
+        for (size_t i = 0; i < key_count && i < results.size(); ++i) {
+            if (keys[i] == *failed_key_) {
+                results[i] = EC_TIMEOUT;
+            }
+        }
+    }
+
+    std::optional<KeyType> failed_key_;
+    std::atomic<size_t> location_value_read_count_{0};
+    std::atomic<size_t> compact_read_count_{0};
+};
+
 ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
                                   RequestContext *request_context,
                                   const KeyVector &keys,
@@ -177,12 +323,12 @@ public:
         return meta_storage_backend_config;
     }
 
-    std::shared_ptr<MetaIndexer> CreateMetaIndexer() {
+    std::shared_ptr<MetaIndexer> CreateMetaIndexer(size_t max_key_count = 10000) {
         auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
         auto backend_config = ConstructMetaStorageBackendConfig();
         meta_indexer_config->SetMetaStorageBackendConfig(backend_config);
         meta_indexer_config->SetMutexShardNum(32);
-        meta_indexer_config->SetMaxKeyCount(10000);
+        meta_indexer_config->SetMaxKeyCount(max_key_count);
         auto indexer = std::make_shared<MetaIndexer>();
         auto metaCachePolicyConfig = std::make_shared<MetaCachePolicyConfig>();
         metaCachePolicyConfig->SetCapacity(0);
@@ -195,9 +341,9 @@ public:
         return indexer;
     }
 
-    FaultyGetLocationIdsBackend *ReplaceWithFaultyBackend() {
+    FaultyTargetedLocationBackend *ReplaceWithFaultyBackend() {
         auto backend_config = ConstructMetaStorageBackendConfig();
-        auto faulty_backend = std::make_unique<FaultyGetLocationIdsBackend>();
+        auto faulty_backend = std::make_unique<FaultyTargetedLocationBackend>();
         EXPECT_EQ(EC_OK, faulty_backend->Init("test", backend_config));
         EXPECT_EQ(EC_OK, faulty_backend->Open());
         auto backend_raw = faulty_backend.get();
@@ -222,6 +368,30 @@ public:
     RollbackFaultBackend *ReplaceWithRollbackFaultBackend() {
         auto backend_config = ConstructMetaStorageBackendConfig();
         auto backend = std::make_unique<RollbackFaultBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    RecordingGetLocationsBackend *ReplaceWithRecordingGetLocationsBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<RecordingGetLocationsBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    PrefixReadBackend *ReplaceWithPrefixReadBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<PrefixReadBackend>();
         EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
         EXPECT_EQ(EC_OK, backend->Open());
         auto backend_raw = backend.get();
@@ -286,8 +456,7 @@ TEST_F(MetaSearcherTest, TestBatchAddLocationReturnsAlignedPartialResults) {
     meta_indexer_->max_key_count_ = 1;
 
     MetaSearcher::KeyVector keys = {1001, 1002};
-    while (GetShardIndex(keys[0], meta_indexer_->mutex_shard_mask_) ==
-           GetShardIndex(keys[1], meta_indexer_->mutex_shard_mask_)) {
+    while (meta_indexer_->GetMutexShardIndex(keys[0]) == meta_indexer_->GetMutexShardIndex(keys[1])) {
         ++keys[1];
     }
     auto location = MetaSearcherTestHelper::CreateCacheLocation(
@@ -429,6 +598,970 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
     EXPECT_EQ("event_report://127.0.0.1:8080/mem", spec_uris["full_3"]);
 }
 
+TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotalSize) {
+    const KeyType key = 10009;
+    const std::string location_id = "kvs#event_report_l2#mem#size-hint:8080";
+    auto make_tasks = [&location_id](std::uint64_t size) {
+        return std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>>{{
+            {location_id,
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CacheLocationStatus::CLS_SERVING,
+             {LocationSpec("tp0", "event_report://size-hint:8080/mem?size=" + std::to_string(size))}},
+        }};
+    };
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(17), per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(23), per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto location_it = location_maps[0].find(location_id);
+    ASSERT_NE(location_maps[0].end(), location_it);
+    ASSERT_TRUE(location_it->second);
+    ASSERT_EQ(1u, location_it->second->location_specs().size());
+    EXPECT_EQ("event_report://size-hint:8080/mem?size=23", location_it->second->location_specs()[0].uri());
+    std::uint64_t total_size = 0;
+    ASSERT_TRUE(location_it->second->GetValidatedTotalSize(total_size));
+    EXPECT_EQ(23u, total_size);
+    EXPECT_EQ(23u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeValidationHintNeverTrustsRetainedMalformedRecoveredSpec) {
+    const KeyType key = 10019;
+    const std::string location_id = "kvs#event_report_l2#mem#recovered-hint:8080";
+    auto recovered = std::make_shared<CacheLocation>(
+        location_id,
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        1,
+        std::vector<LocationSpec>{LocationSpec("broken", "event_report://recovered-hint:not-a-port/mem?size=9")});
+    CacheLocationMapVector recovered_maps(1);
+    recovered_maps[0].emplace(location_id, std::move(recovered));
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, recovered_maps, properties).ec);
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("fresh", "event_report://recovered-hint:8080/mem?size=3")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, tasks, per_key_ec));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    const auto &partially_repaired = location_maps[0].at(location_id);
+    ASSERT_TRUE(partially_repaired);
+    EXPECT_FALSE(partially_repaired->HasValidatedLocationSpecs());
+    std::string_view version;
+    EXPECT_FALSE(SnapshotUriUtils::InspectSnapshotUriForVisibility(
+        partially_repaired->location_specs()[0].uri(), version, partially_repaired->HasValidatedLocationSpecs()));
+
+    // Replacing the only malformed retained spec leaves a fully validated
+    // final vector. The proof may then be restored for subsequent queries.
+    tasks[0][0].specs = {LocationSpec("broken", "event_report://recovered-hint:8080/mem?size=5")};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    const auto &repaired = location_maps[0].at(location_id);
+    ASSERT_TRUE(repaired->HasValidatedLocationSpecs());
+    std::uint64_t total_size = 0;
+    ASSERT_TRUE(repaired->GetValidatedTotalSize(total_size));
+    EXPECT_EQ(8u, total_size);
+    for (const auto &spec : repaired->location_specs()) {
+        EXPECT_TRUE(SnapshotUriUtils::InspectSnapshotUriForVisibility(spec.uri(), version, true));
+    }
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeFlatTasksPreservesPerKeyRangesAndValidatesOffsets) {
+    const MetaSearcher::KeyVector keys{10010, 10011};
+    auto make_task = [](std::string location_id, std::string spec_name) {
+        return MetaSearcher::MergeLocationSpecsTask{
+            std::move(location_id),
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec(std::move(spec_name), "event_report://flat-task:8080/mem?size=1")},
+        };
+    };
+    std::vector<MetaSearcher::MergeLocationSpecsTask> flat_tasks;
+    const InternedLocationId borrowed_location_id =
+        std::make_shared<const std::string>("kvs#event_report_l2#mem#flat-a:8080");
+    MetaSearcher::MergeLocationSpecsTask inline_task{
+        {},
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        CacheLocationStatus::CLS_SERVING,
+        {},
+    };
+    inline_task.borrowed_interned_location_id = &borrowed_location_id;
+    inline_task.PushReportEventSpec(LocationSpec("tp0", "event_report://flat-task:8080/mem?size=1"), 1);
+    inline_task.prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(1);
+    ASSERT_TRUE(inline_task.specs.empty());
+    ASSERT_TRUE(inline_task.inline_spec.has_value());
+    EXPECT_EQ(1, borrowed_location_id.use_count());
+    flat_tasks.push_back(std::move(inline_task));
+    flat_tasks.push_back(make_task("kvs#event_report_l2#mem#flat-b:8080", "tp0"));
+    flat_tasks.push_back(make_task("kvs#event_report_l2#disk#flat-b:8080", "tp1"));
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 1, 3}, flat_tasks, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key_ec);
+    EXPECT_EQ(2, borrowed_location_id.use_count());
+    EXPECT_EQ("tp0", flat_tasks[0].SpecAt(0).name());
+    EXPECT_TRUE(flat_tasks[0].SpecAt(0).uri().empty());
+    EXPECT_EQ("tp0", flat_tasks[1].SpecAt(0).name());
+    EXPECT_FALSE(flat_tasks[1].SpecAt(0).uri().empty());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(2u, location_maps.size());
+    EXPECT_EQ(1u, location_maps[0].size());
+    EXPECT_EQ(2u, location_maps[1].size());
+    EXPECT_TRUE(location_maps[0].count(*borrowed_location_id));
+
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 2, 1}, flat_tasks, per_key_ec));
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), keys, {0, 1, 2}, flat_tasks, per_key_ec));
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeFusedRmwTracksNewKeysAndCapacity) {
+    meta_indexer_->max_key_count_ = 1;
+    const KeyType existing_key = 10022;
+    const KeyType rejected_key = 10023;
+    const std::string location_a = "kvs#event_report_l2#mem#capacity-a:8080";
+    const std::string location_b = "kvs#event_report_l2#disk#capacity-a:8080";
+    auto make_task = [](const std::string &location_id, const std::string &name, const std::string &uri) {
+        return MetaSearcher::MergeLocationSpecsTask{location_id,
+                                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                                    CacheLocationStatus::CLS_SERVING,
+                                                    {LocationSpec(name, uri)}};
+    };
+
+    std::vector<ErrorCode> per_key_ec;
+    auto task_a = make_task(location_a, "tp0", "event_report://capacity-a:8080/mem?size=3");
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_a}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // A new target location under an existing key must not consume another
+    // key-count slot, even though the targeted read returns EC_NOENT for that
+    // location.
+    auto task_b = make_task(location_b, "tp1", "event_report://capacity-a:8080/disk?size=5");
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_b}}, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // Updating an existing target also remains admissible at capacity.
+    task_a.specs = {LocationSpec("tp0", "event_report://capacity-a:8080/mem?size=7")};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {existing_key}, {{task_a}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    EXPECT_NE(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {rejected_key}, {{task_a}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOSPC}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    // A capacity failure for a new key must not reject an existing-key
+    // update that happens to share the same internal upsert batch. The old
+    // two-phase path admitted the existing update in its merge phase.
+    task_a.specs = {LocationSpec("tp0", "event_report://capacity-a:8080/mem?size=9")};
+    const auto rejected_task = make_task(location_a, "tp0", "event_report://capacity-rejected:8080/mem?size=4");
+    EXPECT_EQ(EC_PARTIAL_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {existing_key, rejected_key}, {{task_a}, {rejected_task}}, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}), per_key_ec);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    std::vector<CacheLocationMap> locations;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetLocation(request_context_.get(), {existing_key, rejected_key}, mask, locations));
+    ASSERT_EQ(2u, locations.size());
+    EXPECT_EQ(2u, locations[0].size());
+    ASSERT_TRUE(locations[0].at(location_a));
+    EXPECT_NE(std::string::npos, locations[0].at(location_a)->location_specs()[0].uri().find("size=9"));
+    EXPECT_TRUE(locations[1].empty());
+    EXPECT_EQ(14u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsNormalizesLegacyDuplicateNamesInPlace) {
+    const MetaSearcher::KeyVector keys = {10015};
+    const auto seed =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                        3,
+                                        std::vector<LocationSpec>{
+                                            LocationSpec("z", "event_report://legacy:8080/mem?source=first"),
+                                            LocationSpec("a", "event_report://legacy:8080/mem?source=untouched"),
+                                            LocationSpec("z", "event_report://legacy:8080/mem?source=last"),
+                                        });
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchAddLocation(request_context_.get(), keys, CacheLocationVector{seed}, add_results));
+    ASSERT_EQ(1u, add_results.size());
+    ASSERT_EQ(EC_OK, add_results[0].ec);
+
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {add_results[0].location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("b", "event_report://legacy:8080/mem?source=new")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    const auto &specs = location_maps[0].at(add_results[0].location_id)->location_specs();
+    ASSERT_EQ(3u, specs.size());
+    EXPECT_EQ("a", specs[0].name());
+    EXPECT_EQ("b", specs[1].name());
+    EXPECT_EQ("z", specs[2].name());
+    EXPECT_EQ("event_report://legacy:8080/mem?source=last", specs[2].uri());
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAndLocationUnion) {
+    const MetaSearcher::KeyVector keys = {10030, 10031, 10032, 10033};
+    const std::string host = "mamba-host:8080";
+    std::vector<std::string> full_names;
+    std::vector<std::string> state_names;
+    for (std::size_t i = 0; i < 70; ++i) {
+        full_names.push_back("full_spec_" + std::to_string(i));
+    }
+    for (std::size_t i = 0; i < 5; ++i) {
+        state_names.push_back("state_spec_" + std::to_string(i));
+    }
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", full_names),
+        LocationSpecGroup("L1", state_names),
+    };
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (std::size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        std::vector<LocationSpec> l1_specs;
+        std::vector<LocationSpec> l2_specs;
+        auto append_spec = [&](const std::string &name, std::size_t ordinal) {
+            LocationSpec spec(name, "event_report://" + host + "/mem?name=" + name);
+            (ordinal % 2 == 0 ? l1_specs : l2_specs).push_back(std::move(spec));
+        };
+        for (std::size_t i = 0; i < full_names.size(); ++i) {
+            // The fourth key terminates the full-prefix by omitting one bit in
+            // the second uint64_t word.
+            if (key_index == 3 && i == 69) {
+                continue;
+            }
+            append_spec(full_names[i], i);
+        }
+        if (key_index != 1) {
+            for (std::size_t i = 0; i < state_names.size(); ++i) {
+                append_spec(state_names[i], full_names.size() + i);
+            }
+        }
+        tasks[key_index].push_back({"kvs#event_report_l1p5#mem#" + host,
+                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                    CacheLocationStatus::CLS_SERVING,
+                                    std::move(l1_specs)});
+        tasks[key_index].push_back({"kvs#event_report_l2#mem#" + host,
+                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                    CacheLocationStatus::CLS_SERVING,
+                                    std::move(l2_specs)});
+    }
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_OK}), per_key_ec);
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), keys, false, {"mem"}, groups, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(host, matches[0].host_ip_port);
+    EXPECT_EQ(3, matches[0].local);
+
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), keys, true, {"mem"}, groups, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(host, matches[0].host_ip_port);
+    EXPECT_EQ(1, matches[0].local);
+}
+
+TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParallelReadChunks) {
+    constexpr size_t kKeyCount = 40000;
+    constexpr size_t kFullPrefix = 37001;
+    constexpr size_t kLastStateBeforeEaglePop = 36960;
+    const std::set<size_t> state_indices = {0, 63, 64, 4095, 4096, 20479, 20480, kLastStateBeforeEaglePop, 37000};
+    const std::string host = "parallel-mamba-host:8080";
+    const std::string location_id = "kvs#event_report_l1p5#mem#" + host;
+
+    // The fixture's normal capacity is intentionally small. Recreate only
+    // this test's pure-local index with enough entries to cross the 4096-key
+    // probe and multiple 16384-key parallel read ranges.
+    meta_searcher_.reset();
+    meta_indexer_.reset();
+    meta_indexer_ = CreateMetaIndexer(kKeyCount + 16);
+    ASSERT_TRUE(meta_indexer_);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 8));
+    meta_searcher_ = std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+
+    auto make_location = [&](bool has_full, bool has_state) {
+        std::vector<LocationSpec> specs;
+        if (has_full) {
+            specs.emplace_back("full_0", "event_report://" + host + "/mem");
+        }
+        if (has_state) {
+            specs.emplace_back("state_0", "event_report://" + host + "/mem");
+        }
+        return std::make_shared<CacheLocation>(location_id,
+                                               CacheLocationStatus::CLS_SERVING,
+                                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                               specs.size(),
+                                               std::move(specs));
+    };
+    const auto full_only = make_location(true, false);
+    const auto full_and_state = make_location(true, true);
+    const auto state_only = make_location(false, true);
+    const auto other_only = std::make_shared<CacheLocation>(
+        location_id,
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+        1,
+        std::vector<LocationSpec>{LocationSpec("other", "event_report://" + host + "/mem")});
+
+    MetaSearcher::KeyVector keys(kKeyCount);
+    std::iota(keys.begin(), keys.end(), 20000);
+    CacheLocationMapVector location_maps(kKeyCount);
+    for (size_t key_index = 0; key_index < kKeyCount; ++key_index) {
+        const bool has_full = key_index < kFullPrefix;
+        const bool has_state = state_indices.find(key_index) != state_indices.end();
+        CacheLocationConstPtr location;
+        if (has_full && has_state) {
+            location = full_and_state;
+        } else if (has_full) {
+            location = full_only;
+        } else if (has_state) {
+            location = state_only;
+        } else {
+            // Keep the reporter present beyond the full prefix without
+            // accidentally satisfying either required group.
+            location = other_only;
+        }
+        location_maps[key_index].emplace(location_id, std::move(location));
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    auto run = [&](bool use_eagle_pop, size_t p2p_host_count) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithMambaByHost(
+                      request_context_.get(), keys, use_eagle_pop, {"mem"}, groups, matches, nullptr, p2p_host_count));
+        EXPECT_EQ(1u, matches.size());
+        return matches.empty() ? int64_t{-1} : matches.front().local;
+    };
+
+    // p2p_host_count=1 intentionally selects the established full-materialize
+    // implementation as a semantic reference for the progressive bitset path.
+    EXPECT_EQ(static_cast<int64_t>(kFullPrefix), run(false, 0));
+    EXPECT_EQ(run(false, 1), run(false, 0));
+    EXPECT_EQ(static_cast<int64_t>(kLastStateBeforeEaglePop + 1), run(true, 0));
+    EXPECT_EQ(run(true, 1), run(true, 0));
+}
+
+TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadReference) {
+    constexpr size_t kKeyCount = 6000;
+    constexpr size_t kHostCount = 6;
+    constexpr size_t kLongMambaFullPrefix = 5501;
+
+    meta_searcher_.reset();
+    meta_indexer_.reset();
+    meta_indexer_ = CreateMetaIndexer(kKeyCount + 16);
+    ASSERT_TRUE(meta_indexer_);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 8));
+    meta_searcher_ = std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+
+    std::vector<std::string> hosts;
+    hosts.reserve(kHostCount);
+    for (size_t host_index = 0; host_index < kHostCount; ++host_index) {
+        hosts.push_back("random-reference-host-" + std::to_string(host_index) + ":8080");
+    }
+
+    MetaSearcher::KeyVector keys(kKeyCount);
+    std::iota(keys.begin(), keys.end(), 300000);
+    CacheLocationMapVector location_maps(kKeyCount);
+    std::mt19937 random(0x51A7E5u);
+    auto add_location = [&](size_t key_index,
+                            size_t host_index,
+                            std::string_view medium,
+                            DataStorageType type,
+                            CacheLocationStatus status,
+                            std::vector<std::string> spec_names,
+                            bool valid_uri) {
+        const std::string type_name =
+            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ? "event_report_l2" : "event_report_l1p5";
+        const std::string location_id = "kvs#" + type_name + "#" + std::string(medium) + "#" + hosts[host_index];
+        std::vector<LocationSpec> specs;
+        specs.reserve(spec_names.size());
+        for (auto &name : spec_names) {
+            specs.emplace_back(std::move(name),
+                               valid_uri ? "event_report://" + hosts[host_index] + "/" + std::string(medium)
+                                         : "missing-uri-scheme");
+        }
+        location_maps[key_index].emplace(
+            location_id, std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs)));
+    };
+
+    for (size_t key_index = 0; key_index < kKeyCount; ++key_index) {
+        // Host zero guarantees that both algorithms must cross the synchronous
+        // 4096-key probe. Its ordinary prefix spans the request, while its
+        // Mamba full prefix stops inside the parallel suffix.
+        std::vector<std::string> primary_specs = key_index < kLongMambaFullPrefix
+                                                     ? std::vector<std::string>{"full_a", "full_b"}
+                                                     : std::vector<std::string>{"other"};
+        if (key_index == 0 || key_index % 97 == 0 || key_index == 4095 || key_index == 4096 ||
+            key_index == kLongMambaFullPrefix - 1) {
+            primary_specs.push_back("state_a");
+            primary_specs.push_back("state_b");
+        }
+        add_location(key_index,
+                     0,
+                     "mem",
+                     DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                     CacheLocationStatus::CLS_SERVING,
+                     std::move(primary_specs),
+                     true);
+        if (key_index % 3 != 1) {
+            add_location(key_index,
+                         0,
+                         "ssd",
+                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                         CacheLocationStatus::CLS_SERVING,
+                         {"ssd_aux"},
+                         true);
+        }
+
+        for (size_t host_index = 1; host_index < kHostCount; ++host_index) {
+            const uint32_t sample = random();
+            if (key_index != 0 && sample % 5 == 0) {
+                continue;
+            }
+            const auto status = key_index == 0 || sample % 7 > 2 ? CacheLocationStatus::CLS_SERVING
+                                                                 : static_cast<CacheLocationStatus>(sample % 3 + 1);
+            std::vector<std::string> names;
+            if (key_index == 0 || (sample & 1U) != 0) {
+                names.push_back("full_a");
+            }
+            if (key_index == 0 || (sample & 2U) != 0) {
+                names.push_back("full_b");
+            }
+            if (key_index == 0 || sample % 11 == 0) {
+                names.push_back("state_a");
+                names.push_back("state_b");
+            }
+            if (names.empty()) {
+                names.push_back("other");
+            }
+            add_location(key_index,
+                         host_index,
+                         sample % 2 == 0 ? "mem" : "ssd",
+                         sample % 3 == 0 ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                         : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                         status,
+                         std::move(names),
+                         key_index == 0 || sample % 13 != 0);
+        }
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    auto local_prefixes = [](const std::vector<MetaSearcher::HostCacheMatch> &matches) {
+        std::map<std::string, int64_t> prefixes;
+        for (const auto &match : matches) {
+            prefixes.emplace(match.host_ip_port, match.local);
+        }
+        return prefixes;
+    };
+    const std::vector<std::vector<std::string>> medium_filters = {{}, {"mem"}, {"ssd"}};
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_a", "full_b"}),
+        LocationSpecGroup("L0", {"state_a", "state_b"}),
+    };
+    for (const auto &medium_filter : medium_filters) {
+        for (const bool use_eagle_pop : {false, true}) {
+            std::vector<MetaSearcher::HostCacheMatch> progressive;
+            std::vector<MetaSearcher::HostCacheMatch> full_read;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchByHost(
+                          request_context_.get(), keys, use_eagle_pop, medium_filter, progressive, nullptr, 0));
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchByHost(
+                          request_context_.get(), keys, use_eagle_pop, medium_filter, full_read, nullptr, kHostCount));
+            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithMambaByHost(
+                          request_context_.get(), keys, use_eagle_pop, medium_filter, groups, progressive, nullptr, 0));
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                                 keys,
+                                                                 use_eagle_pop,
+                                                                 medium_filter,
+                                                                 groups,
+                                                                 full_read,
+                                                                 nullptr,
+                                                                 kHostCount));
+            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+        }
+    }
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithAndWithoutP2P) {
+    const MetaSearcher::KeyVector keys = {10040, 10041};
+    const std::vector<std::pair<std::string, CacheLocationStatus>> hosts = {
+        {"serving-host:8080", CacheLocationStatus::CLS_SERVING},
+        {"new-host:8080", CacheLocationStatus::CLS_NEW},
+        {"writing-host:8080", CacheLocationStatus::CLS_WRITING},
+        {"deleting-host:8080", CacheLocationStatus::CLS_DELETING},
+        {"not-found-host:8080", CacheLocationStatus::CLS_NOT_FOUND},
+    };
+    CacheLocationMapVector location_maps(keys.size());
+    for (auto &location_map : location_maps) {
+        for (const auto &[host, status] : hosts) {
+            const std::string location_id = "kvs#event_report_l1p5#mem#" + host;
+            location_map.emplace(
+                location_id,
+                std::make_shared<CacheLocation>(
+                    location_id,
+                    status,
+                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                    2,
+                    std::vector<LocationSpec>{LocationSpec("full_0", "event_report://" + host + "/mem"),
+                                              LocationSpec("state_0", "event_report://" + host + "/mem")}));
+        }
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    auto verify_prefix = [&](size_t p2p_host_count) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys, false, {"mem"}, matches, nullptr, p2p_host_count));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+        EXPECT_EQ(0, matches[0].p2p_1_fetch);
+        EXPECT_EQ(2, matches[0].p2p_1_total_match);
+    };
+    verify_prefix(0);
+    verify_prefix(5);
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    auto verify_mamba = [&](size_t p2p_host_count) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithMambaByHost(
+                      request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, p2p_host_count));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+        EXPECT_EQ(0, matches[0].p2p_1_fetch);
+        EXPECT_EQ(2, matches[0].p2p_1_total_match);
+    };
+    verify_mamba(0);
+    verify_mamba(5);
+}
+
+TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWithoutP2P) {
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+
+    const MetaSearcher::KeyVector keys = {10100, 10101, 10102};
+    const std::string host = "error-host:8080";
+    const std::string location_id = "kvs#event_report_l1p5#mem#" + host;
+    CacheLocationMapVector location_maps(keys.size());
+    for (auto &location_map : location_maps) {
+        location_map.emplace(
+            location_id,
+            std::make_shared<CacheLocation>(
+                location_id,
+                CacheLocationStatus::CLS_SERVING,
+                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                2,
+                std::vector<LocationSpec>{LocationSpec("full_0", "event_report://" + host + "/mem"),
+                                          LocationSpec("state_0", "event_report://" + host + "/mem")}));
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+    backend->SetFailedKey(keys[1]);
+
+    for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_TIMEOUT,
+                  meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys, false, {"mem"}, matches, nullptr, p2p_host_count));
+        EXPECT_TRUE(matches.empty());
+    }
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_TIMEOUT,
+                  meta_searcher_->PrefixMatchWithMambaByHost(
+                      request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, p2p_host_count));
+        EXPECT_TRUE(matches.empty());
+    }
+}
+
+TEST_F(MetaSearcherTest, TestProgressiveHostPrefixOrdersParallelErrorsAndVisitorCancellation) {
+    constexpr size_t kKeyCount = 40000;
+    constexpr size_t kFailureIndex = 20000;
+    constexpr size_t kHostStopIndex = 97;
+    constexpr size_t kProbeKeyCount = 4096;
+    const std::string host = "progressive-error-host:8080";
+    const std::string other_host = "progressive-other-host:8080";
+
+    meta_searcher_.reset();
+    meta_indexer_.reset();
+    meta_indexer_ = CreateMetaIndexer(kKeyCount + 16);
+    ASSERT_TRUE(meta_indexer_);
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 8));
+    meta_searcher_ = std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+
+    auto make_location = [](const std::string &target_host) {
+        const std::string location_id = "kvs#event_report_l1p5#mem#" + target_host;
+        return std::make_shared<CacheLocation>(
+            location_id,
+            CacheLocationStatus::CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+            2,
+            std::vector<LocationSpec>{LocationSpec("full_0", "event_report://" + target_host + "/mem"),
+                                      LocationSpec("state_0", "event_report://" + target_host + "/mem")});
+    };
+    const auto location = make_location(host);
+    const auto other_location = make_location(other_host);
+
+    MetaSearcher::KeyVector keys(kKeyCount);
+    std::iota(keys.begin(), keys.end(), 70000);
+    CacheLocationMapVector location_maps(kKeyCount);
+    for (auto &location_map : location_maps) {
+        location_map.emplace(location->id(), location);
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    const KeyType other_host_key = keys.back() + 1;
+    CacheLocationMapVector other_location_map(1);
+    other_location_map[0].emplace(other_location->id(), other_location);
+    ASSERT_EQ(EC_OK,
+              meta_indexer_
+                  ->Put(request_context_.get(), MetaSearcher::KeyVector{other_host_key}, other_location_map, properties)
+                  .ec);
+    backend->SetFailedKey(keys[kFailureIndex]);
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    EXPECT_EQ(EC_TIMEOUT, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    EXPECT_TRUE(matches.empty());
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    EXPECT_EQ(
+        EC_TIMEOUT,
+        meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), keys, false, {"mem"}, groups, matches));
+    EXPECT_TRUE(matches.empty());
+
+    // The same later backend failure is irrelevant once every candidate host
+    // has already stopped inside the first probe. It must neither leak as an
+    // RPC error nor cause the million-key-style suffix to be read.
+    MetaSearcher::KeyVector early_stop_keys = keys;
+    early_stop_keys[kHostStopIndex] = other_host_key;
+    backend->ResetReadCounts();
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchByHost(request_context_.get(), early_stop_keys, false, {"mem"}, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(host, matches[0].host_ip_port);
+    EXPECT_EQ(static_cast<int64_t>(kHostStopIndex), matches[0].local);
+    EXPECT_EQ(kProbeKeyCount, backend->CompactReadCount());
+
+    backend->ResetReadCounts();
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchWithMambaByHost(
+                  request_context_.get(), early_stop_keys, false, {"mem"}, groups, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(host, matches[0].host_ip_port);
+    EXPECT_EQ(static_cast<int64_t>(kHostStopIndex), matches[0].local);
+    EXPECT_EQ(kProbeKeyCount, backend->CompactReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestProgressiveHostPrefixIgnoresOnlyErrorsBeyondEveryCandidateStop) {
+    constexpr size_t kKeyCount = 33000;
+    constexpr size_t kFirstHostStop = 5000;
+    constexpr size_t kLastHostStop = 25000;
+    constexpr size_t kRequiredFailureIndex = 20000;
+    constexpr size_t kIrrelevantFailureIndex = 30000;
+
+    meta_searcher_.reset();
+    meta_indexer_.reset();
+    meta_indexer_ = CreateMetaIndexer(kKeyCount + 16);
+    ASSERT_TRUE(meta_indexer_);
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 4, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 8));
+    meta_searcher_ = std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
+
+    const std::array<std::string, 2> hosts = {"first-stop-host:8080", "last-stop-host:8080"};
+    std::array<CacheLocationConstPtr, 2> locations;
+    for (size_t host_index = 0; host_index < hosts.size(); ++host_index) {
+        const std::string location_id = "kvs#event_report_l1p5#mem#" + hosts[host_index];
+        locations[host_index] = std::make_shared<CacheLocation>(
+            location_id,
+            CacheLocationStatus::CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+            2,
+            std::vector<LocationSpec>{LocationSpec("full_0", "event_report://" + hosts[host_index] + "/mem"),
+                                      LocationSpec("state_0", "event_report://" + hosts[host_index] + "/mem")});
+    }
+
+    MetaSearcher::KeyVector keys(kKeyCount);
+    std::iota(keys.begin(), keys.end(), 500000);
+    CacheLocationMapVector location_maps(kKeyCount);
+    for (size_t key_index = 0; key_index < kKeyCount; ++key_index) {
+        if (key_index < kFirstHostStop) {
+            location_maps[key_index].emplace(locations[0]->id(), locations[0]);
+        }
+        if (key_index < kLastHostStop) {
+            location_maps[key_index].emplace(locations[1]->id(), locations[1]);
+        }
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("L0", {"state_0"}),
+    };
+    auto expect_success = [&] {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+        ASSERT_EQ(2u, matches.size());
+        EXPECT_EQ(kFirstHostStop, matches[0].local);
+        EXPECT_EQ(kLastHostStop, matches[1].local);
+
+        ASSERT_EQ(
+            EC_OK,
+            meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), keys, false, {"mem"}, groups, matches));
+        ASSERT_EQ(2u, matches.size());
+        EXPECT_EQ(kFirstHostStop, matches[0].local);
+        EXPECT_EQ(kLastHostStop, matches[1].local);
+    };
+    auto expect_timeout = [&] {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_TIMEOUT, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+        EXPECT_TRUE(matches.empty());
+        EXPECT_EQ(
+            EC_TIMEOUT,
+            meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(), keys, false, {"mem"}, groups, matches));
+        EXPECT_TRUE(matches.empty());
+    };
+
+    // This error is in a range that may already be in flight, but both hosts
+    // have a proven shorter prefix. The speculative read must not fail the
+    // request.
+    backend->SetFailedKey(keys[kIrrelevantFailureIndex]);
+    expect_success();
+
+    // The second host still needs this key, so the same backend error class is
+    // now part of the observable prefix and must be propagated.
+    backend->SetFailedKey(keys[kRequiredFailureIndex]);
+    expect_timeout();
+}
+
+TEST_F(MetaSearcherTest, TestHostPrefixQueryStopsPureLocalReadAfterFirstBoundedWindow) {
+    auto *backend = ReplaceWithPrefixReadBackend();
+    ASSERT_TRUE(backend);
+    meta_indexer_->SetQueryExecutor(std::make_shared<QueryExecutor>(
+        /*worker_count*/ 1, /*parallel_threshold*/ 64, /*chunk_size*/ 32, /*queue_capacity*/ 1));
+
+    constexpr size_t kKeyCount = 8192;
+    constexpr size_t kFirstHostMiss = 97;
+    constexpr size_t kExpectedReadWindow = 4096;
+    MetaSearcher::KeyVector keys(kKeyCount);
+    std::iota(keys.begin(), keys.end(), 10200);
+    CacheLocationMapVector location_maps(kKeyCount);
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        const std::string host = i == kFirstHostMiss ? "other-host:8080" : "prefix-host:8080";
+        const std::string location_id = "kvs#event_report_l1p5#mem#" + host;
+        location_maps[i].emplace(location_id,
+                                 std::make_shared<CacheLocation>(location_id,
+                                                                 CacheLocationStatus::CLS_SERVING,
+                                                                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                                                 1,
+                                                                 std::vector<LocationSpec>{LocationSpec(
+                                                                     "tp0", "event_report://" + host + "/mem")}));
+    }
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
+
+    backend->ResetReadCounts();
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ("prefix-host:8080", matches[0].host_ip_port);
+    EXPECT_EQ(static_cast<int64_t>(kFirstHostMiss), matches[0].local);
+    EXPECT_EQ(0u, backend->LocationValueReadCount());
+    EXPECT_EQ(kExpectedReadWindow, backend->CompactReadCount());
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostSupportsMoreThanOnePresenceWord) {
+    const MetaSearcher::KeyVector keys = {10020, 10021, 10022};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    auto host_name = [](std::size_t index) {
+        return std::string("host-") + (index < 10 ? "0" : "") + std::to_string(index) + ":8080";
+    };
+    for (std::size_t host_index = 0; host_index < 70; ++host_index) {
+        const std::string host = host_name(host_index);
+        const MetaSearcher::MergeLocationSpecsTask task{
+            "kvs#event_report_l2#mem#" + host,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://" + host + "/mem")},
+        };
+        tasks[0].push_back(task);
+        if (host_index != 64) {
+            tasks[1].push_back(task);
+        }
+        if (host_index != 63 && host_index != 64) {
+            tasks[2].push_back(task);
+        }
+    }
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), per_key_ec);
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(70u, matches.size());
+    auto prefix_for = [&matches](const std::string &host) {
+        const auto it = std::find_if(
+            matches.begin(), matches.end(), [&host](const auto &match) { return match.host_ip_port == host; });
+        return it == matches.end() ? int64_t{-1} : it->local;
+    };
+    EXPECT_EQ(3, prefix_for(host_name(0)));
+    EXPECT_EQ(2, prefix_for(host_name(63)));
+    EXPECT_EQ(1, prefix_for(host_name(64)));
+    EXPECT_EQ(3, prefix_for(host_name(69)));
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostParallelPresenceMatrixMatchesReference) {
+    constexpr std::size_t kHostCount = 70;
+    constexpr std::size_t kKeyCount = 384;
+    MetaSearcher::KeyVector keys;
+    keys.reserve(kKeyCount);
+    for (std::size_t key_index = 0; key_index < kKeyCount; ++key_index) {
+        keys.push_back(11000 + key_index);
+    }
+
+    auto host_name = [](std::size_t index) {
+        return std::string("parallel-host-") + (index < 10 ? "0" : "") + std::to_string(index) + ":8080";
+    };
+    std::vector<std::size_t> expected_prefixes(kHostCount);
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(kKeyCount);
+    for (std::size_t host_index = 0; host_index < kHostCount; ++host_index) {
+        std::size_t prefix = 1 + (host_index * 83) % kKeyCount;
+        if (host_index == 63) {
+            prefix = 257;
+        } else if (host_index == 64) {
+            prefix = 1;
+        } else if (host_index == 69) {
+            prefix = kKeyCount;
+        }
+        expected_prefixes[host_index] = prefix;
+
+        const std::string host = host_name(host_index);
+        const MetaSearcher::MergeLocationSpecsTask task{
+            "kvs#event_report_l2#mem#" + host,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://" + host + "/mem")},
+        };
+        for (std::size_t key_index = 0; key_index < prefix; ++key_index) {
+            tasks[key_index].push_back(task);
+        }
+    }
+
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ(kKeyCount, per_key_ec.size());
+    EXPECT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+
+    auto verify_matches = [&](const std::vector<MetaSearcher::HostCacheMatch> &matches, bool use_eagle_pop) {
+        std::map<std::string, int64_t> actual;
+        for (const auto &match : matches) {
+            ASSERT_TRUE(actual.emplace(match.host_ip_port, match.local).second);
+        }
+        for (std::size_t host_index = 0; host_index < kHostCount; ++host_index) {
+            const int64_t expected = static_cast<int64_t>(expected_prefixes[host_index]) - (use_eagle_pop ? 1 : 0);
+            const auto it = actual.find(host_name(host_index));
+            if (expected == 0) {
+                EXPECT_EQ(actual.end(), it) << "host_index=" << host_index;
+            } else {
+                ASSERT_NE(actual.end(), it) << "host_index=" << host_index;
+                EXPECT_EQ(expected, it->second) << "host_index=" << host_index;
+            }
+        }
+    };
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"mem"}, matches));
+    ASSERT_EQ(kHostCount, matches.size());
+    verify_matches(matches, false);
+
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, true, {"mem"}, matches));
+    verify_matches(matches, true);
+
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {"disk"}, matches));
+    EXPECT_TRUE(matches.empty());
+}
+
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcrossGenerationChange) {
     const MetaSearcher::KeyVector keys = {10007};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
@@ -444,12 +1577,19 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcros
          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", uri("old_linear", version_a)),
-          LocationSpec("mamba_0", uri("old_mamba", version_a)),
-          LocationSpec("legacy", "event_report://127.0.0.1:8080/mem?source=legacy")}},
+          LocationSpec("mamba_0", uri("old_mamba", version_a))}},
     }};
     ASSERT_EQ(EC_OK, meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, seed_tasks, per_key_ec));
 
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("legacy", "event_report://127.0.0.1:8080/mem?source=legacy")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+
+    tasks = {{
         {location_id,
          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
@@ -510,6 +1650,17 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
 
     const std::vector<std::vector<LocationSpec>> invalid_specs = {
+        {},
+        {
+            LocationSpec("", "event_report://127.0.0.1:8080/mem"),
+        },
+        {
+            LocationSpec("duplicate_name", "event_report://127.0.0.1:8080/mem?source=first"),
+            LocationSpec("duplicate_name", "event_report://127.0.0.1:8080/mem?source=second"),
+        },
+        {
+            LocationSpec("invalid_uri", "not a valid uri"),
+        },
         {
             LocationSpec("valid", uri("valid", version_b)),
             LocationSpec("missing", "event_report://127.0.0.1:8080/mem?source=missing"),
@@ -526,6 +1677,11 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
             LocationSpec("duplicate",
                          "event_report://127.0.0.1:8080/mem?source=duplicate&s_version=" + version_b +
                              "&s_version=" + version_b),
+        },
+        {
+            LocationSpec("max_size",
+                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_version=" + version_b),
+            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_version=" + version_b),
         },
     };
 
@@ -556,6 +1712,67 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), new_keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_TRUE(location_maps.front().empty());
+
+    // Replace performs the same validation as merge, before any key in the
+    // batch is mutated. A valid sibling must therefore remain unwritten when
+    // another task carries inconsistent snapshot metadata.
+    const KeyVector replace_keys = {10014, 10015};
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("valid", uri("valid", version_a))}}},
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+          CacheLocationStatus::CLS_SERVING,
+          invalid_specs.back()}},
+    };
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), replace_keys, replace_tasks, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}), per_key_ec);
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), replace_keys, mask, location_maps));
+    ASSERT_EQ(2u, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+    EXPECT_TRUE(location_maps[1].empty());
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsOverflowAgainstExistingSpecs) {
+    const MetaSearcher::KeyVector keys = {10016};
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
+    const std::string version = "00112233445566778899aabbccddeeff";
+    auto uri = [&version](const std::string &source, const std::string &size) {
+        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_version=" + version;
+    };
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("baseline", uri("baseline", "18446744073709551615"))}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    // Both requests are independently valid. The second one must still be
+    // rejected because the final merged location would overflow uint64_t.
+    tasks[0][0].specs = {LocationSpec("new_spec", uri("new_spec", "1"))};
+    meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    const auto &stored_specs = location_maps[0].at(location_id)->location_specs();
+    ASSERT_EQ(1u, stored_specs.size());
+    EXPECT_EQ("baseline", stored_specs[0].name());
+    EXPECT_EQ(uri("baseline", "18446744073709551615"), stored_specs[0].uri());
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(),
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 }
 
 TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltasDoNotLoseUpdates) {
@@ -731,7 +1948,11 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     ASSERT_EQ(1u, location_maps.front().size());
-    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, location_maps.front().at(location_id)->type());
+    const auto &replaced_location = location_maps.front().at(location_id);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, replaced_location->type());
+    std::uint64_t validated_size = 0;
+    ASSERT_TRUE(replaced_location->GetValidatedTotalSize(validated_size));
+    EXPECT_EQ(7u, validated_size);
 }
 
 TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocation) {
@@ -925,6 +2146,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     }
     ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
     EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
+    EXPECT_TRUE(location_maps[0].at(location_id)->HasValidatedLocationSpecs());
 
     delete_tasks = {{
         {location_id, {"linear_1", "full_3"}},
@@ -948,6 +2170,55 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     EXPECT_FALSE(location_maps[0].empty());
+}
+
+TEST_F(MetaSearcherTest, TestBatchDeleteFinalLocationsReclaimsDuplicateKeyOnce) {
+    constexpr KeyType reclaimed_key = 10014;
+    constexpr KeyType retained_key = 10015;
+    const std::string location_a = "event_report#mem#127.0.0.14:8080";
+    const std::string location_b = "event_report#disk#127.0.0.14:8080";
+    const std::string retained_location = "event_report#mem#127.0.0.15:8080";
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {
+        {{location_a,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("tp0", "event_report://127.0.0.14:8080/mem")}},
+         {location_b,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("tp1", "event_report://127.0.0.14:8080/disk")}}},
+        {{retained_location,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("tp0", "event_report://127.0.0.15:8080/mem")}}},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {reclaimed_key, retained_key}, merge_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key_ec);
+    ASSERT_EQ(2u, meta_indexer_->GetKeyCount());
+
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks = {{
+        {location_a, {"tp0"}},
+        {location_b, {"tp1"}},
+    }};
+    std::vector<std::vector<ErrorCode>> delete_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(
+                  request_context_.get(), {reclaimed_key}, delete_tasks, delete_results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}}), delete_results);
+    EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchGetLocation(request_context_.get(), {reclaimed_key, retained_key}, mask, location_maps));
+    ASSERT_EQ(2u, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+    EXPECT_EQ(1u, location_maps[1].count(retained_location));
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsValidatesShapeAndMissingLocationIsIdempotent) {
@@ -988,6 +2259,71 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsValidatesShapeAndMissingLoc
     ASSERT_TRUE(existing->second);
     ASSERT_EQ(1u, existing->second->location_specs().size());
     EXPECT_EQ("linear_0", existing->second->location_specs()[0].name());
+}
+
+TEST_F(MetaSearcherTest, TestBatchSpecMutationsRejectDuplicateRmwTargetsBeforeWriting) {
+    const int64_t key = 10013;
+    const std::string location_id = "kvs#event_report_l2#mem#duplicate-target:8080";
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> seed = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("tp0", "event_report://duplicate-target:8080/mem?source=seed_tp0"),
+          LocationSpec("tp1", "event_report://duplicate-target:8080/mem?source=seed_tp1")}},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, seed, per_key_ec));
+
+    auto duplicate_merge = seed;
+    duplicate_merge[0].push_back({location_id,
+                                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                  CacheLocationStatus::CLS_SERVING,
+                                  {LocationSpec("tp2", "event_report://duplicate-target:8080/mem?source=lost")}});
+    EXPECT_EQ(EC_BADARGS,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, duplicate_merge, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> duplicate_delete = {{
+        {location_id, {"tp0"}},
+        {location_id, {"tp1"}},
+    }};
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(
+        EC_BADARGS,
+        meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), {key}, duplicate_delete, delete_results));
+    ASSERT_EQ(1u, delete_results.size());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}), delete_results[0]);
+
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> empty_delete = {{
+        {"kvs#event_report_l2#mem#missing:8080", {}},
+    }};
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), {key}, empty_delete, delete_results));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), delete_results[0]);
+
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> duplicate_key_replace = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("tp0", "event_report://duplicate-target:8080/mem?source=replace_a")}}},
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+          CacheLocationStatus::CLS_SERVING,
+          {LocationSpec("tp0", "event_report://duplicate-target:8080/mem?source=replace_b")}}},
+    };
+    EXPECT_EQ(EC_BADARGS,
+              meta_searcher_->BatchReplaceLocationSpecs(
+                  request_context_.get(), {key, key}, duplicate_key_replace, per_key_ec));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto &specs = location_maps[0].at(location_id)->location_specs();
+    ASSERT_EQ(2u, specs.size());
+    EXPECT_EQ(std::string::npos, specs[0].uri().find("source=lost"));
+    EXPECT_EQ(std::string::npos, specs[1].uri().find("source=lost"));
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData) {
@@ -1037,6 +2373,183 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData)
     const auto &specs = location_maps[0].at(location_id)->location_specs();
     ASSERT_EQ(1u, specs.size());
     EXPECT_EQ("linear_0", specs[0].name());
+}
+
+TEST_F(MetaSearcherTest, TestBatchMutationWriteLeaseIsAcquiredOncePerRmwPhase) {
+    const MetaSearcher::KeyVector keys = {10081, 10082, 10083};
+    const std::string location_id = "kvs#event_report_l2#mem#lease-host:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        merge_tasks.push_back({{
+            location_id,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://lease-host:8080/mem?size=1")},
+        }});
+    }
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+
+    size_t acquire_count = 0;
+    MetaSearcher::AcquireMetadataWriteLeaseFunc acquire_write_lease = [&] {
+        ++acquire_count;
+        return std::make_pair(EC_OK, std::static_pointer_cast<void>(std::make_shared<size_t>(acquire_count)));
+    };
+
+    // Every key already has this location. The fused targeted RMW holds one
+    // lease from the post-read fence check through the single upsert phase.
+    for (auto &tasks : merge_tasks) {
+        tasks[0].specs = {LocationSpec("tp1", "event_report://lease-host:8080/mem?size=2")};
+    }
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), keys, merge_tasks, per_key_ec, acquire_write_lease));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
+
+    acquire_count = 0;
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        replace_tasks.push_back({{
+            location_id,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp2", "event_report://lease-host:8080/mem?size=3")},
+        }});
+    }
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(
+                  request_context_.get(), keys, replace_tasks, per_key_ec, acquire_write_lease));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
+
+    acquire_count = 0;
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        delete_tasks.push_back({{location_id, {"tp2"}}});
+    }
+    std::vector<std::vector<ErrorCode>> delete_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(
+                  request_context_.get(), keys, delete_tasks, delete_results, nullptr, acquire_write_lease));
+    EXPECT_EQ(1u, acquire_count);
+    ASSERT_EQ(keys.size(), delete_results.size());
+    for (const auto &results : delete_results) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+    }
+}
+
+TEST_F(MetaSearcherTest, TestBatchMutationWriteLeaseFailurePreventsAllWrites) {
+    const MetaSearcher::KeyVector keys = {10084, 10085};
+    const std::string location_id = "kvs#event_report_l2#mem#fenced-host:8080";
+    size_t acquire_count = 0;
+    MetaSearcher::AcquireMetadataWriteLeaseFunc reject_write = [&] {
+        ++acquire_count;
+        return std::make_pair(EC_NODE_NOT_REGISTERED, MetaSearcher::MetadataWriteLease{});
+    };
+
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        merge_tasks.push_back({{
+            location_id,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://fenced-host:8080/mem")},
+        }});
+    }
+    std::vector<ErrorCode> per_key_ec;
+    EXPECT_EQ(
+        EC_ERROR,
+        meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec, reject_write));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_NODE_NOT_REGISTERED), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(keys.size(), location_maps.size());
+    EXPECT_TRUE(std::all_of(
+        location_maps.begin(), location_maps.end(), [](const auto &locations) { return locations.empty(); }));
+
+    acquire_count = 0;
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        replace_tasks.push_back({{
+            location_id,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp1", "event_report://fenced-host:8080/mem")},
+        }});
+    }
+    EXPECT_NE(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(
+                  request_context_.get(), keys, replace_tasks, per_key_ec, reject_write));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_NODE_NOT_REGISTERED), per_key_ec);
+
+    acquire_count = 0;
+    std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> delete_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        delete_tasks.push_back({{location_id, {"tp0"}}});
+    }
+    std::vector<std::vector<ErrorCode>> delete_results;
+    std::vector<std::vector<bool>> missing_targets;
+    EXPECT_NE(EC_OK,
+              meta_searcher_->BatchDeleteLocationSpecs(
+                  request_context_.get(), keys, delete_tasks, delete_results, &missing_targets, reject_write));
+    EXPECT_EQ(1u, acquire_count);
+    ASSERT_EQ(keys.size(), delete_results.size());
+    ASSERT_EQ(keys.size(), missing_targets.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_NODE_NOT_REGISTERED}), delete_results[i]);
+        EXPECT_EQ((std::vector<bool>{false}), missing_targets[i]);
+    }
+}
+
+TEST_F(MetaSearcherTest, TestBatchMergeDoesNotReacquireLeaseInsideFusedRmw) {
+    const MetaSearcher::KeyVector keys = {10086, 10087};
+    const std::string location_id = "kvs#event_report_l2#mem#lease-race:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        tasks.push_back({{
+            location_id,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+            CacheLocationStatus::CLS_SERVING,
+            {LocationSpec("tp0", "event_report://lease-race:8080/mem?phase=seed")},
+        }});
+    }
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+
+    for (auto &per_key_tasks : tasks) {
+        per_key_tasks[0].specs = {LocationSpec("tp1", "event_report://lease-race:8080/mem?phase=stale")};
+    }
+    size_t acquire_count = 0;
+    MetaSearcher::AcquireMetadataWriteLeaseFunc fail_if_reacquired = [&] {
+        ++acquire_count;
+        if (acquire_count == 1) {
+            return std::make_pair(EC_OK, std::static_pointer_cast<void>(std::make_shared<size_t>(acquire_count)));
+        }
+        return std::make_pair(EC_NODE_NOT_REGISTERED, MetaSearcher::MetadataWriteLease{});
+    };
+    EXPECT_EQ(
+        EC_OK,
+        meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec, fail_if_reacquired));
+    EXPECT_EQ(1u, acquire_count);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(keys.size(), location_maps.size());
+    for (const auto &locations : location_maps) {
+        ASSERT_EQ(1u, locations.size());
+        const auto &specs = locations.at(location_id)->location_specs();
+        ASSERT_EQ(2u, specs.size());
+        EXPECT_EQ("tp0", specs[0].name());
+        EXPECT_EQ("tp1", specs[1].name());
+        EXPECT_NE(std::string::npos, specs[1].uri().find("phase=stale"));
+    }
 }
 
 TEST_F(MetaSearcherTest, TestCleanupLocationsByPredicateSubmitsExactObservedValue) {
@@ -2539,8 +4052,77 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
 class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
 protected:
+    void AddRequestedSpecMatrixEventReportPeer() {
+        // The requested spec is deliberately the second spec in the first
+        // and third locations. The middle key has the same reporter but only
+        // a different spec, forming a requested-spec gap.
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+            {
+                {"kvs#event_report_l2#mem#matrix_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {
+                     LocationSpec("full_0", "event_report://other_peer:8080/mem"),
+                     LocationSpec("linear_1", "event_report://matrix_peer:8080/mem"),
+                 }},
+            },
+            {
+                {"kvs#event_report_l2#mem#matrix_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("full_0", "event_report://matrix_peer:8080/mem")}},
+            },
+            {
+                {"kvs#event_report_l2#mem#matrix_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {
+                     LocationSpec("full_0", "event_report://other_peer:8080/mem"),
+                     LocationSpec("linear_1", "event_report://matrix_peer:8080/mem"),
+                 }},
+            },
+        };
+        std::vector<ErrorCode> per_key_ec;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchMergeLocationSpecs(
+                      request_context_.get(), {82000, 82001, 82002}, upserts, per_key_ec));
+        ASSERT_EQ(3u, per_key_ec.size());
+        EXPECT_TRUE(std::all_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec == EC_OK; }));
+    }
+
+    void AddSpecFilteredEventReportPeers() {
+        // full_peer has better raw coverage, but none of its locations match
+        // linear_1. linear_peer must therefore win after requested-spec
+        // filtering for both cross-key selection strategies.
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+            {
+                {"kvs#event_report_l2#mem#full_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("full_0", "event_report://full_peer:8080/mem")}},
+                {"kvs#event_report_l2#mem#linear_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("linear_1", "event_report://linear_peer:8080/mem")}},
+            },
+            {
+                {"kvs#event_report_l2#mem#full_peer:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                 CLS_SERVING,
+                 {LocationSpec("full_0", "event_report://full_peer:8080/mem")}},
+            },
+        };
+        std::vector<ErrorCode> per_key_ec;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {81000, 81001}, upserts, per_key_ec));
+        ASSERT_EQ(2u, per_key_ec.size());
+        EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[0]);
+        EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[1]);
+    }
+
     void SetUp() override {
         MetaSearcherTest::SetUp();
+        recording_backend_ = ReplaceWithRecordingGetLocationsBackend();
 
         // event report locations
         std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> er_upserts = {
@@ -2604,7 +4186,10 @@ protected:
             std::vector<std::vector<ErrorCode>> results;
             meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results);
         }
+        recording_backend_->ResetReadLog();
     }
+
+    RecordingGetLocationsBackend *recording_backend_ = nullptr;
 };
 
 TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixStrategy) {
@@ -2650,6 +4235,252 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
         EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
     }
     EXPECT_TRUE(out[4].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, BlockMaskSkipsMetadataReadsAndPreservesOutputPositions) {
+    const MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    const BlockMask mask = BlockMaskVector{true, false, true, false, true};
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), keys, out, &policy_, selectors, {}, mask));
+
+    ASSERT_EQ(keys.size(), out.size());
+    EXPECT_TRUE(out[0].empty());
+    ASSERT_EQ(2u, out[1].size());
+    EXPECT_TRUE(out[2].empty());
+    ASSERT_EQ(2u, out[3].size());
+    EXPECT_TRUE(out[4].empty());
+
+    const auto batches = recording_backend_->RequestedKeyBatches();
+    ASSERT_EQ(1u, batches.size());
+    EXPECT_EQ((MetaSearcher::KeyVector{80001, 80003}), batches[0]);
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, FullyMaskedRequestAvoidsMetadataBackend) {
+    const MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+    const BlockMask mask = BlockMaskOffset{keys.size()};
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), keys, out, &policy_, selectors, {}, mask));
+
+    ASSERT_EQ(keys.size(), out.size());
+    for (const auto &locations : out) {
+        EXPECT_TRUE(locations.empty());
+    }
+    EXPECT_TRUE(recording_backend_->RequestedKeyBatches().empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, InvalidBlockMaskFailsBeforeMetadataRead) {
+    const MetaSearcher::KeyVector keys = {80000, 80001, 80002};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    for (const BlockMask &mask : std::vector<BlockMask>{
+             BlockMaskOffset{keys.size() + 1},
+             BlockMaskVector{true, false},
+         }) {
+        LocationsPerKey out;
+        EXPECT_EQ(ErrorCode::EC_BADARGS,
+                  meta_searcher_->BatchGetBestLocationByBackend(
+                      request_context_.get(), keys, out, &policy_, selectors, {}, mask));
+        ASSERT_EQ(keys.size(), out.size());
+        for (const auto &locations : out) {
+            EXPECT_TRUE(locations.empty());
+        }
+    }
+    EXPECT_TRUE(recording_backend_->RequestedKeyBatches().empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixTieBreaksByPeerAddress) {
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {80000, 80001}, out, &policy_, selectors));
+
+    ASSERT_EQ(2u, out.size());
+    for (const auto &locations : out) {
+        ASSERT_EQ(1u, locations.size());
+        EXPECT_NE(locations[0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageTieBreaksByPeerAddress) {
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {80000, 80001}, out, &policy_, selectors));
+
+    ASSERT_EQ(2u, out.size());
+    for (const auto &locations : out) {
+        ASSERT_EQ(1u, locations.size());
+        EXPECT_NE(locations[0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixFiltersRequestedSpecBeforePeerSelection) {
+    AddSpecFilteredEventReportPeers();
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"linear_1", "linear_1"}));
+
+    ASSERT_EQ(2u, out.size());
+    ASSERT_EQ(1u, out[0].size());
+    ASSERT_EQ(1u, out[0][0]->location_specs().size());
+    EXPECT_EQ("linear_1", out[0][0]->location_specs()[0].name());
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("linear_peer"));
+    EXPECT_TRUE(out[1].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageFiltersRequestedSpecBeforePeerSelection) {
+    AddSpecFilteredEventReportPeers();
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"linear_1", "linear_1"}));
+
+    ASSERT_EQ(2u, out.size());
+    ASSERT_EQ(1u, out[0].size());
+    ASSERT_EQ(1u, out[0][0]->location_specs().size());
+    EXPECT_EQ("linear_1", out[0][0]->location_specs()[0].name());
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("linear_peer"));
+    EXPECT_TRUE(out[1].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportUnknownRequestedSpecReturnsNoCandidate) {
+    AddSpecFilteredEventReportPeers();
+    for (const auto strategy : {LocationSelectStrategy::LSS_V6D_PREFIX, LocationSelectStrategy::LSS_V6D_COVERAGE}) {
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy},
+        };
+        LocationsPerKey out;
+        ASSERT_EQ(
+            ErrorCode::EC_OK,
+            meta_searcher_->BatchGetBestLocationByBackend(
+                request_context_.get(), {81000, 81001}, out, &policy_, selectors, {"missing_spec", "missing_spec"}));
+        ASSERT_EQ(2u, out.size());
+        EXPECT_TRUE(out[0].empty());
+        EXPECT_TRUE(out[1].empty());
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportRequestedSpecUsesMatchingNonFirstSpecUri) {
+    AddRequestedSpecMatrixEventReportPeer();
+    for (const auto strategy : {LocationSelectStrategy::LSS_V6D_PREFIX, LocationSelectStrategy::LSS_V6D_COVERAGE}) {
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy},
+        };
+        LocationsPerKey out;
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchGetBestLocationByBackend(
+                      request_context_.get(), {82000}, out, &policy_, selectors, {"linear_1"}));
+        ASSERT_EQ(1u, out.size());
+        ASSERT_EQ(1u, out[0].size());
+        ASSERT_EQ(2u, out[0][0]->location_specs().size());
+        const auto linear_it = std::find_if(out[0][0]->location_specs().begin(),
+                                            out[0][0]->location_specs().end(),
+                                            [](const LocationSpec &spec) { return spec.name() == "linear_1"; });
+        ASSERT_NE(linear_it, out[0][0]->location_specs().end());
+        EXPECT_NE(std::string::npos, linear_it->uri().find("matrix_peer"));
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportRequestedSpecGapStopsPrefixButNotCoverage) {
+    AddRequestedSpecMatrixEventReportPeer();
+    const MetaSearcher::KeyVector keys = {82000, 82001, 82002};
+
+    LocationsPerKey prefix_out;
+    const std::vector<BackendSelector> prefix_selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(),
+                                                            keys,
+                                                            prefix_out,
+                                                            &policy_,
+                                                            prefix_selectors,
+                                                            {"linear_1", "linear_1", "linear_1"}));
+    ASSERT_EQ(3u, prefix_out.size());
+    ASSERT_EQ(1u, prefix_out[0].size());
+    EXPECT_TRUE(prefix_out[1].empty());
+    EXPECT_TRUE(prefix_out[2].empty());
+
+    LocationsPerKey coverage_out;
+    const std::vector<BackendSelector> coverage_selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(),
+                                                            keys,
+                                                            coverage_out,
+                                                            &policy_,
+                                                            coverage_selectors,
+                                                            {"linear_1", "linear_1", "linear_1"}));
+    ASSERT_EQ(3u, coverage_out.size());
+    ASSERT_EQ(1u, coverage_out[0].size());
+    EXPECT_TRUE(coverage_out[1].empty());
+    ASSERT_EQ(1u, coverage_out[2].size());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageCountsRepeatedKeysByPerKeySpec) {
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {{
+        {"kvs#event_report_l2#mem#peer_a:8080",
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CLS_SERVING,
+         {
+             LocationSpec("linear_1", "event_report://peer_a:8080/mem"),
+             LocationSpec("linear_3", "event_report://peer_a:8080/mem"),
+         }},
+        {"kvs#event_report_l2#mem#peer_b:8080",
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CLS_SERVING,
+         {LocationSpec("linear_2", "event_report://peer_b:8080/mem")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {83000}, upserts, per_key_ec));
+
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(),
+                                                            {83000, 83000, 83000},
+                                                            out,
+                                                            &policy_,
+                                                            selectors,
+                                                            {"linear_1", "linear_2", "linear_3"}));
+    ASSERT_EQ(3u, out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_TRUE(out[1].empty());
+    ASSERT_EQ(1u, out[2].size());
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("peer_a"));
+    EXPECT_NE(std::string::npos, out[2][0]->location_specs()[0].uri().find("peer_a"));
 }
 
 TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {

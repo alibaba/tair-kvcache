@@ -28,6 +28,8 @@ def create_add_storage_data(args, storage_type: str, storage_spec: dict):
     }
     if storage_type == "event_report":
         storage["storage_type"] = args.event_report_storage_type
+    elif storage_type == "tair_mem_pool":
+        storage["storage_type"] = get_pace_storage_type(args.media_type)
     return {
         "trace_id": args.trace_id,
         "storage": storage

@@ -3,6 +3,10 @@ syntax = "proto3";
 package kv_cache_manager.proto.meta;
 
 option cc_generic_services = false;
+// HTTP handlers keep request/response messages on one request-scoped arena.
+// This is a C++ allocation policy only; it does not change the wire or JSON
+// representation of any MetaService message.
+option cc_enable_arenas = true;
 
 enum ErrorCode {
     UNSPECIFIED = 0;
@@ -49,6 +53,7 @@ enum StorageType {
     ST_DUMMY = 6;
     ST_EVENT_REPORT_L1P5 = 7;
     ST_EVENT_REPORT_L2 = 8;
+    ST_TAIRMEMPOOL_SSD = 9;
 }
 
 // ---- Cache event reporting ----
@@ -80,7 +85,9 @@ message NodeRegisterEventParams {
 }
 
 message BlockAddEventParams {
-    string block_key = 1; // int64 as string
+    // Signed int64 decimal, or unsigned uint64 decimal mapped to the same
+    // internal 64-bit key (e.g. UINT64_MAX is equivalent to -1).
+    string block_key = 1;
     string uri = 2;       // deprecated, use specs instead
     string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
@@ -520,11 +527,14 @@ message GetHostCacheStateRequest {
     QueryType query_type = 3;
     repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
     repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
+    int32 p2p_host_count = 6;              // 继续计算 P2P 的 local top host 数；未传或 0 表示只计算 local
 }
 
 message HostCacheMatch {
     string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
-    int64 prefix_match_blocks = 2;         // 连续命中的 block 数（调用方自己 ×block_size 算 tokens）
+    int64 local = 2;           // 本地前缀匹配的 block 数
+    int64 p2p_1_fetch = 3;     // P2P 实际拉取的 spec 所属的去重 block key 数
+    int64 p2p_1_total_match = 4;   // p2p 后最终的前缀匹配的block数
 }
 
 message GetHostCacheStateResponse {

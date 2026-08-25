@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -24,6 +26,7 @@ using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk
 
 class MetaIndexer;
 class LocationSpecGroup;
+class CacheManager;
 
 enum class LocationSelectStrategy : int32_t {
     LSS_UNSPECIFIED = 0,
@@ -48,8 +51,23 @@ public:
 
     struct HostCacheMatch {
         std::string host_ip_port;
-        int64_t prefix_match_blocks;
+        int64_t local;
+        int64_t p2p_1_fetch;
+        int64_t p2p_1_total_match;
     };
+
+    struct HostCacheLocationInfo {
+        // When true, the checker has already parsed the EventReport location
+        // id and validated every spec URI while applying query visibility.
+        bool has_reporter_identity = false;
+        // Views borrow the immutable CacheLocation id and are consumed while
+        // that location is still held by the current projection; they are
+        // never retained in output.
+        std::string_view reporter_medium;
+        std::string_view reporter_host;
+    };
+    using CheckHostCacheLocationFunc =
+        std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -72,7 +90,9 @@ public:
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
                                             SelectLocationPolicy *policy,
-                                            const std::vector<BackendSelector> &selectors) const;
+                                            const std::vector<BackendSelector> &selectors,
+                                            const std::vector<std::string> &requested_spec_names = {},
+                                            const BlockMask &input_mask = BlockMask{}) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,
@@ -82,13 +102,17 @@ public:
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
                                 const std::vector<std::string> &medium_filter,
-                                std::vector<HostCacheMatch> &out_matches) const;
+                                std::vector<HostCacheMatch> &out_matches,
+                                const CheckHostCacheLocationFunc *request_check_location = nullptr,
+                                size_t p2p_host_count = 0) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
                                          const std::vector<std::string> &medium_filter,
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
-                                         std::vector<HostCacheMatch> &out_matches) const;
+                                         std::vector<HostCacheMatch> &out_matches,
+                                         const CheckHostCacheLocationFunc *request_check_location = nullptr,
+                                         size_t p2p_host_count = 0) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -134,32 +158,147 @@ public:
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
+        InternedLocationId interned_location_id;
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
     };
     // Replaces existing specs or creates the stable location in one metadata
-    // read-modify-write operation per batch.
+    // read-modify-write operation per batch. Keys and location ids within a
+    // key must be unique. Every task requires non-empty, uniquely named specs
+    // with valid URIs and cannot mix versioned/unversioned specs or multiple
+    // snapshot versions. When supplied, the write-lease callback is invoked
+    // once after the metadata read and before the first mutation; the returned
+    // lease is retained until the operation returns.
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    class PrevalidatedTotalSize {
+    public:
+        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
+
+    private:
+        friend class CacheManager;
+        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
+
+        std::uint64_t value_ = 0;
+    };
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
+        // ReportEvent fully validates and parses every input URI before it
+        // acquires the reporter mutation fence. Supplying this value lets its
+        // internal merge path reuse the already computed aggregate size
+        // instead of parsing every versioned URI a second time. Other callers
+        // must leave it empty and receive the normal strict validation.
+        std::optional<PrevalidatedTotalSize> prevalidated_total_size;
+        InternedLocationId interned_location_id;
+        // ReportEvent owns one canonical id per medium for the duration of
+        // the synchronous Batch* call. Borrow it here so a 20K-key request
+        // does not perform 20K atomic shared_ptr increments/decrements merely
+        // to route tasks. A persisted CacheLocation still takes ownership.
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+        // ReportEvent overwhelmingly carries one spec per block. Keep that
+        // value inline so a 20K-block request does not allocate 20K one-item
+        // vectors; generic/multi-spec callers continue using specs unchanged.
+        std::optional<LocationSpec> inline_spec;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
+        [[nodiscard]] size_t SpecCount() const noexcept { return specs.size() + (inline_spec ? 1 : 0); }
+        [[nodiscard]] bool SpecsEmpty() const noexcept { return SpecCount() == 0; }
+        [[nodiscard]] const LocationSpec &SpecAt(size_t index) const noexcept {
+            return index < specs.size() ? specs[index] : *inline_spec;
+        }
+        [[nodiscard]] LocationSpec &MutableSpecAt(size_t index) noexcept {
+            return index < specs.size() ? specs[index] : *inline_spec;
+        }
+        void PushReportEventSpec(LocationSpec &&spec, size_t max_spec_count) {
+            if (specs.empty() && !inline_spec) {
+                inline_spec.emplace(std::move(spec));
+                return;
+            }
+            if (inline_spec) {
+                specs.reserve(max_spec_count < 2 ? 2 : max_spec_count);
+                specs.push_back(std::move(*inline_spec));
+                inline_spec.reset();
+            }
+            specs.push_back(std::move(spec));
+        }
     };
+    // Keys and location ids within a key must be unique. Every task requires
+    // non-empty, uniquely named specs with valid URIs and cannot mix
+    // versioned/unversioned specs or multiple snapshot versions. The block
+    // existence state and every requested target location are read
+    // together, then merged in one targeted RMW phase. The optional write
+    // lease is acquired once after that read and before the first mutation;
+    // it is retained through the upsert so a concurrent lifecycle change can
+    // fence work that was admitted under an older reporter generation.
     ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
                                       const KeyVector &keys,
                                       const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
                                       std::vector<ErrorCode> &out_per_key_ec,
                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    // Allocation-light equivalent used by ReportEvent. Tasks for key i are
+    // stored in [task_offsets[i], task_offsets[i + 1]); offsets must start at
+    // zero, be nondecreasing, and end at flat_tasks.size(). URI ownership in
+    // CacheManager-prevalidated tasks can be consumed during the synchronous
+    // call; their spec names remain available for per-item failure mapping.
+    // Non-prevalidated flat tasks retain the generic copy semantics.
+    ErrorCode BatchMergeLocationSpecsFlat(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          const std::vector<size_t> &task_offsets,
+                                          std::vector<MergeLocationSpecsTask> &flat_tasks,
+                                          std::vector<ErrorCode> &out_per_key_ec,
+                                          AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct DeleteLocationSpecsTask {
         std::string location_id;
         std::vector<std::string> spec_names;
+        InternedLocationId interned_location_id;
+        const InternedLocationId *borrowed_interned_location_id = nullptr;
+
+        [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
+            const auto *interned = ResolvedInternedLocationId();
+            return interned ? **interned : location_id;
+        }
+        [[nodiscard]] const InternedLocationId *ResolvedInternedLocationId() const noexcept {
+            if (interned_location_id) {
+                return &interned_location_id;
+            }
+            return borrowed_interned_location_id && *borrowed_interned_location_id ? borrowed_interned_location_id
+                                                                                   : nullptr;
+        }
     };
-    // Missing block/location targets are idempotent EC_OK. When requested,
-    // out_missing_targets mirrors tasks_per_key and marks those no-op targets;
-    // an existing location with only missing spec_names is not marked.
+    // Missing block/location targets are idempotent EC_OK. Keys and location
+    // ids within a key must be unique, and every task must name at least one
+    // non-empty spec. When requested, out_missing_targets mirrors
+    // tasks_per_key and marks missing block/location no-ops; an existing
+    // location with only missing spec_names is not marked. The optional write
+    // lease is acquired once after the metadata read and before the first
+    // mutation.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
@@ -214,7 +353,8 @@ public:
                                           DataStorageType storage_type,
                                           size_t scan_batch_size,
                                           LocationCleanupPredicate should_delete,
-                                          std::function<bool()> should_abort = nullptr);
+                                          std::function<bool()> should_abort = nullptr,
+                                          AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
     ErrorCode CleanupLocationsByHost(RequestContext *request_context,
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,
@@ -223,6 +363,14 @@ public:
                                      AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
 
 private:
+    class MergeLocationSpecsTaskView;
+
+    ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          MergeLocationSpecsTaskView tasks,
+                                          std::vector<ErrorCode> &out_per_key_ec,
+                                          AcquireMetadataWriteLeaseFunc acquire_write_lease);
+
     struct StorageTypeWeights {
         static constexpr size_t NFS = 5;          // NFS存储权重较高
         static constexpr size_t MOONCAKE = 3;     // Mooncake存储权重中等

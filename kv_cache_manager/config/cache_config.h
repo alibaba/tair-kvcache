@@ -32,6 +32,8 @@ enum class CachePreferStrategy {
     CPS_PREFER_TAIR_MEMPOOL = 6,
     CPS_ALWAYS_VCNS_3FS = 7,
     CPS_PREFER_VCNS_3FS = 8,
+    CPS_ALWAYS_TAIR_MEMPOOL_SSD = 9,
+    CPS_PREFER_TAIR_MEMPOOL_SSD = 10,
 };
 
 /*

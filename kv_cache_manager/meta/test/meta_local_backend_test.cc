@@ -90,6 +90,222 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("targeted_status", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("target");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("target", location);
+    PropertyMapVector properties(2);
+    properties[1].emplace("property_only", "value");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, locations, properties));
+
+    auto stale = std::make_shared<CacheLocation>();
+    stale->set_id("stale");
+    LocationsPerKey selected(3, CacheLocationVector{stale});
+    std::vector<ErrorCode> key_error_codes;
+    const auto per_location_ecs = meta_storage_backend_->GetLocationsWithKeyStatus(
+        nullptr, {1, 2, 3}, {{"target"}, {"target"}, {"target"}}, selected, key_error_codes);
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_error_codes);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_NOENT}, {EC_NOENT}}), per_location_ecs);
+    ASSERT_EQ(3u, selected.size());
+    ASSERT_EQ(1u, selected[0].size());
+    ASSERT_TRUE(selected[0][0]);
+    EXPECT_EQ("target", selected[0][0]->id());
+    ASSERT_EQ(1u, selected[1].size());
+    EXPECT_FALSE(selected[1][0]);
+    ASSERT_EQ(1u, selected[2].size());
+    EXPECT_FALSE(selected[2][0]);
+}
+
+TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathPreservesKeyStatusAndMetadata) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_fast_path", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string target_id = "target";
+    const std::string sibling_id = "sibling";
+    auto old_target = std::make_shared<CacheLocation>();
+    old_target->set_id(target_id);
+    auto sibling = std::make_shared<CacheLocation>();
+    sibling->set_id(sibling_id);
+    CacheLocationMapVector seed_locations(2);
+    seed_locations[0].emplace(target_id, old_target);
+    seed_locations[0].emplace(sibling_id, sibling);
+    PropertyMapVector seed_properties(2);
+    seed_properties[1].emplace("property_only", "preserved");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, seed_locations, seed_properties));
+
+    const LocationIdRefVector target_ids{&target_id, &target_id, &target_id};
+    auto stale = std::make_shared<CacheLocation>();
+    stale->set_id("stale");
+    CacheLocationVector selected(3, stale);
+    std::vector<ErrorCode> key_error_codes;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}),
+              meta_storage_backend_->GetSingleLocationsWithKeyStatus(
+                  nullptr, {1, 2, 3}, target_ids, selected, key_error_codes));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_error_codes);
+    ASSERT_EQ(3u, selected.size());
+    EXPECT_EQ(old_target, selected[0]);
+    EXPECT_FALSE(selected[1]);
+    EXPECT_FALSE(selected[2]);
+
+    auto replacement = std::make_shared<CacheLocation>();
+    replacement->set_id(target_id);
+    replacement->set_status(CLS_SERVING);
+    auto property_key_location = std::make_shared<CacheLocation>();
+    property_key_location->set_id(target_id);
+    auto new_key_location = std::make_shared<CacheLocation>();
+    new_key_location->set_id(target_id);
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+        meta_storage_backend_->UpsertSingleLocations(
+            nullptr, {1, 2, 3}, target_ids, CacheLocationVector{replacement, property_key_location, new_key_location}));
+
+    CacheLocationMapVector stored_locations;
+    PropertyMapVector stored_properties;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Get(nullptr, {1, 2, 3}, stored_locations, stored_properties));
+    ASSERT_EQ(2u, stored_locations[0].size());
+    EXPECT_EQ(replacement, stored_locations[0].at(target_id));
+    EXPECT_EQ(sibling, stored_locations[0].at(sibling_id));
+    ASSERT_EQ(1u, stored_locations[1].size());
+    EXPECT_EQ(property_key_location, stored_locations[1].at(target_id));
+    EXPECT_EQ("preserved", stored_properties[1].at("property_only"));
+    ASSERT_EQ(1u, stored_locations[2].size());
+    EXPECT_EQ(new_key_location, stored_locations[2].at(target_id));
+}
+
+TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_retained_handles", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string target_id = "target";
+    auto old_target = std::make_shared<CacheLocation>();
+    old_target->set_id(target_id);
+    CacheLocationMapVector seed_locations(2);
+    seed_locations[0].emplace(target_id, old_target);
+    PropertyMapVector seed_properties(2);
+    seed_properties[1].emplace("property_only", "preserved");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2}, seed_locations, seed_properties));
+
+    auto *backend = GetLocalBackend();
+    SingleLocationRmwScratch scratch;
+    backend->PrepareSingleLocationRmwScratch(3, scratch);
+    const KeyTypeVec read_keys{1, 2, 3};
+    const LocationIdRefVector read_ids{&target_id, &target_id, &target_id};
+    CacheLocationViewVector selected_views;
+    std::vector<ErrorCode> key_ecs;
+    std::vector<ErrorCode> location_ecs;
+    const long old_target_use_count = old_target.use_count();
+    backend->GetSingleLocationViewsWithKeyStatusInto(
+        nullptr, read_keys, read_ids, selected_views, key_ecs, location_ecs, scratch);
+    EXPECT_TRUE(scratch.HasRetainedHandles());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}), location_ecs);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), key_ecs);
+    ASSERT_EQ(3u, selected_views.size());
+    EXPECT_EQ(old_target.get(), selected_views[0]);
+    EXPECT_EQ(nullptr, selected_views[1]);
+    EXPECT_EQ(old_target_use_count, old_target.use_count());
+
+    auto replacement = std::make_shared<CacheLocation>();
+    replacement->set_id(target_id);
+    replacement->set_status(CLS_SERVING);
+    auto new_key_location = std::make_shared<CacheLocation>();
+    new_key_location->set_id(target_id);
+    std::vector<ErrorCode> write_ecs;
+    CacheLocationVector replacements{replacement, new_key_location};
+    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
+        nullptr, {1, 3}, {&target_id, &target_id}, replacements, {0, 2}, write_ecs, scratch);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), write_ecs);
+    EXPECT_FALSE(scratch.HasRetainedHandles());
+    ASSERT_EQ(1u, scratch.retired_locations.size());
+    EXPECT_EQ(old_target, scratch.retired_locations[0]);
+    scratch.retired_locations.clear();
+
+    CacheLocationMapVector stored_locations;
+    PropertyMapVector stored_properties;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Get(nullptr, {1, 2, 3}, stored_locations, stored_properties));
+    EXPECT_EQ(replacement, stored_locations[0].at(target_id));
+    EXPECT_TRUE(stored_locations[1].empty());
+    EXPECT_EQ("preserved", stored_properties[1].at("property_only"));
+    EXPECT_EQ(new_key_location, stored_locations[2].at(target_id));
+
+    // Invalid subset metadata must fail the whole write and release the read
+    // handle, so an early validation return cannot pin an LRU entry.
+    CacheLocationVector selected;
+    backend->GetSingleLocationsWithKeyStatusInto(nullptr,
+                                                 {1},
+                                                 {&target_id},
+                                                 selected,
+                                                 key_ecs,
+                                                 location_ecs,
+                                                 scratch,
+                                                 /*retain_handles=*/true);
+    ASSERT_TRUE(scratch.HasRetainedHandles());
+    CacheLocationVector invalid_replacement{replacement};
+    backend->UpsertSingleLocationsUsingRetainedHandlesInto(
+        nullptr, {1}, {&target_id}, invalid_replacement, {1}, write_ecs, scratch);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), write_ecs);
+    EXPECT_FALSE(scratch.HasRetainedHandles());
+}
+
+TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathValidatesBatchAndPreservesDuplicateOrder) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("single_location_edge_cases", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const std::string first_id = "first";
+    const std::string second_id = "second";
+    auto first_old = std::make_shared<CacheLocation>();
+    first_old->set_id(first_id);
+    auto second = std::make_shared<CacheLocation>();
+    second->set_id(second_id);
+    auto first_new = std::make_shared<CacheLocation>();
+    first_new->set_id(first_id);
+    first_new->set_status(CLS_SERVING);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->UpsertSingleLocations(nullptr,
+                                                           {10, 10, 10},
+                                                           LocationIdRefVector{&first_id, &second_id, &first_id},
+                                                           CacheLocationVector{first_old, second, first_new}));
+
+    CacheLocationMapVector stored_locations;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->GetLocations(nullptr, {10}, stored_locations));
+    ASSERT_EQ(2u, stored_locations[0].size());
+    EXPECT_EQ(first_new, stored_locations[0].at(first_id));
+    EXPECT_EQ(second, stored_locations[0].at(second_id));
+
+    const std::string mismatched_id = "mismatched";
+    auto malformed = std::make_shared<CacheLocation>();
+    malformed->set_id(mismatched_id);
+    EXPECT_EQ(
+        (std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}),
+        meta_storage_backend_->UpsertSingleLocations(
+            nullptr, {20, 21}, LocationIdRefVector{&first_id, &first_id}, CacheLocationVector{first_old, malformed}));
+    std::vector<bool> exists;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), meta_storage_backend_->Exists(nullptr, {20, 21}, exists));
+    EXPECT_EQ((std::vector<bool>{false, false}), exists);
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}),
+              meta_storage_backend_->UpsertSingleLocations(
+                  nullptr, {30}, LocationIdRefVector{nullptr}, CacheLocationVector{first_old}));
+    EXPECT_TRUE(meta_storage_backend_->UpsertSingleLocations(nullptr, {}, {}, {}).empty());
+
+    CacheLocationVector empty_locations{first_old};
+    std::vector<ErrorCode> empty_key_error_codes{EC_ERROR};
+    EXPECT_TRUE(
+        meta_storage_backend_->GetSingleLocationsWithKeyStatus(nullptr, {}, {}, empty_locations, empty_key_error_codes)
+            .empty());
+    EXPECT_TRUE(empty_locations.empty());
+    EXPECT_TRUE(empty_key_error_codes.empty());
+}
+
 TEST_F(MetaLocalBackendTest, TestInit) {
     // invalid config
     ASSERT_EQ(EC_BADARGS, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));
@@ -199,6 +415,155 @@ TEST_F(MetaLocalBackendTest, TestUpsert) {
                          {{PROPERTY_URI, "uri3-new"}}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestUpsertPreservesRequestOrderForDuplicateKeys) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_duplicate_upsert", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    // The public backend API historically applies duplicate keys in request
+    // order. In particular, a later partial update to a key first created by
+    // the same batch must merge with, rather than replace, its earlier fields.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              UpsertWithFieldMaps(meta_storage_backend_.get(),
+                                  {7, 8, 7},
+                                  {{{PROPERTY_URI, "uri7"}}, {{PROPERTY_URI, "uri8"}}, {{PROPERTY_HIT_COUNT, "700"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {7, 8},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri7"}, {PROPERTY_HIT_COUNT, "700"}}, {{PROPERTY_URI, "uri8"}}});
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestUpsertPreservesRequestOrderForMixedCapacityBatch) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_mixed_capacity_upsert", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {2}, {{{PROPERTY_URI, "existing"}}}));
+
+    // UpdateInPlace historically does not reject charge growth. Therefore the
+    // request order below first admits key 1 while the cache has room, then
+    // expands existing key 2. Reordering all existing updates ahead of all
+    // missing inserts would incorrectly reject the earlier key 1.
+    const std::string large_insert(600 * 1024, 'i');
+    const std::string large_update(600 * 1024, 'u');
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              UpsertWithFieldMaps(
+                  backend.get(), {1, 2}, {{{PROPERTY_URI, large_insert}}, {{PROPERTY_HIT_COUNT, large_update}}}));
+
+    AssertGetProperties(
+        backend.get(),
+        {1, 2},
+        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+        {EC_OK, EC_OK},
+        {{{PROPERTY_URI, large_insert}}, {{PROPERTY_URI, "existing"}, {PROPERTY_HIT_COUNT, large_update}}});
+    ASSERT_EQ(EC_OK, backend->Close());
+
+    auto reverse_backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, reverse_backend->Init("test_reverse_mixed_capacity_upsert", config));
+    ASSERT_EQ(EC_OK, reverse_backend->Open());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(reverse_backend.get(), {2}, {{{PROPERTY_URI, "existing"}}}));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOSPC}),
+              UpsertWithFieldMaps(reverse_backend.get(),
+                                  {2, 1},
+                                  {{{PROPERTY_HIT_COUNT, large_update}}, {{PROPERTY_URI, large_insert}}}));
+    AssertGetProperties(reverse_backend.get(),
+                        {1, 2},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_NOENT, EC_OK},
+                        {{}, {{PROPERTY_URI, "existing"}, {PROPERTY_HIT_COUNT, large_update}}});
+    ASSERT_EQ(EC_OK, reverse_backend->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestBatchedUpsertShapesMatchSequentialReference) {
+    auto make_backend = [](const std::string &instance_id) {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_shared<MetaLocalBackend>();
+        EXPECT_EQ(EC_OK, backend->Init(instance_id, config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        return backend;
+    };
+    auto optimized = make_backend("test_batched_upsert_reference_optimized");
+    auto reference = make_backend("test_batched_upsert_reference_sequential");
+
+    KeyTypeVec seed_keys;
+    FieldMapVec seed_fields;
+    for (KeyType key = 0; key < 12; ++key) {
+        seed_keys.push_back(key);
+        seed_fields.push_back({{PROPERTY_URI, "seed_" + std::to_string(key)}});
+    }
+    ASSERT_EQ(PutWithFieldMaps(reference.get(), seed_keys, seed_fields),
+              PutWithFieldMaps(optimized.get(), seed_keys, seed_fields));
+
+    std::set<KeyType> observed_keys(seed_keys.begin(), seed_keys.end());
+    auto apply_and_compare = [&](const KeyTypeVec &keys, const FieldMapVec &fields) {
+        SCOPED_TRACE(::testing::PrintToString(keys));
+        CacheLocationMapVector reference_locations;
+        PropertyMapVector reference_properties;
+        SplitFieldMaps(fields, reference_locations, reference_properties);
+        std::vector<ErrorCode> reference_results(keys.size(), EC_OK);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            reference_results[i] = reference->UpsertForOneKey(keys[i], reference_locations[i], reference_properties[i]);
+        }
+        EXPECT_EQ(reference_results, UpsertWithFieldMaps(optimized.get(), keys, fields));
+        observed_keys.insert(keys.begin(), keys.end());
+
+        const KeyTypeVec all_keys(observed_keys.begin(), observed_keys.end());
+        CacheLocationMapVector optimized_locations;
+        CacheLocationMapVector sequential_locations;
+        PropertyMapVector optimized_properties;
+        PropertyMapVector sequential_properties;
+        const auto optimized_ec = optimized->Get(nullptr, all_keys, optimized_locations, optimized_properties);
+        const auto sequential_ec = reference->Get(nullptr, all_keys, sequential_locations, sequential_properties);
+        EXPECT_EQ(sequential_ec, optimized_ec);
+        EXPECT_EQ(sequential_locations, optimized_locations);
+        for (auto &properties : optimized_properties) {
+            properties.erase(PROPERTY_LRU_TIME);
+        }
+        for (auto &properties : sequential_properties) {
+            properties.erase(PROPERTY_LRU_TIME);
+        }
+        EXPECT_EQ(sequential_properties, optimized_properties);
+        EXPECT_EQ(reference->GetMemUsage(), optimized->GetMemUsage());
+    };
+
+    KeyTypeVec all_hit_keys;
+    FieldMapVec all_hit_fields;
+    for (KeyType key = 0; key < 12; ++key) {
+        all_hit_keys.push_back(key);
+        all_hit_fields.push_back({{"hit_" + std::to_string(key), "value"}});
+    }
+    apply_and_compare(all_hit_keys, all_hit_fields);
+
+    KeyTypeVec all_miss_keys;
+    FieldMapVec all_miss_fields;
+    for (KeyType key = 100; key < 112; ++key) {
+        all_miss_keys.push_back(key);
+        all_miss_fields.push_back({{PROPERTY_URI, "new_" + std::to_string(key)}});
+    }
+    apply_and_compare(all_miss_keys, all_miss_fields);
+
+    apply_and_compare({200, 0, 201, 1, 202, 2},
+                      {{{PROPERTY_URI, "mixed_200"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_0"}},
+                       {{PROPERTY_URI, "mixed_201"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_1"}},
+                       {{PROPERTY_URI, "mixed_202"}},
+                       {{PROPERTY_HIT_COUNT, "mixed_2"}}});
+    apply_and_compare({300, 300, 3, 300},
+                      {{{PROPERTY_URI, "duplicate_first"}},
+                       {{PROPERTY_HIT_COUNT, "duplicate_second"}},
+                       {{PROPERTY_HIT_COUNT, "existing"}},
+                       {{"final_field", "duplicate_final"}}});
+
+    EXPECT_EQ(EC_OK, optimized->Close());
+    EXPECT_EQ(EC_OK, reference->Close());
 }
 
 TEST_F(MetaLocalBackendTest, TestDelete) {
@@ -928,6 +1293,108 @@ TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
 // ---------------------------------------------------------------------------
 // Concurrent read-write stress test for MetaMemCacheItem fields_ mutex
 // ---------------------------------------------------------------------------
+TEST_F(MetaLocalBackendTest, TestGetLocationValuesPreservesKeyOrderAndSharedValues) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_location_values", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto make_location = [](const std::string &id) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        location->set_status(CacheLocationStatus::CLS_SERVING);
+        location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        location->set_location_specs({LocationSpec("tp0", "event_report://host/mem")});
+        return location;
+    };
+    auto location_a = make_location("location-a");
+    auto location_b = make_location("location-b");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace(location_a->id(), location_a);
+    locations[0].emplace(location_b->id(), location_b);
+    PropertyMapVector properties(2);
+    properties[1][PROPERTY_URI] = "property-only-key";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {11, 22}, locations, properties));
+
+    LocationsPerKey values;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_OK, EC_OK}),
+              meta_storage_backend_->GetLocationValues(nullptr, {11, 33, 22, 11}, values));
+    ASSERT_EQ(4u, values.size());
+    EXPECT_TRUE(values[1].empty());
+    EXPECT_TRUE(values[2].empty());
+    for (const std::size_t index : {std::size_t{0}, std::size_t{3}}) {
+        ASSERT_EQ(2u, values[index].size());
+        std::set<std::string> ids;
+        for (const auto &location : values[index]) {
+            ASSERT_TRUE(location);
+            ids.insert(location->id());
+            EXPECT_TRUE(location == location_a || location == location_b);
+        }
+        EXPECT_EQ((std::set<std::string>{"location-a", "location-b"}), ids);
+    }
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestGetLocationValuesCompactPreservesOffsetsAndCanBeReused) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_compact_location_values", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto make_location = [](const std::string &id) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        location->set_status(CacheLocationStatus::CLS_SERVING);
+        location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        location->set_location_specs({LocationSpec("tp0", "event_report://host/mem")});
+        return location;
+    };
+    auto location_a = make_location("location-a");
+    auto location_b = make_location("location-b");
+    CacheLocationMapVector locations(2);
+    locations[0].emplace(location_a->id(), location_a);
+    locations[0].emplace(location_b->id(), location_b);
+    PropertyMapVector properties(2);
+    properties[1][PROPERTY_URI] = "property-only-key";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, {11, 22}, locations, properties));
+
+    const KeyType keys[] = {11, 33, 22, 11};
+    CompactLocationsPerKey compact;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_OK, EC_OK}),
+              meta_storage_backend_->GetLocationValuesCompact(nullptr, keys, std::size(keys), compact));
+    ASSERT_TRUE(compact.IsValid(std::size(keys)));
+    EXPECT_EQ((std::vector<size_t>{0, 2, 2, 2, 4}), compact.offsets);
+    EXPECT_TRUE(compact[1].empty());
+    EXPECT_TRUE(compact[2].empty());
+    for (const std::size_t index : {std::size_t{0}, std::size_t{3}}) {
+        ASSERT_EQ(2u, compact[index].size());
+        std::set<std::string> ids;
+        for (const auto &location : compact[index]) {
+            ASSERT_TRUE(location);
+            ids.insert(location->id());
+            EXPECT_TRUE(location == location_a || location == location_b);
+        }
+        EXPECT_EQ((std::set<std::string>{"location-a", "location-b"}), ids);
+    }
+
+    // Reusing an output object must discard every offset and value left by the
+    // previous, longer request.
+    const KeyType shorter_keys[] = {22, 11};
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->GetLocationValuesCompact(nullptr, shorter_keys, std::size(shorter_keys), compact));
+    ASSERT_TRUE(compact.IsValid(std::size(shorter_keys)));
+    EXPECT_EQ((std::vector<size_t>{0, 0, 2}), compact.offsets);
+    EXPECT_TRUE(compact[0].empty());
+    EXPECT_EQ(2u, compact[1].size());
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS, EC_BADARGS}),
+              meta_storage_backend_->GetLocationValuesCompact(nullptr, nullptr, 2, compact));
+    ASSERT_TRUE(compact.IsValid(2));
+    EXPECT_TRUE(compact[0].empty());
+    EXPECT_TRUE(compact[1].empty());
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_concurrent", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -991,6 +1458,17 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
             auto get_loc_ids_ec = meta_storage_backend_->GetLocationIds(nullptr, {kTestKey}, loc_ids);
             ASSERT_EQ(1u, get_loc_ids_ec.size());
             ASSERT_EQ(EC_OK, get_loc_ids_ec[0]);
+
+            // Lightweight host-query projection must be safe while location
+            // entries are concurrently inserted and removed.
+            LocationsPerKey location_values;
+            auto get_values_ec = meta_storage_backend_->GetLocationValues(nullptr, {kTestKey}, location_values);
+            ASSERT_EQ(1u, get_values_ec.size());
+            ASSERT_EQ(EC_OK, get_values_ec[0]);
+            ASSERT_EQ(1u, location_values.size());
+            for (const auto &location : location_values[0]) {
+                ASSERT_TRUE(location);
+            }
         }
     };
 

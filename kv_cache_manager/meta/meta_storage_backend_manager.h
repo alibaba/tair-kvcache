@@ -17,6 +17,7 @@ namespace kv_cache_manager {
 
 class MetaStorageBackendConfig;
 class RequestContext;
+struct SingleLocationRmwScratch;
 
 // Backend orchestrator with two modes (auto-selected at Init):
 //   * Dual-backend: persistent (source-of-truth) + cache (hot cache).
@@ -47,6 +48,24 @@ public:
     // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
+    std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 const CacheLocationVector &locations) noexcept;
+    void PrepareSingleLocationRmwScratch(size_t max_count, SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsInto(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const LocationIdRefVector &location_ids,
+                                   const CacheLocationVector &locations,
+                                   std::vector<ErrorCode> &out_results,
+                                   SingleLocationRmwScratch &scratch) noexcept;
+    void UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext *request_context,
+                                                       const KeyVector &keys,
+                                                       const LocationIdRefVector &location_ids,
+                                                       CacheLocationVector &locations,
+                                                       const std::vector<size_t> &read_indices,
+                                                       std::vector<ErrorCode> &out_results,
+                                                       SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyVector &keys,
@@ -61,15 +80,50 @@ public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
                                         const KeyVector &keys,
                                         CacheLocationMapVector &out_location_maps) noexcept;
+    std::vector<ErrorCode>
+    GetLocationValues(RequestContext *request_context, const KeyVector &keys, LocationsPerKey &out_locations) noexcept;
+    std::vector<ErrorCode> GetLocationValuesCompact(RequestContext *request_context,
+                                                    const KeyType *keys,
+                                                    size_t key_count,
+                                                    CompactLocationsPerKey &out_locations) noexcept;
     // Read the source-of-truth backend directly without touching the hot cache.
     // Maintenance admission uses this to revalidate a persistent scan result.
     std::vector<ErrorCode> GetLocationsFromPersistent(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       CacheLocationMapVector &out_location_maps) noexcept;
+    // Refresh complete keys from persistent storage into the hot cache before
+    // a maintenance RMW. The caller must hold the corresponding shard locks.
+    // In single-backend mode this is a no-op.
+    std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
+    std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
+                                                                  const KeyVector &keys,
+                                                                  const LocationIdsPerKey &location_ids,
+                                                                  LocationsPerKey &out_locations,
+                                                                  std::vector<ErrorCode> &out_key_error_codes) noexcept;
+    std::vector<ErrorCode> GetSingleLocationsWithKeyStatus(RequestContext *request_context,
+                                                           const KeyVector &keys,
+                                                           const LocationIdRefVector &location_ids,
+                                                           CacheLocationVector &out_locations,
+                                                           std::vector<ErrorCode> &out_key_error_codes) noexcept;
+    void GetSingleLocationsWithKeyStatusInto(RequestContext *request_context,
+                                             const KeyVector &keys,
+                                             const LocationIdRefVector &location_ids,
+                                             CacheLocationVector &out_locations,
+                                             std::vector<ErrorCode> &out_key_error_codes,
+                                             std::vector<ErrorCode> &out_results,
+                                             SingleLocationRmwScratch &scratch,
+                                             bool retain_handles = false) noexcept;
+    void GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 CacheLocationViewVector &out_locations,
+                                                 std::vector<ErrorCode> &out_key_error_codes,
+                                                 std::vector<ErrorCode> &out_results,
+                                                 SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyVector &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept;
@@ -79,11 +133,6 @@ public:
                                          PropertyMapVector &out_properties) noexcept;
     std::vector<ErrorCode>
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
-
-    // Refresh complete keys from persistent storage into the hot cache before
-    // a maintenance RMW. The caller must hold the corresponding shard locks.
-    // In single-backend mode this is a no-op.
-    std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
 
     // ----- Cross-batch APIs (no shard locks) -----
     ErrorCode ListKeys(RequestContext *request_context,
@@ -114,14 +163,26 @@ public:
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
 
+    // Only the single local backend is safe and useful to fan out: its cache
+    // and items are independently sharded/locked and it ignores RequestContext.
+    // Redis and cached modes retain their existing batched request semantics.
+    bool SupportsConcurrentLocationValueReads() const noexcept;
+    bool SupportsSingleLocationRmw() const noexcept;
+    bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
+
 private:
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
                                 const PropertyMapVector &properties,
-                                const std::vector<ErrorCode> &get_error_codes) noexcept;
-    // Hydrate missing keys from persistent into cache during Recover.
-    void EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
+                                const std::vector<ErrorCode> &get_error_codes,
+                                // Reports whether every source entry and
+                                // conditional cache write completed safely.
+                                bool *out_success = nullptr) noexcept;
+    // Hydrate missing keys from persistent into cache during Recover. Returns
+    // false when a backend violates the positional response contract or the
+    // full pre-update value cannot be made available safely.
+    bool EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
     // Delete keys that have no remaining location fields. Returns reclaimed count.
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
@@ -134,6 +195,11 @@ private:
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};
     std::thread recover_thread_;
+    // Serializes lifecycle transitions and prevents assigning a second
+    // recovery thread over an already-joinable std::thread (which would call
+    // std::terminate even though Open() is noexcept).
+    mutable std::mutex lifecycle_mutex_;
+    bool opened_ = false;
 
     mutable std::mutex deleted_keys_mutex_;
     std::unordered_set<KeyType> deleted_keys_;

@@ -1,19 +1,36 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <fcntl.h>
+#include <limits>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
 
 SdkWrapper::SdkWrapper() : sdk_factory_(SdkFactory::GetInstance()) {}
 
-SdkWrapper::~SdkWrapper() {}
+SdkWrapper::~SdkWrapper() {
+    if (wait_task_thread_pool_) {
+        wait_task_thread_pool_->stop();
+        wait_task_thread_pool_.reset();
+    }
+    sdk_map_.clear();
+    if (owned_shm_fd_ >= 0) {
+        close(owned_shm_fd_);
+        owned_shm_fd_ = -1;
+    }
+}
 
-ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config, const InitParams &init_params) {
+ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
+                                 const InitParams &init_params,
+                                 const SharedMemoryRegistration *shared_memory_registration) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
@@ -31,6 +48,16 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     if (storage_configs_.empty()) {
         KVCM_LOG_WARN("storage config is empty");
         return ER_INVALID_STORAGE_CONFIG;
+    }
+
+    SharedMemoryRegistration prepared_registration;
+    const SharedMemoryRegistration *active_registration = nullptr;
+    if (shared_memory_registration != nullptr) {
+        auto ec = PrepareSharedMemoryRegistration(*shared_memory_registration, prepared_registration);
+        if (ec != ER_OK) {
+            return ec;
+        }
+        active_registration = &prepared_registration;
     }
 
     wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(
@@ -66,6 +93,11 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
         auto ec = UpdateMooncakeSdkConfig(sdk_backend_config, regist_span, init_params.self_location_spec_name);
         if (ec != ER_OK) {
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
+            return ec;
+        }
+        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, active_registration);
+        if (ec != ER_OK) {
+            KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
 
@@ -324,6 +356,67 @@ ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBac
     config->set_local_mem_ptr(span->base);
     config->set_local_buffer_size(span->size);
     config->set_self_location_spec_name(self_location_spec_name);
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
+                                                            SharedMemoryRegistration &prepared_registration) {
+    const bool disabled = shared_memory_registration.fd == -1 && shared_memory_registration.base == nullptr &&
+                          shared_memory_registration.size == 0;
+    if (disabled) {
+        prepared_registration = shared_memory_registration;
+        return ER_OK;
+    }
+
+    if (shared_memory_registration.fd < 0 || shared_memory_registration.base == nullptr ||
+        shared_memory_registration.size == 0) {
+        KVCM_LOG_WARN("shared memory registration must provide fd, base and size together");
+        return ER_INVALID_PARAMS;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(shared_memory_registration.base);
+    if (shared_memory_registration.size > std::numeric_limits<uintptr_t>::max() - base) {
+        KVCM_LOG_WARN("shared memory registration address range overflows");
+        return ER_INVALID_PARAMS;
+    }
+
+    struct stat file_stat{};
+    if (fstat(shared_memory_registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
+        static_cast<uintmax_t>(file_stat.st_size) < shared_memory_registration.size) {
+        KVCM_LOG_WARN("shared memory fd is invalid or smaller than the registered range");
+        return ER_INVALID_PARAMS;
+    }
+
+    int duplicated_fd = fcntl(shared_memory_registration.fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicated_fd < 0) {
+        KVCM_LOG_WARN("duplicate shared memory fd failed");
+        return ER_INVALID_PARAMS;
+    }
+    if (owned_shm_fd_ >= 0) {
+        close(owned_shm_fd_);
+    }
+    owned_shm_fd_ = duplicated_fd;
+    prepared_registration = shared_memory_registration;
+    prepared_registration.fd = owned_shm_fd_;
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                       const SharedMemoryRegistration *shared_memory_registration) {
+    if (!IsTairMempoolStorageType(sdk_backend_config->type())) {
+        return ER_OK;
+    }
+    auto config = std::dynamic_pointer_cast<TairMempoolSdkConfig>(sdk_backend_config);
+    if (!config) {
+        KVCM_LOG_WARN("convert to tair mempool config failed");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    if (shared_memory_registration == nullptr || shared_memory_registration->fd < 0) {
+        return ER_OK;
+    }
+    config->set_shm_fd(shared_memory_registration->fd);
+    config->set_shm_size(shared_memory_registration->size);
+    config->set_client_base(shared_memory_registration->base);
     return ER_OK;
 }
 

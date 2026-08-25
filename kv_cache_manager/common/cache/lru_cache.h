@@ -325,8 +325,14 @@ public: // Function definitions expected as parameter to ShardedCache
                       Cache::CreateContext *create_context,
                       Cache::Priority priority,
                       Statistics *stats);
+    void LookupBatch(const std::string_view *keys,
+                     const uint32_t *hashes,
+                     const size_t *ordered_indices,
+                     size_t count,
+                     Cache::Handle **out_handles);
 
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
+    void ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count);
     bool Ref(LRUHandle *handle);
     bool Erase(const std::string_view &key, uint32_t hash);
     bool Exists(const std::string_view &key, uint32_t hash);
@@ -503,6 +509,15 @@ public:
     ObjectPtr Value(Handle *handle) override;
     size_t GetCharge(Handle *handle) const override;
     const CacheItemHelper *GetCacheItemHelper(Handle *handle) const override;
+
+    void LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) override;
+    void PrepareBatchOperationScratch(size_t max_count, BatchOperationScratch *scratch) override;
+    void LookupBatchWithScratch(const std::string_view *keys,
+                                size_t count,
+                                Handle **out_handles,
+                                BatchOperationScratch *scratch) override;
+    void ReleaseBatch(Handle *const *handles, size_t count) override;
+    void ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) override;
 
     void ApplyToHandle(Cache *cache,
                        Handle *handle,

@@ -53,6 +53,7 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS exceed availability flag
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY availability flag (testing only)
+    // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD availability flag
     array_t_ storage_quota_avail_by_type_;
 };
 
@@ -61,6 +62,7 @@ DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avai
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_HF3FS)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_DUMMY)) = true;
 }
@@ -222,6 +224,10 @@ DataStorageSelector::Select(RequestContext const *request_context,
         return SelectByType(request_context, candidates, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, false);
     case CachePreferStrategy::CPS_PREFER_TAIR_MEMPOOL:
         return SelectByType(request_context, candidates, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, true);
+    case CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL_SSD:
+        return SelectByType(request_context, candidates, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, false);
+    case CachePreferStrategy::CPS_PREFER_TAIR_MEMPOOL_SSD:
+        return SelectByType(request_context, candidates, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, true);
     case CachePreferStrategy::CPS_UNSPECIFIED:
         // break; skipped intentionally
     default:
