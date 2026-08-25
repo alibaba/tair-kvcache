@@ -8317,6 +8317,266 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDo
     EXPECT_TRUE(hosts.empty());
 }
 
+TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes) {
+    auto make_backend = [&](const std::string &name, DataStorageType type) {
+        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+        StorageConfig config;
+        config.set_global_unique_name(name);
+        config.set_type(type);
+        config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        EXPECT_EQ(EC_OK, backend->Open(config, "v6d_subscriber_reporting_modes"));
+        backend->SetSnapshotMinIntervalMsForTest(0);
+        registry_manager_->data_storage_manager_->storage_map_[name] = backend;
+        return backend;
+    };
+    make_backend("reporting_modes_l1p5", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    make_backend("reporting_modes_l2", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"reporting_modes_l1p5", "reporting_modes_l2"});
+
+    auto register_instance = [&](const std::string &instance_id) {
+        ASSERT_EQ(std::make_pair(EC_OK, default_storage_configs),
+                  cache_manager_->RegisterInstance(request_context_.get(),
+                                                   "default",
+                                                   instance_id,
+                                                   64,
+                                                   createLocationSpecInfos(),
+                                                   createModelDeployment(),
+                                                   std::vector<LocationSpecGroup>(),
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH));
+    };
+
+    auto report_block = [&](const std::string &instance_id,
+                            proto::meta::StorageType storage_type,
+                            const std::string &reporter,
+                            int64_t key,
+                            const std::string &uri) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance_id);
+        request.set_host_ip_port(reporter);
+        request.set_storage_type(storage_type);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block = event->mutable_block_add();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri(uri);
+        proto::meta::ReportEventResponse response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+    };
+
+    auto find_match = [](const std::vector<CacheManager::HostCacheMatch> &matches,
+                         const std::string &host) -> const CacheManager::HostCacheMatch * {
+        const auto it = std::find_if(matches.begin(), matches.end(), [&](const auto &match) {
+            return match.host_ip_port == host;
+        });
+        return it == matches.end() ? nullptr : &*it;
+    };
+
+    // Case 1: ordinary mode. V6D and subscriber use the same unranked reporter
+    // identity, preserving the behavior before multi-engine support.
+    {
+        const std::string instance_id = "test_v6d_subscriber_ordinary";
+        const std::string host = "10.0.8.1:8080";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L1P5,
+                     host,
+                     100,
+                     "event_report://10.0.8.1:9700/mem");
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L2,
+                     host,
+                     200,
+                     "event_report://10.0.8.1:9600/mem");
+
+        auto [ec, matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(host, matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+    }
+
+    // Case 2: multi-engine with independent V6D. Both subscriber and V6D use
+    // the engine rank, and cache metadata must not leak between ranks.
+    {
+        const std::string instance_id = "test_v6d_subscriber_multi_engine_independent";
+        const std::string base = "10.0.8.2:8080";
+        const std::string rank0 = base + "@0";
+        const std::string rank1 = base + "@1";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L2);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L2);
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L1P5,
+                     rank0,
+                     100,
+                     "event_report://10.0.8.2:9700/mem");
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L2,
+                     rank0,
+                     200,
+                     "event_report://10.0.8.2:9600/mem");
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L1P5,
+                     rank1,
+                     100,
+                     "event_report://10.0.8.2:9701/mem");
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L2,
+                     rank1,
+                     300,
+                     "event_report://10.0.8.2:9601/mem");
+
+        auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, rank0_ec);
+        ASSERT_EQ(2u, rank0_matches.size());
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank1));
+        EXPECT_EQ(2, find_match(rank0_matches, rank0)->local);
+        EXPECT_EQ(1, find_match(rank0_matches, rank1)->local);
+
+        auto [rank1_ec, rank1_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 300});
+        ASSERT_EQ(EC_OK, rank1_ec);
+        ASSERT_EQ(2u, rank1_matches.size());
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank1));
+        EXPECT_EQ(1, find_match(rank1_matches, rank0)->local);
+        EXPECT_EQ(2, find_match(rank1_matches, rank1)->local);
+        EXPECT_EQ(nullptr, find_match(rank1_matches, base));
+
+        for (const std::string &invalid_reporter :
+             {base + "@", base + "@-1", base + "@rank", base + "@00", base + "@0@1"}) {
+            proto::meta::ReportEventRequest request;
+            request.set_instance_id(instance_id);
+            request.set_host_ip_port(invalid_reporter);
+            request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+            auto *event = request.add_events();
+            event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            event->mutable_node_register()->add_mediums("mem");
+            proto::meta::ReportEventResponse response;
+            EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+            EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        }
+    }
+
+    // Case 3: multi-engine with shared V6D. Subscriber reporters are ranked,
+    // while the shared V6D reporter is projected onto every active rank.
+    {
+        const std::string instance_id = "test_v6d_subscriber_multi_engine_shared";
+        const std::string base = "10.0.8.3:8080";
+        const std::string rank0 = base + "@0";
+        const std::string rank1 = base + "@1";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, base, proto::meta::ST_EVENT_REPORT_L2);
+
+        const std::string shared_v6d_uri = "event_report://10.0.8.3:9600/mem";
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, base, 100, shared_v6d_uri);
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L1P5,
+                     rank0,
+                     200,
+                     "event_report://10.0.8.3:9700/mem");
+        report_block(instance_id,
+                     proto::meta::ST_EVENT_REPORT_L1P5,
+                     rank1,
+                     300,
+                     "event_report://10.0.8.3:9701/mem");
+
+        auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, rank0_ec);
+        ASSERT_EQ(2u, rank0_matches.size());
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank1));
+        EXPECT_EQ(2, find_match(rank0_matches, rank0)->local);
+        EXPECT_EQ(1, find_match(rank0_matches, rank1)->local);
+
+        auto [rank1_ec, rank1_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 300});
+        ASSERT_EQ(EC_OK, rank1_ec);
+        ASSERT_EQ(2u, rank1_matches.size());
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank1));
+        EXPECT_EQ(1, find_match(rank1_matches, rank0)->local);
+        EXPECT_EQ(2, find_match(rank1_matches, rank1)->local);
+        EXPECT_EQ(nullptr, find_match(rank1_matches, base));
+
+        // Query-only rank projection must not duplicate or rewrite the physical
+        // shared V6D location returned by the data-access API.
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        };
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [location_ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                                    instance_id,
+                                                                                    CacheManager::QueryType::QT_BATCH_GET,
+                                                                                    {100},
+                                                                                    {},
+                                                                                    block_mask,
+                                                                                    0,
+                                                                                    {},
+                                                                                    selectors);
+        ASSERT_EQ(EC_OK, location_ec);
+        ASSERT_EQ(1u, locations.size());
+        ASSERT_EQ(1u, locations[0].cache_locations_view().size());
+        const auto &shared_location = locations[0].cache_locations_view()[0];
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, shared_location.type());
+        ASSERT_EQ(1u, shared_location.location_specs().size());
+        EXPECT_NE(std::string::npos, shared_location.location_specs()[0].uri().find(shared_v6d_uri));
+
+        // A rank lifecycle is isolated: after rank 0 goes down, shared L2 is only
+        // projected onto the still-active rank 1.
+        proto::meta::ReportEventRequest rank0_down;
+        rank0_down.set_instance_id(instance_id);
+        rank0_down.set_host_ip_port(rank0);
+        rank0_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        rank0_down.add_events()->set_event_type(proto::meta::EVENT_HOST_DOWN);
+        rank0_down.mutable_events(0)->mutable_host_down();
+        proto::meta::ReportEventResponse rank0_down_response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &rank0_down, &rank0_down_response));
+
+        auto [rank_down_ec, rank_down_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100});
+        ASSERT_EQ(EC_OK, rank_down_ec);
+        ASSERT_EQ(1u, rank_down_matches.size());
+        EXPECT_EQ(rank1, rank_down_matches[0].host_ip_port);
+
+        // Shared V6D HOST_DOWN removes only the shared contribution. Rank 1's
+        // subscriber metadata remains visible and rank 0's metadata does not
+        // leak across the rank boundary.
+        proto::meta::ReportEventRequest shared_down;
+        shared_down.set_instance_id(instance_id);
+        shared_down.set_host_ip_port(base);
+        shared_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        shared_down.add_events()->set_event_type(proto::meta::EVENT_HOST_DOWN);
+        shared_down.mutable_events(0)->mutable_host_down();
+        proto::meta::ReportEventResponse shared_down_response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &shared_down, &shared_down_response));
+
+        auto [shared_down_ec, shared_down_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {300});
+        ASSERT_EQ(EC_OK, shared_down_ec);
+        ASSERT_EQ(1u, shared_down_matches.size());
+        EXPECT_EQ(rank1, shared_down_matches[0].host_ip_port);
+        EXPECT_EQ(1, shared_down_matches[0].local);
+    }
+
+    registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l1p5");
+    registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l2");
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheState) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_host_cache_state_prefix";
