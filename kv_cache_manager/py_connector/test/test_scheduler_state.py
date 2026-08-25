@@ -529,6 +529,14 @@ class TestParseGroups(unittest.TestCase):
         # per_token = 32768 // 16 = 2048; per_block = 2048 * 32 (manager) * 2 layers
         self.assertEqual(m.per_block_bytes, 2048 * 32 * 2)
 
+    def test_pure_mamba_is_refused_before_init(self):
+        # A mamba-only model would otherwise reach register_kv_caches and
+        # die on the 'first attention tensor' lookup with an obscure
+        # StopIteration; refuse it explicitly in parse_groups instead.
+        with self.assertRaisesRegex(
+                NotImplementedError, "pure-mamba / attention-free models"):
+            self._parse([self._mamba_group(["m0"])], mbs=528)
+
     def test_hybrid_multi_group(self):
         mbs = 528
         metas = self._parse([
@@ -612,9 +620,10 @@ class TestParseGroups(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self._parse([bad], mbs)
 
-    def test_no_usable_groups_asserts(self):
+    def test_no_usable_groups_is_refused(self):
         mbs = 16
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(NotImplementedError,
+                                    "no usable kv cache groups"):
             self._parse([], mbs)
 
 

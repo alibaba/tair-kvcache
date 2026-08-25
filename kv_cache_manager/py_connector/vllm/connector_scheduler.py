@@ -28,7 +28,7 @@ from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQu
 from kv_cache_manager.py_connector.vllm.metadata import (
     FinishRequest, LoadRequest, SaveRequest, TairKvCacheConnectorMetadata)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    ATTN_SPEC_GROUP, FULL_SPEC_GROUP, GroupMeta, StateGroupMeta,
+    ATTN_ONLY_SPEC_GROUP, ALL_SPEC_GROUP, GroupMeta, StateGroupMeta,
     build_spec_groups, spec_name)
 
 if TYPE_CHECKING:
@@ -540,7 +540,7 @@ class ConnectorScheduler:
             assert len(state_complete_mask) == target_save_num, (
                 f"state mask {len(state_complete_mask)} != {target_save_num} blocks")
             request["location_spec_group_names"] = [
-                FULL_SPEC_GROUP if complete else ATTN_SPEC_GROUP
+                ALL_SPEC_GROUP if complete else ATTN_ONLY_SPEC_GROUP
                 for complete in state_complete_mask]
             if not all(state_complete_mask):
                 logger.info("req:%s saving %d/%d blocks without a recurrent "

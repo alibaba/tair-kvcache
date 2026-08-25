@@ -22,8 +22,14 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
 
 # Spec group names advertised at registration and used per key in
 # start_write_cache. See build_spec_groups for the semantics.
-ATTN_SPEC_GROUP = "attn"
-FULL_SPEC_GROUP = "full"
+#
+# NOTE: the wire strings are frozen protocol: the manager keys on the
+# "full" prefix (meta_searcher.cc) and its tests / the optimizer client
+# emit these literals. Only the Python-side names below are free to move;
+# "attn" reads as attention-only coverage, "full" as attention + every
+# recurrent state group (the union, i.e. *all* specs).
+ATTN_ONLY_SPEC_GROUP = "attn"
+ALL_SPEC_GROUP = "full"
 
 
 def spec_name(tp_rank: int, group_idx: int) -> str:
@@ -40,7 +46,7 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     two groups lets ``start_write_cache`` say, per block, which specs that
     block will actually hold:
 
-    * ``full`` -- every group's spec (attention KV + all states);
+    * ``full`` -- *all* specs: attention KV + every recurrent state;
     * ``attn`` -- attention specs only (no state was materialized).
 
     The manager then stores exactly the advertised specs, reports the real
@@ -61,8 +67,8 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     all_specs = sorted(
         spec_name(rank, meta.group_idx)
         for rank in range(tp_size) for meta in group_metas)
-    return [{"name": ATTN_SPEC_GROUP, "spec_names": attn_specs},
-            {"name": FULL_SPEC_GROUP, "spec_names": all_specs}]
+    return [{"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
+            {"name": ALL_SPEC_GROUP, "spec_names": all_specs}]
 
 
 @dataclass(frozen=True)
@@ -153,7 +159,19 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
         else:
             raise NotImplementedError(
                 f"Unsupported kv cache spec {type(spec).__name__} in group {idx}")
-    assert metas, "no usable kv cache groups"
+    if not metas:
+        # Every group was skipped (all-EAGLE config or an empty group list):
+        # nothing to transfer, refuse explicitly instead of asserting.
+        raise NotImplementedError(
+            "no usable kv cache groups (all groups skipped?)")
+    if not any(isinstance(m, AttentionGroupMeta) for m in metas):
+        # Pure-mamba / attention-free models have no attention KV to
+        # transfer; the register_kv_caches path would fail obscurely later
+        # (it requires an attention layer tensor). Refuse before init.
+        raise NotImplementedError(
+            "pure-mamba / attention-free models are not supported: "
+            "TairKvCacheConnector transfers full-attention or hybrid "
+            "(attention + mamba) KV caches only")
     return metas
 
 
