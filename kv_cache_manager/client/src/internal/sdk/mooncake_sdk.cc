@@ -18,10 +18,9 @@ void LogSoftTimeout(bool is_get,
                     const void *caller_buffer,
                     size_t buffer_size,
                     int64_t elapsed_ms) {
-    KVCM_LOG_WARN("mooncake %s timeout: op=%s done=%zu/%zu refused_block_idx=%zu key=%s "
+    KVCM_LOG_WARN("mooncake %s timeout: done=%zu/%zu refused_block_idx=%zu key=%s "
                   "caller_buffer=%p caller_buffer_size=%zu elapsed_ms=%lld "
                   "soft-contract: in-flight RDMA cannot be cancelled, blocks [0,%zu) may still be written",
-                  is_get ? "get" : "put",
                   is_get ? "get" : "put",
                   done,
                   total,
