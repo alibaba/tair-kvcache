@@ -2,6 +2,13 @@ package(default_visibility = ["//integration_test:__subpackages__"])
 
 # Shared library: orchestration (manager + vLLM + driver + comparison) and the
 # verifying connector injected into vLLM via kv_connector_module_path.
+#
+# NOTE: vLLM / torch / triton are NOT bazel deps: the e2e harness runs the
+# tests inside a dedicated venv (one per supported vLLM era) and puts the
+# worktree root first on PYTHONPATH -- the connector under test runs from
+# source, and torch/vLLM resolve from the venv. These targets are manual +
+# GPU-tagged for the same reason; bazel only stages the driver and the
+# manager binary.
 py_library(
     name = "e2e_lib",
     srcs = [
