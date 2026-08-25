@@ -1,4 +1,6 @@
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -18,7 +20,7 @@ protected:
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry_);
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         reporter_ = std::make_unique<KmonitorMetricsReporter>();
-        reporter_->Init(cache_manager_, metrics_registry_, "");
+        ASSERT_TRUE(reporter_->Init(cache_manager_, metrics_registry_, ""));
     }
 
     void TearDown() override {}
@@ -111,6 +113,15 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetCounter("cache_gc.delete_result_count", {{"status", "0"}}) += 1;
         metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "scan"}}) += 1;
         metrics_registry_->GetGauge("cache_gc.inflight_delete_count") = 2;
+        metrics_registry_->GetCounter(
+            "manager.location_lookup.keys_total",
+            {{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}, {"result", "hit"}}) += 2;
+        metrics_registry_->GetCounter(
+            "manager.location_lookup.requests_total",
+            {{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}}) += 1;
+        metrics_registry_->GetCounter(
+            "manager.location_lookup.request_keys_total",
+            {{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}}) += 3;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 
@@ -134,6 +145,22 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         reporter_->metrics_registry_ = nullptr;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, TestLocationLookupCounterSamplesKeepTagsAndValues) {
+    const MetricsTags hit_tags{{"api_name", "GetCacheLocation"},
+                               {"instance_id", "test_instance"},
+                               {"result", "hit"}};
+    metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags) += 7;
+
+    std::vector<std::pair<MetricsTags, double>> samples;
+    reporter_->VisitCounterSamples(
+        "manager.location_lookup.keys_total",
+        [&samples](const MetricsTags &tags, double value) { samples.emplace_back(tags, value); });
+
+    ASSERT_EQ(1u, samples.size());
+    EXPECT_EQ(hit_tags, samples.front().first);
+    EXPECT_EQ(7.0, samples.front().second);
 }
 
 TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {

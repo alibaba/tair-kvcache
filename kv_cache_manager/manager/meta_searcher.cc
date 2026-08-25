@@ -1281,8 +1281,12 @@ std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<Erro
 ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
                                                     const KeyVector &keys,
                                                     CacheLocationVector &out_locations,
-                                                    SelectLocationPolicy *policy) const {
+                                                    SelectLocationPolicy *policy,
+                                                    std::size_t *out_error_key_count) const {
     out_locations.clear();
+    if (out_error_key_count != nullptr) {
+        *out_error_key_count = 0;
+    }
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
@@ -1295,6 +1299,12 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     std::size_t i = 0;
     for (; i != keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
+            if (result.error_codes[i] != ErrorCode::EC_NOENT && out_error_key_count != nullptr) {
+                // Prefix matching cannot use the failed key or any following
+                // key. Preserve the legacy EC_OK response, but expose the
+                // unresolved suffix as a monitoring error instead of a miss.
+                *out_error_key_count = keys.size() - i;
+            }
             KVCM_LOG_DEBUG("prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
             break;
         }
@@ -1347,9 +1357,13 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
                                     const KeyVector &keys,
                                     const BlockMask &input_mask,
                                     CacheLocationVector &out_locations,
-                                    SelectLocationPolicy *policy) const {
+                                    SelectLocationPolicy *policy,
+                                    std::size_t *out_error_key_count) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
+    if (out_error_key_count != nullptr) {
+        *out_error_key_count = 0;
+    }
     KeyVector query_keys;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (!IsIndexInMaskRange(input_mask, i)) {
@@ -1363,7 +1377,8 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
     }
     // TODO: need to confirm shard lock range
     // TODO: use smaller batch if many prefix missed a lot
-    ErrorCode ec = PrefixMatchBestLocationImpl(request_context, query_keys, out_locations, policy);
+    ErrorCode ec = PrefixMatchBestLocationImpl(
+        request_context, query_keys, out_locations, policy, out_error_key_count);
     if (ec != EC_OK) {
         KVCM_LOG_DEBUG("PrefixMatchBestLocationImpl failed");
     }
@@ -1427,11 +1442,15 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                                                       SelectLocationPolicy *policy,
                                                       const std::vector<BackendSelector> &selectors,
                                                       const std::vector<std::string> &requested_spec_names,
-                                                      const BlockMask &input_mask) const {
+                                                      const BlockMask &input_mask,
+                                                      std::vector<bool> *out_had_usable_locations) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
     out_locations.resize(keys.size());
+    if (out_had_usable_locations != nullptr) {
+        out_had_usable_locations->assign(keys.size(), false);
+    }
     if (!requested_spec_names.empty() &&
         (requested_spec_names.size() != keys.size() ||
          std::any_of(requested_spec_names.begin(), requested_spec_names.end(), [](const std::string &name) {
@@ -1488,6 +1507,9 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
         }
         std::vector<std::string> prune_loc_ids;
         valid_maps[i] = FilterValidLocations(location_maps[i], check_loc_data_exist_func_, prune_loc_ids);
+        if (out_had_usable_locations != nullptr && !valid_maps[i].empty()) {
+            (*out_had_usable_locations)[query_to_output_index[i]] = true;
+        }
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(query_keys[i]);
             prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
