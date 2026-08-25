@@ -171,6 +171,10 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
 
     ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
     ASSERT_EQ(actual_remote_uris->size(), 2);
+    // 同序契约：actual_remote_uris[i] 与 remote_uris[i] 逐位置对应
+    // （Alloc 为恒等赋值，天然满足；断言防止将来改为逐项回填时破坏保序）。
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), uri2.ToUriString());
 
     free(put_buffer_1);
     free(put_buffer_2);
@@ -327,6 +331,9 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithGpu) {
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
     ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
     ASSERT_EQ(actual_remote_uris->size(), 2);
+    // 同序契约：与 CPU 用例同理，逐位置对应。
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), uri2.ToUriString());
     free(host_put_buffer_1);
     free(host_put_buffer_2);
     cudaFree(gpu_put_buffer_1);
