@@ -271,7 +271,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryUsesRequestLocalServiceSample
     reporter_->ReportPerQuery(second.get());
 
     EXPECT_DOUBLE_EQ(456.0, registry_->GetGauge("service.query_rt_us", instance_tags).Get());
-    EXPECT_EQ(579u, registry_->GetCounter("service.query_rt_us_total", instance_tags).Get());
+    EXPECT_EQ(579u, registry_->GetCounter("service.query_rt_us_sum", instance_tags).Get());
     EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("service.error_code", instance_tags).Get());
     EXPECT_EQ(1u, registry_->GetCounter("service.error_counter", instance_tags).Get());
 }
@@ -290,12 +290,12 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryTagsServiceMetricsByGroupAndI
     const MetricsTags instance_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
     EXPECT_EQ(2u, registry_->GetCounter("service.query_counter", instance_tags).Get());
     EXPECT_DOUBLE_EQ(123.0, registry_->GetGauge("service.query_rt_us", instance_tags).Get());
-    EXPECT_EQ(246u, registry_->GetCounter("service.query_rt_us_total", instance_tags).Get());
+    EXPECT_EQ(246u, registry_->GetCounter("service.query_rt_us_sum", instance_tags).Get());
     EXPECT_DOUBLE_EQ(static_cast<double>(EC_ERROR), registry_->GetGauge("service.error_code", instance_tags).Get());
     EXPECT_EQ(2u, registry_->GetCounter("service.error_counter", instance_tags).Get());
     EXPECT_EQ(2u, registry_->GetCounter("service.query_counter").Get());
     EXPECT_DOUBLE_EQ(123.0, registry_->GetGauge("service.query_rt_us").Get());
-    EXPECT_EQ(246u, registry_->GetCounter("service.query_rt_us_total").Get());
+    EXPECT_EQ(246u, registry_->GetCounter("service.query_rt_us_sum").Get());
     EXPECT_EQ(2u, registry_->GetCounter("service.error_counter").Get());
 
     auto query_counter_data = registry_->GetMetricsData("service.query_counter");

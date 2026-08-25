@@ -45,7 +45,7 @@ class OptimizerServiceMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(service, query_counter)
     KVCM_COUNTER_METRICS(service, input_tokens_total)
     KVCM_CHRONO_METRICS(service, query_rt_us, ServiceQuery)
-    KVCM_COUNTER_METRICS(service, query_rt_us_total)
+    KVCM_COUNTER_METRICS(service, query_rt_us_sum)
     KVCM_GAUGE_METRICS(service, error_code)
     KVCM_COUNTER_METRICS(service, error_counter)
 
