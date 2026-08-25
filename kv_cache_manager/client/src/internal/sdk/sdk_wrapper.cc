@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <unordered_map>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
@@ -158,19 +159,22 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
     // Build task vector for parallel dispatch
     std::vector<std::function<ClientErrorCode()>> tasks;
     tasks.reserve(groups.size());
-    int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
-    auto now = std::chrono::steady_clock::now();
-    auto internal_deadline = now + std::chrono::milliseconds(timeout_ms);
     // 双重约束取更早者：内部静态预算（client 配置）与调用方交付 buffer 时给的动态
-    // deadline。deadline_ms=0 表示调用方未指定，仅受静态预算约束（向前兼容）。
-    auto deadline =
-        (deadline_ms > 0)
-            ? std::min(internal_deadline, std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)))
-            : internal_deadline;
+    // deadline。min 的结果必须同时作为 (a) RunWithTimeoutParallel 的等待上限和
+    // (b) 下发进 SDK 的准入 deadline —— 两者若不是同一个时间点，会出现"wrapper 已
+    // 按内部预算超时返回、后台任务却按更晚的 caller deadline 继续写 caller buffer"
+    // 的窗口。deadline_ms=0 表示调用方未指定（向前兼容），仅受静态预算约束，此时
+    // 静态预算同样作为真实 deadline 下发（transfer_client.h 注释的语义）。
+    const int64_t internal_deadline_ms = SteadyClockMs() + wrapper_config_->timeout_config().get_timeout_ms();
+    const int64_t effective_deadline_ms =
+        (deadline_ms > 0) ? std::min(deadline_ms, internal_deadline_ms) : internal_deadline_ms;
+    const auto deadline = std::chrono::steady_clock::time_point(std::chrono::milliseconds(effective_deadline_ms));
 
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
-        tasks.push_back([group, deadline_ms]() { return group.sdk->Get(group.uris, group.buffers, deadline_ms); });
+        tasks.push_back([group, effective_deadline_ms]() {
+            return group.sdk->Get(group.uris, group.buffers, effective_deadline_ms);
+        });
     }
     return RunWithTimeoutParallel(OpType::GET, std::move(tasks), deadline);
 }
@@ -196,21 +200,20 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     std::vector<std::shared_ptr<std::vector<DataStorageUri>>> group_results;
     tasks.reserve(groups.size());
     group_results.reserve(groups.size());
-    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
-    auto now = std::chrono::steady_clock::now();
-    auto internal_deadline = now + std::chrono::milliseconds(timeout_ms);
-    auto deadline =
-        (deadline_ms > 0)
-            ? std::min(internal_deadline, std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms)))
-            : internal_deadline;
+    // 与 Get 同理：min(内部预算, caller deadline) 的结果同时作为等待上限与下发给
+    // SDK 的准入 deadline；caller 传 0 时下发内部预算（见 Get 处注释）。
+    const int64_t internal_deadline_ms = SteadyClockMs() + wrapper_config_->timeout_config().put_timeout_ms();
+    const int64_t effective_deadline_ms =
+        (deadline_ms > 0) ? std::min(deadline_ms, internal_deadline_ms) : internal_deadline_ms;
+    const auto deadline = std::chrono::steady_clock::time_point(std::chrono::milliseconds(effective_deadline_ms));
 
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris, deadline_ms]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris, deadline_ms);
+        tasks.push_back([group, group_actual_uris, effective_deadline_ms]() {
+            return group.sdk->Put(group.uris, group.buffers, group_actual_uris, effective_deadline_ms);
         });
     }
 

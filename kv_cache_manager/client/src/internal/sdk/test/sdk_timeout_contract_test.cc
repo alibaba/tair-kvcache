@@ -691,6 +691,62 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathStopsQueuedTasks) {
 }
 
 // ============================================================================
+// 3.8 SDK 收到的 deadline = min(内部预算, caller deadline)
+// ============================================================================
+// P2 回归：wrapper 必须把 min 后的 effective deadline 下发进 SDK，而不是原始 caller
+// 值。否则 caller deadline 晚于内部预算时，wrapper 已按内部预算超时返回，后台任务
+// 却拿着更晚的 caller deadline 继续写 caller buffer —— 等待上限与准入依据脱钩。
+TEST_F(SdkTimeoutContractTest, TestSdkReceivesMinOfInternalAndCallerDeadline) {
+    auto ctrl = std::make_shared<FakeSlowSdkControl>();
+    RegisterFakeForTest("min_host", ctrl);
+
+    // 内部 get_timeout_ms=300；caller 给 100000ms → SDK 必须观测到 ≈ now+300。
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 300, MakeSingleFileStorageConfigs("min_host")));
+
+    auto uris = std::vector<DataStorageUri>{MakeUri("min_host", "m/0/0/1", 0, 1024)};
+    auto buffers = TestBuffers::Make(1, 1024);
+
+    const int64_t before_ms = SteadyClockMs();
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(100000)));
+    const int64_t after_ms = SteadyClockMs();
+
+    ASSERT_EQ(1, ctrl->get_call_count.load());
+    ASSERT_TRUE(ctrl->deadline_set.load());
+    const int64_t observed = ctrl->observed_deadline_ms.load();
+    // 恰为内部预算：effective 在 Get 内部计算（晚于 before、早于 after）；
+    // 绝不能是 caller 的 100000ms（那意味着等待上限与准入依据脱钩）。
+    ASSERT_GE(observed, before_ms + 300);
+    ASSERT_LE(observed, after_ms + 300);
+}
+
+// caller 传 0（未指定）时，SDK 收到内部预算作为真实 deadline，而不是 0：
+// SDK 层的逐 block / 逐 key 准入同样受静态预算保护（transfer_client.h 注释的语义：
+// "退回 client 配置的静态超时预算"）。修复前 SDK 收到 0，DeadlineExpired 恒为
+// false，准入检查在 deadline_ms=0 的调用下完全失效。
+TEST_F(SdkTimeoutContractTest, TestZeroCallerDeadlineStillPassesInternalBudget) {
+    auto ctrl = std::make_shared<FakeSlowSdkControl>();
+    RegisterFakeForTest("zero_host", ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 5000, MakeSingleFileStorageConfigs("zero_host")));
+
+    auto uris = std::vector<DataStorageUri>{MakeUri("zero_host", "z/0/0/1", 0, 1024)};
+    auto buffers = TestBuffers::Make(1, 1024);
+
+    const int64_t before_ms = SteadyClockMs();
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, /*deadline_ms=*/0));
+    const int64_t after_ms = SteadyClockMs();
+
+    // deadline_set 为 true 说明 SDK 拿到的是非 0 的真实 deadline（准入有依据）。
+    ASSERT_TRUE(ctrl->deadline_set.load());
+    const int64_t observed = ctrl->observed_deadline_ms.load();
+    // 且恰为内部预算 ≈ now+5000（在 Get 内部计算，介于 before 与 after 之间）。
+    ASSERT_GE(observed, before_ms + 5000);
+    ASSERT_LE(observed, after_ms + 5000);
+}
+
+// ============================================================================
 // 跨语言时钟同源
 // ============================================================================
 // connector 用 Python 算 deadline_ms，SDK 用 C++ SteadyClockMs() 比较；两者必须

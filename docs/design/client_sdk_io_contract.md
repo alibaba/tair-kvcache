@@ -10,7 +10,9 @@
 
 - 读/写路径均传真实 deadline：`deadline_ms_from_now(sdk_get/put_timeout_ms)`。
 - 写路径的租约（write_timeout_seconds）不由 connector 计算或传递；SdkWrapper 内部对
-  外部 deadline 与内部 timeout_config 取 min，确保内层自律不越过外层租约。
+  外部 deadline 与内部 timeout_config 取 min，**min 结果原样下发进 SDK 作为准入
+  deadline**（caller 传 0 时即内部预算）——wrapper 的等待上限与 SDK 的准入依据
+  始终是同一个时间点，内层自律不越过外层租约。
 - deadline 在各进程内各自计算，不跨进程/跨 rank 传递（见 Known Limitations）。
 
 ## 3. 后端履约矩阵

@@ -663,8 +663,9 @@ TEST_F(SdkWrapperTest, TestDeadlinePropagation) {
     auto fake_factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config_, init_params_, init_ec);
     ASSERT_EQ(ER_OK, init_ec);
 
-    // 显式传 2000ms 的绝对 deadline。
-    const int64_t deadline_ms = SteadyClockMs() + 2000;
+    // caller deadline（1000ms）明确小于 fixture 的内部预算（get_timeout_ms=2000）：
+    // wrapper 下发 min(caller, internal) = caller —— SDK 恰好观测到调用方给的值。
+    const int64_t deadline_ms = SteadyClockMs() + 1000;
     std::vector<DataStorageUri> remote_uris = {
         DataStorageUri("file://nfs_test/" + root_path_ + "/nfs/0/0/1?blkid=0&size=1024")};
     BlockBuffers local_buffers = {BlockBuffer()};
