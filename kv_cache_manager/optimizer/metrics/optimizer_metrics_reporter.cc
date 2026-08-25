@@ -148,10 +148,10 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
     double query_rt_us;
     GET_METRICS_(p, service, query_rt_us, query_rt_us);
-    Counter query_rt_total;
-    COPY_METRICS_(p, service, query_rt_us_total, query_rt_total);
+    Counter query_rt_sum;
+    COPY_METRICS_(p, service, query_rt_us_sum, query_rt_sum);
     if (!std::isnan(query_rt_us)) {
-        query_rt_total += static_cast<uint64_t>(query_rt_us);
+        query_rt_sum += static_cast<uint64_t>(query_rt_us);
     }
 
     double error_code;
@@ -176,7 +176,7 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         }
         metrics_registry_->GetGauge("service.query_rt_us", service_tags) = query_rt_us;
         if (!std::isnan(query_rt_us)) {
-            metrics_registry_->GetCounter("service.query_rt_us_total", service_tags) +=
+            metrics_registry_->GetCounter("service.query_rt_us_sum", service_tags) +=
                 static_cast<uint64_t>(query_rt_us);
         }
         metrics_registry_->GetGauge("service.error_code", service_tags) = error_code;
