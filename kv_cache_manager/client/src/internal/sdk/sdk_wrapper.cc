@@ -296,11 +296,19 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     const std::string op_str = getOpTypeString(op_type);
     const auto start = std::chrono::steady_clock::now();
 
+    // stop：错误/超时路径置位后，排队中尚未被拾起的任务直接短路，不再发起新的 I/O。
+    // 时间准入（now >= deadline）只覆盖"已到 deadline"的情形；普通错误往往发生在
+    // deadline 之前，若不显式拦截，排在后面的 group 会在 caller 拿到错误返回后
+    // 依旧发起 I/O、写 caller buffer（多后端混布时放大暴露面）。
+    auto stop = std::make_shared<std::atomic<bool>>(false);
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
-        auto wrapped = [deadline, task = std::move(task)]() -> ClientErrorCode {
+        auto wrapped = [stop, deadline, task = std::move(task)]() -> ClientErrorCode {
+            if (stop->load()) {
+                return ER_SDK_TIMEOUT;
+            }
             if (std::chrono::steady_clock::now() >= deadline) {
                 auto overdue_ms =
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
@@ -313,6 +321,17 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
     }
 
+    // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
+    // 超时路径调用它时 deadline 已过，wait_until 立即返回，保持"超时立即返回"语义；
+    // 普通错误路径则真正等待在飞 peer（此时 deadline 未到，SDK 仍在契约窗口内写
+    // caller buffer，不等就返回会让 caller 在 hard backend 仍在读写时复用/释放 buffer）。
+    auto drain = [&](size_t from) {
+        stop->store(true);
+        for (size_t j = from; j < futures.size(); ++j) {
+            futures[j].wait_until(deadline);
+        }
+    };
+
     for (size_t i = 0; i < futures.size(); ++i) {
         if (futures[i].wait_until(deadline) != std::future_status::ready) {
             auto elapsed_ms =
@@ -321,12 +340,16 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                           "(in-flight I/O may still write caller buffer)",
                           op_str.c_str(),
                           static_cast<long long>(elapsed_ms));
+            drain(i + 1);
             return ER_SDK_TIMEOUT;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
-            KVCM_LOG_WARN("run %s parallel failed, error: %d", op_str.c_str(), static_cast<int>(ec));
+            KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
+                          op_str.c_str(),
+                          static_cast<int>(ec));
+            drain(i + 1);
             return ec;
         }
     }

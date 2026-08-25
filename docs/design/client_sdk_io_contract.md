@@ -33,9 +33,12 @@
    这是 KVCM 服务端既有问题，本次不改。
 3. **ManagerClient / RTPLLMClient 层无 DDL**：这两层公开接口保持传 0，走 SdkWrapper 兜底。
    不确定外部用户是谁，暂不加。
-4. **普通错误路径不 drain peer 任务**：RunWithTimeoutParallel 中一个 group 返回普通错误
-   即立即返回，不等其余 in-flight 任务。多后端场景下快速失败的 group 可能让调用方在
-   另一 hard backend 仍在读写 buffer 时就复用 buffer。这是 origin/main 既有问题。
+4. **超时路径不等在飞任务；普通错误路径有界等待**：RunWithTimeoutParallel 在
+   deadline 到期时立即返回，在飞任务的 I/O 不被取消也不被等待（hard 后端的逐块
+   准入会尽快停下；soft 后端见 §3）。普通错误路径则不同：错误往往发生在 deadline
+   之前，SDK 仍在契约允许的窗口内写 caller buffer，因此错误路径会先置 stop 拦截
+   仍在排队的 group（不再发起新 I/O），再有界等待在飞 peer 至多到 deadline 才返回
+   ——否则 caller 拿到错误后立即复用/释放 buffer，与在飞 DMA 构成数据竞争。
 5. **HF3FS 超时泄漏 iov/IOR**：当 DeadlineExpired 导致 WaitIos 超时时，不释放已提交
    的 I/O 的 iov 缓冲区和 IOR（释放会导致 UAF）。泄漏规模 = 一次超时的读写调用涉及的
    iov 大小。线上应在 WARN 日志中观测泄漏频率，若高频则需引入 3FS 取消机制。

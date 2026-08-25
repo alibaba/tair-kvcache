@@ -145,6 +145,19 @@ protected:
                name_b + "\",\"storage_spec\":{\"root_path\":\"/nfs_b/\",\"key_count_per_file\":2}}]";
     }
 
+    // 三 host：组顺序 = URI 首现顺序（GroupBySdk 按输入顺序建组，不依赖 unordered_map
+    // 迭代序），单线程 FIFO 池下任务拾起顺序与提交顺序一致 —— 测试可确定性编排
+    // "err → gap → tail"。
+    std::string MakeTripleFileStorageConfigs(const std::string &name_a, const std::string &name_b,
+                                             const std::string &name_c) {
+        return "[{\"type\":\"file\",\"global_unique_name\":\"" + name_a +
+               "\",\"storage_spec\":{\"root_path\":\"/nfs_a/\",\"key_count_per_file\":2}},"
+               "{\"type\":\"file\",\"global_unique_name\":\"" +
+               name_b + "\",\"storage_spec\":{\"root_path\":\"/nfs_b/\",\"key_count_per_file\":2}},"
+               "{\"type\":\"file\",\"global_unique_name\":\"" +
+               name_c + "\",\"storage_spec\":{\"root_path\":\"/nfs_c/\",\"key_count_per_file\":2}}]";
+    }
+
     // 为指定 host 注册 fake；wrapper 经注入的 factory 命中。
     void RegisterFakeForTest(const std::string &global_unique_name, const std::shared_ptr<FakeSlowSdkControl> &ctrl) {
         fake_factory_->SetFake(global_unique_name, ctrl);
@@ -256,8 +269,9 @@ protected:
 // 3.1 运行中超时（有界返回）
 // ============================================================================
 // 守门测试：防止"无界等待 in-flight I/O"方案复活（docs/design/client_sdk_io_contract.md 否决项）。
-// 若有人把 wrapper 改回 drain（等 in-flight 完成后再返回），fake 睡 3s 而 timeout
-// 只有 200ms，本测试会在远大于 1.5s 后才返回，断言立刻变红。
+// 超时路径的 drain 只 wait_until(deadline)——deadline 已过则立即返回；若有人把等待改成
+// "等 in-flight 完成后再返回"（无界），fake 睡 3s 而 timeout 只有 200ms，本测试会在
+// 远大于 1.5s 后才返回，断言立刻变红。
 TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
     ctrl->get_delay_ms.store(3000); // 慢 fake：睡 3s
@@ -545,6 +559,135 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
     ASSERT_TRUE(buffers.BlockBytesEqual(1, 0x00));
     // 慢后端的 in-flight 任务最终自行结束（不阻塞、不取消、不额外写任何东西）。
     ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 5000));
+}
+
+// ============================================================================
+// 3.7 普通错误路径的有界 drain（回归：#280 曾整体删除，此处恢复 origin/main 语义）
+// ============================================================================
+// 一个 group 返回普通错误（非超时）时：wrapper 必须有界等待其余在飞 group（至多到
+// deadline）再返回。理由：错误往往发生在 deadline 之前，SDK 仍在契约允许的窗口内写
+// caller buffer；不等 peer 就返回，caller 拿到错误后复用/释放 buffer，与在飞 DMA 构成
+// 数据竞争 —— 这正是本 PR 要关掉的"返回后写 caller buffer"窗口，只是换到了错误路径。
+TEST_F(SdkTimeoutContractTest, TestErrorPathWaitsForInFlightPeer) {
+    const std::string kErrHost = "err_wait_host";
+    const std::string kSlowHost = "err_wait_slow_host";
+    auto err_ctrl = std::make_shared<FakeSlowSdkControl>();
+    auto slow_ctrl = std::make_shared<FakeSlowSdkControl>();
+    err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR)); // 快速失败
+    slow_ctrl->get_delay_ms.store(400);                            // 在飞 peer：睡 400ms
+
+    RegisterFakeForTest(kErrHost, err_ctrl);
+    RegisterFakeForTest(kSlowHost, slow_ctrl);
+
+    SdkWrapper sdk_wrapper;
+    // deadline 给足（3s）：确保走的是普通错误路径而不是超时路径。
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 3000, MakeDualFileStorageConfigs(kErrHost, kSlowHost)));
+
+    std::vector<DataStorageUri> uris = {
+        MakeUri(kErrHost, "e/0/0/1", 0, 1024),
+        MakeUri(kSlowHost, "s/0/0/1", 0, 1024),
+    };
+    auto buffers = TestBuffers::Make(2, 1024);
+
+    auto start = std::chrono::steady_clock::now();
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(3000));
+    int64_t elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    // 错误码透传（无论 group 提交顺序如何，err group 的错误最终胜出）。
+    ASSERT_EQ(ER_SDKREAD_ERROR, ec);
+    // 核心断言：返回发生在慢 peer 完成（≥400ms）之后 —— 即错误路径等待了在飞 peer，
+    // 而不是拿到错误就立刻返回（那会留下 ~400ms 的"返回后写 buffer"窗口）。
+    ASSERT_GE(elapsed_ms, 350);
+    // 等待有内容但必须有界：远小于 deadline（3s）。
+    ASSERT_LT(elapsed_ms, 2500);
+    // 慢 peer 确实完整跑完（不是被中途放弃）。
+    ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 1000));
+}
+
+// 错误路径的 drain 有界：peer 迟迟不完成时，返回不得晚于 deadline（不会为了等
+// peer 而无限期挂起）。与 3.1 的守门测试互补：3.1 守超时路径，本用例守错误路径。
+TEST_F(SdkTimeoutContractTest, TestErrorPathDrainIsBoundedByDeadline) {
+    const std::string kErrHost = "err_bounded_host";
+    const std::string kSlowHost = "err_bounded_slow_host";
+    auto err_ctrl = std::make_shared<FakeSlowSdkControl>();
+    auto slow_ctrl = std::make_shared<FakeSlowSdkControl>();
+    err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR));
+    slow_ctrl->get_delay_ms.store(3000); // 远超 deadline 的 150ms
+
+    RegisterFakeForTest(kErrHost, err_ctrl);
+    RegisterFakeForTest(kSlowHost, slow_ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 5000, MakeDualFileStorageConfigs(kErrHost, kSlowHost)));
+
+    std::vector<DataStorageUri> uris = {
+        MakeUri(kErrHost, "e/0/0/1", 0, 1024),
+        MakeUri(kSlowHost, "s/0/0/1", 0, 1024),
+    };
+    auto buffers = TestBuffers::Make(2, 1024);
+
+    auto start = std::chrono::steady_clock::now();
+    // 显式 deadline = 150ms；err group 在此之前就会失败，drain 最多等到 150ms。
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(150));
+    int64_t elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    // 返回不得晚于 deadline（150ms）+ 合理调度余量；绝不等待 slow peer 的 3s。
+    ASSERT_LT(elapsed_ms, 1000);
+    ASSERT_NE(ER_OK, ec);
+    // 收尾：等 slow fake 自行结束，避免线程池析构时任务仍在跑。
+    ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 5000));
+}
+
+// 错误路径的 stop 标志：一个 group 报错后，仍在排队的 group 不得再发起 I/O。
+// 确定性设计（无 pop 竞态）：单线程 + 300ms 占位，三个任务全部排队，提交顺序 =
+// URI 首现顺序 = err → gap → tail（GroupBySdk 按输入顺序建组，FIFO 池按序拾起）。
+// err 在 ~300ms 报错时 wrapper 置 stop；gap（睡 500ms）无论是否抢在置位前被拾起，
+// 都保证 tail 被拾起时 stop 已置位数百毫秒 —— tail 的 I/O 必然从未发起。
+TEST_F(SdkTimeoutContractTest, TestErrorPathStopsQueuedTasks) {
+    const std::string kErrHost = "q_err_host";
+    const std::string kGapHost = "q_gap_host";
+    const std::string kTailHost = "q_tail_host";
+    auto err_ctrl = std::make_shared<FakeSlowSdkControl>();
+    auto gap_ctrl = std::make_shared<FakeSlowSdkControl>();
+    auto tail_ctrl = std::make_shared<FakeSlowSdkControl>();
+    err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR)); // 第一个被拾起即报错
+    gap_ctrl->get_delay_ms.store(500);                             // 制造确定性的时间差
+
+    RegisterFakeForTest(kErrHost, err_ctrl);
+    RegisterFakeForTest(kGapHost, gap_ctrl);
+    RegisterFakeForTest(kTailHost, tail_ctrl);
+
+    // 单线程：占住 300ms，确保三个任务提交时全部在队列里排队。
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK,
+              InitWrapper(sdk_wrapper, 1, 2000, 2000, 10000, MakeTripleFileStorageConfigs(kErrHost, kGapHost, kTailHost)));
+
+    auto blocker = sdk_wrapper.wait_task_thread_pool_->async([]() -> ClientErrorCode {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return ER_OK;
+    });
+
+    std::vector<DataStorageUri> uris = {
+        MakeUri(kErrHost, "e/0/0/1", 0, 1024),
+        MakeUri(kGapHost, "g/0/0/1", 0, 1024),
+        MakeUri(kTailHost, "t/0/0/1", 0, 1024),
+    };
+    auto buffers = TestBuffers::Make(3, 1024);
+
+    // deadline 给足：走普通错误路径（err 是第一个 future，其错误码直接透传）。
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(10000));
+    ASSERT_EQ(ER_SDKREAD_ERROR, ec);
+    // 核心断言：排在错误之后的 tail group 从未发起 I/O（stop 拦截，而非靠时间准入——
+    // 此刻距离 deadline 还有 ~9s，时间准入不会拦）。
+    ASSERT_EQ(0, tail_ctrl->get_call_count.load());
+    // gap 的两种合法结局（err 完成与 stop 置位之间存在固有 pop 竞态窗口）：
+    // 要么被 stop 拦下（I/O 未发起），要么抢跑后自然跑完（drain 已等到其 future，
+    // 即 get_done 已置位）。此时 gap 状态必然已定，无需轮询。
+    ASSERT_TRUE(gap_ctrl->get_call_count.load() == 0 || gap_ctrl->get_done.load());
+
+    ASSERT_EQ(ER_OK, blocker.get());
 }
 
 // ============================================================================
