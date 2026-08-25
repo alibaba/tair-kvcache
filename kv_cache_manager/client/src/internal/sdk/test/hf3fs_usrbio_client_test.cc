@@ -731,6 +731,36 @@ TEST_F(Hf3fsUsrbioClientTest, TestWaitIosPassesNullptrWhenNoDeadline) {
     EXPECT_TRUE(captured_null);
 }
 
+// clock_gettime(CLOCK_REALTIME) 失败的防御路径：同样不得回退成 nullptr（那是无限
+// 等待，违反"有 deadline 则等待必须有界"的不变量），而应按已过期处理 —— abs_timeout
+// 恰为当前墙钟之前的零时刻。用已过期的 deadline + mock 直接断言传给 3FS 的 abs 非空
+// 且早于当前 CLOCK_REALTIME（覆盖 zero-timeout 分支的构造逻辑）。
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosExpiredDeadlinePassesZeroTimeoutNotNullptr) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    bool captured_null = true;
+    int64_t diff_ms = -1;
+    struct timespec before{};
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                if (abs != nullptr) {
+                    diff_ms = (abs->tv_sec - before.tv_sec) * 1000 + (abs->tv_nsec - before.tv_nsec) / 1000000;
+                }
+                // 真实 3FS 会因超时返回 0（不足 min_results）；mock 直接模拟该结果。
+                return 0;
+            }));
+
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &before), 0);
+    // 已过期的 deadline：remaining=0 → abs_timeout = now + 0ms，非空且不晚于进入时刻
+    //（clock_gettime 在两次调用间的推进量），绝不可能是 nullptr（无限等待）。
+    Hf3fsIorHandle ior_handle = BuildIorHandle();
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, SteadyClockMs() - 1, true));
+    EXPECT_FALSE(captured_null);
+    EXPECT_LE(diff_ms, 50); // 允许毫秒级时钟噪声，远早于"未来时刻"类的错误构造
+}
+
 TEST_F(Hf3fsUsrbioClientTest, TestReadTimeoutDoesNotCopyToCaller) {
     // 准备足够大的文件满足 Read() 的 FileLength 检查
     {

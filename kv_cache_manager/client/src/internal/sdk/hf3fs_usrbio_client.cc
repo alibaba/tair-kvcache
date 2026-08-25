@@ -361,14 +361,20 @@ bool Hf3fsUsrbioClient::WaitIos(const Hf3fsIorHandle &ior_handle,
     const struct timespec *abs_timeout_ptr = nullptr;
     if (has_deadline) {
         if (clock_gettime(CLOCK_REALTIME, &abs_timeout) != 0) {
-            KVCM_LOG_WARN("wait io skipped abs timeout, clock_gettime failed, errno: %s, file: %s, read: %d, "
-                          "submit ios: %d, remaining ms: %lld",
+            // 拿不到墙钟就无法构造 abs_timeout。回退成 nullptr 是无限等待，违反
+            // 本函数"有 deadline 则等待必须有界"的不变量（见上方注释）；已过期时
+            // 用零超时立即返回。clock_gettime 实际不会失败（CLOCK_REALTIME 无条件
+            // 支持），这里只是防御。
+            KVCM_LOG_WARN("wait io clock_gettime failed, use zero timeout (treat as expired), errno: %s, file: %s, "
+                          "read: %d, submit ios: %d, remaining ms: %lld",
                           strerror(errno),
                           filepath_.c_str(),
                           for_read,
                           submit_io_count,
                           static_cast<long long>(remaining_ms));
-            abs_timeout_ptr = nullptr;
+            abs_timeout.tv_sec = 0;
+            abs_timeout.tv_nsec = 0;
+            abs_timeout_ptr = &abs_timeout;
         } else {
             abs_timeout.tv_sec += remaining_ms / 1000;
             abs_timeout.tv_nsec += (remaining_ms % 1000) * 1000000L;
