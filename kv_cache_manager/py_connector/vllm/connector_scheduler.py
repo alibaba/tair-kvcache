@@ -296,9 +296,21 @@ class ConnectorScheduler:
 
         if num_external_tokens <= 0:
             return
-        locations, computed_blocks = self._location_query_manager.consume_locations(req_id)
-        if locations is None and computed_blocks is None:
-            return
+        consumed = self._location_query_manager.consume_locations(req_id)
+        if consumed is None:
+            # Invariant violation: vLLM allocated blocks for an external hit
+            # (num_external_tokens > 0) only after the match hook answered
+            # positively, and that answer was stored for exactly this
+            # consumption. No cached answer here means the match/alloc
+            # contract is broken -- vLLM would run the request on KV that
+            # was never loaded. Fail closed: a traceback beats silently
+            # corrupting the request's output.
+            raise RuntimeError(
+                f"req {req_id}: allocated for {num_external_tokens} external "
+                f"tokens but no cached location query exists; the match hook "
+                f"did not answer, or its answer was consumed/invalidated "
+                f"before this allocation")
+        locations, computed_blocks = consumed
         # Blocks were allocated for an external hit: the request is now
         # spending its external load (burns hybrid re-queries).
         self._load_attempted.add(req_id)
@@ -384,10 +396,15 @@ class ConnectorScheduler:
                 resumed = cached_reqs.resumed_from_preemption[idx]
 
             new_block_ids = cached_reqs.new_block_ids[idx]
+            if new_block_ids is None:
+                # https://github.com/vllm-project/vllm/pull/23262: None when
+                # no group got new blocks this step (get_block_ids with
+                # allow_none=True). Keep the recorded table as-is: a resumed
+                # request with nothing allocated has no fresh slots to record.
+                continue
             if resumed:
                 ledger.block_ids_per_group = [list(b) for b in new_block_ids]
-            elif new_block_ids is not None:
-                # https://github.com/vllm-project/vllm/pull/23262: may be None
+            else:
                 for group_ids, new_ids in zip(ledger.block_ids_per_group,
                                               new_block_ids):
                     group_ids.extend(new_ids)

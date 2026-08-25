@@ -144,8 +144,13 @@ class MultiResult:
             self._results[idx] = result
             self._finished_num += 1
             if self._finished_num == self._size:
-                # Flatten in submission order.
-                flat = [ok for part in self._results for ok in part]
+                # Flatten in submission order. Every slot is filled by the
+                # count check (submission asserts the slot was None), so the
+                # per-part guard only documents the invariant for readers.
+                flat = []
+                for part in self._results:
+                    assert part is not None
+                    flat.extend(part)
                 self._callback(flat)
 
 

@@ -855,6 +855,27 @@ class TestBuildConnectorMeta(unittest.TestCase):
                 self.assertEqual(conn._tracked["r0"].block_ids_per_group,
                                  [[200, 201]])
 
+    def test_resumed_with_none_new_blocks_keeps_the_recorded_table(self):
+        # A resumed request whose new_block_ids is None (upstream
+        # get_block_ids with allow_none=True: no group got fresh blocks)
+        # must not crash the table replace -- and must not touch the
+        # recorded table either.
+        for use_legacy in (False, True):
+            with self.subTest(legacy=use_legacy):
+                conn = make_scheduler_connector(mbs=self.MBS)
+                req, _ = self._new_request(conn, "r0", 40, 3)
+                before = [list(t) for t in
+                          conn._tracked["r0"].block_ids_per_group]
+                kwargs = dict(cached_req_ids=["r0"], num_scheduled={"r0": 0},
+                              new_block_ids=[None])
+                if use_legacy:
+                    kwargs["legacy_resumed"] = [True]
+                else:
+                    kwargs["resumed_req_ids"] = {"r0"}
+                conn.build_connector_meta(fake_scheduler_output(**kwargs))
+                self.assertEqual(conn._tracked["r0"].block_ids_per_group,
+                                 before)
+
     def test_save_threshold_grows_incrementally(self):
         conn = make_scheduler_connector(mbs=self.MBS)
         req, _ = self._new_request(conn, "r0", 40, 3)  # saved 2 blocks
