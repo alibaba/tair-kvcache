@@ -357,7 +357,8 @@ private:
                                           const KeyVector &keys,
                                           const BlockMask &block_mask,
                                           int32_t sw_size,
-                                          CacheLocationVector &cache_locations) const;
+                                          CacheLocationVector &cache_locations,
+                                          std::size_t *out_prefix_error_key_count = nullptr) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,
@@ -368,7 +369,8 @@ private:
                                         const BlockMask &block_mask,
                                         int32_t sw_size,
                                         KeyVector &query_keys,
-                                        CacheLocationVector &cache_locations) const;
+                                        CacheLocationVector &cache_locations,
+                                        std::size_t *out_lookup_error_key_count = nullptr) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
