@@ -41,6 +41,7 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 
@@ -601,14 +602,15 @@ public:
         return snapshot_response.committed_snapshot_version();
     }
 
-    ControllableMetaLocalBackend *InstallControllableMetaBackend() {
-        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ControllableMetaLocalBackend *
+    InstallControllableMetaBackend(const std::string &instance_id = "test_instance") {
+        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance_id);
         if (!indexer) {
             return nullptr;
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto controlled = std::make_unique<ControllableMetaLocalBackend>();
-        if (controlled->Init("test_instance", config) != EC_OK || controlled->Open() != EC_OK) {
+        if (controlled->Init(instance_id, config) != EC_OK || controlled->Open() != EC_OK) {
             return nullptr;
         }
         auto *controlled_raw = controlled.get();
@@ -1755,23 +1757,25 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_ErrorPath) {
 }
 
 TEST_F(CacheManagerTest, TestLocationLookupMetricsDoNotReappearAfterInstancePurge) {
+    const std::string instance_id = "location_lookup_lifecycle_instance";
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,
               cache_manager_->RegisterInstance(request_context_.get(),
                                                "default",
-                                               "test_instance",
+                                               instance_id,
                                                64,
                                                createLocationSpecInfos(),
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
-    auto *controlled_backend = InstallControllableMetaBackend();
+    auto *controlled_backend = InstallControllableMetaBackend(instance_id);
     ASSERT_NE(nullptr, controlled_backend);
     controlled_backend->BlockNextLocationRead();
 
-    auto query_future = std::async(std::launch::async, [manager = cache_manager_]() {
+    CacheManager *manager = cache_manager_.get();
+    auto query_future = std::async(std::launch::async, [manager, instance_id]() {
         RequestContext context("location_lookup_lifecycle_query");
         return manager->GetCacheLocation(&context,
-                                         "test_instance",
+                                         instance_id,
                                          CacheManager::QueryType::QT_PREFIX_MATCH,
                                          {1, 2, 3},
                                          {},
@@ -1787,13 +1791,11 @@ TEST_F(CacheManagerTest, TestLocationLookupMetricsDoNotReappearAfterInstancePurg
     std::promise<void> purge_started;
     auto purge_started_future = purge_started.get_future();
     auto purge_future = std::async(std::launch::async,
-                                   [manager = cache_manager_, registry = registry_manager_, &purge_started]() {
+                                   [manager, instance_id, &purge_started]() {
         purge_started.set_value();
         std::unique_lock<std::shared_mutex> lifecycle_guard(manager->metrics_lifecycle()->mut_);
         RequestContext remove_context("location_lookup_lifecycle_remove");
-        const auto ec = registry->RemoveInstance(&remove_context, "default", "test_instance");
-        manager->InvalidateInstanceMetrics("test_instance");
-        return ec;
+        return manager->RemoveInstance(&remove_context, "default", instance_id);
     });
     purge_started_future.wait();
     EXPECT_EQ(std::future_status::timeout, purge_future.wait_for(std::chrono::milliseconds(50)));
@@ -1807,7 +1809,7 @@ TEST_F(CacheManagerTest, TestLocationLookupMetricsDoNotReappearAfterInstancePurg
     EXPECT_EQ(EC_INSTANCE_NOT_EXIST,
               cache_manager_
                   ->GetCacheLocation(&post_remove_context,
-                                     "test_instance",
+                                     instance_id,
                                      CacheManager::QueryType::QT_PREFIX_MATCH,
                                      {1, 2, 3},
                                      {},
@@ -1821,7 +1823,10 @@ TEST_F(CacheManagerTest, TestLocationLookupMetricsDoNotReappearAfterInstancePurg
     for (const auto &[name, tags, value] : all_metrics) {
         (void) name;
         (void) value;
-        EXPECT_EQ(tags.end(), tags.find("instance_id"));
+        auto instance_tag = tags.find("instance_id");
+        if (instance_tag != tags.end()) {
+            EXPECT_NE(instance_id, instance_tag->second);
+        }
     }
 }
 
