@@ -8,12 +8,20 @@ answer into a LoadRequest) and invalidated when the request retires. No
 TTL: the producer and the consumer are two hooks of the same request's
 life, so nothing can outlive its usefulness for long.
 
-The cache key is the full query identity ``(req_id, query_type,
-token_length, computed_blocks)`` -- the same key origin/main used. Two
-re-asks are the same query only when the offset matches: a re-ask at a
-grown offset (chunked prefill, re-ask after partial compute) is a
-*different* query. It must neither be deduplicated against an older
-offset's answer nor blocked by an older offset's in-flight query.
+**One slot per request, superseded by the newest ask.** The scheduler
+asks twice per request's life: ``get_num_new_matched_tokens`` (with the
+offset) and ``update_state_after_alloc`` (without it). vLLM's contract
+fills the gap: the alloc hook always consumes the answer of the *last*
+match hook that returned a hit -- it passes the matched token count back
+verbatim. So the cache needs no per-offset addressing; a new ask at a
+different offset is a *different* query that supersedes the old one, and
+only the newest ask's answer may ever be consumed.
+
+**Object identity is the version.** A superseded (or invalidated /
+consumed) query must not write its late answer into the new slot. Each
+ask captures the slot object it created; the async callback compares
+identity before writing. A monotonic version number is kept for logs
+only -- correctness never depends on it.
 """
 
 import threading
@@ -37,16 +45,22 @@ class QueryCacheKey:
 
 
 @dataclass
-class _QueryEntry:
-    """One in-flight (or answered) location query for a request."""
+class _Query:
+    """The request's one active query. ``locations is None`` = in flight."""
 
-    computed_blocks: int            # offset the query was issued at
+    key: QueryCacheKey
+    version: int = 0
     locations: list = None          # None until the manager answered
-    in_flight: bool = True
 
 
 class LocationQueryManager:
-    """Per-request location query cache: produce on match, consume on alloc."""
+    """Per-request location query cache: produce on match, consume on alloc.
+
+    One ``_Query`` slot per request. Re-asking the slot's own offset
+    deduplicates (in flight -> wait, answered -> serve); asking a different
+    offset *supersedes* the slot (the newest ask wins, older asks are
+    dropped wherever they are in their lifetime).
+    """
 
     def __init__(self, manager_client: KvCacheManagerClient, http_executor,
                  instance_id: str, async_get_cache_location: bool):
@@ -55,13 +69,8 @@ class LocationQueryManager:
         self._instance_id = instance_id
         self._async_get_cache_location = async_get_cache_location
         self._lock = threading.Lock()
-        # req_id -> {QueryCacheKey: _QueryEntry}: one request may hold entries
-        # for several offsets at once (an older answered/in-flight query plus
-        # a re-ask at a grown offset).
-        self._entries: Dict[str, Dict[QueryCacheKey, _QueryEntry]] = {}
-        # req_id -> key of the entry the match hook last returned an answer
-        # for; that is the one the allocation consumes.
-        self._last_answered: Dict[str, QueryCacheKey] = {}
+        # req_id -> the request's one active query slot.
+        self._queries: Dict[str, _Query] = {}
 
     def shutdown(self):
         pass
@@ -88,7 +97,7 @@ class LocationQueryManager:
         logger.debug("get_kvcache_location result: %s", result)
         return result["locations"]
 
-    def _query_async(self, request, key: QueryCacheKey) -> None:
+    def _query_async(self, request, key: QueryCacheKey, q: _Query) -> None:
         def run():
             try:
                 locations = self._fetch_from_manager(request, key.computed_blocks)
@@ -96,21 +105,21 @@ class LocationQueryManager:
                 logger.warning("get_cache_location error, request_id: %s, error: %s",
                                request.request_id, e)
                 with self._lock:
-                    # Drop the entry: the next match hook re-issues the query.
-                    per_req = self._entries.get(key.req_id)
-                    if per_req is not None:
-                        entry = per_req.get(key)
-                        if entry is not None and entry.in_flight:
-                            per_req.pop(key, None)
+                    # Drop the slot: the next match hook re-issues the query.
+                    if self._queries.get(request.request_id) is q:
+                        self._queries.pop(request.request_id, None)
                 return
             with self._lock:
-                per_req = self._entries.get(key.req_id)
-                entry = per_req.get(key) if per_req is not None else None
-                if entry is None or not entry.in_flight:
-                    # Replaced or dropped meanwhile (re-issued / invalidated).
-                    return
-                entry.locations = locations
-                entry.in_flight = False
+                if self._queries.get(request.request_id) is q:
+                    q.locations = locations
+                else:
+                    # Superseded / consumed / invalidated meanwhile: the
+                    # answer of a dead ask must never write into the new
+                    # slot (late answers only win against older asks, never
+                    # against newer ones).
+                    logger.debug("get_cache_location answer dropped: request %s "
+                                 "query v%d was superseded",
+                                 request.request_id, q.version)
 
         self._http_executor.submit(run)
 
@@ -120,76 +129,62 @@ class LocationQueryManager:
         Returns the locations when the answer is already cached for this
         exact query key, None while a query is in flight for it (the
         scheduler re-asks next step), and [] when the query answered "no
-        hit". An in-flight query for a *different* offset never blocks this
-        one. A failed query drops its entry so the next hook call re-issues.
+        hit". An ask at a different offset supersedes the slot: a new
+        query starts immediately, and the old one's answer -- arrived or
+        still in flight -- can no longer be consumed. A failed query drops
+        its slot so the next hook call re-issues.
         """
+        req_id = request.request_id
         key = self._key(request, computed_blocks)
         with self._lock:
-            per_req = self._entries.setdefault(request.request_id, {})
-            entry = per_req.get(key)
-            if entry is not None:
-                if entry.in_flight:
-                    # A query for this exact key is already on the wire;
-                    # re-issuing on every scheduler re-ask would fan out one
-                    # full getCacheLocation per engine step.
-                    return None
-                self._last_answered[request.request_id] = key
-                return entry.locations
-            per_req[key] = _QueryEntry(computed_blocks=computed_blocks)
+            q = self._queries.get(req_id)
+            if q is not None and q.key == key:
+                # Same query: wait while in flight (dedupe -- the scheduler
+                # re-asks every step), serve the cached answer otherwise.
+                return None if q.locations is None else q.locations
+            # First ask, or a different offset: the newest ask supersedes.
+            q = _Query(key=key, version=q.version + 1 if q is not None else 0)
+            self._queries[req_id] = q
 
         if self._async_get_cache_location:
-            self._query_async(request, key)
+            self._query_async(request, key, q)
             return None
         try:
             locations = self._fetch_from_manager(request, computed_blocks)
         except Exception as e:
             logger.warning("get_cache_location error, request_id: %s, error: %s",
-                           request.request_id, e)
+                           req_id, e)
             with self._lock:
-                per_req = self._entries.get(request.request_id)
-                if per_req is not None:
-                    per_req.pop(key, None)
+                if self._queries.get(req_id) is q:
+                    self._queries.pop(req_id, None)
             return []
         with self._lock:
-            per_req = self._entries.get(request.request_id)
-            cur = per_req.get(key) if per_req is not None else None
-            if cur is not None:
-                cur.locations = locations
-                cur.in_flight = False
-            self._last_answered[request.request_id] = key
+            if self._queries.get(req_id) is q:
+                q.locations = locations
         return locations
 
     def store_result(self, req_id: str, locations: list) -> None:
         """Overwrite the cached answer (the match hook clamps it to a
-        vLLM-safe prefix before the allocation consumes it). Writes back to
-        the entry the hook last returned an answer for."""
+        vLLM-safe prefix before the allocation consumes it). The slot is
+        necessarily the query the hook just got its answer from: the hook
+        runs on the scheduler thread and only it supersedes slots."""
         with self._lock:
-            key = self._last_answered.get(req_id)
-            if key is None:
-                return
-            per_req = self._entries.get(req_id)
-            entry = per_req.get(key) if per_req is not None else None
-            if entry is not None:
-                entry.locations = locations
-                entry.in_flight = False
+            q = self._queries.get(req_id)
+            if q is not None:
+                q.locations = locations
 
     def consume_locations(self, req_id: str) -> Optional[Tuple[list, int]]:
-        """Pop the answered query the match hook last returned: (locations,
-        computed_blocks), or None when nothing is cached (no query was issued
-        / still in flight)."""
+        """Pop the request's answered query: (locations, computed_blocks),
+        or None when nothing is cached (no query was issued / still in
+        flight / already consumed)."""
         with self._lock:
-            key = self._last_answered.get(req_id)
-            if key is None:
+            q = self._queries.pop(req_id, None)
+            if q is None or q.locations is None:
                 return None
-            self._last_answered.pop(req_id, None)
-            per_req = self._entries.get(req_id)
-            entry = per_req.pop(key, None) if per_req is not None else None
-            if entry is None or entry.in_flight:
-                return None
-            return entry.locations, entry.computed_blocks
+            return q.locations, q.key.computed_blocks
 
     def invalidate(self, req_id: str) -> None:
-        """Drop any cached query for a request that is going away."""
+        """Drop the request's query: it is going away, and any answer still
+        in flight must not write into a future slot."""
         with self._lock:
-            self._entries.pop(req_id, None)
-            self._last_answered.pop(req_id, None)
+            self._queries.pop(req_id, None)
