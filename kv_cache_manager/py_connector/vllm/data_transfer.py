@@ -154,6 +154,19 @@ class MultiResult:
                 self._callback(flat)
 
 
+def _effective_pool_blocks(configured, need, block_bytes, max_bytes):
+    """Blocks per staging-pool group under the per-group pinned-RAM ceiling.
+
+    min(configured, max_bytes // block_bytes), floored at one full task
+    batch: a task stages its whole batch contiguously, so the pool can never
+    be smaller than the batch -- even when the byte cap alone would say so
+    (the caller warns in that case). Pure so the sizing contract is
+    unit-pinnable.
+    """
+    by_bytes = max_bytes // block_bytes if block_bytes > 0 else configured
+    return max(need, min(configured, by_bytes))
+
+
 class DataTransferManager:
     def __init__(self, kvcache_info: KVCacheInfo, manager_block_size: int,
                  transfer_client, coordinator_client: TpCoordinatorClient, extra_config):
@@ -180,9 +193,27 @@ class DataTransferManager:
         # One pool per group: block shapes differ between attention and state
         # groups. The pool is pinned host memory only -- the kernel reaches it
         # over PCIe -- so the connector's device-memory footprint is zero.
-        self._pools = {
-            g.spec_name: _StagingPool(self._device, g.per_block_bytes, pool_blocks)
-            for g in kvcache_info.groups}
+        # The byte cap keeps the configured block count honest for groups
+        # with large blocks (hybrid state/attention blocks are ~17.3 MiB vs
+        # ~0.875 MiB for full attention): the same count would otherwise pin
+        # ~17 GiB of host RAM per group and engine start dies in the pinned
+        # allocator.
+        self._pools = {}
+        for g in kvcache_info.groups:
+            blocks = _effective_pool_blocks(
+                pool_blocks, need, g.per_block_bytes,
+                extra_config.staging_pool_max_bytes_per_group)
+            if blocks < pool_blocks:
+                logger.warning(
+                    "staging pool %s: %d blocks x %d bytes would pin "
+                    "%.1f GiB; capped to %d blocks (%.1f MiB) by "
+                    "staging_pool_max_bytes_per_group=%d",
+                    g.spec_name, pool_blocks, g.per_block_bytes,
+                    pool_blocks * g.per_block_bytes / 2**30, blocks,
+                    blocks * g.per_block_bytes / 2**20,
+                    extra_config.staging_pool_max_bytes_per_group)
+            self._pools[g.spec_name] = _StagingPool(
+                self._device, g.per_block_bytes, blocks)
         for name, pool in self._pools.items():
             logger.info("staging pool %s: %d blocks x %d bytes "
                         "(pinned %.1f MiB, GPU 0)",

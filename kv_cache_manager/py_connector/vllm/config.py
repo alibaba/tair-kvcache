@@ -56,6 +56,17 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     # one task stages its whole batch contiguously).
     staging_pool_blocks: int = 1024
 
+    # Per-group ceiling on the staging pool's pinned host RAM. The block
+    # count above was derived for full-attention blocks (~0.875 MiB each:
+    # 1024 blocks ~= 896 MiB); hybrid blocks are ~17.3 MiB, and the same
+    # count would pin ~17 GiB per group -- four groups then die in the
+    # pinned allocator at engine start on an ordinary host. Effective blocks
+    # per group = min(staging_pool_blocks, this_cap // block_bytes), never
+    # below one full task batch (the contiguity invariant). Raise this cap
+    # (not just the block count) to give hybrid deployments more in-flight
+    # transfer concurrency.
+    staging_pool_max_bytes_per_group: int = 2**30
+
     # --- Manager queries ---
     async_get_cache_location: bool = True
 

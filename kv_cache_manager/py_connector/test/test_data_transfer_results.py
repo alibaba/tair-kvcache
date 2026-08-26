@@ -393,3 +393,52 @@ class TestStagingPool(unittest.TestCase):
         self.assertEqual(kwargs.get("device"), "cpu")
         self.assertTrue(kwargs.get("pin_memory"),
                         "pool backing memory must be pinned for zero-copy")
+
+
+class TestPoolByteCap(unittest.TestCase):
+    """_effective_pool_blocks: per-group sizing under the pinned-RAM ceiling.
+
+    Found by the final-validation e2e smoke: a fixed 1024-block count was
+    tuned for full-attention blocks (~0.875 MiB each) but hybrid blocks are
+    ~17.3 MiB, so four groups pinned ~68 GiB of host RAM and engine start
+    died in the pinned allocator. Pinned here: the count is derived per
+    group from the byte cap, and one full task batch always fits.
+    """
+
+    def _f(self, configured, need, block_bytes, max_bytes):
+        from kv_cache_manager.py_connector.vllm.data_transfer import (
+            _effective_pool_blocks)
+        return _effective_pool_blocks(configured, need, block_bytes, max_bytes)
+
+    def test_full_attention_blocks_keep_the_configured_count(self):
+        # 1024 x 0.875 MiB ~= 896 MiB <= 1 GiB cap: unchanged sizing (the
+        # validated origin/main concurrency of 8 full tasks in flight).
+        self.assertEqual(
+            self._f(1024, 128, 917_504, 2**30), 1024)
+
+    def test_hybrid_blocks_cap_by_bytes(self):
+        # 17.3 MiB blocks: 1024 would pin ~17.3 GiB per group; a cap that
+        # allows more than one task batch caps to cap // block_bytes.
+        block_bytes = 17_301_504
+        self.assertEqual(
+            self._f(1024, 128, block_bytes, 8 * 2**30),
+            8 * 2**30 // block_bytes)
+
+    def test_hybrid_default_cap_floors_at_one_task_batch(self):
+        # With the 1 GiB default the byte cap alone would allow only 62
+        # blocks (< one 128-block task batch); the batch must still fit
+        # contiguously, so the effective size is the batch -- the same
+        # configuration the staging-removal campaign validated for hybrid.
+        self.assertEqual(
+            self._f(1024, 128, 17_301_504, 2**30), 128)
+
+    def test_one_task_batch_always_fits(self):
+        # Even when the byte cap is smaller than one task batch, the batch
+        # must still fit contiguously (contiguity invariant); the caller
+        # warns that the cap was exceeded.
+        self.assertEqual(
+            self._f(1024, 128, 17_301_504, 128 * 1024), 128)
+
+    def test_byte_cap_can_only_shrink_not_grow(self):
+        # A configured count below the byte cap is authoritative.
+        self.assertEqual(self._f(256, 128, 917_504, 2**30), 256)
