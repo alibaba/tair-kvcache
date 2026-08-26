@@ -115,7 +115,7 @@ bool OptimizerEventPublisher::Convert(const std::shared_ptr<BaseEvent> &event,
     // consumer infers it from block count times block size. That inference
     // loses the trailing partial block, which biases the hit rate upwards -
     // the opposite direction from dropped events, so the two do not cancel.
-    out->set_input_token_len(static_cast<std::int64_t>(get_event->get_tokens().size()));
+    out->set_input_token_len(get_event->input_token_len());
 
     // An empty block_keys list is legitimate, not junk: a prompt shorter than
     // one block has no complete block. Its input_token_len still belongs in
