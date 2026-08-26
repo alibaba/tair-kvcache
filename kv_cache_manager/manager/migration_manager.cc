@@ -226,11 +226,26 @@ std::vector<const CacheLocation *> FindLocationsOnStorage(const CacheLocationMap
     }
     return locations;
 }
+
+template <typename T>
+void HashCombine(std::size_t &seed, const T &value) {
+    seed ^= std::hash<T>{}(value) + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+}
 } // namespace
 
 // Mark 持久化属性名（block 级 property）。带 inner 前缀避免与业务属性冲突。
 const std::string MigrationManager::PROPERTY_TIERED_WRITE_TARGET = "__mig_tier_target__";
 const std::string MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS = "__mig_tier_deadline_ms__";
+
+std::size_t MigrationManager::CopySourceFailureKeyHash::operator()(const CopySourceFailureKey &key) const {
+    std::size_t seed = 0;
+    HashCombine(seed, key.instance_id);
+    HashCombine(seed, key.block_key);
+    HashCombine(seed, key.location_id);
+    HashCombine(seed, key.location_create_time);
+    HashCombine(seed, key.target_storage_name);
+    return seed;
+}
 
 MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor,
                                    std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
@@ -262,6 +277,11 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
         m_marks_consumed_total_ = metrics_registry_->GetCounter("migration.marks_consumed_total");
         m_marks_expired_total_ = metrics_registry_->GetCounter("migration.marks_expired_total");
         m_mark_query_errors_total_ = metrics_registry_->GetCounter("migration.mark_query_errors_total");
+        m_source_failures_recorded_total_ = metrics_registry_->GetCounter("migration.source_failures_recorded_total");
+        m_source_retries_suppressed_total_ = metrics_registry_->GetCounter("migration.source_retries_suppressed_total");
+        m_source_switches_total_ = metrics_registry_->GetCounter("migration.source_switches_total");
+        m_no_usable_source_total_ = metrics_registry_->GetCounter("migration.no_usable_source_total");
+        m_source_failure_entries_ = metrics_registry_->GetGauge("migration.source_failure_entries");
     }
 }
 
@@ -277,6 +297,12 @@ void MigrationManager::UpdateMarksActiveGauge() {
         const int64_t added = static_cast<int64_t>(stat_marks_added_.load(std::memory_order_relaxed));
         const int64_t cleared = static_cast<int64_t>(stat_marks_cleared_.load(std::memory_order_relaxed));
         m_marks_active_ = static_cast<double>(added > cleared ? added - cleared : 0);
+    }
+}
+
+void MigrationManager::UpdateCopySourceFailureGaugeLocked() {
+    if (metrics_enabled_) {
+        m_source_failure_entries_ = static_cast<double>(copy_source_failures_.size());
     }
 }
 
@@ -1188,6 +1214,134 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     return collect_results();
 }
 
+MigrationManager::CopySourceFailureKey MigrationManager::MakeCopySourceFailureKey(const CopyTaskContext &ctx) {
+    return CopySourceFailureKey{
+        ctx.instance_id, ctx.block_key, ctx.src_location_id, ctx.src_create_time, ctx.dst_storage_name};
+}
+
+MigrationManager::CopySourceFailureKey
+MigrationManager::MakeCopySourceFailureKey(const std::string &instance_id,
+                                           int64_t block_key,
+                                           const CacheLocation &source,
+                                           const std::string &target_storage_name) {
+    return CopySourceFailureKey{instance_id, block_key, source.id(), source.create_time(), target_storage_name};
+}
+
+std::chrono::milliseconds MigrationManager::ComputeCopySourceBackoff(const CopySourceFailureKey &key,
+                                                                     uint32_t consecutive_failures) {
+    int64_t delay_ms = kCopySourceInitialBackoff.count();
+    uint32_t remaining_doublings = consecutive_failures > 0 ? consecutive_failures - 1 : 0;
+    while (remaining_doublings-- > 0 && delay_ms < kCopySourceMaxBackoff.count()) {
+        delay_ms = std::min(kCopySourceMaxBackoff.count(), delay_ms * 2);
+    }
+
+    // 0~25% 的稳定 jitter，避免大量 stale location 在同一个 retry deadline 上形成惊群。
+    // 使用 identity + failure count 的稳定 hash，便于故障复现，同时不引入共享随机数锁。
+    const int64_t jitter_window_ms = delay_ms / 4;
+    if (jitter_window_ms > 0 && delay_ms < kCopySourceMaxBackoff.count()) {
+        std::size_t jitter_seed = CopySourceFailureKeyHash{}(key);
+        HashCombine(jitter_seed, consecutive_failures);
+        const int64_t jitter_ms = static_cast<int64_t>(jitter_seed % static_cast<std::size_t>(jitter_window_ms + 1));
+        delay_ms = std::min(kCopySourceMaxBackoff.count(), delay_ms + jitter_ms);
+    }
+    return std::chrono::milliseconds(delay_ms);
+}
+
+void MigrationManager::PruneCopySourceFailuresLocked(std::chrono::steady_clock::time_point now) {
+    while (!copy_source_failure_history_.empty()) {
+        const auto &oldest = copy_source_failure_history_.front();
+        const bool expired = now - oldest.failure_time >= kCopySourceFailureRetention;
+        const bool over_capacity = copy_source_failures_.size() > kMaxCopySourceFailureEntries;
+        if (!expired && !over_capacity) {
+            break;
+        }
+
+        auto iter = copy_source_failures_.find(oldest.key);
+        if (iter != copy_source_failures_.end() && iter->second.last_failure_time == oldest.failure_time) {
+            copy_source_failures_.erase(iter);
+        }
+        copy_source_failure_history_.pop_front();
+    }
+
+    // 同一 source 的每次失败都会留下一个过期队列节点。正常 backoff 下增长很慢，但测试直调或
+    // 异常回调风暴仍可能制造大量 stale 节点；超过硬上限时按 map 当前快照重建一次队列。
+    if (copy_source_failure_history_.size() > kMaxCopySourceFailureHistoryEntries) {
+        std::vector<CopySourceFailureHistoryEntry> compacted;
+        compacted.reserve(copy_source_failures_.size());
+        for (const auto &[key, state] : copy_source_failures_) {
+            compacted.push_back(CopySourceFailureHistoryEntry{key, state.last_failure_time});
+        }
+        std::sort(compacted.begin(), compacted.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.failure_time < rhs.failure_time;
+        });
+        copy_source_failure_history_ = std::deque<CopySourceFailureHistoryEntry>(compacted.begin(), compacted.end());
+    }
+}
+
+void MigrationManager::RecordCopySourceFailure(const CopyTaskContext &ctx, ErrorCode reason) {
+    const auto key = MakeCopySourceFailureKey(ctx);
+    const auto now = std::chrono::steady_clock::now();
+    uint32_t failure_count = 0;
+    std::chrono::milliseconds backoff{0};
+    {
+        std::lock_guard<std::mutex> lock(copy_source_failure_mutex_);
+        PruneCopySourceFailuresLocked(now);
+
+        auto &state = copy_source_failures_[key];
+        if (state.consecutive_failures < std::numeric_limits<uint32_t>::max()) {
+            ++state.consecutive_failures;
+        }
+        failure_count = state.consecutive_failures;
+        backoff = ComputeCopySourceBackoff(key, failure_count);
+        state.last_error = reason;
+        state.last_failure_time = now;
+        state.retry_after = now + backoff;
+        copy_source_failure_history_.push_back(CopySourceFailureHistoryEntry{key, now});
+
+        PruneCopySourceFailuresLocked(now);
+        UpdateCopySourceFailureGaugeLocked();
+    }
+
+    stat_source_failures_recorded_.fetch_add(1, std::memory_order_relaxed);
+    if (metrics_enabled_) {
+        ++m_source_failures_recorded_total_;
+    }
+    KVCM_LOG_WARN("migration Copy source enters retry backoff: instance %s block_key %lld source_location %s "
+                  "source_create_time %lld target_storage %s reason %d consecutive_failures %u backoff_ms %lld",
+                  ctx.instance_id.c_str(),
+                  static_cast<long long>(ctx.block_key),
+                  ctx.src_location_id.c_str(),
+                  static_cast<long long>(ctx.src_create_time),
+                  ctx.dst_storage_name.c_str(),
+                  static_cast<int>(reason),
+                  failure_count,
+                  static_cast<long long>(backoff.count()));
+}
+
+void MigrationManager::ClearCopySourceFailure(const CopyTaskContext &ctx) {
+    const auto key = MakeCopySourceFailureKey(ctx);
+    std::lock_guard<std::mutex> lock(copy_source_failure_mutex_);
+    if (copy_source_failures_.erase(key) > 0) {
+        UpdateCopySourceFailureGaugeLocked();
+    }
+}
+
+MigrationManager::CopySourceFailureSnapshot
+MigrationManager::GetCopySourceFailure(const std::string &instance_id,
+                                       int64_t block_key,
+                                       const CacheLocation &source,
+                                       const std::string &target_storage_name,
+                                       std::chrono::steady_clock::time_point now) const {
+    const auto key = MakeCopySourceFailureKey(instance_id, block_key, source, target_storage_name);
+    std::lock_guard<std::mutex> lock(copy_source_failure_mutex_);
+    auto iter = copy_source_failures_.find(key);
+    if (iter == copy_source_failures_.end() || now - iter->second.last_failure_time >= kCopySourceFailureRetention) {
+        return {};
+    }
+    return CopySourceFailureSnapshot{
+        true, now < iter->second.retry_after, iter->second.consecutive_failures, iter->second.last_error};
+}
+
 bool MigrationManager::IsSourceLocationServing(const CopyTaskContext &ctx) const {
     auto indexer = meta_indexer_manager_ ? meta_indexer_manager_->GetMetaIndexer(ctx.instance_id) : nullptr;
     if (!indexer) {
@@ -1263,6 +1417,10 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         return;
     }
     // kClaimedRunning：状态已在锁内置 kCompleting，并发 Cancel 会走 busy 分支。
+
+    // backend 已明确完成 Copy，说明这条 source->target 路由至少在本次可用；即使后续因为
+    // source metadata 并发变化或 target promote 失败而按任务失败收尾，也不应继承旧的 Copy 退避。
+    ClearCopySourceFailure(ctx);
 
     if (!IsSourceLocationServing(ctx)) {
         KVCM_LOG_WARN("migration source lost, block_key %ld src_loc %s, discard dst_loc %s",
@@ -1356,6 +1514,8 @@ void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t bloc
     }
 
     // 失败：CAS 目标 WRITING -> DELETING 并删除目标半成品，源端不动。
+    // 必须先登记 source 退避，再从 active table 移除任务，避免 admission 在两步之间重新选中同一源。
+    RecordCopySourceFailure(ctx, reason);
     const std::string fail_reason = "copy_failed:" + std::to_string(static_cast<int>(reason));
     CompleteCopyTaskAsFailed(ctx, fail_reason);
     KVCM_LOG_WARN("migration failed: instance %s block_key %ld dst_loc %s reason %d",
@@ -2121,7 +2281,16 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
                            [&covered](const auto &spec) { return covered.count(spec.name()) > 0; });
     };
 
+    struct EligibleSource {
+        const CacheLocation *location = nullptr;
+        CopySourceFailureSnapshot failure;
+    };
+
+    const auto now = std::chrono::steady_clock::now();
     bool all_sources_covered_by_serving = true;
+    std::size_t uncovered_source_count = 0;
+    std::size_t suppressed_source_count = 0;
+    std::vector<EligibleSource> eligible_sources;
     for (const auto *src_loc : src_locations) {
         if (specs_covered_by(*src_loc, serving_covered)) {
             continue;
@@ -2131,7 +2300,64 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
             continue;
         }
         // 该 source 既未被 SERVING 也未被 SERVING∪WRITING 联合覆盖 → 需要 copy。
-        return {CopyAdmissionStatus::kAccept, src_loc};
+        ++uncovered_source_count;
+        const auto failure = GetCopySourceFailure(instance_id, block_key, *src_loc, dst_storage_name, now);
+        if (failure.suppressed) {
+            ++suppressed_source_count;
+            continue;
+        }
+        eligible_sources.push_back(EligibleSource{src_loc, failure});
+    }
+
+    if (!eligible_sources.empty()) {
+        // 优先选择从未失败的 source；都失败过时选择连续失败次数更少的 source。这样即使
+        // Reclaimer 周期长于首次 backoff，已知坏源也不会在健康副本之前被反复选中。
+        const auto selected = std::min_element(
+            eligible_sources.begin(), eligible_sources.end(), [](const EligibleSource &lhs, const EligibleSource &rhs) {
+                if (lhs.failure.consecutive_failures != rhs.failure.consecutive_failures) {
+                    return lhs.failure.consecutive_failures < rhs.failure.consecutive_failures;
+                }
+                return lhs.location->id() < rhs.location->id();
+            });
+
+        const bool switched_source =
+            uncovered_source_count > 1 &&
+            (suppressed_source_count > 0 ||
+             std::any_of(eligible_sources.begin(), eligible_sources.end(), [&](const auto &item) {
+                 return item.location != selected->location &&
+                        item.failure.consecutive_failures > selected->failure.consecutive_failures;
+             }));
+        if (switched_source) {
+            stat_source_switches_.fetch_add(1, std::memory_order_relaxed);
+            if (metrics_enabled_) {
+                ++m_source_switches_total_;
+            }
+            KVCM_LOG_INFO("migration admission switches Copy source: instance %s block_key %lld target_storage %s "
+                          "selected_source %s selected_prior_failures %u suppressed_sources %zu",
+                          instance_id.c_str(),
+                          static_cast<long long>(block_key),
+                          dst_storage_name.c_str(),
+                          selected->location->id().c_str(),
+                          selected->failure.consecutive_failures,
+                          suppressed_source_count);
+        }
+        if (suppressed_source_count > 0) {
+            stat_source_retries_suppressed_.fetch_add(suppressed_source_count, std::memory_order_relaxed);
+            if (metrics_enabled_) {
+                m_source_retries_suppressed_total_ += suppressed_source_count;
+            }
+        }
+        return {CopyAdmissionStatus::kAccept, selected->location};
+    }
+
+    if (suppressed_source_count > 0) {
+        stat_source_retries_suppressed_.fetch_add(suppressed_source_count, std::memory_order_relaxed);
+        stat_no_usable_source_.fetch_add(1, std::memory_order_relaxed);
+        if (metrics_enabled_) {
+            m_source_retries_suppressed_total_ += suppressed_source_count;
+            ++m_no_usable_source_total_;
+        }
+        return {CopyAdmissionStatus::kSourceRetrySuppressed, nullptr};
     }
 
     // 循环走完未 return kAccept：每个 source 都被 serving∪writing 覆盖。
@@ -2561,11 +2787,19 @@ MigrationManager::MigrationStats MigrationManager::GetStats() const {
     stats.copy_completed = stat_copy_completed_.load(std::memory_order_relaxed);
     stats.copy_failed = stat_copy_failed_.load(std::memory_order_relaxed);
     stats.copy_cancelled = stat_copy_cancelled_.load(std::memory_order_relaxed);
+    stats.source_failures_recorded = stat_source_failures_recorded_.load(std::memory_order_relaxed);
+    stats.source_retries_suppressed = stat_source_retries_suppressed_.load(std::memory_order_relaxed);
+    stats.source_switches = stat_source_switches_.load(std::memory_order_relaxed);
+    stats.no_usable_source = stat_no_usable_source_.load(std::memory_order_relaxed);
     stats.marks_added = stat_marks_added_.load(std::memory_order_relaxed);
     stats.marks_cleared = stat_marks_cleared_.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
         stats.active_copy_tasks = ActiveTaskCountUnsafe();
+    }
+    {
+        std::lock_guard<std::mutex> lock(copy_source_failure_mutex_);
+        stats.source_failure_entries = copy_source_failures_.size();
     }
     // 持久化方案下无内存表，active_marks 为 best-effort 近似（added - cleared）。
     const uint64_t added = stats.marks_added;
