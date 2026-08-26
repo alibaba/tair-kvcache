@@ -650,11 +650,21 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
             }
             if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
                 KVCM_LOG_WARN("[%s] RemoveInstance drain timeout (%dms) for instance %s, "
-                              "proceeding with trim; residual WRITING targets will be orphan-cleaned",
+                              "refusing removal while asynchronous Copy state is still owned",
                               trace_id.c_str(),
                               kDrainTimeoutMs,
                               instance_id.c_str());
             }
+        }
+        // A quarantined guard is intentionally invisible to the active task
+        // table, and an accepted physical cleanup may outlive task completion.
+        // Removing the registry entry here would make those durable guards
+        // undiscoverable on the next leader and could close their backend while
+        // it is still being used. Keep the instance registered until every
+        // active/quarantined/cleanup reference has drained.
+        if (migration_manager_->HasAsyncCopyInstanceReference(instance_id)) {
+            PREFIX_LOG(WARN, "remove instance rejected: asynchronous Copy reference remains");
+            return EC_EXIST;
         }
     }
 
