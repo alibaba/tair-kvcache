@@ -961,6 +961,77 @@ class TestBuildConnectorMeta(unittest.TestCase):
         meta = conn.build_connector_meta(fake_scheduler_output())
         self.assertEqual([f.req_id for f in meta.to_finish_requests], ["r0"])
 
+    # ------------------------------------------------------------------ #
+    # Hit accounting contract (kv_transfer_params)
+    # ------------------------------------------------------------------ #
+    # These counts travel to clients through vLLM's kv_transfer_params
+    # (EngineCoreOutput -> RequestOutput -> the OpenAI response) and were
+    # silently dropped in an earlier refactor (found only by human review);
+    # the contract is pinned here so a future refactor cannot remove it
+    # without a test failing.
+    def test_finish_reports_hit_accounting(self):
+        conn = make_scheduler_connector(mbs=self.MBS)
+        req, _ = self._new_request(conn, "r0", 4 * self.MBS + 5, 4,
+                                   num_locations=3)
+        # No saves in flight: finish reports the accounting immediately.
+        conn._tracked["r0"].scheduled_saving_count = 0
+        conn._tracked["r0"].sent_saving_count = 0
+        keep, extra = conn.request_finished(req, [])
+        self.assertTrue(keep)
+        self.assertEqual(extra, {
+            "local_matched_token_num": 0,
+            "remote_matched_token_num": 3 * self.MBS,
+        })
+        self.assertIsInstance(extra["local_matched_token_num"], int)
+        self.assertIsInstance(extra["remote_matched_token_num"], int)
+
+    def test_finish_reports_hit_accounting_with_saves_in_flight(self):
+        # The delayed-finish branch must report the same accounting: vLLM
+        # consumes kv_transfer_params from whichever output finishes the
+        # request.
+        conn = make_scheduler_connector(mbs=self.MBS)
+        req, _ = self._new_request(conn, "r0", 4 * self.MBS + 5, 4,
+                                   num_locations=3)
+        keep, extra = conn.request_finished(req, [])
+        self.assertTrue(keep)
+        self.assertEqual(extra, {
+            "local_matched_token_num": 0,
+            "remote_matched_token_num": 3 * self.MBS,
+        })
+
+    def test_hit_accounting_follows_the_last_match_answer(self):
+        # A re-ask with a grown local hit overwrites the accounting (the
+        # last answer is what the request runs with), and the burned path
+        # zeroes the remote half while keeping the local hit.
+        conn = make_scheduler_connector(mbs=self.MBS)
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        conn._location_query_manager.locations = make_locations(3)
+        conn._location_query_manager.in_flight = False
+        conn.get_num_new_matched_tokens(req, 0)   # answer: 3 blocks
+        self.assertEqual(conn._tracked["r0"].remote_matched_token_num,
+                         3 * self.MBS)
+        # Re-ask at a grown offset: local hit counted, remote re-answered.
+        conn._location_query_manager.locations = make_locations(2)
+        conn._location_query_manager.in_flight = False
+        conn.get_num_new_matched_tokens(req, self.MBS)
+        self.assertEqual(conn._tracked["r0"].local_matched_token_num, self.MBS)
+        self.assertEqual(conn._tracked["r0"].remote_matched_token_num,
+                         2 * self.MBS)
+
+    def test_hit_accounting_burned_match_zeroes_remote(self):
+        conn = make_scheduler_connector(
+            mbs=self.MBS, num_groups=1, num_state_groups=1,
+            locations=hybrid_locations([True, True]))
+        req = FakeRequest("r0", list(range(4 * self.MBS + 5)))
+        conn.get_num_new_matched_tokens(req, 0)
+        alloc(conn, req, 2 * self.MBS, [[100, 101], [50, 51]])
+        # The re-ask after the burned match reports zero remote, and the
+        # local hit (the offset vLLM re-asked at) stands.
+        matched, _ = conn.get_num_new_matched_tokens(req, self.MBS)
+        self.assertEqual(matched, 0)
+        self.assertEqual(conn._tracked["r0"].local_matched_token_num, self.MBS)
+        self.assertEqual(conn._tracked["r0"].remote_matched_token_num, 0)
+
     def test_canceled_save_unknown_request_no_crash(self):
         # Cancellations arrive from http_executor threads and may race request
         # teardown; an unknown req_id must be skipped, not KeyError.

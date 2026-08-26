@@ -51,6 +51,14 @@ class RequestLedger:
     block_ids_per_group: List[List[int]]
     # Manager blocks already saved (or covered by an external hit).
     has_saved_block_num: int
+    # Hit accounting reported to vLLM at finish (kv_transfer_params -> the
+    # OpenAI response): local = vLLM's own prefix-cache hit when the match
+    # hook last answered, remote = the external hit it returned (clamped).
+    # Written on the match hook's answer paths (initial / re-ask / burned),
+    # read exactly once by _finish_request. Group-agnostic by design: both
+    # are token-granular totals.
+    local_matched_token_num: int = 0
+    remote_matched_token_num: int = 0
     # Save-session ledger: sessions started vs sessions handed to the worker.
     scheduled_saving_count: int = 0
     sent_saving_count: int = 0
@@ -220,6 +228,12 @@ class ConnectorScheduler:
             # is left, vLLM recomputes locally.
             logger.warning("req:%s re-queried after an external load attempt, "
                            "skip external match", req_id)
+            # Hit accounting: this re-ask answers "no external match";
+            # the local hit stands, the remote hit is spent.
+            ledger = self._tracked.get(req_id)
+            if ledger is not None:
+                ledger.local_matched_token_num = num_computed_tokens
+                ledger.remote_matched_token_num = 0
             return 0, False
 
         computed_blocks = num_computed_tokens // self._manager_block_size
@@ -234,6 +248,18 @@ class ConnectorScheduler:
         # Cache the clamped answer: the allocation consumes exactly this.
         self._location_query_manager.store_result(req_id, need_load_locations)
         new_matched_count = len(need_load_locations) * self._manager_block_size
+        # Hit accounting: record the answer the request will finish with
+        # (local = vLLM's hit when asked, remote = this clamped answer).
+        ledger = self._tracked.get(req_id)
+        if ledger is None:
+            ledger = RequestLedger(
+                vllm_request=request,
+                block_ids_per_group=[],
+                has_saved_block_num=0,
+            )
+            self._tracked[req_id] = ledger
+        ledger.local_matched_token_num = num_computed_tokens
+        ledger.remote_matched_token_num = new_matched_count
         logger.info("req:%s matched %d external tokens", req_id, new_matched_count)
         return new_matched_count, new_matched_count > 0
 
@@ -641,10 +667,19 @@ class ConnectorScheduler:
             self._location_query_manager.invalidate(req_id)
             return False, None
 
+        # Hit accounting travels to the client through vLLM's
+        # kv_transfer_params (EngineCoreOutput -> RequestOutput -> the
+        # OpenAI response); consumers attribute TTFT and per-request hits
+        # to local (vLLM prefix cache) vs remote (KVCM) sources with it.
+        extra_info = {
+            "local_matched_token_num": ledger.local_matched_token_num,
+            "remote_matched_token_num": ledger.remote_matched_token_num,
+        }
+
         if ledger.scheduled_saving_count == ledger.sent_saving_count:
             self._retire_request(req_id)
-            return True, None
+            return True, extra_info
 
         # Saves still in flight; delay freeing the blocks until they land.
         ledger.need_report_after_saving_finished = True
-        return True, None
+        return True, extra_info
