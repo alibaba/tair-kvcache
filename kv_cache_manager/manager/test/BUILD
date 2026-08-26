@@ -159,6 +159,22 @@ cc_test(
 )
 
 cc_test(
+    name = "StorageConfigQueryTest",
+    srcs = ["storage_config_query_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "@cpp_stub",
+        "@rapidjson",
+    ],
+)
+
+cc_test(
     name = "MetaSearcherRedisTest",
     srcs = [
         "meta_searcher_redis_test.cc",

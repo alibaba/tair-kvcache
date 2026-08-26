@@ -40,6 +40,42 @@ curl -g -vvv -X POST http://localhost:6382/api/getInstanceInfo \
 }'
 ```
 
+## Get Storage Configs By Instance Group
+
+This leader-only API returns exactly the StorageConfig entries visible to an
+Instance Group. Its visibility rules are the same as `RegisterInstance`: normal
+`storage_candidates` plus every tiered-migration source and target.
+
+```bash
+curl -g -vvv -X POST http://localhost:6382/api/getStorageConfigsByInstanceGroup \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "pace-bootstrap-125",
+    "instance_group": "test_group"
+}'
+```
+
+Example success response:
+
+```json
+{
+  "header": {
+    "status": {
+      "code": "OK",
+      "message": "Storage configs retrieved successfully"
+    }
+  },
+  "storage_configs": "[{\"type\":\"pace\",\"global_unique_name\":\"pace_primary\",\"storage_spec\":{...}}]"
+}
+```
+
+`storage_configs` is a JSON-encoded array string, matching the field returned
+by `RegisterInstance`. The array may contain both `pace` and `pace_ssd` entries.
+An existing group with no visible client storage returns `OK` and `"[]"`; an
+empty `instance_group` returns `INVALID_ARGUMENT`; an unknown group returns
+`INSTANCE_NOT_EXIST`.
+
 ## Get Cache Location
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/getCacheLocation \

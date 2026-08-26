@@ -312,6 +312,16 @@ message GetInstanceInfoResponse {
     InstanceInfo instance_info = 3;
 }
 
+message GetStorageConfigsByInstanceGroupRequest {
+    string trace_id = 1;
+    string instance_group = 2;
+}
+
+message GetStorageConfigsByInstanceGroupResponse {
+    CommonResponseHeader header = 1;
+    string storage_configs = 2;
+}
+
 message BoolMasksType { repeated bool values = 1; }
 message BlockMask {
     oneof info {
@@ -497,6 +507,9 @@ service MetaService {
     rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
     // 获取Instance的状态信息，用于决策是否不同部署复用kvcache，以及错误调试
     rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
+    // 按 Instance Group 查询推理节点可见的 StorageConfig，用于存储客户端启动引导
+    rpc GetStorageConfigsByInstanceGroup(GetStorageConfigsByInstanceGroupRequest)
+        returns (GetStorageConfigsByInstanceGroupResponse);
     // 在排查问题时获取meta完整信息，明确的; TODO : 把这个挪到debug service中
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
     // 返回Cache的位置，由PD节点调用

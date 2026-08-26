@@ -127,6 +127,10 @@ public:
                                                        const std::vector<LocationSpecGroup> &location_spec_groups,
                                                        QueryType default_query_type = QueryType::QT_UNSPECIFIED);
 
+    std::pair<ErrorCode, std::string>
+    GetStorageConfigsByInstanceGroup(RequestContext *request_context,
+                                     const std::string &instance_group_name) const;
+
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
 

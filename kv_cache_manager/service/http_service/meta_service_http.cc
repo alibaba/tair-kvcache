@@ -29,6 +29,11 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, registerInstance, RegisterInstance, RegisterInstance, RegisterInstance);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getInstanceInfo, GetInstanceInfo, GetInstanceInfo, GetInstanceInfo);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post,
+                                           getStorageConfigsByInstanceGroup,
+                                           GetStorageConfigsByInstanceGroup,
+                                           GetStorageConfigsByInstanceGroup,
+                                           GetStorageConfigsByInstanceGroup);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
@@ -74,6 +79,17 @@ void MetaServiceHttp::GetInstanceInfo(coro_http::coro_http_connection *http_conn
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     meta_service_impl_->GetInstanceInfo(request_context, request, response);
+}
+
+void MetaServiceHttp::GetStorageConfigsByInstanceGroup(
+    coro_http::coro_http_connection *http_conn,
+    proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+    proto::meta::GetStorageConfigsByInstanceGroupResponse *response) {
+    API_CONTEXT_INIT_HTTP(GetStorageConfigsByInstanceGroup);
+    KVCM_LOG_INFO("[traceId: %s] GetStorageConfigsByInstanceGroup called, instance_group: %s",
+                  request->trace_id().c_str(),
+                  request->instance_group().c_str());
+    meta_service_impl_->GetStorageConfigsByInstanceGroup(request_context, request, response);
 }
 
 void MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_conn,

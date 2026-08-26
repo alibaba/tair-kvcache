@@ -273,6 +273,56 @@ class TestRequestTimeout(unittest.TestCase):
             client.close()
 
 
+class TestStorageConfigQuery(unittest.TestCase):
+    """Tests for the instance-group StorageConfig bootstrap endpoint."""
+
+    def test_uses_meta_service_endpoint_and_returns_payload(self):
+        client = KvCacheManagerClient("http://10.0.0.1:6382")
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(
+                _ok_response_json({"storage_configs": "[]"})
+            )
+        )
+        request = {
+            "trace_id": "bootstrap",
+            "instance_group": "group_a",
+        }
+
+        try:
+            result = client.get_storage_configs_by_instance_group(request)
+        finally:
+            client.close()
+
+        self.assertEqual("[]", result["storage_configs"])
+        self.assertEqual(
+            "http://10.0.0.1:6382/api/getStorageConfigsByInstanceGroup",
+            client.session.post.call_args.args[0],
+        )
+        self.assertEqual(request, client.session.post.call_args.kwargs["json"])
+
+    def test_keeps_standard_business_error_check(self):
+        client = KvCacheManagerClient("http://10.0.0.1:6382")
+        client.session.post = MagicMock(
+            return_value=_make_mock_response({
+                "header": {
+                    "status": {
+                        "code": "INSTANCE_NOT_EXIST",
+                        "message": "instance group not found",
+                    }
+                }
+            })
+        )
+
+        try:
+            with self.assertRaisesRegex(AssertionError, "instance group not found"):
+                client.get_storage_configs_by_instance_group({
+                    "trace_id": "bootstrap",
+                    "instance_group": "missing",
+                })
+        finally:
+            client.close()
+
+
 class TestResponseClassification(unittest.TestCase):
     """Transport/protocol failures must be distinct from Manager business errors."""
 

@@ -38,6 +38,15 @@ grpc::Status MetaServiceGRpc::GetInstanceInfo(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::GetStorageConfigsByInstanceGroup(
+    grpc::ServerContext *context,
+    const proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+    proto::meta::GetStorageConfigsByInstanceGroupResponse *response) {
+    API_CONTEXT_INIT_GRPC(GetStorageConfigsByInstanceGroup);
+    meta_service_impl_->GetStorageConfigsByInstanceGroup(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 grpc::Status MetaServiceGRpc::GetCacheMeta(grpc::ServerContext *context,
                                            const proto::meta::GetCacheMetaRequest *request,
                                            proto::meta::GetCacheMetaResponse *response) {

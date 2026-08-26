@@ -393,6 +393,12 @@ class KvCacheManagerClient:
         """Get information about a registered instance"""
         return self._make_api_request('/api/getInstanceInfo', data, check_response)
 
+    def get_storage_configs_by_instance_group(self, data, check_response=True):
+        """Get storage configs visible to an instance group."""
+        return self._make_api_request(
+            '/api/getStorageConfigsByInstanceGroup', data, check_response
+        )
+
     def get_cache_meta(self, data, check_response=True):
         """Get cache metadata for specified block keys"""
         return self._make_api_request('/api/getCacheMeta', data, check_response)

@@ -1,6 +1,23 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "MetaServiceStorageConfigTest",
+    srcs = ["meta_service_storage_config_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:meta_service_impl",
+        "@cpp_stub",
+        "@rapidjson",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",

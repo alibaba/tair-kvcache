@@ -4230,17 +4230,32 @@ std::pair<ErrorCode, int64_t> CacheManager::GetBlockSize(RequestContext *request
 std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const {
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
-    auto all_configs = registry_manager_->data_storage_manager()->ListStorageConfig();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info == nullptr) {
         PREFIX_LOG(WARN, "instance not found");
         return {};
     }
     const auto &instance_group_name = instance_info->instance_group_name();
-    auto [ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, instance_group_name);
-    if (instance_group == nullptr) {
-        PREFIX_LOG(WARN, "instance group not found: %s", instance_group_name.c_str());
+    auto [ec, storage_configs] = GetStorageConfigsByInstanceGroup(request_context, instance_group_name);
+    if (ec != EC_OK) {
+        PREFIX_LOG(WARN, "get storage configs failed for instance group: %s", instance_group_name.c_str());
         return {};
+    }
+    return storage_configs;
+}
+
+std::pair<ErrorCode, std::string>
+CacheManager::GetStorageConfigsByInstanceGroup(RequestContext *request_context,
+                                               const std::string &instance_group_name) const {
+    SPAN_TRACER(request_context);
+    const auto &trace_id = request_context->trace_id();
+    auto [ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, instance_group_name);
+    if (ec != EC_OK || instance_group == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("instance group '" + instance_group_name + "' not found");
+        KVCM_LOG_WARN("trace_id [%s] instance_group [%s] | instance group not found",
+                      trace_id.c_str(),
+                      instance_group_name.c_str());
+        return {ec == EC_OK ? EC_NOENT : ec, {}};
     }
     // storage_candidates only describes normal write placement. Tiered migration may move data to a
     // source/target storage that is intentionally not a normal write candidate, but workers still need
@@ -4257,6 +4272,7 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
             accessible_storage_names.insert(strategy->target_storage_name());
         }
     }
+    auto all_configs = registry_manager_->data_storage_manager()->ListStorageConfig();
     // TODO : try optimize these copy operation
     std::vector<const StorageConfig *> result;
     for (const auto &config : all_configs) {
@@ -4269,7 +4285,7 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
             result.push_back(&config);
         }
     }
-    return Jsonizable::ToJsonString(result);
+    return {EC_OK, Jsonizable::ToJsonString(result)};
 }
 
 ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
