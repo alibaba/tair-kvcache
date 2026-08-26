@@ -768,6 +768,16 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 return EC_TIMEOUT;
             }
         }
+        // A quarantined guard is intentionally invisible to the active task
+        // table, and an accepted physical cleanup may outlive task completion.
+        // Removing the registry entry here would make those durable guards
+        // undiscoverable on the next leader and could close their backend while
+        // it is still being used. Keep the instance registered until every
+        // active/quarantined/cleanup reference has drained.
+        if (migration_manager_->HasAsyncCopyInstanceReference(instance_id)) {
+            PREFIX_LOG(WARN, "remove instance rejected: asynchronous Copy reference remains");
+            return EC_EXIST;
+        }
     }
 
     auto ec = registry_manager_->BeginRemoveInstance(request_context, instance_id);
