@@ -126,6 +126,24 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 "mark_clear_policy",
                                 mark_clear_policy_,
                                 MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "copy_execution_mode", copy_execution_mode_, MigrationCopyExecutionMode::SYNC);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "copy_max_inflight_bytes", copy_max_inflight_bytes_, uint64_t{0});
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "copy_max_quarantine_operations", copy_max_quarantine_operations_, int64_t{0});
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "copy_max_quarantine_bytes", copy_max_quarantine_bytes_, uint64_t{0});
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_operation_deadline_ms",
+                                copy_operation_deadline_ms_,
+                                MigrationConfig::kDefaultCopyOperationDeadlineMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_poll_initial_interval_ms",
+                                copy_poll_initial_interval_ms_,
+                                MigrationConfig::kDefaultCopyPollInitialIntervalMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_poll_max_interval_ms",
+                                copy_poll_max_interval_ms_,
+                                MigrationConfig::kDefaultCopyPollMaxIntervalMs);
     KVCM_JSON_GET_MACRO(rapid_value, "strategies", strategies_);
     return true;
 }
@@ -133,6 +151,13 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "copy_max_concurrency", copy_max_concurrency_);
     Put(writer, "mark_clear_policy", mark_clear_policy_);
+    Put(writer, "copy_execution_mode", copy_execution_mode_);
+    Put(writer, "copy_max_inflight_bytes", copy_max_inflight_bytes_);
+    Put(writer, "copy_max_quarantine_operations", copy_max_quarantine_operations_);
+    Put(writer, "copy_max_quarantine_bytes", copy_max_quarantine_bytes_);
+    Put(writer, "copy_operation_deadline_ms", copy_operation_deadline_ms_);
+    Put(writer, "copy_poll_initial_interval_ms", copy_poll_initial_interval_ms_);
+    Put(writer, "copy_poll_max_interval_ms", copy_poll_max_interval_ms_);
     Put(writer, "strategies", strategies_);
 }
 
@@ -148,6 +173,23 @@ bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const 
         mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED) {
         valid = false;
         local_invalid_fields += "{mark_clear_policy}";
+    }
+    if (copy_execution_mode_ != MigrationCopyExecutionMode::SYNC &&
+        copy_execution_mode_ != MigrationCopyExecutionMode::ASYNC_REQUIRED) {
+        valid = false;
+        local_invalid_fields += "{copy_execution_mode}";
+    }
+    if (copy_operation_deadline_ms_ <= 0 || copy_poll_initial_interval_ms_ <= 0 ||
+        copy_poll_max_interval_ms_ < copy_poll_initial_interval_ms_ ||
+        copy_poll_max_interval_ms_ >= copy_operation_deadline_ms_) {
+        valid = false;
+        local_invalid_fields += "{copy_async_timing}";
+    }
+    if (copy_execution_mode_ == MigrationCopyExecutionMode::ASYNC_REQUIRED &&
+        (copy_max_inflight_bytes_ == 0 || copy_max_quarantine_operations_ <= 0 ||
+         copy_max_quarantine_bytes_ == 0)) {
+        valid = false;
+        local_invalid_fields += "{copy_async_limits}";
     }
     for (const auto &strategy : strategies_) {
         if (strategy == nullptr) {

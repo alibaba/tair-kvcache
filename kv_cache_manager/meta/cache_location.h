@@ -109,6 +109,122 @@ enum CacheLocationStatus : int32_t {
     CLS_DELETING = 4,
 };
 
+// Persistent ownership fence for an asynchronous migration target.  The guard lives
+// in the CacheLocation JSON so both Reclaimer and the background GC can make the
+// correct decision after a Manager restart, when the process-local active task table
+// is no longer available.
+enum class MigrationCopyGuardState : int32_t {
+    MCGS_NONE = 0,
+    MCGS_SUBMITTING = 1,
+    MCGS_ACTIVE = 2,
+    MCGS_CANCELLING = 3,
+    MCGS_UNKNOWN = 4,
+};
+
+class MigrationCopyGuard : public Jsonizable {
+public:
+    static constexpr uint32_t kCurrentSchemaVersion = 1;
+
+    MigrationCopyGuard() = default;
+    ~MigrationCopyGuard() override = default;
+
+    // A serialized guard is a safety fence, not an optional best-effort hint.
+    // Only the exact schema understood by this binary and a known state may be
+    // interpreted.  CacheLocation::FromRapidValue rejects an explicitly
+    // present but invalid/future guard, so callers fail closed instead of
+    // silently treating the target as an ordinary WRITING location.
+    bool present() const {
+        return schema_version_ == kCurrentSchemaVersion && IsKnownState(state_) && !operation_id_.empty();
+    }
+    uint32_t schema_version() const { return schema_version_; }
+    MigrationCopyGuardState state() const { return state_; }
+    const std::string &operation_id() const { return operation_id_; }
+    const std::string &source_location_id() const { return source_location_id_; }
+    int64_t source_location_create_time() const { return source_location_create_time_; }
+    const std::string &source_storage_name() const { return source_storage_name_; }
+    const std::string &target_storage_name() const { return target_storage_name_; }
+    int32_t migration_retention() const { return migration_retention_; }
+    uint64_t total_bytes() const { return total_bytes_; }
+    const std::vector<std::string> &backend_task_ids() const { return backend_task_ids_; }
+    int64_t create_time_us() const { return create_time_us_; }
+    int64_t update_time_us() const { return update_time_us_; }
+    const std::string &last_error() const { return last_error_; }
+
+    void set_schema_version(uint32_t value) { schema_version_ = value; }
+    void set_state(MigrationCopyGuardState value) { state_ = value; }
+    void set_operation_id(std::string value) { operation_id_ = std::move(value); }
+    void set_source_location_id(std::string value) { source_location_id_ = std::move(value); }
+    void set_source_location_create_time(int64_t value) { source_location_create_time_ = value; }
+    void set_source_storage_name(std::string value) { source_storage_name_ = std::move(value); }
+    void set_target_storage_name(std::string value) { target_storage_name_ = std::move(value); }
+    void set_migration_retention(int32_t value) { migration_retention_ = value; }
+    void set_total_bytes(uint64_t value) { total_bytes_ = value; }
+    void set_backend_task_ids(std::vector<std::string> value) { backend_task_ids_ = std::move(value); }
+    void set_create_time_us(int64_t value) { create_time_us_ = value; }
+    void set_update_time_us(int64_t value) { update_time_us_ = value; }
+    void set_last_error(std::string value) { last_error_ = std::move(value); }
+
+    static bool IsKnownState(MigrationCopyGuardState state) {
+        return state == MigrationCopyGuardState::MCGS_SUBMITTING ||
+               state == MigrationCopyGuardState::MCGS_ACTIVE ||
+               state == MigrationCopyGuardState::MCGS_CANCELLING ||
+               state == MigrationCopyGuardState::MCGS_UNKNOWN;
+    }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "schema_version", schema_version_);
+        Put(writer, "state", state_);
+        Put(writer, "operation_id", operation_id_);
+        Put(writer, "source_location_id", source_location_id_);
+        Put(writer, "source_location_create_time", source_location_create_time_);
+        Put(writer, "source_storage_name", source_storage_name_);
+        Put(writer, "target_storage_name", target_storage_name_);
+        Put(writer, "migration_retention", migration_retention_);
+        Put(writer, "total_bytes", total_bytes_);
+        Put(writer, "backend_task_ids", backend_task_ids_);
+        Put(writer, "create_time_us", create_time_us_);
+        Put(writer, "update_time_us", update_time_us_);
+        Put(writer, "last_error", last_error_);
+    }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "schema_version", schema_version_, uint32_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "state", state_, MigrationCopyGuardState::MCGS_NONE);
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "operation_id", operation_id_, std::string());
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "source_location_id", source_location_id_, std::string());
+        KVCM_JSON_GET_DEFAULT_MACRO(
+            rapid_value, "source_location_create_time", source_location_create_time_, int64_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "source_storage_name", source_storage_name_, std::string());
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "target_storage_name", target_storage_name_, std::string());
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "migration_retention", migration_retention_, int32_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "total_bytes", total_bytes_, uint64_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(
+            rapid_value, "backend_task_ids", backend_task_ids_, std::vector<std::string>());
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time_us", create_time_us_, int64_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "update_time_us", update_time_us_, int64_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "last_error", last_error_, std::string());
+        return true;
+    }
+
+private:
+    uint32_t schema_version_ = 0;
+    MigrationCopyGuardState state_ = MigrationCopyGuardState::MCGS_NONE;
+    std::string operation_id_;
+    std::string source_location_id_;
+    int64_t source_location_create_time_ = 0;
+    std::string source_storage_name_;
+    std::string target_storage_name_;
+    // Stored as the public enum's numeric value to keep meta independent from
+    // config headers.  Unknown/missing values recover conservatively as
+    // KEEP_BOTH.
+    int32_t migration_retention_ = 0;
+    uint64_t total_bytes_ = 0;
+    std::vector<std::string> backend_task_ids_;
+    int64_t create_time_us_ = 0;
+    int64_t update_time_us_ = 0;
+    std::string last_error_;
+};
+
 using BlockMaskVector = std::vector<bool>;
 using BlockMaskOffset = size_t;
 
@@ -170,6 +286,9 @@ public:
         Put(writer, "spec_size", spec_size());
         Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
+        if (migration_copy_guard_.present()) {
+            Put(writer, "migration_copy_guard", migration_copy_guard_);
+        }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
@@ -223,6 +342,8 @@ public:
     [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
         return (packed_sizes_ & kValidatedTotalSizeMask) != kUnknownValidatedTotalSize;
     }
+    void set_migration_copy_guard(const MigrationCopyGuard &guard) { migration_copy_guard_ = guard; }
+    void clear_migration_copy_guard() { migration_copy_guard_ = MigrationCopyGuard(); }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
@@ -242,6 +363,8 @@ public:
         return spec_size_overflow_ ? location_specs_.size() : packed_sizes_ >> kSpecSizeShift;
     }
     [[nodiscard]] int64_t create_time() const { return create_time_; }
+    [[nodiscard]] bool has_migration_copy_guard() const { return migration_copy_guard_.present(); }
+    [[nodiscard]] const MigrationCopyGuard &migration_copy_guard() const { return migration_copy_guard_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
         // Shared ID/name ownership can change after insertion; charge their
         // text per item so LRU accounting stays stable.
@@ -253,6 +376,19 @@ public:
         usage += location_specs_.capacity() * sizeof(LocationSpec);
         for (const auto &spec : location_specs_) {
             usage += spec.name().size() + EstimateStringPayloadCharge(spec.uri());
+        }
+        if (migration_copy_guard_.present()) {
+            // sizeof(CacheLocation) already includes the value member
+            // MigrationCopyGuard (including its vector object).  Count only
+            // heap-owned strings and the vector's dynamically allocated string
+            // elements here.
+            usage += migration_copy_guard_.operation_id().size() + migration_copy_guard_.source_location_id().size() +
+                     migration_copy_guard_.source_storage_name().size() +
+                     migration_copy_guard_.target_storage_name().size() + migration_copy_guard_.last_error().size();
+            usage += migration_copy_guard_.backend_task_ids().size() * sizeof(std::string);
+            for (const auto &task_id : migration_copy_guard_.backend_task_ids()) {
+                usage += task_id.size();
+            }
         }
         return usage;
     }
@@ -301,6 +437,16 @@ private:
             return false;
         }
         set_spec_size(spec_size);
+        const bool serialized_guard_present =
+            rapid_value.IsObject() && rapid_value.HasMember("migration_copy_guard");
+        KVCM_JSON_GET_DEFAULT_MACRO(
+            rapid_value, "migration_copy_guard", migration_copy_guard_, MigrationCopyGuard());
+        if (serialized_guard_present && !migration_copy_guard_.present()) {
+            // Reject malformed and future-schema fences.  Returning a normal
+            // unguarded CacheLocation here would let old maintenance paths
+            // reclaim a target whose remote Copy outcome is still unknown.
+            return false;
+        }
         return true;
     }
 
@@ -324,6 +470,7 @@ private:
     DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     bool id_is_interned_ = false;
     bool spec_size_overflow_ = false;
+    MigrationCopyGuard migration_copy_guard_;
 };
 
 using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;
@@ -388,5 +535,25 @@ struct CompactLocationsPerKey {
 
     void FinishKey() { offsets.push_back(values.size()); }
 };
+
+// A target guard pins the exact source identity used by the asynchronous
+// operation.  Legacy/malformed schema-v1 guards may have no create_time; fail
+// closed in that case and pin by location id rather than allowing one deletion
+// path to disagree with another.
+inline const MigrationCopyGuard *FindPersistentMigrationSourcePin(const CacheLocation &candidate,
+                                                                  const CacheLocationMap &location_map) {
+    for (const auto &[_, target] : location_map) {
+        if (!target || !target->has_migration_copy_guard()) {
+            continue;
+        }
+        const auto &guard = target->migration_copy_guard();
+        if (guard.source_location_id() == candidate.id() &&
+            (guard.source_location_create_time() <= 0 ||
+             guard.source_location_create_time() == candidate.create_time())) {
+            return &guard;
+        }
+    }
+    return nullptr;
+}
 
 } // namespace kv_cache_manager
