@@ -4,6 +4,7 @@
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
 
@@ -36,6 +37,9 @@ public:
     void GetCacheLocation(coro_http::coro_http_connection *http_conn,
                           proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);
+    void ReportOptimizerEvent(coro_http::coro_http_connection *http_conn,
+                              proto::optimizer::TraceQueryRequest *request,
+                              proto::optimizer::CommonResponse *response);
     void GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
                              proto::meta::GetCacheLocationLenRequest *request,
                              proto::meta::GetCacheLocationLenResponse *response);

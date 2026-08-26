@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
@@ -32,6 +33,10 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
+    RegisterPostHandler(
+        "/api/reportOptimizerEvent",
+        GetHandler<MetaServiceHttp, proto::optimizer::TraceQueryRequest, proto::optimizer::CommonResponse>(
+            &MetaServiceHttp::ReportOptimizerEvent));
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post,
@@ -81,6 +86,13 @@ void MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_con
                                        proto::meta::GetCacheLocationResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocation, __NOTHING__);
     meta_service_impl_->GetCacheLocation(request_context, request, response);
+}
+
+void MetaServiceHttp::ReportOptimizerEvent(coro_http::coro_http_connection *http_conn,
+                                           proto::optimizer::TraceQueryRequest *request,
+                                           proto::optimizer::CommonResponse *response) {
+    API_CONTEXT_INIT_HTTP(ReportOptimizerEvent);
+    meta_service_impl_->ReportOptimizerEvent(request_context, request, response);
 }
 
 void MetaServiceHttp::GetCacheLocationLen(coro_http::coro_http_connection *http_conn,

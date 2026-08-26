@@ -18,6 +18,7 @@
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/util/fault_injector.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
@@ -26,7 +27,8 @@
 #include "rapidjson/writer.h"
 
 // TODO(rui): move into common.h
-#define API_CALL_GUARD_WITH_DEBUG(api_name, is_leader_only, request_debug_expr, response_debug_expr)                   \
+#define API_CALL_GUARD_WITH_DEBUG_AND_NOT_LEADER_CODE(                                                                 \
+    api_name, is_leader_only, request_debug_expr, response_debug_expr, not_leader_code)                                \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
     {                                                                                                                  \
@@ -36,7 +38,7 @@
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
-        status->set_code(proto::meta::SERVER_NOT_LEADER);                                                              \
+        status->set_code(not_leader_code);                                                                             \
         status->set_message("Server is not leader"); /* TODO: return current leader info */                            \
         request_context->set_status_code(status->code());                                                              \
         KVCM_LOG_INFO("[traceId: %s] %s rejected: service not ready", request->trace_id().c_str(), api_name);          \
@@ -49,6 +51,10 @@
             request_context->set_response_debug(response_debug);                                                       \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
+
+#define API_CALL_GUARD_WITH_DEBUG(api_name, is_leader_only, request_debug_expr, response_debug_expr)                   \
+    API_CALL_GUARD_WITH_DEBUG_AND_NOT_LEADER_CODE(                                                                     \
+        api_name, is_leader_only, request_debug_expr, response_debug_expr, proto::meta::SERVER_NOT_LEADER)
 
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     API_CALL_GUARD_WITH_DEBUG(                                                                                         \
@@ -118,6 +124,28 @@ std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message)
     std::string debug_json;
     ProtoMessageJsonUtil::ToJson(message, debug_json);
     return debug_json;
+}
+
+std::string BuildReportOptimizerEventRequestAccessLogSummary(const proto::optimizer::TraceQueryRequest *request) {
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    writer.StartObject();
+    writer.Key("trace_id");
+    writer.String(request->trace_id().c_str());
+    writer.Key("instance_id");
+    writer.String(request->instance_id().c_str());
+    writer.Key("block_keys_count");
+    writer.Int(request->block_keys_size());
+    writer.Key("token_ids_count");
+    writer.Int(request->token_ids_size());
+    writer.Key("input_token_len");
+    writer.Int64(request->input_token_len());
+    writer.Key("timestamp_ns");
+    writer.Int64(request->timestamp_ns());
+    writer.Key("location_spec_names_count");
+    writer.Int(request->location_spec_names_size());
+    writer.EndObject();
+    return buffer.GetString();
 }
 
 bool IsReportEventFullAccessLogEnabled() { return EnvUtil::GetEnv(kReportEventFullAccessLogEnv, false); }
@@ -513,6 +541,41 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
                       request->trace_id().c_str(),
                       response->locations_size());
     }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::ReportOptimizerEvent(RequestContext *request_context,
+                                           const proto::optimizer::TraceQueryRequest *request,
+                                           proto::optimizer::CommonResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD_WITH_DEBUG_AND_NOT_LEADER_CODE("ReportOptimizerEvent",
+                                                  true,
+                                                  BuildReportOptimizerEventRequestAccessLogSummary(request),
+                                                  BuildProtoMessageDebugJson(response),
+                                                  proto::optimizer::SERVER_NOT_LEADER);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    const auto ec = cache_manager_->ReportOptimizerEvent(
+        request_context,
+        request->instance_id(),
+        {request->block_keys().begin(), request->block_keys().end()},
+        {request->token_ids().begin(), request->token_ids().end()},
+        request->input_token_len(),
+        request->timestamp_ns(),
+        {request->location_spec_names().begin(), request->location_spec_names().end()});
+    if (ec == EC_OK) {
+        status->set_code(proto::optimizer::OK);
+    } else if (ec == EC_BADARGS) {
+        status->set_code(proto::optimizer::INVALID_ARGUMENT);
+    } else if (ec == EC_INSTANCE_NOT_EXIST) {
+        status->set_code(proto::optimizer::INSTANCE_NOT_EXIST);
+    } else {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+    }
+    if (ec != EC_OK) {
+        status->set_message(request_context->error_tracer()->ToJsonString());
+    }
+    request_context->set_status_code(status->code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

@@ -55,6 +55,25 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheLocation \
 }'
 ```
 
+## Report Optimizer Event
+
+旁路流量只需要向 Optimizer 上报查询事件、不需要查询真实 CacheLocation 时，使用：
+
+```bash
+curl -X POST http://localhost:6382/api/reportOptimizerEvent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "trace_id": "trace-1",
+    "instance_id": "instance-1",
+    "token_ids": [1, 2, 3, 4, 5],
+    "input_token_len": "5",
+    "timestamp_ns": "123456789000",
+    "location_spec_names": ["tp0"]
+  }'
+```
+
+请求也可以直接提供 `block_keys`，字段与 `TraceQueryRequest` 一致。该接口只补齐 block keys 并将事件投递到 optimizer event publisher，不执行 CacheLocation 查询；响应成功表示 KVCM 已接受事件，不表示 Optimizer 已完成处理。
+
 ## Start Write Cache
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \

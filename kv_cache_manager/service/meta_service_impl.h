@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/service_impl_base.h"
 
 namespace kv_cache_manager {
@@ -32,6 +33,10 @@ public:
     void GetCacheLocation(RequestContext *request_context,
                           const proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);
+
+    void ReportOptimizerEvent(RequestContext *request_context,
+                              const proto::optimizer::TraceQueryRequest *request,
+                              proto::optimizer::CommonResponse *response);
 
     void GetCacheLocationsByBackend(RequestContext *request_context,
                                     const proto::meta::GetCacheLocationsByBackendRequest *request,
