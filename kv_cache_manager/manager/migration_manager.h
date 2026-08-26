@@ -144,6 +144,7 @@ public:
                                          const std::string &operator_name,
                                          const std::string &external_fencing_evidence);
     bool HasAsyncCopyStorageReference(const std::string &storage_name) const;
+    bool HasAsyncCopyInstanceReference(const std::string &instance_id) const;
 
     // ---- Copy 路径 ----
     // 同步完成"建目标 location + 提交 copy 任务"，copy 字节复制异步执行；
@@ -240,6 +241,7 @@ public:
         kTargetWritingExists,   // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
         kSourceServingNotFound, // 源 storage 上没有 SERVING 副本，无可复制源
         kSourceRetrySuppressed, // 尚未被目标覆盖的源均处于失败退避，当前不应再次提交 Copy
+        kSourcePinnedByGuard,   // 源被另一条持久异步 Copy guard 钉住，不能并行派生新迁移
     };
 
     struct CopyAdmission {
@@ -373,6 +375,7 @@ private:
         kSuccess,
         kFailed,
         kCancelled,
+        kUnknown,
     };
 
     // 单个活跃 Copy 任务的上下文。
@@ -455,12 +458,26 @@ private:
     struct PendingCopy {
         std::string instance_id;
         int64_t block_key = 0;
+        size_t expected_items = 0;
         std::future<PlanExecuteResult> future;
         bool native_async = false;
         std::future<AsyncCopyRemoteSubmitResult> remote_submit_future;
         bool remote_submit_processed = true;
         std::optional<PlanExecuteResult> completed_result;
         std::chrono::steady_clock::time_point completion_retry_after{};
+    };
+
+    // An async Copy is not fully cleaned up when its target/source metadata is
+    // merely queued for deletion. Keep a reference until the executor finishes
+    // the physical delete so RemoveStorage cannot close the backend underneath
+    // the cleanup task.
+    struct PendingLocationCleanup {
+        std::string instance_id;
+        std::string storage_name;
+        CacheLocationDelRequest request;
+        std::future<PlanExecuteResult> future;
+        std::chrono::steady_clock::time_point retry_after{};
+        uint32_t retry_count = 0;
     };
 
     struct ExpiringMark {
@@ -500,7 +517,8 @@ private:
                               bool remote_side_effect_possible,
                               bool record_source_failure);
     bool CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx);
-    void CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx, const std::string &fail_reason);
+    bool CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx, const std::string &fail_reason);
+    bool HasDurableUnknownGuard(const CopyTaskContext &ctx) const;
     GuardMutationResult UpdateAsyncCopyGuard(const CopyTaskContext &ctx,
                                              MigrationCopyGuardState expected_state,
                                              MigrationCopyGuardState state,
@@ -514,13 +532,20 @@ private:
     void MarkGuardFinalizationPendingSync(const CopyTaskContext &ctx,
                                           CopyCompletionAction action,
                                           const std::string &reason = "");
+    void MarkUnknownGuardPersistencePending(const CopyTaskContext &ctx, const std::string &reason, bool sync_only);
     bool ResumePendingGuardFinalization(const CopyTaskContext &ctx);
     bool PersistRemoteAsyncCopyAcceptance(const std::string &instance_id,
                                           int64_t block_key,
+                                          size_t expected_items,
                                           const AsyncCopyRemoteSubmitResult &remote_result,
                                           CopyTaskContext &out_ctx,
                                           bool &out_cancel_requested);
     void SubmitPreparedTargetLocationDelete(const CopyTaskContext &ctx);
+    void TrackLocationCleanup(const std::string &instance_id,
+                              const std::string &storage_name,
+                              CacheLocationDelRequest request,
+                              std::future<PlanExecuteResult> future);
+    void ProcessCompletedLocationCleanups();
     bool ReserveAsyncCopyCredit(const MigrationRequest &request, uint64_t total_bytes);
     void ReleaseAsyncCopyCredit(const CopyTaskContext &ctx);
     void MoveAsyncCopyCreditToQuarantine(const CopyTaskContext &ctx, const std::string &reason);
@@ -592,14 +617,15 @@ private:
     enum class ClaimResult {
         kClaimedRunning,
         kWasCancelling,
-        kRetryingGuardSync,
+        kRetryingGuardTransition,
         kBusyPreparing,
         kBusyCompleting,
         kNotFound,
     };
     // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
     // kCancelling→置 kCompleting，记住 cancellation owner 并返回 kWasCancelling，交由
-    // CompleteCancelledTask 唯一收尾。已应用终态 CAS 但 Sync 未确认时返回 kRetryingGuardSync。
+    // CompleteCancelledTask 唯一收尾。已认领收尾但 guard 跃迁或其 Sync 屏障尚未
+    // 持久确认时返回 kRetryingGuardTransition。
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
     enum class CancelResult { kMarked, kMarkedPreparing, kAlreadyCancelling, kBusyCompleting, kNotFound };
     // 外部 Cancel 认领：kPreparing→kPrepareCancelling（由提交线程清理）；
@@ -682,6 +708,8 @@ private:
     std::mutex pending_mutex_;
     std::condition_variable pending_cv_;
     std::deque<PendingCopy> pending_copies_;
+    mutable std::mutex pending_cleanup_mutex_;
+    std::deque<PendingLocationCleanup> pending_location_cleanups_;
 
     std::mutex mark_expiry_mutex_;
     std::priority_queue<ExpiringMark, std::vector<ExpiringMark>, ExpiringMarkGreater> mark_expiry_queue_;
