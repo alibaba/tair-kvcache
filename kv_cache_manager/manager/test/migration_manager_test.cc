@@ -1269,6 +1269,8 @@ TEST_F(MigrationManagerTest, TestSubmitThenFail) {
     ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
     ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, block_key));
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
+    ASSERT_EQ(1u, mgr.GetStats().source_failures_recorded);
+    ASSERT_EQ(1u, mgr.GetStats().source_failure_entries);
 }
 
 // ============ Cancel 任务状态机（认领 + 延迟收尾） ============
@@ -2669,13 +2671,14 @@ namespace {
 
 CacheLocationConstPtr MakeLocation(const std::string &id,
                                    const std::string &storage_name,
-                                   CacheLocationStatus status) {
+                                   CacheLocationStatus status,
+                                   int64_t create_time = 0) {
     std::string uri = "dummy://" + storage_name + "/blk?size=8";
-    auto loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-                                               1,
-                                               std::vector<LocationSpec>{LocationSpec("TP0", uri)});
+    auto loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("TP0", uri)});
     loc->set_id(id);
     loc->set_status(status);
+    loc->set_create_time(create_time);
     return loc;
 }
 
@@ -2833,6 +2836,195 @@ TEST_F(MigrationManagerTest, TestCheckCopyAdmissionTriesNextSourceLocation) {
     ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, adm.status);
     ASSERT_NE(nullptr, adm.src_location);
     ASSERT_EQ("loc_src_l1", adm.src_location->id());
+}
+
+TEST_F(MigrationManagerTest, TestCopyFailureBackoffSwitchesToHealthySource) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    const std::string src = "hot_01";
+    const std::string dst = "cold_01";
+    const int64_t block_key = 81;
+
+    auto failed_source = MakeLocation("loc_failed", src, CLS_SERVING, 100);
+    auto healthy_source = MakeLocation("loc_healthy", src, CLS_SERVING, 200);
+
+    MigrationManager::CopyTaskContext failed_ctx;
+    failed_ctx.instance_id = kInstance;
+    failed_ctx.block_key = block_key;
+    failed_ctx.src_location_id = failed_source->id();
+    failed_ctx.src_create_time = failed_source->create_time();
+    failed_ctx.src_storage_name = src;
+    failed_ctx.dst_storage_name = dst;
+    mgr.RecordCopySourceFailure(failed_ctx, EC_PARTIAL_OK);
+
+    CacheLocationMap loc_map;
+    loc_map[failed_source->id()] = failed_source;
+    loc_map[healthy_source->id()] = healthy_source;
+    const auto admission = mgr.CheckCopyAdmission(kInstance, block_key, loc_map, src, dst);
+
+    ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, admission.status);
+    ASSERT_NE(nullptr, admission.src_location);
+    EXPECT_EQ(healthy_source->id(), admission.src_location->id());
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(1u, stats.source_failures_recorded);
+    EXPECT_EQ(1u, stats.source_retries_suppressed);
+    EXPECT_EQ(1u, stats.source_switches);
+    EXPECT_EQ(1u, stats.source_failure_entries);
+    EXPECT_EQ(0u, stats.no_usable_source);
+}
+
+TEST_F(MigrationManagerTest, TestTaskFailureHooksSourceBackoffBeforeRemovingActiveTask) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    auto failed_source = MakeLocation("loc_failed_hook", "hot_01", CLS_SERVING, 100);
+    auto healthy_source = MakeLocation("loc_healthy_hook", "hot_01", CLS_SERVING, 200);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_id = kInstance;
+    ctx.block_key = 810;
+    ctx.src_location_id = failed_source->id();
+    ctx.src_create_time = failed_source->create_time();
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+
+    mgr.OnTaskFailed(kInstance, ctx.block_key, EC_NOENT);
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, ctx.block_key));
+
+    CacheLocationMap loc_map;
+    loc_map.emplace(failed_source->id(), failed_source);
+    loc_map.emplace(healthy_source->id(), healthy_source);
+    const auto admission =
+        mgr.CheckCopyAdmission(kInstance, ctx.block_key, loc_map, ctx.src_storage_name, ctx.dst_storage_name);
+    ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, admission.status);
+    ASSERT_NE(nullptr, admission.src_location);
+    EXPECT_EQ(healthy_source->id(), admission.src_location->id());
+}
+
+TEST_F(MigrationManagerTest, TestFailedSourceStaysLowerPriorityAfterBackoffExpires) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    const std::string src = "hot_01";
+    const std::string dst = "cold_01";
+    const int64_t block_key = 85;
+
+    auto failed_source = MakeLocation("loc_failed", src, CLS_SERVING, 100);
+    auto healthy_source = MakeLocation("loc_healthy", src, CLS_SERVING, 200);
+
+    MigrationManager::CopyTaskContext failed_ctx;
+    failed_ctx.instance_id = kInstance;
+    failed_ctx.block_key = block_key;
+    failed_ctx.src_location_id = failed_source->id();
+    failed_ctx.src_create_time = failed_source->create_time();
+    failed_ctx.src_storage_name = src;
+    failed_ctx.dst_storage_name = dst;
+    mgr.RecordCopySourceFailure(failed_ctx, EC_PARTIAL_OK);
+
+    // Reclaimer 的采样周期可能长于首次 5s backoff。即使退避窗口已经结束，存在从未失败的
+    // 完整副本时也应优先换源，而不是因为坏源再次 eligible 就回到 unordered_map 的随机顺序。
+    const auto failed_key = mgr.MakeCopySourceFailureKey(failed_ctx);
+    {
+        std::lock_guard<std::mutex> lock(mgr.copy_source_failure_mutex_);
+        auto iter = mgr.copy_source_failures_.find(failed_key);
+        ASSERT_NE(mgr.copy_source_failures_.end(), iter);
+        iter->second.retry_after = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    }
+
+    CacheLocationMap loc_map;
+    loc_map[failed_source->id()] = failed_source;
+    loc_map[healthy_source->id()] = healthy_source;
+    const auto admission = mgr.CheckCopyAdmission(kInstance, block_key, loc_map, src, dst);
+
+    ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, admission.status);
+    ASSERT_NE(nullptr, admission.src_location);
+    EXPECT_EQ(healthy_source->id(), admission.src_location->id());
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(0u, stats.source_retries_suppressed);
+    EXPECT_EQ(1u, stats.source_switches);
+}
+
+TEST_F(MigrationManagerTest, TestCopyFailureBackoffStopsRetryWhenNoAlternativeSource) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    const std::string src = "hot_01";
+    const std::string dst = "cold_01";
+    const int64_t block_key = 82;
+    auto failed_source = MakeLocation("loc_failed", src, CLS_SERVING, 100);
+
+    MigrationManager::CopyTaskContext failed_ctx;
+    failed_ctx.instance_id = kInstance;
+    failed_ctx.block_key = block_key;
+    failed_ctx.src_location_id = failed_source->id();
+    failed_ctx.src_create_time = failed_source->create_time();
+    failed_ctx.src_storage_name = src;
+    failed_ctx.dst_storage_name = dst;
+    mgr.RecordCopySourceFailure(failed_ctx, EC_PARTIAL_OK);
+
+    CacheLocationMap loc_map;
+    loc_map[failed_source->id()] = failed_source;
+    const auto admission = mgr.CheckCopyAdmission(kInstance, block_key, loc_map, src, dst);
+
+    EXPECT_EQ(MigrationManager::CopyAdmissionStatus::kSourceRetrySuppressed, admission.status);
+    EXPECT_EQ(nullptr, admission.src_location);
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(1u, stats.source_retries_suppressed);
+    EXPECT_EQ(1u, stats.no_usable_source);
+}
+
+TEST_F(MigrationManagerTest, TestCopyFailureIdentityDoesNotPoisonRecreatedLocationOrOtherTarget) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const std::string src = "hot_01";
+    const int64_t block_key = 83;
+    auto old_source = MakeLocation("loc_reused", src, CLS_SERVING, 100);
+
+    MigrationManager::CopyTaskContext failed_ctx;
+    failed_ctx.instance_id = kInstance;
+    failed_ctx.block_key = block_key;
+    failed_ctx.src_location_id = old_source->id();
+    failed_ctx.src_create_time = old_source->create_time();
+    failed_ctx.src_storage_name = src;
+    failed_ctx.dst_storage_name = "cold_01";
+    mgr.RecordCopySourceFailure(failed_ctx, EC_PARTIAL_OK);
+
+    CacheLocationMap recreated_map;
+    auto recreated_source = MakeLocation("loc_reused", src, CLS_SERVING, 101);
+    recreated_map[recreated_source->id()] = recreated_source;
+    const auto recreated = mgr.CheckCopyAdmission(kInstance, block_key, recreated_map, src, "cold_01");
+    ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, recreated.status);
+    ASSERT_EQ(recreated_source.get(), recreated.src_location);
+
+    CacheLocationMap old_map;
+    old_map[old_source->id()] = old_source;
+    const auto other_target = mgr.CheckCopyAdmission(kInstance, block_key, old_map, src, "archive_01");
+    ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, other_target.status);
+    ASSERT_EQ(old_source.get(), other_target.src_location);
+}
+
+TEST_F(MigrationManagerTest, TestCopySuccessClearsSourceFailureBackoff) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const std::string src = "hot_01";
+    const std::string dst = "cold_01";
+    const int64_t block_key = 84;
+    auto source = MakeLocation("loc_source", src, CLS_SERVING, 100);
+
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = source->id();
+    ctx.src_create_time = source->create_time();
+    ctx.src_storage_name = src;
+    ctx.dst_storage_name = dst;
+    mgr.RecordCopySourceFailure(ctx, EC_PARTIAL_OK);
+
+    CacheLocationMap loc_map;
+    loc_map[source->id()] = source;
+    EXPECT_EQ(MigrationManager::CopyAdmissionStatus::kSourceRetrySuppressed,
+              mgr.CheckCopyAdmission(kInstance, block_key, loc_map, src, dst).status);
+
+    mgr.ClearCopySourceFailure(ctx);
+    const auto admission = mgr.CheckCopyAdmission(kInstance, block_key, loc_map, src, dst);
+    EXPECT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, admission.status);
+    EXPECT_EQ(0u, mgr.GetStats().source_failure_entries);
 }
 
 // 多个 target location 分别覆盖不同 specs，联合覆盖完整时不应 kAccept。
