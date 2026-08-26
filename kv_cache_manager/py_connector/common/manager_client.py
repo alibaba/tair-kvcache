@@ -425,6 +425,10 @@ class KvCacheManagerClient:
         """Report node, cache block, host-down, or heartbeat events."""
         return self._make_api_request('/api/reportEvent', data, check_response)
 
+    def report_optimizer_event(self, data, check_response=True):
+        """Report one out-of-band cache query observation to the optimizer stream."""
+        return self._make_api_request('/api/reportOptimizerEvent', data, check_response)
+
     def trim_cache(self, data, check_response=True):
         """Trim cache data based on specified strategy"""
         return self._make_api_request('/api/trimCache', data, check_response)
