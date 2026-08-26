@@ -144,6 +144,18 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 "copy_poll_max_interval_ms",
                                 copy_poll_max_interval_ms_,
                                 MigrationConfig::kDefaultCopyPollMaxIntervalMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_connect_timeout_ms",
+                                copy_connect_timeout_ms_,
+                                MigrationConfig::kDefaultCopyConnectTimeoutMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_submit_timeout_ms",
+                                copy_submit_timeout_ms_,
+                                MigrationConfig::kDefaultCopySubmitTimeoutMs);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_query_timeout_ms",
+                                copy_query_timeout_ms_,
+                                MigrationConfig::kDefaultCopyQueryTimeoutMs);
     KVCM_JSON_GET_MACRO(rapid_value, "strategies", strategies_);
     return true;
 }
@@ -158,6 +170,9 @@ void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &
     Put(writer, "copy_operation_deadline_ms", copy_operation_deadline_ms_);
     Put(writer, "copy_poll_initial_interval_ms", copy_poll_initial_interval_ms_);
     Put(writer, "copy_poll_max_interval_ms", copy_poll_max_interval_ms_);
+    Put(writer, "copy_connect_timeout_ms", copy_connect_timeout_ms_);
+    Put(writer, "copy_submit_timeout_ms", copy_submit_timeout_ms_);
+    Put(writer, "copy_query_timeout_ms", copy_query_timeout_ms_);
     Put(writer, "strategies", strategies_);
 }
 
@@ -184,6 +199,17 @@ bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const 
         copy_poll_max_interval_ms_ >= copy_operation_deadline_ms_) {
         valid = false;
         local_invalid_fields += "{copy_async_timing}";
+    }
+    if (copy_connect_timeout_ms_ <= 0 || copy_submit_timeout_ms_ < copy_connect_timeout_ms_ ||
+        copy_query_timeout_ms_ < copy_connect_timeout_ms_ ||
+        copy_submit_timeout_ms_ >= copy_operation_deadline_ms_ ||
+        copy_query_timeout_ms_ >= copy_operation_deadline_ms_ ||
+        copy_submit_timeout_ms_ >
+            copy_operation_deadline_ms_ / MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline ||
+        copy_query_timeout_ms_ >
+            copy_operation_deadline_ms_ / MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline) {
+        valid = false;
+        local_invalid_fields += "{copy_async_http_timing}";
     }
     if (copy_execution_mode_ == MigrationCopyExecutionMode::ASYNC_REQUIRED &&
         (copy_max_inflight_bytes_ == 0 || copy_max_quarantine_operations_ <= 0 ||
