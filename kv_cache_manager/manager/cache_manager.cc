@@ -489,6 +489,11 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
     // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
     assert(migration_manager_ != nullptr);
+    registry_manager_->data_storage_manager()->SetAsyncCopyReferenceChecker(
+        [weak_manager = std::weak_ptr<MigrationManager>(migration_manager_)](const std::string &storage_name) {
+            const auto manager = weak_manager.lock();
+            return manager && manager->HasAsyncCopyStorageReference(storage_name);
+        });
 
     cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(std::move(cache_gc_config),
                                                                        registry_manager_,
@@ -1538,7 +1543,7 @@ void CacheManager::JoinCacheGarbageCollector() {
     }
 }
 
-void CacheManager::StartMigrationManager() { migration_manager_->Start(); }
+ErrorCode CacheManager::StartMigrationManager() { return migration_manager_->Start(); }
 void CacheManager::StopMigrationManager() { migration_manager_->Stop(); }
 
 CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *request_context,

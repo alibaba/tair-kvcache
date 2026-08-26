@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -12,8 +13,12 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/event/event_manager.h"
@@ -44,7 +49,61 @@ ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
     }
     return ec;
 }
+
+std::atomic<int> g_guard_sync_call_count{0};
+
+bool FailFirstGuardSyncStub(void * /*obj*/, const KeyVector & /*keys*/) noexcept {
+    return g_guard_sync_call_count.fetch_add(1, std::memory_order_acq_rel) > 0;
+}
 } // namespace
+
+namespace async_guard_recovery_stub {
+std::vector<std::shared_ptr<const InstanceGroup>> groups;
+std::vector<std::shared_ptr<const InstanceInfo>> instances;
+ErrorCode list_groups_result = EC_OK;
+ErrorCode list_instances_result = EC_OK;
+size_t resume_calls = 0;
+std::string resumed_storage;
+std::string resumed_operation_id;
+std::vector<std::string> resumed_task_ids;
+
+std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>
+ListInstanceGroupStub(void * /*obj*/, RequestContext * /*request_context*/) {
+    return {list_groups_result, groups};
+}
+
+std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceInfo>>>
+ListInstanceInfoStub(void * /*obj*/, RequestContext * /*request_context*/, const std::string &group_name) {
+    std::vector<std::shared_ptr<const InstanceInfo>> filtered;
+    for (const auto &instance : instances) {
+        if (instance && instance->instance_group_name() == group_name) {
+            filtered.push_back(instance);
+        }
+    }
+    return {list_instances_result, filtered};
+}
+
+AsyncCopyExecuteSubmitResult ResumeAsyncCopyStub(void * /*obj*/,
+                                                 const std::string &storage_name,
+                                                 const std::vector<std::string> &backend_task_ids,
+                                                 size_t /*expected_items*/,
+                                                 const std::string &operation_id,
+                                                 const AsyncCopyOptions & /*options*/) {
+    ++resume_calls;
+    resumed_storage = storage_name;
+    resumed_operation_id = operation_id;
+    resumed_task_ids = backend_task_ids;
+    AsyncCopyExecuteSubmitResult result;
+    result.submit_result.status = EC_OK;
+    result.submit_result.accepted = true;
+    result.submit_result.operation_id = operation_id;
+    result.submit_result.backend_task_ids = backend_task_ids;
+    auto completion = std::make_shared<std::promise<PlanExecuteResult>>();
+    result.future = completion->get_future();
+    completion->set_value(PlanExecuteResult{EC_OK, "", true, true});
+    return result;
+}
+} // namespace async_guard_recovery_stub
 
 // ---- orphan cleanup 测试用 DataStorageManager::Create/Delete 存根 ----
 // 复现"异构 size spec 分散到多个 create_group、某 group 失败使 block ineligible、
@@ -3027,6 +3086,590 @@ TEST_F(MigrationManagerTest, TestCopySuccessClearsSourceFailureBackoff) {
     EXPECT_EQ(0u, mgr.GetStats().source_failure_entries);
 }
 
+TEST_F(MigrationManagerTest, TestGuardRecoveryRebuildsQuarantineAndFailsBeforeClearingOnScanSetupError) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    constexpr int64_t block_key = 859;
+    constexpr uint64_t total_bytes = 7;
+    const std::string operation_id = "recovered-unknown-operation";
+
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
+    guard.set_operation_id(operation_id);
+    guard.set_source_location_id("recovered-source");
+    guard.set_source_location_create_time(1);
+    guard.set_source_storage_name("hot_01");
+    guard.set_target_storage_name("cold_01");
+    guard.set_total_bytes(total_bytes);
+    guard.set_backend_task_ids({"pace-recovered-task"});
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_guard_recovery_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/recovered?size=7")});
+    target->set_migration_copy_guard(guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    auto group = std::make_shared<InstanceGroup>();
+    group->set_name("recovery-group");
+    group->set_cache_config(std::make_shared<CacheConfig>());
+    auto instance = std::make_shared<InstanceInfo>();
+    instance->set_instance_id(kInstance);
+    instance->set_instance_group_name(group->name());
+    async_guard_recovery_stub::groups = {group};
+    async_guard_recovery_stub::instances = {instance};
+    async_guard_recovery_stub::list_groups_result = EC_OK;
+    async_guard_recovery_stub::list_instances_result = EC_OK;
+
+    Stub stub;
+    stub.set(ADDR(RegistryManager, ListInstanceGroup), async_guard_recovery_stub::ListInstanceGroupStub);
+    stub.set(ADDR(RegistryManager, ListInstanceInfo), async_guard_recovery_stub::ListInstanceInfoStub);
+    auto registry = std::make_shared<RegistryManager>("", metrics_registry_);
+    MigrationManager mgr(
+        schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr, registry);
+
+    ASSERT_TRUE(mgr.RecoverAsyncCopyGuards());
+    const auto quarantined = mgr.ListAsyncCopyQuarantine(group->name());
+    ASSERT_EQ(1u, quarantined.size());
+    EXPECT_EQ(operation_id, quarantined[0].guard.operation_id());
+    EXPECT_EQ(total_bytes, mgr.GetStats().async_copy_quarantine_bytes);
+    EXPECT_EQ(0u, mgr.GetStats().async_copy_inflight_operations);
+
+    // A later setup/list failure must return before replacing the previously
+    // rebuilt accounting tables; leader code will demote instead of serving a
+    // false-empty quarantine view.
+    async_guard_recovery_stub::list_groups_result = EC_ERROR;
+    EXPECT_FALSE(mgr.RecoverAsyncCopyGuards());
+    EXPECT_EQ(1u, mgr.ListAsyncCopyQuarantine(group->name()).size());
+
+    async_guard_recovery_stub::groups.clear();
+    async_guard_recovery_stub::instances.clear();
+    async_guard_recovery_stub::list_groups_result = EC_OK;
+    async_guard_recovery_stub::list_instances_result = EC_OK;
+}
+
+TEST_F(MigrationManagerTest, TestGuardRecoveryResumesActiveTaskWithPersistedHandles) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    constexpr int64_t block_key = 860;
+    const std::string operation_id = "recovered-active-operation";
+    const std::vector<std::string> task_ids = {"pace-recovered-active-task"};
+
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
+    guard.set_operation_id(operation_id);
+    guard.set_source_location_id("recovered-active-source");
+    guard.set_source_location_create_time(1);
+    guard.set_source_storage_name("hot_01");
+    guard.set_target_storage_name("cold_01");
+    guard.set_total_bytes(7);
+    guard.set_backend_task_ids(task_ids);
+    guard.set_create_time_us(TimestampUtil::GetCurrentTimeUs());
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_guard_recovery_active_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/recovered-active?size=7")});
+    target->set_migration_copy_guard(guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    auto group = std::make_shared<InstanceGroup>();
+    group->set_name("recovery-active-group");
+    group->set_cache_config(std::make_shared<CacheConfig>());
+    auto instance = std::make_shared<InstanceInfo>();
+    instance->set_instance_id(kInstance);
+    instance->set_instance_group_name(group->name());
+    async_guard_recovery_stub::groups = {group};
+    async_guard_recovery_stub::instances = {instance};
+    async_guard_recovery_stub::list_groups_result = EC_OK;
+    async_guard_recovery_stub::list_instances_result = EC_OK;
+    async_guard_recovery_stub::resume_calls = 0;
+    async_guard_recovery_stub::resumed_storage.clear();
+    async_guard_recovery_stub::resumed_operation_id.clear();
+    async_guard_recovery_stub::resumed_task_ids.clear();
+
+    Stub stub;
+    stub.set(ADDR(RegistryManager, ListInstanceGroup), async_guard_recovery_stub::ListInstanceGroupStub);
+    stub.set(ADDR(RegistryManager, ListInstanceInfo), async_guard_recovery_stub::ListInstanceInfoStub);
+    stub.set(ADDR(SchedulePlanExecutor, ResumeAsyncCopy), async_guard_recovery_stub::ResumeAsyncCopyStub);
+    auto registry = std::make_shared<RegistryManager>("", metrics_registry_);
+    MigrationManager mgr(
+        schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr, registry);
+
+    ASSERT_TRUE(mgr.RecoverAsyncCopyGuards());
+    EXPECT_EQ(1u, async_guard_recovery_stub::resume_calls);
+    EXPECT_EQ("hot_01", async_guard_recovery_stub::resumed_storage);
+    EXPECT_EQ(operation_id, async_guard_recovery_stub::resumed_operation_id);
+    EXPECT_EQ(task_ids, async_guard_recovery_stub::resumed_task_ids);
+    EXPECT_TRUE(mgr.HasMigrationTask(kInstance, block_key));
+    EXPECT_TRUE(mgr.ListAsyncCopyQuarantine(group->name()).empty());
+    EXPECT_EQ(1u, mgr.GetStats().async_copy_inflight_operations);
+
+    async_guard_recovery_stub::groups.clear();
+    async_guard_recovery_stub::instances.clear();
+}
+
+TEST_F(MigrationManagerTest, TestRemoteAsyncAcceptancePersistsActiveTaskHandles) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "async_accept_hot/"));
+    const int64_t block_key = 86;
+    const std::string source_id = CreateSourceLocation(block_key, "hot_01", false, "payload");
+    const auto source = GetLocation(block_key, source_id);
+    ASSERT_TRUE(source);
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_accept_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/target?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = source_id;
+    ctx.src_create_time = source->create_time();
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "async-operation-86";
+    ctx.async_guard_create_time_us = 100;
+    ctx.total_bytes = 7;
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(
+                  ctx, MigrationCopyGuardState::MCGS_NONE, MigrationCopyGuardState::MCGS_SUBMITTING, {}, ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+
+    AsyncCopyRemoteSubmitResult remote;
+    remote.status = EC_OK;
+    remote.accepted = true;
+    remote.operation_id = ctx.async_operation_id;
+    remote.backend_task_ids = {"pace-task-86"};
+    MigrationManager::CopyTaskContext accepted_ctx;
+    bool cancel_requested = true;
+    ASSERT_TRUE(mgr.PersistRemoteAsyncCopyAcceptance(
+        kInstance, block_key, remote, accepted_ctx, cancel_requested));
+    EXPECT_FALSE(cancel_requested);
+    EXPECT_EQ(remote.backend_task_ids, accepted_ctx.async_backend_task_ids);
+
+    const auto guarded_target = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(guarded_target);
+    ASSERT_TRUE(guarded_target->has_migration_copy_guard());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_ACTIVE, guarded_target->migration_copy_guard().state());
+    EXPECT_EQ(remote.backend_task_ids, guarded_target->migration_copy_guard().backend_task_ids());
+}
+
+TEST_F(MigrationManagerTest, TestCancellationBeforeRemoteAcceptanceCannotBeOverwrittenByActive) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "async_cancel_hot/"));
+    const int64_t block_key = 87;
+    const std::string source_id = CreateSourceLocation(block_key, "hot_01", false, "payload");
+    const auto source = GetLocation(block_key, source_id);
+    ASSERT_TRUE(source);
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_cancel_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/target?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = source_id;
+    ctx.src_create_time = source->create_time();
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "async-operation-87";
+    ctx.async_guard_create_time_us = 100;
+    ctx.total_bytes = 7;
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(
+                  ctx, MigrationCopyGuardState::MCGS_NONE, MigrationCopyGuardState::MCGS_SUBMITTING, {}, ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+
+    ASSERT_EQ(EC_OK, mgr.Cancel(kInstance, block_key));
+    AsyncCopyRemoteSubmitResult remote;
+    remote.status = EC_OK;
+    remote.accepted = true;
+    remote.operation_id = ctx.async_operation_id;
+    remote.backend_task_ids = {"pace-task-87"};
+    MigrationManager::CopyTaskContext accepted_ctx;
+    bool cancel_requested = false;
+    ASSERT_TRUE(mgr.PersistRemoteAsyncCopyAcceptance(
+        kInstance, block_key, remote, accepted_ctx, cancel_requested));
+    EXPECT_TRUE(cancel_requested);
+
+    // Every non-initial guard transition checks both operation-id and state.
+    // A stale ACTIVE writer must not regress the durable CANCELLING intent.
+    EXPECT_EQ(MigrationManager::GuardMutationResult::kNotApplied,
+              mgr.UpdateAsyncCopyGuard(accepted_ctx,
+                                       MigrationCopyGuardState::MCGS_ACTIVE,
+                                       MigrationCopyGuardState::MCGS_UNKNOWN,
+                                       remote.backend_task_ids,
+                                       "stale-active-writer"));
+
+    const auto guarded_target = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(guarded_target);
+    ASSERT_TRUE(guarded_target->has_migration_copy_guard());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_CANCELLING, guarded_target->migration_copy_guard().state());
+    EXPECT_EQ(remote.backend_task_ids, guarded_target->migration_copy_guard().backend_task_ids());
+}
+
+TEST_F(MigrationManagerTest, TestCancelAndCompletionHaveExactlyOneTerminalOwner) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "async_race_cold/"));
+    constexpr int64_t block_key = 871;
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_cancel_completion_race");
+    auto target =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/race?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_group_name = "group-race";
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = "source-race";
+    ctx.src_create_time = 1;
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "async-operation-race";
+    ctx.async_backend_task_ids = {"pace-task-race"};
+    ctx.async_credit_active = true;
+    ctx.total_bytes = 7;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(ctx,
+                                       MigrationCopyGuardState::MCGS_NONE,
+                                       MigrationCopyGuardState::MCGS_ACTIVE,
+                                       ctx.async_backend_task_ids,
+                                       ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+    ASSERT_TRUE(mgr.RestoreAsyncCopyInflightCredit(ctx));
+
+    const auto transition_mutex = mgr.GetAsyncTransitionMutex(kInstance, block_key);
+    ASSERT_TRUE(transition_mutex);
+    std::unique_lock<std::mutex> hold_transition(*transition_mutex);
+    std::atomic<int> ready{0};
+    auto cancel = std::async(std::launch::async, [&]() {
+        ready.fetch_add(1, std::memory_order_release);
+        return mgr.Cancel(kInstance, block_key);
+    });
+    auto completion = std::async(std::launch::async, [&]() {
+        ready.fetch_add(1, std::memory_order_release);
+        return mgr.OnTaskFailed(kInstance, block_key, EC_ERROR);
+    });
+    while (ready.load(std::memory_order_acquire) != 2) {
+        std::this_thread::yield();
+    }
+    hold_transition.unlock();
+
+    const ErrorCode cancel_result = cancel.get();
+    EXPECT_TRUE(cancel_result == EC_OK || cancel_result == EC_EXIST || cancel_result == EC_NOENT);
+    EXPECT_TRUE(completion.get());
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(1u, stats.copy_failed + stats.copy_cancelled);
+    EXPECT_EQ(0u, stats.async_copy_inflight_operations);
+    EXPECT_EQ(0u, stats.async_copy_quarantine_operations);
+
+    const auto persisted = GetLocation(block_key, target_ids[0]);
+    if (persisted) {
+        EXPECT_EQ(CLS_DELETING, persisted->status());
+        EXPECT_FALSE(persisted->has_migration_copy_guard());
+    }
+}
+
+TEST_F(MigrationManagerTest, TestAppliedFinalizationRetriesOnlySyncWithoutPhantomQuarantine) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "async_sync_retry_hot/"));
+    constexpr int64_t block_key = 872;
+    const std::string source_id = CreateSourceLocation(block_key, "hot_01", false, "payload");
+    const auto source = GetLocation(block_key, source_id);
+    ASSERT_TRUE(source);
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("async_guard_sync_retry");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/sync-retry?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_group_name = "group-sync-retry";
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = source_id;
+    ctx.src_create_time = source->create_time();
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "async-operation-sync-retry";
+    ctx.async_backend_task_ids = {"pace-task-sync-retry"};
+    ctx.async_credit_active = true;
+    ctx.total_bytes = 7;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(ctx,
+                                       MigrationCopyGuardState::MCGS_NONE,
+                                       MigrationCopyGuardState::MCGS_ACTIVE,
+                                       ctx.async_backend_task_ids,
+                                       ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+    ASSERT_TRUE(mgr.RestoreAsyncCopyInflightCredit(ctx));
+
+    Stub stub;
+    g_guard_sync_call_count.store(0, std::memory_order_release);
+    stub.set(ADDR(MetaIndexer, Sync), FailFirstGuardSyncStub);
+
+    EXPECT_FALSE(mgr.OnTaskSuccess(kInstance, block_key));
+    const auto applied = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(applied);
+    EXPECT_EQ(CLS_SERVING, applied->status());
+    EXPECT_FALSE(applied->has_migration_copy_guard());
+    EXPECT_TRUE(mgr.HasMigrationTask(kInstance, block_key));
+    EXPECT_EQ(1u, mgr.GetStats().async_copy_inflight_operations);
+    EXPECT_EQ(0u, mgr.GetStats().async_copy_quarantine_operations);
+
+    EXPECT_TRUE(mgr.OnTaskSuccess(kInstance, block_key));
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(1u, stats.copy_completed);
+    EXPECT_EQ(0u, stats.copy_failed);
+    EXPECT_EQ(0u, stats.async_copy_unknown);
+    EXPECT_EQ(0u, stats.async_copy_inflight_operations);
+    EXPECT_EQ(0u, stats.async_copy_quarantine_operations);
+}
+
+TEST_F(MigrationManagerTest, TestDefinitePreSubmitFailureDoesNotEnterRemoteUnknownQuarantine) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    constexpr int64_t block_key = 88;
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("pre_submit_failure_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/target?size=7")});
+    MigrationCopyGuard other_guard;
+    other_guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    other_guard.set_state(MigrationCopyGuardState::MCGS_SUBMITTING);
+    other_guard.set_operation_id("persisted-other-operation");
+    target->set_migration_copy_guard(other_guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_group_name = "group-88";
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = "source-88";
+    ctx.src_create_time = 88;
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "never-submitted-operation";
+    ctx.async_credit_active = true;
+    ctx.total_bytes = 7;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+    mgr.RestoreAsyncCopyInflightCredit(ctx);
+    ASSERT_EQ(1u, mgr.GetStats().async_copy_inflight_operations);
+
+    // The exact-owner finalize intentionally fails because the persisted
+    // guard belongs to another operation.  Since no backend handoff happened,
+    // this must release local admission credit without inventing a remote
+    // UNKNOWN operation or deleting the other owner's target.
+    mgr.CompleteCopyTaskAsFailed(ctx, "guard_install_failed_before_submit", false);
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(0u, stats.async_copy_inflight_operations);
+    EXPECT_EQ(0u, stats.async_copy_quarantine_operations);
+    EXPECT_EQ(0u, stats.async_copy_unknown);
+    EXPECT_EQ(0u, stats.active_copy_tasks);
+
+    const auto persisted = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(persisted);
+    ASSERT_TRUE(persisted->has_migration_copy_guard());
+    EXPECT_EQ("persisted-other-operation", persisted->migration_copy_guard().operation_id());
+    EXPECT_EQ(CLS_WRITING, persisted->status());
+}
+
+TEST_F(MigrationManagerTest, TestBreakGlassReleaseRequiresUnknownGuardAndClearsQuarantine) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "break_glass_cold/"));
+    constexpr int64_t block_key = 89;
+    constexpr uint64_t total_bytes = 7;
+    const std::string operation_id = "async-operation-89";
+    const std::string group_name = "group-89";
+
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
+    guard.set_operation_id(operation_id);
+    guard.set_source_location_id("source-89");
+    guard.set_source_location_create_time(89);
+    guard.set_source_storage_name("hot_01");
+    guard.set_target_storage_name("cold_01");
+    guard.set_total_bytes(total_bytes);
+    guard.set_backend_task_ids({"pace-task-89"});
+    guard.set_last_error("remote_terminal_state_unknown");
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("break_glass_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/target-89?size=7")});
+    target->set_migration_copy_guard(guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    {
+        std::lock_guard<std::mutex> lock(mgr.async_copy_usage_mutex_);
+        mgr.async_copy_quarantine_by_operation_.emplace(
+            operation_id,
+            MigrationManager::AsyncCopyQuarantineRecord{
+                group_name, kInstance, block_key, target_ids[0], guard});
+        auto &usage = mgr.async_copy_usage_by_group_[group_name];
+        usage.quarantine_operations = 1;
+        usage.quarantine_bytes = total_bytes;
+    }
+
+    ASSERT_EQ(1u, mgr.ListAsyncCopyQuarantine(group_name).size());
+    EXPECT_EQ(EC_BADARGS, mgr.BreakGlassReleaseAsyncCopy(operation_id, "", "ticket-89"));
+    EXPECT_EQ(EC_NOENT, mgr.BreakGlassReleaseAsyncCopy("missing-operation", "operator-89", "ticket-89"));
+    EXPECT_EQ(EC_OK, mgr.BreakGlassReleaseAsyncCopy(operation_id, "operator-89", "ticket-89"));
+    EXPECT_TRUE(mgr.ListAsyncCopyQuarantine(group_name).empty());
+    const auto stats = mgr.GetStats();
+    EXPECT_EQ(0u, stats.async_copy_quarantine_operations);
+    EXPECT_EQ(0u, stats.async_copy_quarantine_bytes);
+
+    // The exact-owner CAS must clear the durable guard before the asynchronous
+    // target deletion is handed to SchedulePlanExecutor.  Depending on worker
+    // timing the location is either already gone or observably DELETING, but it
+    // must never remain a reusable WRITING location with a silently erased guard.
+    const auto released = GetLocation(block_key, target_ids[0]);
+    if (released) {
+        EXPECT_EQ(CLS_DELETING, released->status());
+        EXPECT_FALSE(released->has_migration_copy_guard());
+    }
+}
+
+TEST_F(MigrationManagerTest, TestBreakGlassRejectsPersistentStateOrOperationMismatch) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("break_glass_mismatch_targets");
+
+    auto make_guard = [](const std::string &operation_id, MigrationCopyGuardState state) {
+        MigrationCopyGuard guard;
+        guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+        guard.set_state(state);
+        guard.set_operation_id(operation_id);
+        guard.set_source_location_id("source-mismatch");
+        guard.set_source_location_create_time(1);
+        guard.set_source_storage_name("hot_01");
+        guard.set_target_storage_name("cold_01");
+        guard.set_total_bytes(7);
+        guard.set_backend_task_ids({"pace-task-mismatch"});
+        return guard;
+    };
+    auto active_target =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/active?size=7")});
+    active_target->set_migration_copy_guard(make_guard("active-state-operation", MigrationCopyGuardState::MCGS_ACTIVE));
+    auto other_owner_target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/other-owner?size=7")});
+    other_owner_target->set_migration_copy_guard(
+        make_guard("persistent-other-operation", MigrationCopyGuardState::MCGS_UNKNOWN));
+
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(
+        EC_OK,
+        BatchAddLocationForTest(&searcher, rc.get(), {890, 891}, {active_target, other_owner_target}, target_ids));
+    ASSERT_EQ(2u, target_ids.size());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const auto active_record_guard = make_guard("active-state-operation", MigrationCopyGuardState::MCGS_UNKNOWN);
+    const auto wrong_owner_record_guard = make_guard("recorded-operation", MigrationCopyGuardState::MCGS_UNKNOWN);
+    {
+        std::lock_guard<std::mutex> lock(mgr.async_copy_usage_mutex_);
+        mgr.async_copy_quarantine_by_operation_.emplace(
+            "active-state-operation",
+            MigrationManager::AsyncCopyQuarantineRecord{
+                "group-mismatch", kInstance, 890, target_ids[0], active_record_guard});
+        mgr.async_copy_quarantine_by_operation_.emplace(
+            "recorded-operation",
+            MigrationManager::AsyncCopyQuarantineRecord{
+                "group-mismatch", kInstance, 891, target_ids[1], wrong_owner_record_guard});
+        auto &usage = mgr.async_copy_usage_by_group_["group-mismatch"];
+        usage.quarantine_operations = 2;
+        usage.quarantine_bytes = 14;
+    }
+
+    EXPECT_EQ(EC_MISMATCH,
+              mgr.BreakGlassReleaseAsyncCopy("active-state-operation", "operator", "external-terminal-proof"));
+    EXPECT_EQ(EC_MISMATCH, mgr.BreakGlassReleaseAsyncCopy("recorded-operation", "operator", "external-terminal-proof"));
+    EXPECT_EQ(2u, mgr.ListAsyncCopyQuarantine("group-mismatch").size());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_ACTIVE, GetLocation(890, target_ids[0])->migration_copy_guard().state());
+    EXPECT_EQ("persistent-other-operation", GetLocation(891, target_ids[1])->migration_copy_guard().operation_id());
+}
+
 // 多个 target location 分别覆盖不同 specs，联合覆盖完整时不应 kAccept。
 TEST_F(MigrationManagerTest, TestCheckCopyAdmissionUnionCoverage) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -3134,6 +3777,120 @@ TEST_F(MigrationManagerTest, TestStopDropsActiveTasks) {
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 1001));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
     mgr.Stop();
+}
+
+TEST_F(MigrationManagerTest, TestStopDetachesRecoverableAsyncCopyWithoutQuarantine) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    constexpr int64_t block_key = 1003;
+    constexpr uint64_t total_bytes = 7;
+    const std::string operation_id = "stop-detach-operation";
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("stop_detach_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/stop-detach?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_EQ(EC_OK, mgr.Start());
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_group_name = "stop-detach-group";
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = "stop-detach-source";
+    ctx.src_create_time = 1;
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = operation_id;
+    ctx.async_backend_task_ids = {"pace-stop-detach-task"};
+    ctx.async_credit_active = true;
+    ctx.async_guard_create_time_us = TimestampUtil::GetCurrentTimeUs();
+    ctx.total_bytes = total_bytes;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(ctx,
+                                       MigrationCopyGuardState::MCGS_NONE,
+                                       MigrationCopyGuardState::MCGS_ACTIVE,
+                                       ctx.async_backend_task_ids,
+                                       ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+    ASSERT_TRUE(mgr.RestoreAsyncCopyInflightCredit(ctx));
+
+    mgr.Stop();
+
+    EXPECT_EQ(0u, mgr.ActiveTaskCount());
+    EXPECT_TRUE(mgr.ListAsyncCopyQuarantine(ctx.instance_group_name).empty());
+    const auto persisted = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(persisted);
+    ASSERT_TRUE(persisted->has_migration_copy_guard());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_ACTIVE, persisted->migration_copy_guard().state());
+    EXPECT_EQ(operation_id, persisted->migration_copy_guard().operation_id());
+    EXPECT_EQ(ctx.async_backend_task_ids, persisted->migration_copy_guard().backend_task_ids());
+}
+
+TEST_F(MigrationManagerTest, TestStopQuarantinesSubmittingAsyncCopyWithoutTaskIds) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    constexpr int64_t block_key = 1004;
+
+    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
+    auto rc = std::make_shared<RequestContext>("stop_submitting_target");
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/stop-submitting?size=7")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, rc.get(), {block_key}, {target}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_EQ(EC_OK, mgr.Start());
+    MigrationManager::CopyTaskContext ctx;
+    ctx.instance_group_name = "stop-submitting-group";
+    ctx.instance_id = kInstance;
+    ctx.block_key = block_key;
+    ctx.src_location_id = "stop-submitting-source";
+    ctx.src_create_time = 1;
+    ctx.src_storage_name = "hot_01";
+    ctx.dst_storage_name = "cold_01";
+    ctx.dst_location_id = target_ids[0];
+    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    ctx.async_operation_id = "stop-submitting-operation";
+    ctx.async_credit_active = true;
+    ctx.async_guard_create_time_us = TimestampUtil::GetCurrentTimeUs();
+    ctx.total_bytes = 7;
+    ctx.submit_time = std::chrono::steady_clock::now();
+    ctx.state = MigrationManager::CopyTaskState::kRunning;
+    ASSERT_EQ(MigrationManager::GuardMutationResult::kAppliedDurably,
+              mgr.UpdateAsyncCopyGuard(ctx,
+                                       MigrationCopyGuardState::MCGS_NONE,
+                                       MigrationCopyGuardState::MCGS_SUBMITTING,
+                                       {},
+                                       ""));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
+    }
+    ASSERT_TRUE(mgr.RestoreAsyncCopyInflightCredit(ctx));
+
+    mgr.Stop();
+
+    const auto quarantined = mgr.ListAsyncCopyQuarantine(ctx.instance_group_name);
+    ASSERT_EQ(1u, quarantined.size());
+    EXPECT_EQ(ctx.async_operation_id, quarantined[0].guard.operation_id());
+    const auto persisted = GetLocation(block_key, target_ids[0]);
+    ASSERT_TRUE(persisted);
+    ASSERT_TRUE(persisted->has_migration_copy_guard());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_UNKNOWN, persisted->migration_copy_guard().state());
 }
 
 // GetActiveBlockKeysForInstance 返回指定 instance 的活跃 block_key 列表（用于 drain 前 BatchCancel）。

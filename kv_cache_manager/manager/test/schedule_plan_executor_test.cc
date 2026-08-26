@@ -344,6 +344,77 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     // 等待任务完成 (即使DataStorageManager为nullptr，任务也会完成，只是存储删除会失败)
     future.get();
 }
+
+TEST_F(SchedulePlanExecutorTest, TestMetaDeleteSkipsGuardedTargetAndItsExactSource) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(EC_OK, CreateDataStorage());
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    auto request_context = std::make_shared<RequestContext>("guarded_source_delete");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    constexpr int64_t block_key = 201;
+
+    auto source = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        std::vector<LocationSpec>{SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "TP0", "nfs://nfs_01/guarded_source")});
+    source->set_status(CLS_SERVING);
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(
+                  &meta_searcher, request_context.get(), {block_key}, {source}, source_ids));
+    ASSERT_EQ(1u, source_ids.size());
+    std::vector<std::vector<ErrorCode>> source_cas_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher.BatchCASLocationStatus(
+                  request_context.get(),
+                  {block_key},
+                  {{MetaSearcher::LocationCASTask{source_ids[0], CLS_WRITING, CLS_SERVING}}},
+                  source_cas_results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), source_cas_results);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher.BatchGetLocation(
+                  request_context.get(), {block_key}, empty_mask, location_maps));
+    const auto persisted_source = location_maps[0].at(source_ids[0]);
+
+    auto target = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        std::vector<LocationSpec>{SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "TP0", "nfs://nfs_01/guarded_target")});
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
+    guard.set_operation_id("guarded-delete-operation");
+    guard.set_source_location_id(persisted_source->id());
+    guard.set_source_location_create_time(persisted_source->create_time());
+    guard.set_source_storage_name("nfs_01");
+    guard.set_target_storage_name("nfs_01");
+    target->set_migration_copy_guard(guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(
+                  &meta_searcher, request_context.get(), {block_key}, {target}, target_ids));
+
+    const auto result = executor.Submit(CacheMetaDelRequest{
+                                            .instance_id = kTestInstanceName,
+                                            .block_keys = {block_key},
+                                        })
+                            .get();
+    ASSERT_EQ(EC_OK, result.status);
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK,
+              meta_searcher.BatchGetLocation(
+                  request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(2u, location_maps[0].size());
+    EXPECT_EQ(CLS_SERVING, location_maps[0].at(source_ids[0])->status());
+    EXPECT_EQ(CLS_WRITING, location_maps[0].at(target_ids[0])->status());
+    EXPECT_TRUE(location_maps[0].at(target_ids[0])->has_migration_copy_guard());
+}
 // 测试一个block_key对应多个location的情况
 TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     // 创建 MetaIndexer
