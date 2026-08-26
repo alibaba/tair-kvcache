@@ -183,6 +183,9 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
         "migration_config": {
             "copy_max_concurrency": 6,
             "mark_clear_policy": 1,
+            "copy_connect_timeout_ms": 750,
+            "copy_submit_timeout_ms": 2500,
+            "copy_query_timeout_ms": 2800,
             "strategies": [
                 {
                     "source_storage_name": "pace_mempool_01",
@@ -204,6 +207,9 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     ASSERT_TRUE(cache_config.FromJsonString(json));
     ASSERT_EQ(6, cache_config.migration_copy_max_concurrency());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED, cache_config.migration_mark_clear_policy());
+    ASSERT_EQ(750, cache_config.migration_copy_connect_timeout_ms());
+    ASSERT_EQ(2500, cache_config.migration_copy_submit_timeout_ms());
+    ASSERT_EQ(2800, cache_config.migration_copy_query_timeout_ms());
     ASSERT_EQ(2u, cache_config.migration_strategies().size());
     ASSERT_EQ("pace_mempool_01", cache_config.migration_strategies()[0]->source_storage_name());
     ASSERT_EQ("pace_ssd_02", cache_config.migration_strategies()[1]->target_storage_name());
@@ -214,6 +220,9 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     ASSERT_TRUE(parsed.FromJsonString(cache_config.ToJsonString()));
     ASSERT_EQ(6, parsed.migration_copy_max_concurrency());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED, parsed.migration_mark_clear_policy());
+    ASSERT_EQ(750, parsed.migration_copy_connect_timeout_ms());
+    ASSERT_EQ(2500, parsed.migration_copy_submit_timeout_ms());
+    ASSERT_EQ(2800, parsed.migration_copy_query_timeout_ms());
     ASSERT_EQ(2u, parsed.migration_strategies().size());
     ASSERT_DOUBLE_EQ(0.70, parsed.migration_strategies()[0]->trigger_threshold());
     ASSERT_EQ(120000, parsed.migration_strategies()[1]->methods().mark().timeout_ms());
@@ -228,7 +237,64 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     ASSERT_TRUE(no_migration.FromJsonString(json2));
     ASSERT_EQ(CacheConfig::kDefaultMigrationCopyMaxConcurrency, no_migration.migration_copy_max_concurrency());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS, no_migration.migration_mark_clear_policy());
+    ASSERT_EQ(MigrationConfig::kDefaultCopyConnectTimeoutMs,
+              no_migration.migration_copy_connect_timeout_ms());
+    ASSERT_EQ(MigrationConfig::kDefaultCopySubmitTimeoutMs,
+              no_migration.migration_copy_submit_timeout_ms());
+    ASSERT_EQ(MigrationConfig::kDefaultCopyQueryTimeoutMs, no_migration.migration_copy_query_timeout_ms());
     ASSERT_TRUE(no_migration.migration_strategies().empty());
+}
+
+TEST_F(MigrationStrategyTest, TestMigrationConfigRejectsInvalidAsyncHttpTiming) {
+    const auto expect_invalid = [](const MigrationConfig &config) {
+        std::string invalid_fields;
+        EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+        EXPECT_NE(std::string::npos, invalid_fields.find("copy_async_http_timing"));
+    };
+
+    MigrationConfig config;
+    std::string invalid_fields;
+    ASSERT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    config.set_copy_connect_timeout_ms(0);
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_submit_timeout_ms(config.copy_connect_timeout_ms() - 1);
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_query_timeout_ms(config.copy_connect_timeout_ms() - 1);
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_operation_deadline_ms(config.copy_submit_timeout_ms());
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_operation_deadline_ms(config.copy_query_timeout_ms());
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_submit_timeout_ms(
+        config.copy_operation_deadline_ms() /
+            MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline +
+        1);
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_query_timeout_ms(
+        config.copy_operation_deadline_ms() /
+            MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline +
+        1);
+    expect_invalid(config);
+
+    config = MigrationConfig();
+    config.set_copy_operation_deadline_ms(
+        config.copy_query_timeout_ms() *
+        MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline);
+    invalid_fields.clear();
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
 }
 
 TEST_F(MigrationStrategyTest, TestCacheConfigRejectsInvalidMigrationCopyConcurrency) {
