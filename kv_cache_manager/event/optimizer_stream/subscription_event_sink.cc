@@ -40,6 +40,19 @@ bool SubscriptionEventSink::Subscription::Enqueue(const proto::optimizer::TraceQ
     return true;
 }
 
+bool SubscriptionEventSink::Subscription::EnqueueBatch(
+    const std::vector<proto::optimizer::TraceQueryRequest> &events) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ || events.size() > queue_size_ - queue_.size()) {
+            return false;
+        }
+        queue_.insert(queue_.end(), events.begin(), events.end());
+    }
+    cv_.notify_all();
+    return true;
+}
+
 void SubscriptionEventSink::Subscription::Close() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -107,6 +120,7 @@ void SubscriptionEventSink::DisableSubscriptions() {
 }
 
 bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
+    std::lock_guard<std::mutex> send_lock(send_mutex_);
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
@@ -127,6 +141,37 @@ bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &even
             delivered = true;
         } else {
             dropped_.fetch_add(1);
+        }
+    }
+    return delivered;
+}
+
+bool SubscriptionEventSink::SendBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events) {
+    if (events.empty()) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> send_lock(send_mutex_);
+    std::vector<std::shared_ptr<Subscription>> subscriptions;
+    {
+        std::lock_guard<std::mutex> lock(subscriptions_mutex_);
+        if (stopped_ || !accepting_subscriptions_) {
+            dropped_.fetch_add(events.size());
+            return false;
+        }
+        subscriptions = subscriptions_;
+    }
+    if (subscriptions.empty()) {
+        dropped_.fetch_add(events.size());
+        return false;
+    }
+
+    bool delivered = false;
+    for (const auto &subscription : subscriptions) {
+        if (subscription->EnqueueBatch(events)) {
+            delivered = true;
+        } else {
+            dropped_.fetch_add(events.size());
         }
     }
     return delivered;

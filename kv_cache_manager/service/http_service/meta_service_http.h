@@ -4,6 +4,7 @@
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
 
@@ -11,6 +12,7 @@ namespace kv_cache_manager {
 
 class MetaServiceImpl;
 class MetricsRegistry;
+class OptimizerEventServiceGRpc;
 struct MetricsLifecycle;
 
 class MetaServiceHttp : public CoroHttpService, public MetaServiceMetricsBase {
@@ -18,6 +20,7 @@ public:
     MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                     std::shared_ptr<MetaServiceImpl> meta_service_impl,
                     std::shared_ptr<RegistryManager> registry_manager,
+                    std::shared_ptr<OptimizerEventServiceGRpc> optimizer_event_service,
                     std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
 
     void Init() override;
@@ -63,12 +66,17 @@ public:
                      proto::meta::ReportEventRequest *request,
                      proto::meta::ReportEventResponse *response);
 
+    void ReportTraceBatch(coro_http::coro_http_connection *http_conn,
+                          proto::optimizer::TraceObservationBatchRequest *request,
+                          proto::optimizer::TraceObservationBatchResponse *response);
+
     void GetHostCacheState(coro_http::coro_http_connection *http_conn,
                            proto::meta::GetHostCacheStateRequest *request,
                            proto::meta::GetHostCacheStateResponse *response);
 
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
+    std::shared_ptr<OptimizerEventServiceGRpc> optimizer_event_service_;
 };
 
 } // namespace kv_cache_manager

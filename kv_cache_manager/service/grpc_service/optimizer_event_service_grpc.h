@@ -2,6 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include <memory>
+#include <mutex>
 
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
 
@@ -25,6 +26,11 @@ public:
                                   const proto::optimizer::KvcmConfigurationRequest *request,
                                   proto::optimizer::KvcmConfigurationResponse *response) override;
 
+    // Called by the KVCM HTTP adapter. DashTrace uses the public Manager
+    // Python client and does not require a producer gRPC RPC.
+    void ReportTraceBatch(const proto::optimizer::TraceObservationBatchRequest *request,
+                          proto::optimizer::TraceObservationBatchResponse *response);
+
     grpc::Status SubscribeEvents(grpc::ServerContext *context,
                                  const proto::optimizer::OptimizerEventSubscriptionRequest *request,
                                  grpc::ServerWriter<proto::optimizer::TraceQueryRequest> *writer) override;
@@ -35,6 +41,7 @@ private:
     std::shared_ptr<SubscriptionEventSink> sink_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<LeaderElector> leader_elector_;
+    std::mutex report_trace_mutex_;
 };
 
 } // namespace kv_cache_manager

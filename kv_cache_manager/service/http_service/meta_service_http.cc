@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
@@ -19,9 +20,11 @@ namespace kv_cache_manager {
 MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
                                  std::shared_ptr<RegistryManager> registry_manager,
+                                 std::shared_ptr<OptimizerEventServiceGRpc> optimizer_event_service,
                                  std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
     : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager, std::move(metrics_lifecycle))
-    , meta_service_impl_(std::move(meta_service_impl)) {}
+    , meta_service_impl_(std::move(meta_service_impl))
+    , optimizer_event_service_(std::move(optimizer_event_service)) {}
 
 void MetaServiceHttp::Init() { MetaServiceMetricsBase::InitMetrics(); }
 
@@ -50,6 +53,10 @@ void MetaServiceHttp::RegisterHandler() {
             &MetaServiceHttp::ReportEvent, &ReportEventJsonParser::FromMutableNullTerminatedJson));
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getHostCacheState, GetHostCacheState, GetHostCacheState, GetHostCacheState);
+    RegisterPostHandler(
+        "/api/reportTraceBatch",
+        GetHandler<MetaServiceHttp, proto::optimizer::TraceObservationBatchRequest,
+                   proto::optimizer::TraceObservationBatchResponse>(&MetaServiceHttp::ReportTraceBatch));
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -210,6 +217,18 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                    first_block_key.c_str());
     AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
+}
+
+void MetaServiceHttp::ReportTraceBatch(coro_http::coro_http_connection *,
+                                       proto::optimizer::TraceObservationBatchRequest *request,
+                                       proto::optimizer::TraceObservationBatchResponse *response) {
+    if (!optimizer_event_service_) {
+        auto *status = response->mutable_header()->mutable_status();
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("optimizer event publisher is disabled");
+        return;
+    }
+    optimizer_event_service_->ReportTraceBatch(request, response);
 }
 
 void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,

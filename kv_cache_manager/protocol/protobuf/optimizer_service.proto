@@ -263,6 +263,28 @@ message KvcmConfigurationResponse {
     repeated KvcmInstanceConfiguration instances = 3;
 }
 
+// Observation ingress. KVCM derives block keys using the registered
+// instance metadata, then forwards events to the existing Optimizer stream.
+message TraceObservation {
+    uint64 sequence = 1;
+    string trace_id = 2;
+    string instance_id = 3;
+    repeated int64 token_ids = 4;
+    int64 timestamp_ns = 5;
+    repeated string location_spec_names = 6;
+}
+
+message TraceObservationBatchRequest {
+    string producer_id = 1;
+    repeated TraceObservation observations = 2;
+}
+
+message TraceObservationBatchResponse {
+    CommonResponseHeader header = 1;
+    uint64 accepted_count = 2;
+    uint64 last_accepted_sequence = 3;
+}
+
 service OptimizerService {
     // InstanceGroup 管理
     rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);

@@ -37,6 +37,7 @@ public:
 
         Subscription(std::string consumer_id, std::size_t queue_size);
         bool Enqueue(const proto::optimizer::TraceQueryRequest &event);
+        bool EnqueueBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events);
         void Close();
 
         const std::string consumer_id_;
@@ -61,6 +62,7 @@ public:
     bool accepting_subscriptions() const { return accepting_subscriptions_.load(); }
 
     bool Send(const proto::optimizer::TraceQueryRequest &event) override;
+    bool SendBatch(const std::vector<proto::optimizer::TraceQueryRequest> &events);
     void Stop() override;
     std::size_t DroppedCount() const;
 
@@ -69,6 +71,7 @@ public:
 
 private:
     OptimizerEventPublisherConfig config_;
+    std::mutex send_mutex_;
     mutable std::mutex subscriptions_mutex_;
     std::vector<std::shared_ptr<Subscription>> subscriptions_;
     std::atomic<bool> accepting_subscriptions_{true};

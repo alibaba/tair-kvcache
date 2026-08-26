@@ -38,6 +38,7 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
+        "//kv_cache_manager/manager:hash_util",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "//kv_cache_manager/service:grpc_wrapper",
     ],

@@ -315,7 +315,8 @@ bool Server::StartHttpServer() {
     KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
 
     meta_http_service_ =
-        std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
+        std::make_shared<MetaServiceHttp>(
+            metrics_registry_, meta_impl_, registry_manager_, optimizer_event_service_, metrics_lifecycle_);
     admin_http_service_ = std::make_shared<AdminServiceHttp>(
         metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);

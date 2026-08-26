@@ -33,6 +33,7 @@ cc_library(
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
         "//kv_cache_manager/service:admin_service_impl",
         "//kv_cache_manager/service:debug_service_impl",
+        "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
         "//kv_cache_manager/service:meta_service_impl",
         "//kv_cache_manager/service:meta_service_metrics_base",
         "//kv_cache_manager/service/util:proto_message_json_util",

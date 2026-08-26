@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
@@ -69,6 +70,29 @@ TEST_F(SubscriptionEventSinkTest, TestDropsWithoutSubscriberAndAtQueueLimit) {
     ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
               subscription->WaitNext(&event, std::chrono::milliseconds(10)));
     EXPECT_EQ("queued", event.trace_id());
+}
+
+TEST_F(SubscriptionEventSinkTest, TestBatchIsAllOrNothingPerSubscriber) {
+    SubscriptionEventSink sink(MakeSinkConfig(1, 2));
+    auto subscription = sink.Subscribe("optimizer");
+    ASSERT_NE(nullptr, subscription);
+
+    const std::vector<proto::optimizer::TraceQueryRequest> batch = {
+        MakeRequest("one"), MakeRequest("two")};
+    ASSERT_TRUE(sink.SendBatch(batch));
+
+    proto::optimizer::TraceQueryRequest event;
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              subscription->WaitNext(&event, std::chrono::milliseconds(10)));
+    EXPECT_EQ("one", event.trace_id());
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              subscription->WaitNext(&event, std::chrono::milliseconds(10)));
+    EXPECT_EQ("two", event.trace_id());
+
+    SubscriptionEventSink full_sink(MakeSinkConfig(1, 1));
+    ASSERT_NE(nullptr, full_sink.Subscribe("slow"));
+    EXPECT_FALSE(full_sink.SendBatch(batch));
+    EXPECT_EQ(2u, full_sink.DroppedCount());
 }
 
 TEST_F(SubscriptionEventSinkTest, TestRejectsExcessSubscribers) {

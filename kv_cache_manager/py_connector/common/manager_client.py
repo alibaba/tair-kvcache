@@ -421,6 +421,10 @@ class KvCacheManagerClient:
         """Remove cache data for specified block keys"""
         return self._make_api_request('/api/removeCache', data, check_response)
 
+    def report_trace_batch(self, data, check_response=True):
+        """Submit observation-only requests to the Optimizer event stream."""
+        return self._make_api_request('/api/reportTraceBatch', data, check_response)
+
     def report_event(self, data, check_response=True):
         """Report node, cache block, host-down, or heartbeat events."""
         return self._make_api_request('/api/reportEvent', data, check_response)

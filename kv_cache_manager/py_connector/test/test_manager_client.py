@@ -257,6 +257,31 @@ class TestRequestTimeout(unittest.TestCase):
 
         self.assertEqual(client.session.post.call_args.kwargs["timeout"], 1.5)
 
+    def test_report_trace_batch_uses_observation_endpoint_and_timeout(self):
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            request_timeout_seconds=0.25,
+        )
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_ok_response_json())
+        )
+        try:
+            client.report_trace_batch({
+                "producer_id": "dashtrace-test",
+                "observations": [{
+                    "sequence": "1",
+                    "trace_id": "trace-1",
+                    "instance_id": "deployment-a",
+                    "token_ids": [1, 2],
+                    "timestamp_ns": "1000",
+                }],
+            })
+        finally:
+            client.close()
+        self.assertEqual(client.session.post.call_args.args[0],
+                         "http://10.0.0.1:8080/api/reportTraceBatch")
+        self.assertEqual(client.session.post.call_args.kwargs["timeout"], 0.25)
+
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_leader_discovery_uses_dedicated_timeout(self, mock_post):
         mock_post.return_value = _make_mock_response(_cluster_info_response())
