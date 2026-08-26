@@ -48,6 +48,7 @@ void MetaServiceMetricsBase::InitMetrics() {
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceInfo);
     MAKE_SERVICE_METRICS_COLLECTOR(GetClusterInfo);
     MAKE_SERVICE_METRICS_COLLECTOR(ReportEvent);
+    MAKE_SERVICE_METRICS_COLLECTOR(ReportOptimizerEvent);
     // GetClusterInfo 的全局 collector 也预置到 MAP 中，以空 instance_id 为 key
     KVCM_METRICS_COLLECTOR_MAP_(GetClusterInfo)[""] = KVCM_METRICS_COLLECTOR_(GetClusterInfo);
 }

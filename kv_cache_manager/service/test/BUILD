@@ -86,6 +86,31 @@ cc_test(
 )
 
 cc_test(
+    name = "OptimizerEventServiceHttpTest",
+    srcs = [
+        "optimizer_event_service_http_test.cc",
+    ],
+    copts = [
+        "-fcoroutines",
+        "-fno-access-control",
+        "-std=c++20",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/event:event_publishers_config",
+        "//kv_cache_manager/event:optimizer_event_publisher",
+        "//kv_cache_manager/event/optimizer_stream:subscription_event_sink",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service:meta_service_impl",
+        "//kv_cache_manager/service/http_service",
+    ],
+)
+
+cc_test(
     name = "AdminServiceRemoveInstanceGroupTest",
     srcs = [
         "admin_service_remove_instance_group_test.cc",
