@@ -103,6 +103,8 @@ public:
     const std::string &source_storage_name() const { return source_storage_name_; }
     const std::string &target_storage_name() const { return target_storage_name_; }
     int32_t migration_retention() const { return migration_retention_; }
+    const std::string &mark_target() const { return mark_target_; }
+    int64_t mark_deadline_ms() const { return mark_deadline_ms_; }
     uint64_t total_bytes() const { return total_bytes_; }
     const std::vector<std::string> &backend_task_ids() const { return backend_task_ids_; }
     int64_t create_time_us() const { return create_time_us_; }
@@ -117,6 +119,8 @@ public:
     void set_source_storage_name(std::string value) { source_storage_name_ = std::move(value); }
     void set_target_storage_name(std::string value) { target_storage_name_ = std::move(value); }
     void set_migration_retention(int32_t value) { migration_retention_ = value; }
+    void set_mark_target(std::string value) { mark_target_ = std::move(value); }
+    void set_mark_deadline_ms(int64_t value) { mark_deadline_ms_ = value; }
     void set_total_bytes(uint64_t value) { total_bytes_ = value; }
     void set_backend_task_ids(std::vector<std::string> value) { backend_task_ids_ = std::move(value); }
     void set_create_time_us(int64_t value) { create_time_us_ = value; }
@@ -139,6 +143,8 @@ public:
         Put(writer, "source_storage_name", source_storage_name_);
         Put(writer, "target_storage_name", target_storage_name_);
         Put(writer, "migration_retention", migration_retention_);
+        Put(writer, "mark_target", mark_target_);
+        Put(writer, "mark_deadline_ms", mark_deadline_ms_);
         Put(writer, "total_bytes", total_bytes_);
         Put(writer, "backend_task_ids", backend_task_ids_);
         Put(writer, "create_time_us", create_time_us_);
@@ -156,6 +162,8 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "source_storage_name", source_storage_name_, std::string());
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "target_storage_name", target_storage_name_, std::string());
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "migration_retention", migration_retention_, int32_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mark_target", mark_target_, std::string());
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mark_deadline_ms", mark_deadline_ms_, int64_t{0});
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "total_bytes", total_bytes_, uint64_t{0});
         KVCM_JSON_GET_DEFAULT_MACRO(
             rapid_value, "backend_task_ids", backend_task_ids_, std::vector<std::string>());
@@ -177,6 +185,8 @@ private:
     // config headers.  Unknown/missing values recover conservatively as
     // KEEP_BOTH.
     int32_t migration_retention_ = 0;
+    std::string mark_target_;
+    int64_t mark_deadline_ms_ = 0;
     uint64_t total_bytes_ = 0;
     std::vector<std::string> backend_task_ids_;
     int64_t create_time_us_ = 0;
@@ -342,7 +352,8 @@ public:
             // elements here.
             usage += migration_copy_guard_.operation_id().size() + migration_copy_guard_.source_location_id().size() +
                      migration_copy_guard_.source_storage_name().size() +
-                     migration_copy_guard_.target_storage_name().size() + migration_copy_guard_.last_error().size();
+                     migration_copy_guard_.target_storage_name().size() +
+                     migration_copy_guard_.mark_target().size() + migration_copy_guard_.last_error().size();
             usage += migration_copy_guard_.backend_task_ids().size() * sizeof(std::string);
             for (const auto &task_id : migration_copy_guard_.backend_task_ids()) {
                 usage += task_id.size();
