@@ -82,6 +82,9 @@ public:
     int64_t migration_copy_poll_max_interval_ms() const {
         return migration_config_.copy_poll_max_interval_ms();
     }
+    int64_t migration_copy_connect_timeout_ms() const { return migration_config_.copy_connect_timeout_ms(); }
+    int64_t migration_copy_submit_timeout_ms() const { return migration_config_.copy_submit_timeout_ms(); }
+    int64_t migration_copy_query_timeout_ms() const { return migration_config_.copy_query_timeout_ms(); }
     // Setters
     void set_reclaim_strategy(const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy) {
         reclaim_strategy_ = reclaim_strategy;
@@ -121,6 +124,15 @@ public:
     }
     void set_migration_copy_poll_max_interval_ms(int64_t value) {
         migration_config_.set_copy_poll_max_interval_ms(value);
+    }
+    void set_migration_copy_connect_timeout_ms(int64_t value) {
+        migration_config_.set_copy_connect_timeout_ms(value);
+    }
+    void set_migration_copy_submit_timeout_ms(int64_t value) {
+        migration_config_.set_copy_submit_timeout_ms(value);
+    }
+    void set_migration_copy_query_timeout_ms(int64_t value) {
+        migration_config_.set_copy_query_timeout_ms(value);
     }
     void set_migration_config(const MigrationConfig &migration_config) {
         migration_config_ = migration_config;

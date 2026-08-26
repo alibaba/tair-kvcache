@@ -668,6 +668,9 @@ bool MigrationManager::RecoverAsyncCopyGuards() {
             options.operation_deadline_ms = group->cache_config()->migration_copy_operation_deadline_ms();
             options.initial_poll_interval_ms = group->cache_config()->migration_copy_poll_initial_interval_ms();
             options.max_poll_interval_ms = group->cache_config()->migration_copy_poll_max_interval_ms();
+            options.connect_timeout_ms = group->cache_config()->migration_copy_connect_timeout_ms();
+            options.submit_timeout_ms = group->cache_config()->migration_copy_submit_timeout_ms();
+            options.query_timeout_ms = group->cache_config()->migration_copy_query_timeout_ms();
         }
         for (const auto &instance : instances) {
             if (!instance) {
@@ -3927,6 +3930,9 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
         params.async_copy_options.operation_deadline_ms = cache_config->migration_copy_operation_deadline_ms();
         params.async_copy_options.initial_poll_interval_ms = cache_config->migration_copy_poll_initial_interval_ms();
         params.async_copy_options.max_poll_interval_ms = cache_config->migration_copy_poll_max_interval_ms();
+        params.async_copy_options.connect_timeout_ms = cache_config->migration_copy_connect_timeout_ms();
+        params.async_copy_options.submit_timeout_ms = cache_config->migration_copy_submit_timeout_ms();
+        params.async_copy_options.query_timeout_ms = cache_config->migration_copy_query_timeout_ms();
         params.mark_timeout_ms = current_strategy->methods().mark().timeout_ms();
         params.dedup_marks = true;
         return DispatchMigrationBatchWithLifecycleLockHeld(job.trace_id,
@@ -4018,6 +4024,9 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
             params.async_copy_options.initial_poll_interval_ms =
                 cache_config->migration_copy_poll_initial_interval_ms();
             params.async_copy_options.max_poll_interval_ms = cache_config->migration_copy_poll_max_interval_ms();
+            params.async_copy_options.connect_timeout_ms = cache_config->migration_copy_connect_timeout_ms();
+            params.async_copy_options.submit_timeout_ms = cache_config->migration_copy_submit_timeout_ms();
+            params.async_copy_options.query_timeout_ms = cache_config->migration_copy_query_timeout_ms();
         }
     }
     const auto dispatch =

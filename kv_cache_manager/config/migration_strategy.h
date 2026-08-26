@@ -131,6 +131,13 @@ public:
     static constexpr int64_t kDefaultCopyOperationDeadlineMs = 10 * 60 * 1000;
     static constexpr int64_t kDefaultCopyPollInitialIntervalMs = 20;
     static constexpr int64_t kDefaultCopyPollMaxIntervalMs = 1000;
+    static constexpr int64_t kDefaultCopyConnectTimeoutMs = 1000;
+    static constexpr int64_t kDefaultCopySubmitTimeoutMs = 3000;
+    static constexpr int64_t kDefaultCopyQueryTimeoutMs = 3000;
+    // Keep one control-plane request from consuming most of the operation
+    // deadline. This guarantees at least sixteen timeout windows for a C1
+    // coordinator; shared-backend concurrency still needs a deployment gate.
+    static constexpr int64_t kMinCopyHttpTimeoutWindowsPerDeadline = 16;
 
     MigrationConfig() = default;
     ~MigrationConfig() override;
@@ -146,6 +153,9 @@ public:
     int64_t copy_operation_deadline_ms() const { return copy_operation_deadline_ms_; }
     int64_t copy_poll_initial_interval_ms() const { return copy_poll_initial_interval_ms_; }
     int64_t copy_poll_max_interval_ms() const { return copy_poll_max_interval_ms_; }
+    int64_t copy_connect_timeout_ms() const { return copy_connect_timeout_ms_; }
+    int64_t copy_submit_timeout_ms() const { return copy_submit_timeout_ms_; }
+    int64_t copy_query_timeout_ms() const { return copy_query_timeout_ms_; }
 
     void set_strategies(const std::vector<std::shared_ptr<MigrationStrategy>> &strategies) {
         strategies_ = strategies;
@@ -163,6 +173,9 @@ public:
     void set_copy_operation_deadline_ms(int64_t value) { copy_operation_deadline_ms_ = value; }
     void set_copy_poll_initial_interval_ms(int64_t value) { copy_poll_initial_interval_ms_ = value; }
     void set_copy_poll_max_interval_ms(int64_t value) { copy_poll_max_interval_ms_ = value; }
+    void set_copy_connect_timeout_ms(int64_t value) { copy_connect_timeout_ms_ = value; }
+    void set_copy_submit_timeout_ms(int64_t value) { copy_submit_timeout_ms_ = value; }
+    void set_copy_query_timeout_ms(int64_t value) { copy_query_timeout_ms_ = value; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
@@ -179,6 +192,9 @@ private:
     int64_t copy_operation_deadline_ms_ = kDefaultCopyOperationDeadlineMs;
     int64_t copy_poll_initial_interval_ms_ = kDefaultCopyPollInitialIntervalMs;
     int64_t copy_poll_max_interval_ms_ = kDefaultCopyPollMaxIntervalMs;
+    int64_t copy_connect_timeout_ms_ = kDefaultCopyConnectTimeoutMs;
+    int64_t copy_submit_timeout_ms_ = kDefaultCopySubmitTimeoutMs;
+    int64_t copy_query_timeout_ms_ = kDefaultCopyQueryTimeoutMs;
 };
 
 } // namespace kv_cache_manager
