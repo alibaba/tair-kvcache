@@ -145,6 +145,18 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsCacheGetEvent) {
     EXPECT_EQ(1u, publisher_->ForwardedCount());
 }
 
+TEST_F(OptimizerEventPublisherTest, TestForwardsExplicitInputTokenLen) {
+    ASSERT_TRUE(publisher_->Init(""));
+    auto event = MakeGetEvent("instance-a", {11, 22}, {});
+    event->set_input_token_len(5);
+    ASSERT_TRUE(publisher_->Publish(event));
+    ASSERT_TRUE(WaitForEvents(*sink_, 1));
+
+    const auto request = sink_->Events()[0];
+    EXPECT_EQ(2, request.block_keys_size());
+    EXPECT_EQ(5, request.input_token_len());
+}
+
 // Microseconds on the event, nanoseconds on the wire.
 TEST_F(OptimizerEventPublisherTest, TestTimestampConvertedToNanos) {
     ASSERT_TRUE(publisher_->Init(""));
