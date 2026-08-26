@@ -8,6 +8,10 @@ cc_library(
     hdrs = [
         "vcns_hf3fs_backend.h",
     ],
+    target_compatible_with = select({
+        "//kv_cache_manager/data_storage:enable_vcns": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     deps = [
         "//kv_cache_manager/common",
         "//kv_cache_manager/data_storage:common_define",

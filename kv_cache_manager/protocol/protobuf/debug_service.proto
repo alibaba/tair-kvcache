@@ -1,3 +1,5 @@
+// 修改本文件前请阅读 docs/develop/proto_modification_guide.md（Proto 文件修改指南），并同步完成其中列出的适配步骤。
+
 syntax = "proto3";
 
 package kv_cache_manager.proto.debug;

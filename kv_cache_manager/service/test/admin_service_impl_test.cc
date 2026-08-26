@@ -30,6 +30,23 @@
 
 using namespace kv_cache_manager;
 
+namespace {
+ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+                                  RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const CacheLocationVector &locations,
+                                  std::vector<std::string> &out_location_ids) {
+    std::vector<MetaSearcher::AddLocationResult> results;
+    const ErrorCode ec = meta_searcher->BatchAddLocation(request_context, keys, locations, results);
+    out_location_ids.clear();
+    out_location_ids.reserve(results.size());
+    for (const auto &result : results) {
+        out_location_ids.push_back(result.location_id);
+    }
+    return ec;
+}
+} // namespace
+
 class AdminServiceImplTest : public TESTBASE {
 public:
     void SetUp() override {
@@ -131,7 +148,7 @@ public:
         auto loc = std::make_shared<CacheLocation>(
             DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
         std::vector<std::string> ids;
-        ASSERT_EQ(EC_OK, meta_searcher.BatchAddLocation(rc.get(), {block_key}, {loc}, ids));
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
         ASSERT_EQ(1u, ids.size());
         std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{
             {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
@@ -152,7 +169,7 @@ public:
         auto loc = std::make_shared<CacheLocation>(
             DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
         std::vector<std::string> ids;
-        ASSERT_EQ(EC_OK, meta_searcher.BatchAddLocation(rc.get(), {block_key}, {loc}, ids));
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
         ASSERT_EQ(1u, ids.size());
         if (status == CLS_SERVING) {
             std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{

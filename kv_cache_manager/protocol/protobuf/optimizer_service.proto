@@ -1,3 +1,5 @@
+// 修改本文件前请阅读 docs/develop/proto_modification_guide.md（Proto 文件修改指南），并同步完成其中列出的适配步骤。
+
 syntax = "proto3";
 
 package kv_cache_manager.proto.optimizer;
@@ -61,7 +63,8 @@ message OptimizerInstanceGroupProto {
     repeated double capacity_gb = 3;     // group 下的多容量列表，单位 GB
     bool shared_group_quota = 4;         // true 表示 group 内 instance 共享容量预算
     int64 ttl_seconds = 5;               // TTL 秒数，0 表示不启用 TTL
-    bool enable_theoretical_max_cache = 6; // 是否启用 theoretical/max cache
+    bool enable_theoretical_max_cache = 6; // 是否统计 theoretical 结果（理论无限容量命中）
+    bool enable_prefix_hash = 7;         // true 时 group 内所有实例输入的 block_keys 为逐 block raw hash，统一转换为 rolling prefix hash
 }
 
 // InstanceGroup 增删改查
@@ -145,13 +148,14 @@ message OptimizerGetInstanceResponse {
     int32 linear_step = 8;
 }
 
-// TraceQuery：模拟 block 级缓存命中
+// TraceQuery：按完整 block 回放缓存状态，full-attention 命中率按 input token 计算
 
 message TraceQueryRequest {
     string trace_id = 1;
     string instance_id = 2;
-    repeated int64 block_keys = 3;  // 本次请求的 block key 序列（有序，前缀匹配）
-    repeated int64 token_ids = 4;   // 预留：token 粒度追踪
+    repeated int64 block_keys = 3; // 本次请求所有完整 block 的 key 序列（有序，前缀匹配）
+    repeated int64 token_ids = 4;  // 兼容输入；未设置 input_token_len 时可由其长度推导
+    int64 input_token_len = 5;     // 原始输入 token 数
 }
 
 message TraceQueryResponse {
@@ -159,18 +163,21 @@ message TraceQueryResponse {
     int64 total_blocks = 2;    // 本次请求的总 block 数
     repeated TraceQueryCapacityResult capacity_results = 3;
     TraceQueryTheoreticalResult theoretical_result = 4;
+    int64 input_token_len = 5;
 }
 
 message TraceQueryCapacityResult {
     double capacity_gb = 1;
-    int64 cache_hit_count = 2;      // 该容量下的前缀连续命中长度
-    double hit_rate = 3;            // cache_hit_count / total_blocks
+    int64 cache_hit_count = 2;      // 该容量下的前缀连续命中长度（block 数）
+    double hit_rate = 3;            // full-attention: cache_hit_count * block_size / input_token_len
     int64 current_unique_keys = 4;  // 该容量下当前 resident unique key 数
 }
 
 message TraceQueryTheoreticalResult {
-    int64 max_hit_count = 1;        // theoretical/max cache 前缀连续命中长度，未启用时为 -1
-    int64 current_unique_keys = 2;  // theoretical/max cache 当前 resident unique key 数
+    // theoretical = 理论无限容量下的命中结果。
+    int64 max_hit_count = 1;        // 前缀连续命中长度（block 数），未启用时为 -1
+    int64 current_unique_keys = 2;  // 当前 resident unique key 数，未启用时为 -1
+    double hit_rate = 3;            // 未启用时为 -1（与 max_hit_count 同哨兵；0 表示已计算且为 0）
 }
 
 // Instance 列表/统计重置
@@ -188,7 +195,7 @@ message OptimizerCapacitySummary {
 
 message OptimizerTheoreticalSummary {
     int64 total_max_hits = 1;
-    double max_hit_rate = 2;
+    double max_hit_rate = 2;    // full-attention 实例未启用 theoretical 统计时为 -1
 }
 
 message OptimizerInstanceDebugInfo {
@@ -197,7 +204,7 @@ message OptimizerInstanceDebugInfo {
     int32 linear_step = 3;
     int64 eviction_count = 4;
     int64 memory_usage_bytes = 5;
-    int64 kv_cache_usage_bytes = 6;
+    int64 kv_cache_usage_bytes = 6;  // full-attention 实例为无限容量口径：当前 resident unique block 数 × block_bytes
     int64 ttl_eviction_count = 7;
 }
 
@@ -209,6 +216,7 @@ message OptimizerInstanceSummary {
     repeated OptimizerCapacitySummary capacity_summaries = 5; // 各容量档位的累积命中率
     OptimizerTheoreticalSummary theoretical_summary = 6;
     OptimizerInstanceDebugInfo debug_info = 7;
+    int64 total_input_tokens = 8;
 }
 
 message OptimizerListInstancesResponse {

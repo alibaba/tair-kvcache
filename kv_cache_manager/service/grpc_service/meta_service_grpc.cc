@@ -116,48 +116,9 @@ grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
                                           const proto::meta::ReportEventRequest *request,
                                           proto::meta::ReportEventResponse *response) {
     std::string metrics_type;
-    std::shared_ptr<MetricsCollector> metrics_collector;
-    switch (request->storage_type()) {
-    case proto::meta::ST_EVENT_REPORT_L1P5:
-        metrics_type = kEventReportL1P5MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    case proto::meta::ST_EVENT_REPORT_L2:
-        metrics_type = kEventReportL2MetricsType;
-        metrics_collector = GetTypedMetricsCollectorForReportEvent(request->instance_id(), metrics_type);
-        break;
-    default:
-        metrics_collector = get_metrics_collector_from_map_for_ReportEvent(request->instance_id());
-        break;
-    }
-    if (metrics_collector == nullptr) {
-        KVCM_LOG_ERROR("get ReportEvent metrics collector failed");
-        auto *header = response->mutable_header();
-        auto *status = header->mutable_status();
-        status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        status->set_message("get ReportEvent metrics collector failed");
-        return grpc::Status::OK;
-    }
+    auto metrics_collector = ResolveReportEventMetricsCollector(*request, metrics_type);
     API_CONTEXT_INIT(metrics_collector, ExtractIpFromPeer, context->peer())
-    bool has_block_add = false, has_block_delete = false;
-    for (int i = 0; i < request->events_size(); ++i) {
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
-            has_block_add = true;
-        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
-            has_block_delete = true;
-    }
-    if (has_block_add && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = GetTypedMetricsCollectorForEventBlockAdd(request->instance_id(), metrics_type);
-        if (mc) {
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-        }
-    }
-    if (has_block_delete && !request->instance_id().empty() && !metrics_type.empty()) {
-        auto mc = GetTypedMetricsCollectorForEventBlockDelete(request->instance_id(), metrics_type);
-        if (mc) {
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
-        }
-    }
+    AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
     return grpc::Status::OK;
 }

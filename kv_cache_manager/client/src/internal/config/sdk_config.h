@@ -150,13 +150,26 @@ private:
 
 class TairMempoolSdkConfig : public SdkBackendConfig {
 public:
-    TairMempoolSdkConfig();
+    explicit TairMempoolSdkConfig(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
     bool operator==(const TairMempoolSdkConfig &other) const { return SdkBackendConfig::operator==(other); }
 
     bool operator!=(const TairMempoolSdkConfig &other) const { return !(*this == other); }
+
+    int shm_fd() const { return shm_fd_; }
+    size_t shm_size() const { return shm_size_; }
+    void *client_base() const { return client_base_; }
+
+    void set_shm_fd(int fd) { shm_fd_ = fd; }
+    void set_shm_size(size_t size) { shm_size_ = size; }
+    void set_client_base(void *base) { client_base_ = base; }
+
+private:
+    int shm_fd_{-1};
+    size_t shm_size_{0};
+    void *client_base_{nullptr};
 };
 
 class NfsSdkConfig : public SdkBackendConfig {
@@ -205,6 +218,8 @@ private:
         {DataStorageType::DATA_STORAGE_TYPE_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, std::make_shared<TairMempoolSdkConfig>()},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+         std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)},
         {DataStorageType::DATA_STORAGE_TYPE_NFS, std::make_shared<NfsSdkConfig>()}};
     SdkTimeoutConfig timeout_config_;
 };

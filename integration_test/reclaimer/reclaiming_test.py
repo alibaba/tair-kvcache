@@ -88,7 +88,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         time.sleep(2)
 
         # now the writing should success
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_reclaiming_01(self):
         """Test start-writing -> reclaiming -> finish-writing."""
@@ -153,13 +153,13 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # now finish write block 0~15
         for i in range(16):
             # no verify because the location could have been reclaimed
-            self._finish_write_with_verify(i, verify=False)
+            self._finish_write_with_verify(i, verify_readback=False)
 
         time.sleep(2)
         # at least one block in 0~15 should be reclaimed already
         # which give room to block 16
         # now the writing of key=16 should success
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_reclaiming_02(self):
         """Test that CLS_WRITING keys left over after a server restart
@@ -274,7 +274,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
 
         # the orphaned CLS_WRITING should not stop the evicting
         # new write should now be accepted
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def test_no_over_eviction_with_delay(self):
         """In-flight byte credit prevents repeated delayed batches."""
@@ -519,9 +519,6 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             "current_version": current_version,
         })
 
-        self._wait_metric_value(
-            "cache_reclaimer.pending_delete_handler_count", 1
-        )
         expected_group_type_tags = {
             "instance_group": self._instance_group_name,
             "storage_type": "file",
@@ -529,76 +526,76 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         expected_group_tags = {
             "instance_group": self._instance_group_name,
         }
-        inflight_metrics = {
-            "delete_submit_count": self._metric_value(
-                "cache_reclaimer.delete_submit_count"
-            ),
-            "pending_delete_handler_count": self._metric_value(
-                "cache_reclaimer.pending_delete_handler_count"
-            ),
-            "pending_location_count": self._metric_value(
-                "cache_reclaimer.pending_location_count"
-            ),
-            "pending_delete_bytes": self._metric_value(
-                "cache_reclaimer.pending_delete_bytes"
-            ),
-            "credited_delete_bytes": self._metric_value(
-                "cache_reclaimer.credited_delete_bytes"
-            ),
-            "predicted_deleted_key_count": self._metric_value(
-                "cache_reclaimer.predicted_deleted_key_count"
-            ),
-        }
-        logging.info("delayed reclaim in-flight metrics: %s", inflight_metrics)
-        self.assertEqual(inflight_metrics["delete_submit_count"], 1)
-        self.assertEqual(inflight_metrics["pending_delete_handler_count"], 1)
-        self.assertEqual(inflight_metrics["pending_location_count"], 4)
-        self.assertEqual(inflight_metrics["pending_delete_bytes"], 4 * 1024)
-        self.assertEqual(inflight_metrics["credited_delete_bytes"], 4 * 1024)
-        self.assertEqual(inflight_metrics["predicted_deleted_key_count"], 4)
-        self.assertEqual(
-            self._metric_value(
+        inflight_metrics = self._wait_metric_values([
+            ("cache_reclaimer.delete_submit_count", {}, 1),
+            ("cache_reclaimer.delete_complete_count", {}, 0),
+            ("cache_reclaimer.pending_delete_handler_count", {}, 1),
+            ("cache_reclaimer.pending_location_count", {}, 4),
+            ("cache_reclaimer.pending_delete_bytes", {}, 4 * 1024),
+            ("cache_reclaimer.credited_delete_bytes", {}, 4 * 1024),
+            ("cache_reclaimer.predicted_deleted_key_count", {}, 4),
+            (
                 "cache_reclaimer.pending_location_count",
                 expected_group_type_tags,
+                4,
             ),
-            4,
-        )
-        self.assertEqual(
-            self._metric_value(
+            (
                 "cache_reclaimer.pending_delete_bytes",
                 expected_group_type_tags,
+                4 * 1024,
             ),
-            4 * 1024,
-        )
-        self.assertEqual(
-            self._metric_value(
+            (
                 "cache_reclaimer.credited_delete_bytes",
                 expected_group_type_tags,
+                4 * 1024,
             ),
-            4 * 1024,
-        )
-        self.assertEqual(
-            self._metric_value(
+            (
                 "cache_reclaimer.predicted_deleted_key_count",
                 expected_group_tags,
+                4,
             ),
-            4,
+        ])
+        logging.info("delayed reclaim in-flight metrics: %s", inflight_metrics)
+        self._wait_surviving_block_count(
+            self._instance_id,
+            range(12),
+            expected_count=8,
+            timeout_s=2,
         )
 
-        self.assertEqual(
-            self._metric_value("cache_reclaimer.delete_complete_count"),
-            0,
-            "the end-to-end Future must remain pending during the delay",
+        completed_metrics = self._wait_metric_values(
+            [
+                ("cache_reclaimer.delete_submit_count", {}, 1),
+                ("cache_reclaimer.delete_complete_count", {}, 1),
+                ("cache_reclaimer.pending_delete_handler_count", {}, 0),
+                ("cache_reclaimer.pending_location_count", {}, 0),
+                ("cache_reclaimer.pending_delete_bytes", {}, 0),
+                ("cache_reclaimer.credited_delete_bytes", {}, 0),
+                ("cache_reclaimer.predicted_deleted_key_count", {}, 0),
+                (
+                    "cache_reclaimer.pending_location_count",
+                    expected_group_type_tags,
+                    0,
+                ),
+                (
+                    "cache_reclaimer.pending_delete_bytes",
+                    expected_group_type_tags,
+                    0,
+                ),
+                (
+                    "cache_reclaimer.credited_delete_bytes",
+                    expected_group_type_tags,
+                    0,
+                ),
+                (
+                    "cache_reclaimer.predicted_deleted_key_count",
+                    expected_group_tags,
+                    0,
+                ),
+            ],
+            timeout_s=8,
         )
-        self.assertEqual(
-            self._count_surviving_blocks(self._instance_id, range(12)),
-            8,
-            "CAS should hide exactly one batch while its Future is pending",
-        )
-
-        self._wait_metric_value(
-            "cache_reclaimer.pending_delete_handler_count", 0, timeout_s=8
-        )
+        logging.info("delayed reclaim completed metrics: %s", completed_metrics)
 
         surviving_blocks = self._count_surviving_blocks(
             self._instance_id, range(12)
@@ -625,41 +622,6 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             1,
             "fresh credit should prevent admission of a second batch",
         )
-        self.assertEqual(
-            self._metric_value("cache_reclaimer.delete_complete_count"), 1
-        )
-        for metric_name in (
-            "pending_delete_handler_count",
-            "pending_location_count",
-            "pending_delete_bytes",
-            "credited_delete_bytes",
-            "predicted_deleted_key_count",
-        ):
-            self.assertEqual(
-                self._metric_value(f"cache_reclaimer.{metric_name}"),
-                0,
-                f"{metric_name} should be released at Future completion",
-            )
-        for metric_name in (
-            "pending_location_count",
-            "pending_delete_bytes",
-            "credited_delete_bytes",
-        ):
-            self.assertEqual(
-                self._metric_value(
-                    f"cache_reclaimer.{metric_name}",
-                    expected_group_type_tags,
-                ),
-                0,
-                f"tagged {metric_name} should be released at Future completion",
-            )
-        self.assertEqual(
-            self._metric_value(
-                "cache_reclaimer.predicted_deleted_key_count",
-                expected_group_tags,
-            ),
-            0,
-        )
 
     def _wait_metric_value(
         self, metric_name, expected_value, tags=None, timeout_s=2
@@ -677,10 +639,13 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
 
     def _metric_value(self, metric_name, tags=None):
-        expected_tags = tags or {}
         metrics = self._admin_client.get_metrics({
             "trace_id": self._trace_id + "_metrics",
         })["metrics"]
+        return self._metric_value_from_metrics(metrics, metric_name, tags)
+
+    def _metric_value_from_metrics(self, metrics, metric_name, tags=None):
+        expected_tags = tags or {}
         values = []
         for metric in metrics:
             if metric.get("metric_name") != metric_name:
@@ -708,6 +673,40 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         return values[0]
 
+    def _wait_metric_values(self, expected_metrics, timeout_s=2):
+        deadline = time.monotonic() + timeout_s
+        expected_values = {
+            f"{metric_name} with tags {tags}": expected_value
+            for metric_name, tags, expected_value in expected_metrics
+        }
+        last_values = {}
+        while time.monotonic() < deadline:
+            metrics = self._admin_client.get_metrics({
+                "trace_id": self._trace_id + "_metrics",
+            })["metrics"]
+            last_values = {}
+            matched = True
+            for metric_name, tags, expected_value in expected_metrics:
+                metric_description = f"{metric_name} with tags {tags}"
+                try:
+                    actual_value = self._metric_value_from_metrics(
+                        metrics, metric_name, tags
+                    )
+                except self.failureException as error:
+                    last_values[metric_description] = str(error)
+                    matched = False
+                    continue
+                last_values[metric_description] = actual_value
+                if actual_value != expected_value:
+                    matched = False
+            if matched:
+                return last_values
+            time.sleep(0.05)
+        self.fail(
+            "metrics did not reach a matching snapshot; "
+            f"expected values: {expected_values}; last values: {last_values}"
+        )
+
     def _count_surviving_blocks(self, instance_id, block_keys):
         surviving_blocks = 0
         for block_key in block_keys:
@@ -723,6 +722,23 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             if any(response.get("locations", [])):
                 surviving_blocks += 1
         return surviving_blocks
+
+    def _wait_surviving_block_count(
+        self, instance_id, block_keys, expected_count, timeout_s
+    ):
+        deadline = time.monotonic() + timeout_s
+        last_count = None
+        while time.monotonic() < deadline:
+            last_count = self._count_surviving_blocks(
+                instance_id, block_keys
+            )
+            if last_count == expected_count:
+                return
+            time.sleep(0.05)
+        self.fail(
+            f"surviving block count did not become {expected_count}; "
+            f"last count: {last_count}"
+        )
 
     def test_persist_recover_00(self):
         """Test e2e persist/recover: cache locations and metadata
@@ -918,7 +934,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
 
         # write should succeed only if reclaiming happened, which
         # requires storage_usage_data to have survived the restart
-        self._write(16)
+        self._write_expect_accepted_after_reclaim(16)
 
     def _get_manager_client(self):
         self._admin_http_port = self.worker_manager.get_worker(
@@ -933,7 +949,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             MetaServiceHttpClient(self._http_url),
         )
 
-    def _write(self, blk_key):
+    def _write(self, blk_key, verify_readback=True):
         logging.info(f"write block key: {blk_key}")
         trace_id = f"{self._trace_id}_blk_key_{blk_key}"
 
@@ -941,7 +957,15 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         self._start_write(blk_key)
 
         # finish write cache
-        self._finish_write_with_verify(blk_key)
+        self._finish_write_with_verify(blk_key, verify_readback=verify_readback)
+
+    def _write_expect_accepted_after_reclaim(self, blk_key):
+        """Assert a write is accepted after reclaim opens capacity.
+
+        The reclaimer remains active in these scenarios, so the new location may
+        be evicted before an immediate get_cache_location readback.
+        """
+        self._write(blk_key, verify_readback=False)
 
     def _start_write_expect_fail(self, blk_key):
         logging.info(f"start write expecting failure, block key: {blk_key}")
@@ -1000,7 +1024,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         logging.info(
             f"block key: {blk_key} start write OK with write session id: {write_session_id}")
 
-    def _finish_write_with_verify(self, blk_key, verify=True):
+    def _finish_write_with_verify(self, blk_key, verify_readback=True):
         # finish write cache
         trace_id = f"{self._trace_id}_blk_key_{blk_key}"
         resp = self._resp_dict[blk_key]
@@ -1018,7 +1042,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             }
         }
         self._client.finish_write_cache(finish_write_req)
-        if not verify:
+        if not verify_readback:
             return
 
         # get cache location to verify it was added correctly

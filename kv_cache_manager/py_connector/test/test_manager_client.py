@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import requests
 
-from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.manager_client import (
+    KvCacheManagerClient,
+    KvCacheManagerProtocolError,
+)
 from kv_cache_manager.py_connector.common.service_discovery import ServiceEndpoint
 
 
@@ -97,6 +100,50 @@ class TestServiceDiscoveryInit(unittest.TestCase):
         mock_create.return_value = None
         with self.assertRaisesRegex(ValueError, "failed to create service discovery"):
             KvCacheManagerClient("custom://manager-service")
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.Session")
+    def test_discovery_factory_exception_closes_session(
+        self,
+        mock_session_cls,
+        mock_create,
+    ):
+        session = MagicMock()
+        mock_session_cls.return_value = session
+        mock_create.side_effect = RuntimeError("discovery plugin failed")
+
+        with self.assertRaisesRegex(RuntimeError, "discovery plugin failed"):
+            KvCacheManagerClient("custom://manager-service")
+
+        session.close.assert_called_once_with()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.Session")
+    def test_discovery_post_resolution_exception_rolls_back_all_resources(
+        self,
+        mock_session_cls,
+        mock_create,
+    ):
+        session = MagicMock()
+        mock_session_cls.return_value = session
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = ServiceEndpoint(
+            ip="10.0.0.1",
+            port=8080,
+            host="10.0.0.1:8080",
+        )
+        discovery.get_type.side_effect = RuntimeError("discovery metadata failed")
+        mock_create.return_value = discovery
+
+        with self.assertRaisesRegex(RuntimeError, "discovery metadata failed"):
+            KvCacheManagerClient("custom://manager-service")
+
+        session.close.assert_called_once_with()
+        discovery.close.assert_called_once_with()
 
     @patch(
         "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
@@ -224,6 +271,65 @@ class TestRequestTimeout(unittest.TestCase):
             self.assertEqual(mock_post.call_args.kwargs["timeout"], 5.0)
         finally:
             client.close()
+
+
+class TestResponseClassification(unittest.TestCase):
+    """Transport/protocol failures must be distinct from Manager business errors."""
+
+    def setUp(self):
+        self.client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=False,
+        )
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_non_200_response_is_transport_failure(self):
+        self.client.session.post = MagicMock(
+            return_value=_make_mock_response({}, status_code=503)
+        )
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.register_instance({"trace_id": "test"})
+
+    def test_malformed_api_envelope_is_protocol_failure(self):
+        for payload in ([], {}, {"header": {}}, {"header": {"status": {}}}):
+            with self.subTest(payload=payload):
+                self.client.session.post = MagicMock(
+                    return_value=_make_mock_response(payload)
+                )
+                with self.assertRaises(KvCacheManagerProtocolError):
+                    self.client.register_instance({"trace_id": "test"})
+
+    def test_manager_business_error_keeps_assertion_contract(self):
+        self.client.session.post = MagicMock(
+            return_value=_make_mock_response({
+                "header": {
+                    "status": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "bad request",
+                    }
+                }
+            })
+        )
+
+        with self.assertRaises(AssertionError) as caught:
+            self.client.register_instance({"trace_id": "test"})
+        self.assertNotIsInstance(caught.exception, requests.RequestException)
+
+    def test_check_response_false_still_validates_transport_and_envelope(self):
+        for response, error_type in (
+            (_make_mock_response({}, status_code=503), requests.HTTPError),
+            (_make_mock_response([]), KvCacheManagerProtocolError),
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                self.client.session.post = MagicMock(return_value=response)
+                with self.assertRaises(error_type):
+                    self.client.report_event(
+                        {"trace_id": "test"},
+                        check_response=False,
+                    )
 
 
 class TestLeaderDiscoveryInit(unittest.TestCase):
@@ -678,6 +784,73 @@ class TestCloseLifecycle(unittest.TestCase):
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=False)
         client.close()  # Should not raise
         self.assertTrue(client._closed.is_set())
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.Session")
+    def test_refresh_thread_start_failure_rolls_back_resources(
+        self,
+        mock_session_cls,
+        mock_create_discovery,
+    ):
+        session = MagicMock()
+        mock_session_cls.return_value = session
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = ServiceEndpoint(
+            ip="10.0.0.1",
+            port=8080,
+            host="10.0.0.1:8080",
+        )
+        discovery.get_type.return_value = "Test"
+        mock_create_discovery.return_value = discovery
+
+        with patch(
+            "kv_cache_manager.py_connector.common.manager_client.threading.Thread.start",
+            side_effect=RuntimeError("thread admission failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread admission failed"):
+                KvCacheManagerClient(
+                    "custom://manager-service",
+                    auto_discover_leader=False,
+                )
+
+        session.close.assert_called_once_with()
+        discovery.close.assert_called_once_with()
+
+    def test_close_defers_discovery_cleanup_until_refresh_worker_exits(self):
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=False,
+        )
+        discovery = MagicMock()
+        client._service_discovery = discovery
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+
+        def blocked_refresh_worker():
+            try:
+                worker_entered.set()
+                release_worker.wait(timeout=5)
+            finally:
+                client._close_deferred_service_discovery()
+
+        refresh_thread = threading.Thread(target=blocked_refresh_worker)
+        client._refresh_thread = refresh_thread
+        refresh_thread.start()
+        self.assertTrue(worker_entered.wait(timeout=1))
+
+        with patch.object(refresh_thread, "join", return_value=None):
+            client.close()
+
+        discovery.close.assert_not_called()
+        release_worker.set()
+        refresh_thread.join(timeout=1)
+        self.assertFalse(refresh_thread.is_alive())
+        discovery.close.assert_called_once_with()
+
+        client.close()
+        discovery.close.assert_called_once_with()
 
 
 class TestThreadSafety(unittest.TestCase):

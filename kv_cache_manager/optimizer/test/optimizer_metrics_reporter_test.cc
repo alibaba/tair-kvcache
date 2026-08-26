@@ -1,7 +1,7 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 
@@ -21,7 +21,8 @@ protected:
     ErrorCode RegisterTestInstance(const std::string &instance_id,
                                    std::vector<double> caps = {1.0},
                                    int64_t ttl_seconds = 0,
-                                   bool enable_theoretical_max_cache = false) {
+                                   bool enable_theoretical_max_cache = false,
+                                   int32_t linear_step = 0) {
         OptimizerInstanceGroup group;
         group.set_name("grp1");
         group.set_capacity_gb(caps);
@@ -37,7 +38,8 @@ protected:
 
         std::vector<LocationSpecInfo> specs = {LocationSpecInfo("full", 1024)};
         std::vector<LocationSpecGroup> groups = {LocationSpecGroup("full_group", {"full"})};
-        OptimizerInstanceInfo info("grp1", instance_id, 1024, specs, groups, 0, OptimizerStateInfo("full_group", ""));
+        OptimizerInstanceInfo info(
+            "grp1", instance_id, 1024, specs, groups, linear_step, OptimizerStateInfo("full_group", ""));
         RegisterInstanceResult result;
         return manager_->RegisterInstance(info, result);
     }
@@ -250,8 +252,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalStaticMetrics) {
 
     MetricsTags tags = {{"instance_id", "inst1"}};
 
-    Gauge avg_bytes = registry_->GetGauge("trace_query_avg_bytes_per_block", tags);
-    EXPECT_DOUBLE_EQ(1024.0, avg_bytes.Get());
+    Gauge bytes_per_block_gauge = registry_->GetGauge("trace_query_bytes_per_block", tags);
+    EXPECT_DOUBLE_EQ(1024.0, bytes_per_block_gauge.Get());
 
     Gauge linear_step = registry_->GetGauge("trace_query_linear_step", tags);
     EXPECT_DOUBLE_EQ(0.0, linear_step.Get());
@@ -331,7 +333,12 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiencySkippedWhen
 
 TEST_F(OptimizerMetricsReporterTest, ReportIntervalHitAgeBucketRatio) {
     // TTL > 0 triggers TtlCacheIndexerWrapper, enabling age-bucket tracking
-    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, /*ttl_seconds=*/3600));
+    ASSERT_EQ(EC_OK,
+              RegisterTestInstance("inst1",
+                                   {1.0},
+                                   /*ttl_seconds=*/3600,
+                                   /*enable_theoretical_max_cache=*/false,
+                                   /*linear_step=*/1));
 
     TraceQueryResult result;
     manager_->TraceQuery("inst1", {1, 2, 3}, result);

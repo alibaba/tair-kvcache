@@ -1,17 +1,20 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -23,6 +26,14 @@ class EventReportBackend : public DataStorageBackend {
 public:
     using CleanupCallback =
         std::function<void(const std::string &instance_id, const std::string &host_ip_port, uint64_t generation)>;
+    struct QueryVisibilityState {
+        bool strict = false;
+        std::string committed_version;
+    };
+    // Transparent ordering lets GetHostCacheState probe the request snapshot
+    // with a string_view borrowed from CacheLocation::id without allocating a
+    // reporter-host string for every block.
+    using QueryVisibilitySnapshot = std::map<std::string, QueryVisibilityState, std::less<>>;
 
     EventReportBackend() = delete;
     explicit EventReportBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
@@ -31,7 +42,12 @@ public:
     // --- DataStorageBackend interface ---
     DataStorageType GetType() override;
     bool Available() override;
+    // Dynamic disable is also an admission cancellation event. Wake snapshot
+    // and delta waiters so they fail immediately instead of waiting for the
+    // configured drain timeout before observing the unavailable state.
+    void SetAvailable(bool available) override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
+    ErrorCode Open(const StorageConfig &config, const std::string &trace_id) override;
     ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override;
     ErrorCode Close() override;
 
@@ -43,6 +59,10 @@ public:
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override;
+    // Conservative context-free storage check. Public cache queries use
+    // CacheManager's location-aware checker because this interface has no
+    // instance id or stable location id with which to validate legacy and
+    // mixed-generation metadata.
     std::vector<bool> MightExist(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
@@ -54,19 +74,108 @@ public:
     ErrorCode RegisterNode(const std::string &instance_id,
                            const std::string &host_ip_port,
                            const std::vector<std::string> &mediums);
+    // Rebuilds a missing process-local reporter entry on the first valid
+    // report from a fresh caller or after KVCM restart. Unlike an explicit
+    // REGISTER, the fast path does not refresh liveness, revive an unavailable
+    // reporter, or clear a same-process unregister tombstone.
+    ErrorCode EnsureNodeRegistered(const std::string &instance_id,
+                                   const std::string &host_ip_port,
+                                   const std::vector<std::string> &mediums);
     ErrorCode UnregisterNode(const std::string &instance_id, const std::string &host_ip_port);
+    ErrorCode UnregisterNodeForHostDown(const std::string &instance_id,
+                                        const std::string &host_ip_port,
+                                        uint64_t &out_generation);
+    ErrorCode UnregisterNodeIfGeneration(const std::string &instance_id,
+                                         const std::string &host_ip_port,
+                                         uint64_t expected_generation);
     ErrorCode OnHeartbeat(const std::string &instance_id,
                           const std::string &host_ip_port,
                           const std::map<std::string, std::string> &system_status);
     void SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port);
+    bool IsNodeRegistered(const std::string &instance_id, const std::string &host_ip_port) const;
     bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const;
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const;
 
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const;
+    bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
+    bool ParseLocationIdView(std::string_view location_id,
+                             std::string_view &out_medium,
+                             std::string_view &out_host_ip_port) const noexcept;
     std::string HostSuffix(const std::string &host_ip_port) const;
+    // A delta lease pins the committed token until every metadata mutation in
+    // that ReportEvent request has completed. If this reporter is replacing
+    // its full snapshot, new deltas wait up to the configured snapshot gate
+    // timeout for commit/abort instead of racing it.
+    ErrorCode BeginDeltaMutation(const ReporterSnapshotKey &reporter_key,
+                                 std::string &out_committed_version,
+                                 uint64_t *out_lifecycle_generation = nullptr,
+                                 bool *out_created_generation = nullptr);
+    void EndDeltaMutation(const ReporterSnapshotKey &reporter_key,
+                          uint64_t lifecycle_generation = 0,
+                          const std::string &expected_snapshot_version = {});
+    ErrorCode BeginSnapshot(const ReporterSnapshotKey &reporter_key,
+                            std::string &out_candidate_version,
+                            uint64_t &out_retry_after_ms,
+                            uint64_t *out_lifecycle_generation = nullptr);
+    using LifecycleMutationLease = std::shared_ptr<std::shared_lock<std::shared_mutex>>;
+    ErrorCode AcquireLifecycleMutationLease(const ReporterSnapshotKey &reporter_key,
+                                            uint64_t expected_generation,
+                                            LifecycleMutationLease &out_lease) const;
+    ErrorCode AcquireLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                           uint64_t expected_generation,
+                                           LifecycleMutationLease &out_lease) const;
+    // Atomically fences a stale-snapshot cleanup against both reporter
+    // lifecycle changes and the start of a later snapshot attempt. The lease
+    // must be retained through the metadata compare-and-delete.
+    ErrorCode AcquireSnapshotCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                          uint64_t expected_generation,
+                                          const std::string &expected_snapshot_version,
+                                          uint64_t expected_attempt_epoch,
+                                          LifecycleMutationLease &out_lease) const;
+    // Retains a lifecycle read lease through candidate validation and commit,
+    // so REGISTER/HOST_DOWN cannot cross the final publication boundary.
+    ErrorCode CommitSnapshotVersionIfGeneration(const ReporterSnapshotKey &reporter_key,
+                                                const std::string &version,
+                                                uint64_t expected_generation);
+    bool CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
+    void AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
+    std::string GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const;
+    void GetSnapshotVersionTokens(const ReporterSnapshotKey &reporter_key,
+                                  std::string &out_committed,
+                                  std::string &out_in_flight) const;
+    // Returns whether the reporter is currently queryable and exposes the
+    // process-local committed visibility state under the same node-table lock.
+    // Strict mode is entered only by a successful complete snapshot. Before
+    // that, after restart, or after an admitted snapshot aborts, callers
+    // accept all well-formed historical generations to avoid false negatives.
+    bool GetQueryVisibilityState(const ReporterSnapshotKey &reporter_key,
+                                 bool &out_strict,
+                                 std::string &out_committed) const;
+    // Captures every currently queryable reporter for one instance under one
+    // node-table read lock. GetHostCacheState uses this request-level snapshot
+    // instead of repeating registry/backend lookups and nodes_mutex_ acquisition
+    // for every (block, location).
+    void GetQueryVisibilitySnapshot(const std::string &instance_id, QueryVisibilitySnapshot &out_snapshot) const;
+    uint64_t GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const;
+    void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
+    void SetSnapshotDeltaDrainTimeoutMsForTest(int64_t timeout_ms);
     DataStorageType GetStorageType() const;
 
 private:
+    // Unit-level state-machine tests also exercise a never-opened backend.
+    // Treat that state as usable, while permanently fencing operations after
+    // Close and respecting DataStorageManager disablement for opened storage.
+    bool AcceptingReports() const { return !retired_.load(std::memory_order_acquire) && (!IsOpen() || IsAvailable()); }
+    bool Retired() const { return retired_.load(std::memory_order_acquire); }
+
+    struct LifecycleFence {
+        mutable std::shared_mutex mutex;
+        uint64_t generation = 0;
+        bool registered = false;
+    };
+    std::shared_ptr<LifecycleFence> GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporter_key);
+    std::shared_ptr<LifecycleFence> FindLifecycleFence(const ReporterSnapshotKey &reporter_key) const;
+    ErrorCode UnregisterNodeLocked(const std::string &instance_id, const std::string &host_ip_port);
     struct NodeInfo {
         std::string instance_id;
         std::atomic<int64_t> last_heartbeat_ms{0};
@@ -79,6 +188,21 @@ private:
         MetricsTags metrics_tags;
     };
 
+    // Caller holds the reporter lifecycle lease and nodes_mutex_. Publishes
+    // and returns true only when HEARTBEAT does not change lifecycle. Success
+    // releases nodes_lock; failure leaves it held.
+    bool TryPublishSteadyHeartbeatLocked(const ReporterSnapshotKey &reporter_key,
+                                         const LifecycleFence &lifecycle_fence,
+                                         const std::map<std::string, std::string> &system_status,
+                                         std::unique_lock<std::shared_mutex> &nodes_lock);
+
+    // Caller holds the reporter lifecycle lease and nodes_mutex_. This method
+    // hands protection to status_mutex, releases the global node-table lock,
+    // and publishes status and metrics while the lifecycle lease pins NodeInfo.
+    void PublishHeartbeatStatus(NodeInfo &info,
+                                const std::map<std::string, std::string> &system_status,
+                                std::unique_lock<std::shared_mutex> &nodes_lock);
+
     void LivenessCheckerLoop();
     void ClearNodeGauges(const NodeInfo &info);
     static int64_t NowMillis() {
@@ -89,14 +213,52 @@ private:
     EventReportStorageSpec spec_;
 
     mutable std::shared_mutex nodes_mutex_;
+    // Final metadata writes may already hold a MetaIndexer lock, while host
+    // cleanup deliberately holds a lifecycle lease before taking metadata
+    // locks. A per-reporter fence prevents that inversion from becoming a
+    // deadlock without making unrelated reporters fail one another's writes.
+    mutable std::mutex lifecycle_fences_mutex_;
+    std::unordered_map<ReporterSnapshotKey, std::shared_ptr<LifecycleFence>, ReporterSnapshotKeyHash> lifecycle_fences_;
     // instance_id -> (host_ip_port -> NodeInfo)
     std::unordered_map<std::string, std::unordered_map<std::string, std::unique_ptr<NodeInfo>>> instance_nodes_;
-    // Persists across unregister/register to fence stale cleanup.
+    // Persists across unregister/register to fence stale cleanup. An entry
+    // without a live instance_nodes_ entry is also the same-process
+    // unregister tombstone. Close() clears both maps, so the first valid
+    // report after process restart can lazily rebuild the node.
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
+    struct SnapshotVersionState {
+        // Process-local reporter state, not a distributed lock. KVCM restart
+        // clears this state; the first valid delta or snapshot rebuilds it.
+        std::string committed;
+        std::string in_flight;
+        // Monotonically advances for every admitted snapshot attempt,
+        // including attempts that later abort. Async cleanup captures this
+        // value so an older task cannot reclaim writes from a later attempt.
+        uint64_t attempt_epoch = 0;
+        uint64_t active_delta_mutations = 0;
+        int64_t last_commit_ms = 0;
+        // A successful complete snapshot proves that committed is an
+        // authoritative query fence. An admitted snapshot failure switches
+        // back to soft visibility because in-place candidate writes may have
+        // replaced committed metadata. Process-local recovery also starts
+        // soft until the next successful snapshot.
+        bool strict_query_visibility = false;
+    };
+    std::unordered_map<ReporterSnapshotKey, SnapshotVersionState, ReporterSnapshotKeyHash> snapshot_versions_;
+    // Resolves an opaque committed token back to the reporter whose liveness
+    // must also be checked by the context-free MightExist interface.
+    // Guarded by nodes_mutex_ together with snapshot_versions_.
+    std::unordered_map<std::string, ReporterSnapshotKey> snapshot_token_owners_;
+    std::condition_variable_any snapshot_state_cv_;
+    int64_t snapshot_min_interval_ms_ = EventReportStorageSpec::kDefaultSnapshotMinIntervalMs;
+    int64_t snapshot_delta_drain_timeout_ms_ = EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs;
 
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};
+    std::atomic<bool> retired_{false};
+    std::mutex liveness_wait_mutex_;
+    std::condition_variable liveness_wait_cv_;
 
     int64_t heartbeat_timeout_ms_ = EventReportStorageSpec::kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = EventReportStorageSpec::kDefaultCleanupGraceMs;

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <climits>
+#include <optional>
 #include <random>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -10,6 +12,60 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr size_t kMaxRetainedCompactReadKeys = 16384;
+
+struct CompactReadScratch {
+    bool in_use = false;
+    std::vector<std::string_view> key_views;
+    std::vector<Cache::Handle *> handles;
+    std::vector<int64_t> revisit_intervals;
+    Cache::BatchOperationScratch cache_batch;
+};
+
+thread_local CompactReadScratch tls_compact_read_scratch;
+
+class CompactReadScratchLease {
+public:
+    explicit CompactReadScratchLease(size_t key_count) {
+        if (key_count <= kMaxRetainedCompactReadKeys && !tls_compact_read_scratch.in_use) {
+            scratch_ = &tls_compact_read_scratch;
+            scratch_->in_use = true;
+            uses_thread_local_ = true;
+        } else {
+            local_.emplace();
+            scratch_ = &*local_;
+        }
+    }
+
+    ~CompactReadScratchLease() {
+        if (uses_thread_local_) {
+            scratch_->in_use = false;
+        }
+    }
+
+    CompactReadScratch &get() noexcept { return *scratch_; }
+
+private:
+    std::optional<CompactReadScratch> local_;
+    CompactReadScratch *scratch_ = nullptr;
+    bool uses_thread_local_ = false;
+};
+
+} // namespace
+
+SingleLocationRmwScratch::~SingleLocationRmwScratch() { ReleaseRetainedHandles(); }
+
+void SingleLocationRmwScratch::ReleaseRetainedHandles() noexcept {
+    if (!retained_handle_owner) {
+        return;
+    }
+    retained_handle_owner->ReleaseBatchWithScratch(handles.data(), handles.size(), &cache_batch);
+    std::fill(handles.begin(), handles.end(), nullptr);
+    retained_handle_owner = nullptr;
+}
 
 std::string MetaLocalBackend::GetStorageType() noexcept { return "local"; }
 
@@ -149,13 +205,10 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(std::string_view key_sv,
     return ret;
 }
 
-ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
-                                          const CacheLocationMap &locations,
-                                          const PropertyMap &properties) {
-    Cache::Handle *handle = cache_->Lookup(key_sv);
-    if (!handle) {
-        return EC_NOENT;
-    }
+ErrorCode MetaLocalBackend::UpdateHandleInPlace(Cache::Handle *handle,
+                                                const CacheLocationMap &locations,
+                                                const PropertyMap &properties) {
+    assert(handle != nullptr);
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     existing->TouchAccessTime();
     ssize_t charge_delta = 0;
@@ -190,8 +243,91 @@ ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
     }
-    cache_->Release(handle);
     return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(Cache::Handle *handle,
+                                                              const LocationId &location_id,
+                                                              CacheLocationConstPtr location,
+                                                              CacheLocationVector *retired_locations) {
+    assert(handle != nullptr);
+    auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    existing->TouchAccessTime();
+    ssize_t charge_delta = 0;
+    {
+        std::unique_lock lock(existing->GetMutex());
+        auto &existing_locations = existing->GetMutableLocations();
+        auto it = existing_locations.end();
+        if (existing_locations.size() == 1) {
+            auto only = existing_locations.begin();
+            if (only->first == location_id) {
+                it = only;
+            }
+        } else if (!existing_locations.empty()) {
+            it = existing_locations.find(location_id);
+        }
+        if (it != existing_locations.end()) {
+            const ssize_t old_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
+            const ssize_t new_usage = location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
+            if (retired_locations) {
+                assert(retired_locations->size() < retired_locations->capacity());
+                retired_locations->push_back(std::move(it->second));
+                it->second = std::move(location);
+            } else {
+                it->second = std::move(location);
+            }
+            charge_delta = new_usage - old_usage;
+        } else {
+            const ssize_t new_usage = location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
+            charge_delta = static_cast<ssize_t>(sizeof(void *) * 4 + location_id.size()) + new_usage;
+            existing_locations.emplace(location_id, std::move(location));
+        }
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
+                                          const CacheLocationMap &locations,
+                                          const PropertyMap &properties) {
+    Cache::Handle *handle = cache_->Lookup(key_sv);
+    if (!handle) {
+        return EC_NOENT;
+    }
+    const ErrorCode ec = UpdateHandleInPlace(handle, locations, properties);
+    cache_->Release(handle);
+    return ec;
+}
+
+ErrorCode MetaLocalBackend::CreateAndInsertSingleLocation(std::string_view key_sv,
+                                                          const LocationId &location_id,
+                                                          CacheLocationConstPtr location) {
+    MetaMemCacheItem *item = MetaMemCacheItem::CreateSingleLocation(location_id, std::move(location));
+    item->TouchAccessTime();
+    const size_t charge = item->Size();
+    Cache::Handle *handle = nullptr;
+    const ErrorCode ec = cache_->Insert(key_sv, item, cache_item_helper_.get(), charge, &handle);
+    if (ec != EC_OK) {
+        MetaMemCacheItem::Deleter(item, nullptr);
+    } else if (handle) {
+        cache_->Release(handle);
+    }
+    return ec;
+}
+
+ErrorCode MetaLocalBackend::UpsertSingleLocationForOneKey(KeyType key,
+                                                          const LocationId &location_id,
+                                                          const CacheLocationConstPtr &location) {
+    const std::string_view key_view = KeyToView(key);
+    Cache::Handle *handle = cache_->Lookup(key_view);
+    if (handle) {
+        const ErrorCode ec = UpdateHandleInPlaceSingleLocation(handle, location_id, location);
+        cache_->Release(handle);
+        return ec;
+    }
+    return CreateAndInsertSingleLocation(key_view, location_id, location);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,10 +414,245 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
                                                 const CacheLocationMapVector &locations,
                                                 const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
+    bool has_duplicate_keys = false;
+    bool keys_are_sorted = true;
+    for (size_t i = 1; i < keys.size(); ++i) {
+        has_duplicate_keys = has_duplicate_keys || keys[i] == keys[i - 1];
+        keys_are_sorted = keys_are_sorted && keys[i - 1] <= keys[i];
+    }
+    if (!has_duplicate_keys && !keys_are_sorted) {
+        std::unordered_set<KeyType> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const KeyType key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
+        }
+    }
+    if (has_duplicate_keys) {
+        // Preserve the historical request-order merge semantics for the
+        // general backend API. ReportEvent supplies sorted unique keys and
+        // therefore stays on the batched-LRU fast path below.
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
+        }
+        return results;
+    }
+
+    std::vector<std::string_view> key_views(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+    const size_t missing_count = static_cast<size_t>(std::count(handles.begin(), handles.end(), nullptr));
+    if (missing_count > 0 && missing_count < handles.size()) {
+        // Updating every hit before inserting every miss reorders a mixed
+        // request. Besides partial-field merge semantics, order is observable
+        // under strict capacity because in-place charge growth is admitted
+        // differently from a new insertion. Preserve the original per-key
+        // behavior for this uncommon shape. Existing handles were already
+        // acquired in one batch, but are updated/released at their original
+        // position so a preceding insert still observes the preceding cache
+        // charge. All-hit updates and all-miss creates retain the fully
+        // batched-LRU fast paths below.
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (handles[i]) {
+                results[i] = UpdateHandleInPlace(handles[i], locations[i], properties[i]);
+                cache_->Release(handles[i]);
+            } else {
+                results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+            }
+        }
+        return results;
+    }
+
+    if (missing_count == 0) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpdateHandleInPlace(handles[i], locations[i], properties[i]);
+        }
+        cache_->ReleaseBatch(handles.data(), handles.size());
+        return results;
+    }
+
+    // The mixed shape returned above, so every handle is null here. Avoid a
+    // pointless ReleaseBatch shard-group allocation and retain ordered insert
+    // semantics for the all-new-key path.
+    assert(missing_count == handles.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
     }
     return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::UpsertSingleLocations(RequestContext * /*request_context*/,
+                                                               const KeyTypeVec &keys,
+                                                               const LocationIdRefVector &location_ids,
+                                                               const CacheLocationVector &locations) noexcept {
+    SingleLocationRmwScratch scratch;
+    PrepareSingleLocationRmwScratch(keys.size(), scratch);
+    std::vector<ErrorCode> results;
+    results.reserve(keys.size());
+    UpsertSingleLocationsInto(nullptr, keys, location_ids, locations, results, scratch);
+    return results;
+}
+
+void MetaLocalBackend::PrepareSingleLocationRmwScratch(size_t max_count, SingleLocationRmwScratch &scratch) noexcept {
+    scratch.ReleaseRetainedHandles();
+    scratch.retired_locations.clear();
+    scratch.key_views.reserve(max_count);
+    scratch.handles.reserve(max_count);
+    scratch.retired_locations.reserve(max_count);
+    cache_->PrepareBatchOperationScratch(max_count, &scratch.cache_batch);
+}
+
+void MetaLocalBackend::UpsertSingleLocationsInto(RequestContext * /*request_context*/,
+                                                 const KeyTypeVec &keys,
+                                                 const LocationIdRefVector &location_ids,
+                                                 const CacheLocationVector &locations,
+                                                 std::vector<ErrorCode> &results,
+                                                 SingleLocationRmwScratch &scratch) noexcept {
+    if (keys.size() != location_ids.size() || keys.size() != locations.size()) {
+        results.assign(keys.size(), EC_BADARGS);
+        return;
+    }
+    if (keys.empty()) {
+        results.clear();
+        return;
+    }
+    results.assign(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i] == nullptr || !locations[i] || locations[i]->id() != *location_ids[i]) {
+            // The method is a batch write: do not report EC_OK for valid-looking
+            // entries when a malformed sibling prevents the batch from being
+            // applied. This also matches the generic backend adapter.
+            results.assign(keys.size(), EC_BADARGS);
+            return;
+        }
+    }
+
+    bool has_duplicate_keys = false;
+    bool keys_are_sorted = true;
+    for (size_t i = 1; i < keys.size(); ++i) {
+        has_duplicate_keys = has_duplicate_keys || keys[i] == keys[i - 1];
+        keys_are_sorted = keys_are_sorted && keys[i - 1] <= keys[i];
+    }
+    if (!has_duplicate_keys && !keys_are_sorted) {
+        std::unordered_set<KeyType> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const KeyType key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
+        }
+    }
+    if (has_duplicate_keys) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpsertSingleLocationForOneKey(keys[i], *location_ids[i], locations[i]);
+        }
+        return;
+    }
+
+    scratch.key_views.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        scratch.key_views[i] = KeyToView(keys[i]);
+    }
+    scratch.handles.assign(keys.size(), nullptr);
+    cache_->LookupBatchWithScratch(
+        scratch.key_views.data(), scratch.key_views.size(), scratch.handles.data(), &scratch.cache_batch);
+    const size_t missing_count =
+        static_cast<size_t>(std::count(scratch.handles.begin(), scratch.handles.end(), nullptr));
+    if (missing_count == 0) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = UpdateHandleInPlaceSingleLocation(scratch.handles[i], *location_ids[i], locations[i]);
+        }
+        cache_->ReleaseBatchWithScratch(scratch.handles.data(), scratch.handles.size(), &scratch.cache_batch);
+        return;
+    }
+    if (missing_count == scratch.handles.size()) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] = CreateAndInsertSingleLocation(scratch.key_views[i], *location_ids[i], locations[i]);
+        }
+        return;
+    }
+
+    // Preserve request order for the mixed hit/miss shape. Capacity admission
+    // can observe whether an earlier item was inserted or grew in place.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (scratch.handles[i]) {
+            results[i] = UpdateHandleInPlaceSingleLocation(scratch.handles[i], *location_ids[i], locations[i]);
+            cache_->Release(scratch.handles[i]);
+        } else {
+            results[i] = CreateAndInsertSingleLocation(scratch.key_views[i], *location_ids[i], locations[i]);
+        }
+    }
+}
+
+void MetaLocalBackend::UpsertSingleLocationsUsingRetainedHandlesInto(RequestContext * /*request_context*/,
+                                                                     const KeyTypeVec &keys,
+                                                                     const LocationIdRefVector &location_ids,
+                                                                     CacheLocationVector &locations,
+                                                                     const std::vector<size_t> &read_indices,
+                                                                     std::vector<ErrorCode> &results,
+                                                                     SingleLocationRmwScratch &scratch) noexcept {
+    auto fail_and_release = [&results, &scratch, &keys](ErrorCode ec) {
+        results.assign(keys.size(), ec);
+        scratch.ReleaseRetainedHandles();
+    };
+    if (keys.size() != location_ids.size() || keys.size() != locations.size() || keys.size() != read_indices.size()) {
+        fail_and_release(EC_BADARGS);
+        return;
+    }
+    if (keys.empty()) {
+        results.clear();
+        scratch.ReleaseRetainedHandles();
+        return;
+    }
+    if (scratch.retained_handle_owner != cache_.get()) {
+        fail_and_release(EC_BADARGS);
+        return;
+    }
+
+    results.assign(keys.size(), EC_OK);
+    size_t previous_read_index = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t read_index = read_indices[i];
+        if (read_index >= scratch.handles.size() || read_index >= scratch.key_views.size() ||
+            (i > 0 && read_index <= previous_read_index) || location_ids[i] == nullptr || !locations[i] ||
+            locations[i]->id() != *location_ids[i] || scratch.key_views[read_index] != KeyToView(keys[i])) {
+            fail_and_release(EC_BADARGS);
+            return;
+        }
+        previous_read_index = read_index;
+    }
+
+    // A modifier may skip some read hits. Release those before inserting new
+    // keys so pinned, unrelated entries cannot change strict-capacity behavior.
+    size_t selected_position = 0;
+    for (size_t read_index = 0; read_index < scratch.handles.size(); ++read_index) {
+        if (selected_position < read_indices.size() && read_indices[selected_position] == read_index) {
+            ++selected_position;
+            continue;
+        }
+        if (scratch.handles[read_index]) {
+            cache_->Release(scratch.handles[read_index]);
+            scratch.handles[read_index] = nullptr;
+        }
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Cache::Handle *handle = scratch.handles[read_indices[i]];
+        if (handle) {
+            results[i] = UpdateHandleInPlaceSingleLocation(
+                handle, *location_ids[i], std::move(locations[i]), &scratch.retired_locations);
+        } else {
+            results[i] = CreateAndInsertSingleLocation(
+                scratch.key_views[read_indices[i]], *location_ids[i], std::move(locations[i]));
+        }
+    }
+    scratch.ReleaseRetainedHandles();
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
@@ -462,25 +833,153 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocations(RequestContext * /*request
     return results;
 }
 
-std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
-                                                                   const KeyTypeVec &keys,
-                                                                   const LocationIdsPerKey &location_ids,
-                                                                   LocationsPerKey &out_locations) noexcept {
-    assert(keys.size() == location_ids.size());
-    std::vector<std::vector<ErrorCode>> results(keys.size());
+std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*request_context*/,
+                                                           const KeyTypeVec &keys,
+                                                           LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_locations.clear();
     out_locations.resize(keys.size());
-
+    std::vector<int64_t> revisit_intervals;
+    if (revisit_histogram_) {
+        revisit_intervals.reserve(keys.size());
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
-        out_locations[i].resize(location_ids[i].size());
-
         std::string_view key_sv = KeyToView(keys[i]);
         Cache::Handle *handle = cache_->Lookup(key_sv);
         if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        const int64_t stored_time = item->GetLastAccessTime();
+        if (revisit_histogram_ && stored_time > 0) {
+            revisit_intervals.push_back(TimestampUtil::GetCurrentTimeUs() - stored_time);
+        }
+        item->TouchAccessTime();
+        {
+            std::shared_lock lock(item->GetMutex());
+            const auto &locations = item->GetLocations();
+            auto &values = out_locations[i];
+            values.reserve(locations.size());
+            for (const auto &[location_id, location] : locations) {
+                (void)location_id;
+                values.push_back(location);
+            }
+        }
+        cache_->Release(handle);
+    }
+    if (revisit_histogram_) {
+        revisit_histogram_->ObserveBatch(revisit_intervals);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext * /*request_context*/,
+                                                                  const KeyType *keys,
+                                                                  size_t key_count,
+                                                                  CompactLocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> results(key_count, EC_OK);
+    out_locations.Clear(key_count, key_count);
+    if (key_count != 0 && keys == nullptr) {
+        results.assign(key_count, EC_BADARGS);
+        for (size_t i = 0; i < key_count; ++i) {
+            out_locations.FinishKey();
+        }
+        return results;
+    }
+
+    CompactReadScratchLease scratch_lease(key_count);
+    auto &scratch = scratch_lease.get();
+    auto &revisit_intervals = scratch.revisit_intervals;
+    revisit_intervals.clear();
+    if (revisit_histogram_) {
+        revisit_intervals.reserve(key_count);
+    }
+    auto &key_views = scratch.key_views;
+    key_views.resize(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    auto &handles = scratch.handles;
+    handles.assign(key_count, nullptr);
+    cache_->PrepareBatchOperationScratch(key_count, &scratch.cache_batch);
+    cache_->LookupBatchWithScratch(key_views.data(), key_count, handles.data(), &scratch.cache_batch);
+
+    const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
+    for (size_t i = 0; i < key_count; ++i) {
+        Cache::Handle *handle = handles[i];
+        if (!handle) {
+            results[i] = EC_NOENT;
+            out_locations.FinishKey();
+            continue;
+        }
+
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        if (revisit_histogram_) {
+            const int64_t stored_time = item->GetLastAccessTime();
+            if (stored_time > 0 && stored_time <= access_time_us) {
+                revisit_intervals.push_back(access_time_us - stored_time);
+            }
+        }
+        item->TouchAccessTime(access_time_us);
+        {
+            std::shared_lock lock(item->GetMutex());
+            for (const auto &[location_id, location] : item->GetLocations()) {
+                (void)location_id;
+                out_locations.values.push_back(location);
+            }
+        }
+        out_locations.FinishKey();
+    }
+    cache_->ReleaseBatchWithScratch(handles.data(), handles.size(), &scratch.cache_batch);
+    if (revisit_histogram_) {
+        revisit_histogram_->ObserveBatch(revisit_intervals);
+    }
+    return results;
+}
+
+std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept {
+    std::vector<ErrorCode> ignored_key_error_codes;
+    return GetLocationsWithKeyStatus(request_context, keys, location_ids, out_locations, ignored_key_error_codes);
+}
+
+std::vector<std::vector<ErrorCode>>
+MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/,
+                                            const KeyTypeVec &keys,
+                                            const LocationIdsPerKey &location_ids,
+                                            LocationsPerKey &out_locations,
+                                            std::vector<ErrorCode> &out_key_error_codes) noexcept {
+    assert(keys.size() == location_ids.size());
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_key_error_codes.assign(keys.size(), EC_OK);
+    out_locations.assign(keys.size(), CacheLocationVector{});
+
+    // Targeted RMW commonly reads thousands of one-location keys at once.
+    // Group the LRU lookups/releases by cache shard instead of taking the same
+    // shard mutex once per key. Handles remain pinned while the immutable
+    // CacheLocation pointers are projected below, matching the compact query
+    // path's lifetime contract.
+    std::vector<std::string_view> key_views(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_views[i] = KeyToView(keys[i]);
+    }
+    std::vector<Cache::Handle *> handles(keys.size(), nullptr);
+    cache_->LookupBatch(key_views.data(), key_views.size(), handles.data());
+    const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_locations[i].resize(location_ids[i].size());
+
+        Cache::Handle *handle = handles[i];
+        if (!handle) {
+            out_key_error_codes[i] = EC_NOENT;
             results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
         }
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        item->TouchAccessTime();
+        item->TouchAccessTime(access_time_us);
         results[i].resize(location_ids[i].size());
         {
             std::shared_lock lock(item->GetMutex());
@@ -495,9 +994,137 @@ std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContex
                 }
             }
         }
-        cache_->Release(handle);
     }
+    cache_->ReleaseBatch(handles.data(), handles.size());
     return results;
+}
+
+std::vector<ErrorCode>
+MetaLocalBackend::GetSingleLocationsWithKeyStatus(RequestContext * /*request_context*/,
+                                                  const KeyTypeVec &keys,
+                                                  const LocationIdRefVector &location_ids,
+                                                  CacheLocationVector &out_locations,
+                                                  std::vector<ErrorCode> &out_key_error_codes) noexcept {
+    SingleLocationRmwScratch scratch;
+    PrepareSingleLocationRmwScratch(keys.size(), scratch);
+    std::vector<ErrorCode> results;
+    results.reserve(keys.size());
+    GetSingleLocationsWithKeyStatusInto(
+        nullptr, keys, location_ids, out_locations, out_key_error_codes, results, scratch);
+    return results;
+}
+
+void MetaLocalBackend::GetSingleLocationsWithKeyStatusInto(RequestContext *request_context,
+                                                           const KeyTypeVec &keys,
+                                                           const LocationIdRefVector &location_ids,
+                                                           CacheLocationVector &out_locations,
+                                                           std::vector<ErrorCode> &out_key_error_codes,
+                                                           std::vector<ErrorCode> &results,
+                                                           SingleLocationRmwScratch &scratch,
+                                                           bool retain_handles) noexcept {
+    GetSingleLocationsWithKeyStatusIntoImpl(request_context,
+                                            keys,
+                                            location_ids,
+                                            &out_locations,
+                                            nullptr,
+                                            out_key_error_codes,
+                                            results,
+                                            scratch,
+                                            retain_handles);
+}
+
+void MetaLocalBackend::GetSingleLocationViewsWithKeyStatusInto(RequestContext *request_context,
+                                                               const KeyTypeVec &keys,
+                                                               const LocationIdRefVector &location_ids,
+                                                               CacheLocationViewVector &out_locations,
+                                                               std::vector<ErrorCode> &out_key_error_codes,
+                                                               std::vector<ErrorCode> &results,
+                                                               SingleLocationRmwScratch &scratch) noexcept {
+    GetSingleLocationsWithKeyStatusIntoImpl(request_context,
+                                            keys,
+                                            location_ids,
+                                            nullptr,
+                                            &out_locations,
+                                            out_key_error_codes,
+                                            results,
+                                            scratch,
+                                            /*retain_handles=*/true);
+}
+
+void MetaLocalBackend::GetSingleLocationsWithKeyStatusIntoImpl(RequestContext * /*request_context*/,
+                                                               const KeyTypeVec &keys,
+                                                               const LocationIdRefVector &location_ids,
+                                                               CacheLocationVector *out_owned_locations,
+                                                               CacheLocationViewVector *out_borrowed_locations,
+                                                               std::vector<ErrorCode> &out_key_error_codes,
+                                                               std::vector<ErrorCode> &results,
+                                                               SingleLocationRmwScratch &scratch,
+                                                               bool retain_handles) noexcept {
+    scratch.ReleaseRetainedHandles();
+    assert((out_owned_locations == nullptr) != (out_borrowed_locations == nullptr));
+    if (out_owned_locations) {
+        out_owned_locations->assign(keys.size(), CacheLocationConstPtr{});
+    }
+    if (out_borrowed_locations) {
+        out_borrowed_locations->assign(keys.size(), nullptr);
+    }
+    out_key_error_codes.assign(keys.size(), EC_OK);
+    if (keys.size() != location_ids.size()) {
+        out_key_error_codes.assign(keys.size(), EC_BADARGS);
+        results.assign(keys.size(), EC_BADARGS);
+        return;
+    }
+    if (keys.empty()) {
+        results.clear();
+        return;
+    }
+    results.assign(keys.size(), EC_NOENT);
+    scratch.key_views.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i] == nullptr) {
+            out_key_error_codes.assign(keys.size(), EC_BADARGS);
+            results.assign(keys.size(), EC_BADARGS);
+            return;
+        }
+        scratch.key_views[i] = KeyToView(keys[i]);
+    }
+    scratch.handles.assign(keys.size(), nullptr);
+    cache_->LookupBatchWithScratch(
+        scratch.key_views.data(), scratch.key_views.size(), scratch.handles.data(), &scratch.cache_batch);
+    const int64_t access_time_us = TimestampUtil::GetCurrentTimeUs();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Cache::Handle *handle = scratch.handles[i];
+        if (!handle) {
+            out_key_error_codes[i] = EC_NOENT;
+            continue;
+        }
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        item->TouchAccessTime(access_time_us);
+        std::shared_lock lock(item->GetMutex());
+        const auto &locations = item->GetLocations();
+        auto it = locations.end();
+        if (locations.size() == 1) {
+            auto only = locations.begin();
+            if (only->first == *location_ids[i]) {
+                it = only;
+            }
+        } else if (!locations.empty()) {
+            it = locations.find(*location_ids[i]);
+        }
+        if (it != locations.end()) {
+            if (out_borrowed_locations) {
+                (*out_borrowed_locations)[i] = it->second.get();
+            } else {
+                (*out_owned_locations)[i] = it->second;
+            }
+            results[i] = EC_OK;
+        }
+    }
+    if (retain_handles) {
+        scratch.retained_handle_owner = cache_.get();
+    } else {
+        cache_->ReleaseBatchWithScratch(scratch.handles.data(), scratch.handles.size(), &scratch.cache_batch);
+    }
 }
 
 std::vector<ErrorCode> MetaLocalBackend::GetLocationIds(RequestContext * /*request_context*/,
@@ -597,6 +1224,51 @@ ErrorCode MetaLocalBackend::ListKeys(RequestContext * /*request_context*/,
     return EC_OK;
 }
 
+ErrorCode MetaLocalBackend::ScanLocationsForMaintenance(RequestContext * /*request_context*/,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+
+    int64_t start_shard = 0;
+    if (!StringUtil::StrToInt64(cursor.c_str(), start_shard) || start_shard < 0 || start_shard > shard_mask_) {
+        return EC_BADARGS;
+    }
+
+    const uint32_t num_shards = shard_mask_ + 1;
+    int64_t collected = 0;
+    for (uint32_t shard_id = static_cast<uint32_t>(start_shard); shard_id < num_shards; ++shard_id) {
+        cache_->ApplyToSingleShard(shard_id,
+                                   [&](const std::string_view &key,
+                                       Cache::ObjectPtr value,
+                                       size_t /*charge*/,
+                                       const Cache::CacheItemHelper * /*helper*/) {
+                                       if (key.size() != sizeof(KeyType) || value == nullptr) {
+                                           return;
+                                       }
+                                       const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                                       CacheLocationMap locations;
+                                       {
+                                           std::shared_lock lock(item->GetMutex());
+                                           locations = item->GetLocations();
+                                       }
+                                       out.keys.push_back(ViewToKey(key));
+                                       out.locations.emplace_back(std::move(locations));
+                                       out.location_results.push_back(EC_OK);
+                                       ++collected;
+                                   });
+
+        if (collected >= limit) {
+            const uint32_t next_shard = shard_id + 1;
+            out.next_cursor = (next_shard >= num_shards) ? SCAN_BASE_CURSOR : std::to_string(next_shard);
+            return EC_OK;
+        }
+    }
+
+    out.next_cursor = SCAN_BASE_CURSOR;
+    return EC_OK;
+}
+
 ErrorCode MetaLocalBackend::RandomSample(RequestContext * /*request_context*/,
                                          const int64_t count,
                                          std::vector<KeyType> &out_keys) noexcept {
@@ -667,6 +1339,14 @@ ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcep
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { return EC_NOENT; }
 
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
+
+bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept {
+    if (!cache_) {
+        return false;
+    }
+    out_hash_seed = cache_->GetHashSeed();
+    return true;
+}
 
 int64_t MetaLocalBackend::GetOldestAccessTime() const noexcept {
     int64_t oldest = INT64_MAX;

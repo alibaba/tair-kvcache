@@ -8,27 +8,35 @@ storage module:
         python3 -m kvcm_ops add_storage --help
         python3 -m kvcm_ops add_storage nfs --help
         python3 -m kvcm_ops add_storage pace --help
+        python3 -m kvcm_ops add_storage pace_ssd --help
         python3 -m kvcm_ops add_storage 3fs --help
 
         # add nfs storage, given "global_unique_name, root_path, key_kount_per_file"
         python3 -m kvcm_ops add_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 16
 
         # add pace storage, given "global_unique_name, domain, timeout"
-        python3 -m kvcm_ops add_storage -u common_pace_storage pace -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30
+        python3 -m kvcm_ops add_storage -u common_pace_storage pace -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30 --media_type 2
+        python3 -m kvcm_ops add_storage -u common_pace_ssd_storage pace_ssd -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30
 
         # add 3fs storage, given "global_unique_name, cluster_name, mountpoint, root_dir, key_count_per_file, touch_file_when_create(default true)"
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16 --not_touch_file_when_create
 
         # add event_report storage
-        python3 -m kvcm_ops add_storage -u test_vllm_1 event_report_l1p5 --heartbeat_timeout_ms 30000
-        python3 -m kvcm_ops add_storage -u test_vinyard_1 event_report_l2 --heartbeat_timeout_ms 30000
+        python3 -m kvcm_ops add_storage -u test_vllm_1 event_report_l1p5 --heartbeat_timeout_ms 30000 --snapshot_min_interval_ms 30000
+        python3 -m kvcm_ops add_storage -u test_vinyard_1 event_report_l2 --heartbeat_timeout_ms 30000 --snapshot_min_interval_ms 30000
     update storage:
         python3 -m kvcm_ops update_storage --help
         python3 -m kvcm_ops update_storage nfs --help
         python3 -m kvcm_ops update_storage pace --help
+        python3 -m kvcm_ops update_storage pace_ssd --help
         python3 -m kvcm_ops update_storage 3fs --help
         python3 -m kvcm_ops update_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 64
+        # omitting --media_type preserves the current PACE storage type/media, including legacy media_type=5
+        python3 -m kvcm_ops update_storage -u common_pace_storage pace -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 60
+        # pace and pace_ssd only update storages registered with their respective storage type
+        python3 -m kvcm_ops update_storage -u common_pace_ssd_storage pace_ssd -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30
+        python3 -m kvcm_ops update_storage -u test_vllm_1 event_report_l1p5 --heartbeat_timeout_ms 30000 --cleanup_grace_ms 300000 --liveness_check_interval_ms 5000 --snapshot_min_interval_ms 1000
     enable/disable storage:
         python3 -m kvcm_ops enable_storage --help
         python3 -m kvcm_ops enable_storage -u test_nfs_1

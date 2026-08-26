@@ -1,4 +1,5 @@
 import argparse
+import math
 from ..common.json_data import *
 from ..common.common_args import *
 
@@ -22,6 +23,7 @@ class StorageQuota(JsonData):
         supported_types = [
             "ST_3FS",
             "ST_TAIRMEMPOOL",
+            "ST_TAIRMEMPOOL_SSD",
             "ST_NFS",
             "ST_EVENT_REPORT_L1P5",
             "ST_EVENT_REPORT_L2",
@@ -311,6 +313,7 @@ class CacheConfig(JsonData):
         valid_strategies = [
             "CPS_ALWAYS_3FS", "CPS_PREFER_3FS",
             "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL",
+            "CPS_ALWAYS_TAIR_MEMPOOL_SSD", "CPS_PREFER_TAIR_MEMPOOL_SSD",
             "CPS_ALWAYS_VCNS_3FS", "CPS_PREFER_VCNS_3FS",
         ]
         if _data_storage_strategy not in valid_strategies:
@@ -331,6 +334,36 @@ class CacheConfig(JsonData):
         return cls(data_storage_strategy, reclaim_strategy, meta_indexer_config)
 
 
+# Aligned with server-side StringUtil::ParseBucketBoundaries: comma separated,
+# each token must fully parse to a finite positive number, strictly ascending.
+def parse_bucket_boundaries(value: str):
+    boundaries = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"empty token in bucket boundaries: '{value}'")
+        try:
+            number = float(token)
+        except ValueError as exc:
+            raise ValueError(f"invalid number '{token}' in bucket boundaries: '{value}'") from exc
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"bucket boundary '{token}' must be a finite positive number: '{value}'")
+        if boundaries and number <= boundaries[-1]:
+            raise ValueError(f"bucket boundaries must be strictly ascending: '{value}'")
+        boundaries.append(number)
+    return boundaries
+
+
+def revisit_interval_buckets_value(value: str) -> str:
+    if value == "":
+        return ""  # empty means server-side default buckets
+    try:
+        parse_bucket_boundaries(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid revisit_interval_buckets: {exc}") from exc
+    return ",".join(token.strip() for token in value.split(","))
+
+
 class InstanceGroup(JsonData):
     def __init__(self,
                  name: str,
@@ -343,6 +376,7 @@ class InstanceGroup(JsonData):
                  version: int = 1,
                  extra_info: str = "",
                  event_report_storage_candidates=None,
+                 revisit_interval_buckets: str = "",
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -354,6 +388,7 @@ class InstanceGroup(JsonData):
         self._version = version
         self._extra_info = extra_info
         self._event_report_storage_candidates = event_report_storage_candidates or []
+        self._revisit_interval_buckets = revisit_interval_buckets
         self.check()
 
     def check(self):
@@ -365,6 +400,11 @@ class InstanceGroup(JsonData):
                 json.loads(self._extra_info)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"extra_info must be valid JSON, got: '{self._extra_info}'") from exc
+        if self._revisit_interval_buckets:
+            try:
+                parse_bucket_boundaries(self._revisit_interval_buckets)
+            except ValueError as exc:
+                raise RuntimeError(f"revisit_interval_buckets invalid: {exc}") from exc
         self._instance_group_quota.check()
         self._cache_config.check()
 
@@ -379,6 +419,7 @@ class InstanceGroup(JsonData):
             "user_data": self._user_data,
             "version": self._version,
             "extra_info": self._extra_info,
+            "revisit_interval_buckets": self._revisit_interval_buckets,
         }
         if self._event_report_storage_candidates:
             data["event_report_storage_candidates"] = self._event_report_storage_candidates
@@ -404,8 +445,10 @@ class InstanceGroup(JsonData):
             version = int(json_data["version"])
         extra_info = json_data.get("extra_info", "")
         event_report_storage_candidates = json_data.get("event_report_storage_candidates", [])
+        revisit_interval_buckets = json_data.get("revisit_interval_buckets", "")
         return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count,
-                   cache_config, user_data, version, extra_info, event_report_storage_candidates)
+                   cache_config, user_data, version, extra_info, event_report_storage_candidates,
+                   revisit_interval_buckets)
 
 # create or update
 
@@ -474,7 +517,9 @@ def parse_instance_group_args(is_create: bool):
             StorageQuota(
                 "ST_TAIRMEMPOOL",
                 10000000000)] if is_create else argparse.SUPPRESS,
-        help="quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;ST_TAIRMEMPOOL,10000000000")
+        help=(
+            "quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;"
+            "ST_TAIRMEMPOOL,10000000000;ST_TAIRMEMPOOL_SSD,10000000000"))
 
     parser.add_argument(
         "--reclaim_policy",
@@ -494,7 +539,10 @@ def parse_instance_group_args(is_create: bool):
         "--data_storage_strategy",
         type=str,
         default="CPS_PREFER_3FS" if is_create else argparse.SUPPRESS,
-        help="data_storage_strategy, only support CPS_ALWAYS_3FS|CPS_PREFER_3FS|CPS_ALWAYS_TAIR_MEMPOOL|CPS_PREFER_TAIR_MEMPOOL now"
+        help=(
+            "data_storage_strategy, supports 3FS, VCNS_3FS, TairMempool DRAM "
+            "and TairMempool SSD ALWAYS/PREFER strategies"
+        )
     )
 
     parser.add_argument(
@@ -554,6 +602,17 @@ def parse_instance_group_args(is_create: bool):
         type=split_strs,
         default=[] if is_create else argparse.SUPPRESS,
         help="event_report_storage_candidates, eg. event_report_default or event_report_g1,event_report_g2"
+    )
+
+    parser.add_argument(
+        "--revisit_interval_buckets",
+        type=revisit_interval_buckets_value,
+        default="" if is_create else argparse.SUPPRESS,
+        help=(
+            "revisit_interval_buckets, comma separated positive numbers in strictly "
+            "ascending order, eg. 1,5,30,60. Empty string clears it to server default. "
+            "On update, omit to keep the server-side value."
+        )
     )
 
     args = parser.parse_args()

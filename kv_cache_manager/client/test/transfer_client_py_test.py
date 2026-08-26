@@ -10,7 +10,9 @@ import sys
 import os
 import tempfile
 import ctypes
+import gc
 import unittest
+import weakref
 from kv_cache_manager.client.pybind import kvcm_py_client
 
 class TransferClientPyTest(unittest.TestCase):
@@ -79,6 +81,7 @@ class TransferClientPyTest(unittest.TestCase):
         regist_span = kvcm_py_client.RegistSpan()
         regist_span.base = buffer_addr  # 使用地址值
         regist_span.size = buffer_size
+        regist_span.owner = buffer
         init_params.regist_span = regist_span
         
         init_params.self_location_spec_name = spec_name
@@ -94,6 +97,60 @@ class TransferClientPyTest(unittest.TestCase):
         ]'''
         
         return init_params
+
+    def test_regist_span_lifetime_survives_gc(self):
+        """注册内存及其持有对象在客户端生命周期内保持有效。"""
+
+        class BufferOwner:
+            def __init__(self, size):
+                self.buffer = ctypes.create_string_buffer(size)
+
+        owner = BufferOwner(1024 * 1024)
+        owner_ref = weakref.ref(owner)
+        init_params = self._create_init_params("tp0")
+        init_params.regist_span.base = ctypes.addressof(owner.buffer)
+        init_params.regist_span.owner = owner
+        del owner
+
+        gc.collect()
+        self.assertIsNotNone(owner_ref())
+
+        captured_span = init_params.regist_span
+        client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+        self.assertIsNotNone(client)
+        init_params.regist_span = None
+        captured_span.owner = None
+        del captured_span
+        del init_params
+        gc.collect()
+        self.assertIsNotNone(owner_ref())
+
+        del client
+        gc.collect()
+        self.assertIsNone(owner_ref())
+
+    def test_create_with_valid_shared_memory_fd(self):
+        """fd、base 和 size 同时有效时使用共享内存接口。"""
+
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(self.init_params.regist_span.size)
+            self.init_params.regist_span.fd = shared_memory_file.fileno()
+            client = kvcm_py_client.TransferClient.Create(self.client_config, self.init_params)
+            self.assertIsNotNone(client)
+
+    def test_reject_partial_shared_memory_registration(self):
+        """只提供部分共享内存字段时创建失败。"""
+
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(self.init_params.regist_span.size)
+            self.init_params.regist_span.fd = shared_memory_file.fileno()
+            self.init_params.regist_span.base = 0
+            client = kvcm_py_client.TransferClient.Create(self.client_config, self.init_params)
+            self.assertIsNone(client)
+
+        self.init_params.regist_span.fd = -2
+        client = kvcm_py_client.TransferClient.Create(self.client_config, self.init_params)
+        self.assertIsNone(client)
 
     def tearDown(self):
         """测试后清理"""

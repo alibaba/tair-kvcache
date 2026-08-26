@@ -12,6 +12,7 @@ namespace kv_cache_manager {
 struct PerCapacityHitInfo {
     double capacity_gb;
     int64_t hit_count;
+    double hit_rate = -1.0;
 };
 
 // Re-define macros that were #undef'd at the bottom of metrics_collector.h.

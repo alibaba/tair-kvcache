@@ -22,11 +22,19 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_TRUE(config.Check());
         ASSERT_EQ(2, config.GetSchedulePlanExecutorThreadCount());
         ASSERT_EQ(1u, config.GetSchedulePlanMigrationWorkerBudget());
+        ASSERT_EQ(4u, config.GetMetaQueryWorkerCount());
+        ASSERT_EQ(256u, config.GetMetaQueryParallelThreshold());
+        ASSERT_EQ(128u, config.GetMetaQueryChunkSize());
         ASSERT_EQ(60000, config.GetCacheReclaimerInflightDeleteTimeoutMs());
         ASSERT_EQ(100000, config.GetCacheReclaimerPendingLocationLimitPerGroupType());
         ASSERT_EQ(64ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
         ASSERT_EQ(256ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimit());
+        ASSERT_FALSE(config.IsCacheGcEnabled());
+        ASSERT_EQ(1000, config.GetCacheGcScanIntervalMs());
+        ASSERT_EQ(86400000, config.GetCacheGcRoundPauseMs());
+        ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
+        ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
     }
     // config_file not exist
     {
@@ -165,6 +173,42 @@ TEST_F(ServerConfigTest, TestSchedulePlanMigrationWorkerBudget) {
     }
 }
 
+TEST_F(ServerConfigTest, TestMetaQueryExecutorConfig) {
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ{
+            {"kvcm.meta_query.worker_count", "8"},
+            {"kvcm.meta_query.parallel_threshold", "512"},
+            {"kvcm.meta_query.chunk_size", "64"},
+        };
+        ASSERT_TRUE(config.Parse("", environ));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(8u, config.GetMetaQueryWorkerCount());
+        EXPECT_EQ(512u, config.GetMetaQueryParallelThreshold());
+        EXPECT_EQ(64u, config.GetMetaQueryChunkSize());
+    }
+    for (const auto &invalid : std::vector<std::pair<std::string, std::string>>{
+             {"kvcm.meta_query.worker_count", "0"},
+             {"kvcm.meta_query.worker_count", "65"},
+             {"kvcm.meta_query.parallel_threshold", "0"},
+             {"kvcm.meta_query.chunk_size", "0"},
+         }) {
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{invalid.first, invalid.second}}));
+        EXPECT_FALSE(config.Check()) << invalid.first << "=" << invalid.second;
+    }
+    {
+        ServerConfig config;
+        ASSERT_TRUE(
+            config.Parse("", {{"kvcm.meta_query.parallel_threshold", "128"}, {"kvcm.meta_query.chunk_size", "129"}}));
+        EXPECT_FALSE(config.Check());
+    }
+    for (const auto &invalid_value : {"invalid", "12x", "-1", "4294967296"}) {
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.meta_query.worker_count", invalid_value}})) << invalid_value;
+    }
+}
+
 TEST_F(ServerConfigTest, TestCacheReclaimerAsyncDeleteConfig) {
     ServerConfig config;
     std::unordered_map<std::string, std::string> environ{
@@ -185,6 +229,57 @@ TEST_F(ServerConfigTest, TestCacheReclaimerAsyncDeleteConfig) {
     environ["kvcm.cache_reclaimer.pending_delete_handler_limit"] = "0";
     ASSERT_TRUE(config.Parse("", environ));
     EXPECT_FALSE(config.Check());
+}
+
+TEST_F(ServerConfigTest, TestCacheGcConfig) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ{
+        {"kvcm.cache_gc.enabled", "true"},
+        {"kvcm.cache_gc.scan_interval_ms", "123"},
+        {"kvcm.cache_gc.round_pause_ms", "456"},
+        {"kvcm.cache_gc.scan_batch_size", "7"},
+        {"kvcm.cache_gc.orphan_writing_grace_period_ms", "3600000"},
+        {"kvcm.cache_gc.max_inflight_delete_requests", "3"},
+    };
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_TRUE(config.Check());
+    EXPECT_TRUE(config.IsCacheGcEnabled());
+    EXPECT_EQ(123, config.GetCacheGcScanIntervalMs());
+    EXPECT_EQ(456, config.GetCacheGcRoundPauseMs());
+    EXPECT_EQ(7, config.GetCacheGcScanBatchSize());
+    EXPECT_EQ(3600000, config.GetCacheGcOrphanWritingGracePeriodMs());
+    EXPECT_EQ(3, config.GetCacheGcMaxInflightDeleteRequests());
+
+    environ["kvcm.cache_gc.orphan_writing_grace_period_ms"] = "3599999";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.orphan_writing_grace_period_ms"] = "3600000";
+    environ["kvcm.cache_gc.scan_batch_size"] = "0";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.scan_batch_size"] = "9223372036854775808";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.scan_batch_size"] = "7";
+    environ["kvcm.cache_gc.max_inflight_delete_requests"] = "0";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.enabled"] = "false";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, TestMalformedNumericEnvironmentValueReturnsParseError) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ{
+        {"kvcm.cache_gc.scan_interval_ms", "not-a-number"},
+    };
+
+    EXPECT_FALSE(config.Parse("", environ));
 }
 
 TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {

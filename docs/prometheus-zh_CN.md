@@ -128,7 +128,11 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
 | `manager.get_cache_location_hit_block_counter` | counter | GetCacheLocation 命中的 Block 总数（累计） |
-| `manager.prefix_match_time_us` | gauge | 前缀匹配延迟（微秒） |
+| `manager.prefix_match_time_us` | gauge | GetHostCacheState 等前缀匹配的外层总延迟（微秒） |
+| `meta_searcher.indexer_get_time_us` | gauge | MetaSearcher 调用 MetaIndexer 读取 metadata 的墙钟时间（微秒） |
+| `meta_indexer.get_io_time_us` | gauge | metadata backend 调用区间的墙钟并集；local 模式包含 LRU/锁/复制，不包含并行 projection，也不表示 Redis I/O |
+| `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
+| `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
 
@@ -148,6 +152,11 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。
 
+上述 GetHostCacheState 分段指标是嵌套关系：`meta_indexer.get_io_time_us` 位于
+`meta_searcher.indexer_get_time_us` 内，后者与 projection/reduce 又位于
+`manager.prefix_match_time_us` 内。渐进 local 查询会流水化 backend read 与 projection，两者可能重叠，排障时
+不能把它们相加。`get_io_time_us` 是历史命名；当实例使用 `storage_type=local` 时没有 Redis 网络调用。
+
 ## 与 KMonitor 指标对照
 
 KVCacheManager 同时通过 KMonitor 与 Prometheus `/metrics` 端点导出
@@ -162,12 +171,22 @@ KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `event_report.qps` | `rate(kvcm_event_report_request_counter[1m])` |
+| `event_report.error_qps` | `rate(kvcm_event_report_error_counter[1m])` |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
 | `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
 
 Prometheus 侧存储的是底层 *counter*（单调递增），KMonitor 的
 `*.qps` 值由 agent 在上报时计算。两种视图反映的是同一事件流，
 查询 Prometheus 时直接用 counter + `rate` 即可。
+
+`event_report.*` 按固定标签 `instance_group`、`instance_id`、`type` 和
+`event_type` 拆分。其中 `type` 为 `event_report_l1p5` 或
+`event_report_l2`，`event_type` 为协议定义的六种事件类型之一（未知值
+统一记为 `unknown`）。一个批量请求包含某事件类型时，该类型 QPS 计一次；
+同一请求内同类型的多个 event 不重复计数。`event_report.request_rt_us`
+记录整次 `ReportEvent` 请求的端到端耗时；请求失败时
+`event_report.error_qps` 按该请求包含的事件类型分别计一次。
 
 注：`data_storage.create_keys_qps` 在 Prom 侧也会以 gauge 形式
 导出"最近一次批次大小"（不是每秒速率）。每秒速率请使用

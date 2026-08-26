@@ -17,6 +17,22 @@ cc_test(
 )
 
 cc_test(
+    name = "CacheGarbageCollectorTest",
+    srcs = [
+        "cache_garbage_collector_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:cache_garbage_collector",
+        "//kv_cache_manager/manager:migration_manager",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
     name = "DataStorageSelectorTest",
     srcs = [
         "data_storage_selector_test.cc",
@@ -71,8 +87,22 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:instance_info",
+        "//kv_cache_manager/manager:meta_searcher",
+        "//kv_cache_manager/meta",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:meta_local_backend",
+    ],
+)
+
+cc_test(
+    name = "GetHostCacheStateBenchmark",
+    srcs = ["get_host_cache_state_benchmark.cc"],
+    copts = ["-fno-access-control"],
+    tags = ["manual"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
     ],
@@ -141,9 +171,9 @@ cc_test(
     ],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
     ],
 )
 

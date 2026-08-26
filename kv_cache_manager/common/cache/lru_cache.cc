@@ -9,6 +9,7 @@
 
 #include "kv_cache_manager/common/cache/lru_cache.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -475,6 +476,27 @@ LRUHandle *LRUCacheShard::Lookup(const std::string_view &key,
     return e;
 }
 
+void LRUCacheShard::LookupBatch(const std::string_view *keys,
+                                const uint32_t *hashes,
+                                const size_t *ordered_indices,
+                                size_t count,
+                                Cache::Handle **out_handles) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < count; ++i) {
+        const size_t index = ordered_indices[i];
+        LRUHandle *entry = table_.Lookup(keys[index], hashes[index]);
+        if (entry != nullptr) {
+            assert(entry->InCache());
+            if (!entry->HasRefs()) {
+                LRU_Remove(entry);
+            }
+            entry->Ref();
+            entry->SetHit();
+        }
+        out_handles[index] = static_cast<Cache::Handle *>(entry);
+    }
+}
+
 bool LRUCacheShard::Ref(LRUHandle *e) {
     std::lock_guard<std::mutex> l(mutex_);
     // To create another reference - entry must be already externally referenced.
@@ -561,6 +583,39 @@ bool LRUCacheShard::Release(LRUHandle *e, bool /*useful*/, bool erase_if_last_re
         }
     }
     return must_free;
+}
+
+void LRUCacheShard::ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count) {
+    autovector<LRUHandle *> free_handles;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (size_t i = 0; i < count; ++i) {
+            auto *entry = static_cast<LRUHandle *>(handles[ordered_indices[i]]);
+            if (entry == nullptr) {
+                continue;
+            }
+            bool must_free = entry->Unref();
+            const bool was_in_cache = entry->InCache();
+            if (must_free && was_in_cache) {
+                if (!no_evict_on_insert_ && usage_ > capacity_) {
+                    assert(lru_.next == &lru_);
+                    table_.Remove(entry->key(), entry->hash);
+                    entry->SetInCache(false);
+                } else {
+                    LRU_Insert(entry);
+                    must_free = false;
+                }
+            }
+            if (must_free) {
+                assert(usage_ >= entry->total_charge);
+                usage_ -= entry->total_charge;
+                free_handles.push_back(entry);
+            }
+        }
+    }
+    for (auto *entry : free_handles) {
+        entry->Free(table_.GetAllocator());
+    }
 }
 
 LRUHandle *LRUCacheShard::CreateHandle(const std::string_view &key,
@@ -784,6 +839,124 @@ size_t LRUCache::GetCharge(Handle *handle) const {
 const Cache::CacheItemHelper *LRUCache::GetCacheItemHelper(Handle *handle) const {
     auto h = static_cast<const LRUHandle *>(handle);
     return h->helper;
+}
+
+void LRUCache::LookupBatch(const std::string_view *keys, size_t count, Handle **out_handles) {
+    BatchOperationScratch scratch;
+    PrepareBatchOperationScratch(count, &scratch);
+    LookupBatchWithScratch(keys, count, out_handles, &scratch);
+}
+
+void LRUCache::PrepareBatchOperationScratch(size_t max_count, BatchOperationScratch *scratch) {
+    if (!scratch) {
+        return;
+    }
+    scratch->hashes.reserve(max_count);
+    scratch->ordered_indices.reserve(max_count);
+    const size_t shard_slots = GetNumShards() + 1;
+    scratch->shard_offsets.reserve(shard_slots);
+    scratch->cursors.reserve(shard_slots);
+}
+
+void LRUCache::LookupBatchWithScratch(const std::string_view *keys,
+                                      size_t count,
+                                      Handle **out_handles,
+                                      BatchOperationScratch *scratch) {
+    if (count == 0) {
+        return;
+    }
+    if (!scratch) {
+        LookupBatch(keys, count, out_handles);
+        return;
+    }
+    std::fill(out_handles, out_handles + count, nullptr);
+
+    const size_t shard_count = GetNumShards();
+    scratch->hashes.resize(count);
+    scratch->shard_offsets.assign(shard_count + 1, 0);
+    auto &hashes = scratch->hashes;
+    auto &shard_offsets = scratch->shard_offsets;
+    for (size_t i = 0; i < count; ++i) {
+        hashes[i] = LRUCacheShard::ComputeHash(keys[i], hash_seed_);
+        const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
+        ++shard_offsets[shard + 1];
+    }
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        shard_offsets[shard + 1] += shard_offsets[shard];
+    }
+
+    scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
+    scratch->ordered_indices.resize(count);
+    auto &cursors = scratch->cursors;
+    auto &ordered_indices = scratch->ordered_indices;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t shard = LRUCacheShard::HashPieceForSharding(hashes[i]) & shard_mask_;
+        ordered_indices[cursors[shard]++] = i;
+    }
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        const size_t begin = shard_offsets[shard];
+        const size_t end = shard_offsets[shard + 1];
+        if (begin == end) {
+            continue;
+        }
+        GetShard(hashes[ordered_indices[begin]])
+            .LookupBatch(keys, hashes.data(), ordered_indices.data() + begin, end - begin, out_handles);
+    }
+}
+
+void LRUCache::ReleaseBatch(Handle *const *handles, size_t count) {
+    BatchOperationScratch scratch;
+    PrepareBatchOperationScratch(count, &scratch);
+    ReleaseBatchWithScratch(handles, count, &scratch);
+}
+
+void LRUCache::ReleaseBatchWithScratch(Handle *const *handles, size_t count, BatchOperationScratch *scratch) {
+    if (count == 0) {
+        return;
+    }
+    if (!scratch) {
+        ReleaseBatch(handles, count);
+        return;
+    }
+
+    const size_t shard_count = GetNumShards();
+    scratch->shard_offsets.assign(shard_count + 1, 0);
+    auto &shard_offsets = scratch->shard_offsets;
+    size_t non_null_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (handles[i] == nullptr) {
+            continue;
+        }
+        const auto *entry = static_cast<const LRUHandle *>(handles[i]);
+        const size_t shard = LRUCacheShard::HashPieceForSharding(entry->GetHash()) & shard_mask_;
+        ++shard_offsets[shard + 1];
+        ++non_null_count;
+    }
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        shard_offsets[shard + 1] += shard_offsets[shard];
+    }
+
+    scratch->cursors.assign(shard_offsets.begin(), shard_offsets.end());
+    scratch->ordered_indices.resize(non_null_count);
+    auto &cursors = scratch->cursors;
+    auto &ordered_indices = scratch->ordered_indices;
+    for (size_t i = 0; i < count; ++i) {
+        if (handles[i] == nullptr) {
+            continue;
+        }
+        const auto *entry = static_cast<const LRUHandle *>(handles[i]);
+        const size_t shard = LRUCacheShard::HashPieceForSharding(entry->GetHash()) & shard_mask_;
+        ordered_indices[cursors[shard]++] = i;
+    }
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        const size_t begin = shard_offsets[shard];
+        const size_t end = shard_offsets[shard + 1];
+        if (begin == end) {
+            continue;
+        }
+        const auto *entry = static_cast<const LRUHandle *>(handles[ordered_indices[begin]]);
+        GetShard(entry->GetHash()).ReleaseBatch(handles, ordered_indices.data() + begin, end - begin);
+    }
 }
 
 void LRUCache::ApplyToHandle(

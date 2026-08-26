@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/meta_service_impl.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -111,6 +112,7 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
+constexpr const char *kGetHostCacheStateFullAccessLogEnv = "KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG";
 
 std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
     std::string debug_json;
@@ -119,6 +121,8 @@ std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message)
 }
 
 bool IsReportEventFullAccessLogEnabled() { return EnvUtil::GetEnv(kReportEventFullAccessLogEnv, false); }
+
+bool IsGetHostCacheStateFullAccessLogEnabled() { return EnvUtil::GetEnv(kGetHostCacheStateFullAccessLogEnv, false); }
 
 const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
     if (event.has_block_add()) {
@@ -244,6 +248,59 @@ std::string BuildReportEventResponseAccessLogSummary(const proto::meta::ReportEv
     writer.Int(failed_item_count);
     writer.Key("extra_info_size");
     writer.Uint64(response->extra_info().size());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+std::string BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheStateRequest *request) {
+    if (IsGetHostCacheStateFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(request);
+    }
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("trace_id");
+    writer.String(request->trace_id().c_str());
+    writer.Key("instance_id");
+    writer.String(request->instance_id().c_str());
+    writer.Key("query_type");
+    writer.String(proto::meta::QueryType_Name(request->query_type()).c_str());
+    writer.Key("key_count");
+    writer.Int(request->block_cache_keys_size());
+    if (request->block_cache_keys_size() > 0) {
+        writer.Key("first_key");
+        writer.Int64(request->block_cache_keys(0));
+        writer.Key("last_key");
+        writer.Int64(request->block_cache_keys(request->block_cache_keys_size() - 1));
+    }
+    writer.Key("medium_count");
+    writer.Int(request->medium_size());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+std::string BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheStateResponse *response) {
+    if (IsGetHostCacheStateFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(response);
+    }
+
+    int64_t max_prefix_match_blocks = 0;
+    for (const auto &host : response->hosts()) {
+        max_prefix_match_blocks = std::max(max_prefix_match_blocks, host.local());
+    }
+    const auto &status = response->header().status();
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("status_code");
+    writer.String(proto::meta::ErrorCode_Name(status.code()).c_str());
+    writer.Key("status_message");
+    writer.String(status.message().c_str());
+    writer.Key("returned_host_count");
+    writer.Int(response->hosts_size());
+    writer.Key("max_prefix_match_blocks");
+    writer.Int64(max_prefix_match_blocks);
     writer.EndObject();
     return sb.GetString();
 }
@@ -487,8 +544,13 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
     std::vector<BackendSelector> backend_selectors;
     backend_selectors.reserve(request->backend_selectors_size());
     for (const auto &sel : request->backend_selectors()) {
+        DataStorageType backend_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        // StorageType is an open protobuf enum while DataStorageType uses an
+        // uint8_t underlying type. Explicit conversion prevents an unknown
+        // wire value such as 263 from truncating to L1P5 (7).
+        ProtoConvert::DataStorageTypeFromProto(sel.backend_type(), backend_type);
         backend_selectors.push_back({
-            static_cast<DataStorageType>(sel.backend_type()),
+            backend_type,
             static_cast<LocationSelectStrategy>(sel.strategy()),
         });
     }
@@ -518,9 +580,9 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Batch cache locations retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
-                      request->trace_id().c_str(),
-                      batch_result.size());
+        KVCM_LOG_DEBUG("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
+                       request->trace_id().c_str(),
+                       batch_result.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -877,18 +939,17 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                               BuildReportEventResponseAccessLogSummary(response));
     auto *header = response->mutable_header();
 
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->host_ip_port().c_str(),
-                  request->events_size());
+    KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->host_ip_port().c_str(),
+                   request->events_size());
 
     auto ec = cache_manager_->ReportEvent(request_context, request, response);
-    if (ec != EC_OK) {
-        KVCM_LOG_WARN("[traceId: %s] ReportEvent %s, ec=%d",
-                      request->trace_id().c_str(),
-                      (ec == EC_PARTIAL_OK) ? "partially failed" : "failed",
-                      ec);
+    // Partial failures are logged once with bounded per-type/error counts by
+    // CacheManager::ReportEvent. Keep this generic log for top-level failures.
+    if (ec != EC_OK && ec != EC_PARTIAL_OK) {
+        KVCM_LOG_WARN("[traceId: %s] ReportEvent failed, ec=%d", request->trace_id().c_str(), ec);
     }
     if (!request->instance_id().empty()) {
         response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));
@@ -903,7 +964,10 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                         const proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     SPAN_TRACER(request_context);
-    API_CALL_GUARD("GetHostCacheState", true);
+    API_CALL_GUARD_WITH_DEBUG("GetHostCacheState",
+                              true,
+                              BuildGetHostCacheStateRequestAccessLogSummary(request),
+                              BuildGetHostCacheStateResponseAccessLogSummary(response));
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
     std::string invalid_fields = "missing or invalid fields: ";
@@ -917,21 +981,27 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
+    if (request->p2p_host_count() < 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "p2p_host_count (must be >= 0)", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
 
     CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
     std::vector<std::string> mediums(request->medium().begin(), request->medium().end());
 
-    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
-                  request->trace_id().c_str(),
-                  request->instance_id().c_str(),
-                  request->block_cache_keys_size());
+    KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                   request->trace_id().c_str(),
+                   request->instance_id().c_str(),
+                   request->block_cache_keys_size());
 
     auto [ec, host_matches] =
         cache_manager_->GetHostCacheState(request_context,
                                           request->instance_id(),
                                           static_cast<CacheManager::QueryType>(request->query_type()),
                                           keys,
-                                          mediums);
+                                          mediums,
+                                          static_cast<size_t>(request->p2p_host_count()));
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());
@@ -941,14 +1011,16 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         for (const auto &match : host_matches) {
             auto *host_match = response->add_hosts();
             host_match->set_host_ip_port(match.host_ip_port);
-            host_match->set_prefix_match_blocks(match.prefix_match_blocks);
+            host_match->set_local(match.local);
+            host_match->set_p2p_1_fetch(match.p2p_1_fetch);
+            host_match->set_p2p_1_total_match(match.p2p_1_total_match);
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Host cache state retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
-                      request->trace_id().c_str(),
-                      response->hosts_size());
+        KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
+                       request->trace_id().c_str(),
+                       response->hosts_size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }

@@ -53,6 +53,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/service/util:service_call_guard",
         "@cpp_stub",
     ],
 )
@@ -105,6 +106,7 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:prometheus_exporter",
     ],

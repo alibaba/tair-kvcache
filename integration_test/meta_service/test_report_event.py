@@ -18,11 +18,13 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import time
 import statistics
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
@@ -350,6 +352,14 @@ class EventReportFunctionalTest(unittest.TestCase):
                 },
                 "location_spec_infos": [
                     {"name": "tp0", "size": 1024},
+                    {"name": "mem_spec", "size": 1024},
+                    {"name": "disk_spec", "size": 1024},
+                    {"name": "spec_4096", "size": 1024},
+                    {"name": "spec_8192", "size": 1024},
+                    {"name": "keep_spec", "size": 1024},
+                    {"name": "drop_spec", "size": 1024},
+                    {"name": "l1p5_spec", "size": 1024},
+                    {"name": "l2_spec", "size": 1024},
                 ],
             })
         except Exception as e:
@@ -480,7 +490,34 @@ class EventReportFunctionalTest(unittest.TestCase):
                 specs_by_name,
                 f"Expected {profile_name} spec [{spec_name}], locations={json.dumps(locations, ensure_ascii=False)}",
             )
-            self.assertEqual(specs_by_name[spec_name].get("uri"), uri)
+            actual_uri = specs_by_name[spec_name].get("uri", "")
+            actual = urlsplit(actual_uri)
+            expected = urlsplit(uri)
+            self.assertEqual(
+                (actual.scheme, actual.netloc, actual.path, actual.fragment),
+                (expected.scheme, expected.netloc, expected.path, expected.fragment),
+            )
+
+            actual_params = parse_qsl(actual.query, keep_blank_values=True)
+            expected_params = parse_qsl(expected.query, keep_blank_values=True)
+            versions = [
+                value for key, value in actual_params if key == "s_version"
+            ]
+            self.assertEqual(
+                len(versions),
+                1,
+                f"Expected exactly one s_version in URI: {actual_uri}",
+            )
+            self.assertRegex(versions[0], re.compile(r"^[0-9a-fA-F]{32}$"))
+            self.assertEqual(
+                sorted(
+                    (key, value)
+                    for key, value in actual_params
+                    if key != "s_version"
+                ),
+                sorted(expected_params),
+                f"KVCM changed caller URI parameters: {actual_uri}",
+            )
 
     def _assert_profile_spec_absent(self, block_key, profile_name, spec_name, trace_id, instance_id=None,
                                     timeout_seconds=10.0, interval_seconds=0.2):
@@ -586,7 +623,10 @@ class EventReportFunctionalTest(unittest.TestCase):
     def test_01_node_register(self):
         def run(profile_name):
             body = self._report_node(profile_name, self.HOST, ["mem", "disk", "ssd"], f"t01_{profile_name}")
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertTrue(body.get("snapshot_required"))
+            self.assertEqual(body.get("committed_snapshot_version", ""), "")
         self._for_each_profile(run)
 
     # 2. NODE_REGISTER is idempotent and merges mediums
@@ -595,7 +635,10 @@ class EventReportFunctionalTest(unittest.TestCase):
             host = f"192.168.1.{201 + self.PROFILES[profile_name]['type_value']}:8080"
             self._report_node(profile_name, host, ["mem"], f"t02a_{profile_name}")
             body = self._report_node(profile_name, host, ["mem", "disk"], f"t02b_{profile_name}")
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertTrue(body.get("snapshot_required"))
+            self.assertEqual(body.get("committed_snapshot_version", ""), "")
         self._for_each_profile(run)
 
     # 3. BLOCK_ADD then query: spec name/uri should match what was sent
@@ -632,7 +675,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 ],
                 f"t04_add_{profile_name}",
             )
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
                 profile_name,
@@ -660,7 +706,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 ],
                 f"t05_add_{profile_name}",
             )
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
                 profile_name,
@@ -696,7 +745,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 ["drop_spec"],
                 f"t06_del_{profile_name}",
             )
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertFalse(body.get("snapshot_required"))
             self._assert_profile_specs(block_key, profile_name, {"keep_spec": keep_uri}, f"t06_query_{profile_name}")
             self._assert_profile_spec_absent(block_key, profile_name, "drop_spec", f"t06_absent_{profile_name}")
         self._for_each_profile(run)
@@ -713,7 +765,8 @@ class EventReportFunctionalTest(unittest.TestCase):
                 f"t07_{profile_name}",
                 check_ok=False,
             )
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
         self._for_each_profile(run)
 
     # 8. HOST_DOWN cleans up all mediums under the host for each event report type
@@ -738,7 +791,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                 ))
             self._report_event(profile_name, down_host, events, f"t08_add_{profile_name}")
             body = self._report_event(profile_name, down_host, [_ev_host_down()], f"t08_down_{profile_name}")
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertTrue(body.get("snapshot_required"))
+            self.assertEqual(body.get("committed_snapshot_version", ""), "")
             self._assert_host_removed_from_cache_locations(
                 block_keys,
                 down_host,
@@ -754,8 +810,10 @@ class EventReportFunctionalTest(unittest.TestCase):
             self._report_node(profile_name, down_host, ["mem"], f"t09_reg_{profile_name}")
             body1 = self._report_event(profile_name, down_host, [_ev_host_down()], f"t09_down1_{profile_name}")
             body2 = self._report_event(profile_name, down_host, [_ev_host_down()], f"t09_down2_{profile_name}")
-            self.assertIn("header", body1)
-            self.assertIn("header", body2)
+            self.assertEqual(body1["header"]["status"]["code"], "OK")
+            self.assertEqual(body2["header"]["status"]["code"], "OK")
+            self.assertEqual(body1.get("item_results", []), [])
+            self.assertEqual(body2.get("item_results", []), [])
         self._for_each_profile(run)
 
     # 10. HEARTBEAT extends liveness; payload is opaque
@@ -767,7 +825,8 @@ class EventReportFunctionalTest(unittest.TestCase):
                 [_ev_heartbeat({"version": "er-0.18", "cpu": "45%"})],
                 f"t10_{profile_name}",
             )
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
         self._for_each_profile(run)
 
     # 11. Mixed batch: register + add + heartbeat in a single RPC
@@ -785,14 +844,21 @@ class EventReportFunctionalTest(unittest.TestCase):
                 _ev_heartbeat({"phase": "boot"}),
             ]
             body = self._report_event(profile_name, host, events, f"t11_{profile_name}")
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertTrue(body.get("snapshot_required"))
         self._for_each_profile(run)
 
     # 12. Empty events array: should be a no-op success
     def test_12_empty_batch(self):
         def run(profile_name):
             body = self._report_event(profile_name, self.HOST, [], f"t12_{profile_name}")
-            self.assertIn("header", body)
+            self.assertEqual(body["header"]["status"]["code"], "OK")
+            self.assertEqual(body.get("item_results", []), [])
+            self.assertEqual(body.get("committed_snapshot_version", ""), "")
+            self.assertFalse(body.get("snapshot_required"))
+            self.assertEqual(body.get("retry_after_ms", "0"), "0")
         self._for_each_profile(run)
 
     # 13. Missing block_add params: server must surface a per-item failure
@@ -805,8 +871,8 @@ class EventReportFunctionalTest(unittest.TestCase):
                 f"t13_{profile_name}",
                 check_ok=False,
             )
-            self.assertIn("header", body)
-            self.assertIn("item_results", body)
+            self.assertEqual(body["header"]["status"]["code"], "INVALID_ARGUMENT")
+            self.assertEqual(body.get("item_results"), ["INVALID_ARGUMENT"])
         self._for_each_profile(run)
 
     # 15. L1.5 and L2 coexist for the same host/key/medium without overwriting each other
@@ -956,9 +1022,13 @@ class EventReportFunctionalTest(unittest.TestCase):
             "10.0.0.3:8080": 1,
         }
         actual = {
-            h["host_ip_port"]: int(h["prefix_match_blocks"])
+            h["host_ip_port"]: int(h["local"])
             for h in resp.get("hosts", [])
         }
+        self.assertNotIn("p2p_1_hit_count", resp)
+        for host_match in resp.get("hosts", []):
+            self.assertIn("p2p_1_fetch", host_match)
+            self.assertIn("p2p_1_total_match", host_match)
         for host, prefix in expected.items():
             self.assertIn(host, actual, f"host {host} not found in response")
             self.assertEqual(actual[host], prefix, f"host {host}: expected prefix={prefix}, got {actual[host]}")

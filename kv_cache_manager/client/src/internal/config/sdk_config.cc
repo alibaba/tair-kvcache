@@ -103,7 +103,7 @@ std::string MooncakeSdkConfig::ToString() const {
     return oss.str();
 }
 
-TairMempoolSdkConfig::TairMempoolSdkConfig() { set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL); }
+TairMempoolSdkConfig::TairMempoolSdkConfig(DataStorageType type) { set_type(type); }
 
 bool TairMempoolSdkConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     return SdkBackendConfig::FromRapidValue(rapid_value);
@@ -146,7 +146,8 @@ bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                 sdk_backend_config = std::make_shared<MooncakeSdkConfig>();
                 break;
             case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
-                sdk_backend_config = std::make_shared<TairMempoolSdkConfig>();
+            case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+                sdk_backend_config = std::make_shared<TairMempoolSdkConfig>(type);
                 break;
             case DataStorageType::DATA_STORAGE_TYPE_NFS:
                 sdk_backend_config = std::make_shared<NfsSdkConfig>();

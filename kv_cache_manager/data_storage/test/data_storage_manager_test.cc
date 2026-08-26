@@ -85,3 +85,32 @@ TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
         ASSERT_EQ(EC_BADARGS, ec);
     }
 }
+
+TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+
+#ifdef ENABLE_MOONCAKE
+    EXPECT_NE(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+#else
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+#endif
+
+#ifdef ENABLE_VCNS
+    EXPECT_NE(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+#else
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+#endif
+
+    auto pace_ssd_backend =
+        data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD);
+    ASSERT_NE(nullptr, pace_ssd_backend);
+    auto pace_ssd_spec = std::make_shared<TairMemPoolStorageSpec>();
+    pace_ssd_spec->set_domain("pace.meta");
+    pace_ssd_spec->set_timeout(5000);
+    pace_ssd_spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    StorageConfig pace_ssd_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", pace_ssd_spec);
+    // Do not assert Open(): the open-source stub intentionally returns EC_ERROR,
+    // while the internal PACE backend can initialize successfully.
+    pace_ssd_backend->config_ = pace_ssd_config;
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, pace_ssd_backend->GetType());
+}

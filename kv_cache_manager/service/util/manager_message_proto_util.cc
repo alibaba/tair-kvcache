@@ -42,7 +42,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         mooncake->set_protocol(mooncake_storage.protocol());
         mooncake->set_rdma_device(mooncake_storage.rdma_device());
         mooncake->set_master_service_entry(mooncake_storage.master_server_entry());
-    } else if (type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {
+    } else if (IsTairMempoolStorageType(type)) {
         const auto &tair_mem_pool_storage =
             *std::dynamic_pointer_cast<TairMemPoolStorageSpec>(storage_config.storage_spec());
         // proto_storage_config->set_global_unique_name(tair_mem_pool_storage.get_global_unique_name());
@@ -51,6 +51,9 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
         tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
         tair_mem_pool->set_media_type(tair_mem_pool_storage.media_type());
+        proto::admin::StorageType proto_storage_type = proto::admin::ST_UNSPECIFIED;
+        ProtoConvert::DataStorageTypeToProto(type, &proto_storage_type);
+        proto_storage_config->set_storage_type(proto_storage_type);
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
         const auto &nfs_storage = *std::dynamic_pointer_cast<NfsStorageSpec>(storage_config.storage_spec());
         auto *nfs = proto_storage_config->mutable_nfs();
@@ -70,6 +73,8 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         spec->set_heartbeat_timeout_ms(er_spec.heartbeat_timeout_ms());
         spec->set_cleanup_grace_ms(er_spec.cleanup_grace_ms());
         spec->set_liveness_check_interval_ms(er_spec.liveness_check_interval_ms());
+        spec->set_snapshot_min_interval_ms(er_spec.snapshot_min_interval_ms());
+        spec->set_snapshot_delta_drain_timeout_ms(er_spec.snapshot_delta_drain_timeout_ms());
     }
 }
 
@@ -126,7 +131,20 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
                                 ? std::numeric_limits<uint16_t>::max()
                                 : static_cast<uint16_t>(media_type));
         storage_config.set_storage_spec(std::make_shared<TairMemPoolStorageSpec>(spec));
-        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+        switch (proto_storage_config->storage_type()) {
+        case proto::admin::ST_UNSPECIFIED:
+        case proto::admin::ST_TAIRMEMPOOL:
+            storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+            break;
+        case proto::admin::ST_TAIRMEMPOOL_SSD:
+            storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD);
+            break;
+        default:
+            storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
+            KVCM_LOG_WARN("tair_mem_pool storage has incompatible storage_type [%d]",
+                          static_cast<int>(proto_storage_config->storage_type()));
+            break;
+        }
         break;
     }
     case proto::admin::StorageConfig::kNfs: {
@@ -148,12 +166,20 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     case proto::admin::StorageConfig::kEventReport: {
         EventReportStorageSpec spec;
         const auto &v = proto_storage_config->event_report();
-        if (v.heartbeat_timeout_ms() > 0)
+        // Proto3 scalar zero means "not supplied" for backward
+        // compatibility. Preserve any non-zero value so negative inputs reach
+        // StorageConfig validation instead of silently falling back to a
+        // valid-looking default.
+        if (v.heartbeat_timeout_ms() != 0)
             spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
-        if (v.cleanup_grace_ms() > 0)
+        if (v.cleanup_grace_ms() != 0)
             spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
-        if (v.liveness_check_interval_ms() > 0)
+        if (v.liveness_check_interval_ms() != 0)
             spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
+        if (v.snapshot_min_interval_ms() != 0)
+            spec.set_snapshot_min_interval_ms(v.snapshot_min_interval_ms());
+        if (v.snapshot_delta_drain_timeout_ms() != 0)
+            spec.set_snapshot_delta_drain_timeout_ms(v.snapshot_delta_drain_timeout_ms());
         storage_config.set_storage_spec(std::make_shared<EventReportStorageSpec>(spec));
         DataStorageType event_report_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         ProtoConvert::DataStorageTypeFromProto(proto_storage_config->storage_type(), event_report_type);
@@ -240,7 +266,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         auto *method_configs = proto_migration_strategy->mutable_method_configs();
         method_configs->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
         method_configs->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
-        method_configs->mutable_mark()->mutable_timeout_ms()->set_value(migration_strategy->methods().mark().timeout_ms());
+        method_configs->mutable_mark()->mutable_timeout_ms()->set_value(
+            migration_strategy->methods().mark().timeout_ms());
         proto_migration_strategy->set_retention(
             static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
     }
@@ -322,13 +349,13 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
         methods.mutable_copy().set_enabled(proto_migration_strategy.method_configs().copy().enabled());
         methods.mutable_mark().set_enabled(proto_migration_strategy.method_configs().mark().enabled());
         if (proto_migration_strategy.method_configs().mark().has_timeout_ms()) {
-            methods.mutable_mark().set_timeout_ms(proto_migration_strategy.method_configs().mark().timeout_ms().value());
+            methods.mutable_mark().set_timeout_ms(
+                proto_migration_strategy.method_configs().mark().timeout_ms().value());
         } else {
             methods.mutable_mark().set_timeout_ms(MigrationMarkMethod::kDefaultTimeoutMs);
         }
         migration_strategy->set_methods(methods);
-        migration_strategy->set_retention(
-            static_cast<MigrationRetention>(proto_migration_strategy.retention()));
+        migration_strategy->set_retention(static_cast<MigrationRetention>(proto_migration_strategy.retention()));
         migration_strategies.push_back(migration_strategy);
     }
     cache_config_info.set_migration_strategies(migration_strategies);

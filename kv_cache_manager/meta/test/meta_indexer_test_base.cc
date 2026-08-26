@@ -252,21 +252,16 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     std::sort(keys.begin(), keys.end());
     ASSERT_EQ((KeyVector{0, 1, 2}), keys);
 
-    // 2. SampleReclaimKeys must converge to the full key set after enough tries.
-    keys.clear();
-    try_count = 100;
-    while (try_count-- && keys.size() < static_cast<size_t>(key_count)) {
-        KeyVector out_keys;
-        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
-        for (const auto key : out_keys) {
-            if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
-                keys.push_back(key);
-            }
-        }
+    // 2. SampleReclaimKeys returns a non-empty subset. The requested count is
+    // a hint: a sharded backend may return fewer keys when its per-shard
+    // sampling quota is exhausted.
+    KeyVector out_keys;
+    ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
+    ASSERT_FALSE(out_keys.empty());
+    ASSERT_LE(out_keys.size(), static_cast<size_t>(key_count));
+    for (const auto key : out_keys) {
+        ASSERT_TRUE(key >= 0 && key < key_count) << "Unexpected key: " << key;
     }
-    ASSERT_GT(try_count, 0);
-    std::sort(keys.begin(), keys.end());
-    ASSERT_EQ((KeyVector{0, 1, 2}), keys);
 
     // 3. Cleanup
     meta_indexer_->Delete(request_context_.get(), data.keys);
@@ -453,11 +448,11 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
 }
 
 void MetaIndexerTestBase::DoSimpleTest() {
-    DoPutTest();
-    DoDeleteAndExistTest();
-    DoScanAndSampleReclaimKeysTest();
-    DoReadModifyWriteBlockTest();
-    DoReadModifyWriteLocationTest();
+    ASSERT_NO_FATAL_FAILURE(DoPutTest());
+    ASSERT_NO_FATAL_FAILURE(DoDeleteAndExistTest());
+    ASSERT_NO_FATAL_FAILURE(DoScanAndSampleReclaimKeysTest());
+    ASSERT_NO_FATAL_FAILURE(DoReadModifyWriteBlockTest());
+    ASSERT_NO_FATAL_FAILURE(DoReadModifyWriteLocationTest());
 }
 
 void MetaIndexerTestBase::DoMultiThreadTest() {

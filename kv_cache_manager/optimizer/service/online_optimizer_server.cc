@@ -8,7 +8,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"

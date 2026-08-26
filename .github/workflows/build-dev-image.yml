@@ -1,9 +1,17 @@
 #
-name: Create and publish a develop Docker image
+name: Create and publish a KVCM Docker image
 
 # Configures this workflow to run every time a change is pushed to the branch called `release`.
 on:
   workflow_dispatch:
+    inputs:
+      flavor:
+        description: Image flavor
+        type: choice
+        options:
+          - dev
+          - integration
+        default: dev
 
 # Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
 env:
@@ -12,7 +20,60 @@ env:
 
 # There is a single job in this workflow. It's configured to run on the latest available version of Ubuntu.
 jobs:
+  integration:
+    if: ${{ inputs.flavor == 'integration' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build server package
+        env:
+          BUILD_IMAGE: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+        run: |
+          docker run --rm --privileged \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${BUILD_IMAGE}" \
+            bash -lc '
+              git config --global --add safe.directory /workspace &&
+              bazelisk build //package:kv_cache_manager_server --config=ci_fast &&
+              cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/docker/ &&
+              chown "$(stat -c %u /workspace):$(stat -c %g /workspace)" \
+                open_source/docker/kv_cache_manager_server.tar.gz
+            '
+
+      - name: Prepare image tag and context
+        id: integration_image
+        run: |
+          VERSION="integration-$(date -u '+%Y_%m_%d_%H_%M')-${GITHUB_SHA::7}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          test -r open_source/docker/kv_cache_manager_server.tar.gz
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "KVCM integration image: ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish integration image
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: open_source/docker
+          file: open_source/docker/Dockerfile.prod
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.integration_image.outputs.image }}
+          build-args: BINARY_PACKAGE_TAR=kv_cache_manager_server.tar.gz
+
   build:
+    if: ${{ inputs.flavor != 'integration' }}
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +158,7 @@ jobs:
           retention-days: 1
 
   merge:
+    if: ${{ inputs.flavor != 'integration' }}
     runs-on: ubuntu-latest
     needs:
       - build

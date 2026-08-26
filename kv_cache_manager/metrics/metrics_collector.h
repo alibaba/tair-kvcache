@@ -277,6 +277,8 @@ class ServiceMetricsCollector final : public MetricsCollector {
 
     // meta searcher metrics
     KVCM_CHRONO_METRICS(meta_searcher, indexer_get_time_us, MetaSearcherIndexerGet)
+    KVCM_CHRONO_METRICS(meta_searcher, host_projection_time_us, MetaSearcherHostProjection)
+    KVCM_CHRONO_METRICS(meta_searcher, host_prefix_reduce_time_us, MetaSearcherHostPrefixReduce)
     KVCM_CHRONO_METRICS(meta_searcher, indexer_read_modify_write_block_time_us, MetaSearcherIndexerReadModifyWriteBlock)
     KVCM_CHRONO_METRICS(meta_searcher,
                         indexer_read_modify_write_location_time_us,
@@ -319,6 +321,57 @@ public:
     bool Init() override;
 };
 
+// Lightweight per-event observability for ReportEvent. It reuses service.*
+// metrics for request outcome and carries only request_key_count from the
+// manager metric family, rather than registering every manager/meta metric
+// from ServiceMetricsCollector.
+class EventReportMetricsCollector final : public MetricsCollector {
+    KVCM_COUNTER_METRICS(service, query_counter)
+    KVCM_GAUGE_METRICS(service, query_rt_us)
+    KVCM_GAUGE_METRICS(service, error_code)
+    KVCM_COUNTER_METRICS(service, error_counter)
+    KVCM_GAUGE_METRICS(manager, request_key_count)
+
+public:
+    EventReportMetricsCollector() = delete;
+    EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
+    EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept;
+    ~EventReportMetricsCollector() override = default;
+
+    bool Init() override;
+
+    // Collector objects are request-local, while registry gauges with the
+    // same event_type tag are shared. Synchronous reporters must consume this
+    // local sample so concurrent requests cannot attribute one another's
+    // latency, error, or request key count.
+    void SetRequestSample(double request_rt_us, double error_code) noexcept {
+        request_rt_us_sample_ = request_rt_us;
+        error_code_sample_ = error_code;
+        has_request_sample_ = true;
+    }
+    [[nodiscard]] double GetRequestRtUsSample() const noexcept {
+        return has_request_sample_ ? request_rt_us_sample_ : get_service_query_rt_us_metrics();
+    }
+    [[nodiscard]] double GetErrorCodeSample() const noexcept {
+        return has_request_sample_ ? error_code_sample_ : get_service_error_code_metrics();
+    }
+    void SetRequestKeyCountSample(double request_key_count) noexcept {
+        request_key_count_sample_ = request_key_count;
+        has_request_key_count_sample_ = true;
+    }
+    [[nodiscard]] bool HasRequestKeyCountSample() const noexcept { return has_request_key_count_sample_; }
+    [[nodiscard]] double GetRequestKeyCountSample() const noexcept {
+        return has_request_key_count_sample_ ? request_key_count_sample_ : get_manager_request_key_count_metrics();
+    }
+
+private:
+    double request_rt_us_sample_ = 0.0;
+    double error_code_sample_ = 0.0;
+    double request_key_count_sample_ = 0.0;
+    bool has_request_sample_ = false;
+    bool has_request_key_count_sample_ = false;
+};
+
 /* ------------------ DataStorageMetricsCollector ------------------- */
 
 #ifndef KVCM_DATA_STORAGE_METRICS_COLLECTOR_PTR
@@ -338,6 +391,16 @@ class DataStorageMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(data_storage, copy_keys_qps)
     KVCM_CHRONO_METRICS(data_storage, copy_time_us, DataStorageCopy)
 
+    // Dispatched-view estimate of bytes written to this storage, aggregated per storage.
+    // Incremented when the control plane finishes dispatching a write:
+    //   - normal writes: in StartWriteCache once BatchAddLocation succeeds (locations
+    //     are about to be handed to the client);
+    //   - migration copies: once the copy task is accepted by the schedule plan executor.
+    // This is an upper-bound estimate of bytes actually written to the backend:
+    // abandoned client writes and failed/cancelled copies are still counted, and the
+    // counter is cumulative and never decreases.
+    KVCM_COUNTER_METRICS(data_storage, write_bytes_dispatched_total)
+
 public:
     DataStorageMetricsCollector() = delete;
     explicit DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept;
@@ -345,6 +408,12 @@ public:
     ~DataStorageMetricsCollector() override = default;
 
     bool Init() override;
+
+    // Accumulates dispatched write bytes; see the semantic contract on the
+    // write_bytes_dispatched_total definition above.
+    void AddWriteBytes(std::uint64_t bytes) {
+        data_storage_write_bytes_dispatched_total_metrics_ += bytes;
+    }
 };
 
 /* --------------- DataStorageIntervalMetricsCollector ---------------- */

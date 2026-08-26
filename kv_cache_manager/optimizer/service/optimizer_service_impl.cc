@@ -6,7 +6,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/optimizer/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
@@ -37,6 +37,7 @@ OptimizerInstanceGroup ConvertProtoToInstanceGroup(const proto::optimizer::Optim
     group.set_shared_group_quota(pb.shared_group_quota());
     group.set_enable_theoretical_max_cache(pb.enable_theoretical_max_cache());
     group.set_ttl_seconds(pb.ttl_seconds());
+    group.set_enable_prefix_hash(pb.enable_prefix_hash());
     return group;
 }
 
@@ -49,6 +50,7 @@ void ConvertInstanceGroupToProto(const OptimizerInstanceGroup &group,
     pb->set_shared_group_quota(group.shared_group_quota());
     pb->set_ttl_seconds(group.ttl_seconds());
     pb->set_enable_theoretical_max_cache(group.enable_theoretical_max_cache());
+    pb->set_enable_prefix_hash(group.enable_prefix_hash());
     if (group.eviction_policy() == "lru") {
         pb->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
     } else {
@@ -296,43 +298,58 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
     OptimizerCallGuard guard(request_context, metrics_reporter_.get());
 
     std::vector<int64_t> block_keys(request->block_keys().begin(), request->block_keys().end());
+    int64_t input_token_len = request->input_token_len();
+    if (input_token_len == 0 && request->token_ids_size() > 0) {
+        input_token_len = request->token_ids_size();
+    }
 
     TraceQueryResult result;
-    ErrorCode ec = manager_->TraceQuery(request->instance_id(), block_keys, result);
+    ErrorCode ec;
+    if (input_token_len == 0 && request->token_ids_size() == 0) {
+        // Backward compatibility for block-only clients: assume there is no
+        // incomplete tail. New full-attention clients should always provide
+        // input_token_len so the token denominator is exact.
+        ec = manager_->TraceQuery(request->instance_id(), block_keys, result);
+    } else {
+        ec = manager_->TraceQuery(request->instance_id(), block_keys, input_token_len, result);
+    }
 
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));
 
     if (ec == EC_OK) {
         response->set_total_blocks(result.total_blocks);
+        response->set_input_token_len(result.input_token_len);
         for (size_t i = 0; i < result.capacity_gb.size() && i < result.hit_count_per_capacity.size(); i++) {
             auto *pb_cap = response->add_capacity_results();
             pb_cap->set_capacity_gb(result.capacity_gb[i]);
             pb_cap->set_cache_hit_count(result.hit_count_per_capacity[i]);
-            pb_cap->set_hit_rate(result.total_blocks > 0 ? static_cast<double>(result.hit_count_per_capacity[i]) /
-                                                               static_cast<double>(result.total_blocks)
-                                                         : 0.0);
+            if (i < result.hit_rate_per_capacity.size()) {
+                pb_cap->set_hit_rate(result.hit_rate_per_capacity[i]);
+            }
             if (i < result.unique_keys_per_capacity.size()) {
                 pb_cap->set_current_unique_keys(result.unique_keys_per_capacity[i]);
             }
         }
         response->mutable_theoretical_result()->set_max_hit_count(result.max_hit_count);
         response->mutable_theoretical_result()->set_current_unique_keys(result.theoretical_unique_keys);
+        response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
 
         auto *collector = dynamic_cast<OptimizerServiceMetricsCollector *>(request_context->metrics_collector());
         if (collector) {
             collector->set_instance_id(request->instance_id());
             collector->set_total_blocks(result.total_blocks);
-            collector->set_cache_hit_count(result.cache_hit_count);
+            collector->set_cache_hit_count(
+                result.hit_count_per_capacity.empty() ? 0 : result.hit_count_per_capacity.front());
             std::vector<PerCapacityHitInfo> per_cap;
             for (size_t i = 0; i < result.capacity_gb.size() && i < result.hit_count_per_capacity.size(); i++) {
-                per_cap.push_back({result.capacity_gb[i], result.hit_count_per_capacity[i]});
+                const double hit_rate = i < result.hit_rate_per_capacity.size() ? result.hit_rate_per_capacity[i] : 0.0;
+                per_cap.push_back({result.capacity_gb[i], result.hit_count_per_capacity[i], hit_rate});
             }
             collector->set_per_capacity_hits(std::move(per_cap));
             collector->set_max_hit_count(result.max_hit_count);
-            if (result.total_blocks > 0 && result.max_hit_count >= 0) {
-                collector->set_max_hit_rate(static_cast<double>(result.max_hit_count) /
-                                            static_cast<double>(result.total_blocks));
+            if (result.max_hit_count >= 0) {
+                collector->set_max_hit_rate(result.max_hit_rate);
             }
         }
     } else {
@@ -360,6 +377,7 @@ void OptimizerServiceImpl::ListInstances(RequestContext *request_context,
             pb->set_instance_group(s.instance_group);
             pb->set_total_queries(s.total_queries);
             pb->set_total_blocks_queried(s.total_blocks_queried);
+            pb->set_total_input_tokens(s.total_input_tokens);
             pb->mutable_theoretical_summary()->set_total_max_hits(s.total_max_hits);
             pb->mutable_theoretical_summary()->set_max_hit_rate(s.max_hit_rate);
             auto *debug = pb->mutable_debug_info();

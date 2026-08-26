@@ -37,9 +37,14 @@ TEST_F(LoopThreadTest, TestCreateAndStop) {
 
     loop_thread->Stop();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // A callback may already have been admitted between the observation above
+    // and Stop() acquiring the loop mutex. Stop() joins that callback before
+    // returning; only the value observed after Stop() is guaranteed to remain
+    // stable.
     int count_after_stop = count.load();
-    EXPECT_EQ(count_before_stop, count_after_stop);
+    EXPECT_GE(count_after_stop, count_before_stop);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(count_after_stop, count.load());
 }
 
 TEST_F(LoopThreadTest, TestRunOnce) {
@@ -96,11 +101,15 @@ TEST_F(LoopThreadTest, TestStrictMode) {
         true); // 严格模式
     EXPECT_NE(loop_thread, nullptr);
 
-    // 等待一段时间
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-    int final_count = count.load();
-    EXPECT_GT(final_count, 0);
+    auto start_time = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(1);
+    while (count.load() == 0) {
+        if (std::chrono::steady_clock::now() - start_time > timeout) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GT(count.load(), 0);
 
     loop_thread->Stop();
 }

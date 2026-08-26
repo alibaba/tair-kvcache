@@ -435,6 +435,30 @@ ErrorCode MetaDummyBackend::ListKeys(RequestContext * /*request_context*/,
     return ErrorCode::EC_OK;
 }
 
+ErrorCode MetaDummyBackend::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        MaintenanceScanBatch &out) noexcept {
+    MaintenanceScanBatch batch;
+    ErrorCode ec = ListKeys(request_context, cursor, limit, batch.next_cursor, batch.keys);
+    if (ec != EC_OK) {
+        out.Clear();
+        return ec;
+    }
+
+    batch.locations.resize(batch.keys.size());
+    batch.location_results.resize(batch.keys.size(), EC_OK);
+    for (size_t i = 0; i < batch.keys.size(); ++i) {
+        const bool found =
+            table_.FindAndApply(batch.keys[i], [&](const DummyItem &item) { batch.locations[i] = item.locations; });
+        if (!found) {
+            batch.location_results[i] = EC_NOENT;
+        }
+    }
+    out = std::move(batch);
+    return EC_OK;
+}
+
 ErrorCode MetaDummyBackend::RandomSample(RequestContext * /*request_context*/,
                                          const std::int64_t count,
                                          KeyTypeVec &out_keys) noexcept {

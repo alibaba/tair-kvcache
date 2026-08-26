@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
@@ -68,6 +69,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta searcher metrics
     DECLARE_METRICS(meta_searcher, indexer_get_time_us);
+    DECLARE_METRICS(meta_searcher, host_projection_time_us);
+    DECLARE_METRICS(meta_searcher, host_prefix_reduce_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
     DECLARE_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
     DECLARE_METRICS(meta_searcher, index_serialize_time_us);
@@ -114,6 +117,7 @@ struct KmonitorMetricsReporter::Context {
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
+    DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     DECLARE_METRICS(scheduler_plan_executor, waiting_task_count);
@@ -155,6 +159,17 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
+    // cache garbage collector metrics
+    DECLARE_METRICS(cache_gc, scan_round_count);
+    DECLARE_METRICS(cache_gc, scan_key_count);
+    DECLARE_METRICS(cache_gc, candidate_count);
+    DECLARE_METRICS(cache_gc, delete_target_count);
+    DECLARE_METRICS(cache_gc, delete_result_count);
+    DECLARE_METRICS(cache_gc, operation_error_count);
+    DECLARE_METRICS(cache_gc, inflight_delete_count);
+    DECLARE_METRICS(cache_gc, inflight_delete_age_ms);
+    DECLARE_METRICS(cache_gc, round_duration_ms);
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -292,7 +307,6 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
         }                                                                                                              \
     } while (0)
 
-
 bool KmonitorMetricsReporter::InitMetrics() {
     ctx_->kmonitor = kmonitor::KMonitorFactory::GetKMonitor("kvcm_default");
     auto reporter = ctx_->kmonitor;
@@ -326,6 +340,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_get_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_projection_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, host_prefix_reduce_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_block_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_serialize_time_us);
@@ -372,6 +388,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
+    REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
     // schedule plan executor metrics
     REGISTER_GAUGE_METRIC(scheduler_plan_executor, waiting_task_count);
@@ -413,6 +430,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_min_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_max_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
+    // Cache GC counters are registered as gauges, matching the existing
+    // cumulative counter convention used for CacheReclaimer. Tagged series
+    // share one KMonitor metric and are distinguished at report time.
+    REGISTER_GAUGE_METRIC(cache_gc, scan_round_count);
+    REGISTER_GAUGE_METRIC(cache_gc, scan_key_count);
+    REGISTER_GAUGE_METRIC(cache_gc, candidate_count);
+    REGISTER_GAUGE_METRIC(cache_gc, delete_target_count);
+    REGISTER_GAUGE_METRIC(cache_gc, delete_result_count);
+    REGISTER_GAUGE_METRIC(cache_gc, operation_error_count);
+    REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_count);
+    REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_age_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, round_duration_ms);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -510,6 +540,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta searcher metrics
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_get_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_projection_time_us);
+        REPORT_COLLECTED_METRICS(meta_searcher, host_prefix_reduce_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
         REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
         REPORT_STEAL_METRICS(meta_searcher, index_serialize_time_us);
@@ -540,6 +572,17 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_upsert_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_delete_time_us);
+    } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
+        auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
+        const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
+        REPORT_METRICS(service, qps, 1.0);
+        REPORT_METRICS(service, query_rt_us, p->GetRequestRtUsSample());
+
+        const double error_code = p->GetErrorCodeSample();
+        REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
+        if (p->HasRequestKeyCountSample()) {
+            REPORT_METRICS(manager, request_key_count, p->GetRequestKeyCountSample());
+        }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
@@ -595,6 +638,38 @@ void KmonitorMetricsReporter::ReportInterval() {
                 GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                 REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
             }
+        }
+    } while (false);
+
+    do {
+        // for per-storage accumulative dispatched write bytes
+        // the counter is updated in real-time on each backend's DataStorageMetricsCollector
+        // (via DataStorageManager::RecordWriteBytes, covering both normal writes and migration
+        // copies at their dispatch points), so read the current cumulative values and report
+        // them to kmonitor periodically
+        const auto registry_manager = cache_manager_->GetRegistryManager();
+        if (!registry_manager) {
+            break;
+        }
+        const auto data_storage_manager = registry_manager->data_storage_manager();
+        if (!data_storage_manager) {
+            break;
+        }
+
+        const auto storage_names = data_storage_manager->GetAllStorageNames();
+        for (const auto &unique_name : storage_names) {
+            const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
+            if (storage_backend == nullptr) {
+                continue;
+            }
+            const auto collector = storage_backend->GetMetricsCollector();
+            if (collector == nullptr) {
+                continue;
+            }
+            std::uint64_t write_bytes_v;
+            GET_METRICS_(collector, data_storage, write_bytes_dispatched_total, write_bytes_v);
+            const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(collector->GetMetricsTags());
+            REPORT_METRICS(data_storage, write_bytes_dispatched_total, static_cast<double>(write_bytes_v));
         }
     } while (false);
 
@@ -742,6 +817,45 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
+    } while (false);
+
+    do {
+        // Cache GC owns both untagged metrics and bounded tagged families
+        // (candidate reason, delete status and error stage). Read the registry
+        // snapshot so KMonitor preserves the same labels as Prometheus/local
+        // reporting instead of maintaining a second hard-coded tag list.
+        if (!metrics_registry_) {
+            break;
+        }
+        const auto report_registry_metric = [this](kmonitor::MutableMetric *metric, const std::string &name) {
+            const auto data = metrics_registry_->GetMetricsData(name);
+            if (!metric || !data) {
+                return;
+            }
+            for (const auto &[base_tags, value] : data->GetMetricsValues()) {
+                if (!value || !value->touched.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                double sample = 0.0;
+                if (std::holds_alternative<CounterValue>(value->value)) {
+                    sample = static_cast<double>(std::get<CounterValue>(value->value).load(std::memory_order_relaxed));
+                } else {
+                    sample = std::get<GaugeValue>(value->value).load(std::memory_order_relaxed);
+                }
+                const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(base_tags);
+                metric->Report(&tags, sample);
+            }
+        };
+
+        report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
+        report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");
+        report_registry_metric(ctx_->cache_gc_candidate_count_metrics.get(), "cache_gc.candidate_count");
+        report_registry_metric(ctx_->cache_gc_delete_target_count_metrics.get(), "cache_gc.delete_target_count");
+        report_registry_metric(ctx_->cache_gc_delete_result_count_metrics.get(), "cache_gc.delete_result_count");
+        report_registry_metric(ctx_->cache_gc_operation_error_count_metrics.get(), "cache_gc.operation_error_count");
+        report_registry_metric(ctx_->cache_gc_inflight_delete_count_metrics.get(), "cache_gc.inflight_delete_count");
+        report_registry_metric(ctx_->cache_gc_inflight_delete_age_ms_metrics.get(), "cache_gc.inflight_delete_age_ms");
+        report_registry_metric(ctx_->cache_gc_round_duration_ms_metrics.get(), "cache_gc.round_duration_ms");
     } while (false);
 
     do {

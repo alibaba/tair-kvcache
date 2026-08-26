@@ -1,128 +1,131 @@
 # KVCacheManager Optimizer
 
-## 概述
+> [中文](README_zh.md) | English
 
-KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回放 trace 数据来模拟缓存读写操作，评估不同驱逐策略和配置对缓存命中率的影响，并为 KVCacheManager 主程序提供参数优化能力。
+## Overview
 
-核心功能包括：
-- Trace 数据的回放和模拟
-- 多种驱逐策略的模拟和对比
-- 缓存命中率的实时统计和分析
-- Radix Tree 索引结构的可视化
+KVCacheManager Optimizer is a standalone cache optimization analysis module. It replays trace data to simulate cache read/write operations, evaluates the impact of different eviction policies and configurations on cache hit rate, and provides parameter optimization capabilities for the KVCacheManager main program.
 
-## 动机
+Core capabilities include:
+- Trace data replay and simulation
+- Simulation and comparison of multiple eviction policies
+- Real-time statistics and analysis of cache hit rate
+- Visualization of the Radix Tree index structure
+- LiteHit: capacity-independent hit-rate analysis for full-attention scenarios (a single replay produces facts, arbitrary LRU capacities are projected after the fact, with re-blocking and multi block-size fanout supported). See [liteHit/README.md](liteHit/README.md)
 
-在大语言模型（LLM）推理场景中，KV Cache 的管理对系统性能至关重要。不同的驱逐策略、缓存容量配置和存储层级设置会显著影响缓存命中率和整体推理效率。Optimizer 模块的设计动机包括：
+## Motivation
 
-1. **策略评估**：在生产环境部署前，通过 trace 回放评估不同驱逐策略的效果，选择最优配置
-2. **参数调优**：分析缓存访问模式，为驱逐策略参数（如采样率、TTL 等）提供优化建议
-3. **性能预测**：预测不同容量配置下的缓存命中率，辅助资源规划
-4. **问题诊断**：通过 Radix Tree 可视化和详细统计，帮助理解缓存行为和性能瓶颈
+In large language model (LLM) inference scenarios, KV Cache management is critical to system performance. Different eviction policies, cache capacity configurations, and storage tier settings significantly affect cache hit rate and overall inference efficiency. The design motivations of the Optimizer module include:
 
-## 特性与架构
+1. **Policy evaluation**: Before deploying to production, evaluate the effectiveness of different eviction policies through trace replay and select the optimal configuration
+2. **Parameter tuning**: Analyze cache access patterns and provide optimization suggestions for eviction policy parameters (such as sample rate, TTL, etc.)
+3. **Performance prediction**: Predict cache hit rate under different capacity configurations to assist resource planning
+4. **Problem diagnosis**: Help understand cache behavior and performance bottlenecks through Radix Tree visualization and detailed statistics
 
-### 核心特性
+## Features and Architecture
 
-- **多种驱逐策略**：支持 LRU、RandomLRU、LeafAwareLRU、TTL 等驱逐算法
-- **TTL 过期机制**：当前采用 V1 语义，仅 `POLICY_TTL` 执行 TTL 过期物理清理
-- **分层存储**：支持多层级存储配置，目前功能不完备
-- **Trace 回放**：支持 Publisher Log、Qwen Bailian 等多种 trace 格式
-- **详细统计**：提供命中率、缓存使用情况等详细统计
-- **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
-- **可视化分析**：支持 Radix Tree 可视化和命中率图表生成
+### Core Features
 
-标准策略配置、multi-instance replay、trace schema 和命中率口径见 [docs/strategy_config.md](docs/strategy_config.md)。标准版中 `HitRate` 统一表示整体 token hit rate，即 `HitTokens / InputTokens`；local/remote 只作为 trace `block_mask` 与 optimizer 模拟命中的诊断拆分，不作为标准结论维度。传入 optimizer config 的 Python 入口统一使用配置中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，使用显式 `--output-dir`。标准 `get` trace 必须包含 `input_len`；外部只有请求级日志时可使用 `type=request`，optimizer 会按 `trace_replay.write_delay_ns` 在内部调度 delayed write；已经拆分好的 `get` / `write` trace 仍然支持。
+- **Multiple eviction policies**: Supports eviction algorithms such as LRU, RandomLRU, LeafAwareLRU, and TTL
+- **TTL expiration mechanism**: Currently adopts V1 semantics; only `POLICY_TTL` performs physical cleanup of TTL-expired entries
+- **Tiered storage**: Supports multi-tier storage configuration; currently the feature is not fully complete
+- **Trace replay**: Supports multiple trace formats such as Publisher Log and Qwen Bailian
+- **Detailed statistics**: Provides detailed statistics such as hit rate and cache usage
+- **Flexible configuration**: Flexibly configure instances, storage, and policies through JSON configuration files
+- **Visual analysis**: Supports Radix Tree visualization and hit-rate chart generation
 
-### 架构设计
+Standard strategy configuration, multi-instance replay, trace schema, and hit-rate metrics are described in [docs/strategy_config.md](docs/strategy_config.md). In the standard edition, `HitRate` uniformly denotes the overall token hit rate, i.e. `HitTokens / InputTokens`; local/remote serve only as a diagnostic split between the trace `block_mask` and the optimizer's simulated hits, and are not used as a standard conclusion dimension. Python entry points that pass an optimizer config uniformly use `output_result_path` from the config; `multi_instance_replay` does not read the full config and uses an explicit `--output-dir`. A standard `get` trace must contain `input_len`; when only request-level logs are available externally, `type=request` can be used, and the optimizer will internally schedule delayed writes according to `trace_replay.write_delay_ns`; already-split `get` / `write` traces are still supported (replay path only; LiteHit facts replay recognizes and ignores `write` events, and a `get` submission is treated as write-back complete).
+
+### Architecture Design
 
 ```
-OptimizerManager (核心协调器)
-    ├── OptEvictionManager (驱逐管理器)
-    ├── OptIndexerManager (索引管理器)
-    └── OptimizerRunner (Trace 执行器)
+OptimizerManager (core coordinator)
+    ├── OptEvictionManager (eviction manager)
+    ├── OptIndexerManager (indexer manager)
+    └── OptimizerRunner (trace executor)
         ↓
-    ├── Eviction Policies (驱逐策略)
-    ├── RadixTreeIndex (索引)
-    └── Trace Converter (转换器)
+    ├── Eviction Policies
+    ├── RadixTreeIndex (index)
+    └── Trace Converter
         ↓
-    HitAnalysis (结果分析)
+    HitAnalysis (result analysis)
 ```
 
 
-### 驱逐策略
+### Eviction Policies
 
 **LRU (Least Recently Used)**
-- 维护双向链表记录块的访问顺序，最近访问的块在链表头部，最久未访问的块在链表尾部
+- Maintains a doubly linked list recording the access order of blocks; the most recently accessed block is at the head of the list, and the least recently accessed block is at the tail
 
 **RandomLRU**
-- 结合随机采样和 LRU 策略，从缓存中随机采样一定数量的块，选择最久未访问的块进行驱逐
+- Combines random sampling with the LRU policy: randomly samples a number of blocks from the cache and evicts the least recently accessed one among them
 
 **LeafAwareLRU**
-- 在 LRU 基础上增加了对叶子节点的感知，优先驱逐叶子节点中的块
+- Adds leaf-node awareness on top of LRU, preferentially evicting blocks within leaf nodes
 
 **TTL (Time-To-Live)**
-- 两阶段驱逐：先清走所有 TTL 过期的 block，若容量仍超限则按 `last_access_time` 从最旧开始兜底驱逐
-- `fallback_on_pressure`（默认 true）：关闭后退化为纯 TTL，只回收过期 block，无容量兜底
+- Two-phase eviction: first clears all TTL-expired blocks; if capacity still exceeds the limit, falls back to evicting from the oldest by `last_access_time`
+- `fallback_on_pressure` (default true): when disabled, degrades to pure TTL, only reclaiming expired blocks with no capacity fallback
 
-#### TTL 过期机制（V1）
+#### TTL Expiration Mechanism (V1)
 
-当前实现语义：
+Current implementation semantics:
 
-- 仅 `eviction_policy_type: "ttl"` 的实例会执行读写前 TTL 过期物理清理。
-- 非 TTL 策略（`lru` / `random_lru` / `leaf_aware_lru`）下，TTL 视为不存在（既不做前置清理，也不做逻辑过期判定）。
+- Only instances with `eviction_policy_type: "ttl"` perform physical TTL expiration cleanup before reads/writes.
+- Under non-TTL policies (`lru` / `random_lru` / `leaf_aware_lru`), TTL is treated as nonexistent (neither pre-cleanup nor logical expiration judgment is performed).
 
-| 使用模式 | 配置方式 | 驱逐行为 |
+| Usage mode | Configuration | Eviction behavior |
 |---|---|---|
-| 纯 LRU 容量管理 | `eviction_policy_type: "lru"` | LRU 按访问时间驱逐 |
-| TTL 优先 + 容量兜底 | `eviction_policy_type: "ttl"` + `fallback_on_pressure: true` | 先清所有过期 block，不够则按链表尾部兜底 |
-| 纯时间驱逐（无兜底） | `eviction_policy_type: "ttl"` + `fallback_on_pressure: false` | 只清过期 block，容量不足不管 |
+| Pure LRU capacity management | `eviction_policy_type: "lru"` | LRU evicts by access time |
+| TTL priority + capacity fallback | `eviction_policy_type: "ttl"` + `fallback_on_pressure: true` | First clears all expired blocks; if insufficient, falls back by list tail |
+| Pure time eviction (no fallback) | `eviction_policy_type: "ttl"` + `fallback_on_pressure: false` | Only clears expired blocks; ignores capacity shortage |
 
-**TTL 行为规则**：
-- `default_block_ttl_seconds`：在 instance group 级别配置，`0` 表示组级禁用 TTL。
-- `ttl_refresh_on_read`：控制读命中是否刷新 TTL 锚点；默认 `true`（Sliding TTL），`false` 时读不续命。
-- 组级禁用 TTL 时，请求级 `ttl_seconds > 0` 不生效（写入路径会强制关闭 TTL）。
-- 写入时，`ttl_anchor_time` 重置为写入时间，TTL 从该锚点开始计时。
-- 读取时（`PrefixQuery`），`last_access_time` 总是刷新；仅在 `ttl_refresh_on_read=true` 时刷新 `ttl_anchor_time`。
-- 读写请求执行前，会先进行一次 TTL 过期块物理清理，并由 `CleanEvictedBlocks` 统一做节点清理。
-- 写入完成后，`CheckAndEvict` 负责容量驱逐；当 `fallback_on_pressure=false` 时跳过容量驱逐。
-- `POLICY_TTL` 过期清理已优化为基于最小过期时间堆（min-heap）的增量回收，避免每次请求全链表扫描。
+**TTL behavior rules**:
+- `default_block_ttl_seconds`: configured at the instance group level; `0` means TTL is disabled at the group level.
+- `ttl_refresh_on_read`: controls whether a read hit refreshes the TTL anchor; default `true` (Sliding TTL); when `false`, reads do not extend lifetime.
+- When TTL is disabled at the group level, request-level `ttl_seconds > 0` does not take effect (the write path forcibly disables TTL).
+- On write, `ttl_anchor_time` is reset to the write time, and TTL starts counting from that anchor.
+- On read (`PrefixQuery`), `last_access_time` is always refreshed; `ttl_anchor_time` is refreshed only when `ttl_refresh_on_read=true`.
+- Before a read/write request is executed, a physical cleanup of TTL-expired blocks is performed first, and `CleanEvictedBlocks` uniformly handles node cleanup.
+- After a write completes, `CheckAndEvict` handles capacity eviction; when `fallback_on_pressure=false`, capacity eviction is skipped.
+- `POLICY_TTL` expiration cleanup has been optimized to incremental reclamation based on a min-heap of expiration times, avoiding a full list scan on every request.
 
-**TTL 生命周期统计注意事项（重要）**：
-- TTL 模式下的 Block 生命周期统计（`birth_time_us/death_time_us/lifespan_us`）仅反映系统实际处理事件的时间点，不代表真实过期时刻。
-- 由于当前采用写后惰性驱逐（Lazy Eviction），`death_time_us` 记录的是被系统清理/处理的时间，而非严格的 `last_access_time + ttl`。
-- 因此 TTL 场景下的生命周期数据仅用于相对趋势分析，不建议用于精确时长评估或跨策略精确对比。
+**TTL lifecycle statistics notes (important)**:
+- Block lifecycle statistics in TTL mode (`birth_time_us/death_time_us/lifespan_us`) only reflect the time points at which the system actually processes events, not the real expiration moments.
+- Because the current implementation uses lazy eviction after write, `death_time_us` records the time when the block is cleaned up/processed by the system, not strictly `last_access_time + ttl`.
+- Therefore, lifecycle data in TTL scenarios should only be used for relative trend analysis, and is not recommended for precise duration estimation or precise cross-policy comparison.
 
-**Per-request TTL 覆盖**（通过 `WriteCache` API）：
+**Per-request TTL override** (via the `WriteCache` API):
 
-| `ttl_seconds` 值 | 含义 |
+| `ttl_seconds` value | Meaning |
 |---|---|
-| `0`（默认） | 使用 group 的 `default_block_ttl_seconds` |
-| `-1` | 禁用 TTL，该 block 永不过期 |
-| `>0` | 自定义 TTL（秒）；若 group 已禁用 TTL（`default_block_ttl_seconds=0`），该值会被忽略 |
+| `0` (default) | Use the group's `default_block_ttl_seconds` |
+| `-1` | Disable TTL; the block never expires |
+| `>0` | Custom TTL (seconds); if the group has disabled TTL (`default_block_ttl_seconds=0`), this value is ignored |
 
-### Trace 类型
+### Trace Types
 
 ```
-OptimizerSchemaTrace (基类)
-    ├── GetLocationSchemaTrace (读操作)
-    └── WriteCacheSchemaTrace (写操作)
+OptimizerSchemaTrace (base class)
+    ├── GetLocationSchemaTrace (read operation)
+    └── WriteCacheSchemaTrace (write operation)
 ```
 
-**支持的 Trace 格式**
-- **Publisher Log**：KVCacheManager Event Publisher 日志，区分读写请求
-- **Qwen Bailian**：百炼开源数据集格式，转换后强制区分读写请求
+**Supported Trace Formats**
+- **Publisher Log**: KVCacheManager Event Publisher log, distinguishing read and write requests
+- **Qwen Bailian**: Qwen Bailian open-source dataset format; forcibly distinguishes read and write requests after conversion
 
-## 快速开始
+## Quick Start
 
-### 步骤1: 转换trace为标准格式
+### Step 1: Convert trace to standard format
 
 ```bash
 cd tools/trace_converter
 
-# 安装依赖 (首次使用)
+# Install dependencies (first time only)
 pip install -r requirements.txt
 
-# 转换trace
+# Convert trace
 python trace_converter.py \
     -i /path/to/your_trace.jsonl \
     -o /path/to/optimizer_trace.jsonl \
@@ -130,7 +133,7 @@ python trace_converter.py \
     --mode optimizer
 ```
 
-### 步骤2: 编译 Optimizer
+### Step 2: Build the Optimizer
 
 ```bash
 bazel build \
@@ -138,9 +141,9 @@ bazel build \
     //kv_cache_manager/optimizer/analysis/script:optimizer_run
 ```
 
-### 步骤3: 创建配置文件
+### Step 3: Create a configuration file
 
-创建 JSON 配置文件。下面是非分层 LRU 的最小可用配置；trace 中的 `instance_id` 必须能匹配这里的 `instances[].instance_id`。
+Create a JSON configuration file. Below is a minimal usable configuration for non-tiered LRU; the `instance_id` in the trace must match the `instances[].instance_id` here.
 
 ```json
 {
@@ -185,18 +188,18 @@ bazel build \
 ```
 
 
-### 步骤4: 运行Optimizer
+### Step 4: Run the Optimizer
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     -c /path/to/config.json
 ```
 
-运行完成后，会在 `output_result_path` 指定的目录下生成：
+After running, the following is generated in the directory specified by `output_result_path`:
 
-- `{instance_id}_hit_rates.csv` - 每个 instance 的命中率数据
+- `{instance_id}_hit_rates.csv` - hit-rate data for each instance
 
-需要画命中率时序图时加 `--draw-chart`：
+To draw a hit-rate time-series chart, add `--draw-chart`:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -204,29 +207,29 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --draw-chart
 ```
 
-常见入口速查：
+Quick reference for common entry points:
 
-| 需求 | 推荐入口 |
+| Need | Recommended entry point |
 |---|---|
-| 单次回放、输出 `*_hit_rates.csv` | `optimizer_run -c config.json` |
-| 单次回放并画时序图 | `optimizer_run -c config.json --draw-chart` |
-| 无限容量理论命中率 | config 中将 `quota_capacity` 或 tier `capacity` 设为 `-1` 后运行 `optimizer_run` |
-| 非分层容量 Pareto | `tradeoff -c config.json --num-points 30` |
-| 多驱逐策略 Pareto | `tradeoff -c config.json --eviction-policies lru random_lru leaf_aware_lru ttl` |
-| 每个 pod/instance 独立缓存回放 | `multi_instance_replay --trace-dir ... --output-dir ...` |
-| 导出生命周期 CSV | `optimizer_run -c config.json --export-lifecycle` |
-| 分析 lifecycle 图表 | `analyze_lifecycle -i <lifecycle.csv 或目录>` |
-| 导出/可视化 RadixTree | `export_tree -c config.json --show-hot-paths` |
+| Single replay, output `*_hit_rates.csv` | `optimizer_run -c config.json` |
+| Single replay with time-series chart | `optimizer_run -c config.json --draw-chart` |
+| Infinite-capacity theoretical hit rate | Set `quota_capacity` or tier `capacity` to `-1` in config, then run `optimizer_run` |
+| Non-tiered capacity Pareto | `tradeoff -c config.json --num-points 30` |
+| Multi eviction-policy Pareto | `tradeoff -c config.json --eviction-policies lru random_lru leaf_aware_lru ttl` |
+| Per-pod/instance independent cache replay | `multi_instance_replay --trace-dir ... --output-dir ...` |
+| Export lifecycle CSV | `optimizer_run -c config.json --export-lifecycle` |
+| Analyze lifecycle charts | `analyze_lifecycle -i <lifecycle.csv or dir>` |
+| Export/visualize RadixTree | `export_tree -c config.json --show-hot-paths` |
 
-### 可视化分析
+### Visual Analysis
 
-Optimizer 模块提供多种可视化分析工具，用于分析缓存性能、命中率和 Radix Tree 结构。
+The Optimizer module provides a variety of visual analysis tools for analyzing cache performance, hit rate, and Radix Tree structure.
 
-#### 命中率随时间变化图表
+#### Hit Rate Over Time Chart
 
-运行optimizer，分析trace并绘制多实例缓存分析图表，展示所有 instance 的存储容量总和以及各自命中率随时间的变化。
+Run the optimizer to analyze the trace and draw multi-instance cache analysis charts, showing the sum of storage capacity across all instances and their respective hit rates over time.
 
-**注意**: 配置文件中的 `trace_file_path` 必须是标准格式trace文件。
+**Note**: The `trace_file_path` in the configuration file must be a standard-format trace file.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -234,27 +237,27 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --draw-chart
 ```
 
-**输出**：`{output_result_path}/timeseries/multi_instance_cache_analysis.png`
+**Output**: `{output_result_path}/timeseries/multi_instance_cache_analysis.png`
 
-#### Radix Tree 可视化
+#### Radix Tree Visualization
 
-导出并可视化前缀树结构，统计并展示热节点以及所属节点的前缀路径。
-具体配置见 `analysis/script/run/export_tree.py`。
+Export and visualize the prefix tree structure, counting and displaying hot nodes and the prefix paths of their associated nodes.
+See `analysis/script/run/export_tree.py` for specific configuration.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
     -c /path/to/config.json
 ```
 
-**输出**：
-- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree 导出数据
-- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree 可视化图表
+**Output**:
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree export data
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree visualization chart
 
-#### Pareto 容量-命中率曲线分析
+#### Pareto Capacity-Hit-Rate Curve Analysis
 
-统一入口是 `tradeoff`。它先用无限容量 warmup 获取理论命中率和最大缓存量，然后按容量点回放 optimizer，绘制容量与命中率的 Pareto 曲线。
+The unified entry point is `tradeoff`. It first uses infinite-capacity warmup to obtain the theoretical hit rate and maximum cache size, then replays the optimizer per capacity point and draws the Pareto curve of capacity versus hit rate.
 
-> **适用范围**：Tradeoff 只适用于非分层模式。在分层模式下，容量扫描只修改 `quota_capacity`，不会修改各 tier 的 `storages[i].capacity`，因此不能代表真实分层容量权衡。
+> **Scope of applicability**: Tradeoff only applies to non-tiered mode. In tiered mode, the capacity scan only modifies `quota_capacity` and does not modify each tier's `storages[i].capacity`, so it cannot represent the real tiered capacity tradeoff.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
@@ -265,19 +268,19 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --max-workers 4
 ```
 
-**参数说明**：
-- `-c, --config` - 配置文件路径
-- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中率后提前停止
-- `--min-capacity-ratio` - 最小容量点相对阈值（默认 `1e-4`）
-- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
-- `--max-workers` - 并行执行的最大线程数（默认 4）
-- `--plot-title` - 覆盖图标题
+**Parameter description**:
+- `-c, --config` - configuration file path
+- `--num-points` - maximum number of capacity sampling points to run per policy (default 30); stops early after reaching 99% of the theoretical hit rate
+- `--min-capacity-ratio` - minimum capacity point relative threshold (default `1e-4`)
+- `--hit-rate-type` - hit-rate type: total/local/remote/all (default total)
+- `--max-workers` - maximum number of parallel execution threads (default 4)
+- `--plot-title` - override the chart title
 
-**输出**：`{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
+**Output**: `{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
 
-#### 多策略对比分析
+#### Multi-Policy Comparison Analysis
 
-通过 `--eviction-policies` 对比多个驱逐策略。每个策略独立 warmup、独立计算理论命中率，并独立在达到 99% 理论命中后停止。
+Compare multiple eviction policies via `--eviction-policies`. Each policy warms up independently, computes its theoretical hit rate independently, and independently stops after reaching 99% of the theoretical hit rate.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
@@ -288,82 +291,82 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --max-workers 4
 ```
 
-**参数说明**：
-- `-c, --config` - 配置文件路径
-- `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru ttl）
-- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中率后提前停止
-- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
-- `--max-workers` - 并行执行的最大线程数（默认 4）
+**Parameter description**:
+- `-c, --config` - configuration file path
+- `--eviction-policies` - list of eviction policies to compare (default lru random_lru leaf_aware_lru ttl)
+- `--num-points` - maximum number of capacity sampling points to run per policy (default 30); stops early after reaching 99% of the theoretical hit rate
+- `--hit-rate-type` - hit-rate type: total/local/remote/all (default total)
+- `--max-workers` - maximum number of parallel execution threads (default 4)
 
-**输出**：`{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
+**Output**: `{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
 
-图形规则：X 轴为 `Capacity (GB)`，Y 轴为 `HitRate (%)`；曲线从 `(0 GB, 0%)` 开始，只画上升段；95% 和 99% 理论命中率用插值交点、虚线和标签标出。若某个容量点出现下降，会从图上剔除并在日志中打印，原始 CSV 保留。
+Chart rules: the X axis is `Capacity (GB)`, the Y axis is `HitRate (%)`; the curve starts from `(0 GB, 0%)` and only the rising segment is drawn; the 95% and 99% theoretical hit rates are marked with interpolation intersections, dashed lines, and labels. If a capacity point shows a decrease, it is removed from the chart and printed in the log, while the original CSV is retained.
 
-### Python 接口示例
+### Python Interface Example
 
 ```python
 from kv_cache_manager.optimizer import OptimizerConfigLoader, OptimizerLoader, OptimizerManager
 
-# 加载配置
+# Load configuration
 config_loader = OptimizerConfigLoader()
 config = config_loader.Load("/path/to/config.json")
 
-# 创建优化器
+# Create the optimizer
 optimizer = OptimizerManager(config)
 optimizer.Init()
 
-# 运行
+# Run
 optimizer.DirectRun()
 
-# 分析结果
+# Analyze results
 optimizer.AnalyzeResults()
 
-# 单次读写操作（需要指定instance_id）
+# Single read/write operations (instance_id must be specified)
 write_res = optimizer.WriteCache("instance_id", "trace_001", timestamp, block_ids)
 read_res = optimizer.GetCacheLocation("instance_id", "trace_002", timestamp, block_ids, block_mask,
                                       input_len=real_prompt_tokens)
 
-# 写入时指定 TTL（可选）
+# Specify TTL on write (optional)
 write_res = optimizer.WriteCache("instance_id", "trace_003", timestamp, block_ids,
-                                  ttl_seconds=0)     # 使用 group 默认
+                                  ttl_seconds=0)     # Use group default
 write_res = optimizer.WriteCache("instance_id", "trace_004", timestamp, block_ids,
-                                  ttl_seconds=-1)    # 禁用 TTL，永不过期
+                                  ttl_seconds=-1)    # Disable TTL, never expires
 write_res = optimizer.WriteCache("instance_id", "trace_005", timestamp, block_ids,
-                                  ttl_seconds=300)   # 自定义 300 秒
+                                  ttl_seconds=300)   # Custom 300 seconds
 
-# 清空缓存（保留统计）
-optimizer.ClearCache("instance_id")        # 清空指定实例
-optimizer.ClearAllCaches()                 # 清空所有实例
+# Clear cache (keep statistics)
+optimizer.ClearCache("instance_id")        # Clear the specified instance
+optimizer.ClearAllCaches()                 # Clear all instances
 
-# 清空缓存并重置统计
-optimizer.ClearCacheAndResetStats("instance_id")  # 清空指定实例并重置统计
-optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置统计
+# Clear cache and reset statistics
+optimizer.ClearCacheAndResetStats("instance_id")  # Clear the specified instance and reset statistics
+optimizer.ClearAllCachesAndResetStats()           # Clear all instances and reset statistics
 ```
 
-### 配置参数说明
+### Configuration Parameter Description
 
-| 参数 | 说明 |
+| Parameter | Description |
 |------|------|
-| eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
-| eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
-| quota_capacity | 非分层模式下的 group 总容量，单位 GB；`-1` 表示无限容量，不触发容量驱逐 |
-| storages[].capacity | 分层模式下单个 tier 的容量，单位 GB；`-1` 表示该 tier 无限容量 |
-| tier_strategy | 多层读写策略包，包含分层驱逐开关、写入模式、读访问传播、promote 和 selective write 阈值；顶层字段是所有相邻 tier edge 的默认策略 |
-| tier_strategy.write_mode | 写入/下沉模式：`write_through`、`cascading`、`write_through_selective` |
-| tier_strategy.access_propagation_enabled | 读命中上层副本时是否刷新下层副本访问时间；它不是写入模式 |
-| tier_strategy.tier_flows | 相邻 tier edge 的策略覆盖；未覆盖 edge 继承 `tier_strategy` 默认策略 |
-| bytes_per_token | 单 token KV 大小；Python 分析脚本用它和 `block_size` 将 block 容量换算为 GB |
-| default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
-| ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
-| fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
+| eviction_mode | Eviction mode: 1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
+| eviction_policy_type | Eviction policy type: lru, random_lru, leaf_aware_lru, ttl |
+| quota_capacity | Total group capacity in non-tiered mode, in GB; `-1` means infinite capacity, no capacity eviction triggered |
+| storages[].capacity | Capacity of a single tier in tiered mode, in GB; `-1` means infinite capacity for that tier |
+| tier_strategy | Multi-tier read/write policy package, including hierarchical eviction switch, write mode, read access propagation, promote and selective write thresholds; top-level fields are the default policy for all adjacent tier edges |
+| tier_strategy.write_mode | Write/sink mode: `write_through`, `cascading`, `write_through_selective` |
+| tier_strategy.access_propagation_enabled | Whether to refresh the access time of lower-tier copies when a read hits an upper-tier copy; it is not a write mode |
+| tier_strategy.tier_flows | Policy overrides for adjacent tier edges; edges not overridden inherit the `tier_strategy` default policy |
+| bytes_per_token | KV size per token; Python analysis scripts use it together with `block_size` to convert block capacity to GB |
+| default_block_ttl_seconds | Default TTL (seconds) at the instance group level; 0 = disable TTL |
+| ttl_refresh_on_read | TTL refresh switch at the instance group level: true=read refreshes, false=fixed window |
+| fallback_on_pressure | TTL policy parameter: whether to fall back to LRU when expiration is insufficient (default true) |
 
-## 使用案例
+## Use Cases
 
-下面的案例都假设输入已经是标准 optimizer JSONL trace。标准结论使用 token hit rate，即 CSV 最后一行的 `AccHitRate = AccHitTokens / AccInputTokens`。示例中的 JSON 多数只展示 `instance_groups[]` 中的一项，完整 config 仍需要顶层 `trace_file_path`、`output_result_path` 和 `eviction_params`。
+The following cases all assume the input is already a standard optimizer JSONL trace. Standard conclusions use token hit rate, i.e. `AccHitRate = AccHitTokens / AccInputTokens` in the last row of the CSV. The JSON in the examples mostly shows only one item in `instance_groups[]`; a complete config still requires the top-level `trace_file_path`, `output_result_path`, and `eviction_params`.
 
-### 案例 1：全局池化无限容量理论命中率
+### Case 1: Global Pooled Infinite-Capacity Theoretical Hit Rate
 
-用于回答“如果容量无限，当前 trace 理论上最多能命中多少”。非分层全局池化配置中把 `quota_capacity` 设为 `-1`：
+Used to answer "if capacity were infinite, how much could the current trace theoretically hit at most". In a non-tiered global pooled configuration, set `quota_capacity` to `-1`:
 
 ```json
 {
@@ -395,19 +398,19 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 }
 ```
 
-运行：
+Run:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     -c /path/to/global_pool_unlimited.json
 ```
 
-结果看 `{output_result_path}/global_hit_rates.csv` 最后一行的 `AccHitRate`、`AccInputTokens`、`AccHitTokens`。
-如果 trace 中使用真实 pod 名作为 `instance_id`，需要把上面示例里的 `instances[].instance_id` 同步改成对应名称。
+For results, look at `AccHitRate`, `AccInputTokens`, and `AccHitTokens` in the last row of `{output_result_path}/global_hit_rates.csv`.
+If the trace uses real pod names as `instance_id`, you need to change `instances[].instance_id` in the example above to the corresponding names.
 
-### 案例 2：单层有限容量回放
+### Case 2: Single-Tier Finite-Capacity Replay
 
-用于评估给定容量下的实际 token 命中率。非分层模式只需要设置 `quota_capacity`，单位是 GB：
+Used to evaluate the actual token hit rate under a given capacity. Non-tiered mode only requires setting `quota_capacity`, in GB:
 
 ```json
 {
@@ -425,7 +428,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
 }
 ```
 
-`block_size * bytes_per_token` 决定一个 block 对应的 KV 容量；Pareto 图和容量输出都依赖这个换算。
+`block_size * bytes_per_token` determines the KV capacity corresponding to one block; Pareto charts and capacity output all depend on this conversion.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -433,14 +436,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --draw-chart
 ```
 
-输出：
+Output:
 
 - `{output_result_path}/*_hit_rates.csv`
 - `{output_result_path}/timeseries/multi_instance_cache_analysis.png`
 
-### 案例 3：HBM + DRAM 分层回放，write-through，读不更新下层
+### Case 3: HBM + DRAM Tiered Replay, write-through, reads do not update lower tier
 
-用于模拟线上多层缓存。`hierarchical_eviction_enabled=true` 时，每层按 `storages[].capacity` 独立驱逐；此时 `quota_capacity` 只是保留字段，不用于每层驱逐。
+Used to simulate online multi-tier caching. When `hierarchical_eviction_enabled=true`, each tier evicts independently according to `storages[].capacity`; in this case `quota_capacity` is only a reserved field and is not used for per-tier eviction.
 
 ```json
 {
@@ -473,7 +476,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
 }
 ```
 
-运行：
+Run:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -481,11 +484,11 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --draw-chart
 ```
 
-分层结果看 `Tier<N>(name)_HitTokens`、`AccTier<N>(name)_HitRate` 和 `Tier<N>(name)_BlockNum`，图在 `{output_result_path}/timeseries/per_tier_timeseries.png`。
+For tiered results, look at `Tier<N>(name)_HitTokens`, `AccTier<N>(name)_HitRate`, and `Tier<N>(name)_BlockNum`; the chart is at `{output_result_path}/timeseries/per_tier_timeseries.png`.
 
-### 案例 4：三层 HBM + DRAM + L3，前两层 write-through，DRAM 到 L3 cascading
+### Case 4: Three-Tier HBM + DRAM + L3, first two tiers write-through, DRAM to L3 cascading
 
-当每条 edge 策略不一致时，用 `tier_flows` 覆盖默认策略：
+When the policy differs per edge, use `tier_flows` to override the default policy:
 
 ```json
 {
@@ -520,11 +523,11 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
 }
 ```
 
-`tier_strategy` 顶层字段是默认 edge 策略；`tier_flows` 只覆盖指定相邻 edge。
+The top-level fields of `tier_strategy` are the default edge policy; `tier_flows` only overrides the specified adjacent edges.
 
-### 案例 5：每个 pod 独立缓存回放并聚合全局命中率
+### Case 5: Per-Pod Independent Cache Replay with Global Hit-Rate Aggregation
 
-当线上每个 pod/实例独立缓存时，用 `multi_instance_replay`。输入目录下每个 JSONL 文件只能包含一个 `instance_id`。
+When each online pod/instance caches independently, use `multi_instance_replay`. Each JSONL file in the input directory can only contain one `instance_id`.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
@@ -543,18 +546,18 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
     --window-seconds 60
 ```
 
-输出：
+Output:
 
-- `<output_dir>/<instance_id>_hit_rates.csv`：每个 pod 的回放结果
-- `<output_dir>/aggregate/instance_aggregate.csv`：每个 pod 汇总
-- `<output_dir>/aggregate/global_aggregate.csv`：所有 pod 聚合后的整体命中率
-- `<output_dir>/aggregate/global_window_hit_rates.csv`：窗口级整体命中率
+- `<output_dir>/<instance_id>_hit_rates.csv`: replay result for each pod
+- `<output_dir>/aggregate/instance_aggregate.csv`: summary per pod
+- `<output_dir>/aggregate/global_aggregate.csv`: overall hit rate after aggregating all pods
+- `<output_dir>/aggregate/global_window_hit_rates.csv`: window-level overall hit rate
 
-当前 `multi_instance_replay` CLI 直接支持 L1/L2 两层。需要 L3 或更复杂拓扑时，使用完整 optimizer config 或扩展脚本。
+The current `multi_instance_replay` CLI directly supports two tiers, L1/L2. When L3 or more complex topologies are needed, use a full optimizer config or extend the script.
 
-### 案例 6：容量 Pareto 图
+### Case 6: Capacity Pareto Chart
 
-非分层容量扫描使用 `tradeoff`。脚本先跑无限容量 warmup 获取理论命中率，再生成容量点；达到 99% 理论命中后停止。
+Non-tiered capacity scanning uses `tradeoff`. The script first runs an infinite-capacity warmup to obtain the theoretical hit rate, then generates capacity points; it stops after reaching 99% of the theoretical hit rate.
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
@@ -566,7 +569,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --plot-title "service-a Pareto"
 ```
 
-多策略对比：
+Multi-policy comparison:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
@@ -577,16 +580,16 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --max-workers 8
 ```
 
-输出：
+Output:
 
 - `{output_result_path}/pareto/pareto_curve_total.png`
 - `{output_result_path}/pareto/multi_policy_total.png`
 
-图上会标出 95%/99% 理论命中对应容量；下降点只从图上剔除，原始 CSV 不改。
+The chart marks the capacities corresponding to 95%/99% theoretical hit rate; decreasing points are only removed from the chart, and the original CSV is not modified.
 
-### 案例 7：Block 生命周期分析
+### Case 7: Block Lifecycle Analysis
 
-先在回放时导出 lifecycle CSV：
+First export the lifecycle CSV during replay:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -594,14 +597,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --export-lifecycle
 ```
 
-再生成生命周期统计和图：
+Then generate lifecycle statistics and charts:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
     -i /path/to/output_result_path
 ```
 
-只打印统计、不画图：
+To print statistics only, without drawing charts:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
@@ -609,9 +612,9 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
     --stats-only
 ```
 
-### 案例 8：RadixTree 热点路径排查
+### Case 8: RadixTree Hot Path Troubleshooting
 
-用于看热点前缀、叶子节点和已缓存/已驱逐 block：
+Used to inspect hot prefixes, leaf nodes, and cached/evicted blocks:
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
@@ -621,56 +624,56 @@ bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
     --show-blocks
 ```
 
-输出：
+Output:
 
 - `{output_result_path}/radix_tree/{instance_id}_radix_tree.json`
 - `{output_result_path}/radix_tree/{instance_id}_hot_paths.png`
 
-### 案例 9：结果读取口径
+### Case 9: Result Reading Metrics
 
-标准报告只看 token hit rate：
+Standard reports only look at token hit rate:
 
-| 指标 | 说明 |
+| Metric | Description |
 |---|---|
-| `InputTokens` / `AccInputTokens` | 当前 / 累计输入 token 数 |
-| `HitTokens` / `AccHitTokens` | 当前 / 累计命中 token 数 |
-| `HitRate` | 当前请求 token 命中率 |
-| `AccHitRate` | 累计 token 命中率，主要结论看这一列 |
-| `ReadBlocks` / `HitBlocks` | block 级诊断字段，不作为最终命中率口径 |
-| `Tier<N>(name)_HitTokens` | 分层命中 token 数 |
-| `AccTier<N>(name)_HitRate` | 分层累计 token 命中率 |
+| `InputTokens` / `AccInputTokens` | Current / cumulative input token count |
+| `HitTokens` / `AccHitTokens` | Current / cumulative hit token count |
+| `HitRate` | Current request token hit rate |
+| `AccHitRate` | Cumulative token hit rate; the main conclusion looks at this column |
+| `ReadBlocks` / `HitBlocks` | Block-level diagnostic fields, not used as the final hit-rate metric |
+| `Tier<N>(name)_HitTokens` | Tiered hit token count |
+| `AccTier<N>(name)_HitRate` | Tiered cumulative token hit rate |
 
 
-## Trace 输入格式
+## Trace Input Format
 
-### 概述
+### Overview
 
-Optimizer 只接受标准格式的trace文件。使用独立的Python工具将各种trace格式转换为标准格式。
+The Optimizer only accepts standard-format trace files. Use a standalone Python tool to convert various trace formats to the standard format.
 
-### 标准格式
+### Standard Format
 
-Optimizer 支持两种标准 trace 类型：
+The Optimizer supports two standard trace types:
 
-- **GetLocationSchemaTrace**: 读操作 (prefill阶段)
-- **WriteCacheSchemaTrace**: 写操作 (decode阶段)
+- **GetLocationSchemaTrace**: read operation (prefill phase)
+- **WriteCacheSchemaTrace**: write operation (decode phase)
 
-**推荐**: 所有Optimizer输入统一使用Get+Write格式以保留精确的读写时序。
-标准 `get` trace 必须包含 `input_len`；`keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `InputTokens`。
+**Recommendation**: Unify all Optimizer inputs to the Get+Write format to preserve precise read/write timing.
+A standard `get` trace must contain `input_len`; `keys` can only contain complete block keys — trailing tokens that do not fill a full block are not written into `keys`, but are still counted into `InputTokens`.
 
 ---
 
-### 转换工具
+### Conversion Tool
 
-使用独立的Python工具转换各种格式 (无需bazel):
+Use a standalone Python tool to convert various formats (no bazel required):
 
 ```bash
-# 进入工具目录
+# Enter the tool directory
 cd tools/trace_converter
 
-# 安装依赖 (首次使用)
+# Install dependencies (first time only)
 pip install -r requirements.txt
 
-# 转换trace为Optimizer格式
+# Convert trace to Optimizer format
 python trace_converter.py \
     -i your_trace.log \
     -o optimizer_trace.jsonl \
@@ -679,31 +682,31 @@ python trace_converter.py \
 
 ```
 
-**支持的格式**:
-- `publisher_log`: KVCacheManager Event Publisher日志
-- `qwen_bailian`: Qwen Bailian开源数据集
-- `text`: 文本对话 (需要指定--tokenizer-path)
+**Supported formats**:
+- `publisher_log`: KVCacheManager Event Publisher log
+- `qwen_bailian`: Qwen Bailian open-source dataset
+- `text`: text conversation (requires specifying --tokenizer-path)
 
-**自动发现 Converter**:
+**Auto-discovery of Converters**:
 
-系统会自动扫描并发现所有可用的 converter：
+The system automatically scans and discovers all available converters:
 
 ```bash
-# 使用内置 converter
+# Use a built-in converter
 python3 trace_converter.py -i input.jsonl -o output.jsonl -f qwen_bailian
 
-# 使用自定义 converter
+# Use a custom converter
 python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
     --converter-module /path/to/custom_converter.py
 ```
 
-详见: [Trace Converter文档](tools/trace_converter/README.md)
+See: [Trace Converter documentation](tools/trace_converter/README.md)
 
 ---
 
-### 配置文件
+### Configuration File
 
-**新版配置**:
+**New configuration**:
 ```json
 {
     "trace_file_path": "/path/to/optimizer_trace.jsonl",
@@ -739,17 +742,17 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
 }
 ```
 
-**注意**: 
-- `trace_file_path` 必须是标准格式文件
+**Note**:
+- `trace_file_path` must be a standard-format file
 
 ---
 
-### 使用示例
+### Usage Example
 
-完整流程:
+Complete workflow:
 
 ```bash
-# 步骤1: 转换trace
+# Step 1: Convert trace
 cd tools/trace_converter
 python trace_converter.py \
     -i /path/to/qwen_trace.jsonl \
@@ -757,47 +760,47 @@ python trace_converter.py \
     -f qwen_bailian \
     --mode optimizer
 
-# 步骤2: 运行Optimizer
+# Step 2: Run the Optimizer
 cd ../..
 bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 ```
 
 ---
 
-### 添加自定义 Trace Converter
+### Adding a Custom Trace Converter
 
-如果需要支持新的 trace 格式,在Python工具中添加新的converter:
+If you need to support a new trace format, add a new converter in the Python tool:
 
-1. **创建Converter类**: 在任意目录创建新文件
+1. **Create a Converter class**: create a new file in any directory
    ```python
    from converters.base import BaseConverter
    
    class MyCustomConverter(BaseConverter):
        def convert(self, input_file: str, output_file: str) -> int:
-           # 实现转换逻辑
+           # Implement conversion logic
            pass
    ```
 
-2. **使用 - 方式1 (自动扫描目录)**:
+2. **Usage - Option 1 (auto-scan directory)**:
    ```bash
-   # 将converter文件放到指定目录，自动发现所有继承BaseConverter的类
+   # Place the converter file in the specified directory; automatically discovers all classes inheriting BaseConverter
    python trace_converter.py -i input.log -o output.jsonl -f my_custom \
        --converter-dir /path/to/your/converters
    ```
 
-3. **使用 - 方式2 (显式注册文件)**:
+3. **Usage - Option 2 (explicitly register file)**:
    ```bash
-   # 直接指定converter文件和类名
+   # Directly specify the converter file and class name
    python trace_converter.py -i input.log -o output.jsonl -f my_custom \
        --converter-module /path/to/my_custom_converter.py:MyCustomConverter
    ```
 
-**无需修改 `trace_converter.py` 源码** Converter会根据类名自动推断format名称：
+**No need to modify the `trace_converter.py` source code** — the Converter automatically infers the format name from the class name:
 - `MyCustomConverter` → `my_custom`
 - `QwenBailianConverter` → `qwen_bailian`
 
 ---
 
-### 相关文档
+### Related Documentation
 
-- [Trace Converter工具文档](tools/trace_converter/README.md) - Python转换工具详细说明
+- [Trace Converter tool documentation](tools/trace_converter/README.md) - detailed description of the Python conversion tool

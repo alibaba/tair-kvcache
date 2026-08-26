@@ -22,6 +22,7 @@ public:
     int32_t pp_size() const noexcept { return pp_size_; }
     const std::string &extra() const noexcept { return extra_; }
     const std::string &user_data() const noexcept { return user_data_; }
+    bool use_eagle_pop() const noexcept { return use_eagle_pop_; }
 
     // Setter methods
     void set_model_name(const std::string &v) { model_name_ = v; }
@@ -33,6 +34,7 @@ public:
     void set_pp_size(int32_t pp_size) { pp_size_ = pp_size; }
     void set_extra(const std::string &v) { extra_ = v; }
     void set_user_data(const std::string &v) { user_data_ = v; }
+    void set_use_eagle_pop(bool v) noexcept { use_eagle_pop_ = v; }
 
 private:
     std::string model_name_;
@@ -44,5 +46,6 @@ private:
     int32_t pp_size_ = 0;
     std::string extra_;
     std::string user_data_;
+    bool use_eagle_pop_ = false;
 };
 } // namespace kv_cache_manager

@@ -22,6 +22,25 @@ protected:
 
 #define GET(ptr, group, name) (ptr)->get_##group##_##name##_metrics()
 
+TEST_F(MetricsCollectorTest, EventReportMetricsTest) {
+    MetricsTags tags = {{"event_type", "block_snapshot"}};
+    auto collector = std::make_shared<EventReportMetricsCollector>(metrics_registry_, tags);
+    ASSERT_TRUE(collector->Init());
+    EXPECT_EQ(tags, collector->GetMetricsTags());
+    EXPECT_EQ(5, metrics_registry_->GetSize());
+
+    EXPECT_EQ(0, GET(collector, service, query_counter));
+    EXPECT_DOUBLE_EQ(0., GET(collector, service, query_rt_us));
+    EXPECT_DOUBLE_EQ(0., GET(collector, service, error_code));
+    EXPECT_EQ(0, GET(collector, service, error_counter));
+    EXPECT_DOUBLE_EQ(0., GET(collector, manager, request_key_count));
+
+    SET_METRICS_(collector, service, query_rt_us, 123.);
+    SET_METRICS_(collector, service, error_code, 10.);
+    EXPECT_DOUBLE_EQ(123., GET(collector, service, query_rt_us));
+    EXPECT_DOUBLE_EQ(10., GET(collector, service, error_code));
+}
+
 // Test MetaIndexer metrics functionality
 TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
@@ -113,6 +132,8 @@ TEST_F(MetricsCollectorTest, MetaSearcherMetricsTest) {
     ASSERT_NE(nullptr, p);
 
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_get_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, host_projection_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, host_prefix_reduce_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_read_modify_write_block_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_read_modify_write_location_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, index_serialize_time_us), 0.);
@@ -128,13 +149,19 @@ TEST_F(MetricsCollectorTest, MetaSearcherMetricsTest) {
 
     // Test time measurement for indexer get
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerGet);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherHostProjection);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherHostPrefixReduce);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerReadModifyWriteBlock);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerReadModifyWriteLocation);
     usleep(1000); // 1ms
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerGet);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherHostProjection);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherHostPrefixReduce);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerReadModifyWriteBlock);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerReadModifyWriteLocation);
     EXPECT_GE(GET(p, meta_searcher, indexer_get_time_us), 1000.0);
+    EXPECT_GE(GET(p, meta_searcher, host_projection_time_us), 1000.0);
+    EXPECT_GE(GET(p, meta_searcher, host_prefix_reduce_time_us), 1000.0);
     EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_block_time_us), 1000.0);
     EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_location_time_us), 1000.0);
 }
@@ -261,6 +288,13 @@ TEST_F(MetricsCollectorTest, DataStorageMetricsCollectorTest) {
     usleep(1000); // 1ms
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, DataStorageCreate);
     EXPECT_GT(GET(p, data_storage, create_time_us), 1000.);
+
+    // Test write_bytes_dispatched counter.
+    EXPECT_EQ(GET(p, data_storage, write_bytes_dispatched_total), 0);
+    p->AddWriteBytes(1024);
+    p->AddWriteBytes(1024);
+    EXPECT_EQ(GET(p, data_storage, write_bytes_dispatched_total), 2048);
+    EXPECT_EQ(metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total").Get(), 2048);
 }
 
 TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {

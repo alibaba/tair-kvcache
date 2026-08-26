@@ -1,16 +1,22 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
+#include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
@@ -31,10 +37,14 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+class EventReportBackend;
 struct MetricsLifecycle;
 class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
+constexpr unsigned int DEFAULT_META_QUERY_WORKER_COUNT = 4;
+constexpr std::size_t DEFAULT_META_QUERY_PARALLEL_THRESHOLD = 256;
+constexpr std::size_t DEFAULT_META_QUERY_CHUNK_SIZE = 128;
 
 class CacheManager {
     // TODO should not public
@@ -69,7 +79,9 @@ public:
 
     struct HostCacheMatch {
         std::string host_ip_port;
-        int64_t prefix_match_blocks;
+        int64_t local;
+        int64_t p2p_1_fetch;
+        int64_t p2p_1_total_match;
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -84,7 +96,11 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16,
               CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config = {},
-              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET);
+              uint32_t schedule_plan_migration_worker_budget = DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET,
+              uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
+              std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
+              std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE,
+              CacheGarbageCollector::Config cache_gc_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -200,7 +216,8 @@ public:
                       const std::string &instance_id,
                       QueryType query_type,
                       const KeyVector &block_cache_keys,
-                      const std::vector<std::string> &medium_filter = {});
+                      const std::vector<std::string> &medium_filter = {},
+                      size_t p2p_host_count = 0);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -209,6 +226,9 @@ public:
 
     void PauseReclaimer();
     void ResumeReclaimer();
+    ErrorCode StartCacheGarbageCollector();
+    void RequestStopCacheGarbageCollector();
+    void JoinCacheGarbageCollector();
 
     // 多层存储迁移控制面随 leader 生命周期启停（OnBecomeLeader/OnNoLongerLeader）。
     void StartMigrationManager();
@@ -217,6 +237,7 @@ public:
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager() { return meta_indexer_manager_; }
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor() { return schedule_plan_executor_; }
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
+    std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
@@ -226,6 +247,15 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    struct EventCleanupCallbackState {
+        std::shared_mutex mutex;
+        bool accepting = true;
+        // Advances whenever cleanup is deactivated. A task admitted before a
+        // leader cleanup must stay stale even if the same CacheManager is later
+        // activated again during recovery.
+        uint64_t epoch = 1;
+    };
+
     ErrorCode FilterWriteCache(RequestContext *request_context,
                                const std::string &instance_id,
                                MetaSearcher *meta_searcher,
@@ -252,6 +282,10 @@ private:
                                const std::vector<std::string_view> &location_spec_group_names,
                                const std::vector<std::string> &tiered_targets,
                                CacheLocationVector &new_locations);
+    // 按 LocationSpec URI 汇总各 storage 的预估写入字节并记录到 per-storage 指标。
+    // URI 约定：hostname = storage unique_name（DataStorageManager::Create 设置），
+    // size 参数 = 该 spec 的字节数（各 backend Create 时写入）。解析失败的 spec 跳过。
+    void RecordWriteBytesForLocations(const CacheLocationVector &locations);
     // 在指定 storage 上为 keys 分配写 location（GenWriteLocation 的单 storage 分配单元，
     // 供多层存储 Mark 路径按 block 路由到不同 storage 复用）。out_locations 与 keys 同序追加。
     ErrorCode GenWriteLocationOnStorage(RequestContext *request_context,
@@ -263,6 +297,11 @@ private:
                                         const std::string &storage_name,
                                         DataStorageType storage_type,
                                         CacheLocationVector &out_locations);
+    void RollbackAddLocations(RequestContext *request_context,
+                              const std::string &instance_id,
+                              const KeyVector &keys,
+                              const CacheLocationVector &locations,
+                              const std::vector<MetaSearcher::AddLocationResult> &add_results);
     ErrorCode CreateInSingleBatch(RequestContext *request_context,
                                   const std::string &instance_id,
                                   const CacheManager::KeyVector &keys,
@@ -303,7 +342,14 @@ private:
     void CleanupHostLocations(const std::string &instance_id,
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
-                              DataStorageType storage_type);
+                              DataStorageType storage_type,
+                              const std::shared_ptr<EventReportBackend> &expected_backend);
+    ErrorCode CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
+                                            const std::string &snapshot_version,
+                                            DataStorageType storage_type,
+                                            const std::shared_ptr<EventReportBackend> &event_backend,
+                                            uint64_t snapshot_attempt_epoch = 0,
+                                            uint64_t lifecycle_generation = 0);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -326,8 +372,12 @@ private:
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
+    MetaSearcher::CheckHostCacheLocationFunc
+    GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
+    void DeactivateEventCleanupCallbacks();
+    void ActivateEventCleanupCallbacks();
 
     // purge metrics registry entries and invoke the removal callback
     // for a given instance_id
@@ -356,6 +406,8 @@ private:
     std::shared_ptr<RegistryManager> registry_manager_;
     // 无需清理 - 让遗留的Plan自行跑完
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
+    // leader demotion 和析构时先停止 GC 线程；已接受的删除任务由 Executor best effort 继续执行
+    std::shared_ptr<CacheGarbageCollector> cache_garbage_collector_;
     // 无需清理 - 仅需要暂停
     std::shared_ptr<CacheReclaimer> cache_reclaimer_;
     // 无需清理 - 随 leader 生命周期 Start/Stop；活跃任务在切主时由 Reclaimer 孤儿检测兜底
@@ -366,6 +418,11 @@ private:
     std::shared_ptr<EventManager> event_manager_;
     // 无需清理
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
+    // EventReportBackend owns a callback that cannot retain CacheManager.
+    // This separate gate lets destruction drain a callback copy that was
+    // already taken by the liveness thread and reject copies invoked later.
+    std::shared_ptr<EventCleanupCallbackState> event_cleanup_callback_state_ =
+        std::make_shared<EventCleanupCallbackState>();
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理

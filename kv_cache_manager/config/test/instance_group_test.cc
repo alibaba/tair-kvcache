@@ -193,4 +193,105 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings) {
+    proto::admin::StorageConfig legacy_proto_config;
+    legacy_proto_config.set_global_unique_name("legacy_event_report");
+    legacy_proto_config.set_storage_type(proto::admin::ST_EVENT_REPORT_L2);
+    legacy_proto_config.mutable_event_report();
+    StorageConfig legacy_restored;
+    ProtoConvert::StorageFromProto(&legacy_proto_config, legacy_restored);
+    auto legacy_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(legacy_restored.storage_spec());
+    ASSERT_NE(nullptr, legacy_spec);
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs,
+              legacy_spec->snapshot_delta_drain_timeout_ms());
+
+    auto spec = std::make_shared<EventReportStorageSpec>();
+    spec->set_heartbeat_timeout_ms(1234);
+    spec->set_cleanup_grace_ms(5678);
+    spec->set_liveness_check_interval_ms(90);
+    spec->set_snapshot_min_interval_ms(4321);
+    spec->set_snapshot_delta_drain_timeout_ms(8765);
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report_test", spec);
+
+    proto::admin::StorageConfig proto_config;
+    ProtoConvert::StorageConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.has_event_report());
+    EXPECT_EQ(4321, proto_config.event_report().snapshot_min_interval_ms());
+    EXPECT_EQ(8765, proto_config.event_report().snapshot_delta_drain_timeout_ms());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_config, restored);
+    auto restored_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(1234, restored_spec->heartbeat_timeout_ms());
+    EXPECT_EQ(5678, restored_spec->cleanup_grace_ms());
+    EXPECT_EQ(90, restored_spec->liveness_check_interval_ms());
+    EXPECT_EQ(4321, restored_spec->snapshot_min_interval_ms());
+    EXPECT_EQ(8765, restored_spec->snapshot_delta_drain_timeout_ms());
+
+    proto::admin::StorageConfig invalid_proto_config;
+    invalid_proto_config.set_global_unique_name("invalid_event_report");
+    invalid_proto_config.set_storage_type(proto::admin::ST_EVENT_REPORT_L2);
+    invalid_proto_config.mutable_event_report()->set_snapshot_delta_drain_timeout_ms(-1);
+    StorageConfig invalid_restored;
+    ProtoConvert::StorageFromProto(&invalid_proto_config, invalid_restored);
+    auto invalid_spec = std::dynamic_pointer_cast<EventReportStorageSpec>(invalid_restored.storage_spec());
+    ASSERT_NE(nullptr, invalid_spec);
+    EXPECT_EQ(-1, invalid_spec->snapshot_delta_drain_timeout_ms());
+    std::string invalid_fields;
+    EXPECT_FALSE(invalid_restored.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+}
+
+TEST_F(InstanceGroupTest, UnknownProtoStorageTypeFailsClosed) {
+    DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    ProtoConvert::DataStorageTypeFromProto(static_cast<proto::admin::StorageType>(263), storage_type);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, storage_type);
+
+    proto::admin::CacheLocation proto_location;
+    proto_location.set_type(static_cast<proto::admin::StorageType>(263));
+    CacheLocation location;
+    ProtoConvert::CacheLocationFromProto(&proto_location, location);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, location.type());
+}
+
+TEST_F(InstanceGroupTest, TairMempoolSsdStorageProtoRoundTripPreservesTypeAndMedia) {
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_service_discovery_url("spectrum://pace-meta");
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    proto::admin::StorageConfig proto_config;
+    ProtoConvert::StorageConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.has_tair_mem_pool());
+    EXPECT_EQ(proto::admin::ST_TAIRMEMPOOL_SSD, proto_config.storage_type());
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, proto_config.tair_mem_pool().media_type());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_config, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+    EXPECT_EQ("spectrum://pace-meta", restored_spec->service_discovery_url());
+}
+
+TEST_F(InstanceGroupTest, LegacyTairMempoolProtoWithoutStorageTypeRemainsDramType) {
+    proto::admin::StorageConfig legacy;
+    legacy.set_global_unique_name("legacy_pace");
+    auto *spec = legacy.mutable_tair_mem_pool();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&legacy, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+}
+
 } // namespace kv_cache_manager

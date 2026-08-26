@@ -191,6 +191,9 @@ private:
     // slot 4: DATA_STORAGE_TYPE_NFS usage data
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
+    // slot 7: DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 usage data
+    // slot 8: DATA_STORAGE_TYPE_EVENT_REPORT_L2 usage data
+    // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD usage data
     array_t_ grp_storage_usage_by_type_;
 };
 
@@ -777,6 +780,10 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         const auto &type = storage_quota.storage_spec();
         if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
             // skip vcns_hf3fs, because it is treated as hf3fs
+            continue;
+        }
+        if (IsEventReportStorageType(type)) {
+            // EventReport metadata is not reclaimed by CacheReclaimer.
             continue;
         }
 
@@ -1418,7 +1425,8 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&is_pending_location, &loc_on_cold_storage, block_key, &source_spec](const auto &entry) {
                 const auto &loc_ptr = entry.second;
                 if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
-                    is_pending_location(block_key, loc_ptr->id()) || !loc_on_cold_storage(*loc_ptr)) {
+                    IsEventReportStorageType(loc_ptr->type()) || is_pending_location(block_key, loc_ptr->id()) ||
+                    !loc_on_cold_storage(*loc_ptr)) {
                     return false;
                 }
                 return std::any_of(loc_ptr->location_specs().begin(),
@@ -1454,6 +1462,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     continue;
                 }
                 const auto &loc = *loc_ptr;
+                if (IsEventReportStorageType(loc.type())) {
+                    continue;
+                }
                 if (is_pending_location(block_key, loc.id())) {
                     continue;
                 }
@@ -1480,8 +1491,18 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             if (!loc_ptr) {
                 continue;
             }
+            // Reporter-owned locations are not reclaim candidates, but still
+            // keep the metadata key alive after all ordinary locations have
+            // been removed. Count them before filtering so key-count credit is
+            // only granted when the deletion can actually remove the key.
             ++valid_location_count;
             const auto &loc = *loc_ptr;
+            if (IsEventReportStorageType(loc.type())) {
+                // Generic reclamation must not remove metadata owned by a
+                // ReportEvent reporter. Dedicated lifecycle/snapshot cleanup
+                // uses metadata-only conditional deletion instead.
+                continue;
+            }
             if (is_pending_location(block_key, loc.id())) {
                 METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
                 continue;
@@ -1987,7 +2008,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
 
         for (std::size_t idx = 1; idx < static_cast<std::size_t>(DataStorageType::COUNT); ++idx) {
             const auto type = static_cast<DataStorageType>(idx);
-            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+            if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || IsEventReportStorageType(type)) {
                 continue;
             }
             data->AddGroupUsageByType(type, meta_indexer->GetStorageUsageByType(type));

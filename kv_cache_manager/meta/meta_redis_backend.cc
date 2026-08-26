@@ -420,6 +420,32 @@ ErrorCode MetaRedisBackend::ListKeys(RequestContext * /*request_context*/,
     return EC_OK;
 }
 
+ErrorCode MetaRedisBackend::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        MaintenanceScanBatch &out) noexcept {
+    MaintenanceScanBatch batch;
+    ErrorCode ec = ListKeys(request_context, cursor, limit, batch.next_cursor, batch.keys);
+    if (ec != EC_OK) {
+        out.Clear();
+        return ec;
+    }
+    if (!batch.keys.empty()) {
+        batch.location_results = GetLocations(request_context, batch.keys, batch.locations);
+    }
+    if (batch.locations.size() != batch.keys.size() || batch.location_results.size() != batch.keys.size()) {
+        KVCM_LOG_ERROR("maintenance scan result shape mismatch, instance[%s] keys[%zu] locations[%zu] results[%zu]",
+                       instance_id_.c_str(),
+                       batch.keys.size(),
+                       batch.locations.size(),
+                       batch.location_results.size());
+        out.Clear();
+        return EC_ERROR;
+    }
+    out = std::move(batch);
+    return EC_OK;
+}
+
 ErrorCode MetaRedisBackend::RandomSample(RequestContext * /*request_context*/,
                                          const int64_t count,
                                          KeyTypeVec &out_keys) noexcept {

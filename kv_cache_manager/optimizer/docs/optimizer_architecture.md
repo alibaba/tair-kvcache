@@ -1,162 +1,172 @@
-# KVCacheManager Optimizer 架构文档
+# KVCacheManager Optimizer Architecture Document
 
-## 目录
+> [中文](optimizer_architecture_zh.md) | English
 
-1. [概述](#概述)
-2. [架构设计](#架构设计)
-3. [核心模块](#核心模块)
-4. [配置系统](#配置系统)
-5. [驱逐策略](#驱逐策略)
-6. [索引系统](#索引系统)
-7. [Trace 处理](#trace-处理)
-8. [结果分析](#结果分析)
-9. [可视化分析](#可视化分析)
-10. [使用说明](#使用说明)
-11. [扩展指南](#扩展指南)
+## Table of Contents
 
----
-
-## 概述
-
-KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回放 trace 数据来模拟缓存读写操作，评估不同驱逐策略和配置对缓存命中率的影响，并为 KVCacheManager 主程序提供参数优化能力。
-
-### 主要特性
-
-- **多种驱逐策略**：支持 LRU、RandomLRU、LeafAwareLRU、TTL 等驱逐算法
-- **分层存储**：支持多层级存储配置，目前功能不完备
-- **Trace 回放**：支持 Publisher Log、Qwen Bailian 等多种 trace 格式
-- **读写分离**：支持读写分离模式和组合模式
-- **详细统计**：提供命中率、缓存使用情况等详细统计
-- **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
-- **可视化分析**：支持 Radix Tree 可视化、命中率图表和 Trade-off 曲线分析
-- **在线优化服务**：支持通过服务接口注册在线实例、实时 TraceQuery 统计命中率和容量使用
+1. [Overview](#overview)
+2. [Architecture Design](#architecture-design)
+3. [Core Modules](#core-modules)
+4. [Configuration System](#configuration-system)
+5. [Eviction Policies](#eviction-policies)
+6. [Index System](#index-system)
+7. [Trace Processing](#trace-processing)
+8. [Result Analysis](#result-analysis)
+9. [Visual Analysis](#visual-analysis)
+10. [Usage Instructions](#usage-instructions)
+11. [Extension Guide](#extension-guide)
 
 ---
 
-## 架构设计
+## Overview
 
-### 整体架构
+KVCacheManager Optimizer is a standalone cache optimization analysis module. It replays trace data to simulate cache read/write operations, evaluates the impact of different eviction policies and configurations on cache hit rate, and provides parameter optimization capabilities for the KVCacheManager main program.
 
-Optimizer 当前包含离线 trace 回放和在线优化服务两条运行路径：
+### Main Features
 
-- 离线回放路径使用 `OptimizerManager`、`OptIndexerManager`、`OptEvictionManager` 和 `RadixTreeIndex`，依赖 replay 配置、trace loader/converter 和 data storage 类型。
-- 在线服务路径使用 `OnlineOptimizerManager`、`CacheIndexerFactory`、`LruCacheIndexer`/`TtlCacheIndexerWrapper` 和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。
+- **Multiple eviction policies**: Supports eviction algorithms such as LRU, RandomLRU, LeafAwareLRU, and TTL
+- **Tiered storage**: Supports multi-tier storage configuration; currently the feature is not fully complete
+- **Trace replay**: Supports multiple trace formats such as Publisher Log and Qwen Bailian
+- **Read/write separation**: Supports read/write separation mode and combined mode
+- **Detailed statistics**: Provides detailed statistics such as hit rate and cache usage
+- **Flexible configuration**: Flexibly configure instances, storage, and policies through JSON configuration files
+- **Visual analysis**: Supports Radix Tree visualization, hit-rate charts, and Trade-off curve analysis
+- **Online optimization service**: Supports registering online instances via service interfaces, real-time TraceQuery statistics of hit rate and capacity usage
+- **Lightweight multi-capacity analysis**: LiteHit uses reuse distance to precisely compute hit rates for multiple full-attention LRU capacities (including infinite capacity) in one pass, supporting both offline request sequences and online streaming requests
 
-两条路径共享 optimizer 模块内的命中率建模代码，但运行时、配置 target 和服务边界保持独立，避免在线服务引入离线 replay/data storage 依赖。
+---
 
-#### 离线回放
+## Architecture Design
+
+### Overall Architecture
+
+The Optimizer currently contains two execution paths: offline trace replay and online optimization service:
+
+- The offline replay path uses `OptimizerManager`, `OptIndexerManager`, `OptEvictionManager`, and `RadixTreeIndex`, depending on replay configuration, trace loader/converter, and data storage types.
+- The online service path uses `OnlineOptimizerManager`, LiteHit, `CacheIndexerFactory`, `LruCacheIndexer`/`TtlCacheIndexerWrapper`, and service/protobuf interfaces, depending on online instance group/instance configuration and registry. Full-attention multi-capacity LRU is directly held by `InstanceState` as LiteHit; linear attention is still simulated by the generic `CacheIndexer`.
+
+The two paths share the hit-rate modeling code within the optimizer module, but the runtime, configuration targets, and service boundaries remain independent, avoiding the online service introducing offline replay/data storage dependencies.
+
+#### Offline Replay
 
 ```
-main.cc (程序入口)
+main.cc (program entry)
     ↓
-OptimizerManager (核心协调器)
-    ├── OptEvictionManager (驱逐管理器)
-    ├── OptIndexerManager (索引管理器)
-    └── OptimizerRunner (Trace 执行器)
+OptimizerManager (core coordinator)
+    ├── OptEvictionManager (eviction manager)
+    ├── OptIndexerManager (indexer manager)
+    └── OptimizerRunner (trace executor)
         ↓
-    ├── Eviction Policies (驱逐策略)
+    ├── Eviction Policies
     │   ├── LRU
     │   ├── RandomLRU
     │   └── LeafAwareLRU
-    ├── RadixTreeIndex (索引)
-    └── Trace Converter (转换器)
+    ├── RadixTreeIndex (index)
+    └── Trace Converter
         ↓
-    HitAnalysis (结果分析)
+    HitAnalysis (result analysis)
         ↓
-    Visualization Tools (可视化工具)
+    Visualization Tools
 ```
 
-#### 在线服务
+#### Online Service
 
 ```
-OptimizerServiceImpl (HTTP/gRPC 接口)
+OptimizerServiceImpl (HTTP/gRPC interface)
     ↓
-OnlineOptimizerManager (在线运行时协调器)
-    ├── OptimizerRegistryManager (实例组/实例持久化)
-    └── InstanceState (instance_id 隔离的运行状态)
+OnlineOptimizerManager (online runtime coordinator)
+    ├── OptimizerRegistryManager (instance group/instance persistence)
+    └── InstanceState (instance_id-isolated runtime state)
         ↓
-    CacheIndexerFactory
-        ├── LruCacheIndexer (容量命中率模拟)
-        └── TtlCacheIndexerWrapper (TTL 淘汰和 hit-age 统计)
+    ├── LiteHit (full-attention multi-capacity LRU)
+    └── CacheIndexerFactory (linear attention)
+        └── LruCacheIndexer / TtlCacheIndexerWrapper
 ```
 
-### 目录结构
+### Directory Structure
 
 ```
 kv_cache_manager/optimizer/
-├── manager/              # 核心管理层
-│   ├── optimizer_manager.h/cc       # 主协调器
-│   ├── optimizer_runner.h/cc        # Trace 执行器
-│   ├── eviction_manager.h/cc        # 驱逐管理器
-│   ├── indexer_manager.h/cc         # 索引管理器
-│   └── optimizer_loader.h/cc        # Trace 加载器
-├── index/                # 索引层
-│   ├── radix_tree_index.h/cc        # 离线 Radix 树索引
-│   └── online/                    # 在线容量/TTL 命中率索引器
-├── eviction_policy/      # 驱逐策略层
-│   ├── base.h                   # 策略基类
-│   ├── common_structure.h       # 通用数据结构
-│   ├── lru.h/cc                 # LRU 策略
-│   ├── random_lru.h/cc          # RandomLRU 策略
-│   ├── leaf_aware_lru.h/cc      # LeafAwareLRU 策略
-│   └── policy_factory.h/cc      # 策略工厂
-├── trace_converter/      # Trace 转换层
-│   ├── optimizer_schema_trace.h  # Trace 定义
-│   ├── base_converter.h          # 转换器基类
-│   ├── publisher_log_converter.h/cc  # Publisher Log 转换器
-│   ├── qwen_bailian_converter.h/cc    # Qwen Bailian 转换器
-│   ├── converter_factory.h/cc    # 转换器工厂
-│   └── trace_util.h              # Trace 工具
-├── config/               # 配置层
-│   ├── optimizer_config.h/cc     # 顶层配置
-│   ├── replay_instance_group_config.h/cc # trace replay/tier 模拟实例组配置
-│   ├── replay_instance_config.h/cc      # trace replay 实例配置
-│   ├── optimizer_instance_group.h/cc    # 在线优化实例组配置
-│   ├── optimizer_instance_info.h/cc     # 在线优化实例配置
-│   ├── optimizer_registry_manager.h/cc  # 在线实例 registry
-│   ├── tier_config.h/cc          # 存储层配置
-│   ├── eviction_config.h         # 驱逐策略参数
-│   └── types.h                   # 类型定义
-├── online_runtime/       # 在线优化运行时
-│   └── online_optimizer_manager.h/cc # 在线实例注册、TraceQuery 和统计
-├── service/              # 在线服务实现
-│   ├── optimizer_service_impl.h/cc    # 服务接口适配层
-│   └── metrics/                   # 在线指标上报
-├── analysis/             # 分析层
-│   ├── result_structure.h        # 结果结构定义
-│   ├── result_analysis.h/cc      # 命中率分析
-│   └── script/                   # 分析脚本
+├── manager/              # core management layer
+│   ├── optimizer_manager.h/cc       # main coordinator
+│   ├── optimizer_runner.h/cc        # trace executor
+│   ├── eviction_manager.h/cc        # eviction manager
+│   ├── indexer_manager.h/cc         # indexer manager
+│   ├── optimizer_loader.h/cc        # trace loader
+│   ├── lite_hit_offline_runner.h/cc # offline LiteHit runner: drives OnlineOptimizerManager in-process
+│   └── online_runtime/              # online runtime
+│       └── online_optimizer_manager.h/cc # online instance registration, TraceQuery, and statistics
+├── index/                # index layer
+│   ├── radix_tree_index.h/cc        # offline Radix tree index
+│   └── online/                    # linear attention online capacity/TTL indexer
+├── liteHit/              # lightweight multi-capacity full-attention LRU hit-rate core
+│   ├── lite_hit.h/cc                # multi-capacity LRU hit-rate analyzer
+│   └── dynamic_fenwick_tree.h/cc    # order-statistics Fenwick for reuse-distance
+├── eviction_policy/      # eviction policy layer
+│   ├── base.h                   # policy base class
+│   ├── common_structure.h       # common data structures
+│   ├── lru.h/cc                 # LRU policy
+│   ├── random_lru.h/cc          # RandomLRU policy
+│   ├── leaf_aware_lru.h/cc      # LeafAwareLRU policy
+│   └── policy_factory.h/cc      # policy factory
+├── trace_converter/      # trace conversion layer
+│   ├── optimizer_schema_trace.h  # trace definitions
+│   ├── base_converter.h          # converter base class
+│   ├── publisher_log_converter.h/cc  # Publisher Log converter
+│   ├── qwen_bailian_converter.h/cc    # Qwen Bailian converter
+│   ├── converter_factory.h/cc    # converter factory
+│   └── trace_util.h              # trace utilities
+├── config/               # configuration layer
+│   ├── optimizer_config.h/cc     # top-level config
+│   ├── replay_instance_group_config.h/cc # trace replay/tier simulation instance group config
+│   ├── replay_instance_config.h/cc      # trace replay instance config
+│   ├── optimizer_instance_group.h/cc    # online optimization instance group config
+│   ├── optimizer_instance_info.h/cc     # online optimization instance config
+│   ├── optimizer_registry_manager.h/cc  # online instance registry
+│   ├── tier_config.h/cc          # storage tier config
+│   ├── eviction_config.h         # eviction policy parameters
+│   └── types.h                   # type definitions
+├── service/              # online service implementation
+│   ├── optimizer_service_impl.h/cc    # service interface adapter layer
+│   └── metrics/                   # online metrics reporting
+├── analysis/             # analysis layer
+│   ├── result_structure.h        # result structure definitions
+│   ├── result_analysis.h/cc      # hit-rate analysis
+│   └── script/                   # analysis scripts
 │       ├── run/
-│       │   ├── optimizer_run.py          # 单次回放 + 可选时序图
-│       │   ├── tradeoff.py               # Pareto 曲线，单策略/多策略统一入口
-│       │   ├── export_tree.py            # RadixTree 导出 + 可视化
-│       │   ├── analyze_lifecycle.py      # Block lifecycle 统计
-│       │   └── multi_instance_replay.py  # 多实例并行回放 + 聚合
+│       │   ├── optimizer_run.py          # single replay + optional time-series chart
+│       │   ├── tradeoff.py               # Pareto curve, unified entry for single/multi-policy
+│       │   ├── export_tree.py            # RadixTree export + visualization
+│       │   ├── analyze_lifecycle.py      # block lifecycle statistics
+│       │   └── multi_instance_replay.py  # multi-instance parallel replay + aggregation
 │       ├── plot/
-│       │   ├── hit_rate_plot.py          # 命中率时序图
-│       │   ├── radix_tree_plot.py        # RadixTree 绘图
-│       │   └── lifecycle_plot.py         # Lifecycle CDF/直方图
+│       │   ├── hit_rate_plot.py          # hit-rate time-series chart
+│       │   ├── radix_tree_plot.py        # RadixTree plotting
+│       │   └── lifecycle_plot.py         # lifecycle CDF/histogram
 │       └── utils/
-│           ├── optimizer_runner.py       # optimizer 运行封装
-│           ├── csv_loader.py             # CSV 加载 + 容量点生成
-│           └── plot_utils.py             # Pareto/per-tier 绘图工具
-├── pybind/               # Python 绑定
-│   └── py_optimizer_binding.cc   # Python 接口
-├── main.cc               # 程序入口
-└── optimizer_startup_config_load.json  # 配置示例
+│           ├── optimizer_runner.py       # optimizer run wrapper
+│           ├── csv_loader.py             # CSV loading + capacity point generation
+│           └── plot_utils.py             # Pareto/per-tier plotting utilities
+├── pybind/               # Python bindings
+│   └── py_optimizer_binding.cc   # Python interface
+├── main.cc               # offline replay program entry (optimizer_main)
+├── lite_hit_main.cc      # offline LiteHit multi-capacity analysis entry (lite_hit_main)
+└── optimizer_startup_config_load.json  # config example
 ```
 
-在线服务协议定义在 `kv_cache_manager/protocol/protobuf/optimizer_service.proto`，由 service 层转换为 optimizer online config/runtime 对象。
+The online service protocol is defined in `kv_cache_manager/protocol/protobuf/optimizer_service.proto`, and is converted by the service layer into optimizer online config/runtime objects.
+
+A full-attention TraceQuery only puts complete blocks into `block_keys`, and passes the original input length including trailing tokens via `input_token_len`. The Online Manager uses the fixed byte charge of the full location spec group to floor `capacity_gb` to block capacity, then hands the same request to LiteHit; both per-request and cumulative hit rates are `prefix_hit_blocks * block_size_tokens / input_tokens`. When old clients lack the length, the compatibility assumption is that there are no trailing tokens. When a full-attention group config has `ttl_seconds != 0`, a fixed TTL is layered on top of LiteHit with wall-clock time (metrics consistent with `TtlCacheIndexerWrapper`); the statistics metrics and TTL behavior of linear attention keep the legacy path unchanged.
 
 ---
 
-## 核心模块
+## Core Modules
 
-### 1. OptimizerManager（优化器管理器）
+### 1. OptimizerManager
 
-**职责**：核心协调器，初始化所有子组件，管理实例组和实例配置，提供公共 API 接口。
+**Responsibility**: Core coordinator; initializes all subcomponents, manages instance group and instance configuration, and provides the public API interface.
 
-**主要接口**：
+**Main interfaces**:
 ```cpp
 class OptimizerManager {
 public:
@@ -170,18 +180,18 @@ public:
 };
 ```
 
-### 2. OptimizerRunner（优化器运行器）
+### 2. OptimizerRunner
 
-**职责**：执行 Trace 回放和模拟，处理两种 Trace 类型（GetLocationSchemaTrace、WriteCacheSchemaTrace），支持读写分离模式。
+**Responsibility**: Executes trace replay and simulation, handles two trace types (GetLocationSchemaTrace, WriteCacheSchemaTrace), and supports read/write separation mode.
 
-### 3. OptEvictionManager（驱逐管理器）
+### 3. OptEvictionManager
 
-**职责**：管理跨实例的驱逐策略，支持三种驱逐模式：
-- `EVICTION_MODE_GROUP_ROUGH` - 组级别粗粒度驱逐
-- `EVICTION_MODE_INSTANCE_ROUGH` - 实例级别粗粒度驱逐
-- `EVICTION_MODE_INSTANCE_PRECISE` - 实例级别精确驱逐
+**Responsibility**: Manages cross-instance eviction policies, supporting three eviction modes:
+- `EVICTION_MODE_GROUP_ROUGH` - group-level coarse-grained eviction
+- `EVICTION_MODE_INSTANCE_ROUGH` - instance-level coarse-grained eviction
+- `EVICTION_MODE_INSTANCE_PRECISE` - instance-level precise eviction
 
-**主要接口**：
+**Main interfaces**:
 ```cpp
 class OptEvictionManager {
 public:
@@ -193,11 +203,11 @@ public:
 };
 ```
 
-### 4. OptIndexerManager（索引管理器）
+### 4. OptIndexerManager
 
-**职责**：管理 RadixTreeIndex 实例，为每个实例创建索引器，支持多层存储配置。
+**Responsibility**: Manages RadixTreeIndex instances, creates an indexer for each instance, and supports multi-tier storage configuration.
 
-**主要接口**：
+**Main interfaces**:
 ```cpp
 class OptIndexerManager {
 public:
@@ -210,42 +220,42 @@ public:
 };
 ```
 
-### 5. OptimizerLoader（Trace 加载器）
+### 5. OptimizerLoader
 
-**职责**：加载和转换 trace 文件，按时间戳排序 trace，导出转换后的 trace 到文件。
+**Responsibility**: Loads and converts trace files, sorts traces by timestamp, and exports converted traces to files.
 
 ---
 
-## 配置系统
+## Configuration System
 
-### 配置层次结构
+### Configuration Hierarchy
 
 ```
-OptimizerConfig (顶层配置)
-    ├── trace_file_path (Trace 文件路径)
-    ├── output_result_path (输出路径)
-    ├── eviction_params (驱逐参数)
-    │   ├── eviction_mode (驱逐模式)
-    │   └── eviction_batch_size_per_instance (驱逐批量大小)
-    └── instance_groups[] (实例组数组)
-        ├── group_name (组名)
-        ├── quota_capacity (配额容量)
-        ├── used_percentage (使用百分比)
-        ├── tier_strategy (多层读写策略)
-        │   ├── hierarchical_eviction_enabled (分层驱逐)
-        │   ├── write_mode (多层写入模式)
-        │   ├── access_propagation_enabled (读访问传播)
-        │   ├── promote_enabled (低层命中回填高层)
-        │   └── selective_write_threshold (选择性下写阈值)
-        ├── storages[] (存储层数组)
-        └── instances[] (实例数组)
-            ├── instance_id (实例ID)
-            ├── block_size (块大小)
-            ├── eviction_policy_type (驱逐策略类型)
-            └── eviction_policy_params (驱逐策略参数)
+OptimizerConfig (top-level config)
+    ├── trace_file_path (trace file path)
+    ├── output_result_path (output path)
+    ├── eviction_params (eviction parameters)
+    │   ├── eviction_mode (eviction mode)
+    │   └── eviction_batch_size_per_instance (eviction batch size)
+    └── instance_groups[] (instance group array)
+        ├── group_name (group name)
+        ├── quota_capacity (quota capacity)
+        ├── used_percentage (used percentage)
+        ├── tier_strategy (multi-tier read/write policy)
+        │   ├── hierarchical_eviction_enabled (hierarchical eviction)
+        │   ├── write_mode (multi-tier write mode)
+        │   ├── access_propagation_enabled (read access propagation)
+        │   ├── promote_enabled (lower-tier hit backfill to higher tier)
+        │   └── selective_write_threshold (selective down-write threshold)
+        ├── storages[] (storage tier array)
+        └── instances[] (instance array)
+            ├── instance_id (instance ID)
+            ├── block_size (block size)
+            ├── eviction_policy_type (eviction policy type)
+            └── eviction_policy_params (eviction policy parameters)
 ```
 
-### 配置文件示例
+### Configuration File Example
 
 ```json
 {
@@ -292,27 +302,27 @@ OptimizerConfig (顶层配置)
 }
 ```
 
-### 配置参数说明
+### Configuration Parameter Description
 
-| 参数 | 说明 |
+| Parameter | Description |
 |------|------|
-| trace_file_path | Trace 文件路径 |
-| output_result_path | 结果输出目录；所有 config 驱动入口都使用该目录，`export_tree` 输出到其下的 `radix_tree/` |
-| eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
-| eviction_batch_size_per_instance | 粗粒度驱逐时的批量大小 |
-| group_name | 实例组唯一标识 |
-| quota_capacity | 组的总容量（GB）；`-1` 表示无限容量，不触发容量驱逐 |
-| used_percentage | 实际使用的配额百分比 |
-| instance_id | 实例唯一标识 |
-| block_size | 每个 block 包含的 token 数量 |
-| bytes_per_token | 单 token KV 大小；Python 分析脚本用它和 `block_size` 将 block 容量换算为 GB |
-| eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru |
+| trace_file_path | trace file path |
+| output_result_path | result output directory; all config-driven entry points use this directory, and `export_tree` outputs to `radix_tree/` under it |
+| eviction_mode | eviction mode: 1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
+| eviction_batch_size_per_instance | batch size for coarse-grained eviction |
+| group_name | unique identifier of the instance group |
+| quota_capacity | total capacity of the group (GB); `-1` means infinite capacity, no capacity eviction triggered |
+| used_percentage | percentage of quota actually used |
+| instance_id | unique identifier of the instance |
+| block_size | number of tokens contained in each block |
+| bytes_per_token | KV size per token; Python analysis scripts use it together with `block_size` to convert block capacity to GB |
+| eviction_policy_type | eviction policy type: lru, random_lru, leaf_aware_lru |
 
 ---
 
-## 驱逐策略
+## Eviction Policies
 
-### 驱逐策略接口
+### Eviction Policy Interface
 
 ```cpp
 class EvictionPolicy {
@@ -328,77 +338,77 @@ public:
 };
 ```
 
-### LRU 策略
+### LRU Policy
 
-**原理**：维护双向链表记录块的访问顺序，最近访问的块在链表头部，最久未访问的块在链表尾部，驱逐时从链表尾部移除块。
+**Principle**: Maintains a doubly linked list recording the access order of blocks; the most recently accessed block is at the head of the list, and the least recently accessed block is at the tail. During eviction, blocks are removed from the tail of the list.
 
-**时间复杂度**：
+**Time complexity**:
 - `OnBlockAccessed()`: O(1)
 - `OnBlockWritten()`: O(1)
 - `EvictBlocks()`: O(n)
 
-### RandomLRU 策略
+### RandomLRU Policy
 
-**原理**：结合随机采样和 LRU 策略，从缓存中随机采样一定比例的块，选择最久未访问的块进行驱逐。
+**Principle**: Combines random sampling with the LRU policy; randomly samples a certain proportion of blocks from the cache and selects the least recently accessed block for eviction.
 
-**时间复杂度**：
+**Time complexity**:
 - `OnBlockAccessed()`: O(1)
 - `OnBlockWritten()`: O(1)
-- `EvictBlocks()`: O(m log m)，其中 m 为采样数量
+- `EvictBlocks()`: O(m log m), where m is the number of samples
 
-### LeafAwareLRU 策略
+### LeafAwareLRU Policy
 
-**原理**：在 LRU 基础上增加了对叶子节点的感知，优先驱逐叶子节点中的块，提高缓存效率。
+**Principle**: Adds leaf-node awareness on top of LRU, preferentially evicting blocks within leaf nodes to improve cache efficiency.
 
-**实现特点**：
-- 维护一个独立的叶子节点 LRU 链表
-- 跟踪叶子节点中的所有 block
-- 驱逐时优先从叶子节点链表中选择最久未访问的块
+**Implementation characteristics**:
+- Maintains an independent LRU linked list of leaf nodes
+- Tracks all blocks within leaf nodes
+- During eviction, preferentially selects the least recently accessed block from the leaf-node list
 
-### TTL 语义分阶段说明（V1 / V2）
+### TTL Semantics Phased Description (V1 / V2)
 
-当前实现采用 **V1 语义**（已落地）：
+The current implementation adopts **V1 semantics** (already implemented):
 
-- 仅 `POLICY_TTL` 实例会执行“读写前 TTL 过期物理清理”
-- 非 TTL 策略（`lru` / `random_lru` / `leaf_aware_lru`）下，TTL 视为不存在
-  - 不做前置 TTL 物理清理
-  - 也不做 TTL 逻辑过期判定
-- `POLICY_TTL` 下保证先清理过期块，再进入读写流程
-- `default_block_ttl_seconds = 0` 表示组级禁用 TTL：
-  - 写入路径会将 TTL 解析为“不过期”
-  - 若 `fallback_on_pressure = false`，则不会发生 TTL 过期驱逐，也不会触发容量兜底驱逐
-  - 若 `fallback_on_pressure = true`，则仅在容量压力时走链表尾部兜底驱逐（行为等价于 LRU）
-- `POLICY_TTL` 的过期清理实现已从“每次读写前全链表扫描”优化为“最小过期时间堆（min-heap）增量回收”：
-  - 写入/访问时写入过期事件
-  - 清理时仅弹出到期事件，不再全量扫描
-  - 使用版本号做惰性失效，避免过期事件重复处理
-  - 在不改变 TTL 语义的前提下显著降低回放时延
+- Only `POLICY_TTL` instances perform "physical cleanup of TTL-expired entries before reads/writes"
+- Under non-TTL policies (`lru` / `random_lru` / `leaf_aware_lru`), TTL is treated as nonexistent
+  - No pre-TTL physical cleanup is performed
+  - No TTL logical expiration judgment is performed either
+- Under `POLICY_TTL`, it is guaranteed that expired blocks are cleaned up first before entering the read/write flow
+- `default_block_ttl_seconds = 0` means TTL is disabled at the group level:
+  - The write path parses TTL as "never expires"
+  - If `fallback_on_pressure = false`, no TTL expiration eviction occurs, and no capacity fallback eviction is triggered
+  - If `fallback_on_pressure = true`, only under capacity pressure does it fall back to list-tail eviction (behavior equivalent to LRU)
+- The expiration cleanup implementation of `POLICY_TTL` has been optimized from "full list scan before every read/write" to "min-heap of minimum expiration times with incremental reclamation":
+  - Expiration events are written on write/access
+  - During cleanup, only due events are popped, no full scan
+  - Version numbers are used for lazy invalidation, avoiding repeated processing of expiration events
+  - Significantly reduces replay latency without changing TTL semantics
 
-后续 **V2 设计**（仅文档方案，暂不实现）：
+The subsequent **V2 design** (documentation plan only, not implemented for now):
 
-- 统一语义：所有策略都支持前置过期清理
-- 对过期扫描做精细化性能优化（例如 next_expire_ts / min-heap 等）
-- 在不改变容量驱逐策略语义的前提下，实现跨策略一致的 TTL 生命周期
+- Unified semantics: all policies support pre-expiration cleanup
+- Fine-grained performance optimization for expiration scanning (e.g. next_expire_ts / min-heap, etc.)
+- Achieve cross-policy consistent TTL lifecycle without changing the semantics of capacity eviction policies
 
 ---
 
-## 索引系统
+## Index System
 
-### RadixTreeIndex 概述
+### RadixTreeIndex Overview
 
-**职责**：基于前缀树（Radix Tree）的数据结构，支持高效的前缀匹配查询，管理缓存的插入、查询和驱逐。
+**Responsibility**: A data structure based on the prefix tree (Radix Tree), supporting efficient prefix matching queries, and managing cache insertion, query, and eviction.
 
-**核心操作**：
-1. `InsertOnly()` - 仅插入块，不查询
-2. `PrefixQuery()` - 前缀匹配查询
-3. `ExportForVisualization()` - 导出前缀树用于可视化
+**Core operations**:
+1. `InsertOnly()` - insert blocks only, no query
+2. `PrefixQuery()` - prefix matching query
+3. `ExportForVisualization()` - export the prefix tree for visualization
 
-### Radix Tree 数据结构
+### Radix Tree Data Structure
 
 ```cpp
 struct RadixTreeNode {
-    std::vector<std::unique_ptr<BlockEntry>> blocks;  // 连续的块段
-    NodeStat stat;  // 节点统计信息
+    std::vector<std::unique_ptr<BlockEntry>> blocks;  // contiguous block segment
+    NodeStat stat;  // node statistics
     RadixTreeNode *parent = nullptr;
     std::unordered_map<int64_t, std::unique_ptr<RadixTreeNode>> children;
     bool isLeaf() const { return children.empty(); }
@@ -407,7 +417,7 @@ struct RadixTreeNode {
 struct NodeStat {
     size_t access_count = 0;
     int64_t last_access_time = 0;
-    int64_t ttl = 250000;  // 默认TTL为250000微秒
+    int64_t ttl = 250000;  // default TTL is 250000 microseconds
 };
 
 struct BlockEntry {
@@ -420,53 +430,53 @@ struct BlockEntry {
 };
 ```
 
-### Radix Tree 可视化
+### Radix Tree Visualization
 
-支持导出 Radix Tree 结构用于可视化分析，可以展示：
-- 节点访问次数
-- 最后访问时间
-- 节点中的块数量
-- 缓存的块数量
-- 节点层级关系
-
----
-
-## Trace 处理
-
-### Trace 类型定义
-
-**继承关系**：
-```
-OptimizerSchemaTrace (基类)
-    ├── GetLocationSchemaTrace (读操作)
-    ├── RequestSchemaTrace (请求级操作，内部调度读和延迟写)
-    └── WriteCacheSchemaTrace (写操作)
-```
-
-### Trace 转换器
-
-**支持的格式**：
-- **Publisher Log**：转换 KVCacheManager Event Publisher 日志，区分读和写请求
-- **Qwen Bailian**：转换 Qwen Bailian 数据集格式，输出读写分离 trace
-
-**转换流程**：
-1. 根据配置文件选择转换器
-2. 解析日志文件并转换为标准 Trace；标准 `get` 必须带 `input_len`
-3. 按时间戳排序 Trace
-4. 分配唯一 Trace ID
-
-标准 trace 接受显式 `type=get/write/request` 的 JSONL。`request` 用于外部只有请求级记录的场景，optimizer 会按 `trace_replay.write_delay_ns` 在内部调度 delayed write。`get/request.keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍通过 `input_len` 计入 token 命中率分母。缺少 `input_len`、时间戳非法、`keys` 超过 `input_len / block_size` 等输入会在回放前失败。
+Supports exporting the Radix Tree structure for visual analysis, which can display:
+- Node access count
+- Last access time
+- Number of blocks in the node
+- Number of cached blocks
+- Node hierarchy relationships
 
 ---
 
-## 结果分析
+## Trace Processing
 
-### 结果结构
+### Trace Type Definitions
+
+**Inheritance relationships**:
+```
+OptimizerSchemaTrace (base class)
+    ├── GetLocationSchemaTrace (read operation)
+    ├── RequestSchemaTrace (request-level operation, internally schedules read and delayed write)
+    └── WriteCacheSchemaTrace (write operation)
+```
+
+### Trace Converters
+
+**Supported formats**:
+- **Publisher Log**: converts KVCacheManager Event Publisher logs, distinguishing read and write requests
+- **Qwen Bailian**: converts the Qwen Bailian dataset format, outputting read/write separated traces
+
+**Conversion flow**:
+1. Select the converter based on the configuration file
+2. Parse the log file and convert to standard Trace; a standard `get` must carry `input_len`
+3. Sort traces by timestamp
+4. Assign unique Trace IDs
+
+Standard traces accept JSONL with explicit `type=get/write/request`. `request` is used for scenarios where externally only request-level records exist; the optimizer schedules delayed writes internally according to `trace_replay.write_delay_ns`. `get/request.keys` can only contain complete block keys; trailing tokens that do not fill a block are not written into `keys`, but are still counted into the token hit-rate denominator via `input_len`. Inputs missing `input_len`, with illegal timestamps, or with `keys` exceeding `input_len / block_size` will fail before replay.
+
+---
+
+## Result Analysis
+
+### Result Structure
 
 ```cpp
 struct ReadRecord {
     int64_t timestamp_ns;
-    // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中
+    // local = existing local hits brought in by trace block_mask; remote = hits from the optimizer simulation layer
     size_t remote_read_blocks;
     size_t remote_hit_blocks;
     size_t local_read_blocks;
@@ -482,92 +492,92 @@ struct ReadRecord {
 };
 ```
 
-### CSV 输出格式
+### CSV Output Format
 
-**文件名**：`{instance_id}_hit_rates.csv`
+**File name**: `{instance_id}_hit_rates.csv`
 
-**主要列**：
-- `TimestampNs` - 时间戳（纳秒）
-- `CachedBlocks` - 当前 CSV 对应 instance 的缓存 block 数
-- `CachedBlocksAllInstances` - 同一 optimizer 进程内所有 instance 的总缓存 block 数
-- `ReadBlocks` / `HitBlocks` - 当前请求读取和命中的 block 数
-- `LocalHitBlocks` / `RemoteHitBlocks` - 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中
-- `InputTokens` / `HitTokens` - 当前请求的输入 token 数和命中 token 数
-- `HitRate` - 当前 token 命中率，`HitTokens / InputTokens`
-- `LocalHitTokens` / `RemoteHitTokens` - 诊断字段：本地 / optimizer 模拟层命中 token 数
-- `AccReadBlocks` / `AccHitBlocks` - 累计读取和命中的 block 数
-- `AccHitRate` - 累积 token 命中率，`AccHitTokens / AccInputTokens`
-- `AccLocalHitRate` / `AccRemoteHitRate` - 诊断字段，不作为标准分析主口径
-- `Tier<N>(name)_HitTokens` / `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` - 分层命中 token 指标
+**Main columns**:
+- `TimestampNs` - timestamp (nanoseconds)
+- `CachedBlocks` - number of cached blocks for the instance corresponding to the current CSV
+- `CachedBlocksAllInstances` - total number of cached blocks across all instances within the same optimizer process
+- `ReadBlocks` / `HitBlocks` - number of blocks read and hit by the current request
+- `LocalHitBlocks` / `RemoteHitBlocks` - diagnostic fields: existing local hits brought in by trace `block_mask` / hits from the optimizer simulation layer
+- `InputTokens` / `HitTokens` - input token count and hit token count of the current request
+- `HitRate` - current token hit rate, `HitTokens / InputTokens`
+- `LocalHitTokens` / `RemoteHitTokens` - diagnostic fields: local / optimizer simulation layer hit token count
+- `AccReadBlocks` / `AccHitBlocks` - cumulative read and hit block count
+- `AccHitRate` - cumulative token hit rate, `AccHitTokens / AccInputTokens`
+- `AccLocalHitRate` / `AccRemoteHitRate` - diagnostic fields, not used as the main metric of standard analysis
+- `Tier<N>(name)_HitTokens` / `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` - tiered hit token metrics
 
-标准分析直接按请求输入计算整体 `HitRate`，不把 local/remote 作为独立结论维度。local/remote 只用于兼容 optimizer 作为单独 L3 模拟并和 HiSim 结合、或直接分析 KVCacheManager event log 时已有的本地命中信息。
+Standard analysis directly computes the overall `HitRate` from request input, and does not treat local/remote as independent conclusion dimensions. local/remote are only used for compatibility when the optimizer acts as a standalone L3 simulation combined with HiSim, or when directly analyzing KVCacheManager event logs with existing local hit information.
 
 ---
 
-## 可视化分析
+## Visual Analysis
 
-### 1. 命中率随时间变化图表
+### 1. Hit Rate Over Time Chart
 
-**脚本**：`optimizer_run.py --draw-chart`，绘图实现位于 `plot/hit_rate_plot.py`
+**Script**: `optimizer_run.py --draw-chart`; the plotting implementation is in `plot/hit_rate_plot.py`
 
-**功能**：绘制多实例缓存分析图表，展示所有 instance 的存储容量总和以及各自命中率随时间的变化。
+**Function**: Draws multi-instance cache analysis charts, showing the sum of storage capacity across all instances and their respective hit rates over time.
 
-**运行方式**：
+**How to run**:
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     -c /path/to/config.json \
     --draw-chart
 ```
 
-**输出**：
+**Output**:
 - `{output_result_path}/timeseries/multi_instance_cache_analysis.png`
-- 分层配置额外输出 `{output_result_path}/timeseries/per_tier_timeseries.png`
+- Tiered configurations additionally output `{output_result_path}/timeseries/per_tier_timeseries.png`
 
-**图表内容**：
-- 上图：累计命中率随时间变化
-- 下图：当前 trace 命中率随时间变化
+**Chart content**:
+- Top chart: cumulative hit rate over time
+- Bottom chart: current trace hit rate over time
 
-### 2. Radix Tree 可视化
+### 2. Radix Tree Visualization
 
-**脚本**：`export_tree.py`，绘图实现位于 `plot/radix_tree_plot.py`
+**Script**: `export_tree.py`; the plotting implementation is in `plot/radix_tree_plot.py`
 
-**功能**：导出并可视化前缀树结构，统计并展示热节点以及所属节点的前缀路径。
+**Function**: Exports and visualizes the prefix tree structure, counting and displaying hot nodes and the prefix paths of their associated nodes.
 
-**运行方式**：
+**How to run**:
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
     -c /path/to/config.json
 ```
 
-**输出**：
-- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree 导出数据
-- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree 可视化图表
-- `{output_result_path}/radix_tree/{instance_id}_hot_paths.png` - 热点路径图（传 `--show-hot-paths` 时）
+**Output**:
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree export data
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree visualization chart
+- `{output_result_path}/radix_tree/{instance_id}_hot_paths.png` - hot path chart (when `--show-hot-paths` is passed)
 
-**可视化内容**：
-- 节点访问次数
-- 最后访问时间
-- 节点中的块数量
-- 缓存的块数量
-- 节点层级关系
+**Visualization content**:
+- Node access count
+- Last access time
+- Number of blocks in the node
+- Number of cached blocks
+- Node hierarchy relationships
 
-### 3. Pareto 容量-命中率曲线分析
+### 3. Pareto Capacity-Hit-Rate Curve Analysis
 
-**脚本**：`tradeoff.py`
+**Script**: `tradeoff.py`
 
-**功能**：在不同容量配置下回放 optimizer，绘制容量与 token 命中率的 Pareto 曲线。不给 `--eviction-policies` 时使用配置文件中的策略；给出多个策略时生成多策略对比图。
+**Function**: Replays the optimizer under different capacity configurations and draws the Pareto curve of capacity versus token hit rate. When `--eviction-policies` is not given, the policy in the config file is used; when multiple policies are given, a multi-policy comparison chart is generated.
 
-> **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
+> **Scope of applicability**: Trade-off analysis only applies to non-tiered mode. In tiered mode (`tier_strategy.hierarchical_eviction_enabled=true`), the capacity scan only modifies `quota_capacity` and does not affect each tier's independent `storages[i].capacity`, so it cannot produce meaningful capacity-performance tradeoff results.
 
-**运行流程**：
+**Execution flow**:
 
-1. 用无限容量 warmup 跑完整 trace。实现上会将 `quota_capacity` 写为 `-1`，C++ optimizer 将负容量视作无限容量。
-2. 从 warmup 读取理论命中率和最大缓存 block 数。
-3. 基于最大缓存 block 数按指数分布生成最多 `--num-points` 个容量点，并用 `--min-capacity-ratio` 过滤过小点。
-4. 对每个容量点运行 optimizer；达到 99% 理论命中率后停止继续扫更大容量。
-5. 画图时补 `(0 GB, 0%)` 起点，只保留命中率上升段。下降点会从图上剔除，并在 stdout 打印 `Drop descending Pareto point ...`；原始 CSV 保留。
+1. Run the full trace with infinite-capacity warmup. In implementation, `quota_capacity` is written as `-1`, and the C++ optimizer treats negative capacity as infinite capacity.
+2. Read the theoretical hit rate and maximum cache block count from the warmup.
+3. Generate up to `--num-points` capacity points based on the maximum cache block count with an exponential distribution, and filter out overly small points with `--min-capacity-ratio`.
+4. Run the optimizer for each capacity point; stop scanning larger capacities after reaching 99% of the theoretical hit rate.
+5. When plotting, add the `(0 GB, 0%)` starting point and only keep the rising segment of hit rate. Descending points are removed from the chart, and `Drop descending Pareto point ...` is printed to stdout; the original CSV is retained.
 
-**运行方式**：
+**How to run**:
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
@@ -577,25 +587,25 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --max-workers 4
 ```
 
-**参数说明**：
-- `-c, --config` - 配置文件路径
-- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中后提前停止
-- `--min-capacity-ratio` - 最小容量点相对阈值（默认 `1e-4`）
-- `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
-- `--max-workers` - 并行执行的最大线程数（默认 4）
-- `--plot-title` - 覆盖图标题
+**Parameter description**:
+- `-c, --config` - configuration file path
+- `--num-points` - maximum number of capacity sampling points to run per policy (default 30); stops early after reaching 99% of the theoretical hit rate
+- `--min-capacity-ratio` - minimum capacity point relative threshold (default `1e-4`)
+- `--hit-rate-type` - hit-rate type; standard analysis uses total; local/remote/all are only diagnostic splits (default total)
+- `--max-workers` - maximum number of parallel execution threads (default 4)
+- `--plot-title` - override the chart title
 
-**输出**：`{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
+**Output**: `{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
 
-### 4. 多策略对比分析
+### 4. Multi-Policy Comparison Analysis
 
-**脚本**：`tradeoff.py --eviction-policies ...`
+**Script**: `tradeoff.py --eviction-policies ...`
 
-**功能**：对比多个驱逐策略在不同容量配置下的表现。所有 instance 使用同一个给定策略进行一轮回放；每个策略独立 warmup、独立计算理论命中率，并独立提前停止。
+**Function**: Compares the performance of multiple eviction policies under different capacity configurations. All instances use the same given policy for one round of replay; each policy warms up independently, computes its theoretical hit rate independently, and stops early independently.
 
-> **适用范围**：同单策略 Trade-off 分析，仅适用于非分层模式。
+> **Scope of applicability**: Same as single-policy Trade-off analysis, only applies to non-tiered mode.
 
-**运行方式**：
+**How to run**:
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
@@ -605,158 +615,185 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     --max-workers 4
 ```
 
-**参数说明**：
-- `-c, --config` - 配置文件路径
-- `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
-- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中后提前停止
-- `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
-- `--max-workers` - 并行执行的最大线程数（默认 4）
+**Parameter description**:
+- `-c, --config` - configuration file path
+- `--eviction-policies` - list of eviction policies to compare (default lru random_lru leaf_aware_lru)
+- `--num-points` - maximum number of capacity sampling points to run per policy (default 30); stops early after reaching 99% of the theoretical hit rate
+- `--hit-rate-type` - hit-rate type; standard analysis uses total; local/remote/all are only diagnostic splits (default total)
+- `--max-workers` - maximum number of parallel execution threads (default 4)
 
-**输出**：`{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
+**Output**: `{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
 
-图形规则：X 轴是 `Capacity (GB)`，Y 轴是 `HitRate (%)`；95%/99% 理论命中率会按相邻 sweep 点线性插值后标出容量和命中率。`--skip-run` 只从已有 `csv_results` 画图，不重新 warmup，因此不会生成理论 95%/99% 标注。
+Chart rules: the X axis is `Capacity (GB)`, the Y axis is `HitRate (%)`; the 95%/99% theoretical hit rates are marked with capacity and hit rate after linear interpolation between adjacent sweep points. `--skip-run` only plots from existing `csv_results` without re-warming up, so the theoretical 95%/99% annotations are not generated.
 
 ---
 
-## 使用说明
+## Usage Instructions
 
-### 编译
+### Build
 
 ```bash
 bazel build //kv_cache_manager/optimizer:optimizer_main
 ```
 
-### 运行优化器
+### Run the Optimizer
 
-**方式：直接运行二进制文件**
+**Method: run the binary directly**
 
 ```bash
 bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 ```
 
-### Python 接口
+### Offline LiteHit Multi-Capacity Analysis
+
+A standalone entry point `lite_hit_main`, parallel to and non-interfering with the replay above. It replays the read requests of a standard trace into the LiteHit core in arrival order, producing **capacity-independent** per-request facts CSV (`litehit_facts.csv`, written to `.tmp` first then atomically renamed); the hit rate is not computed during replay, but is obtained by a second CLI `lite_hit_facts_query_main` projecting onto the facts with an arbitrary capacity list (JSONL per-request results + per-instance / overall summary). The same facts can be repeatedly queried with different capacities without replaying the trace.
+
+The trace reuses the shared `StandardTraceLoader`: the same standard-format trace can be fed to both liteHit offline analysis and directly to replay. Replay is fixed to streaming (`StreamFromFile`, memory O(1)), requiring the trace to be ordered by `timestamp_ns`. **Write events are recognized and ignored**: when a read request is submitted, all blocks are treated as written back (write-back itself is a touch), so split `write` traces have no side effect on liteHit — they are only meaningful for the replay path.
+
+```bash
+bazel build //kv_cache_manager/optimizer:lite_hit_main //kv_cache_manager/optimizer:lite_hit_facts_query_main
+bazel run //kv_cache_manager/optimizer:lite_hit_main -- /path/to/lite_hit_config.json
+bazel run //kv_cache_manager/optimizer:lite_hit_facts_query_main -- <facts_csv> <capacity_gb_list> <output_jsonl>
+```
+
+The config `OptimizerLiteHitConfig` reuses the online `OptimizerInstanceGroup` / `OptimizerInstanceInfo` objects (full-attention instances require `linear_step=0`):
+
+| Field | Meaning |
+|------|------|
+| trace_file_path | standard-format trace file path (shares the same trace as replay) |
+| output_result_path | facts CSV output directory |
+| instance_groups | list of online `OptimizerInstanceGroup` (including eviction_policy / enable_prefix_hash, etc.) |
+| instances | list of online `OptimizerInstanceInfo` (including block_size / linear_step / location spec, etc.) |
+| block_size | token granularity of the trace (default 256); instance block_size must be an integer multiple of it (re-blocking only coarsens) |
+| override_instance_id | route all requests to the specified instance (must be in instances) |
+| fanout_all_instances | broadcast each request to all configured instances (mutually exclusive with override), used to compare multiple block_size in one replay |
+| pipeline_worker_count | replay pipeline parallelism (default 1) |
+
+Algorithm details, facts field definitions, projection metrics, and the verification checklist are in [liteHit/README.md](../liteHit/README.md).
+
+### Python Interface
 
 ```python
 from kv_cache_manager.optimizer import OptimizerConfigLoader, OptimizerLoader, OptimizerManager
 
-# 加载配置
+# Load configuration
 config_loader = OptimizerConfigLoader()
 config = config_loader.Load("/path/to/config.json")
 
-# 创建优化器
+# Create the optimizer
 optimizer = OptimizerManager(config)
 optimizer.Init()
 
-# 运行
+# Run
 optimizer.DirectRun()
 
-# 分析结果
+# Analyze results
 optimizer.AnalyzeResults()
 ```
 
-### 输出文件
+### Output Files
 
-运行完成后，会在 `output_result_path` 指定的目录下生成：
-- `{instance_id}_hit_rates.csv` - 每个 instance 的命中率数据
-
----
-
-## 扩展指南
-
-### 添加新的驱逐策略
-
-1. 在 `kv_cache_manager/optimizer/eviction_policy/` 创建新策略文件，继承 `EvictionPolicy` 基类
-2. 在 `kv_cache_manager/optimizer/config/types.h` 添加新的策略类型枚举值
-3. 在 `kv_cache_manager/optimizer/config/eviction_config.h` 添加新的参数类型
-4. 在 `kv_cache_manager/optimizer/eviction_policy/policy_factory.cc` 添加新的策略创建逻辑
-5. 在 BUILD 文件中添加新的源文件
-
-### 添加新的 Trace 转换器
-
-1. 在 `kv_cache_manager/optimizer/trace_converter/` 创建新转换器文件，继承 `BaseConverter` 基类
-2. 在 `kv_cache_manager/optimizer/config/types.h` 添加新的 trace 类型枚举值
-3. 在 `kv_cache_manager/optimizer/trace_converter/converter_factory.cc` 添加新的转换器创建逻辑
-4. 在 BUILD 文件中添加新的源文件
-
-### 添加新的分析指标
-
-1. 在 `kv_cache_manager/optimizer/analysis/result_structure.h` 添加新的统计字段
-2. 在 `kv_cache_manager/optimizer/analysis/result_analysis.cc` 添加新的分析逻辑
-3. 实现新的导出函数来输出自定义指标
+After running, the following is generated in the directory specified by `output_result_path`:
+- `{instance_id}_hit_rates.csv` - hit-rate data for each instance
 
 ---
 
-## 附录
+## Extension Guide
 
-### 文件索引
+### Adding a New Eviction Policy
 
-**核心管理器**：
-- optimizer_manager.h/cc - 主协调器
-- optimizer_runner.h/cc - Trace 执行器
-- eviction_manager.h/cc - 驱逐管理器
-- indexer_manager.h/cc - 索引管理器
-- optimizer_loader.h/cc - Trace 加载器
+1. Create a new policy file in `kv_cache_manager/optimizer/eviction_policy/`, inheriting the `EvictionPolicy` base class
+2. Add a new policy type enum value in `kv_cache_manager/optimizer/config/types.h`
+3. Add a new parameter type in `kv_cache_manager/optimizer/config/eviction_config.h`
+4. Add new policy creation logic in `kv_cache_manager/optimizer/eviction_policy/policy_factory.cc`
+5. Add the new source file in the BUILD file
 
-**索引层**：
-- radix_tree_index.h/cc - Radix 树索引
+### Adding a New Trace Converter
 
-**驱逐策略**：
-- base.h - 策略基类
-- common_structure.h - 通用数据结构
-- lru.h/cc - LRU 策略
-- random_lru.h/cc - RandomLRU 策略
-- leaf_aware_lru.h/cc - LeafAwareLRU 策略
-- policy_factory.h/cc - 策略工厂
+1. Create a new converter file in `kv_cache_manager/optimizer/trace_converter/`, inheriting the `BaseConverter` base class
+2. Add a new trace type enum value in `kv_cache_manager/optimizer/config/types.h`
+3. Add new converter creation logic in `kv_cache_manager/optimizer/trace_converter/converter_factory.cc`
+4. Add the new source file in the BUILD file
 
-**Trace 转换**：
-- optimizer_schema_trace.h - Trace 定义
-- base_converter.h - 转换器基类
-- publisher_log_converter.h/cc - Publisher Log 转换器
-- qwen_bailian_converter.h/cc - Qwen Bailian 转换器
-- converter_factory.h/cc - 转换工厂
-- trace_util.h - Trace 工具
+### Adding a New Analysis Metric
 
-**配置**：
-- optimizer_config.h/cc - 顶层配置
-- replay_instance_group_config.h/cc - trace replay/tier 模拟实例组配置
-- replay_instance_config.h/cc - trace replay 实例配置
-- tier_config.h/cc - 存储层配置
-- eviction_config.h - 驱逐策略参数
-- types.h - 类型定义
-- optimizer_config_loader.h/cc - 配置加载器
+1. Add a new statistics field in `kv_cache_manager/optimizer/analysis/result_structure.h`
+2. Add new analysis logic in `kv_cache_manager/optimizer/analysis/result_analysis.cc`
+3. Implement a new export function to output custom metrics
 
-**分析**：
-- result_structure.h - 结果结构定义
-- result_analysis.h/cc - 命中率分析
-- script/run/optimizer_run.py - 单次回放 + 可选时序图
-- script/run/tradeoff.py - Pareto 曲线，单策略/多策略统一入口
-- script/run/export_tree.py - Radix Tree 导出 + 可视化
-- script/run/analyze_lifecycle.py - Block lifecycle 分析
-- script/run/multi_instance_replay.py - 多实例并行回放 + 聚合
-- script/plot/hit_rate_plot.py - 命中率时序图
-- script/plot/radix_tree_plot.py - Radix Tree 绘图
-- script/utils/optimizer_runner.py - optimizer 运行封装
+---
 
-**Python 绑定**：
-- pybind/py_optimizer_binding.cc - Python 接口
+## Appendix
 
-### 术语表
+### File Index
 
-| 术语 | 说明 |
+**Core managers**:
+- optimizer_manager.h/cc - main coordinator
+- optimizer_runner.h/cc - trace executor
+- eviction_manager.h/cc - eviction manager
+- indexer_manager.h/cc - indexer manager
+- optimizer_loader.h/cc - trace loader
+
+**Index layer**:
+- radix_tree_index.h/cc - Radix tree index
+
+**Eviction policies**:
+- base.h - policy base class
+- common_structure.h - common data structures
+- lru.h/cc - LRU policy
+- random_lru.h/cc - RandomLRU policy
+- leaf_aware_lru.h/cc - LeafAwareLRU policy
+- policy_factory.h/cc - policy factory
+
+**Trace conversion**:
+- optimizer_schema_trace.h - trace definitions
+- base_converter.h - converter base class
+- publisher_log_converter.h/cc - Publisher Log converter
+- qwen_bailian_converter.h/cc - Qwen Bailian converter
+- converter_factory.h/cc - converter factory
+- trace_util.h - trace utilities
+
+**Configuration**:
+- optimizer_config.h/cc - top-level config
+- replay_instance_group_config.h/cc - trace replay/tier simulation instance group config
+- replay_instance_config.h/cc - trace replay instance config
+- tier_config.h/cc - storage tier config
+- eviction_config.h - eviction policy parameters
+- types.h - type definitions
+- optimizer_config_loader.h/cc - config loader
+
+**Analysis**:
+- result_structure.h - result structure definitions
+- result_analysis.h/cc - hit-rate analysis
+- script/run/optimizer_run.py - single replay + optional time-series chart
+- script/run/tradeoff.py - Pareto curve, unified entry for single/multi-policy
+- script/run/export_tree.py - Radix Tree export + visualization
+- script/run/analyze_lifecycle.py - block lifecycle analysis
+- script/run/multi_instance_replay.py - multi-instance parallel replay + aggregation
+- script/plot/hit_rate_plot.py - hit-rate time-series chart
+- script/plot/radix_tree_plot.py - Radix Tree plotting
+- script/utils/optimizer_runner.py - optimizer run wrapper
+
+**Python bindings**:
+- pybind/py_optimizer_binding.cc - Python interface
+
+### Glossary
+
+| Term | Description |
 |------|------|
-| 驱逐策略 | 当缓存满时选择哪些块被移除的算法 |
-| LRU | 最近最少使用算法 |
-| RandomLRU | 结合随机采样和 LRU 的混合算法 |
-| LeafAwareLRU | 叶子节点感知的 LRU 算法 |
-| Radix Tree | 用于高效前缀匹配的树形数据结构 |
-| Trace | 记录系统操作序列的数据 |
-| Instance | 缓存系统的独立实例 |
-| Instance Group | 共享资源的实例集合 |
-| Block | 缓存的基本单位 |
-| Hit Rate | 缓存命中次数与总访问次数的比值 |
-| Prefix Match | 查找具有相同前缀的键 |
-| Read/Write Separation | 将读和写操作分开处理 |
-| Trade-off Curve | 容量与命中率之间的权衡曲线 |
+| Eviction Policy | The algorithm that selects which blocks are removed when the cache is full |
+| LRU | Least Recently Used algorithm |
+| RandomLRU | A hybrid algorithm combining random sampling and LRU |
+| LeafAwareLRU | A leaf-node-aware LRU algorithm |
+| Radix Tree | A tree data structure for efficient prefix matching |
+| Trace | Data recording the sequence of system operations |
+| Instance | An independent instance of the cache system |
+| Instance Group | A collection of instances sharing resources |
+| Block | The basic unit of the cache |
+| Hit Rate | The ratio of cache hits to total accesses |
+| Prefix Match | Finding keys that share the same prefix |
+| Read/Write Separation | Processing read and write operations separately |
+| Trade-off Curve | The tradeoff curve between capacity and hit rate |
 
 
 

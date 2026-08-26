@@ -186,6 +186,33 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
+    const auto current_backend = data_storage_manager_->GetDataStorageBackend(global_unique_name);
+    const auto current_type = current_backend == nullptr ? DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
+                                                         : current_backend->GetStorageConfig().type();
+    if (current_backend != nullptr && current_type != storage_config.type() &&
+        (IsTairMempoolStorageType(current_type) || IsTairMempoolStorageType(storage_config.type()))) {
+        PREFIX_LOG_S(WARN,
+                     "update storage rejected: TairMempool storage type is immutable, current type: [%d], requested "
+                     "type: [%d]",
+                     static_cast<int>(current_type),
+                     static_cast<int>(storage_config.type()));
+        return EC_BADARGS;
+    }
+    if (current_backend != nullptr && IsTairMempoolStorageType(current_type) &&
+        IsTairMempoolStorageType(storage_config.type())) {
+        const auto current_spec =
+            std::dynamic_pointer_cast<TairMemPoolStorageSpec>(current_backend->GetStorageConfig().storage_spec());
+        const auto requested_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(storage_config.storage_spec());
+        if (current_spec == nullptr || requested_spec == nullptr ||
+            current_spec->media_type() != requested_spec->media_type()) {
+            PREFIX_LOG_S(WARN,
+                         "update storage rejected: TairMempool media type is immutable, current media type: [%d], "
+                         "requested media type: [%d]",
+                         current_spec == nullptr ? -1 : static_cast<int>(current_spec->media_type()),
+                         requested_spec == nullptr ? -1 : static_cast<int>(requested_spec->media_type()));
+            return EC_BADARGS;
+        }
+    }
     // 重建期间短暂不可用
     auto ec = RemoveStorage(request_context, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");
@@ -291,6 +318,9 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
         const auto &existing = it->second;
         auto mismatched = existing->MismatchFields(
             block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
+        if (existing->instance_group_name() != instance_group) {
+            mismatched.insert(mismatched.begin(), "instance_group_name");
+        }
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(

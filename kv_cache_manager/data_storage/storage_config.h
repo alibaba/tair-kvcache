@@ -18,6 +18,9 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_DUMMY = 6,
     DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 = 7,
     DATA_STORAGE_TYPE_EVENT_REPORT_L2 = 8,
+    // Keep the legacy TairMempool type for DRAM/backward compatibility and
+    // account explicit SSD locations independently for quota and water level.
+    DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD = 9,
     COUNT, // as sentinel, must be last
 };
 
@@ -35,6 +38,15 @@ constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
 }
+
+constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
+           type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+}
+
+// Storage type names are persisted in KVCM metadata, while both TairMempool
+// media types use the same PACE data-plane URI scheme.
+inline constexpr char kTairMempoolUriScheme[] = "pace";
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)
@@ -216,6 +228,8 @@ public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;
     static constexpr int64_t kDefaultLivenessCheckIntervalMs = 5 * 1000;
+    static constexpr int64_t kDefaultSnapshotMinIntervalMs = 30 * 1000;
+    static constexpr int64_t kDefaultSnapshotDeltaDrainTimeoutMs = 10 * 1000;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
@@ -225,15 +239,21 @@ public:
     int64_t heartbeat_timeout_ms() const { return heartbeat_timeout_ms_; }
     int64_t cleanup_grace_ms() const { return cleanup_grace_ms_; }
     int64_t liveness_check_interval_ms() const { return liveness_check_interval_ms_; }
+    int64_t snapshot_min_interval_ms() const { return snapshot_min_interval_ms_; }
+    int64_t snapshot_delta_drain_timeout_ms() const { return snapshot_delta_drain_timeout_ms_; }
 
     void set_heartbeat_timeout_ms(int64_t v) { heartbeat_timeout_ms_ = v; }
     void set_cleanup_grace_ms(int64_t v) { cleanup_grace_ms_ = v; }
     void set_liveness_check_interval_ms(int64_t v) { liveness_check_interval_ms_ = v; }
+    void set_snapshot_min_interval_ms(int64_t v) { snapshot_min_interval_ms_ = v; }
+    void set_snapshot_delta_drain_timeout_ms(int64_t v) { snapshot_delta_drain_timeout_ms_ = v; }
 
 private:
     int64_t heartbeat_timeout_ms_ = kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;
+    int64_t snapshot_min_interval_ms_ = kDefaultSnapshotMinIntervalMs;
+    int64_t snapshot_delta_drain_timeout_ms_ = kDefaultSnapshotDeltaDrainTimeoutMs;
 };
 
 class StorageConfig : public Jsonizable {

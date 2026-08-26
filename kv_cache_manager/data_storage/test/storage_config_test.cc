@@ -51,6 +51,60 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     EXPECT_EQ(nfs_spec2.key_count_per_file(), nfs_spec.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings) {
+    EventReportStorageSpec spec;
+    spec.set_heartbeat_timeout_ms(1234);
+    spec.set_cleanup_grace_ms(5678);
+    spec.set_liveness_check_interval_ms(90);
+    spec.set_snapshot_min_interval_ms(4321);
+    spec.set_snapshot_delta_drain_timeout_ms(8765);
+
+    const std::string json = spec.ToJsonString();
+    EXPECT_NE(json.find("\"snapshot_min_interval_ms\":4321"), std::string::npos);
+    EXPECT_NE(json.find("\"snapshot_delta_drain_timeout_ms\":8765"), std::string::npos);
+
+    EventReportStorageSpec parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(1234, parsed.heartbeat_timeout_ms());
+    EXPECT_EQ(5678, parsed.cleanup_grace_ms());
+    EXPECT_EQ(90, parsed.liveness_check_interval_ms());
+    EXPECT_EQ(4321, parsed.snapshot_min_interval_ms());
+    EXPECT_EQ(8765, parsed.snapshot_delta_drain_timeout_ms());
+    std::string invalid_fields;
+    EXPECT_TRUE(parsed.ValidateRequiredFields(invalid_fields));
+    EXPECT_TRUE(invalid_fields.empty());
+}
+
+TEST_F(StorageConfigTest, TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation) {
+    EventReportStorageSpec default_spec;
+    ASSERT_TRUE(default_spec.FromJsonString(
+        R"({"heartbeat_timeout_ms":1000,"cleanup_grace_ms":2000,"liveness_check_interval_ms":100})"));
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs, default_spec.snapshot_min_interval_ms());
+    EXPECT_EQ(EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs,
+              default_spec.snapshot_delta_drain_timeout_ms());
+
+    default_spec.set_snapshot_min_interval_ms(0);
+    std::string invalid_fields;
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_min_interval_ms"));
+
+    default_spec.set_snapshot_min_interval_ms(EventReportStorageSpec::kDefaultSnapshotMinIntervalMs);
+    default_spec.set_snapshot_delta_drain_timeout_ms(0);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+
+    default_spec.set_snapshot_delta_drain_timeout_ms(-1);
+    invalid_fields.clear();
+    EXPECT_FALSE(default_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
+}
+
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =
@@ -150,4 +204,50 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.timeout(), spec.timeout());
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
     EXPECT_EQ(parsed.media_type(), spec.media_type());
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRoundTripAndValidation) {
+    EXPECT_EQ("pace_ssd", ToString(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, ToDataStorageType("pace_ssd"));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+              ToBaseType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_STREQ("pace", kTairMempoolUriScheme);
+
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    std::string invalid_fields;
+    ASSERT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    const std::string json = config.ToJsonString();
+    EXPECT_NE(std::string::npos, json.find("\"type\":\"pace_ssd\""));
+    EXPECT_NE(std::string::npos, json.find("\"media_type\":5"));
+
+    StorageConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(json));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRequiresSsdMedia) {
+    auto spec = std::make_shared<TairMemPoolStorageSpec>();
+    spec->set_domain("pace.meta");
+    spec->set_timeout(5000);
+    spec->set_media_type(kTairMemPoolMediaTypeDram);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd_1", spec);
+
+    std::string invalid_fields;
+    EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("tair_mempool_ssd_requires_media_type_5"));
+
+    // Legacy TairMempool remains permissive so existing media_type=5
+    // configurations can be read during a rolling upgrade.
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    invalid_fields.clear();
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
 }

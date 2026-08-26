@@ -26,6 +26,7 @@ MEDIUM="${MEDIUM:-mem}"
 SECONDARY_MEDIUM="${SECONDARY_MEDIUM:-disk}"
 FULL_SPEC_NAME="${FULL_SPEC_NAME:-full_attention}"
 MAMBA_SPEC_NAME="${MAMBA_SPEC_NAME:-mamba_state}"
+USE_EAGLE_POP="${USE_EAGLE_POP:-0}"
 EVENT_HEARTBEAT_TIMEOUT_MS="${EVENT_HEARTBEAT_TIMEOUT_MS:-300000}"
 EVENT_CLEANUP_GRACE_MS="${EVENT_CLEANUP_GRACE_MS:-300000}"
 EVENT_LIVENESS_CHECK_INTERVAL_MS="${EVENT_LIVENESS_CHECK_INTERVAL_MS:-5000}"
@@ -105,6 +106,8 @@ DATA MODEL
                            default: full_attention
   MAMBA_SPEC_NAME          Mamba/linear LocationSpec name
                            default: mamba_state
+  USE_EAGLE_POP            Register model_deployment.use_eagle_pop as true when set to 1.
+                           default: 0, preserving existing stress expectations
   EVENT_HEARTBEAT_TIMEOUT_MS
                            Synthetic event-report node heartbeat timeout.
                            Increase this for long read stress runs.
@@ -313,6 +316,7 @@ build_register_payload() {
         --arg instance "$INSTANCE_ID" \
         --arg full_spec "$FULL_SPEC_NAME" \
         --arg mamba_spec "$MAMBA_SPEC_NAME" \
+        --argjson use_eagle_pop "$USE_EAGLE_POP" \
         '{
             trace_id: $trace,
             instance_group: $group,
@@ -324,7 +328,8 @@ build_register_payload() {
                 use_mla: false,
                 tp_size: 1,
                 dp_size: 1,
-                pp_size: 1
+                pp_size: 1,
+                use_eagle_pop: ($use_eagle_pop == 1)
             },
             location_spec_infos: [
                 {name: "tp0", size: 1024},

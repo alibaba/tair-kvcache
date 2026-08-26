@@ -12,6 +12,21 @@
 bazelisk run //kv_cache_manager:main
 ```
 
+Mooncake 和 VCNS 后端默认不参与编译，需要时通过 Bazel 配置显式启用：
+
+```bash
+# Mooncake（包含 CUDA、HTTP 和 TCP 支持）
+bazelisk run //kv_cache_manager:main --config=mooncake
+
+# Mooncake（不启用 CUDA）
+bazelisk run //kv_cache_manager:main --config=mooncake_common
+
+# VCNS（仅内源模式提供真实实现）
+bazelisk run //kv_cache_manager:main --config=vcns
+```
+
+两个后端可通过同时传入 `--config=mooncake` 和 `--config=vcns` 一起启用。`--config=client` 会继续启用客户端所需的 Mooncake 支持。
+
 ### Bazel 缓存与多 worktree 开发
 
 Bazel 默认会按 workspace 路径生成独立的 `output_base`。因此从同一个仓库拉出新的 git worktree 后，新的 worktree 不能直接复用旧 worktree 的 `bazel-out`、analysis cache 和本地 action cache；首次构建仍需要重新完成 loading/analysis、内部 symlink/action bookkeeping，以及测试执行。
@@ -153,9 +168,13 @@ grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
 
 githooks中已经添加了C++等语言的格式化脚本，请确保开发环境安装了clang-format、autopep8、buildifier。（开发镜像均已预装）。
 
+## Proto 修改
+
+修改 `kv_cache_manager/protocol/protobuf` 下的 proto 定义时，请遵循 [Proto 文件修改指南](proto_modification_guide.md)，并同步完成其中列出的适配步骤（例如修改 AdminService 接口定义时需适配 `package/kvcm_ops` 运维 CLI）。
+
 ## 提交要求
 
 提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。
 
 ## CI
-可参考```.github/workflows```目录下的配置。
+可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。

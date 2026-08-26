@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -12,6 +13,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
 
 namespace kv_cache_manager {
 
@@ -21,28 +23,39 @@ struct InstanceState {
     std::shared_ptr<const OptimizerInstanceInfo> instance_info;
     std::shared_ptr<const OptimizerInstanceGroup> instance_group;
 
+    // Exactly one analyzer is active. Full-attention uses LiteHit directly;
+    // linear attention remains on the legacy CacheIndexer path.
+    std::unique_ptr<LiteHit> lite_hit;
     std::unique_ptr<CacheIndexer> indexer;
+    // Static byte->block estimation of the configured capacities, kept for
+    // the existing response contract and used as projection slots.
+    std::vector<int64_t> lite_hit_capacity_blocks;
 
     int64_t size_full_only = 0;
     int64_t size_full_linear = 0;
     int32_t linear_step = 0;
     std::mutex mutex;
 
+    // Minimal cumulative integers per the existing contract. LiteHit itself
+    // no longer accumulates anything; the full-attention path updates these
+    // from projected facts. Rates are derived on read.
     int64_t total_queries = 0;
     int64_t total_blocks_queried = 0;
+    int64_t total_input_tokens = 0;
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
 };
 
 struct TraceQueryResult {
-    int64_t cache_hit_count = 0;
     int64_t total_blocks = 0;
+    int64_t input_token_len = 0;
     std::vector<int64_t> hit_count_per_capacity;
+    std::vector<double> hit_rate_per_capacity;
     std::vector<double> capacity_gb;
     std::vector<int64_t> unique_keys_per_capacity;
-    int64_t current_unique_keys = 0;
     int64_t theoretical_unique_keys = 0;
     int64_t max_hit_count = -1;
+    double max_hit_rate = 0.0;
 };
 
 struct RegisterInstanceResult {
@@ -69,10 +82,11 @@ struct InstanceSummary {
     int32_t block_size = 0;
     int64_t total_queries = 0;
     int64_t total_blocks_queried = 0;
+    int64_t total_input_tokens = 0;
     int64_t total_max_hits = 0;
     double max_hit_rate = 0.0;
     int64_t unique_keys = 0;
-    int64_t avg_bytes_per_block = 0;
+    int64_t bytes_per_block = 0;
     int32_t linear_step = 0;
     int64_t eviction_count = 0;
     int64_t memory_usage_bytes = 0;
@@ -100,6 +114,14 @@ public:
 
     ErrorCode RemoveInstance(const std::string &instance_id);
 
+    ErrorCode TraceQuery(const std::string &instance_id,
+                         const std::vector<int64_t> &block_keys,
+                         int64_t input_token_len,
+                         TraceQueryResult &result);
+
+    // Compatibility entry point for legacy block-only callers. It assumes the
+    // request contains no incomplete tail tokens. New full-attention callers
+    // must pass input_token_len explicitly through the overload above.
     ErrorCode
     TraceQuery(const std::string &instance_id, const std::vector<int64_t> &block_keys, TraceQueryResult &result);
 

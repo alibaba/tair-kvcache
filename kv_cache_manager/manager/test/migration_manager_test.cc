@@ -29,6 +29,23 @@
 
 using namespace kv_cache_manager;
 
+namespace {
+ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+                                  RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const CacheLocationVector &locations,
+                                  std::vector<std::string> &out_location_ids) {
+    std::vector<MetaSearcher::AddLocationResult> results;
+    const ErrorCode ec = meta_searcher->BatchAddLocation(request_context, keys, locations, results);
+    out_location_ids.clear();
+    out_location_ids.reserve(results.size());
+    for (const auto &result : results) {
+        out_location_ids.push_back(result.location_id);
+    }
+    return ec;
+}
+} // namespace
+
 // ---- orphan cleanup 测试用 DataStorageManager::Create/Delete 存根 ----
 // 复现"异构 size spec 分散到多个 create_group、某 group 失败使 block ineligible、
 // 后处理 group 已成功分配的 URI 被跳过 → rollback 漏删 → orphan"的场景。
@@ -188,6 +205,8 @@ bool g_cancel_first_reservation_on_create = false;
 std::optional<ErrorCode> g_cancel_result;
 int g_create_calls = 0;
 std::vector<std::size_t> g_create_key_counts;
+std::vector<DataStorageUri> g_deleted_uris;
+std::vector<std::shared_ptr<std::promise<PlanExecuteResult>>> g_pending_copy_promises;
 
 void Reset() {
     g_manager = nullptr;
@@ -198,6 +217,8 @@ void Reset() {
     g_cancel_result.reset();
     g_create_calls = 0;
     g_create_key_counts.clear();
+    g_deleted_uris.clear();
+    g_pending_copy_promises.clear();
 }
 
 std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
@@ -231,6 +252,15 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
     return results;
 }
 
+std::vector<ErrorCode> Delete_stub(void * /*obj*/,
+                                   RequestContext * /*rc*/,
+                                   const std::string & /*name*/,
+                                   const std::vector<DataStorageUri> &uris,
+                                   std::function<void()> /*cb*/) {
+    g_deleted_uris.insert(g_deleted_uris.end(), uris.begin(), uris.end());
+    return std::vector<ErrorCode>(uris.size(), EC_OK);
+}
+
 MetaIndexer::Result ReadModifyWriteBlockFail_stub(void * /*obj*/,
                                                   RequestContext * /*rc*/,
                                                   const KeyVector &keys,
@@ -244,6 +274,13 @@ using CopySubmitLocation = std::future<PlanExecuteResult> (SchedulePlanExecutor:
 
 std::future<PlanExecuteResult> CopySubmitInvalid_stub(void * /*obj*/, const CacheLocationCopyRequest & /*request*/) {
     return {};
+}
+
+std::future<PlanExecuteResult> CopySubmitPending_stub(void * /*obj*/, const CacheLocationCopyRequest & /*request*/) {
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    auto future = promise->get_future();
+    g_pending_copy_promises.push_back(std::move(promise));
+    return future;
 }
 } // namespace preparing_reservation_stub
 
@@ -395,7 +432,8 @@ public:
             loc->set_create_time(create_time);
         }
         std::vector<std::string> ids;
-        EXPECT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(rc.get(), {block_key}, {loc}, ids));
+        EXPECT_EQ(
+            ErrorCode::EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
         EXPECT_EQ(1u, ids.size());
         // BatchAddLocation 写入 CLS_WRITING，CAS 到 SERVING 模拟一个已就绪的源副本。
         std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{
@@ -1794,8 +1832,7 @@ TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
     ASSERT_FALSE(mgr.GetActiveTaskDstLocation(kInstance, 811).empty());
 }
 
-// batch AddLocation 失败时，所有尚未运行的 reservation 必须释放；此后即使 meta 曾部分
-// 成功，残留 WRITING 也只是无 copy 在跑的真正 orphan。
+// batch AddLocation 失败时，目标 URI 必须按逐 key 结果回滚，所有尚未运行的 reservation 必须释放。
 TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReservations) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_add_fail_hot/"));
@@ -1826,6 +1863,78 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReserva
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
     ASSERT_EQ(1u, LocationCount(block_key));
+}
+
+// batch AddLocation 部分成功时，成功项继续进入 copy，失败项按其 rollback-only ID 精确清理；
+// 不能再把整个 batch 一并判失败或删除成功项的 URI。
+TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCopyAndRollsBackFailedItem) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_cold/"));
+
+    auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+    ASSERT_NE(nullptr, indexer);
+    indexer->batch_key_size_ = 1;
+    indexer->max_key_count_ = 1;
+
+    std::vector<int64_t> block_keys{814, 815};
+    // batch_key_size is a soft limit: every key in one mutex shard remains
+    // in the same batch. Select two shards using this indexer's runtime hash
+    // seed so max_key_count=1 deterministically exercises one successful
+    // batch followed by one capacity failure.
+    while (indexer->GetMutexShardIndex(block_keys[0]) == indexer->GetMutexShardIndex(block_keys[1])) {
+        ++block_keys[1];
+    }
+    auto make_request = [&](int64_t block_key) {
+        MigrationManager::MigrationRequest req;
+        req.instance_group_name = "group_a";
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = "src_" + std::to_string(block_key);
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        req.src_specs = {
+            LocationSpec("TP0", "dummy://hot_01/src_" + std::to_string(block_key) + "?size=4")};
+        return req;
+    };
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
+    mgr.DebugEnableCopySubmissionsForTest();
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, block_keys[0]}, {kInstance, block_keys[1]}};
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), preparing_reservation_stub::Delete_stub);
+    stub.set(static_cast<preparing_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
+             preparing_reservation_stub::CopySubmitPending_stub);
+
+    const auto results =
+        mgr.BatchSubmit("batch_add_location_partial", {make_request(block_keys[0]), make_request(block_keys[1])});
+    ASSERT_EQ(2u, results.size());
+    ASSERT_TRUE((results[0] == EC_OK && results[1] == EC_NOSPC) ||
+                (results[1] == EC_OK && results[0] == EC_NOSPC));
+
+    const std::size_t success_index = results[0] == EC_OK ? 0 : 1;
+    const std::size_t failed_index = 1 - success_index;
+    EXPECT_TRUE(mgr.HasMigrationTask(kInstance, block_keys[success_index]));
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_keys[failed_index]));
+    EXPECT_EQ(1u, mgr.ActiveTaskCount());
+    EXPECT_EQ(1u, preparing_reservation_stub::g_pending_copy_promises.size());
+    EXPECT_EQ(1u, LocationCount(block_keys[success_index]));
+    EXPECT_EQ(0u, LocationCount(block_keys[failed_index]));
+    ASSERT_EQ(1u, preparing_reservation_stub::g_deleted_uris.size());
+    EXPECT_NE(std::string::npos,
+              preparing_reservation_stub::g_deleted_uris.front().ToUriString().find(
+                  StringUtil::Uint64ToHex(block_keys[failed_index])));
+
+    // 统一口径：add 成功项已提交 executor（stub pending future），计入其 4 字节；
+    // add 失败项（EC_NOSPC）已回滚且未提交，不计入。
+    EXPECT_EQ(4u,
+              metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                                            {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
+                                             {"unique_name", "cold_01"}})
+                  .Get());
 }
 
 // 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
@@ -2443,6 +2552,115 @@ TEST_F(MigrationManagerTest, TestMetricsAndEvents) {
     mgr.OnTaskFailed(kInstance, block_key2, ErrorCode::EC_IO_ERROR);
     ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.tasks_completed_total", {{"status", "failed"}}).Get());
     ASSERT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("migration.tasks_active").Get());
+}
+
+TEST_F(MigrationManagerTest, TestCopyWriteBytesRecorded) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "m_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "m_cold/"));
+
+    MigrationManager mgr(schedule_plan_executor_,
+                         meta_manager_,
+                         data_storage_manager_,
+                         metrics_registry_,
+                         nullptr);
+
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    auto get_write_bytes = [&]() {
+        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
+                              {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
+                               {"unique_name", "cold_01"}}).Get();
+    };
+
+    // 场景1：成功复制
+    {
+        int64_t block_key = 1000;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // 统一口径：任务成功提交 executor 即计入（Submit 返回时已发生）
+        ASSERT_EQ(10u, get_write_bytes());
+        mgr.OnTaskSuccess(kInstance, block_key);
+        // 完成回调不再重复计入
+        ASSERT_EQ(10u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
+    }
+
+    // 场景2：取消仍计入
+    {
+        int64_t block_key = 1001;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(20u, get_write_bytes()); // 提交 executor 即计入，累计：场景1的10 + 本次10
+        // copy 进行中用户取消：任务标记 kCancelling，仍留在活跃表
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+        // 完成回调认领到 kWasCancelling：不计入也不走主路径（计数在提交时已发生）
+        mgr.OnTaskSuccess(kInstance, block_key);
+        ASSERT_EQ(20u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 取消不 promote，不涨
+    }
+
+    // 场景3: Copy 失败
+    {
+        int64_t block_key = 1002;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        // copy 失败仍计入：任务已提交 executor，失败属于派发未兑现（累计 20 + 10）
+        ASSERT_EQ(30u, get_write_bytes());
+        mgr.OnTaskFailed(kInstance, block_key, ErrorCode::EC_IO_ERROR);
+        ASSERT_EQ(30u, get_write_bytes()); // 失败回调不再影响计数
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get());
+    }
+
+    // 场景4: 源丢失，仍计入
+    {
+        int64_t block_key = 1003;
+        std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "abcdefghij");
+
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+        ASSERT_EQ(40u, get_write_bytes()); // 提交 executor 即计入，累计：30 + 10
+
+        // 破坏源：把源 location 从 SERVING CAS 成 DELETING，模拟 copy 期间源被回收
+        auto rc = std::make_shared<RequestContext>("break_source");
+        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
+        std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{
+            {MetaSearcher::LocationCASTask{src_loc, CLS_SERVING, CLS_DELETING}}};
+        std::vector<std::vector<ErrorCode>> cas_results;
+        ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas, cas_results));
+
+        // 完成回调：计数已在提交时发生；此处走 source_lost 失败收尾，不再影响计数
+        mgr.OnTaskSuccess(kInstance, block_key);
+        ASSERT_EQ(40u, get_write_bytes());
+        ASSERT_EQ(10u, metrics_registry_->GetCounter("migration.copy_bytes_total").Get()); // 源丢失按失败收尾，不涨
+    }
+
 }
 
 // ============ Copy 准入策略：CheckCopyAdmission ============
