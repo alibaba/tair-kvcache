@@ -86,6 +86,72 @@ TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
     }
 }
 
+TEST_F(DataStorageManagerTest, TestResumeAsyncCopyQueriesTemporarilyUnavailableBackend) {
+    class TemporarilyUnavailableAsyncBackend : public DataStorageBackend {
+    public:
+        TemporarilyUnavailableAsyncBackend(std::shared_ptr<MetricsRegistry> metrics_registry, bool &resume_called)
+            : DataStorageBackend(std::move(metrics_registry)), resume_called_(resume_called) {}
+
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return false; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+            return {};
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<bool>(uris.size(), true);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        bool SupportsAsyncCopy() const override { return true; }
+        AsyncCopySubmitResult ResumeAsyncCopy(const std::vector<std::string> &backend_task_ids,
+                                              size_t expected_items,
+                                              const std::string &operation_id,
+                                              const std::string &,
+                                              const AsyncCopyOptions &,
+                                              AsyncCopyCompletion) override {
+            resume_called_ = true;
+            AsyncCopySubmitResult result;
+            result.status = backend_task_ids.size() == expected_items ? EC_OK : EC_MISMATCH;
+            result.accepted = result.status == EC_OK;
+            result.operation_id = operation_id;
+            return result;
+        }
+
+    private:
+        bool &resume_called_;
+    };
+
+    DataStorageManager data_storage_manager(metrics_registry_);
+    bool resume_called = false;
+    data_storage_manager.storage_map_["temporarily-unavailable"] =
+        std::make_shared<TemporarilyUnavailableAsyncBackend>(metrics_registry_, resume_called);
+
+    RequestContext request_context("resume-temporarily-unavailable");
+    auto result = data_storage_manager.ResumeAsyncCopy(&request_context,
+                                                       "temporarily-unavailable",
+                                                       {"pace-task-1"},
+                                                       1,
+                                                       "operation-1",
+                                                       AsyncCopyOptions{},
+                                                       [](AsyncCopyBatchResult) {});
+    EXPECT_TRUE(resume_called);
+    EXPECT_EQ(EC_OK, result.status);
+    EXPECT_TRUE(result.accepted);
+    EXPECT_EQ("operation-1", result.operation_id);
+}
+
 TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
     DataStorageManager data_storage_manager(metrics_registry_);
 

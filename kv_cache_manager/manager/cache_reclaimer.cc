@@ -1667,6 +1667,12 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 if (is_pending_location(block_key, loc.id())) {
                     continue;
                 }
+                if (loc.has_migration_copy_guard()) {
+                    continue;
+                }
+                if (FindPersistentMigrationSourcePin(loc, loc_map) != nullptr) {
+                    continue;
+                }
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                     migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
@@ -1703,6 +1709,18 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
             }
             if (is_pending_location(block_key, loc.id())) {
                 METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
+                continue;
+            }
+            if (loc.has_migration_copy_guard()) {
+                // Persistent Copy ownership fence.  The process-local active
+                // target hook below is only an optimization and cannot replace
+                // this check after restart/leader switch.
+                continue;
+            }
+            if (FindPersistentMigrationSourcePin(loc, loc_map) != nullptr) {
+                // An async operation can still need this exact source after a
+                // leader restart.  The target guard is the durable source pin;
+                // do not let pressure eviction race its completion/reconcile.
                 continue;
             }
             // a location is eligible for eviction if:

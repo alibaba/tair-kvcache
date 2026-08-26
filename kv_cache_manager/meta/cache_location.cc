@@ -39,7 +39,8 @@ CacheLocation::CacheLocation(const CacheLocation &other)
     , spec_size_(other.spec_size_)
     , create_time_(other.create_time_)
     , location_specs_(other.location_specs_)
-    , validated_total_size_(other.validated_total_size_) {
+    , validated_total_size_(other.validated_total_size_)
+    , migration_copy_guard_(other.migration_copy_guard_) {
     if (const auto *owned = std::get_if<std::string>(&other.id_)) {
         id_.emplace<std::string>(*owned);
     } else {

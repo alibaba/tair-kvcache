@@ -61,6 +61,14 @@ public:
     grpc::Status MigrateCache(grpc::ServerContext *context,
                               const proto::admin::MigrateCacheRequest *request,
                               proto::admin::MigrateCacheResponse *response) override;
+    grpc::Status ListAsyncCopyQuarantine(
+        grpc::ServerContext *context,
+        const proto::admin::ListAsyncCopyQuarantineRequest *request,
+        proto::admin::ListAsyncCopyQuarantineResponse *response) override;
+    grpc::Status BreakGlassReleaseAsyncCopy(
+        grpc::ServerContext *context,
+        const proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+        proto::admin::CommonResponse *response) override;
     grpc::Status RegisterInstance(grpc::ServerContext *context,
                                   const proto::admin::RegisterInstanceRequest *request,
                                   proto::admin::CommonResponse *response) override;
@@ -135,6 +143,8 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveCache);
     KVCM_DECLARE_METRICS_COLLECTOR_(MigrateCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListAsyncCopyQuarantine);
+    KVCM_DECLARE_METRICS_COLLECTOR_(BreakGlassReleaseAsyncCopy);
 
     // for instance APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);

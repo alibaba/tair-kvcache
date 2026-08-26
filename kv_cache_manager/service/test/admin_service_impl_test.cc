@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -623,4 +624,70 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysRejectsDstAlreadyHasCopy) {
     ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 701));
     ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 702));
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 703));
+}
+
+TEST_F(AdminServiceImplTest, TestAsyncCopyQuarantineListAndBreakGlassValidation) {
+    auto migration_manager = cache_manager_->migration_manager();
+    ASSERT_NE(nullptr, migration_manager);
+
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
+    guard.set_operation_id("admin-operation-801");
+    guard.set_source_location_id("admin-source-801");
+    guard.set_source_location_create_time(801);
+    guard.set_source_storage_name("hot_01");
+    guard.set_target_storage_name("cold_01");
+    guard.set_total_bytes(16);
+    guard.set_backend_task_ids({"pace-admin-task-801"});
+    guard.set_create_time_us(1000);
+    guard.set_update_time_us(2000);
+    guard.set_last_error("remote_state_unknown");
+    {
+        std::lock_guard<std::mutex> lock(migration_manager->async_copy_usage_mutex_);
+        migration_manager->async_copy_quarantine_by_operation_.emplace(
+            guard.operation_id(),
+            MigrationManager::AsyncCopyQuarantineRecord{
+                "default", kInstance, 801, "admin-target-801", guard});
+    }
+
+    auto rc = std::make_shared<RequestContext>("list_async_copy_quarantine");
+    proto::admin::ListAsyncCopyQuarantineRequest list_request;
+    list_request.set_trace_id("list-801");
+    list_request.set_instance_group_name("default");
+    proto::admin::ListAsyncCopyQuarantineResponse list_response;
+    admin_->ListAsyncCopyQuarantine(rc.get(), &list_request, &list_response);
+
+    ASSERT_EQ(proto::admin::OK, list_response.header().status().code());
+    ASSERT_EQ(1, list_response.records_size());
+    const auto &record = list_response.records(0);
+    EXPECT_EQ("default", record.instance_group_name());
+    EXPECT_EQ(kInstance, record.instance_id());
+    EXPECT_EQ(801, record.block_key());
+    EXPECT_EQ("admin-target-801", record.target_location_id());
+    EXPECT_EQ(static_cast<int32_t>(MigrationCopyGuardState::MCGS_UNKNOWN), record.guard_state());
+    EXPECT_EQ(guard.operation_id(), record.operation_id());
+    EXPECT_EQ(guard.backend_task_ids()[0], record.backend_task_ids(0));
+    EXPECT_EQ(guard.last_error(), record.last_error());
+
+    proto::admin::ListAsyncCopyQuarantineRequest filtered_request;
+    filtered_request.set_trace_id("list-filtered-801");
+    filtered_request.set_instance_group_name("another-group");
+    proto::admin::ListAsyncCopyQuarantineResponse filtered_response;
+    admin_->ListAsyncCopyQuarantine(rc.get(), &filtered_request, &filtered_response);
+    EXPECT_EQ(proto::admin::OK, filtered_response.header().status().code());
+    EXPECT_EQ(0, filtered_response.records_size());
+
+    proto::admin::BreakGlassReleaseAsyncCopyRequest release_request;
+    release_request.set_trace_id("release-801");
+    release_request.set_operation_id(guard.operation_id());
+    release_request.set_operator_name("operator-801");
+    release_request.set_external_fencing_evidence("ticket-801");
+    // Merely supplying text evidence is insufficient: the operator must make
+    // the explicit external-fencing assertion before the service calls Manager.
+    release_request.set_external_fencing_confirmed(false);
+    proto::admin::CommonResponse release_response;
+    admin_->BreakGlassReleaseAsyncCopy(rc.get(), &release_request, &release_response);
+    EXPECT_EQ(proto::admin::INVALID_ARGUMENT, release_response.header().status().code());
+    EXPECT_EQ(1u, migration_manager->ListAsyncCopyQuarantine("default").size());
 }
