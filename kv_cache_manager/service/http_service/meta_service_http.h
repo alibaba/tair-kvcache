@@ -30,6 +30,10 @@ public:
     CachedJsonResponse GetInstanceInfo(coro_http::coro_http_connection *http_conn,
                                        proto::meta::GetInstanceInfoRequest *request,
                                        proto::meta::GetInstanceInfoResponse *response);
+    CachedJsonResponse GetStorageConfigsByInstanceGroup(
+        coro_http::coro_http_connection *http_conn,
+        proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+        proto::meta::GetStorageConfigsByInstanceGroupResponse *response);
     CachedJsonResponse GetCacheMeta(coro_http::coro_http_connection *http_conn,
                                     proto::meta::GetCacheMetaRequest *request,
                                     proto::meta::GetCacheMetaResponse *response);

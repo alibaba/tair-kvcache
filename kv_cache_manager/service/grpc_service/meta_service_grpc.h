@@ -29,6 +29,10 @@ public:
     grpc::Status GetInstanceInfo(grpc::ServerContext *context,
                                  const proto::meta::GetInstanceInfoRequest *request,
                                  proto::meta::GetInstanceInfoResponse *response) override;
+    grpc::Status GetStorageConfigsByInstanceGroup(
+        grpc::ServerContext *context,
+        const proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+        proto::meta::GetStorageConfigsByInstanceGroupResponse *response) override;
     grpc::Status GetCacheMeta(grpc::ServerContext *context,
                               const proto::meta::GetCacheMetaRequest *request,
                               proto::meta::GetCacheMetaResponse *response) override;

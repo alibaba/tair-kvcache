@@ -28,10 +28,18 @@ from kv_cache_manager.manager_client import KvCacheManagerClient
 
 client = KvCacheManagerClient("http://127.0.0.1:6382")
 try:
-    response = client.get_cluster_info({"trace_id": "example"})
+    response = client.get_storage_configs_by_instance_group({
+        "trace_id": "pace-bootstrap",
+        "instance_group": "example-group",
+    })
+    storage_configs_json = response["storage_configs"]
 finally:
     client.close()
 ```
+
+`storage_configs` is a JSON-encoded array string using the same format returned
+by `register_instance`. The method reuses the standard service-discovery,
+leader retry, timeout, and business-status checks.
 
 Static service discovery is also available through the Manager URI:
 

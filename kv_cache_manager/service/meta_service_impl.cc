@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/meta_service_impl.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,6 +23,7 @@
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
+#include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
 
@@ -113,6 +115,7 @@ namespace {
 
 constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
 constexpr const char *kGetHostCacheStateFullAccessLogEnv = "KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG";
+constexpr char kSpectrumPrefix[] = "spectrum://";
 
 RequestContext::JsonFragment BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
     RequestContext::JsonFragment fragment;
@@ -308,6 +311,144 @@ BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheSt
     return {std::string(sb.GetString(), sb.GetSize()), true};
 }
 
+size_t CountStorageConfigs(const std::string &storage_configs) {
+    rapidjson::Document document;
+    document.Parse(storage_configs.c_str());
+    return document.IsArray() ? document.Size() : 0;
+}
+
+bool IsValidPort(const std::string &value) {
+    if (value.empty()) {
+        return false;
+    }
+    uint32_t port = 0;
+    for (char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        port = port * 10 + static_cast<uint32_t>(ch - '0');
+        if (port > 65535) {
+            return false;
+        }
+    }
+    return port != 0;
+}
+
+bool HasQueryParam(const std::string &query, const std::string &key) {
+    size_t begin = 0;
+    while (begin <= query.size()) {
+        const size_t end = query.find('&', begin);
+        const size_t length = end == std::string::npos ? std::string::npos : end - begin;
+        const std::string param = query.substr(begin, length);
+        const size_t equal = param.find('=');
+        if (param.substr(0, equal) == key) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return false;
+}
+
+// Older configs sometimes put Spectrum's custom port after the service id. In
+// the service-discovery grammar that suffix is part of the opaque body, so make
+// the API response unambiguous without rewriting the persisted StorageConfig.
+std::string CanonicalizeSpectrumUrl(const std::string &url) {
+    constexpr size_t kSpectrumPrefixLength = sizeof(kSpectrumPrefix) - 1;
+    if (url.compare(0, kSpectrumPrefixLength, kSpectrumPrefix) != 0) {
+        return url;
+    }
+
+    const size_t body_begin = kSpectrumPrefixLength;
+    const size_t query_begin = url.find('?', body_begin);
+    const size_t body_end = query_begin == std::string::npos ? url.size() : query_begin;
+    const size_t colon = url.rfind(':', body_end - 1);
+    if (colon == std::string::npos || colon < body_begin) {
+        return url;
+    }
+
+    const std::string port = url.substr(colon + 1, body_end - colon - 1);
+    if (!IsValidPort(port)) {
+        return url;
+    }
+
+    const std::string base = url.substr(0, colon);
+    const std::string query = query_begin == std::string::npos ? "" : url.substr(query_begin + 1);
+    if (HasQueryParam(query, "port")) {
+        return query.empty() ? base : base + "?" + query;
+    }
+    return base + "?port=" + port + (query.empty() ? "" : "&" + query);
+}
+
+std::vector<std::string> ExtractServiceDiscoveryUrls(const std::string &storage_configs) {
+    rapidjson::Document document;
+    document.Parse(storage_configs.c_str());
+    if (!document.IsArray()) {
+        return {};
+    }
+
+    for (const auto &config : document.GetArray()) {
+        if (!config.IsObject() || !config.HasMember("type") || !config["type"].IsString()) {
+            continue;
+        }
+        const std::string type = config["type"].GetString();
+        if (type != "pace" && type != "pace_ssd") {
+            continue;
+        }
+        if (!config.HasMember("storage_spec") || !config["storage_spec"].IsObject()) {
+            continue;
+        }
+        const auto &spec = config["storage_spec"];
+        if (!spec.HasMember("service_discovery_url") || !spec["service_discovery_url"].IsString()) {
+            continue;
+        }
+        const std::string raw_url = spec["service_discovery_url"].GetString();
+        if (raw_url.compare(0, sizeof(kSpectrumPrefix) - 1, kSpectrumPrefix) != 0) {
+            continue;
+        }
+        const std::string url = CanonicalizeSpectrumUrl(raw_url);
+        if (!url.empty()) {
+            // Temporary policy: expose at most one address. A later change will
+            // replace first-match selection with the intended business policy.
+            return {url};
+        }
+    }
+    return {};
+}
+
+RequestContext::JsonFragment BuildGetStorageConfigsByInstanceGroupRequestAccessLogSummary(
+    const proto::meta::GetStorageConfigsByInstanceGroupRequest *request) {
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("trace_id");
+    writer.String(request->trace_id().c_str());
+    writer.Key("instance_group");
+    writer.String(request->instance_group().c_str());
+    writer.EndObject();
+    return {std::string(sb.GetString(), sb.GetSize()), true};
+}
+
+RequestContext::JsonFragment BuildGetStorageConfigsByInstanceGroupResponseAccessLogSummary(
+    const proto::meta::GetStorageConfigsByInstanceGroupResponse *response) {
+    const auto &status = response->header().status();
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("status_code");
+    writer.String(proto::meta::ErrorCode_Name(status.code()).c_str());
+    writer.Key("status_message");
+    writer.String(status.message().c_str());
+    writer.Key("storage_count");
+    writer.Uint64(CountStorageConfigs(response->storage_configs()));
+    writer.Key("service_discovery_url_count");
+    writer.Int(response->service_discovery_urls_size());
+    writer.EndObject();
+    return {std::string(sb.GetString(), sb.GetSize()), true};
+}
+
 } // namespace
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
@@ -457,6 +598,59 @@ void MetaServiceImpl::GetInstanceInfo(RequestContext *request_context,
     response->set_instance_group(instance_info_ptr->instance_group_name());
     ProtoConvert::InstanceInfoToProto(*instance_info_ptr, response->mutable_instance_info());
     KVCM_LOG_INFO("[traceId: %s] GetInstanceInfo succeeded", request->trace_id().c_str());
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::GetStorageConfigsByInstanceGroup(
+    RequestContext *request_context,
+    const proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+    proto::meta::GetStorageConfigsByInstanceGroupResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD_WITH_DEBUG("GetStorageConfigsByInstanceGroup",
+                              true,
+                              BuildGetStorageConfigsByInstanceGroupRequestAccessLogSummary(request),
+                              BuildGetStorageConfigsByInstanceGroupResponseAccessLogSummary(response),
+                              RequestContext::ResponseJsonKind::kAccessLogSummary);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    CHECK_FAULT_INJECTION("GetStorageConfigsByInstanceGroup");
+
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_group().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetStorageConfigsByInstanceGroup", "instance_group", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    auto [ec, storage_configs] =
+        cache_manager_->GetStorageConfigsByInstanceGroup(request_context, request->instance_group());
+    if (ec != EC_OK) {
+        status->set_code(ToMetaPbError(ec));
+        status->set_message("Failed to get storage configs for instance group '" + request->instance_group() +
+                            "': " + request_context->error_tracer()->ToJsonString());
+        request_context->set_status_code(status->code());
+        KVCM_LOG_WARN("[traceId: %s] GetStorageConfigsByInstanceGroup failed, instance_group: %s, ec: %d",
+                      request->trace_id().c_str(),
+                      request->instance_group().c_str(),
+                      ec);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    status->set_code(proto::meta::OK);
+    status->set_message("Storage configs retrieved successfully");
+    request_context->set_status_code(status->code());
+    response->set_storage_configs(std::move(storage_configs));
+    for (auto &url : ExtractServiceDiscoveryUrls(response->storage_configs())) {
+        response->add_service_discovery_urls(std::move(url));
+    }
+    KVCM_LOG_INFO(
+        "[traceId: %s] GetStorageConfigsByInstanceGroup succeeded, instance_group: %s, storage_count: %zu, "
+        "service_discovery_url_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_group().c_str(),
+                  CountStorageConfigs(response->storage_configs()),
+                  response->service_discovery_urls_size());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

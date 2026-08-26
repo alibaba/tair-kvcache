@@ -29,6 +29,11 @@ public:
                          const proto::meta::GetInstanceInfoRequest *request,
                          proto::meta::GetInstanceInfoResponse *response);
 
+    void GetStorageConfigsByInstanceGroup(
+        RequestContext *request_context,
+        const proto::meta::GetStorageConfigsByInstanceGroupRequest *request,
+        proto::meta::GetStorageConfigsByInstanceGroupResponse *response);
+
     void GetCacheLocation(RequestContext *request_context,
                           const proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);
