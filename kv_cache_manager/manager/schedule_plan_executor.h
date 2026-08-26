@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -41,8 +42,12 @@ struct CacheMetaDelRequest {
 };
 
 struct PlanExecuteResult {
-    ErrorCode status;
+    ErrorCode status{EC_UNKNOWN};
     std::string error_message;
+    // Sync operations use the safe defaults below.  Native async Copy overrides
+    // them from the backend result.  ErrorCode never authorizes target reuse.
+    bool terminal{true};
+    bool safe_to_reuse_dst{true};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -64,6 +69,11 @@ struct CacheLocationDelRequest {
     // Maintenance scans observe the persistent source of truth. Revalidate
     // admission there and refresh candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
+    // Internal migration-finalization path only: metadata has already been
+    // conditionally moved to CLS_DELETING and its guard cleared after a remote
+    // `terminal && safe_to_reuse_dst` proof.  Skip the ordinary status CAS and
+    // continue with physical delete + CAD.
+    bool prepared_deleting{false};
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -76,6 +86,15 @@ struct CacheLocationCopyRequest {
     std::vector<DataStorageUri> src_uris; // 源端各 spec 的 uri
     std::vector<DataStorageUri> dst_uris; // 目标端各 spec 预分配的 uri（与 src_uris 一一对应）
     std::chrono::microseconds delay{std::chrono::seconds(0)};
+};
+
+struct AsyncCopyExecuteSubmitResult {
+    AsyncCopySubmitResult submit_result;
+    // Becomes ready after the backend coordinator finishes the short PACE
+    // submit phase.  MigrationManager must persist task ids before treating
+    // the terminal completion future as recoverable.
+    std::future<AsyncCopyRemoteSubmitResult> remote_submit_future;
+    std::future<PlanExecuteResult> future;
 };
 
 // 任务类别同时定义 ready task 的调度优先级。Migration continuation 已经持有活跃
@@ -116,6 +135,15 @@ public:
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
+    AsyncCopyExecuteSubmitResult SubmitAsyncCopy(const CacheLocationCopyRequest &task,
+                                                 const std::string &operation_id,
+                                                 const AsyncCopyOptions &options);
+    AsyncCopyExecuteSubmitResult ResumeAsyncCopy(const std::string &storage_name,
+                                                 const std::vector<std::string> &backend_task_ids,
+                                                 size_t expected_items,
+                                                 const std::string &operation_id,
+                                                 const AsyncCopyOptions &options);
+    ErrorCode RequestCancelAsyncCopy(const std::string &storage_name, const std::string &operation_id);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
 
@@ -174,7 +202,8 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          bool prepared_deleting = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,

@@ -49,6 +49,8 @@ void AdminServiceHttp::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveCache);
     MAKE_SERVICE_METRICS_COLLECTOR(MigrateCache);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListAsyncCopyQuarantine);
+    MAKE_SERVICE_METRICS_COLLECTOR(BreakGlassReleaseAsyncCopy);
 
     // for instance APIs
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
@@ -104,6 +106,16 @@ void AdminServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, migrateCache, MigrateCache, MigrateCache, MigrateCache);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post,
+                                            listAsyncCopyQuarantine,
+                                            ListAsyncCopyQuarantine,
+                                            ListAsyncCopyQuarantine,
+                                            ListAsyncCopyQuarantine);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post,
+                                            breakGlassReleaseAsyncCopy,
+                                            BreakGlassReleaseAsyncCopy,
+                                            Common,
+                                            BreakGlassReleaseAsyncCopy);
 
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, registerInstance, RegisterInstance, Common, RegisterInstance);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, removeInstance, RemoveInstance, Common, RemoveInstance);
@@ -314,6 +326,22 @@ void AdminServiceHttp::MigrateCache(coro_http::coro_http_connection *http_conn,
                   request->instance_id().c_str());
 
     admin_service_impl_->MigrateCache(request_context, request, response);
+}
+
+void AdminServiceHttp::ListAsyncCopyQuarantine(
+    coro_http::coro_http_connection *http_conn,
+    proto::admin::ListAsyncCopyQuarantineRequest *request,
+    proto::admin::ListAsyncCopyQuarantineResponse *response) {
+    API_CONTEXT_INIT_HTTP(ListAsyncCopyQuarantine)
+    admin_service_impl_->ListAsyncCopyQuarantine(request_context, request, response);
+}
+
+void AdminServiceHttp::BreakGlassReleaseAsyncCopy(
+    coro_http::coro_http_connection *http_conn,
+    proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+    proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_HTTP(BreakGlassReleaseAsyncCopy)
+    admin_service_impl_->BreakGlassReleaseAsyncCopy(request_context, request, response);
 }
 
 void AdminServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,

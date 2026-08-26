@@ -3542,6 +3542,123 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksExactLocationValue) {
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
 }
 
+TEST_F(MetaSearcherTest, TestMigrationCopyGuardExactOwnershipAndRoundTrip) {
+    const MetaSearcher::KeyVector keys = {151};
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(
+                  meta_searcher_.get(), request_context_.get(), keys, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    MigrationCopyGuard submitting;
+    submitting.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    submitting.set_state(MigrationCopyGuardState::MCGS_SUBMITTING);
+    submitting.set_operation_id("operation-151");
+    submitting.set_source_location_id("source-151");
+    submitting.set_source_location_create_time(12345);
+    submitting.set_source_storage_name("pace_dram");
+    submitting.set_target_storage_name("pace_ssd");
+    submitting.set_total_bytes(4096);
+    submitting.set_create_time_us(100);
+    submitting.set_update_time_us(100);
+
+    MetaSearcher::LocationCASTask install;
+    install.location_id = location_ids[0];
+    install.old_status = CLS_WRITING;
+    install.new_status = CLS_WRITING;
+    install.expected_migration_copy_guard_absent = true;
+    install.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(submitting);
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{install}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    const auto guarded = location_maps[0].at(location_ids[0]);
+    ASSERT_TRUE(guarded->has_migration_copy_guard());
+    EXPECT_EQ(MigrationCopyGuardState::MCGS_SUBMITTING, guarded->migration_copy_guard().state());
+    EXPECT_EQ("operation-151", guarded->migration_copy_guard().operation_id());
+    EXPECT_EQ("source-151", guarded->migration_copy_guard().source_location_id());
+    EXPECT_EQ(4096u, guarded->migration_copy_guard().total_bytes());
+
+    // A second operation cannot steal the first operation's target.
+    MigrationCopyGuard other = submitting;
+    other.set_operation_id("operation-other");
+    auto duplicate_install = install;
+    duplicate_install.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(other);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(
+                  request_context_.get(), keys, {{duplicate_install}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+
+    // Only the exact owner and expected state may attach PACE task handles.
+    MigrationCopyGuard active = submitting;
+    active.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
+    active.set_backend_task_ids({"pace-task-151"});
+    active.set_update_time_us(200);
+    MetaSearcher::LocationCASTask activate;
+    activate.location_id = location_ids[0];
+    activate.old_status = CLS_WRITING;
+    activate.new_status = CLS_WRITING;
+    activate.expected_operation_id = "wrong-operation";
+    activate.expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_SUBMITTING;
+    activate.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(active);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{activate}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+
+    activate.expected_operation_id = "operation-151";
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{activate}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+
+    MetaSearcher::LocationCASTask finalize;
+    finalize.location_id = location_ids[0];
+    finalize.old_status = CLS_WRITING;
+    finalize.new_status = CLS_SERVING;
+    finalize.expected_operation_id = "operation-151";
+    finalize.expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_ACTIVE;
+    finalize.clear_migration_copy_guard = true;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{finalize}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    const auto serving = location_maps[0].at(location_ids[0]);
+    EXPECT_EQ(CLS_SERVING, serving->status());
+    EXPECT_FALSE(serving->has_migration_copy_guard());
+}
+
+TEST_F(MetaSearcherTest, TestExplicitMalformedOrFutureMigrationGuardFailsClosed) {
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::string base = location->ToJsonString();
+    ASSERT_FALSE(base.empty());
+    ASSERT_EQ('}', base.back());
+    base.pop_back();
+
+    CacheLocation parsed;
+    EXPECT_FALSE(parsed.FromJsonString(base + R"(,"migration_copy_guard":{}})"));
+    EXPECT_FALSE(parsed.FromJsonString(
+        base +
+        R"(,"migration_copy_guard":{"schema_version":2,"state":2,"operation_id":"future-op"}})"));
+    EXPECT_FALSE(parsed.FromJsonString(
+        base +
+        R"(,"migration_copy_guard":{"schema_version":1,"state":99,"operation_id":"bad-state"}})"));
+
+    // A fully understood fence still round-trips normally.
+    EXPECT_TRUE(parsed.FromJsonString(
+        base +
+        R"(,"migration_copy_guard":{"schema_version":1,"state":1,"operation_id":"known-op"}})"));
+    EXPECT_TRUE(parsed.has_migration_copy_guard());
+    EXPECT_EQ("known-op", parsed.migration_copy_guard().operation_id());
+}
+
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
     // 准备测试数据
     MetaSearcher::KeyVector keys = {400, 500, 600};
