@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 
@@ -16,7 +17,6 @@ public:
 
     bool Validate() const;
 
-    bool enable() const { return enable_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
     const std::string &consumer_id() const { return consumer_id_; }
     int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
@@ -24,7 +24,6 @@ public:
 private:
     friend class OnlineOptimizerServerConfig;
 
-    bool enable_ = false;
     std::string service_discovery_url_;
     std::string consumer_id_ = "online-optimizer";
     int64_t discovery_refresh_interval_ms_ = 5000;
@@ -51,10 +50,13 @@ public:
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     int32_t io_thread_num() const { return io_thread_num_; }
-    const KvcmEventSubscriptionConfig &kvcm_event_subscription() const { return kvcm_event_subscription_; }
+    const std::vector<KvcmEventSubscriptionConfig> &kvcm_event_subscriptions() const {
+        return kvcm_event_subscriptions_;
+    }
 
 private:
     void UpdateEnviron(EnvironMap &environ);
+    bool ValidateKvcmEventSubscriptions() const;
 
     int32_t rpc_port_ = 50052;
     int32_t http_port_ = 8082;
@@ -64,7 +66,7 @@ private:
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm_optimizer";
     int32_t io_thread_num_ = 4;
-    KvcmEventSubscriptionConfig kvcm_event_subscription_;
+    std::vector<KvcmEventSubscriptionConfig> kvcm_event_subscriptions_;
 
     using SettingFunction = std::function<bool(const std::string &, OnlineOptimizerServerConfig *)>;
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;

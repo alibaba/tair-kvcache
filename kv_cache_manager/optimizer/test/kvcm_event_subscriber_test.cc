@@ -203,10 +203,10 @@ private:
 KvcmEventSubscriptionConfig MakeConfig(const std::string &seed_endpoint, int refresh_interval_ms = 50) {
     OnlineOptimizerServerConfig server_config;
     EXPECT_TRUE(server_config.FromJsonString(
-        std::string(R"({"kvcm_event_subscription":{"enable":true,"service_discovery_url":"static://)") + seed_endpoint +
+        std::string(R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://)") + seed_endpoint +
         R"(","consumer_id":"subscriber-test","discovery_refresh_interval_ms":)" + std::to_string(refresh_interval_ms) +
-        "}}"));
-    return server_config.kvcm_event_subscription();
+        "}]}"));
+    return server_config.kvcm_event_subscriptions().front();
 }
 
 } // namespace

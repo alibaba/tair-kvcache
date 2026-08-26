@@ -46,9 +46,6 @@ KvcmEventSubscriber::KvcmEventSubscriber(const KvcmEventSubscriptionConfig &conf
 KvcmEventSubscriber::~KvcmEventSubscriber() { Stop(); }
 
 bool KvcmEventSubscriber::Init() {
-    if (!config_.enable()) {
-        return true;
-    }
     if (!optimizer_service_) {
         KVCM_LOG_ERROR("KvcmEventSubscriber: optimizer service is null");
         return false;
@@ -63,9 +60,6 @@ bool KvcmEventSubscriber::Init() {
 }
 
 bool KvcmEventSubscriber::Start() {
-    if (!config_.enable()) {
-        return true;
-    }
     if (!service_discovery_ || !optimizer_service_) {
         return false;
     }
