@@ -105,6 +105,7 @@ enum class WrapperKind {
     kNone,
     kInt32,
     kInt64,
+    kUInt64,
     kUnsupportedWellKnownType,
 };
 
@@ -115,6 +116,9 @@ WrapperKind GetWrapperKind(const Descriptor *descriptor) {
     }
     if (name == "google.protobuf.Int64Value") {
         return WrapperKind::kInt64;
+    }
+    if (name == "google.protobuf.UInt64Value") {
+        return WrapperKind::kUInt64;
     }
     if (name.compare(0, sizeof("google.protobuf.") - 1, "google.protobuf.") == 0) {
         return WrapperKind::kUnsupportedWellKnownType;
@@ -128,7 +132,8 @@ bool SupportsDescriptor(const Descriptor *descriptor, std::unordered_set<const D
     }
 
     const WrapperKind wrapper_kind = GetWrapperKind(descriptor);
-    if (wrapper_kind == WrapperKind::kInt32 || wrapper_kind == WrapperKind::kInt64) {
+    if (wrapper_kind == WrapperKind::kInt32 || wrapper_kind == WrapperKind::kInt64 ||
+        wrapper_kind == WrapperKind::kUInt64) {
         return true;
     }
     if (wrapper_kind == WrapperKind::kUnsupportedWellKnownType || descriptor->extension_range_count() != 0) {
@@ -216,6 +221,10 @@ bool WriteWrapper(const Message &message, WrapperKind kind, JsonWriter &writer) 
     }
     if (kind == WrapperKind::kInt64) {
         WriteInt64(reflection->GetInt64(message, value_field), writer);
+        return true;
+    }
+    if (kind == WrapperKind::kUInt64) {
+        WriteUInt64(reflection->GetUInt64(message, value_field), writer);
         return true;
     }
     return false;
@@ -412,6 +421,16 @@ bool ParseWrapperValue(const rapidjson::Value &value, Message *message, WrapperK
             return false;
         }
         reflection->SetInt64(message, field, result);
+        return true;
+    }
+    if (kind == WrapperKind::kUInt64) {
+        uint64_t result = 0;
+        if (value.IsUint64()) {
+            result = value.GetUint64();
+        } else if (!ParseIntegerString(value, &result)) {
+            return false;
+        }
+        reflection->SetUInt64(message, field, result);
         return true;
     }
     return false;
