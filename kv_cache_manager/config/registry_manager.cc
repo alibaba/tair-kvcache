@@ -172,10 +172,14 @@ ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const
 
 ErrorCode RegistryManager::RemoveStorage(RequestContext *request_context, const std::string &global_unique_name) {
     const auto &trace_id = request_context->request_id();
-    auto ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed");
-    ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
+    // Drain/close the runtime backend before deleting the durable config.
+    // Async Copy recovery needs that config to recreate the PACE client; the
+    // old order could lose the only recovery route when Close returned busy or
+    // failed with in-flight operations.
+    auto ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "remove storage failed");
+    ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed after backend close");
     PREFIX_LOG_S(INFO, "remove storage OK");
     return ec;
 }

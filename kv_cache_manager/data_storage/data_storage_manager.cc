@@ -129,6 +129,11 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
         KVCM_LOG_WARN("UnRegisterStorage failed, name: %s not exist", name.c_str());
         return EC_NOENT;
     }
+    if (async_copy_reference_checker_ && async_copy_reference_checker_(name)) {
+        KVCM_LOG_WARN("UnRegisterStorage rejected: storage %s is referenced by an active or quarantined async Copy",
+                      name.c_str());
+        return EC_EXIST;
+    }
     auto ec = iter->second->Close();
     if (ec != EC_OK) {
         KVCM_LOG_WARN("UnRegisterStorage failed, name: %s, type: %d, close storage backend failed with error code: %d",
@@ -139,6 +144,11 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
     }
     storage_map_.erase(iter);
     return ec;
+}
+
+void DataStorageManager::SetAsyncCopyReferenceChecker(std::function<bool(const std::string &)> checker) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    async_copy_reference_checker_ = std::move(checker);
 }
 
 ErrorCode DataStorageManager::DoCleanup() {
@@ -270,6 +280,151 @@ std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
     }
     auto storage_backend = iter->second;
     return storage_backend->Copy(src_uris, dst_uris, trace_id);
+}
+
+bool DataStorageManager::SupportsAsyncCopy(const std::string &unique_name) const {
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end()) {
+            return false;
+        }
+        storage_backend = iter->second;
+    }
+    return storage_backend != nullptr && storage_backend->SupportsAsyncCopy();
+}
+
+AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_context,
+                                                    const std::string &unique_name,
+                                                    const std::vector<DataStorageUri> &src_uris,
+                                                    const std::vector<DataStorageUri> &dst_uris,
+                                                    const std::string &operation_id,
+                                                    const AsyncCopyOptions &options,
+                                                    AsyncCopyRemoteSubmitCompletion remote_submit_completion,
+                                                    AsyncCopyCompletion completion) {
+    SPAN_TRACER(request_context);
+    AsyncCopySubmitResult rejected;
+    rejected.operation_id = operation_id;
+    if (src_uris.size() != dst_uris.size() || src_uris.empty() || !remote_submit_completion || !completion) {
+        rejected.status = EC_BADARGS;
+        rejected.detail = "invalid asynchronous copy input";
+        return rejected;
+    }
+
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        // The shared_ptr is the backend lifetime lease.  Do not retain the
+        // manager lock across remote submit/poll; Disable/Unregister must not
+        // block behind the duration of a physical CopyGA operation.
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || !iter->second) {
+            rejected.status = EC_NOENT;
+            rejected.detail = "storage does not exist";
+            return rejected;
+        }
+        storage_backend = iter->second;
+        if (!storage_backend->Available()) {
+            rejected.status = EC_NOENT;
+            rejected.detail = "storage is unavailable";
+            return rejected;
+        }
+    }
+
+    if (!storage_backend->SupportsAsyncCopy()) {
+        rejected.status = EC_UNIMPLEMENTED;
+        rejected.detail = "storage backend does not support asynchronous copy";
+        return rejected;
+    }
+    const std::string trace_id = request_context ? request_context->trace_id() : std::string();
+    // Keep the backend alive until the exactly-once completion callback.  The
+    // local shared_ptr above only protects the submit call itself; without the
+    // capture an unregister could destroy the coordinator while PACE is still
+    // executing the operation.
+    auto completion_with_backend_lease =
+        [storage_backend, completion = std::move(completion)](AsyncCopyBatchResult result) mutable {
+            completion(std::move(result));
+        };
+    auto remote_submit_with_backend_lease =
+        [storage_backend,
+         remote_submit_completion = std::move(remote_submit_completion)](AsyncCopyRemoteSubmitResult result) mutable {
+            remote_submit_completion(std::move(result));
+        };
+    return storage_backend->CopyAsync(src_uris,
+                                      dst_uris,
+                                      operation_id,
+                                      trace_id,
+                                      options,
+                                      std::move(remote_submit_with_backend_lease),
+                                      std::move(completion_with_backend_lease));
+}
+
+AsyncCopySubmitResult DataStorageManager::ResumeAsyncCopy(RequestContext *request_context,
+                                                          const std::string &unique_name,
+                                                          const std::vector<std::string> &backend_task_ids,
+                                                          size_t expected_items,
+                                                          const std::string &operation_id,
+                                                          const AsyncCopyOptions &options,
+                                                          AsyncCopyCompletion completion) {
+    SPAN_TRACER(request_context);
+    AsyncCopySubmitResult rejected;
+    rejected.operation_id = operation_id;
+    if (backend_task_ids.empty() || expected_items == 0 || operation_id.empty() || !completion) {
+        rejected.status = EC_BADARGS;
+        rejected.detail = "invalid asynchronous copy recovery input";
+        return rejected;
+    }
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || !iter->second) {
+            rejected.status = EC_NOENT;
+            rejected.detail = "recovery storage does not exist";
+            return rejected;
+        }
+        storage_backend = iter->second;
+    }
+    // Recovery/query is a control-plane operation over already-issued backend
+    // task IDs.  Data-path Available()==false is commonly transient and must
+    // not be collapsed into permanent EC_NOENT/UNKNOWN quarantine.  Let the
+    // concrete coordinator resume/query the task and report an authoritative
+    // terminal or unknown result instead.  The shared_ptr lease keeps the
+    // backend alive while it does so.
+    if (!storage_backend->SupportsAsyncCopy()) {
+        rejected.status = EC_UNIMPLEMENTED;
+        rejected.detail = "storage backend does not support asynchronous copy recovery";
+        return rejected;
+    }
+    const std::string trace_id = request_context ? request_context->trace_id() : std::string();
+    auto completion_with_backend_lease =
+        [storage_backend, completion = std::move(completion)](AsyncCopyBatchResult result) mutable {
+            completion(std::move(result));
+        };
+    return storage_backend->ResumeAsyncCopy(backend_task_ids,
+                                            expected_items,
+                                            operation_id,
+                                            trace_id,
+                                            options,
+                                            std::move(completion_with_backend_lease));
+}
+
+ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name,
+                                                     const std::string &operation_id) {
+    if (operation_id.empty()) {
+        return EC_BADARGS;
+    }
+    std::shared_ptr<DataStorageBackend> storage_backend;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        const auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || !iter->second) {
+            return EC_NOENT;
+        }
+        storage_backend = iter->second;
+    }
+    return storage_backend->RequestCancelAsyncCopy(operation_id);
 }
 
 std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,

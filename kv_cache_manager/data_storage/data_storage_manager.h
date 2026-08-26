@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -35,6 +36,7 @@ public:
     ErrorCode
     RegisterStorage(RequestContext *request_context, const std::string &name, const StorageConfig &storage_config);
     ErrorCode UnRegisterStorage(const std::string &name);
+    void SetAsyncCopyReferenceChecker(std::function<bool(const std::string &)> checker);
     ErrorCode DoCleanup();
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
@@ -53,6 +55,23 @@ public:
                                 const std::string &unique_name,
                                 const std::vector<DataStorageUri> &src_uris,
                                 const std::vector<DataStorageUri> &dst_uris);
+    bool SupportsAsyncCopy(const std::string &unique_name) const;
+    AsyncCopySubmitResult CopyAsync(RequestContext *request_context,
+                                    const std::string &unique_name,
+                                    const std::vector<DataStorageUri> &src_uris,
+                                    const std::vector<DataStorageUri> &dst_uris,
+                                    const std::string &operation_id,
+                                    const AsyncCopyOptions &options,
+                                    AsyncCopyRemoteSubmitCompletion remote_submit_completion,
+                                    AsyncCopyCompletion completion);
+    AsyncCopySubmitResult ResumeAsyncCopy(RequestContext *request_context,
+                                          const std::string &unique_name,
+                                          const std::vector<std::string> &backend_task_ids,
+                                          size_t expected_items,
+                                          const std::string &operation_id,
+                                          const AsyncCopyOptions &options,
+                                          AsyncCopyCompletion completion);
+    ErrorCode RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id);
     std::vector<bool>
     Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
@@ -76,6 +95,7 @@ private:
     // stroage unique name -> storage_backend
     std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_map_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::function<bool(const std::string &)> async_copy_reference_checker_;
 };
 
 } // namespace kv_cache_manager

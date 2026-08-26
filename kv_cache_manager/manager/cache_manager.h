@@ -231,7 +231,7 @@ public:
     void JoinCacheGarbageCollector();
 
     // 多层存储迁移控制面随 leader 生命周期启停（OnBecomeLeader/OnNoLongerLeader）。
-    void StartMigrationManager();
+    ErrorCode StartMigrationManager();
     void StopMigrationManager();
 
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager() { return meta_indexer_manager_; }

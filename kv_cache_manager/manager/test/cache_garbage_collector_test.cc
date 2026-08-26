@@ -1257,6 +1257,44 @@ TEST_F(CacheGarbageCollectorTest, ActiveMigrationCopyTargetIsNotCollected) {
     EXPECT_EQ(2, gc->get_cache_gc_candidate_count_metrics());
 }
 
+TEST_F(CacheGarbageCollectorTest, PersistentCopyGuardFencesTargetAndExactSourceWithoutActiveTask) {
+    auto config = DefaultConfig();
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    const int64_t source_create_time = now_us - 100;
+    const std::string source_uri = "dummy://pace_dram/source?size=1";
+    might_exist_by_uri[source_uri] = false;
+
+    auto source = MakeStoredLocation(
+        "source_location", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {source_uri});
+    source->set_create_time(source_create_time);
+    auto target = MakeLocation(
+        "target_location", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
+    guard.set_operation_id("operation-after-restart");
+    guard.set_source_location_id(source->id());
+    guard.set_source_location_create_time(source_create_time);
+    guard.set_source_storage_name("pace_dram");
+    guard.set_target_storage_name("pace_ssd");
+    guard.set_total_bytes(1);
+    target->set_migration_copy_guard(guard);
+
+    CacheLocationMap locations;
+    locations[source->id()] = source;
+    locations[target->id()] = target;
+    const auto request =
+        gc->BuildDeleteActions("instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), now_us)
+            .executor_request;
+
+    EXPECT_TRUE(request.block_keys.empty());
+    EXPECT_TRUE(might_exist_calls.empty());
+    EXPECT_FALSE(gc->IsOrphanWriting(target->id(), *target, now_us));
+}
+
 TEST_F(CacheGarbageCollectorTest, MissingScannedKeyIsNotCountedAsOperationError) {
     auto gc = MakeGc(DefaultConfig());
     PrepareForSingleStep(*gc);

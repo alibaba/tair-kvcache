@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
@@ -12,6 +15,81 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+enum class AsyncCopyOutcome : int32_t {
+    kSuccess = 0,
+    kFailed = 1,
+    kCancelled = 2,
+    kUnknown = 3,
+};
+
+// `error` is diagnostic only.  Target reuse is authorized exclusively by
+// `terminal && safe_to_reuse_dst`; callers must never infer safety from an
+// ErrorCode, timeout, task age or HTTP status.
+struct AsyncCopyItemResult {
+    AsyncCopyOutcome outcome = AsyncCopyOutcome::kUnknown;
+    ErrorCode error = EC_UNKNOWN;
+    bool terminal = false;
+    bool safe_to_reuse_dst = false;
+    std::string backend_task_id;
+    std::string detail;
+};
+
+struct AsyncCopyBatchResult {
+    ErrorCode status = EC_UNKNOWN;
+    std::vector<AsyncCopyItemResult> items;
+    std::string detail;
+
+    bool AllSucceeded() const {
+        return !items.empty() && std::all_of(items.begin(), items.end(), [](const auto &item) {
+            return item.terminal && item.safe_to_reuse_dst && item.outcome == AsyncCopyOutcome::kSuccess;
+        });
+    }
+    bool AllTerminalAndSafe() const {
+        return !items.empty() && std::all_of(items.begin(), items.end(), [](const auto &item) {
+            return item.terminal && item.safe_to_reuse_dst;
+        });
+    }
+};
+
+struct AsyncCopyOptions {
+    int64_t operation_deadline_ms = 10 * 60 * 1000;
+    int64_t initial_poll_interval_ms = 20;
+    int64_t max_poll_interval_ms = 1000;
+};
+
+using AsyncCopyCompletion = std::function<void(AsyncCopyBatchResult)>;
+
+// Result of the short remote submission phase.  This is deliberately
+// separate from AsyncCopySubmitResult: CopyAsync() returns after a local
+// coordinator handoff, while this result reports whether PACE accepted the
+// POST and supplies the durable task handles needed for leader recovery.
+struct AsyncCopyRemoteSubmitResult {
+    ErrorCode status = EC_UNKNOWN;
+    bool accepted = false;
+    // True means the POST may have reached PACE but KVCM did not receive an
+    // authoritative task handle set.  The destination must remain fenced.
+    bool acceptance_unknown = false;
+    std::string operation_id;
+    std::vector<std::string> backend_task_ids;
+    std::string detail;
+};
+
+using AsyncCopyRemoteSubmitCompletion = std::function<void(AsyncCopyRemoteSubmitResult)>;
+
+struct AsyncCopySubmitResult {
+    ErrorCode status = EC_UNIMPLEMENTED;
+    // This flag acknowledges only the local coordinator handoff.  Remote PACE
+    // acceptance is reported later through AsyncCopyRemoteSubmitCompletion.
+    bool accepted = false;
+    // Kept for backends that cannot make local handoff atomic.  Native PACE
+    // asynchronous copy always returns false here because no POST happens
+    // before the handoff result is returned.
+    bool acceptance_unknown = false;
+    std::string operation_id;
+    std::vector<std::string> backend_task_ids;
+    std::string detail;
+};
 
 class DataStorageBackend {
 public:
@@ -69,6 +147,58 @@ public:
                                         const std::vector<DataStorageUri> &dst_uris,
                                         const std::string &trace_id) {
         return std::vector<ErrorCode>(src_uris.size(), EC_UNIMPLEMENTED);
+    }
+
+    virtual bool SupportsAsyncCopy() const { return false; }
+
+    // Native asynchronous copy.  A successful return means the backend owns
+    // the completion callback and will invoke it exactly once.  A rejected
+    // request has no remote side effect unless acceptance_unknown is true.
+    virtual AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &src_uris,
+                                            const std::vector<DataStorageUri> &dst_uris,
+                                            const std::string &operation_id,
+                                            const std::string &trace_id,
+                                            const AsyncCopyOptions &options,
+                                            AsyncCopyRemoteSubmitCompletion remote_submit_completion,
+                                            AsyncCopyCompletion completion) {
+        (void)dst_uris;
+        (void)operation_id;
+        (void)trace_id;
+        (void)options;
+        (void)remote_submit_completion;
+        (void)completion;
+        AsyncCopySubmitResult result;
+        result.status = src_uris.empty() ? EC_BADARGS : EC_UNIMPLEMENTED;
+        result.detail = "backend does not support asynchronous copy";
+        return result;
+    }
+
+    // Reattach a recovered KVCM operation to backend task handles that were
+    // durably recorded before a leader restart.  This must query existing
+    // tasks only; it must never issue a second physical Copy.
+    virtual AsyncCopySubmitResult ResumeAsyncCopy(const std::vector<std::string> &backend_task_ids,
+                                                  size_t expected_items,
+                                                  const std::string &operation_id,
+                                                  const std::string &trace_id,
+                                                  const AsyncCopyOptions &options,
+                                                  AsyncCopyCompletion completion) {
+        (void)backend_task_ids;
+        (void)expected_items;
+        (void)trace_id;
+        (void)options;
+        (void)completion;
+        AsyncCopySubmitResult result;
+        result.operation_id = operation_id;
+        result.status = EC_UNIMPLEMENTED;
+        result.detail = "backend does not support asynchronous copy recovery";
+        return result;
+    }
+
+    // Best-effort request only.  EC_OK means the coordinator accepted the
+    // cancellation intent, not that PACE proved the target drained.
+    virtual ErrorCode RequestCancelAsyncCopy(const std::string &operation_id) {
+        (void)operation_id;
+        return EC_UNIMPLEMENTED;
     }
 
 protected:

@@ -107,9 +107,20 @@ ErrorCode MetaDummyBackend::Open() noexcept {
             if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
                 std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
                 auto loc = std::make_shared<CacheLocation>();
-                if (loc->FromJsonString(field_value)) {
-                    item.locations[loc_id] = std::move(loc);
+                if (!loc->FromJsonString(field_value)) {
+                    // A malformed/future migration guard is an ownership fence
+                    // this binary cannot interpret.  Silently dropping it and
+                    // later rewriting the whole persistence file would erase
+                    // the fence, so fail the complete Open instead.
+                    KVCM_LOG_ERROR("parse persisted CacheLocation failed, path: [%s], key: [%s], location: [%s]",
+                                   path_.c_str(),
+                                   k.c_str(),
+                                   loc_id.c_str());
+                    table_.Clear();
+                    metadata_.clear();
+                    return ErrorCode::EC_CORRUPTION;
                 }
+                item.locations[loc_id] = std::move(loc);
             } else {
                 item.properties[field_name] = std::move(field_value);
             }
