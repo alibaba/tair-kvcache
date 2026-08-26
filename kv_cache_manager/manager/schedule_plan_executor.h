@@ -74,6 +74,10 @@ struct CacheLocationDelRequest {
     // `terminal && safe_to_reuse_dst` proof.  Skip the ordinary status CAS and
     // continue with physical delete + CAD.
     bool prepared_deleting{false};
+    // Retry a previously submitted delete without assuming whether its status
+    // transition reached persistent meta. Admission accepts an already
+    // CLS_DELETING location or performs the ordinary exact-snapshot CAS.
+    bool resume_deleting{false};
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -146,6 +150,8 @@ public:
     ErrorCode RequestCancelAsyncCopy(const std::string &storage_name, const std::string &operation_id);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
+    std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
+                                                        ScheduleTaskClass task_class);
 
     bool SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req,
@@ -203,7 +209,8 @@ private:
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
                           bool authoritative_read = false,
-                          bool prepared_deleting = false);
+                          bool prepared_deleting = false,
+                          bool resume_deleting = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
@@ -211,8 +218,6 @@ private:
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
     std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
-    std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
-                                                        ScheduleTaskClass task_class);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);
