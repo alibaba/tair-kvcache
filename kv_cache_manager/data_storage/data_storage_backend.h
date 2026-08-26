@@ -53,9 +53,17 @@ struct AsyncCopyBatchResult {
 };
 
 struct AsyncCopyOptions {
+    static constexpr int64_t kMinHttpTimeoutWindowsPerDeadline = 16;
+
     int64_t operation_deadline_ms = 10 * 60 * 1000;
     int64_t initial_poll_interval_ms = 20;
     int64_t max_poll_interval_ms = 1000;
+    // Per-request control-plane budgets.  They are deliberately independent
+    // from the end-to-end operation deadline: an HTTP timeout never proves
+    // that a remote Copy task is terminal or that its destination is safe.
+    int64_t connect_timeout_ms = 1000;
+    int64_t submit_timeout_ms = 3000;
+    int64_t query_timeout_ms = 3000;
 };
 
 using AsyncCopyCompletion = std::function<void(AsyncCopyBatchResult)>;
