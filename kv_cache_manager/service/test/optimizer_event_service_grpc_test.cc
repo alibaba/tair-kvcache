@@ -24,6 +24,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
+#include "kv_cache_manager/service/server.h"
 
 using namespace ::testing;
 
@@ -88,6 +89,7 @@ protected:
         SetServingState(RoleState::LEADER, true);
 
         grpc::ServerBuilder builder;
+        Server::ConfigureRpcServerBuilder(&builder);
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
         builder.RegisterService(service_.get());
         server_ = builder.BuildAndStart();
@@ -288,6 +290,30 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));
     EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestAcceptsOptimizerEventAboveDefaultGrpcLimit) {
+    RequestContext request_context("seed-large-report-instance");
+    InstanceGroup instance_group;
+    instance_group.set_name("large-report-group");
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context, instance_group));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(&request_context,
+                                                  "large-report-group",
+                                                  "large-report-instance",
+                                                  256,
+                                                  {LocationSpecInfo("tp0", 128)},
+                                                  ModelDeployment(),
+                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+
+    grpc::ClientContext report_context;
+    proto::optimizer::TraceQueryRequest request;
+    request.set_trace_id("large-raw-report");
+    request.set_instance_id("large-report-instance");
+    request.set_token_ids_le64(EncodeTokenIdsLe64(std::vector<int64_t>(600000, 1)));
+    proto::optimizer::CommonResponse response;
+    ASSERT_TRUE(stub_->ReportOptimizerEvent(&report_context, request, &response).ok());
+    EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
 }
 
 TEST_F(OptimizerEventServiceGRpcTest, TestRejectsInvalidOrUnknownOptimizerEvent) {

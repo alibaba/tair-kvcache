@@ -36,6 +36,12 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+constexpr int kRpcMaxReceiveMessageSize = 16 * 1024 * 1024;
+
+} // namespace
+
 bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
 
@@ -262,6 +268,7 @@ bool Server::StartRpcServer() {
     debug_service_->Init();
 
     grpc::ServerBuilder builder;
+    ConfigureRpcServerBuilder(&builder);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (optimizer_event_service_) {
@@ -284,6 +291,10 @@ bool Server::StartRpcServer() {
         return StartSeparateAdminRpcServer();
     }
     return true;
+}
+
+void Server::ConfigureRpcServerBuilder(grpc::ServerBuilder *builder) {
+    builder->SetMaxReceiveMessageSize(kRpcMaxReceiveMessageSize);
 }
 
 bool Server::StartSeparateAdminRpcServer() {

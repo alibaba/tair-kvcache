@@ -81,6 +81,7 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "//kv_cache_manager/service:grpc_wrapper",
+        "//kv_cache_manager/service",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",
     ],
 )
