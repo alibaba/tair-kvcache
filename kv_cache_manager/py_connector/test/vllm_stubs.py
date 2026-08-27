@@ -16,6 +16,11 @@ import types
 from typing import Optional
 from unittest.mock import MagicMock
 
+#: Modules this run replaced with stand-ins (empty when the real deps are
+#: importable). Tests that need real behaviour (e.g. an actual torch tensor)
+#: skip on membership instead of failing against MagicMocks.
+STUBBED: set = set()
+
 
 def _module(name: str) -> types.ModuleType:
     mod = sys.modules.get(name)
@@ -38,9 +43,41 @@ def _stub_third_party():
     requests installed). Real modules always win."""
     # Pure-attribute deps: a MagicMock module is enough because the pure-logic
     # tests never execute tensor/socket/http work at module import time.
-    for name in ("torch", "triton", "triton.language", "zmq", "requests"):
+    for name in ("torch", "triton", "triton.language", "zmq"):
         if name not in sys.modules and not _importable(name):
             sys.modules[name] = MagicMock(__name__=name)
+            STUBBED.add(name.split(".")[0])
+
+    # requests needs real exception classes, not a MagicMock: production code
+    # subclasses them (manager_client defines KvCacheManagerHTTPError(
+    # requests.HTTPError, AssertionError)), and a MagicMock attribute cannot
+    # serve as a base class (metaclass conflict at class-creation time). The
+    # stand-in mirrors requests' own hierarchy (RequestException(IOError));
+    # the functional entry points stay MagicMocks because the tests patch
+    # them (requests.post / requests.Session) before any call.
+    if "requests" not in sys.modules and not _importable("requests"):
+        req = _module("requests")
+        STUBBED.add("requests")
+
+        class _RequestException(IOError):
+            """Stand-in for requests.exceptions.RequestException."""
+
+        class _HTTPError(_RequestException):
+            pass
+
+        class _ConnectionError(_RequestException):
+            pass
+
+        class _Timeout(_RequestException):
+            pass
+
+        req.RequestException = _RequestException
+        req.HTTPError = _HTTPError
+        req.ConnectionError = _ConnectionError
+        req.Timeout = _Timeout
+        req.Session = MagicMock(name="requests.Session")
+        req.post = MagicMock(name="requests.post")
+        req.get = MagicMock(name="requests.get")
 
     # orjson is used functionally (CoordinateMsgSerializer round trips), so
     # the stand-in must actually (de)serialize; stdlib json handles the

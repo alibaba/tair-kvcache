@@ -13,9 +13,12 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
-import torch
-
+# vllm_stubs must be imported before torch: in the open-source CI (no torch
+# installed) it registers the MagicMock stand-in that the bare `import torch`
+# below then resolves to.
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
+
+import torch
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager, MultiResult)
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
@@ -371,6 +374,8 @@ class TestStagingPool(unittest.TestCase):
         with self.assertRaises(ValueError):
             pool.acquire(5)
 
+    @unittest.skipIf("torch" in vllm_stubs.STUBBED,
+                     "needs a real torch tensor (stubbed in the open-source CI)")
     def test_views_slice_the_same_run(self):
         pool = self._pool(max_blocks=8, block_bytes=16)
         start = pool.acquire(3)
@@ -382,11 +387,14 @@ class TestStagingPool(unittest.TestCase):
     def test_pool_allocates_host_memory_only(self):
         """Zero-VRAM regression guard: even for a CUDA device the pool makes
         exactly one allocation, and it is pinned host memory -- no device-side
-        mirror may come back."""
+        mirror may come back. The fake device keeps the contract testable
+        wherever torch itself is a stand-in."""
+        from types import SimpleNamespace
         from unittest.mock import patch
         from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
         with patch("torch.empty") as empty:
-            _StagingPool(torch.device("cuda"), block_bytes=16, max_blocks=8)
+            _StagingPool(SimpleNamespace(type="cuda"),
+                         per_block_bytes=16, max_blocks=8)
         self.assertEqual(empty.call_count, 1,
                          "pool must own exactly one backing allocation")
         kwargs = empty.call_args.kwargs
