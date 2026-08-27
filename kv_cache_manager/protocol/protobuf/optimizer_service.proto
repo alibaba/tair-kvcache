@@ -266,6 +266,72 @@ message KvcmConfigurationResponse {
     repeated KvcmInstanceConfiguration instances = 3;
 }
 
+enum QuotaPullStatus {
+    QUOTA_PULL_STATUS_UNSPECIFIED = 0;
+    QUOTA_PULL_NO_PLAN = 1;
+    QUOTA_PULL_NOT_MODIFIED = 2;
+    QUOTA_PULL_FROZEN = 3;
+    QUOTA_PULL_PLAN = 4;
+}
+
+message QuotaAllocationProto {
+    string quota_target_id = 1;
+    string instance_group = 3;
+    int64 current_quota_bytes = 4;
+    int64 target_quota_bytes = 5;
+    int64 min_quota_bytes = 6;
+    int64 max_quota_bytes = 7;
+}
+
+message PullQuotaAllocationRequest {
+    string trace_id = 1;
+    string pool_id = 2;
+    string quota_target_id = 3;
+    uint64 last_leader_epoch = 4;
+    uint64 last_allocation_epoch = 5;
+    int64 current_quota_bytes = 6;
+    int64 current_used_bytes = 8;
+    uint64 last_execution_revision = 9;
+}
+
+message PullQuotaAllocationResponse {
+    CommonResponseHeader header = 1;
+    QuotaPullStatus pull_status = 2;
+    string plan_id = 3;
+    string plan_hash = 4;
+    string pool_id = 5;
+    string reason = 9;
+    uint64 leader_epoch = 10;
+    uint64 allocation_epoch = 11;
+    int64 valid_until_ns = 14;
+    bool executable = 16;
+    QuotaAllocationProto allocation = 17;
+    string execution_phase = 18;
+    uint64 execution_revision = 19;
+    int64 release_deadline_ns = 20;
+    int64 release_consecutive_samples = 21;
+    bool writes_quota = 22;
+}
+
+message ReportQuotaResizeResultRequest {
+    string trace_id = 1;
+    string plan_id = 2;
+    string plan_hash = 3;
+    string pool_id = 4;
+    string quota_target_id = 5;
+    uint64 leader_epoch = 6;
+    uint64 allocation_epoch = 7;
+    string phase = 8;
+    string status = 9;
+    string reason = 10;
+    int64 observed_quota_bytes = 11;
+    int64 observed_used_bytes = 12;
+    int64 instance_group_version = 13;
+    uint64 execution_revision = 14;
+}
+
+message ReportQuotaResizeResultResponse { CommonResponseHeader header = 1; }
+
 service OptimizerService {
     // InstanceGroup 管理
     rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
@@ -283,6 +349,10 @@ service OptimizerService {
     // 在线 TraceQuery
     rpc TraceQuery(TraceQueryRequest) returns (TraceQueryResponse);
     rpc ResetStats(OptimizerResetStatsRequest) returns (OptimizerResetStatsResponse);
+
+    // KVCM pulls versioned plans; donors must release before receivers grow.
+    rpc PullQuotaAllocation(PullQuotaAllocationRequest) returns (PullQuotaAllocationResponse);
+    rpc ReportQuotaResizeResult(ReportQuotaResizeResultRequest) returns (ReportQuotaResizeResultResponse);
 }
 
 // KVCM 在现有 Meta gRPC 端口实现该服务。Optimizer 作为客户端建立长连接，

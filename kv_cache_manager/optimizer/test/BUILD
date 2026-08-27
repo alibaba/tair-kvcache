@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "QuotaPlanTest",
+    srcs = ["quota_plan_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:quota_plan",
+    ],
+)
+
+cc_test(
     name = "LruEvictionPolicyTest",
     srcs = [
         "lru_eviction_policy_test.cc",

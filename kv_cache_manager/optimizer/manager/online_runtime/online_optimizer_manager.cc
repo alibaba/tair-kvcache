@@ -62,6 +62,17 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
     return static_cast<int64_t>(lhs * rhs);
 }
 
+uint64_t SaturatingAddUint64(uint64_t lhs, uint64_t rhs) {
+    return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
+}
+
+uint64_t SaturatingMultiplyUint64(uint64_t lhs, uint64_t rhs) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return lhs * rhs;
+}
+
 } // namespace
 
 int64_t OnlineOptimizerManager::ComputeSizeForGroup(const std::vector<LocationSpecInfo> &specs,
@@ -521,6 +532,10 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         if (state->instance_group->enable_theoretical_max_cache()) {
             const uint64_t max_hits = HitCurveProjector::ProjectInfinite(fact);
             state->mrc_window.Record(fact);
+            state->quota_mrc_window.Record(fact);
+            state->quota_input_tokens = SaturatingAddUint64(state->quota_input_tokens, normalized.input_token_len);
+            ++state->quota_accepted_facts;
+            state->quota_newest_event_ns = std::max(state->quota_newest_event_ns, replay_timestamp_ns);
             result.max_hit_count = ClampToInt64(max_hits);
             result.max_hit_rate =
                 normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
@@ -726,6 +741,51 @@ ErrorCode OnlineOptimizerManager::TakeMrcMetrics(std::vector<MrcMetricInfo> &met
     return EC_OK;
 }
 
+OnlineMrcDecisionSnapshot OnlineOptimizerManager::TakeQuotaDecisionSnapshot(
+    const std::map<std::string, std::vector<uint64_t>> &capacity_bytes_by_source, int64_t now_ns) {
+    if (now_ns == 0) {
+        now_ns = static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000;
+    }
+    OnlineMrcDecisionSnapshot snapshot;
+    snapshot.snapshot_id = ++quota_snapshot_generation_;
+    snapshot.created_at_ns = now_ns;
+
+    std::shared_lock lock(instances_mutex_);
+    snapshot.sources.reserve(capacity_bytes_by_source.size());
+    for (const auto &[source_id, capacity_bytes] : capacity_bytes_by_source) {
+        OnlineMrcSourceSnapshot source;
+        source.source_id = source_id;
+        const auto state_it = instances_.find(source_id);
+        if (state_it == instances_.end() || !state_it->second) {
+            snapshot.sources.push_back(std::move(source));
+            continue;
+        }
+        const auto &state = state_it->second;
+        std::lock_guard<std::mutex> guard(state->mutex);
+        std::vector<uint64_t> capacity_blocks;
+        capacity_blocks.reserve(capacity_bytes.size());
+        const uint64_t bytes_per_block = state->size_full > 0 ? static_cast<uint64_t>(state->size_full) : 0;
+        for (uint64_t bytes : capacity_bytes) {
+            capacity_blocks.push_back(bytes_per_block == 0 ? 0 : bytes / bytes_per_block);
+        }
+        const auto hit_blocks = state->quota_mrc_window.TakeHitCounts(capacity_blocks);
+        source.newest_event_time_ns = state->quota_newest_event_ns;
+        source.accepted_facts = state->quota_accepted_facts;
+        source.curve.reserve(capacity_bytes.size());
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        for (size_t i = 0; i < capacity_bytes.size(); ++i) {
+            source.curve.push_back({capacity_bytes[i],
+                                    state->quota_input_tokens,
+                                    i < hit_blocks.size() ? SaturatingMultiplyUint64(hit_blocks[i], block_size) : 0});
+        }
+        state->quota_input_tokens = 0;
+        state->quota_accepted_facts = 0;
+        state->quota_newest_event_ns = 0;
+        snapshot.sources.push_back(std::move(source));
+    }
+    return snapshot;
+}
+
 ErrorCode OnlineOptimizerManager::TakeIntervalMetrics(std::vector<IntervalMetricInfo> &metrics) {
     std::shared_lock lock(instances_mutex_);
     metrics.clear();
@@ -812,6 +872,10 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::fill(state->interval_hits_per_capacity.begin(), state->interval_hits_per_capacity.end(), 0);
     state->interval_max_hits = 0;
     state->mrc_window.Reset();
+    state->quota_mrc_window.Reset();
+    state->quota_input_tokens = 0;
+    state->quota_accepted_facts = 0;
+    state->quota_newest_event_ns = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

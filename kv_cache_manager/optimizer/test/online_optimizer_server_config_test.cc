@@ -206,4 +206,44 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     EXPECT_EQ(8888, config.http_port());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, ParsesHardResizeQuotaPlannerWithAuthoritativeBounds) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({
+        "quota_planner_enable": true,
+        "quota_planner_enable_hard_resize": true,
+        "quota_planner_plan_ttl_seconds": 3600,
+        "quota_planner_release_timeout_seconds": 1800,
+        "quota_planner_pools": [{
+            "pool_id": "pool-a",
+            "quota_scope": "per_replica",
+            "allocatable_bytes": 2000,
+            "allocatable_source": "pool-config",
+            "candidate_step_bytes": 100,
+            "members": [{
+                "quota_target_id": "kvcm-a",
+                "source_id": "instance-a",
+                "instance_group": "group-a",
+                "quota_scope": "per_replica",
+                "current_quota_bytes": 1000,
+                "min_quota_bytes": 500,
+                "configured_max_quota_bytes": 1500,
+                "hardware_max_quota_bytes": 1600,
+                "configured_max_source": "instance-group",
+                "hardware_max_source": "node-inventory"
+            }]
+        }]
+    })"));
+    const auto &quota = config.quota_planner_config();
+    ASSERT_TRUE(quota.enable);
+    ASSERT_TRUE(quota.enable_hard_resize);
+    ASSERT_EQ(1, quota.pools.size());
+    EXPECT_EQ(100, quota.pools[0].candidate_step_bytes);
+    EXPECT_EQ("instance-a", quota.pools[0].members[0].source_id);
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, RejectsHardResizeWithoutPlanner) {
+    OnlineOptimizerServerConfig config;
+    EXPECT_FALSE(config.FromJsonString(R"({"quota_planner_enable_hard_resize": true})"));
+}
+
 } // namespace kv_cache_manager

@@ -1,5 +1,21 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "quota_mrc_snapshot",
+    hdrs = ["quota_runtime/quota_mrc_snapshot.h"],
+)
+
+cc_library(
+    name = "quota_plan",
+    srcs = ["quota_runtime/quota_plan.cc"],
+    hdrs = ["quota_runtime/quota_plan.h"],
+    deps = [
+        ":quota_mrc_snapshot",
+        "//kv_cache_manager/common:jsonizable",
+        "@rapidjson",
+    ],
+)
+
 cc_binary(
     name = "optimizer_main",
     srcs = [
@@ -80,6 +96,8 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/optimizer/config:online_optimizer_config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        ":quota_plan",
+        "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],
 )
@@ -138,6 +156,7 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:string_util",
+        ":quota_plan",
     ],
 )
 
@@ -190,6 +209,7 @@ cc_library(
         "//kv_cache_manager/common:loop_thread",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        ":quota_plan",
         "@grpc//:grpc++",
     ],
 )

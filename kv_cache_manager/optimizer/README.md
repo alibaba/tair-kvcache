@@ -92,6 +92,69 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
 
+### KVBrain 配额闭环
+
+Optimizer 可按固定周期为同一个 pool 下的多个 KVCM 生成版本化配额方案并保存在内存。下面是最小双成员示例；当前 `source_id` 必须等于订阅配置自动注册到 Optimizer 的 `instance_id`，且同一 pool 内每个 KVCM 的该 ID 必须唯一，所有容量单位均为 byte：
+
+```json
+{
+    "quota_planner_enable": true,
+    "quota_planner_enable_hard_resize": false,
+    "quota_planner_period_seconds": 300,
+    "quota_planner_plan_ttl_seconds": 3600,
+    "quota_planner_release_timeout_seconds": 1800,
+    "quota_planner_release_consecutive_samples": 3,
+    "quota_planner_pools": [{
+        "pool_id": "pool-a",
+        "quota_scope": "per_replica",
+        "allocatable_bytes": 962072674304,
+        "allocatable_source": "pool-inventory",
+        "candidate_step_bytes": 8589934592,
+        "max_mrc_freshness_seconds": 300,
+        "members": [{
+            "quota_target_id": "kvcm-a",
+            "source_id": "instance-a",
+            "instance_group": "group-a",
+            "quota_scope": "per_replica",
+            "current_quota_bytes": 481036337152,
+            "min_quota_bytes": 274877906944,
+            "configured_max_quota_bytes": 549755813888,
+            "hardware_max_quota_bytes": 549755813888,
+            "configured_max_source": "instance-group-config",
+            "hardware_max_source": "node-inventory"
+        }, {
+            "quota_target_id": "kvcm-b",
+            "source_id": "instance-b",
+            "instance_group": "group-b",
+            "quota_scope": "per_replica",
+            "current_quota_bytes": 481036337152,
+            "min_quota_bytes": 274877906944,
+            "configured_max_quota_bytes": 549755813888,
+            "hardware_max_quota_bytes": 549755813888,
+            "configured_max_source": "instance-group-config",
+            "hardware_max_source": "node-inventory"
+        }]
+    }]
+}
+```
+
+默认 `quota_planner_enable_hard_resize=false`，只发布 Shadow 计划。真实 resize 还要求对应 KVCM 同时配置：
+
+```properties
+kvcm.quota_policy_poller.enable=true
+kvcm.quota_policy_poller.enable_hard_resize=true
+kvcm.quota_policy_poller.optimizer_service_discovery_url=static://127.0.0.1:50052
+kvcm.quota_policy_poller.pool_id=pool-a
+kvcm.quota_policy_poller.quota_target_id=kvcm-a
+kvcm.quota_policy_poller.instance_group=group-a
+kvcm.quota_policy_poller.state_file=/var/run/kvcm/kvbrain-quota.state
+kvcm.quota_policy_poller.poll_interval_seconds=30
+kvcm.quota_policy_poller.rpc_timeout_ms=1000
+```
+
+执行顺序固定为 `RECONCILE → DONOR_SHRINK → RECEIVER_GROW → COMPLETE`。donor 先用 Instance Group version CAS 修改硬上限，再等待实际使用量不高于目标并连续确认；所有 donor 释放完成前 receiver 不会扩容。`quota_decision_audit` / `quota_resize_audit` 记录计划、状态转换和 CAS 结果，Prometheus 指标前缀为 `quota_plan.*` / `quota_resize.*`。当前只校验窗口内存在事件且事件时间新鲜，不代表 DashTrace 到 KVCM 的端到端事件完整率。
+
+同一 pool 的全部 KVCM 必须使用相同的 Optimizer 服务发现集合；poller 会固定选择排序最小的健康端点，确保各成员消费同一份内存计划。计划不会持久化，Optimizer 重启或切换到另一个进程后需要重新积累 MRC 并生成新计划；此时 KVCM 保持现有硬配额，不会自行扩容。
 
 ### Eviction Policies
 

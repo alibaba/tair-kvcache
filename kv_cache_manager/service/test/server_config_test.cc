@@ -92,6 +92,40 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, ParsesQuotaPolicyPollerConfig) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ = {
+        {"kvcm.quota_policy_poller.enable", "true"},
+        {"kvcm.quota_policy_poller.enable_hard_resize", "true"},
+        {"kvcm.quota_policy_poller.optimizer_service_discovery_url", "static://127.0.0.1:50052"},
+        {"kvcm.quota_policy_poller.pool_id", "pool-a"},
+        {"kvcm.quota_policy_poller.quota_target_id", "kvcm-a"},
+        {"kvcm.quota_policy_poller.instance_group", "group-a"},
+        {"kvcm.quota_policy_poller.state_file", "/tmp/kvbrain-quota-state"},
+        {"kvcm.quota_policy_poller.poll_interval_seconds", "15"},
+        {"kvcm.quota_policy_poller.rpc_timeout_ms", "2000"},
+    };
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_TRUE(config.Check());
+    const auto poller = config.GetQuotaPolicyPollerConfig();
+    EXPECT_TRUE(poller.enable);
+    EXPECT_TRUE(poller.enable_hard_resize);
+    EXPECT_EQ("static://127.0.0.1:50052", poller.optimizer_service_discovery_url);
+    EXPECT_EQ("pool-a", poller.pool_id);
+    EXPECT_EQ("kvcm-a", poller.quota_target_id);
+    EXPECT_EQ(15, poller.poll_interval_seconds);
+    EXPECT_EQ(2000, poller.rpc_timeout_ms);
+}
+
+TEST_F(ServerConfigTest, RejectsHardResizeWhenQuotaPolicyPollerIsDisabled) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ = {
+        {"kvcm.quota_policy_poller.enable_hard_resize", "true"},
+    };
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+}
+
 TEST_F(ServerConfigTest, TestMetricsReporterType) {
     {
         ServerConfig config;

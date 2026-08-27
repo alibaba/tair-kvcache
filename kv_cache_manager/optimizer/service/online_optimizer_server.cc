@@ -3,6 +3,9 @@
 #include <chrono>
 #include <fstream>
 #include <grpcpp/grpcpp.h>
+#include <map>
+#include <set>
+#include <sstream>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
@@ -12,6 +15,7 @@
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_plan.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
@@ -65,7 +69,12 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     metrics_reporter_ =
         std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, kmonitor_metrics_reporter_);
 
-    service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
+    if (config_.quota_planner_config().enable) {
+        quota_plan_store_ = std::make_shared<InMemoryQuotaPlanStore>();
+        quota_planner_ = std::make_unique<ShadowQuotaPlanner>(config_.quota_planner_config());
+    }
+    service_impl_ =
+        std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_, quota_plan_store_, metrics_registry_);
 
     kvcm_event_subscribers_.clear();
     kvcm_event_subscribers_.reserve(config_.kvcm_event_subscriptions().size());
@@ -161,6 +170,19 @@ bool OnlineOptimizerServer::Start() {
         }
     }
 
+    if (quota_planner_) {
+        PlanQuotaOnce();
+        quota_planner_thread_ =
+            LoopThread::CreateLoopThread([this]() { PlanQuotaOnce(); },
+                                         config_.quota_planner_config().period_seconds * 1000 * 1000,
+                                         "KVBrainQuotaPlanner");
+        if (!quota_planner_thread_) {
+            KVCM_LOG_ERROR("Failed to start KVBrain quota planner");
+            Stop();
+            return false;
+        }
+    }
+
     KVCM_LOG_INFO("OnlineOptimizerServer started: rpc_port=%d http_port=%d", config_.rpc_port(), config_.http_port());
     return true;
 }
@@ -207,6 +229,10 @@ void OnlineOptimizerServer::DoStop() {
         metrics_report_thread_->Stop();
         metrics_report_thread_.reset();
     }
+    if (quota_planner_thread_) {
+        quota_planner_thread_->Stop();
+        quota_planner_thread_.reset();
+    }
     if (kmonitor_metrics_reporter_) {
         kmonitor_metrics_reporter_->Shutdown();
         kmonitor_metrics_reporter_.reset();
@@ -243,6 +269,65 @@ void OnlineOptimizerServer::RecoveryRetryLoop() {
         KVCM_LOG_WARN("Recovery retry attempt %d failed (ec=%d)", attempt, static_cast<int>(ec));
     }
     KVCM_LOG_ERROR("Recovery failed after %d retries, running without persisted state", kMaxRetries);
+}
+
+void OnlineOptimizerServer::PlanQuotaOnce() {
+    if (!manager_ || !quota_planner_ || !quota_plan_store_) {
+        return;
+    }
+    std::map<std::string, std::set<uint64_t>> capacity_sets_by_source;
+    for (const auto &pool : config_.quota_planner_config().pools) {
+        for (const auto &member : pool.members) {
+            const int64_t maximum = std::min(member.configured_max_quota_bytes, member.hardware_max_quota_bytes);
+            auto &capacities = capacity_sets_by_source[member.source_id];
+            capacities.insert(static_cast<uint64_t>(member.min_quota_bytes));
+            capacities.insert(static_cast<uint64_t>(member.current_quota_bytes));
+            capacities.insert(static_cast<uint64_t>(maximum));
+            for (int64_t candidate = member.min_quota_bytes;
+                 candidate < maximum && candidate <= maximum - pool.candidate_step_bytes;
+                 candidate += pool.candidate_step_bytes) {
+                capacities.insert(static_cast<uint64_t>(candidate + pool.candidate_step_bytes));
+            }
+        }
+    }
+
+    std::map<std::string, std::vector<uint64_t>> capacities_by_source;
+    for (const auto &[source_id, capacities] : capacity_sets_by_source) {
+        capacities_by_source.emplace(source_id, std::vector<uint64_t>(capacities.begin(), capacities.end()));
+    }
+
+    const auto snapshot = manager_->TakeQuotaDecisionSnapshot(capacities_by_source);
+    for (const auto &plan : quota_planner_->BuildPlans(snapshot, quota_plan_store_->GetObservedQuotas())) {
+        if (!quota_plan_store_->Publish(plan)) {
+            KVCM_LOG_WARN("quota_decision_audit event=plan_publish_skipped pool_id=%s reason=active_plan",
+                          plan->pool_id.c_str());
+            continue;
+        }
+        std::ostringstream allocations;
+        for (const auto &allocation : plan->allocations) {
+            allocations << allocation.quota_target_id << ':' << allocation.current_quota_bytes << "->"
+                        << allocation.target_quota_bytes << ',';
+        }
+        KVCM_LOG_INFO("quota_decision_audit event=plan_published system=KVBrain plan_id=%s plan_hash=%s pool_id=%s "
+                      "snapshot_id=%llu status=%s phase=%s writes_quota=%d reason=%s allocations=%s",
+                      plan->plan_id.c_str(),
+                      plan->plan_hash.c_str(),
+                      plan->pool_id.c_str(),
+                      static_cast<unsigned long long>(plan->mrc_snapshot_id),
+                      plan->status.c_str(),
+                      plan->execution_phase.c_str(),
+                      static_cast<int>(plan->writes_quota),
+                      plan->reason.c_str(),
+                      allocations.str().c_str());
+        if (metrics_registry_) {
+            MetricsTags tags{{"pool_id", plan->pool_id}, {"status", plan->status}, {"phase", plan->execution_phase}};
+            metrics_registry_->GetCounter("quota_plan.published_total", tags) += 1;
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.execution_revision",
+                                  tags,
+                                  static_cast<double>(plan->execution_revision));
+        }
+    }
 }
 
 } // namespace kv_cache_manager
