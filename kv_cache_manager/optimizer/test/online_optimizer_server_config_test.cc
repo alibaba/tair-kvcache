@@ -162,6 +162,35 @@ TEST_F(OnlineOptimizerServerConfigTest, OverrideFromEnvironMap) {
     EXPECT_EQ("static://127.0.0.1:6382", config.kvcm_event_subscriptions()[1].service_discovery_url());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, OverrideQuotaPlannerFromEnvironMap) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({})"));
+
+    std::unordered_map<std::string, std::string> environ = {
+        {"kvcm_optimizer.quota_planner_enable", "true"},
+        {"kvcm_optimizer.quota_planner_enable_hard_resize", "false"},
+        {"kvcm_optimizer.quota_planner_period_seconds", "60"},
+        {"kvcm_optimizer.quota_planner_plan_ttl_seconds", "300"},
+        {"kvcm_optimizer.quota_planner_release_timeout_seconds", "120"},
+        {"kvcm_optimizer.quota_planner_release_consecutive_samples", "4"},
+        {"kvcm_optimizer.quota_planner_pools",
+         R"([{"pool_id":"pool-a","quota_scope":"per_replica","allocatable_bytes":2000,"allocatable_source":"test","candidate_step_bytes":100,"members":[{"quota_target_id":"kvcm-a","source_id":"instance-a","instance_group":"default","quota_scope":"per_replica","current_quota_bytes":1000,"min_quota_bytes":500,"configured_max_quota_bytes":1500,"hardware_max_quota_bytes":1600,"configured_max_source":"test-config","hardware_max_source":"test-hardware"}]}])"},
+    };
+
+    ASSERT_TRUE(config.OverrideFromEnviron(environ));
+    const auto &quota = config.quota_planner_config();
+    EXPECT_TRUE(quota.enable);
+    EXPECT_FALSE(quota.enable_hard_resize);
+    EXPECT_EQ(60, quota.period_seconds);
+    EXPECT_EQ(300, quota.plan_ttl_seconds);
+    EXPECT_EQ(120, quota.release_timeout_seconds);
+    EXPECT_EQ(4, quota.release_consecutive_samples);
+    ASSERT_EQ(1, quota.pools.size());
+    EXPECT_EQ("pool-a", quota.pools[0].pool_id);
+    ASSERT_EQ(1, quota.pools[0].members.size());
+    EXPECT_EQ("kvcm-a", quota.pools[0].members[0].quota_target_id);
+}
+
 TEST_F(OnlineOptimizerServerConfigTest, RejectsInvalidSubscriptions) {
     OnlineOptimizerServerConfig config;
     EXPECT_FALSE(config.FromJsonString(R"({"kvcm_event_subscriptions":[{}]})"));

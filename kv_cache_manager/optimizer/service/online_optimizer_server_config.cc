@@ -83,6 +83,30 @@ std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
          config->quota_planner_config_.enable_hard_resize = value == "true";
          return value == "true" || value == "false";
      }},
+    {"kvcm_optimizer.quota_planner_period_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.period_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_plan_ttl_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.plan_ttl_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_release_timeout_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.release_timeout_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_release_consecutive_samples",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.release_consecutive_samples = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_pools",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         return Jsonizable::FromJsonString(value, config->quota_planner_config_.pools);
+     }},
 };
 // clang-format on
 
