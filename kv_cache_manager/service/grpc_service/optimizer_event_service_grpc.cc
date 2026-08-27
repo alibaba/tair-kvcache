@@ -1,6 +1,8 @@
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -13,6 +15,76 @@
 #include "kv_cache_manager/manager/cache_manager.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+ErrorCode DecodeOptimizerEventTokens(const proto::optimizer::TraceQueryRequest &request,
+                                     RequestContext *request_context,
+                                     CacheManager::TokenIdsVector *tokens) {
+    if (request.token_ids_size() != 0 && !request.token_ids_le64().empty()) {
+        request_context->error_tracer()->AddErrorMsg("token_ids and token_ids_le64 are mutually exclusive");
+        return EC_BADARGS;
+    }
+    if (request.token_ids_le64().empty()) {
+        tokens->assign(request.token_ids().begin(), request.token_ids().end());
+        return EC_OK;
+    }
+    if (request.token_ids_le64().size() % sizeof(int64_t) != 0) {
+        request_context->error_tracer()->AddErrorMsg("token_ids_le64 size must be a multiple of 8");
+        return EC_BADARGS;
+    }
+
+    const auto token_count = request.token_ids_le64().size() / sizeof(int64_t);
+    tokens->resize(token_count);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    std::memcpy(tokens->data(), request.token_ids_le64().data(), request.token_ids_le64().size());
+#else
+    const auto *data = reinterpret_cast<const unsigned char *>(request.token_ids_le64().data());
+    for (size_t token_index = 0; token_index < token_count; ++token_index) {
+        uint64_t value = 0;
+        for (size_t byte_index = 0; byte_index < sizeof(int64_t); ++byte_index) {
+            value |= static_cast<uint64_t>(data[token_index * sizeof(int64_t) + byte_index]) << (byte_index * 8);
+        }
+        (*tokens)[token_index] = static_cast<int64_t>(value);
+    }
+#endif
+    return EC_OK;
+}
+
+ErrorCode PublishOptimizerEvent(CacheManager *cache_manager,
+                                RequestContext *request_context,
+                                const proto::optimizer::TraceQueryRequest &request) {
+    CacheManager::TokenIdsVector tokens;
+    const auto decode_ec = DecodeOptimizerEventTokens(request, request_context, &tokens);
+    if (decode_ec != EC_OK) {
+        return decode_ec;
+    }
+    return cache_manager->ReportOptimizerEvent(
+        request_context,
+        request.instance_id(),
+        {request.block_keys().begin(), request.block_keys().end()},
+        tokens,
+        request.input_token_len(),
+        request.timestamp_ns(),
+        {request.location_spec_names().begin(), request.location_spec_names().end()});
+}
+
+void SetOptimizerEventStatus(ErrorCode ec, RequestContext &request_context, proto::optimizer::Status *status) {
+    if (ec == EC_OK) {
+        status->set_code(proto::optimizer::OK);
+    } else if (ec == EC_BADARGS) {
+        status->set_code(proto::optimizer::INVALID_ARGUMENT);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    } else if (ec == EC_INSTANCE_NOT_EXIST) {
+        status->set_code(proto::optimizer::INSTANCE_NOT_EXIST);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    } else {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    }
+}
+
+} // namespace
 
 OptimizerEventServiceGRpc::OptimizerEventServiceGRpc(std::shared_ptr<SubscriptionEventSink> sink,
                                                      std::shared_ptr<RegistryManager> registry_manager,
@@ -118,26 +190,8 @@ grpc::Status OptimizerEventServiceGRpc::ReportOptimizerEvent(grpc::ServerContext
     }
 
     RequestContext request_context(request->trace_id());
-    const auto ec = cache_manager_->ReportOptimizerEvent(
-        &request_context,
-        request->instance_id(),
-        {request->block_keys().begin(), request->block_keys().end()},
-        {request->token_ids().begin(), request->token_ids().end()},
-        request->input_token_len(),
-        request->timestamp_ns(),
-        {request->location_spec_names().begin(), request->location_spec_names().end()});
-    if (ec == EC_OK) {
-        status->set_code(proto::optimizer::OK);
-    } else if (ec == EC_BADARGS) {
-        status->set_code(proto::optimizer::INVALID_ARGUMENT);
-        status->set_message(request_context.error_tracer()->ToJsonString());
-    } else if (ec == EC_INSTANCE_NOT_EXIST) {
-        status->set_code(proto::optimizer::INSTANCE_NOT_EXIST);
-        status->set_message(request_context.error_tracer()->ToJsonString());
-    } else {
-        status->set_code(proto::optimizer::SERVICE_NOT_READY);
-        status->set_message(request_context.error_tracer()->ToJsonString());
-    }
+    const auto ec = PublishOptimizerEvent(cache_manager_.get(), &request_context, *request);
+    SetOptimizerEventStatus(ec, request_context, status);
     return grpc::Status::OK;
 }
 

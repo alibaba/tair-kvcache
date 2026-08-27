@@ -52,6 +52,18 @@ std::shared_ptr<CacheGetEvent> MakeGetEvent() {
     return event;
 }
 
+std::string EncodeTokenIdsLe64(const std::vector<int64_t> &token_ids) {
+    std::string encoded;
+    encoded.reserve(token_ids.size() * sizeof(int64_t));
+    for (const auto token_id : token_ids) {
+        const auto value = static_cast<uint64_t>(token_id);
+        for (size_t byte_index = 0; byte_index < sizeof(int64_t); ++byte_index) {
+            encoded.push_back(static_cast<char>((value >> (byte_index * 8)) & 0xff));
+        }
+    }
+    return encoded;
+}
+
 } // namespace
 
 class OptimizerEventServiceGRpcTest : public TESTBASE {
@@ -257,6 +269,22 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
               std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
     EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
+    grpc::ClientContext raw_report_context;
+    proto::optimizer::TraceQueryRequest raw_request;
+    raw_request.set_trace_id("reported-raw-trace");
+    raw_request.set_instance_id("report-instance");
+    raw_request.set_token_ids_le64(EncodeTokenIdsLe64({1, 2, 3, 4, 5}));
+    proto::optimizer::CommonResponse raw_response;
+    ASSERT_TRUE(stub_->ReportOptimizerEvent(&raw_report_context, raw_request, &raw_response).ok());
+    ASSERT_EQ(proto::optimizer::OK, raw_response.header().status().code());
+
+    proto::optimizer::TraceQueryRequest raw_received;
+    ASSERT_TRUE(reader->Read(&raw_received));
+    EXPECT_EQ("reported-raw-trace", raw_received.trace_id());
+    EXPECT_EQ(std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()),
+              std::vector<int64_t>(raw_received.block_keys().begin(), raw_received.block_keys().end()));
+    EXPECT_EQ(5, raw_received.input_token_len());
+
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));
     EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
@@ -279,6 +307,25 @@ TEST_F(OptimizerEventServiceGRpcTest, TestRejectsInvalidOrUnknownOptimizerEvent)
     proto::optimizer::CommonResponse unknown_response;
     ASSERT_TRUE(stub_->ReportOptimizerEvent(&unknown_context, unknown_request, &unknown_response).ok());
     EXPECT_EQ(proto::optimizer::INSTANCE_NOT_EXIST, unknown_response.header().status().code());
+
+    grpc::ClientContext ambiguous_context;
+    proto::optimizer::TraceQueryRequest ambiguous_request;
+    ambiguous_request.set_trace_id("ambiguous-report");
+    ambiguous_request.set_instance_id("unknown-instance");
+    ambiguous_request.add_token_ids(1);
+    ambiguous_request.set_token_ids_le64(EncodeTokenIdsLe64({1}));
+    proto::optimizer::CommonResponse ambiguous_response;
+    ASSERT_TRUE(stub_->ReportOptimizerEvent(&ambiguous_context, ambiguous_request, &ambiguous_response).ok());
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, ambiguous_response.header().status().code());
+
+    grpc::ClientContext malformed_context;
+    proto::optimizer::TraceQueryRequest malformed_request;
+    malformed_request.set_trace_id("malformed-report");
+    malformed_request.set_instance_id("unknown-instance");
+    malformed_request.set_token_ids_le64("short");
+    proto::optimizer::CommonResponse malformed_response;
+    ASSERT_TRUE(stub_->ReportOptimizerEvent(&malformed_context, malformed_request, &malformed_response).ok());
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, malformed_response.header().status().code());
 }
 
 TEST_F(OptimizerEventServiceGRpcTest, TestReturnsInstanceConfigurationSnapshot) {
