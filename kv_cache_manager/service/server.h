@@ -9,7 +9,8 @@
 
 namespace grpc {
 class Server;
-}
+class ServerBuilder;
+} // namespace grpc
 
 namespace kv_cache_manager {
 class DebugServiceImpl;
@@ -42,6 +43,7 @@ public:
     void Stop();
 
 private:
+    static void ConfigureRpcServerBuilder(grpc::ServerBuilder *builder);
     bool StartRpcServer();
     bool StartSeparateAdminRpcServer();
     bool StartHttpServer();
