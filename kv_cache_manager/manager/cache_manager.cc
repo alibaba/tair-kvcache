@@ -2114,6 +2114,10 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         }
 
+        if (block_keys.empty()) {
+            continue;
+        }
+
         std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
             request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
 
