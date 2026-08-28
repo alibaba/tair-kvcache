@@ -87,7 +87,8 @@ class ConnectorScheduler:
         self._http_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kvcm_http_")
         self._location_query_manager = LocationQueryManager(
             manager_client, self._http_executor, extra_config.instance_id,
-            extra_config.async_get_cache_location)
+            extra_config.async_get_cache_location,
+            extra_config.location_query_max_age_seconds)
 
         self._tracked: Dict[str, RequestLedger] = {}
         self._waiting_to_load_requests: List[LoadRequest] = []

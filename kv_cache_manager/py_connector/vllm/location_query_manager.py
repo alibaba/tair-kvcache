@@ -4,9 +4,9 @@
 queries run on the http executor and the answer is cached per request
 until consumed. The cache is request-lifecycle scoped -- produced by the
 match hook, consumed by ``update_state_after_alloc`` (which turns the
-answer into a LoadRequest) and invalidated when the request retires. No
-TTL: the producer and the consumer are two hooks of the same request's
-life, so nothing can outlive its usefulness for long.
+answer into a LoadRequest) and invalidated when the request retires --
+plus the expiry below, because a queued request can sit between the two
+hooks for arbitrarily long.
 
 **One slot per request, superseded by the newest ask.** The scheduler
 asks twice per request's life: ``get_num_new_matched_tokens`` (with the
@@ -17,6 +17,13 @@ verbatim. So the cache needs no per-offset addressing; a new ask at a
 different offset is a *different* query that supersedes the old one, and
 only the newest ask's answer may ever be consumed.
 
+**Answers expire.** The manager may delete the blocks a cached answer
+points to at any time after it answered, so a hit is served only while
+younger than ``max_answer_age_s``, measured from query issue. An
+expired hit is a miss: the slot is superseded and the query re-issued.
+In-flight queries are never expired -- the client's request timeout
+bounds them.
+
 **Object identity is the version.** A superseded (or invalidated /
 consumed) query must not write its late answer into the new slot. Each
 ask captures the slot object it created; the async callback compares
@@ -25,6 +32,7 @@ only -- correctness never depends on it.
 """
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -51,26 +59,32 @@ class _Query:
     key: QueryCacheKey
     version: int = 0
     locations: list = None          # None until the manager answered
+    ask_time: float = 0.0           # monotonic clock, at query issue
 
 
 class LocationQueryManager:
     """Per-request location query cache: produce on match, consume on alloc.
 
     One ``_Query`` slot per request. Re-asking the slot's own offset
-    deduplicates (in flight -> wait, answered -> serve); asking a different
-    offset *supersedes* the slot (the newest ask wins, older asks are
-    dropped wherever they are in their lifetime).
+    deduplicates (in flight -> wait, answered -> serve while fresh);
+    asking a different offset *supersedes* the slot. An answered hit
+    older than ``max_answer_age_s`` is a miss: the slot is superseded
+    and the query re-issued.
     """
 
     def __init__(self, manager_client: KvCacheManagerClient, http_executor,
-                 instance_id: str, async_get_cache_location: bool):
+                 instance_id: str, async_get_cache_location: bool,
+                 max_answer_age_s: float = 1.0):
         self._manager_client = manager_client
         self._http_executor = http_executor
         self._instance_id = instance_id
         self._async_get_cache_location = async_get_cache_location
+        self._max_answer_age_s = max_answer_age_s
         self._lock = threading.Lock()
         # req_id -> the request's one active query slot.
         self._queries: Dict[str, _Query] = {}
+        # Hits refused for age and re-fetched.
+        self.stale_supersede_count = 0
 
     def shutdown(self):
         pass
@@ -126,24 +140,36 @@ class LocationQueryManager:
     def get_locations_for_query(self, request, computed_blocks: int) -> Optional[list]:
         """Ask (or re-ask) for the request's external match at this offset.
 
-        Returns the locations when the answer is already cached for this
-        exact query key, None while a query is in flight for it (the
+        Returns the locations when a fresh answer is already cached for
+        this exact query key, None while a query is in flight for it (the
         scheduler re-asks next step), and [] when the query answered "no
-        hit". An ask at a different offset supersedes the slot: a new
-        query starts immediately, and the old one's answer -- arrived or
-        still in flight -- can no longer be consumed. A failed query drops
-        its slot so the next hook call re-issues.
+        hit". An ask at a different offset -- or one whose cached answer
+        has expired -- supersedes the slot: a new query starts
+        immediately, and the old answer can no longer be consumed. A
+        failed query drops its slot so the next hook call re-issues.
         """
         req_id = request.request_id
         key = self._key(request, computed_blocks)
         with self._lock:
             q = self._queries.get(req_id)
             if q is not None and q.key == key:
-                # Same query: wait while in flight (dedupe -- the scheduler
-                # re-asks every step), serve the cached answer otherwise.
-                return None if q.locations is None else q.locations
-            # First ask, or a different offset: the newest ask supersedes.
-            q = _Query(key=key, version=q.version + 1 if q is not None else 0)
+                if q.locations is None:
+                    # Same query still in flight: dedupe (the scheduler
+                    # re-asks every step; the client timeout bounds it).
+                    return None
+                age = time.monotonic() - q.ask_time
+                if age <= self._max_answer_age_s:
+                    return q.locations
+                # Expired: a miss. Old answers are never served.
+                self.stale_supersede_count += 1
+                logger.info("req:%s location answer expired after %.3fs "
+                            "(max %.3fs); re-querying", req_id, age,
+                            self._max_answer_age_s)
+            # First ask, a different offset, or an expired answer: the
+            # newest ask supersedes.
+            q = _Query(key=key,
+                       version=q.version + 1 if q is not None else 0,
+                       ask_time=time.monotonic())
             self._queries[req_id] = q
 
         if self._async_get_cache_location:

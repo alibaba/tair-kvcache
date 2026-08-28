@@ -69,6 +69,12 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
 
     # --- Manager queries ---
     async_get_cache_location: bool = True
+    # How long a cached GetCacheLocation answer may be served, measured
+    # from query issue; an older hit is a miss and re-fetched. Keep this
+    # plus one scheduling step plus the load transfer duration under the
+    # manager's delay_before_delete_ms -- the reclaimer may delete the
+    # pointed-to blocks that late.
+    location_query_max_age_seconds: float = 1.0
 
     # --- Leader discovery / HTTP ---
     auto_discover_leader: bool = False

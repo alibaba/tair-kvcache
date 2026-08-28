@@ -214,6 +214,63 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
 
     # ------------------------------------------------------------------ #
+    # Expiry: an old answer is a miss, never a hit
+    # ------------------------------------------------------------------ #
+    def _expire(self, lqm, req_id="r1"):
+        """Age the request's slot far past every horizon."""
+        with lqm._lock:
+            lqm._queries[req_id].ask_time -= 3600.0
+
+    def test_expired_answer_is_refetched_not_served(self):
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
+        self._gate(0).set()
+        self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
+        self._expire(lqm)
+        # Expired hit: same key, but not served -- re-issued instead.
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
+        self._gate(1)  # the re-query reached the client
+        self.assertEqual(self.client.calls, 2)
+        self.assertEqual(lqm.stale_supersede_count, 1)
+        self._gate(1).set()
+        self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
+
+    def test_fresh_answer_served_without_refetch(self):
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
+        self._gate(0).set()
+        self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
+        # Well inside the horizon: re-asks keep serving the cached answer.
+        for _ in range(3):
+            self.assertEqual(lqm.get_locations_for_query(self.req, 0),
+                             ["loc0", "loc1"])
+        self.assertEqual(self.client.calls, 1)
+        self.assertEqual(lqm.stale_supersede_count, 0)
+
+    def test_expired_answer_refetches_inline_in_sync_mode(self):
+        self.client = GatedClient(answers=[["old"], ["new"]], open=True)
+        lqm = self._manager(async_mode=False)
+        self.assertEqual(lqm.get_locations_for_query(self.req, 0), ["old"])
+        self._expire(lqm)
+        self.assertEqual(lqm.get_locations_for_query(self.req, 0), ["new"])
+        self.assertEqual(self.client.calls, 2)
+        self.assertEqual(lqm.stale_supersede_count, 1)
+
+    def test_expiry_holds_at_the_serve_boundary_not_consume(self):
+        # Consumption pops the slot regardless of age, so expiry holds at
+        # the serve boundary: consume only ever sees a fresh serve's slot.
+        lqm = self._manager()
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
+        self._gate(0).set()
+        self._await_answer(lqm, 0)
+        self._expire(lqm)
+        lqm.store_result("r1", ["loc0"])     # the hook's clamp, post-answer
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # expired: miss
+        self._gate(1).set()
+        self._await_answer(lqm, 0)           # re-answered fresh
+        self.assertEqual(lqm.consume_locations("r1"), (["loc0", "loc1"], 0))
+
+    # ------------------------------------------------------------------ #
     # Consume / store / invalidate
     # ------------------------------------------------------------------ #
     def test_consume_returns_answers_and_empties(self):
