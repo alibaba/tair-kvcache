@@ -1,96 +1,248 @@
-# KVCM 环境变量启动与自动初始化
+# KVCM 环境变量自动初始化
 
-## 1. 功能说明
+## 1. 功能概览
 
-KVCM 启动后会根据环境变量自动创建或更新 EventReport Storage 和 Instance Group，不再需要进入容器手动执行 `kvcm_ops` 命令。
+KVCM 启动后，可以根据环境变量自动创建或更新 Storage 和 Instance Group，无需再进入容器手动执行 `kvcm_ops`。
 
-单机和高可用部署都只访问本机 Admin API。只有 Leader 执行初始化；Follower 晋升为 Leader 后执行相同的初始化。
+自动初始化有四个入口变量：
 
-## 2. 环境变量
+| 环境变量 | 用途 |
+|---|---|
+| `KVCM_L1P5_STORAGE` | 配置 L1.5 EventReport Storage |
+| `KVCM_L2P_STORAGE` | 配置 L2 EventReport Storage |
+| `KVCM_PACE_STORAGE` | 配置 PACE Storage |
+| `KVCM_INSTANCE_GROUP` | 配置公共 Instance Group |
 
-| 环境变量 | 是否必填 | 说明 |
-|---|---|---|
-| `KVCM_ENABLE_SUBSCRIBER_EVENT_REPORT` | 是 | 是否启用 L1.5 Storage，只接受 `true`/`false` |
-| `KVCM_ENABLE_V6D_EVENT_REPORT` | 是 | 是否启用 L2 Storage，只接受 `true`/`false` |
-| `KVCM_INSTANCE_GROUP_NAME` | 开启任一上报时 | Instance Group 名称 |
-| `KVCM_META_STORAGE_BACKEND_CONFIG` | 开启任一上报时 | Meta Storage 配置，格式为 `type,uri`，type 支持 `redis`、`cached` |
-| `KVCM_METADATA_BACKEND_MODE` | 否 | 1～4 的整数；设置时写入 `extra_info.metadata_backend_mode` |
+三个 Storage 变量可以独立使用，也可以任意组合。只要配置了任意一个 Storage，就必须同时配置 `KVCM_INSTANCE_GROUP`。
 
-两个上报开关都为 `false` 时，只启动 KVCM，不创建或更新 Storage 和 Instance Group。
+如果三个 Storage 变量都没有配置，KVCM 正常启动，但不会访问 Admin API，也不会创建、更新或删除任何资源。
 
-EventReport Storage 名称由 Instance Group 名称自动生成：
+## 2. 启动和主从行为
 
-- subscriber 开启时创建 `<instance_group_name>_event_report_l1p5`。
-- V6D 开启时创建 `<instance_group_name>_event_report_l2`。
-- 对应开关关闭时，不创建该类型的 Storage。
+bootstrap 在 KVCM Admin 服务健康后执行，典型调用关系为：
 
-`KVCM_META_STORAGE_BACKEND_CONFIG` 与 `create_instance_group --meta_storage_backend_config` 使用相同的 `type,uri` 格式，当前推荐使用 `cached,redis://...`，URI 必须包含 `cluster_name`。Redis 密码可沿用已有 URI 写法，密码中的 `#` 无需转义。
-
-## 3. URI 参数
-
-以下参数统一配置在 `KVCM_META_STORAGE_BACKEND_CONFIG` 的 URI query 中，未配置时使用默认值：
-
-| 参数 | 默认值 |
-|---|---:|
-| `max_instance_count` | 512 |
-| `quota_capacity` | 2087740652912 |
-| `max_key_count` | 1000000000 |
-| `mutex_shard_num` | 131072 |
-| `batch_key_size` | 1024 |
-
-Redis timeout、shard、async queue 等参数也直接写在同一个 URI 中，并随 URI 传给 Meta Storage Backend。
-
-## 4. Subscriber 与 V6D 组合
-
-| Subscriber | V6D | 创建的 Storage | 主 Storage / quota | EventReport candidates |
-|---|---|---|---|---|
-| 开 | 关 | L1.5 | L1.5 | L1.5 |
-| 关 | 开 | L2 | L2 | L2 |
-| 开 | 开 | L1.5、L2 | L1.5 | L1.5、L2 |
-| 关 | 关 | 不创建 | 不配置 | 不配置 |
-
-`KVCM_METADATA_BACKEND_MODE` 与 subscriber、V6D 开关相互独立。配置时更新 `metadata_backend_mode`；未配置时删除 Instance Group 中已有的该字段，并保留 `extra_info` 中其他字段。
-
-## 5. 配置示例
-
-以下示例同时启用 subscriber 和 V6D，连接信息均为示例值：
-
-```json
-{
-  "KVCM_ENABLE_SUBSCRIBER_EVENT_REPORT": "true",
-  "KVCM_ENABLE_V6D_EVENT_REPORT": "true",
-  "KVCM_INSTANCE_GROUP_NAME": "example_group",
-  "KVCM_METADATA_BACKEND_MODE": "4",
-  "KVCM_META_STORAGE_BACKEND_CONFIG": "cached,redis://default:example#password@redis.example.com:6379?timeout_ms=1000&retry_count=3&cluster_name=example_cluster&num_shard_bits=18&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=16&async_max_batch=1024000&async_max_size=1024000&async_enqueue_timeout_ms=10&async_wait_us=1000000&max_instance_count=512&quota_capacity=2087740652912&max_key_count=1000000000&mutex_shard_num=131072&batch_key_size=1024"
-}
+```text
+start_server.sh
+  -> 启动 KVCM
+  -> 执行 bootstrap
+  -> 读取环境变量
+  -> 对比 Registry 中的 Storage 和 Instance Group
+  -> 创建或更新有变化的资源
 ```
 
-该配置创建 `example_group_event_report_l1p5`、`example_group_event_report_l2` 两个 Storage 和 `example_group`。Instance Group 的主 Storage 和 quota 使用 L1.5，EventReport candidates 为 L1.5、L2。
+高可用部署遵循以下规则：
 
-## 6. 环境变量变化后的行为
+- 每个 KVCM 只访问本机 Admin API。
+- 只有 Leader 修改 Storage 和 Instance Group。
+- Follower 不执行写操作，并持续等待；晋升为 Leader 后重新执行相同的 bootstrap。
+- bootstrap 只负责当前节点，不会主动重启其他 KVCM 节点。
+- 如果 MetaIndexer 配置变化且 Group 已经有 Instance，执行更新的 KVCM 会自动重启一次，以便按新配置恢复 MetaIndexer。
 
-KVCM 重启后，bootstrap 会读取已有配置并按变化类型处理，不会先删除全部资源再重新创建。
+因此，多次启动、Leader 切换或环境变量未变化时，bootstrap 都是幂等的，不会重复创建相同资源。
 
-| 变化 | 行为 |
+## 3. 最简配置
+
+下面是只启用 L1.5 Storage 的最简配置：
+
+```bash
+export KVCM_L1P5_STORAGE='{"unique_name":"example_l1p5"}'
+export KVCM_INSTANCE_GROUP='{"name":"example_group","meta_storage_backend_config":"cached,redis://redis.example.com:6379?cluster_name=example_cluster"}'
+```
+
+启动后会得到：
+
+- Storage：`example_l1p5`
+- Instance Group：`example_group`
+- Group 的主 Storage：`example_l1p5`
+- Group quota：默认 `1000000000` bytes（1 GB）
+
+其余未配置字段使用本文后面的默认值。
+
+## 4. 最全配置
+
+下面展示三个 Storage 和全部可配置字段。示例地址和密码仅用于说明格式：
+
+```bash
+export KVCM_L1P5_STORAGE='{
+  "unique_name": "example_l1p5",
+  "heartbeat_timeout_ms": 30000,
+  "cleanup_grace_ms": 300000,
+  "liveness_check_interval_ms": 5000,
+  "snapshot_min_interval_ms": 30000
+}'
+
+export KVCM_L2P_STORAGE='{
+  "unique_name": "example_l2",
+  "heartbeat_timeout_ms": 30000,
+  "cleanup_grace_ms": 300000,
+  "liveness_check_interval_ms": 5000,
+  "snapshot_min_interval_ms": 30000
+}'
+
+export KVCM_PACE_STORAGE='{
+  "unique_name": "example_pace",
+  "domain": "http://pace.example.com",
+  "timeout": 30,
+  "service_discovery_url": "http://discovery.example.com",
+  "media_type": 2
+}'
+
+export KVCM_INSTANCE_GROUP='{
+  "name": "example_group",
+  "user_data": "example_group",
+  "quota_capacity": 1000000000,
+  "max_instance_count": 512,
+  "reclaim_policy": "POLICY_LRU",
+  "reclaim_used_percentage": 0.8,
+  "max_key_count": 1000000000,
+  "mutex_shard_num": 131072,
+  "batch_key_size": 1024,
+  "search_cache_capacity": 10240,
+  "search_cache_shard_bits": 6,
+  "metadata_backend_mode": 4,
+  "meta_storage_backend_config": "cached,redis://user:password@redis.example.com:6379?cluster_name=example_cluster&timeout_ms=1000"
+}'
+```
+
+这组配置同时创建 L1.5、L2 和 PACE Storage。由于 PACE 的优先级最高，Group 会使用 `example_pace` 作为主 Storage；L1.5 和 L2 则作为 EventReport Storage。
+
+## 5. 主 Storage 选择规则
+
+主 Storage 优先级固定为：
+
+```text
+PACE > L1.5 > L2
+```
+
+| 配置情况 | 主 Storage | EventReport Storage |
+|---|---|---|
+| 配置了 PACE | PACE | 已配置的 L1.5、L2 |
+| 未配置 PACE，但配置了 L1.5 | L1.5 | 已配置的 L1.5、L2 |
+| 只配置 L2 | L2 | L2 |
+| 三个都未配置 | 不执行初始化 | 不执行初始化 |
+
+bootstrap 会根据主 Storage 自动生成 Group 的 `storage_candidates`、quota 类型、reclaim Storage 和 data strategy。EventReport candidates 固定按 L1.5、L2 排序。
+
+## 6. 配置变化后的行为
+
+线上修改环境变量后，KVCM 会重启。新进程启动时，bootstrap 会读取 Registry 中的已有配置并进行对比。
+
+### Storage 变化
+
+| 变化 | KVCM 行为 |
 |---|---|
-| Meta Storage、quota、MetaIndexer 参数变化 | 原地更新当前 Instance Group |
-| Storage 配置变化但名称相同 | 原地更新对应 Storage |
-| 开启 subscriber 或 V6D | 按自动命名规则创建对应 Storage，并更新 Group 引用 |
-| 关闭 subscriber 或 V6D，且另一开关仍开启 | 从 Group candidates 中移除对应 Storage 引用，保留已有 Storage |
-| Instance Group 名称变化 | 按新名称创建 Storage 和 Group，保留旧 Storage 和旧 Group |
-| `KVCM_METADATA_BACKEND_MODE` 修改 | 更新当前 Group 的该字段，保留其他 `extra_info` |
-| `KVCM_METADATA_BACKEND_MODE` 删除 | 删除当前 Group 中的该字段，保留其他 `extra_info` |
-| 两个上报开关都改为 `false` | 跳过初始化，不删除已有 Storage 或 Group |
+| Storage 不存在 | 创建 Storage |
+| Storage 同名且配置一致 | 不处理 |
+| Storage 同名但配置不同 | 更新 Storage；旧 backend 会被重新创建 |
+| Storage 改名 | 创建新名称的 Storage，并更新 Group 引用；旧 Storage 保留 |
+| 删除某个 Storage 环境变量 | 从 Group 中移除该 Storage 的引用；旧 Storage 保留 |
+| 删除全部 Storage 环境变量 | 跳过 bootstrap，不修改或删除已有资源 |
 
-例如 Instance Group 名称从 `example_group` 改为 `example_group_new`，且两个上报开关都开启时：
+### Instance Group 变化
 
-- 创建 `example_group_new_event_report_l1p5`。
-- 创建 `example_group_new_event_report_l2`。
-- 创建 `example_group_new` 并引用两个新 Storage。
-- 原有 Group 和 Storage 保留，后续由用户确认引用关系后手动清理。
+| 变化 | KVCM 行为 |
+|---|---|
+| Group 不存在 | 创建 Group |
+| Group 同名且配置一致 | 不处理 |
+| Group 同名但配置不同 | 使用完整的新配置更新 Group，并保留 bootstrap 不管理的字段 |
+| Group 改名 | 创建新 Group；旧 Group 和旧资源保留 |
 
-## 7. 配置失败
+### 是否需要再次重启
 
-环境变量错误或资源更新失败时，bootstrap 打印错误日志，等待 5 秒后重试，最多重试 2 次。重试仍失败时停止本次自动初始化，但 KVCM 继续运行，用户可以进入容器手动配置。
+一般的 Storage、quota、reclaim 或 candidates 变化，只需要更新 Registry，不要求额外重启。
 
-bootstrap 日志位于容器标准输出/标准错误；KVCM C++ 处理请求产生的日志仍写入 `kv_cache_manager.log`。
+只有 MetaIndexer 相关配置变化时需要进一步判断：
+
+| Group 状态 | KVCM 行为 |
+|---|---|
+| Group 已有 Instance | 先更新 Group，再重启一次；重启后按新配置重建 MetaIndexer |
+| Group 没有 Instance | 只更新 Group，不重启；后续第一个 Instance 注册时直接使用新配置 |
+
+MetaIndexer 相关字段包括：
+
+- `meta_storage_backend_config`
+- `max_key_count`
+- `mutex_shard_num`
+- `batch_key_size`
+- `search_cache_capacity`
+- `search_cache_shard_bits`
+
+### 示例：从 L1.5 切换到 L2
+
+第一次只配置：
+
+```bash
+export KVCM_L1P5_STORAGE='{"unique_name":"example_l1p5"}'
+```
+
+第二次改为：
+
+```bash
+unset KVCM_L1P5_STORAGE
+export KVCM_L2P_STORAGE='{"unique_name":"example_l2"}'
+```
+
+重启后 KVCM 会：
+
+1. 创建 `example_l2`。
+2. 将同名 Group 的主 Storage、quota、reclaim Storage 和 EventReport candidates 更新为 L2。
+3. 保留旧的 `example_l1p5`，但 Group 不再引用它。
+4. 不执行第二次重启，因为 MetaIndexer 配置没有变化。
+
+## 7. 字段说明和默认值
+
+### L1.5 / L2 Storage
+
+| 字段 | 必填 | 默认值 |
+|---|---|---:|
+| `unique_name` | 是 | 无 |
+| `heartbeat_timeout_ms` | 否 | 30000 |
+| `cleanup_grace_ms` | 否 | 300000 |
+| `liveness_check_interval_ms` | 否 | 5000 |
+| `snapshot_min_interval_ms` | 否 | 30000 |
+
+### PACE Storage
+
+| 字段 | 必填 | 默认值或限制 |
+|---|---|---|
+| `unique_name` | 是 | 无 |
+| `domain` | 是 | 无 |
+| `timeout` | 是 | 必须是正整数 |
+| `service_discovery_url` | 否 | 空字符串 |
+| `media_type` | 否 | 新建时为 0，仅支持 0、2 |
+
+更新同名 PACE Storage 时，如果没有配置 `media_type`，会保留已有值；如果显式配置了不同的值，则直接报错。需要切换介质时应使用新的 `unique_name`。PACE SSD/media type 5 不在当前范围。
+
+### Instance Group
+
+| 字段 | 必填 | 默认值 |
+|---|---|---:|
+| `name` | 是 | 无 |
+| `meta_storage_backend_config` | 是 | 无 |
+| `user_data` | 否 | Group 名称 |
+| `quota_capacity` | 否 | 1000000000 |
+| `max_instance_count` | 否 | 512 |
+| `reclaim_policy` | 否 | `POLICY_LRU` |
+| `reclaim_used_percentage` | 否 | 0.8 |
+| `max_key_count` | 否 | 1000000000 |
+| `mutex_shard_num` | 否 | 131072 |
+| `batch_key_size` | 否 | 1024 |
+| `search_cache_capacity` | 否 | 10240 |
+| `search_cache_shard_bits` | 否 | 6 |
+| `metadata_backend_mode` | 否 | 不写入 |
+
+`meta_storage_backend_config` 使用 `type,uri` 格式，type 支持 `redis` 和 `cached`，Redis URI 必须包含 `cluster_name`。URI query 会原样传递给 Meta Backend，Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
+
+## 8. 配置错误和重试
+
+以下情况会被视为配置错误：
+
+- JSON 格式错误、字段类型错误或包含未知字段。
+- 配置了 Storage，但没有配置 `KVCM_INSTANCE_GROUP`。
+- 多个 Storage 使用相同的 `unique_name`。
+- 必填字段缺失或数值超出允许范围。
+- 同名 PACE Storage 的 `media_type` 发生变化。
+
+bootstrap 失败后会等待 5 秒并重试，最多重试 2 次。重试仍失败时停止自动初始化，但 KVCM 进程继续运行，可通过日志排查或手动配置。
+
+bootstrap 日志输出到容器标准输出和标准错误，错误信息不会打印完整 Redis URI 或密码。
