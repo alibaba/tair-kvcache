@@ -616,7 +616,7 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventLargeInSituJsonParserPreservesEs
     EXPECT_FALSE(ReportEventJsonParser::FromMutableNullTerminatedJson(raw_nul.data(), raw_nul.size(), &fast));
 }
 
-TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMatchesGenericParser) {
+TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMatchesProtobufParser) {
     struct CompatibilityCase {
         const char *name;
         std::string json;
@@ -663,15 +663,31 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
 
     for (const auto &test_case : cases) {
         SCOPED_TRACE(test_case.name);
+        proto::meta::ReportEventRequest protobuf_parsed;
+        const bool protobuf_ok = ProtobufFromJson(test_case.json, &protobuf_parsed);
+
+        // The fast codec may conservatively reject a compatible shape, but it
+        // must never accept input with semantics different from protobuf.
+        proto::meta::ReportEventRequest fast_codec_parsed;
+        const bool fast_codec_ok = FastProtoJsonCodec::TryFromJson(test_case.json, &fast_codec_parsed);
+        if (fast_codec_ok) {
+            ASSERT_TRUE(protobuf_ok);
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, fast_codec_parsed));
+        }
+
         proto::meta::ReportEventRequest generic;
         const bool generic_ok = ProtoMessageJsonUtil::FromJson(test_case.json, &generic);
+        EXPECT_EQ(protobuf_ok, generic_ok);
+        if (protobuf_ok && generic_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, generic));
+        }
 
         proto::meta::ReportEventRequest compatible;
         compatible.set_trace_id("must-be-cleared");
         const bool compatible_ok = ReportEventJsonParser::FromJson(test_case.json, &compatible);
-        EXPECT_EQ(generic_ok, compatible_ok);
-        if (generic_ok && compatible_ok) {
-            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(generic, compatible));
+        EXPECT_EQ(protobuf_ok, compatible_ok);
+        if (protobuf_ok && compatible_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, compatible));
         }
 
         // Exercise the HTTP-only in-situ path as well. Appending an ignored
@@ -691,16 +707,30 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
         large_json.append(40 * 1024, 'p');
         large_json += R"json("})json";
 
+        proto::meta::ReportEventRequest protobuf_large;
+        const bool protobuf_large_ok = ProtobufFromJson(large_json, &protobuf_large);
+        EXPECT_EQ(protobuf_ok, protobuf_large_ok);
+
+        proto::meta::ReportEventRequest fast_codec_large;
+        const bool fast_codec_large_ok = FastProtoJsonCodec::TryFromJson(large_json, &fast_codec_large);
+        if (fast_codec_large_ok) {
+            ASSERT_TRUE(protobuf_large_ok);
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, fast_codec_large));
+        }
+
         proto::meta::ReportEventRequest generic_large;
         const bool generic_large_ok = ProtoMessageJsonUtil::FromJson(large_json, &generic_large);
-        EXPECT_EQ(generic_ok, generic_large_ok);
+        EXPECT_EQ(protobuf_large_ok, generic_large_ok);
+        if (protobuf_large_ok && generic_large_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, generic_large));
+        }
 
         proto::meta::ReportEventRequest mutable_compatible;
         const bool mutable_ok = ReportEventJsonParser::FromMutableNullTerminatedJson(
             large_json.data(), large_json.size(), &mutable_compatible);
-        EXPECT_EQ(generic_large_ok, mutable_ok);
-        if (generic_large_ok && mutable_ok) {
-            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(generic_large, mutable_compatible));
+        EXPECT_EQ(protobuf_large_ok, mutable_ok);
+        if (protobuf_large_ok && mutable_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, mutable_compatible));
         }
     }
 }
