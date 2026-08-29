@@ -23,6 +23,7 @@ struct WriteOp {
     WriteOpType type;
     KeyTypeVec keys;
     FieldMapVec field_maps;
+    CacheLocationMapVector locations;
     std::vector<std::vector<std::string>> field_names_vec;
 
     WriteOp() = default;
