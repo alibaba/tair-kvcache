@@ -144,6 +144,12 @@ ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
 - `google.protobuf.Int32Value` 和 `google.protobuf.Int64Value`。
 
 `ProtoMessageJsonUtilTest.TestFastCodecSupportsAllProtocolMessages` 会检查所有当前协议消息。
+新增 `kv_cache_manager/protocol/protobuf/*.proto` 协议文件时，必须同时在该测试的 `protocol_files`
+数组中加入新文件的 `FileDescriptor`（通常通过新文件中任一顶层 message 的 `descriptor()->file()`
+取得），并包含对应的生成 `.pb.h`。否则即使新文件使用了快路径尚未覆盖的字段类型，该测试也无法
+发现。仅在已有协议文件中增删 message 或字段时，不需要手工登记 message，测试会遍历文件内全部
+顶层 message，并递归检查其嵌套类型。
+
 不在列表内的类型仍会回退到 protobuf 3.8 的通用 JSON 实现，功能不受影响，但 access log
 等热点路径无法获得加速。引入例如 `bytes`、其他 map 形态或其他 well-known type 时，应同时补充
 `FastProtoJsonCodec` 的实现与兼容性测试，或者在评审中明确接受相关 message 回退，并调整上述测试。
