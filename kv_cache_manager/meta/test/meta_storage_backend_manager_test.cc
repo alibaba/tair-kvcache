@@ -312,6 +312,36 @@ private:
     std::shared_ptr<BackendLifecycleCalls> calls_;
 };
 
+class PagedCleanupPersistentBackend : public MetaDummyBackend {
+public:
+    ErrorCode ListKeys(RequestContext *,
+                       const std::string &cursor,
+                       int64_t,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        if (cursor == SCAN_BASE_CURSOR) {
+            out_next_cursor = "persistent-page-2";
+            out_keys = {778};
+            return EC_OK;
+        }
+        if (cursor == "persistent-page-2") {
+            out_next_cursor = SCAN_BASE_CURSOR;
+            out_keys = {780};
+            return EC_OK;
+        }
+        return EC_BADARGS;
+    }
+};
+
+class PagedCleanupCacheBackend : public MetaLocalBackend {
+public:
+    std::vector<ErrorCode>
+    GetLocations(RequestContext *, const KeyTypeVec &keys, CacheLocationMapVector &out_locations) noexcept override {
+        out_locations.resize(keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_OK);
+    }
+};
+
 } // namespace
 
 class MetaStorageBackendManagerTest : public TESTBASE {
@@ -1015,6 +1045,62 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{true}), cache_exists);
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestCleanupScanFollowsCurrentListKeysView) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_cleanup_scan";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_cleanup", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto persistent_batch = MakeBatch({778});
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        mgr.persistent_backend_->Put(
+            nullptr, persistent_batch.batch_keys, persistent_batch.batch_locations, persistent_batch.batch_properties));
+    auto cache_batch = MakeBatch({779});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(
+                  nullptr, cache_batch.batch_keys, cache_batch.batch_locations, cache_batch.batch_properties));
+
+    MaintenanceScanBatch scan_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForCleanup(nullptr, SCAN_BASE_CURSOR, 10, scan_batch));
+    EXPECT_EQ((KeyVector{779}), scan_batch.keys);
+    ASSERT_EQ(1u, scan_batch.locations.size());
+    EXPECT_TRUE(scan_batch.locations[0].count("loc_779") > 0);
+
+    auto cache_overlay = MakeBatch({778});
+    cache_overlay.batch_locations[0]["loc_778"] = MakeLocation("loc_778", "cache_uri_778");
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(
+                  nullptr, cache_overlay.batch_keys, cache_overlay.batch_locations, cache_overlay.batch_properties));
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForCleanup(nullptr, SCAN_BASE_CURSOR, 10, scan_batch));
+    EXPECT_EQ((KeyVector{778}), scan_batch.keys);
+    ASSERT_EQ(1u, scan_batch.locations.size());
+    ASSERT_TRUE(scan_batch.locations[0].count("loc_778") > 0);
+    EXPECT_EQ("cache_uri_778", scan_batch.locations[0].at("loc_778")->location_specs()[0].uri());
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestCleanupScanPinsRecoverySourceAcrossPages) {
+    MetaStorageBackendManager mgr;
+    mgr.persistent_backend_ = std::make_unique<PagedCleanupPersistentBackend>();
+    mgr.cache_backend_ = std::make_unique<PagedCleanupCacheBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+
+    MaintenanceScanBatch first_page;
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForCleanup(nullptr, SCAN_BASE_CURSOR, 1, first_page));
+    ASSERT_EQ((KeyVector{778}), first_page.keys);
+    ASSERT_NE(SCAN_BASE_CURSOR, first_page.next_cursor);
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
+    MaintenanceScanBatch second_page;
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForCleanup(nullptr, first_page.next_cursor, 1, second_page));
+    EXPECT_EQ((KeyVector{780}), second_page.keys);
+    EXPECT_EQ(SCAN_BASE_CURSOR, second_page.next_cursor);
 }
 
 // --- PutMetaData / GetMetaData always routed to persistent --------------------

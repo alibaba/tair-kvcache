@@ -24,6 +24,8 @@ namespace kv_cache_manager {
 namespace {
 constexpr int64_t kRecoverScanBatchSize = 1000;
 constexpr int kRecoverMaxConsecutiveFailures = 3;
+constexpr char kCleanupCacheCursorPrefix[] = "cleanup-cache:";
+constexpr char kCleanupRecoverCursorPrefix[] = "cleanup-recover:";
 
 // Collects keys where results[i] == EC_NOENT. Returns {missing_keys, missing_indices}.
 std::pair<KeyTypeVec, std::vector<size_t>> CollectMissingKeys(const KeyVector &keys,
@@ -1533,21 +1535,71 @@ ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext 
                                                                  const std::string &cursor,
                                                                  const int64_t limit,
                                                                  MaintenanceScanBatch &out) noexcept {
-    out.Clear();
-    if (!persistent_backend_) {
-        KVCM_LOG_ERROR("maintenance scan failed, persistent backend is null, instance[%s]", instance_id_.c_str());
-        return EC_ERROR;
+    return ScanLocationsFromBackend(persistent_backend_.get(), request_context, cursor, limit, out);
+}
+
+ErrorCode MetaStorageBackendManager::ScanLocationsForCleanup(RequestContext *request_context,
+                                                             const std::string &cursor,
+                                                             const int64_t limit,
+                                                             MaintenanceScanBatch &out) noexcept {
+    if (!cache_backend_) {
+        return ScanLocationsFromBackend(persistent_backend_.get(), request_context, cursor, limit, out);
     }
 
+    bool use_cache_scan = false;
+    std::string backend_cursor = cursor;
+    if (cursor.compare(0, sizeof(kCleanupCacheCursorPrefix) - 1, kCleanupCacheCursorPrefix) == 0) {
+        use_cache_scan = true;
+        backend_cursor.erase(0, sizeof(kCleanupCacheCursorPrefix) - 1);
+    } else if (cursor.compare(0, sizeof(kCleanupRecoverCursorPrefix) - 1, kCleanupRecoverCursorPrefix) == 0) {
+        backend_cursor.erase(0, sizeof(kCleanupRecoverCursorPrefix) - 1);
+    } else {
+        use_cache_scan = recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning;
+    }
+
+    ErrorCode ec = EC_OK;
+    if (use_cache_scan) {
+        ec = ScanLocationsFromBackend(cache_backend_.get(), request_context, backend_cursor, limit, out);
+    } else {
+        // Before the mirror is complete, preserve the existing ListKeys +
+        // cache-first GetLocations view. In particular, an accepted async write
+        // can already be newer in cache while its Redis command is still queued.
+        out.Clear();
+        MaintenanceScanBatch batch;
+        ec = persistent_backend_->ListKeys(request_context, backend_cursor, limit, batch.next_cursor, batch.keys);
+        if (ec == EC_OK && !batch.keys.empty()) {
+            batch.location_results = GetLocations(request_context, batch.keys, batch.locations);
+        }
+        if (ec == EC_OK) {
+            ec = FinalizeLocationScan(std::move(batch), out);
+        }
+    }
+    if (ec == EC_OK && out.next_cursor != SCAN_BASE_CURSOR) {
+        out.next_cursor.insert(0, use_cache_scan ? kCleanupCacheCursorPrefix : kCleanupRecoverCursorPrefix);
+    }
+    return ec;
+}
+
+ErrorCode MetaStorageBackendManager::ScanLocationsFromBackend(MetaStorageBackend *backend,
+                                                              RequestContext *request_context,
+                                                              const std::string &cursor,
+                                                              const int64_t limit,
+                                                              MaintenanceScanBatch &out) noexcept {
+    out.Clear();
     MaintenanceScanBatch batch;
-    ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
+    ErrorCode ec = backend->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
     if (ec != EC_OK) {
         return ec;
     }
+    return FinalizeLocationScan(std::move(batch), out);
+}
+
+ErrorCode MetaStorageBackendManager::FinalizeLocationScan(MaintenanceScanBatch &&batch,
+                                                          MaintenanceScanBatch &out) noexcept {
     if (batch.next_cursor.empty() || batch.keys.size() != batch.locations.size() ||
         batch.keys.size() != batch.location_results.size()) {
         KVCM_LOG_ERROR(
-            "maintenance scan result invalid, instance[%s] cursor_empty[%d] keys[%zu] locations[%zu] results[%zu]",
+            "location scan result invalid, instance[%s] cursor_empty[%d] keys[%zu] locations[%zu] results[%zu]",
             instance_id_.c_str(),
             batch.next_cursor.empty(),
             batch.keys.size(),

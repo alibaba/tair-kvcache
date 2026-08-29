@@ -681,8 +681,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
-            refresh_results =
-                backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -1853,6 +1852,13 @@ ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_conte
                        ec);
     }
     return ec;
+}
+
+ErrorCode MetaIndexer::ScanLocationsForCleanup(RequestContext *request_context,
+                                               const std::string &cursor,
+                                               const size_t limit,
+                                               MaintenanceScanBatch &out) noexcept {
+    return backend_manager_->ScanLocationsForCleanup(request_context, cursor, static_cast<int64_t>(limit), out);
 }
 
 ErrorCode

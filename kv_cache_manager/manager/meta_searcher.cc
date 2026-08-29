@@ -3671,106 +3671,95 @@ ErrorCode MetaSearcher::CleanupLocationsByHost(RequestContext *request_context,
             KVCM_LOG_INFO("CleanupLocationsByHost: aborted by caller (host_suffix=%s)", host_suffix.c_str());
             return EC_OK;
         }
-        std::string next_cursor;
-        KeyVector keys;
-        if (auto ec = meta_indexer_->Scan(request_context, cursor, scan_batch_size, next_cursor, keys); ec != EC_OK) {
+        MaintenanceScanBatch batch;
+        if (auto ec = meta_indexer_->ScanLocationsForCleanup(request_context, cursor, scan_batch_size, batch);
+            ec != EC_OK) {
             KVCM_LOG_WARN("CleanupLocationsByHost: scan failed, ec %d", ec);
             has_failure = true;
             break;
         }
+        const KeyVector &keys = batch.keys;
         if (!keys.empty()) {
-            CacheLocationMapVector location_maps;
-            auto get_result = meta_indexer_->GetLocations(request_context, keys, location_maps);
-            if (get_result.ec == EC_OK || get_result.ec == EC_PARTIAL_OK) {
-                if (get_result.ec == EC_PARTIAL_OK) {
+            LocationIdsPerKey delete_loc_ids(keys.size());
+            std::vector<std::vector<std::string>> expected_location_values(keys.size());
+            bool has_any_location = false;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (batch.location_results[i] != EC_OK) {
                     has_failure = true;
+                    continue;
                 }
-                LocationIdsPerKey delete_loc_ids(keys.size());
-                std::vector<std::vector<std::string>> expected_location_values(keys.size());
-                bool has_any_location = false;
-                for (size_t i = 0; i < keys.size(); ++i) {
-                    if (get_result.ec == EC_PARTIAL_OK && get_result.error_codes[i] != EC_OK) {
+                for (const auto &[loc_id, location] : batch.locations[i]) {
+                    if (!location) {
+                        has_failure = true;
                         continue;
                     }
-                    for (const auto &kv : location_maps[i]) {
-                        const std::string &loc_id = kv.first;
-                        if (!kv.second) {
-                            has_failure = true;
-                            continue;
-                        }
-                        const CacheLocation &loc = *kv.second;
-                        if (loc.type() == storage_type && loc_id.size() >= host_suffix.size() &&
-                            loc_id.compare(loc_id.size() - host_suffix.size(), host_suffix.size(), host_suffix) == 0) {
-                            delete_loc_ids[i].push_back(loc_id);
-                            expected_location_values[i].push_back(loc.ToJsonString());
-                            has_any_location = true;
-                        }
+                    if (location->type() == storage_type && loc_id.size() >= host_suffix.size() &&
+                        loc_id.compare(loc_id.size() - host_suffix.size(), host_suffix.size(), host_suffix) == 0) {
+                        delete_loc_ids[i].push_back(loc_id);
+                        expected_location_values[i].push_back(location->ToJsonString());
+                        has_any_location = true;
                     }
                 }
-                if (has_any_location) {
-                    MetadataWriteLease cleanup_lease;
-                    if (acquire_cleanup_lease) {
-                        auto [lease_ec, lease] = acquire_cleanup_lease();
-                        if (lease_ec == EC_MISMATCH) {
-                            KVCM_LOG_INFO("CleanupLocationsByHost: lifecycle changed before delete "
-                                          "(host_suffix=%s)",
-                                          host_suffix.c_str());
-                            return EC_OK;
-                        }
-                        if (lease_ec != EC_OK) {
-                            KVCM_LOG_WARN("CleanupLocationsByHost: failed to acquire cleanup lease, ec %d", lease_ec);
-                            return lease_ec;
-                        }
-                        cleanup_lease = std::move(lease);
-                    } else if (should_abort && should_abort()) {
-                        KVCM_LOG_INFO("CleanupLocationsByHost: aborted before delete (host_suffix=%s)",
+            }
+            if (has_any_location) {
+                MetadataWriteLease cleanup_lease;
+                if (acquire_cleanup_lease) {
+                    auto [lease_ec, lease] = acquire_cleanup_lease();
+                    if (lease_ec == EC_MISMATCH) {
+                        KVCM_LOG_INFO("CleanupLocationsByHost: lifecycle changed before delete "
+                                      "(host_suffix=%s)",
                                       host_suffix.c_str());
                         return EC_OK;
                     }
-                    KeyVector delete_keys;
-                    LocationIdsPerKey compact_delete_loc_ids;
-                    std::vector<std::vector<std::string>> compact_expected_location_values;
-                    delete_keys.reserve(keys.size());
-                    compact_delete_loc_ids.reserve(keys.size());
-                    compact_expected_location_values.reserve(keys.size());
-                    for (size_t i = 0; i < keys.size(); ++i) {
-                        if (delete_loc_ids[i].empty()) {
-                            continue;
-                        }
-                        delete_keys.push_back(keys[i]);
-                        compact_delete_loc_ids.push_back(std::move(delete_loc_ids[i]));
-                        compact_expected_location_values.push_back(std::move(expected_location_values[i]));
+                    if (lease_ec != EC_OK) {
+                        KVCM_LOG_WARN("CleanupLocationsByHost: failed to acquire cleanup lease, ec %d", lease_ec);
+                        return lease_ec;
                     }
-                    std::vector<std::vector<ErrorCode>> per_location_ec;
-                    auto del_ec = BatchDeleteLocations(request_context,
-                                                       delete_keys,
-                                                       compact_delete_loc_ids,
-                                                       per_location_ec,
-                                                       compact_expected_location_values);
-                    if (del_ec != EC_OK) {
-                        KVCM_LOG_WARN("CleanupLocationsByHost: BatchDeleteLocations failed, ec %d", del_ec);
-                        has_failure = true;
-                    } else {
-                        for (size_t i = 0; i < per_location_ec.size(); ++i) {
-                            for (const auto &loc_ec : per_location_ec[i]) {
-                                if (loc_ec != EC_OK && loc_ec != EC_NOENT && loc_ec != EC_MISMATCH) {
-                                    KVCM_LOG_WARN(
-                                        "CleanupLocationsByHost: delete location failed for key index %zu, ec %d",
-                                        i,
-                                        loc_ec);
-                                    has_failure = true;
-                                    break;
-                                }
+                    cleanup_lease = std::move(lease);
+                } else if (should_abort && should_abort()) {
+                    KVCM_LOG_INFO("CleanupLocationsByHost: aborted before delete (host_suffix=%s)",
+                                  host_suffix.c_str());
+                    return EC_OK;
+                }
+                KeyVector delete_keys;
+                LocationIdsPerKey compact_delete_loc_ids;
+                std::vector<std::vector<std::string>> compact_expected_location_values;
+                delete_keys.reserve(keys.size());
+                compact_delete_loc_ids.reserve(keys.size());
+                compact_expected_location_values.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    if (delete_loc_ids[i].empty()) {
+                        continue;
+                    }
+                    delete_keys.push_back(keys[i]);
+                    compact_delete_loc_ids.push_back(std::move(delete_loc_ids[i]));
+                    compact_expected_location_values.push_back(std::move(expected_location_values[i]));
+                }
+                std::vector<std::vector<ErrorCode>> per_location_ec;
+                auto del_ec = BatchDeleteLocations(request_context,
+                                                   delete_keys,
+                                                   compact_delete_loc_ids,
+                                                   per_location_ec,
+                                                   compact_expected_location_values);
+                if (del_ec != EC_OK) {
+                    KVCM_LOG_WARN("CleanupLocationsByHost: BatchDeleteLocations failed, ec %d", del_ec);
+                    has_failure = true;
+                } else {
+                    for (size_t i = 0; i < per_location_ec.size(); ++i) {
+                        for (const auto &loc_ec : per_location_ec[i]) {
+                            if (loc_ec != EC_OK && loc_ec != EC_NOENT && loc_ec != EC_MISMATCH) {
+                                KVCM_LOG_WARN("CleanupLocationsByHost: delete location failed for key index %zu, ec %d",
+                                              i,
+                                              loc_ec);
+                                has_failure = true;
+                                break;
                             }
                         }
                     }
                 }
-            } else {
-                KVCM_LOG_WARN("CleanupLocationsByHost: GetLocations failed, ec %d", get_result.ec);
-                has_failure = true;
             }
         }
-        cursor = next_cursor;
+        cursor = batch.next_cursor;
     } while (cursor != SCAN_BASE_CURSOR);
 
     return has_failure ? EC_PARTIAL_OK : EC_OK;

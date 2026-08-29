@@ -144,6 +144,14 @@ public:
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    // Background cleanup view: no-touch after the cache mirror is complete;
+    // while recovering, preserves the existing persistent-key/cache-first
+    // visibility needed by accepted async writes.
+    // Its opaque nonterminal cursor pins that view for the whole scan.
+    ErrorCode ScanLocationsForCleanup(RequestContext *request_context,
+                                      const std::string &cursor,
+                                      int64_t limit,
+                                      MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
 
@@ -183,6 +191,12 @@ private:
     // false when a backend violates the positional response contract or the
     // full pre-update value cannot be made available safely.
     bool EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
+    ErrorCode ScanLocationsFromBackend(MetaStorageBackend *backend,
+                                       RequestContext *request_context,
+                                       const std::string &cursor,
+                                       int64_t limit,
+                                       MaintenanceScanBatch &out) noexcept;
+    ErrorCode FinalizeLocationScan(MaintenanceScanBatch &&batch, MaintenanceScanBatch &out) noexcept;
     // Delete keys that have no remaining location fields. Returns reclaimed count.
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
