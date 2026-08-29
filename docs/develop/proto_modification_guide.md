@@ -138,7 +138,8 @@ ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
 `ProtoMessageJsonUtil` 会对 KVCM 当前协议使用的类型直接做 protobuf Reflection 与 RapidJSON
 之间的转换。新增或修改字段时需要确认其类型是否在以下支持范围内：
 
-- `int32`、`uint32`、`int64`、`uint64`、`float`、`double`、`bool`、`string` 和 enum；
+- `int32`、`uint32`、`int64`、`uint64`、`float`、`double`、`bool`、`string` 和普通 enum
+  （不含 `google.protobuf.NullValue`）；
 - 普通嵌套 message、repeated 和 oneof；
 - `map<string, string>`；
 - `google.protobuf.Int32Value` 和 `google.protobuf.Int64Value`。

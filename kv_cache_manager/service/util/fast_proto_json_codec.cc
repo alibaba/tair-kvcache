@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <google/protobuf/stubs/common.h>
 #include <google/protobuf/stubs/strutil.h>
 #include <limits>
 #include <memory>
@@ -67,10 +68,14 @@ bool SupportsDescriptor(const Descriptor *descriptor, std::unordered_set<const D
             field->is_extension()) {
             return false;
         }
+        if (field->cpp_type() == FieldDescriptor::CPPTYPE_ENUM &&
+            field->enum_type()->full_name() == "google.protobuf.NullValue") {
+            return false;
+        }
         if (field->is_map()) {
             const Descriptor *entry = field->message_type();
-            if (!entry || entry->field_count() != 2 || entry->field(0)->cpp_type() != FieldDescriptor::CPPTYPE_STRING ||
-                entry->field(1)->cpp_type() != FieldDescriptor::CPPTYPE_STRING) {
+            if (!entry || entry->field_count() != 2 || entry->field(0)->type() != FieldDescriptor::TYPE_STRING ||
+                entry->field(1)->type() != FieldDescriptor::TYPE_STRING) {
                 return false;
             }
             continue;
@@ -193,6 +198,9 @@ bool WriteFieldValue(
         const std::string &value =
             repeated ? reflection->GetRepeatedStringReference(message, field, repeated_index, &scratch)
                      : reflection->GetStringReference(message, field, &scratch);
+        if (!::google::protobuf::internal::IsStructurallyValidUTF8(value)) {
+            return false;
+        }
         writer.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
         return true;
     }
@@ -221,6 +229,10 @@ bool WriteMap(const Message &message, const FieldDescriptor *field, JsonWriter &
         std::string value_scratch;
         const std::string &key = entry_reflection->GetStringReference(entry, key_field, &key_scratch);
         const std::string &value = entry_reflection->GetStringReference(entry, value_field, &value_scratch);
+        if (!::google::protobuf::internal::IsStructurallyValidUTF8(key) ||
+            !::google::protobuf::internal::IsStructurallyValidUTF8(value)) {
+            return false;
+        }
         writer.Key(key.data(), static_cast<rapidjson::SizeType>(key.size()));
         writer.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
     }
@@ -415,7 +427,14 @@ bool ParseScalarValue(const rapidjson::Value &value, Message *message, const Fie
             const auto *enum_value =
                 field->enum_type()->FindValueByName(std::string(value.GetString(), value.GetStringLength()));
             if (!enum_value) {
-                return true; // ignore_unknown_fields also ignores unknown enum names
+                int32_t enum_number = 0;
+                if (!ParseIntegerString(value, &enum_number)) {
+                    return true; // ignore_unknown_fields also ignores unknown enum names
+                }
+                enum_value = field->enum_type()->FindValueByNumber(enum_number);
+                if (!enum_value) {
+                    return true; // protobuf ignores unknown quoted enum numbers
+                }
             }
             number = enum_value->number();
         } else if (value.IsInt()) {

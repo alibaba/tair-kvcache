@@ -98,7 +98,7 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
 }
 
-TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypeFallsBackToProtobufJsonUtil) {
+TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypesFallBackToProtobufJsonUtil) {
     UnsupportedBytesMessage message;
     message.set_value(std::string("\0\1\2", 3));
     EXPECT_FALSE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
@@ -110,6 +110,30 @@ TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypeFallsBackToProtobufJsonUtil)
     UnsupportedBytesMessage parsed;
     ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(json, &parsed));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(message, parsed));
+
+    UnsupportedMapBytesMessage map_bytes;
+    (*map_bytes.mutable_value())["key"] = std::string("\0\1\2", 3);
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(map_bytes.GetDescriptor()));
+    std::string protobuf_map_json;
+    std::string compatible_map_json;
+    ASSERT_TRUE(ProtobufToJson(map_bytes, &protobuf_map_json));
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&map_bytes, compatible_map_json));
+    EXPECT_EQ(protobuf_map_json, compatible_map_json);
+    UnsupportedMapBytesMessage parsed_map_bytes;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(compatible_map_json, &parsed_map_bytes));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(map_bytes, parsed_map_bytes));
+
+    UnsupportedNullValueMessage null_value;
+    null_value.set_value(google::protobuf::NULL_VALUE);
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(null_value.GetDescriptor()));
+    std::string protobuf_null_json;
+    std::string compatible_null_json;
+    ASSERT_TRUE(ProtobufToJson(null_value, &protobuf_null_json));
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&null_value, compatible_null_json));
+    EXPECT_EQ(protobuf_null_json, compatible_null_json);
+    UnsupportedNullValueMessage parsed_null_value;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(compatible_null_json, &parsed_null_value));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(null_value, parsed_null_value));
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecParsesArenaMessageTransactionally) {
@@ -159,8 +183,17 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecMatchesProtobufForScalarEdgeCases)
     invalid_utf8.set_stringvalue(std::string(1, static_cast<char>(0xff)));
     std::string protobuf_invalid_json;
     std::string fast_invalid_json;
-    EXPECT_EQ(ProtobufToJson(invalid_utf8, &protobuf_invalid_json),
-              FastProtoJsonCodec::TryToJson(invalid_utf8, fast_invalid_json));
+    std::string compatible_invalid_json;
+    ASSERT_TRUE(ProtobufToJson(invalid_utf8, &protobuf_invalid_json));
+    EXPECT_FALSE(FastProtoJsonCodec::TryToJson(invalid_utf8, fast_invalid_json));
+    EXPECT_TRUE(fast_invalid_json.empty());
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&invalid_utf8, compatible_invalid_json));
+    EXPECT_EQ(protobuf_invalid_json, compatible_invalid_json);
+
+    proto::meta::ReportEventRequest invalid_map_utf8;
+    auto *heartbeat = invalid_map_utf8.add_events()->mutable_heartbeat();
+    (*heartbeat->mutable_system_status())["state"] = std::string(1, static_cast<char>(0xff));
+    EXPECT_FALSE(FastProtoJsonCodec::TryToJson(invalid_map_utf8, fast_invalid_json));
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonSimple) {
@@ -627,6 +660,8 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
          R"json({"trace_id":"t","instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem?size=1"}]}}],"storage_type":"ST_EVENT_REPORT_L2"})json"},
         {"camel_case_and_numeric_enums",
          R"json({"traceId":"t","instanceId":"i","hostIpPort":"h:1","events":[{"eventType":5,"heartbeat":{"systemStatus":{"state":"ready"}}}],"storageType":8})json"},
+        {"quoted_numeric_enums",
+         R"json({"trace_id":"t","instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"5","heartbeat":{"system_status":{"state":"ready"}}}],"storage_type":"8"})json"},
         {"known_null_fields",
          R"json({"trace_id":null,"instance_id":"i","host_ip_port":"h:1","events":null,"storage_type":null})json"},
         {"unknown_enum_names",

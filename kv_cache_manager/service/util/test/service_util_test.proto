@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "google/protobuf/struct.proto";
+
 message SimpleMessage {
     int32 int32Value = 1;
     uint32 uint32Value = 2;
@@ -37,4 +39,12 @@ message RepeatMessage {
 
 message UnsupportedBytesMessage {
     bytes value = 1;
+}
+
+message UnsupportedMapBytesMessage {
+    map<string, bytes> value = 1;
+}
+
+message UnsupportedNullValueMessage {
+    google.protobuf.NullValue value = 1;
 }
