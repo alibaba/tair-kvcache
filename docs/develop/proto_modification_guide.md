@@ -150,12 +150,16 @@ HTML-safe 的 `\uXXXX` 形式；两种 JSON 解析后得到相同字符串，且
 因此快路径输出只能作为 JSON 或日志 JSON 消费，不能未经 HTML 层转义就直接嵌入可执行的
 `<script>` 内容。
 
-`ProtoMessageJsonUtilTest.TestFastCodecSupportsAllProtocolMessages` 会检查所有当前协议消息。
-新增 `kv_cache_manager/protocol/protobuf/*.proto` 协议文件时，必须同时在该测试的 `protocol_files`
+`FastProtoJsonCodecConformanceTest.TestAllRegisteredProtocolMessagesMatchProtobufJsonSemantics` 会检查所有
+当前协议消息。测试通过 Reflection 构造空消息及多组包含边界值、转义字符串、repeated、map、wrapper、
+oneof 和嵌套 message 的确定性样本，并以 protobuf 3.8 通用 JSON 实现作为 oracle，检查快路径输出的
+JSON 语义相同、两边输出均可由另一边解析回原消息。
+
+新增 `kv_cache_manager/protocol/protobuf/*.proto` 协议文件时，必须同时在该测试的 `kProtocolFiles`
 数组中加入新文件的 `FileDescriptor`（通常通过新文件中任一顶层 message 的 `descriptor()->file()`
-取得），并包含对应的生成 `.pb.h`。否则即使新文件使用了快路径尚未覆盖的字段类型，该测试也无法
-发现。仅在已有协议文件中增删 message 或字段时，不需要手工登记 message，测试会遍历文件内全部
-顶层 message，并递归检查其嵌套类型。
+取得），并包含对应的生成 `.pb.h`。否则即使新文件使用了快路径尚未覆盖的字段类型或行为，该测试也
+无法发现。仅在已有协议文件中增删 message 或字段时，不需要手工登记 message，测试会遍历文件内全部
+顶层 message，并递归构造其嵌套类型。
 
 不在列表内的类型仍会回退到 protobuf 3.8 的通用 JSON 实现，功能不受影响，但 access log
 等热点路径无法获得加速。引入例如 `bytes`、其他 map 形态或其他 well-known type 时，应同时补充

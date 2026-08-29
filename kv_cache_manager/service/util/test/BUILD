@@ -30,6 +30,18 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "FastProtoJsonCodecConformanceTest",
+    srcs = ["fast_proto_json_codec_conformance_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:proto_message_json_util",
+        "@com_google_protobuf//:protobuf",
+        "@rapidjson",
+    ],
+)
+
 tf_proto_library_cc(
     name = "service_util_test",
     srcs = [

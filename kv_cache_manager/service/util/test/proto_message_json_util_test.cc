@@ -10,10 +10,7 @@
 #include "google/protobuf/util/message_differencer.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
-#include "kv_cache_manager/protocol/protobuf/debug_service.pb.h"
-#include "kv_cache_manager/protocol/protobuf/kv_meta_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
-#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
 #include "service/util/fast_proto_json_codec.h"
@@ -63,33 +60,6 @@ std::string JsonWithUnknownArrayNesting(int depth) {
 class ProtoMessageJsonUtilTest : public TESTBASE {
 public:
 };
-
-TEST_F(ProtoMessageJsonUtilTest, TestFastCodecSupportsAllProtocolMessages) {
-    const google::protobuf::FileDescriptor *protocol_files[] = {
-        proto::admin::Status::descriptor()->file(),
-        proto::debug::Status::descriptor()->file(),
-        proto::kv_meta::Status::descriptor()->file(),
-        proto::meta::Status::descriptor()->file(),
-        proto::optimizer::Status::descriptor()->file(),
-    };
-    for (const auto *file : protocol_files) {
-        SCOPED_TRACE(file->name());
-        for (int i = 0; i < file->message_type_count(); ++i) {
-            SCOPED_TRACE(file->message_type(i)->full_name());
-            const auto *descriptor = file->message_type(i);
-            ASSERT_TRUE(FastProtoJsonCodec::Supports(descriptor));
-
-            const auto *prototype = google::protobuf::MessageFactory::generated_factory()->GetPrototype(descriptor);
-            ASSERT_NE(nullptr, prototype);
-            std::unique_ptr<google::protobuf::Message> message(prototype->New());
-            std::string protobuf_json;
-            std::string fast_json;
-            ASSERT_TRUE(ProtobufToJson(*message, &protobuf_json));
-            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(*message, fast_json));
-            EXPECT_EQ(protobuf_json, fast_json);
-        }
-    }
-}
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) {
     proto::meta::ReportEventRequest event_request;
