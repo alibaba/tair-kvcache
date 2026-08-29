@@ -7,12 +7,19 @@ config_setting(
 
 cc_library(
     name = "proto_message_json_util",
-    srcs = ["proto_message_json_util.cc"],
-    hdrs = ["proto_message_json_util.h"],
+    srcs = [
+        "fast_proto_json_codec.cc",
+        "proto_message_json_util.cc",
+    ],
+    hdrs = [
+        "fast_proto_json_codec.h",
+        "proto_message_json_util.h",
+    ],
     include_prefix = "service/util",
     deps = [
         ":grpc_wrapper",
         "//kv_cache_manager/common",
+        "@rapidjson",
     ],
 )
 

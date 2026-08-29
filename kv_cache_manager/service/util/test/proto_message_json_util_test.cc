@@ -1,21 +1,167 @@
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "google/protobuf/arena.h"
+#include "google/protobuf/util/json_util.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/debug_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/kv_meta_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
+#include "service/util/fast_proto_json_codec.h"
 #include "service/util/proto_message_json_util.h"
 #include "service/util/test/service_util_test.pb.h"
 
 namespace kv_cache_manager {
 
+namespace {
+
+bool ProtobufToJson(const google::protobuf::Message &message, std::string *json) {
+    google::protobuf::util::JsonPrintOptions options;
+    options.always_print_primitive_fields = true;
+    options.preserve_proto_field_names = true;
+    return google::protobuf::util::MessageToJsonString(message, json, options).ok();
+}
+
+bool ProtobufFromJson(std::string_view json, google::protobuf::Message *message) {
+    google::protobuf::util::JsonParseOptions options;
+    options.ignore_unknown_fields = true;
+    const google::protobuf::StringPiece input(json.data(), static_cast<ptrdiff_t>(json.size()));
+    return google::protobuf::util::JsonStringToMessage(input, message, options).ok();
+}
+
+} // namespace
+
 class ProtoMessageJsonUtilTest : public TESTBASE {
 public:
 };
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecSupportsAllProtocolMessages) {
+    const google::protobuf::FileDescriptor *protocol_files[] = {
+        proto::admin::Status::descriptor()->file(),
+        proto::debug::Status::descriptor()->file(),
+        proto::kv_meta::Status::descriptor()->file(),
+        proto::meta::Status::descriptor()->file(),
+        proto::optimizer::Status::descriptor()->file(),
+    };
+    for (const auto *file : protocol_files) {
+        SCOPED_TRACE(file->name());
+        for (int i = 0; i < file->message_type_count(); ++i) {
+            SCOPED_TRACE(file->message_type(i)->full_name());
+            const auto *descriptor = file->message_type(i);
+            ASSERT_TRUE(FastProtoJsonCodec::Supports(descriptor));
+
+            const auto *prototype = google::protobuf::MessageFactory::generated_factory()->GetPrototype(descriptor);
+            ASSERT_NE(nullptr, prototype);
+            std::unique_ptr<google::protobuf::Message> message(prototype->New());
+            std::string protobuf_json;
+            std::string fast_json;
+            ASSERT_TRUE(ProtobufToJson(*message, &protobuf_json));
+            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(*message, fast_json));
+            EXPECT_EQ(protobuf_json, fast_json);
+        }
+    }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) {
+    proto::meta::ReportEventRequest event_request;
+    auto *event = event_request.add_events();
+    event->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    (*event->mutable_heartbeat()->mutable_system_status())["state"] = "ready";
+    (*event->mutable_heartbeat()->mutable_system_status())["load"] = "7";
+
+    std::string event_json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(event_request, event_json));
+    std::string protobuf_event_json;
+    ASSERT_TRUE(ProtobufToJson(event_request, &protobuf_event_json));
+    EXPECT_EQ(protobuf_event_json, event_json);
+    proto::meta::ReportEventRequest parsed_event;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(event_json, &parsed_event));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(event_request, parsed_event));
+
+    proto::admin::MigrationMarkMethodConfig wrapper_message;
+    wrapper_message.set_enabled(true);
+    wrapper_message.mutable_timeout_ms()->set_value(1234567890123LL);
+    std::string wrapper_json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(wrapper_message, wrapper_json));
+    EXPECT_EQ(R"({"enabled":true,"timeout_ms":"1234567890123"})", wrapper_json);
+    proto::admin::MigrationMarkMethodConfig parsed_wrapper;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypeFallsBackToProtobufJsonUtil) {
+    UnsupportedBytesMessage message;
+    message.set_value(std::string("\0\1\2", 3));
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
+
+    std::string json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&message, json));
+    EXPECT_EQ(R"({"value":"AAEC"})", json);
+
+    UnsupportedBytesMessage parsed;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(json, &parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(message, parsed));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecParsesArenaMessageTransactionally) {
+    google::protobuf::Arena arena;
+    auto *request = google::protobuf::Arena::CreateMessage<proto::meta::GetCacheLocationsByBackendRequest>(&arena);
+    request->set_trace_id("before");
+    ASSERT_NE(nullptr, request->GetArena());
+
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(
+        R"({"trace_id":"after","instance_id":"instance","query_type":"QT_BATCH_GET","block_keys":["1","2"]})",
+        request));
+    EXPECT_EQ("after", request->trace_id());
+    EXPECT_EQ(2, request->block_keys_size());
+
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(R"({"block_keys":["invalid"]})", request));
+    EXPECT_EQ("after", request->trace_id());
+    EXPECT_EQ(2, request->block_keys_size());
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecMatchesProtobufForScalarEdgeCases) {
+    SimpleMessage source;
+    source.set_int32value(std::numeric_limits<int32_t>::min());
+    source.set_uint32value(std::numeric_limits<uint32_t>::max());
+    source.set_int64value(std::numeric_limits<int64_t>::min());
+    source.set_uint64value(std::numeric_limits<uint64_t>::max());
+    source.set_doublevalue(std::numeric_limits<double>::infinity());
+    source.set_floatvalue(-std::numeric_limits<float>::infinity());
+    source.set_boolvalue(true);
+    constexpr char kSpecialString[] = "quote:\" slash:\\ newline:\n nul:\0 unicode:雪";
+    source.set_stringvalue(kSpecialString, sizeof(kSpecialString) - 1);
+
+    std::string protobuf_json;
+    std::string fast_json;
+    ASSERT_TRUE(ProtobufToJson(source, &protobuf_json));
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(source, fast_json));
+    EXPECT_EQ(protobuf_json, fast_json);
+
+    const std::string compatible_json =
+        R"({"int32Value":"-2147483648","uint32Value":"4294967295","int64Value":-9223372036854775808,"uint64Value":"18446744073709551615","doubleValue":"Infinity","floatValue":"-Infinity","boolValue":true,"stringValue":"unicode:\u96ea","future":{"ignored":true}})";
+    SimpleMessage protobuf_parsed;
+    SimpleMessage fast_parsed;
+    ASSERT_TRUE(ProtobufFromJson(compatible_json, &protobuf_parsed));
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(compatible_json, &fast_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, fast_parsed));
+
+    SimpleMessage invalid_utf8;
+    invalid_utf8.set_stringvalue(std::string(1, static_cast<char>(0xff)));
+    std::string protobuf_invalid_json;
+    std::string fast_invalid_json;
+    EXPECT_EQ(ProtobufToJson(invalid_utf8, &protobuf_invalid_json),
+              FastProtoJsonCodec::TryToJson(invalid_utf8, fast_invalid_json));
+}
 
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonSimple) {
     { // Empty msg
@@ -60,6 +206,15 @@ TEST_F(ProtoMessageJsonUtilTest, TestToJsonNullPtr) {
     std::string json;
     ASSERT_FALSE(ProtoMessageJsonUtil::ToJson(nullptr, json));
     ASSERT_EQ("", json);
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestToJsonPreservesProtobufAppendBehavior) {
+    SimpleMessage message;
+    std::string json = "prefix:";
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&message, json));
+    EXPECT_EQ("prefix:{\"int32Value\":0,\"uint32Value\":0,\"int64Value\":\"0\",\"uint64Value\":\"0\","
+              "\"doubleValue\":0,\"floatValue\":0,\"boolValue\":false,\"stringValue\":\"\"}",
+              json);
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonEnum) {
@@ -270,13 +425,17 @@ TEST_F(ProtoMessageJsonUtilTest, TestFromJsonSimple) {
 TEST_F(ProtoMessageJsonUtilTest, TestFromJsonError) {
     {
         SimpleMessage msg;
+        msg.set_int32value(123);
         std::string json = "{\"int32Value\":111,";
         ASSERT_FALSE(ProtoMessageJsonUtil::FromJson(json, &msg));
+        EXPECT_EQ(123, msg.int32value());
     }
     {
         SimpleMessage msg;
+        msg.set_int32value(123);
         std::string json = "{\"int32Value\":\"not_int\"}";
         ASSERT_FALSE(ProtoMessageJsonUtil::FromJson(json, &msg));
+        EXPECT_EQ(123, msg.int32value());
     }
 }
 

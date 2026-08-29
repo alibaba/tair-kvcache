@@ -34,3 +34,7 @@ message RepeatMessage {
     repeated EnumMessage enumMsgVec = 3;
     repeated OneOfMeaaage oneOfVec = 4;
 }
+
+message UnsupportedBytesMessage {
+    bytes value = 1;
+}

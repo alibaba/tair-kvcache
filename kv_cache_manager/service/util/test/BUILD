@@ -2,6 +2,17 @@ load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
 
 package(default_visibility = ["//visibility:private"])
 
+cc_binary(
+    name = "proto_message_json_benchmark",
+    srcs = ["proto_message_json_benchmark.cc"],
+    tags = ["manual"],
+    deps = [
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:proto_message_json_util",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
 cc_test(
     name = "ProtoMessageJsonUtilTest",
     srcs = [
