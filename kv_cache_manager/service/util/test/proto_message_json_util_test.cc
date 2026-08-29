@@ -38,6 +38,26 @@ bool ProtobufFromJson(std::string_view json, google::protobuf::Message *message)
     return google::protobuf::util::JsonStringToMessage(input, message, options).ok();
 }
 
+std::string JsonWithUnknownObjectNesting(int depth) {
+    std::string json = R"({"stringValue":"after","unknown":)";
+    for (int i = 0; i < depth; ++i) {
+        json += R"({"next":)";
+    }
+    json += "null";
+    json.append(depth, '}');
+    json += '}';
+    return json;
+}
+
+std::string JsonWithUnknownArrayNesting(int depth) {
+    std::string json = R"({"stringValue":"after","unknown":)";
+    json.append(depth, '[');
+    json += "null";
+    json.append(depth, ']');
+    json += '}';
+    return json;
+}
+
 } // namespace
 
 class ProtoMessageJsonUtilTest : public TESTBASE {
@@ -151,6 +171,66 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecParsesArenaMessageTransactionally)
     EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(R"({"block_keys":["invalid"]})", request));
     EXPECT_EQ("after", request->trace_id());
     EXPECT_EQ(2, request->block_keys_size());
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecBoundsDomNestingBeforeTraversingUnknownFields) {
+    // The root object counts as one level, matching protobuf 3.8's default
+    // maximum of 100 nested JSON objects.
+    const std::string supported_depth = JsonWithUnknownObjectNesting(99);
+    SimpleMessage protobuf_supported;
+    SimpleMessage fast_supported;
+    ASSERT_TRUE(ProtobufFromJson(supported_depth, &protobuf_supported));
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(supported_depth, &fast_supported));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_supported, fast_supported));
+
+    const std::string excessive_object_depth = JsonWithUnknownObjectNesting(100);
+    SimpleMessage protobuf_rejected;
+    EXPECT_FALSE(ProtobufFromJson(excessive_object_depth, &protobuf_rejected));
+    SimpleMessage fast_rejected;
+    fast_rejected.set_stringvalue("before");
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(excessive_object_depth, &fast_rejected));
+    EXPECT_EQ("before", fast_rejected.stringvalue());
+
+    // Protobuf 3.8 does not count arrays in its object recursion limit. The
+    // fast DOM parser bounds both container kinds and delegates this uncommon
+    // shape to protobuf, preserving the public API behavior without building
+    // an arbitrarily deep DOM.
+    const std::string excessive_array_depth = JsonWithUnknownArrayNesting(4096);
+    SimpleMessage protobuf_array;
+    ASSERT_TRUE(ProtobufFromJson(excessive_array_depth, &protobuf_array));
+    SimpleMessage fast_array;
+    fast_array.set_stringvalue("before");
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(excessive_array_depth, &fast_array));
+    EXPECT_EQ("before", fast_array.stringvalue());
+
+    SimpleMessage compatible_array;
+    compatible_array.set_stringvalue("before");
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(excessive_array_depth, &compatible_array));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_array, compatible_array));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecPreservesJsonSemanticsWithoutHtmlSafeEscaping) {
+    SimpleMessage source;
+    source.set_stringvalue("</script><value>");
+
+    std::string protobuf_json;
+    std::string fast_json;
+    ASSERT_TRUE(ProtobufToJson(source, &protobuf_json));
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(source, fast_json));
+    EXPECT_NE(protobuf_json, fast_json);
+    EXPECT_NE(std::string::npos, protobuf_json.find(R"(\u003c/script\u003e)"));
+    EXPECT_NE(std::string::npos, fast_json.find("</script>"));
+
+    SimpleMessage protobuf_parsed;
+    SimpleMessage fast_parsed;
+    ASSERT_TRUE(ProtobufFromJson(protobuf_json, &protobuf_parsed));
+    ASSERT_TRUE(ProtobufFromJson(fast_json, &fast_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(source, protobuf_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(source, fast_parsed));
+
+    std::string compatible_json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&source, compatible_json));
+    EXPECT_EQ(fast_json, compatible_json);
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecMatchesProtobufForScalarEdgeCases) {

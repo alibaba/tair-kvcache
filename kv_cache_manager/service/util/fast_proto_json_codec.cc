@@ -8,6 +8,8 @@
 #include <limits>
 #include <memory>
 #include <rapidjson/document.h>
+#include <rapidjson/memorystream.h>
+#include <rapidjson/reader.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <string>
@@ -24,6 +26,80 @@ using ::google::protobuf::Reflection;
 using JsonWriter = rapidjson::Writer<rapidjson::StringBuffer>;
 
 constexpr int kMaxNestingDepth = 100;
+
+template <typename Handler>
+class DepthLimitedJsonHandler {
+public:
+    explicit DepthLimitedJsonHandler(Handler &handler) : handler_(handler) {}
+
+    bool Null() { return handler_.Null(); }
+    bool Bool(bool value) { return handler_.Bool(value); }
+    bool Int(int value) { return handler_.Int(value); }
+    bool Uint(unsigned value) { return handler_.Uint(value); }
+    bool Int64(int64_t value) { return handler_.Int64(value); }
+    bool Uint64(uint64_t value) { return handler_.Uint64(value); }
+    bool Double(double value) { return handler_.Double(value); }
+    bool RawNumber(const char *value, rapidjson::SizeType length, bool copy) {
+        return handler_.RawNumber(value, length, copy);
+    }
+    bool String(const char *value, rapidjson::SizeType length, bool copy) {
+        return handler_.String(value, length, copy);
+    }
+    bool Key(const char *value, rapidjson::SizeType length, bool copy) { return handler_.Key(value, length, copy); }
+
+    bool StartObject() { return StartContainer(&Handler::StartObject); }
+    bool EndObject(rapidjson::SizeType member_count) {
+        const bool success = handler_.EndObject(member_count);
+        --depth_;
+        return success;
+    }
+    bool StartArray() { return StartContainer(&Handler::StartArray); }
+    bool EndArray(rapidjson::SizeType element_count) {
+        const bool success = handler_.EndArray(element_count);
+        --depth_;
+        return success;
+    }
+
+private:
+    bool StartContainer(bool (Handler::*start)()) {
+        if (depth_ >= kMaxNestingDepth) {
+            return false;
+        }
+        ++depth_;
+        if ((handler_.*start)()) {
+            return true;
+        }
+        --depth_;
+        return false;
+    }
+
+    Handler &handler_;
+    int depth_ = 0;
+};
+
+class DepthLimitedDomGenerator {
+public:
+    explicit DepthLimitedDomGenerator(std::string_view json) : json_(json) {}
+
+    template <typename Handler>
+    bool operator()(Handler &handler) {
+        rapidjson::MemoryStream input(json_.data(), json_.size());
+        rapidjson::Reader reader;
+        DepthLimitedJsonHandler<Handler> depth_limited_handler(handler);
+        // The handler stops before the reader can descend past the same
+        // bounded depth, so neither the DOM nor the recursive reader stack is
+        // allowed to grow with adversarial input.
+        const auto result = reader.Parse<rapidjson::kParseValidateEncodingFlag>(input, depth_limited_handler);
+        success_ = !result.IsError();
+        return success_;
+    }
+
+    bool success() const { return success_; }
+
+private:
+    std::string_view json_;
+    bool success_ = false;
+};
 
 enum class WrapperKind {
     kNone,
@@ -585,8 +661,9 @@ bool FastProtoJsonCodec::TryFromJson(std::string_view json, Message *message) {
         return false;
     }
     rapidjson::Document document;
-    document.Parse<rapidjson::kParseValidateEncodingFlag>(json.data(), json.size());
-    if (document.HasParseError()) {
+    DepthLimitedDomGenerator generator(json);
+    document.Populate(generator);
+    if (!generator.success()) {
         return false;
     }
 

@@ -144,6 +144,12 @@ ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
 - `map<string, string>`；
 - `google.protobuf.Int32Value` 和 `google.protobuf.Int64Value`。
 
+快路径承诺 protobuf JSON 的解析语义兼容，不承诺与 protobuf 3.8 的输出逐字节相同。特别是
+RapidJSON 会直接输出字符串中的 `<`、`>` 和部分合法 Unicode 字符，而 protobuf 3.8 会将它们写成
+HTML-safe 的 `\uXXXX` 形式；两种 JSON 解析后得到相同字符串，且该差异不会触发通用实现回退。
+因此快路径输出只能作为 JSON 或日志 JSON 消费，不能未经 HTML 层转义就直接嵌入可执行的
+`<script>` 内容。
+
 `ProtoMessageJsonUtilTest.TestFastCodecSupportsAllProtocolMessages` 会检查所有当前协议消息。
 新增 `kv_cache_manager/protocol/protobuf/*.proto` 协议文件时，必须同时在该测试的 `protocol_files`
 数组中加入新文件的 `FileDescriptor`（通常通过新文件中任一顶层 message 的 `descriptor()->file()`
