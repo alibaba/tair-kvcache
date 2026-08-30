@@ -54,16 +54,6 @@ cc_library(
 )
 
 cc_library(
-    name = "service_access_log",
-    srcs = ["service_access_log.cc"],
-    hdrs = ["service_access_log.h"],
-    deps = [
-        "//kv_cache_manager/manager:cache_manager",
-        "//kv_cache_manager/metrics:metrics_reporter",
-    ],
-)
-
-cc_library(
     name = "common",
     srcs = ["common.cc"],
     hdrs = ["common.h"],
