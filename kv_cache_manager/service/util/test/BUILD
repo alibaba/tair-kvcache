@@ -3,6 +3,17 @@ load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "AccessLogWriterTest",
+    srcs = ["access_log_writer_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:access_log_writer",
+        "@rapidjson",
+    ],
+)
+
+cc_test(
     name = "ProtoMessageJsonUtilTest",
     srcs = [
         "proto_message_json_util_test.cc",

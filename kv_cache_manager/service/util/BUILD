@@ -44,10 +44,22 @@ cc_library(
 )
 
 cc_library(
+    name = "access_log_writer",
+    srcs = ["access_log_writer.cc"],
+    hdrs = ["access_log_writer.h"],
+    deps = [
+        "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:timestamp_util",
+        "@rapidjson",
+    ],
+)
+
+cc_library(
     name = "service_call_guard",
     srcs = ["service_call_guard.cc"],
     hdrs = ["service_call_guard.h"],
     deps = [
+        ":access_log_writer",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/metrics:metrics_reporter",
     ],
