@@ -16,6 +16,7 @@
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/event_publisher.h"
 #include "kv_cache_manager/event/optimizer_event_publisher.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
@@ -65,6 +66,18 @@ std::string EncodeTokenIdsLe64(const std::vector<int64_t> &token_ids) {
     return encoded;
 }
 
+class CaptureEventPublisher : public EventPublisher {
+public:
+    bool Init(const std::string & /*config*/) override { return true; }
+    bool Publish(const std::shared_ptr<BaseEvent> &event) override {
+        events.push_back(event);
+        return true;
+    }
+    bool Stop() override { return true; }
+
+    std::vector<std::shared_ptr<BaseEvent>> events;
+};
+
 } // namespace
 
 class OptimizerEventServiceGRpcTest : public TESTBASE {
@@ -83,6 +96,9 @@ protected:
         publisher_ = std::make_shared<OptimizerEventPublisher>(sink_, optimizer_config);
         ASSERT_TRUE(publisher_->Init(""));
         ASSERT_TRUE(cache_manager_->event_manager()->RegisterPublisher("optimizer_event_publisher", publisher_));
+        capture_publisher_ = std::make_shared<CaptureEventPublisher>();
+        ASSERT_TRUE(capture_publisher_->Init(""));
+        ASSERT_TRUE(cache_manager_->event_manager()->RegisterPublisher("log_event_publisher", capture_publisher_));
         leader_elector_ = std::make_shared<LeaderElector>(nullptr, "test-lock", "test-node");
         service_ =
             std::make_unique<OptimizerEventServiceGRpc>(sink_, registry_manager_, leader_elector_, cache_manager_);
@@ -127,6 +143,7 @@ protected:
     std::shared_ptr<LeaderElector> leader_elector_;
     std::unique_ptr<OptimizerEventServiceGRpc> service_;
     std::shared_ptr<OptimizerEventPublisher> publisher_;
+    std::shared_ptr<CaptureEventPublisher> capture_publisher_;
     std::unique_ptr<proto::optimizer::OptimizerEventStreamService::Stub> stub_;
     std::unique_ptr<grpc::Server> server_;
     int port_ = 0;
@@ -271,6 +288,15 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
               std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
     EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("report-instance"));
 
+    ASSERT_EQ(1u, capture_publisher_->events.size());
+    auto broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.front());
+    ASSERT_NE(nullptr, broadcast_event);
+    EXPECT_EQ("reported-trace", broadcast_event->trace_id());
+    EXPECT_EQ("report-instance", broadcast_event->event_source());
+    EXPECT_EQ(5, broadcast_event->input_token_len());
+    EXPECT_EQ(123456789, broadcast_event->event_trigger_time_us());
+    EXPECT_EQ((std::vector<std::string>{"tp0"}), broadcast_event->location_spec_names());
+
     grpc::ClientContext raw_report_context;
     proto::optimizer::TraceQueryRequest raw_request;
     raw_request.set_trace_id("reported-raw-trace");
@@ -286,6 +312,10 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     EXPECT_EQ(std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()),
               std::vector<int64_t>(raw_received.block_keys().begin(), raw_received.block_keys().end()));
     EXPECT_EQ(5, raw_received.input_token_len());
+    ASSERT_EQ(2u, capture_publisher_->events.size());
+    auto raw_broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.back());
+    ASSERT_NE(nullptr, raw_broadcast_event);
+    EXPECT_EQ("reported-raw-trace", raw_broadcast_event->trace_id());
 
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));

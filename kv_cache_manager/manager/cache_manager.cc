@@ -902,7 +902,7 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
     event->set_input_token_len(tokens.empty() ? input_token_len : static_cast<int64_t>(tokens.size()));
     event->SetAddtionalArgs(
         QueryTypeToString(QueryType::QT_PREFIX_MATCH), query_keys, {}, BlockMask(), 0, location_spec_names);
-    if (!publisher->Publish(event)) {
+    if (!event_manager_->Publish(event)) {
         request_context->error_tracer()->AddErrorMsg("failed to publish optimizer event");
         return EC_ERROR;
     }
