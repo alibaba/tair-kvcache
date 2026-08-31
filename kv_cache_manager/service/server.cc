@@ -426,7 +426,8 @@ void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_
         optimizer_publisher->Stop();
         return;
     }
-    optimizer_event_service_ = std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_, leader_elector_);
+    optimizer_event_service_ =
+        std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_, leader_elector_, cache_manager_);
     KVCM_LOG_INFO("create and register optimizer gRPC event publisher OK, rpc_port=%d", config_.GetServiceRpcPort());
 }
 bool Server::CreateLeaderElector() {

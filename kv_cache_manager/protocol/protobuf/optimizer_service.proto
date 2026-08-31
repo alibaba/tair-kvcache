@@ -161,6 +161,9 @@ message TraceQueryRequest {
     // 时间会让 TTL 判定偏晚（纯 LRU 只看顺序，不受影响）。
     int64 timestamp_ns = 6;
     repeated string location_spec_names = 7; // 本次查询指定的 location spec；空表示未指定
+    // 旁路 gRPC 上报可用的紧凑输入：连续 little-endian int64 token ids。
+    // 与 token_ids 互斥；KVCM 解码后仍按同一套 block hash 逻辑处理。
+    bytes token_ids_le64 = 8;
 }
 
 message TraceQueryResponse {
@@ -288,5 +291,8 @@ service OptimizerService {
 // KVCM 再通过 response stream 单向写入缓存访问事件。
 service OptimizerEventStreamService {
     rpc GetConfiguration(KvcmConfigurationRequest) returns (KvcmConfigurationResponse);
+    // 接收旁路观测到的单次缓存查询。KVCM 只补齐 block keys 并将事件
+    // 投递给 optimizer event publisher，不执行真实 CacheLocation 查询。
+    rpc ReportOptimizerEvent(TraceQueryRequest) returns (CommonResponse);
     rpc SubscribeEvents(OptimizerEventSubscriptionRequest) returns (stream TraceQueryRequest);
 }
