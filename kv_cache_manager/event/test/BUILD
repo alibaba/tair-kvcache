@@ -66,6 +66,18 @@ cc_test(
 )
 
 cc_test(
+    name = "OptimizerQueryHitEventTest",
+    srcs = [
+        "optimizer_query_hit_event_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event/spec_events:spec_events",
+    ],
+)
+
+cc_test(
     name = "EventPublishersConfigTest",
     srcs = [
         "event_publishers_config_test.cc",

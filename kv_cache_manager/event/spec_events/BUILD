@@ -7,10 +7,10 @@ cc_library(
         "cache_reclaim_event.h",
         "migration_event.h",
         "optimizer_event.h",
+        "optimizer_query_hit_event.h",
     ],
     deps = [
         "//kv_cache_manager/event:base_event",
         "//kv_cache_manager/meta:cache_location",
     ],
 )
-

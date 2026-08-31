@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/online_optimizer_server.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
@@ -157,6 +158,8 @@ TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscri
 
     OnlineOptimizerServer server;
     ASSERT_TRUE(server.Init(config_path));
+    ASSERT_NE(nullptr, server.event_manager_);
+    ASSERT_TRUE(server.event_manager_->HasPublisher("log_event_publisher"));
     ASSERT_TRUE(server.Start());
     ASSERT_TRUE(WaitUntil([&event_service_a, &event_service_b] {
         return event_service_a.subscribe_count_.load() == 1 && event_service_b.subscribe_count_.load() == 1;
