@@ -14,10 +14,10 @@ LruCacheIndexer::LruCacheIndexer(bool enable_theoretical_max_cache)
     : enable_theoretical_max_cache_(enable_theoretical_max_cache) {}
 
 void LruCacheIndexer::Init(const std::vector<double> &capacity_gb,
-                           int64_t size_full_only,
+                           int64_t size_full,
                            int64_t size_full_linear,
                            int32_t linear_step) {
-    size_full_only_ = size_full_only;
+    size_full_ = size_full;
     size_full_linear_ = size_full_linear;
     linear_step_ = std::max(linear_step, int32_t(0));
 
@@ -67,7 +67,7 @@ bool LruCacheIndexer::LookupAndInsert(Cache *cache, std::string_view key_sv, boo
         cache->Release(handle);
         return true;
     }
-    cache->Insert(key_sv, nullptr, &kHelper, static_cast<size_t>(size_full_only_));
+    cache->Insert(key_sv, nullptr, &kHelper, static_cast<size_t>(size_full_));
     return false;
 }
 
@@ -173,7 +173,7 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
         int64_t key = keys[i];
         std::string_view key_sv(reinterpret_cast<const char *>(&key), sizeof(key));
         const bool is_linear = (((i + 1) % linear_step_) == 0) || (i == total_keys - 1);
-        const int64_t desired_charge = is_linear ? size_full_linear_ : size_full_only_;
+        const int64_t desired_charge = is_linear ? size_full_linear_ : size_full_;
 
         bool is_new_key = true;
         bool largest_cache_hit = false;

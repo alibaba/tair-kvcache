@@ -21,7 +21,7 @@ public:
     TtlCacheIndexerWrapper(std::unique_ptr<CacheIndexer> inner, int64_t ttl_seconds, ClockFunc clock);
 
     void Init(const std::vector<double> &capacity_gb,
-              int64_t size_full_only,
+              int64_t size_full,
               int64_t size_full_linear,
               int32_t linear_step) override;
 
@@ -29,6 +29,12 @@ public:
                      std::vector<int64_t> &hit_count,
                      int64_t &max_hit_count,
                      std::vector<bool> *key_hits = nullptr) override;
+
+    void ProcessKeysAtTimestamp(const std::vector<int64_t> &keys,
+                                int64_t timestamp_ns,
+                                std::vector<int64_t> &hit_count,
+                                int64_t &max_hit_count,
+                                std::vector<bool> *key_hits = nullptr) override;
 
     int64_t unique_count() const override;
     int64_t eviction_count() const override;
@@ -47,6 +53,11 @@ public:
     void SetHitAgeBucketThresholds(const std::vector<int64_t> &thresholds);
 
 private:
+    void ProcessKeysAtTime(const std::vector<int64_t> &keys,
+                           int64_t now_seconds,
+                           std::vector<int64_t> &hit_count,
+                           int64_t &max_hit_count,
+                           std::vector<bool> *key_hits);
     void HarvestExpired(int64_t now);
     size_t FindAgeBucket(int64_t age_seconds) const;
 
@@ -57,6 +68,8 @@ private:
     std::unordered_map<int64_t, int64_t> key_access_time_;
     std::set<std::pair<int64_t, int64_t>> expire_set_;
     int64_t ttl_eviction_count_ = 0;
+    int64_t last_process_time_seconds_ = 0;
+    bool has_process_time_ = false;
 
     // Age bucket thresholds (sorted ascending). Each value is the upper bound
     // of a bucket. A final "+inf" bucket is always appended.
