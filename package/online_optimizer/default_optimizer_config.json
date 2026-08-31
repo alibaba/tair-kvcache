@@ -6,5 +6,11 @@
     "metrics_report_interval_ms": 10000,
     "enable_prometheus": true,
     "prometheus_prefix": "kvcm_optimizer",
-    "io_thread_num": 4
+    "io_thread_num": 4,
+    "kvcm_event_subscription": {
+        "enable": true,
+        "service_discovery_url": "static://127.0.0.1:6381",
+        "consumer_id": "online-optimizer",
+        "discovery_refresh_interval_ms": 5000
+    }
 }
