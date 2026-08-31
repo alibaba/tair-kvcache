@@ -14,6 +14,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
 namespace kv_cache_manager {
 
@@ -45,11 +46,11 @@ struct InstanceState {
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
 
-    // Range-add difference array for the current reporting interval's
-    // distribution of minimum LRU capacities required by theoretically
-    // hittable blocks.
-    std::vector<int64_t> mrc_interval_hit_count_deltas;
-    uint64_t mrc_interval_total_hits = 0;
+    int64_t interval_input_tokens = 0;
+    std::vector<int64_t> interval_hits_per_capacity;
+    int64_t interval_max_hits = 0;
+
+    MrcWindow mrc_window;
 };
 
 struct TraceQueryResult {
@@ -84,7 +85,19 @@ struct HitAgeBucketRatio {
 
 struct MrcMetricInfo {
     std::string instance_id;
+    std::string instance_group;
+    // Relative target against the reporting window's theoretical maximum hit
+    // count; 9500 means retaining 95% of those theoretical hits.
+    uint32_t target_basis_points = 0;
     int64_t capacity_bytes = 0;
+};
+
+struct IntervalMetricInfo {
+    std::string instance_id;
+    std::string instance_group;
+    bool has_theoretical_max_hit_rate = false;
+    double max_hit_rate = 0.0;
+    std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
 };
 
 struct InstanceSummary {
@@ -134,6 +147,9 @@ public:
                          TraceQueryResult &result);
 
     ErrorCode ListInstances(const std::string &instance_group_filter, std::vector<InstanceSummary> &summaries) const;
+
+    // Returns and clears the query metrics accumulated since the previous call.
+    ErrorCode TakeIntervalMetrics(std::vector<IntervalMetricInfo> &metrics);
 
     // Returns and clears the MRC curve accumulated since the previous call.
     ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);

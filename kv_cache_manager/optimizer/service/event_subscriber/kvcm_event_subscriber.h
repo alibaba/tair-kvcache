@@ -19,6 +19,8 @@ class ClientContext;
 
 namespace kv_cache_manager {
 
+class MetricsRegistry;
+class OptimizerMetricsReporter;
 class OptimizerServiceImpl;
 class ServiceDiscovery;
 
@@ -29,7 +31,9 @@ class TraceQueryRequest;
 class KvcmEventSubscriber {
 public:
     KvcmEventSubscriber(const KvcmEventSubscriptionConfig &config,
-                        std::shared_ptr<OptimizerServiceImpl> optimizer_service);
+                        std::shared_ptr<OptimizerServiceImpl> optimizer_service,
+                        std::shared_ptr<MetricsRegistry> metrics_registry,
+                        std::shared_ptr<OptimizerMetricsReporter> metrics_reporter);
     ~KvcmEventSubscriber();
 
     KvcmEventSubscriber(const KvcmEventSubscriber &) = delete;
@@ -57,7 +61,7 @@ private:
     void UpdateWorker(const std::string &leader_endpoint);
     void EndpointLoop(EndpointWorker *worker);
     void StopWorker(std::unique_ptr<EndpointWorker> worker);
-    void ProcessEvent(const proto::optimizer::TraceQueryRequest &event);
+    void ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip);
     void RequestConfigurationRefresh();
     bool WaitForSupervisor(std::chrono::milliseconds duration);
     bool WaitForReconnect(EndpointWorker *worker, std::chrono::milliseconds duration);
@@ -65,6 +69,8 @@ private:
 
     KvcmEventSubscriptionConfig config_;
     std::shared_ptr<OptimizerServiceImpl> optimizer_service_;
+    std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::unique_ptr<ServiceDiscovery> service_discovery_;
 
     std::atomic<bool> running_{false};

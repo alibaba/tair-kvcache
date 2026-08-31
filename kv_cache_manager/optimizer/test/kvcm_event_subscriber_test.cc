@@ -12,8 +12,10 @@
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
@@ -215,7 +217,9 @@ protected:
         registry_ = std::make_shared<OptimizerRegistryManager>("");
         ASSERT_TRUE(registry_->Init());
         manager_ = std::make_shared<OnlineOptimizerManager>(registry_);
-        optimizer_service_ = std::make_shared<OptimizerServiceImpl>(manager_, nullptr);
+        metrics_registry_ = std::make_shared<MetricsRegistry>();
+        metrics_reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_);
+        optimizer_service_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
     }
 
     bool IsRegistered(const std::string &instance_id) const {
@@ -235,6 +239,8 @@ protected:
 
     std::shared_ptr<OptimizerRegistryManager> registry_;
     std::shared_ptr<OnlineOptimizerManager> manager_;
+    std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<OptimizerServiceImpl> optimizer_service_;
 };
 
@@ -244,7 +250,8 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     seed.meta_service_.SetLeader("127.0.0.1", leader.port());
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
 
-    KvcmEventSubscriber subscriber(MakeConfig(seed.endpoint()), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(seed.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
 
@@ -276,7 +283,8 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
 TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRefresh) {
     TestKvcmServer leader;
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
-    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint(), 5000), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(leader.endpoint(), 5000), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([this] { return IsRegistered("known"); }));
@@ -292,6 +300,50 @@ TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRef
 
     leader.event_service_.Publish(MakeEvent("new-instance", "accepted", 2));
     ASSERT_TRUE(WaitUntil([this] { return TotalQueries("new-instance") == 1; }));
+    const MetricsTags unknown_instance_tags = {{"instance_group", ""}, {"instance_id", "new-instance"}};
+    const MetricsTags known_instance_tags = {{"instance_group", "g1"}, {"instance_id", "new-instance"}};
+    ASSERT_TRUE(WaitUntil([this, &unknown_instance_tags, &known_instance_tags] {
+        return metrics_registry_->GetCounter("service.query_counter").Get() == 2u &&
+               metrics_registry_->GetCounter("service.error_counter").Get() == 1u &&
+               metrics_registry_->GetCounter("service.query_counter", unknown_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.error_counter", unknown_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.query_counter", known_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.error_counter", known_instance_tags).Get() == 0u;
+    }));
+    subscriber.Stop();
+}
+
+TEST_F(KvcmEventSubscriberTest, ReportsQueryMetricsForStreamEvents) {
+    TestKvcmServer leader;
+    leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+    KvcmEventSubscriber subscriber(
+        MakeConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.Start());
+    ASSERT_TRUE(WaitUntil([this] { return IsRegistered("known"); }));
+    ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
+
+    const MetricsTags base_tags = {{"instance_group", "g1"}, {"instance_id", "known"}, {"client_ip", "127.0.0.1"}};
+    const MetricsTags capacity_tags = {{"instance_group", "g1"},
+                                       {"instance_id", "known"},
+                                       {"client_ip", "127.0.0.1"},
+                                       {"capacity_gb", std::to_string(2.0)}};
+
+    leader.event_service_.Publish(MakeEvent("known", "miss", 1));
+    ASSERT_TRUE(WaitUntil(
+        [this, &base_tags] { return metrics_registry_->GetGauge("query_total_blocks", base_tags).Get() == 1.0; }));
+    EXPECT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, metrics_registry_->GetGauge("query_hit_rate", capacity_tags).Get());
+
+    leader.event_service_.Publish(MakeEvent("known", "hit", 1));
+    ASSERT_TRUE(WaitUntil(
+        [this, &capacity_tags] { return metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get() == 1.0; }));
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("query_hit_rate", capacity_tags).Get());
+    const MetricsTags service_instance_tags = {{"instance_group", "g1"}, {"instance_id", "known"}};
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", service_instance_tags).Get());
+    EXPECT_EQ(0u, metrics_registry_->GetCounter("service.error_counter", service_instance_tags).Get());
+    EXPECT_GE(metrics_registry_->GetGauge("service.query_rt_us", service_instance_tags).Get(), 0.0);
+
     subscriber.Stop();
 }
 
@@ -301,7 +353,8 @@ TEST_F(KvcmEventSubscriberTest, MovesTheOnlyStreamWhenLeaderChanges) {
     first.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     second.event_service_.SetConfiguration(MakeConfiguration({"known"}));
 
-    KvcmEventSubscriber subscriber(MakeConfig(first.endpoint()), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(first.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([&first] { return first.event_service_.active_subscribers_.load() == 1; }));
@@ -326,7 +379,8 @@ TEST_F(KvcmEventSubscriberTest, KeepsOldStreamUntilNewLeaderConfigurationSucceed
     second.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     second.event_service_.SetConfigurationAvailable(false);
 
-    KvcmEventSubscriber subscriber(MakeConfig(first.endpoint()), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(first.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([&first] { return first.event_service_.active_subscribers_.load() == 1; }));
@@ -364,7 +418,8 @@ TEST_F(KvcmEventSubscriberTest, SubscribesAndDoesNotRefreshForUnsupportedInstanc
     }
     leader.event_service_.SetConfiguration(configuration);
 
-    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint(), 5000), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(leader.endpoint(), 5000), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
     ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
@@ -381,7 +436,8 @@ TEST_F(KvcmEventSubscriberTest, SubscribesAndDoesNotRefreshForUnsupportedInstanc
 TEST_F(KvcmEventSubscriberTest, ReconnectsClosedLeaderStream) {
     TestKvcmServer leader(false);
     leader.event_service_.SetConfiguration(MakeConfiguration({}));
-    KvcmEventSubscriber subscriber(MakeConfig(leader.endpoint()), optimizer_service_);
+    KvcmEventSubscriber subscriber(
+        MakeConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
     ASSERT_TRUE(subscriber.Init());
     ASSERT_TRUE(subscriber.Start());
 

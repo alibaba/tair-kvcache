@@ -6,13 +6,15 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
 namespace kv_cache_manager {
@@ -53,17 +55,21 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     }
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
-    metrics_reporter_ =
-        std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, config_.prometheus_prefix());
-    if (!metrics_reporter_->InitKmonitor()) {
-        KVCM_LOG_WARN("KMonitor init failed, kmonitor metrics disabled");
+    if (config_.metrics_reporter_type() == "kmonitor") {
+        kmonitor_metrics_reporter_ = std::make_shared<OptimizerKmonitorMetricsReporter>(config_.prometheus_prefix());
+        if (!kmonitor_metrics_reporter_->Init()) {
+            KVCM_LOG_WARN("KMonitor init failed, kmonitor metrics disabled");
+            kmonitor_metrics_reporter_.reset();
+        }
     }
+    metrics_reporter_ =
+        std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, kmonitor_metrics_reporter_);
 
     service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
 
     if (config_.kvcm_event_subscription().enable()) {
-        kvcm_event_subscriber_ =
-            std::make_unique<KvcmEventSubscriber>(config_.kvcm_event_subscription(), service_impl_);
+        kvcm_event_subscriber_ = std::make_unique<KvcmEventSubscriber>(
+            config_.kvcm_event_subscription(), service_impl_, metrics_registry_, metrics_reporter_);
         if (!kvcm_event_subscriber_->Init()) {
             KVCM_LOG_ERROR("Failed to init KVCM event subscriber");
             return false;
@@ -137,7 +143,15 @@ bool OnlineOptimizerServer::Start() {
     }
 
     if (config_.metrics_report_interval_ms() > 0) {
-        metrics_thread_ = std::thread(&OnlineOptimizerServer::MetricsReportLoop, this);
+        metrics_report_thread_ =
+            LoopThread::CreateLoopThread([reporter = metrics_reporter_]() { reporter->ReportInterval(); },
+                                         config_.metrics_report_interval_ms() * 1000,
+                                         "OptimizerMetricsReporter");
+        if (!metrics_report_thread_) {
+            KVCM_LOG_ERROR("Failed to start optimizer metrics reporter");
+            Stop();
+            return false;
+        }
     }
 
     KVCM_LOG_INFO("OnlineOptimizerServer started: rpc_port=%d http_port=%d", config_.rpc_port(), config_.http_port());
@@ -178,15 +192,17 @@ void OnlineOptimizerServer::DoStop() {
     }
 
     // Now that all request threads have finished, safe to join background
-    // threads and shut down kmonitor without racing with ReportPerQuery().
+    // threads and shut down kmonitor without racing with request/query reporting.
     if (recovery_thread_.joinable()) {
         recovery_thread_.join();
     }
-    if (metrics_thread_.joinable()) {
-        metrics_thread_.join();
+    if (metrics_report_thread_) {
+        metrics_report_thread_->Stop();
+        metrics_report_thread_.reset();
     }
-    if (metrics_reporter_) {
-        metrics_reporter_->ShutdownKmonitor();
+    if (kmonitor_metrics_reporter_) {
+        kmonitor_metrics_reporter_->Shutdown();
+        kmonitor_metrics_reporter_.reset();
     }
     KVCM_LOG_INFO("OnlineOptimizerServer stopped");
 }
@@ -196,15 +212,6 @@ void OnlineOptimizerServer::WaitForShutdown() {
         grpc_server_->Wait();
     }
     Stop();
-}
-
-void OnlineOptimizerServer::MetricsReportLoop() {
-    while (running_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(config_.metrics_report_interval_ms()));
-        if (!running_)
-            break;
-        metrics_reporter_->ReportInterval();
-    }
 }
 
 void OnlineOptimizerServer::RecoveryRetryLoop() {
