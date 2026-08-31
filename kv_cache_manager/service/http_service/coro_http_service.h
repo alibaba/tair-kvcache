@@ -164,11 +164,11 @@ CoroHttpService::GetArenaHandler(Callback callback, bool (*request_parser)(char 
             json_res = std::move(*cached_response);
         } else {
             json_res.reserve(512);
-        }
-        if (!cached_response.has_value() && !ProtoMessageJsonUtil::ToJson(pb_res, json_res)) {
-            json_res = "{}";
-            res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
-            co_return;
+            if (!ProtoMessageJsonUtil::ToJson(pb_res, json_res)) {
+                json_res = "{}";
+                res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
+                co_return;
+            }
         }
         res.add_header("Content-Type", "application/json");
         res.set_status_and_content(coro_http::status_type::ok, json_res);

@@ -84,6 +84,8 @@ public:
 private:
     class LazyResponseJsonCache {
     public:
+        // Not thread-safe: this request-local cache is lazily mutated through
+        // const accessors and must only be used by the request's owning thread.
         void SetGenerator(ResponseJsonGenerator generator, ResponseJsonKind kind);
         const JsonFragment &Get() const;
         std::optional<std::string> TakeIfReusable();
