@@ -1,6 +1,8 @@
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/env_util.h"
@@ -8,11 +10,19 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMaxCapacityGbForInt64 = static_cast<double>(std::numeric_limits<int64_t>::max()) / kBytesPerGb;
+
+} // namespace
+
 bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string());
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "consumer_id", consumer_id_, std::string("online-optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
+    KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
     return Validate();
 }
 
@@ -20,10 +30,16 @@ void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "service_discovery_url", service_discovery_url_);
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
+    Put(writer, "capacity_gb", capacity_gb_);
 }
 
 bool KvcmEventSubscriptionConfig::Validate() const {
-    return !service_discovery_url_.empty() && !consumer_id_.empty() && discovery_refresh_interval_ms_ > 0;
+    if (service_discovery_url_.empty() || consumer_id_.empty() || discovery_refresh_interval_ms_ <= 0) {
+        return false;
+    }
+    return std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
+        return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;
+    });
 }
 
 // clang-format off

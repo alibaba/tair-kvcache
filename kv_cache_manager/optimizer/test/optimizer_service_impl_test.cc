@@ -434,7 +434,18 @@ TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryUsesSharedInputConversion) {
 }
 
 TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryPublishesOptimizerQueryHitEvent) {
-    CreateTestGroup("grp1");
+    proto::optimizer::CreateInstanceGroupRequest group_request;
+    group_request.set_trace_id("setup");
+    auto *group = group_request.mutable_instance_group();
+    group->set_name("grp1");
+    for (double capacity_gb : {1.0, 2.0, 4.0}) {
+        group->add_capacity_gb(capacity_gb);
+    }
+    group->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
+    proto::optimizer::CommonResponse group_response;
+    RequestContext group_context("setup", nullptr);
+    service_->CreateInstanceGroup(&group_context, &group_request, &group_response);
+    ASSERT_EQ(proto::optimizer::OK, group_response.header().status().code());
 
     auto register_request = MakeRegisterRequest("grp1", "inst1", 4, 0);
     proto::optimizer::OptimizerRegisterInstanceResponse register_response;
@@ -474,11 +485,14 @@ TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryPublishesOptimizerQueryHitEven
     EXPECT_EQ(hit_response.input_token_len(), event->input_token_len());
     EXPECT_EQ(hit_response.total_blocks(), event->total_blocks());
     ASSERT_EQ(hit_response.capacity_results_size(), event->capacity_results().size());
-    ASSERT_EQ(1, event->capacity_results().size());
-    EXPECT_EQ(hit_response.capacity_results(0).cache_hit_count(), event->capacity_results()[0].cache_hit_count());
-    EXPECT_DOUBLE_EQ(hit_response.capacity_results(0).hit_rate(), event->capacity_results()[0].hit_rate());
-    EXPECT_EQ(hit_response.capacity_results(0).current_unique_keys(),
-              event->capacity_results()[0].current_unique_keys());
+    ASSERT_EQ(3, event->capacity_results().size());
+    for (int i = 0; i < hit_response.capacity_results_size(); ++i) {
+        EXPECT_DOUBLE_EQ(hit_response.capacity_results(i).capacity_gb(), event->capacity_results()[i].capacity_gb());
+        EXPECT_EQ(hit_response.capacity_results(i).cache_hit_count(), event->capacity_results()[i].cache_hit_count());
+        EXPECT_DOUBLE_EQ(hit_response.capacity_results(i).hit_rate(), event->capacity_results()[i].hit_rate());
+        EXPECT_EQ(hit_response.capacity_results(i).current_unique_keys(),
+                  event->capacity_results()[i].current_unique_keys());
+    }
     EXPECT_EQ(hit_response.theoretical_result().max_hit_count(), event->theoretical_result().max_hit_count());
     EXPECT_DOUBLE_EQ(hit_response.theoretical_result().hit_rate(), event->theoretical_result().hit_rate());
     EXPECT_EQ(hit_response.theoretical_result().current_unique_keys(),
@@ -525,6 +539,20 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     }));
 
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+}
+
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationUsesCapacityOverride) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, {40.0, 10.0, 20.0}));
+
+    auto stored_group = registry_->GetInstanceGroup("kvcm-group");
+    ASSERT_NE(nullptr, stored_group);
+    EXPECT_EQ((std::vector<double>{10.0, 20.0, 40.0}), stored_group->capacity_gb());
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroups) {

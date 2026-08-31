@@ -304,7 +304,8 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 }
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                                       std::unordered_set<std::string> &unsupported_instance_ids) {
+                                                       std::unordered_set<std::string> &unsupported_instance_ids,
+                                                       const std::vector<double> &capacity_gb_override) {
     unsupported_instance_ids.clear();
     if (!manager_) {
         KVCM_LOG_ERROR("ApplyKvcmConfiguration: optimizer manager is null");
@@ -331,8 +332,12 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (!registry->GetInstanceGroup(source.name())) {
             OptimizerInstanceGroup group;
             group.set_name(source.name());
-            group.set_capacity_gb(
-                {static_cast<double>(static_cast<long double>(source.capacity_bytes()) / kBytesPerGb)});
+            if (capacity_gb_override.empty()) {
+                group.set_capacity_gb(
+                    {static_cast<double>(static_cast<long double>(source.capacity_bytes()) / kBytesPerGb)});
+            } else {
+                group.set_capacity_gb(capacity_gb_override);
+            }
             group.set_eviction_policy("lru");
             group.set_enable_prefix_hash(true);
             group.set_enable_theoretical_max_cache(true);

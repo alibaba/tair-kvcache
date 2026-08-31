@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
@@ -61,7 +62,8 @@ public:
 
     // KVCM ingress
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
-                                     std::unordered_set<std::string> &unsupported_instance_ids);
+                                     std::unordered_set<std::string> &unsupported_instance_ids,
+                                     const std::vector<double> &capacity_gb_override = {});
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,
