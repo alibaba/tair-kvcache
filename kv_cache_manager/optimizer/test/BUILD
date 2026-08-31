@@ -248,6 +248,8 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/event/spec_events",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer:optimizer_service_impl",
         "//kv_cache_manager/optimizer/config",
@@ -327,6 +329,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/optimizer:kvcm_event_subscriber",
         "//kv_cache_manager/optimizer:online_optimizer_server",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",

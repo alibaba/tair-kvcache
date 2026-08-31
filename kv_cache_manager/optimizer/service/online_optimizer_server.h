@@ -14,6 +14,7 @@
 namespace kv_cache_manager {
 
 class OnlineOptimizerManager;
+class EventManager;
 class OptimizerServiceImpl;
 class OptimizerServiceGRpc;
 class OptimizerServiceHttp;
@@ -55,6 +56,7 @@ private:
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<OptimizerKmonitorMetricsReporter> kmonitor_metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::shared_ptr<EventManager> event_manager_;
     std::vector<std::unique_ptr<KvcmEventSubscriber>> kvcm_event_subscribers_;
 
     std::unique_ptr<grpc::Server> grpc_server_;

@@ -7,6 +7,8 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/loop_thread.h"
+#include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
@@ -65,7 +67,22 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
     metrics_reporter_ =
         std::make_shared<OptimizerMetricsReporter>(manager_, metrics_registry_, kmonitor_metrics_reporter_);
 
-    service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
+    event_manager_ = std::make_shared<EventManager>();
+    if (!event_manager_->Init()) {
+        KVCM_LOG_ERROR("Failed to init optimizer event manager");
+        return false;
+    }
+    auto log_event_publisher = std::make_shared<LogEventPublisher>();
+    if (!log_event_publisher->Init("")) {
+        KVCM_LOG_ERROR("Failed to init optimizer log event publisher; event log disabled");
+    } else if (!event_manager_->RegisterPublisher("log_event_publisher", log_event_publisher)) {
+        KVCM_LOG_ERROR("Failed to register optimizer log event publisher; event log disabled");
+        log_event_publisher->Stop();
+    } else {
+        KVCM_LOG_INFO("Optimizer log event publisher registered");
+    }
+
+    service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_, event_manager_);
 
     kvcm_event_subscribers_.clear();
     kvcm_event_subscribers_.reserve(config_.kvcm_event_subscriptions().size());
@@ -210,6 +227,9 @@ void OnlineOptimizerServer::DoStop() {
     if (kmonitor_metrics_reporter_) {
         kmonitor_metrics_reporter_->Shutdown();
         kmonitor_metrics_reporter_.reset();
+    }
+    if (event_manager_) {
+        event_manager_->Stop();
     }
     KVCM_LOG_INFO("OnlineOptimizerServer stopped");
 }
