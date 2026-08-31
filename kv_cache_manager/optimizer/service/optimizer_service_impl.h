@@ -10,6 +10,7 @@
 namespace kv_cache_manager {
 
 class OnlineOptimizerManager;
+class EventManager;
 class OptimizerMetricsReporter;
 class OptimizerRegistryManager;
 class RequestContext;
@@ -17,7 +18,8 @@ class RequestContext;
 class OptimizerServiceImpl {
 public:
     OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManager> manager,
-                         std::shared_ptr<OptimizerMetricsReporter> metrics_reporter);
+                         std::shared_ptr<OptimizerMetricsReporter> metrics_reporter,
+                         std::shared_ptr<EventManager> event_manager = nullptr);
     ~OptimizerServiceImpl() = default;
 
     OptimizerServiceImpl(const OptimizerServiceImpl &) = delete;
@@ -80,6 +82,7 @@ public:
 private:
     std::shared_ptr<OnlineOptimizerManager> manager_;
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
+    std::shared_ptr<EventManager> event_manager_;
 };
 
 } // namespace kv_cache_manager

@@ -2,12 +2,39 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/event_publisher.h"
+#include "kv_cache_manager/event/spec_events/optimizer_query_hit_event.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+class CapturingEventPublisher : public EventPublisher {
+public:
+    bool Init(const std::string &) override {
+        running_ = true;
+        return true;
+    }
+
+    bool Publish(const std::shared_ptr<BaseEvent> &event) override {
+        events.push_back(event);
+        return true;
+    }
+
+    bool Stop() override {
+        running_ = false;
+        return true;
+    }
+
+    std::vector<std::shared_ptr<BaseEvent>> events;
+};
+
+} // namespace
 
 class OptimizerServiceImplTest : public TESTBASE {
 protected:
@@ -404,6 +431,60 @@ TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryUsesSharedInputConversion) {
     ASSERT_EQ(EC_OK, service_->ExecuteTraceQuery(request, &response));
     EXPECT_EQ(4, response.input_token_len());
     EXPECT_EQ(1, response.total_blocks());
+}
+
+TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryPublishesOptimizerQueryHitEvent) {
+    CreateTestGroup("grp1");
+
+    auto register_request = MakeRegisterRequest("grp1", "inst1", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse register_response;
+    RequestContext context("setup", nullptr);
+    service_->RegisterInstance(&context, &register_request, &register_response);
+    ASSERT_EQ(proto::optimizer::OK, register_response.header().status().code());
+
+    auto event_manager = std::make_shared<EventManager>();
+    ASSERT_TRUE(event_manager->Init());
+    auto publisher = std::make_shared<CapturingEventPublisher>();
+    ASSERT_TRUE(publisher->Init(""));
+    ASSERT_TRUE(event_manager->RegisterPublisher("capture", publisher));
+    OptimizerServiceImpl event_service(manager_, nullptr, event_manager);
+
+    proto::optimizer::TraceQueryRequest request;
+    request.set_trace_id("request-id-1");
+    request.set_instance_id("inst1");
+    request.set_input_token_len(12);
+    request.set_timestamp_ns(987654321);
+    request.add_block_keys(1);
+    request.add_block_keys(2);
+    request.add_block_keys(3);
+
+    proto::optimizer::TraceQueryResponse miss_response;
+    ASSERT_EQ(EC_OK, event_service.ExecuteTraceQuery(request, &miss_response));
+    proto::optimizer::TraceQueryResponse hit_response;
+    ASSERT_EQ(EC_OK, event_service.ExecuteTraceQuery(request, &hit_response));
+
+    ASSERT_EQ(2, publisher->events.size());
+    auto event = std::dynamic_pointer_cast<OptimizerQueryHitEvent>(publisher->events.back());
+    ASSERT_NE(nullptr, event);
+    EXPECT_EQ("inst1", event->event_source());
+    EXPECT_EQ("optimizer", event->event_component());
+    EXPECT_EQ("OptimizerQueryHitEvent", event->event_type());
+    EXPECT_EQ("request-id-1", event->trace_id());
+    EXPECT_EQ(987654321, event->request_timestamp_ns());
+    EXPECT_EQ(hit_response.input_token_len(), event->input_token_len());
+    EXPECT_EQ(hit_response.total_blocks(), event->total_blocks());
+    ASSERT_EQ(hit_response.capacity_results_size(), event->capacity_results().size());
+    ASSERT_EQ(1, event->capacity_results().size());
+    EXPECT_EQ(hit_response.capacity_results(0).cache_hit_count(), event->capacity_results()[0].cache_hit_count());
+    EXPECT_DOUBLE_EQ(hit_response.capacity_results(0).hit_rate(), event->capacity_results()[0].hit_rate());
+    EXPECT_EQ(hit_response.capacity_results(0).current_unique_keys(),
+              event->capacity_results()[0].current_unique_keys());
+    EXPECT_EQ(hit_response.theoretical_result().max_hit_count(), event->theoretical_result().max_hit_count());
+    EXPECT_DOUBLE_EQ(hit_response.theoretical_result().hit_rate(), event->theoretical_result().hit_rate());
+    EXPECT_EQ(hit_response.theoretical_result().current_unique_keys(),
+              event->theoretical_result().current_unique_keys());
+    EXPECT_GT(event->event_trigger_time_us(), 0);
+    event_manager->Stop();
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndInstance) {
