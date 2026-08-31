@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 
@@ -54,7 +55,7 @@ private:
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<OptimizerKmonitorMetricsReporter> kmonitor_metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
-    std::unique_ptr<KvcmEventSubscriber> kvcm_event_subscriber_;
+    std::vector<std::unique_ptr<KvcmEventSubscriber>> kvcm_event_subscribers_;
 
     std::unique_ptr<grpc::Server> grpc_server_;
     std::thread http_thread_;

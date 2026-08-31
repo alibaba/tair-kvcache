@@ -446,6 +446,20 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
 }
 
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationUsesCapacityOverride) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, {40.0, 10.0, 20.0}));
+
+    auto stored_group = registry_->GetInstanceGroup("kvcm-group");
+    ASSERT_NE(nullptr, stored_group);
+    EXPECT_EQ((std::vector<double>{10.0, 20.0, 40.0}), stored_group->capacity_gb());
+}
+
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroups) {
     proto::optimizer::KvcmConfigurationResponse configuration;
     auto *group = configuration.add_instance_groups();
