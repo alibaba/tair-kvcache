@@ -46,9 +46,6 @@ KvcmEventSubscriber::KvcmEventSubscriber(const KvcmEventSubscriptionConfig &conf
 KvcmEventSubscriber::~KvcmEventSubscriber() { Stop(); }
 
 bool KvcmEventSubscriber::Init() {
-    if (!config_.enable()) {
-        return true;
-    }
     if (!optimizer_service_) {
         KVCM_LOG_ERROR("KvcmEventSubscriber: optimizer service is null");
         return false;
@@ -63,9 +60,6 @@ bool KvcmEventSubscriber::Init() {
 }
 
 bool KvcmEventSubscriber::Start() {
-    if (!config_.enable()) {
-        return true;
-    }
     if (!service_discovery_ || !optimizer_service_) {
         return false;
     }
@@ -182,7 +176,8 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
     }
 
     std::unordered_set<std::string> unsupported_instance_ids;
-    const ErrorCode ec = optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids);
+    const ErrorCode ec =
+        optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, config_.capacity_gb());
     if (ec != EC_OK) {
         KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
                       leader_endpoint.c_str(),

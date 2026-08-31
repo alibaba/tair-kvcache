@@ -1,30 +1,45 @@
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <unordered_set>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
 
 namespace kv_cache_manager {
 
+namespace {
+
+constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMaxCapacityGbForInt64 = static_cast<double>(std::numeric_limits<int64_t>::max()) / kBytesPerGb;
+
+} // namespace
+
 bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable", enable_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string());
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "consumer_id", consumer_id_, std::string("online-optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
+    KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
     return Validate();
 }
 
 void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "enable", enable_);
     Put(writer, "service_discovery_url", service_discovery_url_);
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
+    Put(writer, "capacity_gb", capacity_gb_);
 }
 
 bool KvcmEventSubscriptionConfig::Validate() const {
-    return !enable_ || (!service_discovery_url_.empty() && !consumer_id_.empty() && discovery_refresh_interval_ms_ > 0);
+    if (service_discovery_url_.empty() || consumer_id_.empty() || discovery_refresh_interval_ms_ <= 0) {
+        return false;
+    }
+    return std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
+        return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;
+    });
 }
 
 // clang-format off
@@ -70,25 +85,9 @@ std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
          config->io_thread_num_ = std::stoi(value);
          return true;
      }},
-    {"kvcm_optimizer.kvcm_event_subscription.enable",
+    {"kvcm_optimizer.kvcm_event_subscriptions",
      [](const std::string &value, OnlineOptimizerServerConfig *config) {
-         config->kvcm_event_subscription_.enable_ = value == "true";
-         return true;
-     }},
-    {"kvcm_optimizer.kvcm_event_subscription.service_discovery_url",
-     [](const std::string &value, OnlineOptimizerServerConfig *config) {
-         config->kvcm_event_subscription_.service_discovery_url_ = value;
-         return true;
-     }},
-    {"kvcm_optimizer.kvcm_event_subscription.consumer_id",
-     [](const std::string &value, OnlineOptimizerServerConfig *config) {
-         config->kvcm_event_subscription_.consumer_id_ = value;
-         return true;
-     }},
-    {"kvcm_optimizer.kvcm_event_subscription.discovery_refresh_interval_ms",
-     [](const std::string &value, OnlineOptimizerServerConfig *config) {
-         config->kvcm_event_subscription_.discovery_refresh_interval_ms_ = std::stol(value);
-         return true;
+         return Jsonizable::FromJsonString(value, config->kvcm_event_subscriptions_);
      }},
 };
 // clang-format on
@@ -102,9 +101,8 @@ bool OnlineOptimizerServerConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_prometheus", enable_prometheus_, true);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "prometheus_prefix", prometheus_prefix_, std::string("kvcm_optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "io_thread_num", io_thread_num_, int32_t(4));
-    kvcm_event_subscription_ = KvcmEventSubscriptionConfig{};
-    KVCM_JSON_GET_MACRO(rapid_value, "kvcm_event_subscription", kvcm_event_subscription_);
-    return true;
+    KVCM_JSON_GET_MACRO(rapid_value, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
+    return ValidateKvcmEventSubscriptions();
 }
 
 void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -116,7 +114,7 @@ void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "enable_prometheus", enable_prometheus_);
     Put(writer, "prometheus_prefix", prometheus_prefix_);
     Put(writer, "io_thread_num", io_thread_num_);
-    Put(writer, "kvcm_event_subscription", kvcm_event_subscription_);
+    Put(writer, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
 }
 
 bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ) {
@@ -143,7 +141,17 @@ bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ)
             success = false;
         }
     }
-    return success && kvcm_event_subscription_.Validate();
+    return success && ValidateKvcmEventSubscriptions();
+}
+
+bool OnlineOptimizerServerConfig::ValidateKvcmEventSubscriptions() const {
+    std::unordered_set<std::string> discovery_urls;
+    for (const auto &subscription : kvcm_event_subscriptions_) {
+        if (!subscription.Validate() || !discovery_urls.insert(subscription.service_discovery_url()).second) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void OnlineOptimizerServerConfig::UpdateEnviron(EnvironMap &environ) {

@@ -108,13 +108,20 @@ int AllocatePort() {
 
 class OnlineOptimizerServerEventSubscriptionTest : public TESTBASE {};
 
-TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsSubscriberWithServer) {
-    LeaderMetaService meta_service;
-    BlockingEventService event_service;
-    std::unique_ptr<grpc::Server> event_server;
-    const int event_port = StartEventServer(&meta_service, &event_service, &event_server);
-    ASSERT_NE(nullptr, event_server);
-    ASSERT_GT(event_port, 0);
+TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsMultipleSubscribersWithServer) {
+    LeaderMetaService meta_service_a;
+    BlockingEventService event_service_a;
+    std::unique_ptr<grpc::Server> event_server_a;
+    const int event_port_a = StartEventServer(&meta_service_a, &event_service_a, &event_server_a);
+    ASSERT_NE(nullptr, event_server_a);
+    ASSERT_GT(event_port_a, 0);
+
+    LeaderMetaService meta_service_b;
+    BlockingEventService event_service_b;
+    std::unique_ptr<grpc::Server> event_server_b;
+    const int event_port_b = StartEventServer(&meta_service_b, &event_service_b, &event_server_b);
+    ASSERT_NE(nullptr, event_server_b);
+    ASSERT_GT(event_port_b, 0);
     const int optimizer_rpc_port = AllocatePort();
     const int optimizer_http_port = AllocatePort();
     ASSERT_GT(optimizer_rpc_port, 0);
@@ -131,25 +138,36 @@ TEST_F(OnlineOptimizerServerEventSubscriptionTest, StartsAndStopsSubscriberWithS
         "registry_storage_uri": "",
         "metrics_report_interval_ms": 0,
         "enable_prometheus": false,
-        "kvcm_event_subscription": {
-            "enable": true,
-            "service_discovery_url": "static://127.0.0.1:)"
-           << event_port << R"(",
-            "consumer_id": "server-lifecycle-test",
-            "discovery_refresh_interval_ms": 50
-        }
+        "kvcm_event_subscriptions": [
+            {
+                "service_discovery_url": "static://127.0.0.1:)"
+           << event_port_a << R"(",
+                "consumer_id": "server-lifecycle-test-a",
+                "discovery_refresh_interval_ms": 50
+            },
+            {
+                "service_discovery_url": "static://127.0.0.1:)"
+           << event_port_b << R"(",
+                "consumer_id": "server-lifecycle-test-b",
+                "discovery_refresh_interval_ms": 50
+            }
+        ]
     })";
     output.close();
 
     OnlineOptimizerServer server;
     ASSERT_TRUE(server.Init(config_path));
     ASSERT_TRUE(server.Start());
-    ASSERT_TRUE(WaitUntil([&event_service] { return event_service.subscribe_count_.load() == 1; }));
-    ASSERT_NE(nullptr, server.kvcm_event_subscriber_);
+    ASSERT_TRUE(WaitUntil([&event_service_a, &event_service_b] {
+        return event_service_a.subscribe_count_.load() == 1 && event_service_b.subscribe_count_.load() == 1;
+    }));
+    ASSERT_EQ(2, server.kvcm_event_subscribers_.size());
 
     server.Stop();
-    EXPECT_FALSE(server.kvcm_event_subscriber_->running_);
-    event_server->Shutdown();
+    EXPECT_FALSE(server.kvcm_event_subscribers_[0]->running_);
+    EXPECT_FALSE(server.kvcm_event_subscribers_[1]->running_);
+    event_server_a->Shutdown();
+    event_server_b->Shutdown();
 }
 
 } // namespace kv_cache_manager
