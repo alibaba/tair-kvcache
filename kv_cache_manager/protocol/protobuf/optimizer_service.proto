@@ -156,6 +156,11 @@ message TraceQueryRequest {
     repeated int64 block_keys = 3; // 本次请求所有完整 block 的 key 序列（有序，前缀匹配）
     repeated int64 token_ids = 4;  // 兼容输入；未设置 input_token_len 时可由其长度推导
     int64 input_token_len = 5;     // 原始输入 token 数
+    // 事件在生产侧的发生时间。0 表示未设置，此时服务端回退到自己的墙钟。
+    // kvcm 主动推送事件时会填它：事件在推送队列里可能积压，用服务端收到的
+    // 时间会让 TTL 判定偏晚（纯 LRU 只看顺序，不受影响）。
+    int64 timestamp_ns = 6;
+    repeated string location_spec_names = 7; // 本次查询指定的 location spec；空表示未指定
 }
 
 message TraceQueryResponse {
@@ -233,6 +238,33 @@ message OptimizerResetStatsResponse {
     CommonResponseHeader header = 1;
 }
 
+message OptimizerEventSubscriptionRequest {
+    string consumer_id = 1; // 仅用于 KVCM 日志，便于区分 optimizer 副本
+}
+
+message KvcmConfigurationRequest {
+    string trace_id = 1;
+}
+
+message KvcmInstanceGroupConfiguration {
+    string name = 1;
+    int64 capacity_bytes = 2;
+}
+
+message KvcmInstanceConfiguration {
+    string instance_group_name = 1;
+    string instance_id = 2;
+    int32 block_size = 3;
+    repeated LocationSpecInfo location_spec_infos = 4;
+    repeated LocationSpecGroup location_spec_groups = 5;
+}
+
+message KvcmConfigurationResponse {
+    CommonResponseHeader header = 1;
+    repeated KvcmInstanceGroupConfiguration instance_groups = 2;
+    repeated KvcmInstanceConfiguration instances = 3;
+}
+
 service OptimizerService {
     // InstanceGroup 管理
     rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
@@ -250,4 +282,11 @@ service OptimizerService {
     // 在线 TraceQuery
     rpc TraceQuery(TraceQueryRequest) returns (TraceQueryResponse);
     rpc ResetStats(OptimizerResetStatsRequest) returns (OptimizerResetStatsResponse);
+}
+
+// KVCM 在现有 Meta gRPC 端口实现该服务。Optimizer 作为客户端建立长连接，
+// KVCM 再通过 response stream 单向写入缓存访问事件。
+service OptimizerEventStreamService {
+    rpc GetConfiguration(KvcmConfigurationRequest) returns (KvcmConfigurationResponse);
+    rpc SubscribeEvents(OptimizerEventSubscriptionRequest) returns (stream TraceQueryRequest);
 }

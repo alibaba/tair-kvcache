@@ -857,6 +857,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
     cache_get_event->SetEventTriggerTime();
+    cache_get_event->set_trace_id(request_context->trace_id());
     cache_get_event->SetAddtionalArgs(
         QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
     if (event_manager_) {
@@ -1012,6 +1013,7 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
     cache_get_event->SetEventTriggerTime();
+    cache_get_event->set_trace_id(request_context->trace_id());
     cache_get_event->SetAddtionalArgs(
         QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
     if (event_manager_) {
@@ -1084,6 +1086,7 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     }
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
     cache_get_event->SetEventTriggerTime();
+    cache_get_event->set_trace_id(request_context->trace_id());
     cache_get_event->SetAddtionalArgs(QueryTypeToString(query_type), query_keys, tokens, BlockMask(), sw_size, {});
     if (event_manager_) {
         event_manager_->Publish(cache_get_event);

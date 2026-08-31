@@ -20,11 +20,12 @@ flowchart TD
     data_storage --> common["common"]
 
     manager --> event["event"]
+    event --> protocol["protocol（proto/grpc）"]
     manager --> metrics["metrics"]
     service --> metrics
     service --> config
     service --> data_storage
-    manager --> protocol["protocol（proto/grpc）"]
+    manager --> protocol
 
     %% 有意的反向边（近似环，改动需谨慎）
     common -. request_context .-> metrics
