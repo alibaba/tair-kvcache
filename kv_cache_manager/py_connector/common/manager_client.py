@@ -389,14 +389,6 @@ class KvCacheManagerClient:
         """Register an instance with the service"""
         return self._make_api_request('/api/registerInstance', data, check_response)
 
-    def create_instance_group(self, data, check_response=True):
-        """Create an instance group through the Manager admin API."""
-        return self._make_api_request('/api/createInstanceGroup', data, check_response)
-
-    def get_instance_group(self, data, check_response=True):
-        """Get one instance group through the Manager admin API."""
-        return self._make_api_request('/api/getInstanceGroup', data, check_response)
-
     def get_instance_info(self, data, check_response=True):
         """Get information about a registered instance"""
         return self._make_api_request('/api/getInstanceInfo', data, check_response)
@@ -432,10 +424,6 @@ class KvCacheManagerClient:
     def report_event(self, data, check_response=True):
         """Report node, cache block, host-down, or heartbeat events."""
         return self._make_api_request('/api/reportEvent', data, check_response)
-
-    def report_optimizer_event(self, data, check_response=True):
-        """Report one out-of-band cache query observation to the optimizer stream."""
-        return self._make_api_request('/api/reportOptimizerEvent', data, check_response)
 
     def trim_cache(self, data, check_response=True):
         """Trim cache data based on specified strategy"""
