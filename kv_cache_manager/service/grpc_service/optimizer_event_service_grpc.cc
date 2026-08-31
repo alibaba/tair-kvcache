@@ -1,7 +1,9 @@
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 
 #include <chrono>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -10,15 +12,38 @@
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
+#include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/service/util/optimizer_event_proto_util.h"
 
 namespace kv_cache_manager {
 
+namespace {
+
+void SetOptimizerEventStatus(ErrorCode ec, RequestContext &request_context, proto::optimizer::Status *status) {
+    if (ec == EC_OK) {
+        status->set_code(proto::optimizer::OK);
+    } else if (ec == EC_BADARGS) {
+        status->set_code(proto::optimizer::INVALID_ARGUMENT);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    } else if (ec == EC_INSTANCE_NOT_EXIST) {
+        status->set_code(proto::optimizer::INSTANCE_NOT_EXIST);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    } else {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message(request_context.error_tracer()->ToJsonString());
+    }
+}
+
+} // namespace
+
 OptimizerEventServiceGRpc::OptimizerEventServiceGRpc(std::shared_ptr<SubscriptionEventSink> sink,
                                                      std::shared_ptr<RegistryManager> registry_manager,
-                                                     std::shared_ptr<LeaderElector> leader_elector)
+                                                     std::shared_ptr<LeaderElector> leader_elector,
+                                                     std::shared_ptr<CacheManager> cache_manager)
     : sink_(std::move(sink))
     , registry_manager_(std::move(registry_manager))
-    , leader_elector_(std::move(leader_elector)) {
+    , leader_elector_(std::move(leader_elector))
+    , cache_manager_(std::move(cache_manager)) {
     DisableSubscriptions();
 }
 
@@ -101,6 +126,33 @@ grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
     }
 
     status->set_code(proto::optimizer::OK);
+    return grpc::Status::OK;
+}
+
+grpc::Status OptimizerEventServiceGRpc::ReportOptimizerEvent(grpc::ServerContext *,
+                                                             const proto::optimizer::TraceQueryRequest *request,
+                                                             proto::optimizer::CommonResponse *response) {
+    auto *status = response->mutable_header()->mutable_status();
+    if (!IsAvailable() || !cache_manager_) {
+        status->set_code(proto::optimizer::SERVICE_NOT_READY);
+        status->set_message("KVCM is unavailable");
+        return grpc::Status::OK;
+    }
+
+    RequestContext request_context(request->trace_id());
+    std::vector<int64_t> tokens;
+    auto ec = DecodeOptimizerEventTokens(*request, &request_context, &tokens);
+    if (ec == EC_OK) {
+        ec = cache_manager_->ReportOptimizerEvent(
+            &request_context,
+            request->instance_id(),
+            {request->block_keys().begin(), request->block_keys().end()},
+            tokens,
+            request->input_token_len(),
+            request->timestamp_ns(),
+            {request->location_spec_names().begin(), request->location_spec_names().end()});
+    }
+    SetOptimizerEventStatus(ec, request_context, status);
     return grpc::Status::OK;
 }
 
