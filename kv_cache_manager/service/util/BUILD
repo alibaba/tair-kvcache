@@ -61,6 +61,16 @@ cc_library(
 )
 
 cc_library(
+    name = "optimizer_event_proto_util",
+    srcs = ["optimizer_event_proto_util.cc"],
+    hdrs = ["optimizer_event_proto_util.h"],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)
+
+cc_library(
     name = "service_access_log",
     srcs = ["service_access_log.cc"],
     hdrs = ["service_access_log.h"],
