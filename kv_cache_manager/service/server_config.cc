@@ -240,6 +240,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_gc_event_report_action_batch_size_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.event_report.read_failure_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->read_failure_invalidation_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -330,6 +335,7 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_gc_max_inflight_delete_requests_ = 2;
     cache_gc_event_report_cleanup_enabled_ = true;
     cache_gc_event_report_action_batch_size_ = 32;
+    read_failure_invalidation_enabled_ = false;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {

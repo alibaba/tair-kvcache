@@ -77,6 +77,8 @@ bool Server::Init(const ServerConfig &config) {
     cache_gc_config.event_report_cleanup_enabled = config_.IsCacheGcEventReportCleanupEnabled();
     cache_gc_config.event_report_action_batch_size =
         static_cast<size_t>(config_.GetCacheGcEventReportActionBatchSize());
+    ReadFailureInvalidationConfig read_failure_config;
+    read_failure_config.enabled = config_.IsReadFailureInvalidationEnabled();
     if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                               config_.GetCacheReclaimerKeySamplingSizeTotal(),
                               config_.GetCacheReclaimerKeySamplingSizePerTask(),
@@ -88,7 +90,8 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetMetaQueryWorkerCount(),
                               config_.GetMetaQueryParallelThreshold(),
                               config_.GetMetaQueryChunkSize(),
-                              cache_gc_config)) {
+                              cache_gc_config,
+                              read_failure_config)) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;
     }

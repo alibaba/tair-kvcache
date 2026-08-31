@@ -109,6 +109,9 @@ kvcm.meta_query.parallel_threshold=256
 # 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
 kvcm.meta_query.chunk_size=128
 
+# Reader 确认远端对象不存在后清理对应 metadata，默认关闭。
+kvcm.event_report.read_failure_enabled=false
+
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
@@ -201,6 +204,11 @@ batch 调用。CPU 投影使用同一有界池。参数约束为：
 默认值是 `4/256/128`。`worker_count=1` 是线上回退开关；调大 worker 前应同时对比单请求和并发请求
 p99、CPU 与 ReportEvent RT。设计、指标含义、测试命令见
 [`design/report_event_performance.md`](design/report_event_performance.md)。
+
+### EventReport READ_FAILED
+
+`kvcm.event_report.read_failure_enabled` 默认 `false`。开启后，KVCM 处理 READ_FAILED 上报并按
+`name + URI` 清理对应 metadata。
 
 同一个 `migration_config` 中，`strategies` 的 `(source_storage_name, target_storage_name)` 组合必须唯一。
 相同 source 迁移到不同 target、不同 source 迁移到相同 target，以及 `hot -> warm -> cold` 级联均可配置；只有

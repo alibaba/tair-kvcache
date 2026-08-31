@@ -116,7 +116,8 @@ public:
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
-                               std::vector<CacheLocationMap> &out_location_maps);
+                               std::vector<CacheLocationMap> &out_location_maps,
+                               std::vector<ErrorCode> *out_per_key_ec = nullptr);
     struct AddLocationResult {
         ErrorCode ec = EC_UNKNOWN;
         // EC_OK 时是可供业务使用的 location id；失败时若非空，仅可作为回滚定位符。
@@ -305,6 +306,33 @@ public:
                                        std::vector<std::vector<ErrorCode>> &out_batch_results,
                                        std::vector<std::vector<bool>> *out_missing_targets = nullptr,
                                        AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    enum class ConditionalSpecRemovalOutcome : std::uint8_t {
+        kNoent = 0,
+        kMismatch = 1,
+        kApplied = 2,
+    };
+    struct ExpectedLocationSpec {
+        std::string name;
+        std::string expected_uri;
+    };
+    struct ConditionalDeleteLocationSpecsTask {
+        std::string location_id;
+        DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        std::vector<ExpectedLocationSpec> specs;
+    };
+    struct ConditionalDeleteLocationSpecsResult {
+        ErrorCode ec = EC_OK;
+        std::vector<ConditionalSpecRemovalOutcome> spec_outcomes;
+        std::size_t removed_spec_count = 0;
+    };
+    // Removes only specs whose name and complete URI still match inside the
+    // metadata RMW. The caller supplies candidate location ids discovered for
+    // the target storage type; a refreshed type/URI is a no-op.
+    ErrorCode
+    BatchDeleteLocationSpecsIfMatch(RequestContext *request_context,
+                                    const KeyVector &keys,
+                                    const std::vector<std::vector<ConditionalDeleteLocationSpecsTask>> &tasks_per_key,
+                                    std::vector<std::vector<ConditionalDeleteLocationSpecsResult>> &out_batch_results);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;

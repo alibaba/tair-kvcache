@@ -396,7 +396,8 @@ public:
 
     void TearDown() override {}
 
-    std::unique_ptr<CacheManager> createCacheManager() {
+    std::unique_ptr<CacheManager>
+    createCacheManager(ReadFailureInvalidationConfig read_failure_config = {true}) {
         metrics_registry_ = std::make_shared<MetricsRegistry>();
         std::shared_ptr<MetricsRegistry> &metrics_registry = metrics_registry_;
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry);
@@ -421,7 +422,19 @@ public:
         std::unique_ptr<CacheManager> cache_manager =
             std::make_unique<CacheManager>(metrics_registry, registry_manager_);
 
-        EXPECT_TRUE(cache_manager->Init());
+        EXPECT_TRUE(cache_manager->Init(DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
+                                        /*cache_reclaimer_key_sampling_size_total*/ 1000,
+                                        /*cache_reclaimer_key_sampling_size_per_task*/ 100,
+                                        /*cache_reclaimer_del_batch_size*/ 100,
+                                        /*cache_reclaimer_idle_interval_ms*/ 100,
+                                        /*cache_reclaimer_worker_size*/ 16,
+                                        CacheReclaimerAsyncDeleteConfig{},
+                                        DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET,
+                                        DEFAULT_META_QUERY_WORKER_COUNT,
+                                        DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
+                                        DEFAULT_META_QUERY_CHUNK_SIZE,
+                                        CacheGarbageCollector::Config{},
+                                        read_failure_config));
 
         // load first because we need default group
         // in real usage, we load startup config after recover
@@ -633,6 +646,26 @@ public:
         return request;
     }
 
+    static proto::meta::ReportEventRequest
+    MakeReadFailureRequest(const std::string &observer,
+                           int64_t key,
+                           const std::vector<std::pair<std::string, std::string>> &observations) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("test_instance");
+        request.set_host_ip_port(observer);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_READ_FAILED);
+        auto *params = event->mutable_block_read_failed();
+        params->set_block_key(std::to_string(key));
+        for (const auto &[name, uri] : observations) {
+            auto *spec = params->add_specs();
+            spec->set_name(name);
+            spec->set_observed_uri(uri);
+        }
+        return request;
+    }
+
     std::pair<ErrorCode, proto::meta::ReportEventResponse>
     CallReportEvent(const proto::meta::ReportEventRequest &request, const std::string &trace_id) {
         RequestContext context(trace_id);
@@ -657,8 +690,8 @@ public:
         return uris;
     }
 
-    std::vector<std::string> QueryRawEventReportUris(int64_t key) {
-        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    std::vector<std::string> QueryRawEventReportUris(int64_t key, const std::string &instance_id = "test_instance") {
+        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
         if (!meta_searcher) {
             return {};
         }
@@ -2771,6 +2804,351 @@ TEST(ReportEventContractTest, SnapshotAndResponseFieldNumbersMatchContract) {
     EXPECT_EQ(4, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("retry_after_ms")->number());
     EXPECT_EQ(5, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("snapshot_required")->number());
     EXPECT_EQ(6, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("extra_info")->number());
+    EXPECT_EQ(8, proto::meta::EventItem::descriptor()->FindFieldByName("block_read_failed")->number());
+    EXPECT_EQ(1, proto::meta::ObservedReadFailureSpec::descriptor()->FindFieldByName("name")->number());
+    EXPECT_EQ(2, proto::meta::ObservedReadFailureSpec::descriptor()->FindFieldByName("observed_uri")->number());
+}
+
+TEST_F(CacheManagerTest, TestReadFailureRemovesOnlyExactSpecWithoutTouchingReporterLifecycle) {
+    const std::string owner = "192.168.20.1:8080";
+    const std::string observer = "192.168.20.2:8080";
+    const int64_t key = 96'000;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    auto snapshot = MakeSnapshotRequest(owner, {});
+    auto *block = snapshot.mutable_events(0)->mutable_block_snapshot()->add_blocks();
+    block->set_block_key(std::to_string(key));
+    block->set_medium("mem");
+    auto *tp0 = block->add_specs();
+    tp0->set_name("tp0");
+    tp0->set_uri("event_report://" + owner + "/mem?source=tp0&size=10");
+    auto *tp1 = block->add_specs();
+    tp1->set_name("tp1");
+    tp1->set_uri("event_report://" + owner + "/mem?source=tp1&size=20");
+    const auto [snapshot_ec, snapshot_response] = CallReportEvent(snapshot, "read_failure_seed");
+    ASSERT_EQ(EC_OK, snapshot_ec);
+    const std::string committed = snapshot_response.committed_snapshot_version();
+    const uint64_t owner_generation = event_backend->GetNodeGeneration("test_instance", owner);
+    ASSERT_TRUE(event_backend->IsNodeRegistered("test_instance", owner));
+    ASSERT_FALSE(event_backend->IsNodeRegistered("test_instance", observer));
+
+    const auto before = QueryRawEventReportUris(key);
+    ASSERT_EQ(2u, before.size());
+    const auto tp0_uri = std::find_if(before.begin(), before.end(), [](const std::string &uri) {
+        return uri.find("source=tp0") != std::string::npos;
+    });
+    ASSERT_NE(before.end(), tp0_uri);
+
+    const auto request = MakeReadFailureRequest(observer, key, {{"tp0", *tp0_uri}});
+    const auto [ec, response] = CallReportEvent(request, "read_failure_exact_match");
+    ASSERT_EQ(EC_OK, ec);
+    EXPECT_EQ(proto::meta::OK, response.header().status().code());
+    EXPECT_TRUE(response.committed_snapshot_version().empty());
+    EXPECT_FALSE(response.snapshot_required());
+    EXPECT_EQ(0, response.item_results_size());
+
+    const auto after = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, after.size());
+    EXPECT_NE(std::string::npos, after.front().find("source=tp1"));
+    EXPECT_TRUE(event_backend->IsNodeRegistered("test_instance", owner));
+    EXPECT_EQ(owner_generation, event_backend->GetNodeGeneration("test_instance", owner));
+    EXPECT_EQ(committed, event_backend->GetSnapshotVersion({"test_instance", owner}));
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", observer));
+    EXPECT_EQ(0u, event_backend->GetNodeGeneration("test_instance", observer));
+    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", observer}).empty());
+
+    const MetricsTags base_tags = {
+        {"instance_group", "default"}, {"instance_id", "test_instance"}, {"type", "event_report_l2"}};
+    auto outcome_metrics = metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter");
+    ASSERT_NE(nullptr, outcome_metrics);
+    auto applied_tags = base_tags;
+    applied_tags["outcome"] = "applied";
+    EXPECT_EQ(1u, outcome_metrics->GetOrCreateCounter(applied_tags).Get());
+
+    const auto [duplicate_ec, duplicate_response] = CallReportEvent(request, "read_failure_duplicate");
+    EXPECT_EQ(EC_OK, duplicate_ec);
+    EXPECT_EQ(proto::meta::OK, duplicate_response.header().status().code());
+    EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
+    auto noent_tags = base_tags;
+    noent_tags["outcome"] = "noent";
+    EXPECT_EQ(1u, outcome_metrics->GetOrCreateCounter(noent_tags).Get());
+
+    uint64_t tombstone_generation = 0;
+    ASSERT_EQ(EC_OK, event_backend->UnregisterNodeForHostDown("test_instance", owner, tombstone_generation));
+    ASSERT_FALSE(event_backend->IsNodeRegistered("test_instance", owner));
+    const uint64_t generation_after_tombstone = event_backend->GetNodeGeneration("test_instance", owner);
+    const std::string snapshot_after_tombstone = event_backend->GetSnapshotVersion({"test_instance", owner});
+    const auto remaining_uri = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, remaining_uri.size());
+    EXPECT_EQ(EC_OK,
+              CallReportEvent(MakeReadFailureRequest(observer, key, {{"tp1", remaining_uri.front()}}),
+                              "read_failure_tombstoned_owner")
+                  .first);
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", owner));
+    EXPECT_EQ(generation_after_tombstone, event_backend->GetNodeGeneration("test_instance", owner));
+    EXPECT_EQ(snapshot_after_tombstone, event_backend->GetSnapshotVersion({"test_instance", owner}));
+}
+
+TEST_F(CacheManagerTest, TestReadFailureOldUriAndMixedRequestsAreNoops) {
+    const std::string owner = "192.168.20.3:8080";
+    const std::string observer = "192.168.20.4:8080";
+    const int64_t key = 96'001;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(owner, key, "old"), "read_failure_old_seed").first);
+    const auto old_uris = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, old_uris.size());
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(owner, key, "new"), "read_failure_new_value").first);
+    const auto new_uris = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, new_uris.size());
+    ASSERT_NE(old_uris.front(), new_uris.front());
+
+    auto stale_request = MakeReadFailureRequest(observer, key, {{"tp0", old_uris.front()}});
+    const auto [stale_ec, stale_response] = CallReportEvent(stale_request, "read_failure_stale_uri");
+    EXPECT_EQ(EC_OK, stale_ec);
+    EXPECT_EQ(proto::meta::OK, stale_response.header().status().code());
+    EXPECT_EQ(new_uris, QueryRawEventReportUris(key));
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", observer));
+
+    auto mixed = MakeReadFailureRequest(observer, key, {{"tp0", new_uris.front()}});
+    auto *heartbeat = mixed.add_events();
+    heartbeat->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    heartbeat->mutable_heartbeat();
+    const auto [mixed_ec, mixed_response] = CallReportEvent(mixed, "read_failure_mixed_request");
+    EXPECT_EQ(EC_BADARGS, mixed_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, mixed_response.header().status().code());
+    EXPECT_TRUE(mixed_response.committed_snapshot_version().empty());
+    EXPECT_FALSE(mixed_response.snapshot_required());
+    EXPECT_EQ(new_uris, QueryRawEventReportUris(key));
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", observer));
+
+    auto missing_name = MakeReadFailureRequest(observer, key, {{"unregistered", new_uris.front()}});
+    const auto [missing_name_ec, missing_name_response] =
+        CallReportEvent(missing_name, "read_failure_unregistered_spec");
+    EXPECT_EQ(EC_OK, missing_name_ec);
+    EXPECT_EQ(proto::meta::OK, missing_name_response.header().status().code());
+    EXPECT_EQ(new_uris, QueryRawEventReportUris(key));
+
+    auto missing_version =
+        MakeReadFailureRequest(observer, key, {{"tp0", "event_report://" + owner + "/mem?source=new"}});
+    EXPECT_EQ(EC_BADARGS, CallReportEvent(missing_version, "read_failure_missing_version").first);
+    EXPECT_EQ(new_uris, QueryRawEventReportUris(key));
+
+    auto outcome_metrics = metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter");
+    ASSERT_NE(nullptr, outcome_metrics);
+    const MetricsTags base_tags = {
+        {"instance_group", "default"}, {"instance_id", "test_instance"}, {"type", "event_report_l2"}};
+    auto mismatch_tags = base_tags;
+    mismatch_tags["outcome"] = "mismatch";
+    EXPECT_EQ(1u, outcome_metrics->GetOrCreateCounter(mismatch_tags).Get());
+    auto noent_tags = base_tags;
+    noent_tags["outcome"] = "noent";
+    EXPECT_EQ(1u, outcome_metrics->GetOrCreateCounter(noent_tags).Get());
+    auto invalid_tags = base_tags;
+    invalid_tags["outcome"] = "invalid";
+    EXPECT_EQ(2u, outcome_metrics->GetOrCreateCounter(invalid_tags).Get());
+}
+
+TEST_F(CacheManagerTest, TestReadFailureRemovesExactUnregisteredSpecAndRegisteredSibling) {
+    const std::string owner = "192.168.20.11:8080";
+    const std::string observer = "192.168.20.12:8080";
+    const int64_t key = 96'006;
+    const std::string version = "0123456789abcdef0123456789abcdef";
+    const std::string stale_uri =
+        "event_report://" + owner + "/mem?source=legacy&s_version=" + version;
+    const std::string registered_uri =
+        "event_report://" + owner + "/mem?source=current&s_version=" + version;
+    ASSERT_NE(nullptr, InstallEventReportBackend());
+
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance");
+    ASSERT_NE(nullptr, instance_info);
+    EXPECT_FALSE(std::any_of(instance_info->location_spec_infos().begin(),
+                             instance_info->location_spec_infos().end(),
+                             [](const LocationSpecInfo &spec) { return spec.name() == "legacy_tp"; }));
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {"kvs#event_report_l2#mem#" + owner,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("legacy_tp", stale_uri), LocationSpec("tp0", registered_uri)}},
+    }};
+    std::vector<ErrorCode> merge_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchMergeLocationSpecs(request_context_.get(), {key}, merge_tasks, merge_results));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), merge_results);
+    ASSERT_EQ(2u, QueryRawEventReportUris(key).size());
+
+    const auto request =
+        MakeReadFailureRequest(observer, key, {{"legacy_tp", stale_uri}, {"tp0", registered_uri}});
+    const auto [ec, response] = CallReportEvent(request, "read_failure_stale_spec_and_registered_sibling");
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ(proto::meta::OK, response.header().status().code());
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+
+    auto metrics = metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter");
+    ASSERT_NE(nullptr, metrics);
+    const MetricsTags applied_tags = {{"instance_group", "default"},
+                                      {"instance_id", "test_instance"},
+                                      {"type", "event_report_l2"},
+                                      {"outcome", "applied"}};
+    EXPECT_EQ(2u, metrics->GetOrCreateCounter(applied_tags).Get());
+}
+
+TEST_F(CacheManagerTest, TestConcurrentReadFailureAndAddPreserveRefreshedUri) {
+    const std::string owner = "192.168.20.7:8080";
+    const std::string observer = "192.168.20.8:8080";
+    const int64_t key = 96'004;
+    auto event_backend = InstallEventReportBackend();
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_NE(nullptr, meta_backend);
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(owner, key, "old"), "read_failure_race_seed").first);
+    const auto old_uris = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, old_uris.size());
+
+    meta_backend->BlockNextLocationRead();
+    auto invalidation = std::async(std::launch::async, [this, observer, key, old_uri = old_uris.front()] {
+        return CallReportEvent(MakeReadFailureRequest(observer, key, {{"tp0", old_uri}}),
+                               "read_failure_race_invalidation");
+    });
+    const bool read_blocked = meta_backend->WaitUntilLocationReadEntered(std::chrono::seconds(1));
+    if (!read_blocked) {
+        meta_backend->ReleaseLocationRead();
+    }
+    ASSERT_TRUE(read_blocked);
+
+    auto add = std::async(std::launch::async, [this, owner, key] {
+        return CallReportEvent(MakeAddRequest(owner, key, "new"), "read_failure_race_add");
+    });
+    meta_backend->ReleaseLocationRead();
+    ASSERT_EQ(std::future_status::ready, invalidation.wait_for(std::chrono::seconds(2)));
+    ASSERT_EQ(std::future_status::ready, add.wait_for(std::chrono::seconds(2)));
+    EXPECT_EQ(EC_OK, invalidation.get().first);
+    EXPECT_EQ(EC_OK, add.get().first);
+
+    const auto final_uris = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, final_uris.size());
+    EXPECT_NE(std::string::npos, final_uris.front().find("source=new"));
+}
+
+TEST_F(CacheManagerTest, TestReadFailureIsIsolatedAcrossInstances) {
+    const std::string other_instance = "read_failure_other_instance";
+    const std::string owner = "192.168.20.9:8080";
+    const std::string observer = "192.168.20.10:8080";
+    const int64_t key = 96'005;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     other_instance,
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>())
+                  .first);
+
+    auto add = MakeAddRequest(owner, key, "other_instance");
+    add.set_instance_id(other_instance);
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "read_failure_other_instance_seed").first);
+    const auto other_uris = QueryRawEventReportUris(key, other_instance);
+    ASSERT_EQ(1u, other_uris.size());
+
+    EXPECT_EQ(EC_OK,
+              CallReportEvent(MakeReadFailureRequest(observer, key, {{"tp0", other_uris.front()}}),
+                              "read_failure_wrong_instance")
+                  .first);
+    EXPECT_TRUE(QueryRawEventReportUris(key).empty());
+    EXPECT_EQ(other_uris, QueryRawEventReportUris(key, other_instance));
+
+    auto correct_instance = MakeReadFailureRequest(observer, key, {{"tp0", other_uris.front()}});
+    correct_instance.set_instance_id(other_instance);
+    EXPECT_EQ(EC_OK, CallReportEvent(correct_instance, "read_failure_correct_instance").first);
+    EXPECT_TRUE(QueryRawEventReportUris(key, other_instance).empty());
+}
+
+TEST_F(CacheManagerTest, TestReadFailureDisabledAndLargeBatchUseNormalRequestSemantics) {
+    const std::string owner = "192.168.20.5:8080";
+    const std::string observer = "192.168.20.6:8080";
+    const int64_t key_a = 96'002;
+    const int64_t key_b = 96'003;
+
+    cache_manager_ = createCacheManager(ReadFailureInvalidationConfig{});
+    auto missing_instance_request = MakeReadFailureRequest(observer, key_a, {{"tp0", "invalid"}});
+    missing_instance_request.set_instance_id("missing_instance");
+    const auto [missing_instance_ec, missing_instance_response] =
+        CallReportEvent(missing_instance_request, "read_failure_missing_instance");
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, missing_instance_ec);
+    EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, missing_instance_response.header().status().code());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter"));
+
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(owner, key_a, "disabled"), "read_failure_disabled_seed").first);
+    auto key_a_uri = QueryRawEventReportUris(key_a);
+    ASSERT_EQ(1u, key_a_uri.size());
+    auto disabled_request = MakeReadFailureRequest(observer, key_a, {{"tp0", key_a_uri.front()}});
+    const auto [disabled_ec, disabled_response] = CallReportEvent(disabled_request, "read_failure_disabled");
+    EXPECT_EQ(EC_BADARGS, disabled_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, disabled_response.header().status().code());
+    EXPECT_EQ(key_a_uri, QueryRawEventReportUris(key_a));
+    EXPECT_FALSE(event_backend->IsNodeRegistered("test_instance", observer));
+    EXPECT_EQ(0u, event_backend->GetNodeGeneration("test_instance", observer));
+    EXPECT_TRUE(event_backend->GetSnapshotVersion({"test_instance", observer}).empty());
+
+    auto malformed_disabled_request = disabled_request;
+    malformed_disabled_request.mutable_events(0)->mutable_block_read_failed()->mutable_specs(0)->set_observed_uri(
+        "invalid");
+    const auto [malformed_disabled_ec, malformed_disabled_response] =
+        CallReportEvent(malformed_disabled_request, "read_failure_disabled_malformed");
+    EXPECT_EQ(EC_BADARGS, malformed_disabled_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, malformed_disabled_response.header().status().code());
+    EXPECT_EQ("read-failure invalidation is disabled", malformed_disabled_response.header().status().message());
+
+    auto disabled_metrics = metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter");
+    ASSERT_NE(nullptr, disabled_metrics);
+    const MetricsTags disabled_tags = {{"instance_group", "default"},
+                                       {"instance_id", "test_instance"},
+                                       {"type", "event_report_l2"},
+                                       {"outcome", "disabled"}};
+    EXPECT_EQ(2u, disabled_metrics->GetOrCreateCounter(disabled_tags).Get());
+    auto disabled_requested_tags = disabled_tags;
+    disabled_requested_tags["outcome"] = "requested";
+    EXPECT_EQ(0u, disabled_metrics->GetOrCreateCounter(disabled_requested_tags).Get());
+
+    cache_manager_ = createCacheManager(ReadFailureInvalidationConfig{true});
+    event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    constexpr std::size_t kObservationCount = 257;
+    const std::string observed_uri =
+        "event_report://" + owner + "/mem?s_version=0123456789abcdef0123456789abcdef";
+    std::vector<std::pair<std::string, std::string>> observations;
+    observations.reserve(kObservationCount);
+    for (std::size_t i = 0; i < kObservationCount; ++i) {
+        observations.emplace_back("missing_" + std::to_string(i), observed_uri);
+    }
+    const auto [large_ec, large_response] =
+        CallReportEvent(MakeReadFailureRequest(observer, key_b, observations), "read_failure_large_batch");
+    EXPECT_EQ(EC_OK, large_ec);
+    EXPECT_EQ(proto::meta::OK, large_response.header().status().code());
+    EXPECT_TRUE(QueryRawEventReportUris(key_b).empty());
+
+    auto metrics = metrics_registry_->GetMetricsData("event_report.read_failure_spec_counter");
+    ASSERT_NE(nullptr, metrics);
+    const MetricsTags base_tags = {
+        {"instance_group", "default"}, {"instance_id", "test_instance"}, {"type", "event_report_l2"}};
+    auto requested_tags = base_tags;
+    requested_tags["outcome"] = "requested";
+    EXPECT_EQ(kObservationCount, metrics->GetOrCreateCounter(requested_tags).Get());
+    auto noent_tags = base_tags;
+    noent_tags["outcome"] = "noent";
+    EXPECT_EQ(kObservationCount, metrics->GetOrCreateCounter(noent_tags).Get());
 }
 
 TEST_F(CacheManagerTest, TestLegacyEventCleanupCallbackIsSafeAfterCacheManagerDestruction) {

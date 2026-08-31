@@ -46,6 +46,10 @@ constexpr unsigned int DEFAULT_META_QUERY_WORKER_COUNT = 4;
 constexpr std::size_t DEFAULT_META_QUERY_PARALLEL_THRESHOLD = 256;
 constexpr std::size_t DEFAULT_META_QUERY_CHUNK_SIZE = 128;
 
+struct ReadFailureInvalidationConfig {
+    bool enabled = false;
+};
+
 class CacheManager {
     // TODO should not public
 public:
@@ -100,7 +104,8 @@ public:
               uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
               std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
               std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE,
-              CacheGarbageCollector::Config cache_gc_config = {});
+              CacheGarbageCollector::Config cache_gc_config = {},
+              ReadFailureInvalidationConfig read_failure_invalidation_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();
@@ -378,6 +383,10 @@ private:
     void ClearEventCleanupCallbacks();
     void DeactivateEventCleanupCallbacks();
     void ActivateEventCleanupCallbacks();
+    ErrorCode ReportBlockReadFailures(RequestContext *request_context,
+                                      const proto::meta::ReportEventRequest *request,
+                                      proto::meta::ReportEventResponse *response,
+                                      DataStorageType requested_type);
 
     // purge metrics registry entries and invoke the removal callback
     // for a given instance_id
@@ -423,6 +432,8 @@ private:
     // already taken by the liveness thread and reject copies invoked later.
     std::shared_ptr<EventCleanupCallbackState> event_cleanup_callback_state_ =
         std::make_shared<EventCleanupCallbackState>();
+    // 无需清理 - immutable startup configuration.
+    ReadFailureInvalidationConfig read_failure_invalidation_config_;
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
     // 无需清理

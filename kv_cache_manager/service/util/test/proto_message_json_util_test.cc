@@ -548,7 +548,8 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventFastJsonParserMatchesGenericPars
             {"event_type":3,"blockDelete":{"block_key":"2","medium":"disk","specNames":["tp0","tp1"]}},
             {"event_type":"EVENT_HOST_DOWN","hostDown":{"ignored":{"nested":true}}},
             {"event_type":"EVENT_HEARTBEAT","heartbeat":{"systemStatus":{"state":"ready","load":"7"}}},
-            {"event_type":"EVENT_BLOCK_SNAPSHOT","blockSnapshot":{"medium":"legacy","blocks":[{"blockKey":"3","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem?block=3"}]}]}}
+            {"event_type":"EVENT_BLOCK_SNAPSHOT","blockSnapshot":{"medium":"legacy","blocks":[{"blockKey":"3","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem?block=3"}]}]}},
+            {"eventType":"EVENT_BLOCK_READ_FAILED","blockReadFailed":{"blockKey":"4","specs":[{"name":"tp0","observedUri":"event_report://host/mem?s_version=0123456789abcdef0123456789abcdef"}]}}
         ],
         "storageType":8,
         "ignored_top_level":{"deep":[1,2,3]}
@@ -593,6 +594,46 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventFastJsonParserMatchesGenericPars
         mutable_large.data(), mutable_large.size(), &mutable_large_fast));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(generic_large, mutable_large_fast));
     EXPECT_NE(large_json, mutable_large);
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestReportEventReadFailureSnakeAndCamelJsonAreEquivalent) {
+    const std::string snake = R"json({
+        "instance_id":"instance-fast",
+        "host_ip_port":"observer:8080",
+        "events":[{"event_type":"EVENT_BLOCK_READ_FAILED","block_read_failed":{
+            "block_key":"4","specs":[{"name":"tp0","observed_uri":"event_report://host/mem?s_version=0123456789abcdef0123456789abcdef"}]
+        }}],
+        "storage_type":"ST_EVENT_REPORT_L2"
+    })json";
+    const std::string camel = R"json({
+        "instanceId":"instance-fast",
+        "hostIpPort":"observer:8080",
+        "events":[{"eventType":"EVENT_BLOCK_READ_FAILED","blockReadFailed":{
+            "blockKey":"4","specs":[{"name":"tp0","observedUri":"event_report://host/mem?s_version=0123456789abcdef0123456789abcdef"}]
+        }}],
+        "storageType":"ST_EVENT_REPORT_L2"
+    })json";
+
+    proto::meta::ReportEventRequest snake_fast;
+    proto::meta::ReportEventRequest camel_fast;
+    proto::meta::ReportEventRequest snake_generic;
+    ASSERT_TRUE(ReportEventJsonParser::TryFromJson(snake, &snake_fast));
+    ASSERT_TRUE(ReportEventJsonParser::TryFromJson(camel, &camel_fast));
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(snake, &snake_generic));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(snake_fast, camel_fast));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(snake_generic, snake_fast));
+
+    const std::string malformed = R"json({
+        "instance_id":"instance-fast",
+        "host_ip_port":"observer:8080",
+        "events":[{"event_type":"EVENT_BLOCK_READ_FAILED","block_read_failed":{
+            "block_key":"4","specs":[{"name":"tp0","observed_uri":7}]
+        }}],
+        "storage_type":"ST_EVENT_REPORT_L2"
+    })json";
+    proto::meta::ReportEventRequest rejected;
+    EXPECT_FALSE(ReportEventJsonParser::TryFromJson(malformed, &rejected));
+    EXPECT_FALSE(ReportEventJsonParser::FromJson(malformed, &rejected));
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestReportEventFastJsonParserFallsBackForCompatibleRareShapes) {
