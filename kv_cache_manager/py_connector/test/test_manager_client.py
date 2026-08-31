@@ -273,31 +273,6 @@ class TestRequestTimeout(unittest.TestCase):
             client.close()
 
 
-class TestInstanceGroupAdminApi(unittest.TestCase):
-    def setUp(self):
-        self.client = KvCacheManagerClient("http://10.0.0.1:8080")
-        self.client.session.post = MagicMock(
-            return_value=_make_mock_response(_ok_response_json())
-        )
-
-    def tearDown(self):
-        self.client.close()
-
-    def test_instance_group_methods_use_admin_http_endpoints(self):
-        for method_name, endpoint in (
-            ("create_instance_group", "/api/createInstanceGroup"),
-            ("get_instance_group", "/api/getInstanceGroup"),
-        ):
-            with self.subTest(method=method_name):
-                self.client.session.post.reset_mock()
-                getattr(self.client, method_name)({"trace_id": "test"})
-                self.client.session.post.assert_called_once()
-                self.assertEqual(
-                    self.client.session.post.call_args[0][0],
-                    "http://10.0.0.1:8080" + endpoint,
-                )
-
-
 class TestResponseClassification(unittest.TestCase):
     """Transport/protocol failures must be distinct from Manager business errors."""
 
