@@ -51,6 +51,39 @@ OptimizerManager (core coordinator)
     HitAnalysis (result analysis)
 ```
 
+### 在线订阅 KVCM 事件
+
+`online_optimizer_server_main` 可以主动发现 KVCM，并通过 KVCM 现有的 Meta gRPC 端口订阅缓存读取事件。KVCM 不需要知道 Optimizer 地址，也不新增事件端口；Optimizer 是 gRPC 客户端，调用 `OptimizerEventStreamService.SubscribeEvents`，KVCM 通过 response stream 写入 `TraceQueryRequest`。
+
+KVCM 侧先在原有 server 配置中启用 optimizer publisher：
+
+```properties
+kvcm.event.event_publishers_configs={"log":{"enable":true,"queue_size":10000},"optimizer":{"enable":true,"queue_size":100000,"max_subscribers":4,"subscriber_queue_size":10000}}
+```
+
+Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置文件：
+
+```json
+{
+    "kvcm_event_subscription": {
+        "enable": true,
+        "service_discovery_url": "static://127.0.0.1:6381",
+        "consumer_id": "online-optimizer",
+        "discovery_refresh_interval_ms": 5000
+    }
+}
+```
+
+`service_discovery_url` 指向 KVCM 的 `kvcm.service.rpc_port`，支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`）。发现结果只作为 seed：Optimizer 周期调用任一健康 seed 的 `MetaService.GetClusterInfo` 获取当前 Leader，并且只向 Leader 维持一条 `SubscribeEvents` stream。切主后下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流期间会自动重连。
+
+`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知 `instance_id` 时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。当前同步只添加新配置，不删除或热更新已经存在的 Optimizer 配置。
+
+自动注册采用能从 KVCM 配置直接确定的口径：Instance Group 的 quota byte 数转换成一个 GiB 容量点，使用当前 Optimizer 支持的 LRU，并开启 prefix hash；Instance 按 full-only 注册，优先合并名称以 `full` / `FULL` 开头的 location spec group，没有时使用全部 spec。当前在线 indexer 不支持 shared group quota，因此同组各 Instance 分别按完整 Group quota 模拟。KVCM 没有 `linear_step` 等 Optimizer 专属参数，因此这里不猜测 linear/mamba 周期。
+
+订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，旧客户端未设置时间戳时仍回退到 Optimizer 本机墙钟。
+
+在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_id`，单位 byte）。它表示最近一个 `metrics_report_interval_ms` 上报周期内，达到理论无限容量命中数 95% 所需的最小 LRU 容量；每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+
 
 ### Eviction Policies
 

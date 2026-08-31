@@ -1,7 +1,10 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <unordered_set>
 
+#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
 namespace kv_cache_manager {
@@ -54,7 +57,14 @@ public:
                      const proto::optimizer::OptimizerGetInstanceRequest *request,
                      proto::optimizer::OptimizerGetInstanceResponse *response);
 
+    // KVCM ingress
+    ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
+                                     std::unordered_set<std::string> &unsupported_instance_ids);
+
     // TraceQuery
+    ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,
+                                proto::optimizer::TraceQueryResponse *response);
+
     void TraceQuery(RequestContext *request_context,
                     const proto::optimizer::TraceQueryRequest *request,
                     proto::optimizer::TraceQueryResponse *response);

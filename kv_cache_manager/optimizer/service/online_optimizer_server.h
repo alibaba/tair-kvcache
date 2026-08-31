@@ -19,12 +19,13 @@ class OptimizerServiceHttp;
 class OptimizerRegistryManager;
 class OptimizerMetricsReporter;
 class MetricsRegistry;
+class KvcmEventSubscriber;
 
 class OnlineOptimizerServer {
 public:
     using EnvironMap = std::unordered_map<std::string, std::string>;
 
-    OnlineOptimizerServer() = default;
+    OnlineOptimizerServer();
     ~OnlineOptimizerServer();
 
     OnlineOptimizerServer(const OnlineOptimizerServer &) = delete;
@@ -51,6 +52,7 @@ private:
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
+    std::unique_ptr<KvcmEventSubscriber> kvcm_event_subscriber_;
 
     std::unique_ptr<grpc::Server> grpc_server_;
     std::thread http_thread_;

@@ -1,3 +1,5 @@
+#include <unordered_set>
+
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -380,6 +382,127 @@ TEST_F(OptimizerServiceImplTest, TraceQuery) {
     ASSERT_EQ(1, tq_resp2.capacity_results_size());
     EXPECT_EQ(3, tq_resp2.capacity_results(0).cache_hit_count());
     EXPECT_EQ(3, tq_resp2.capacity_results(0).current_unique_keys());
+}
+
+TEST_F(OptimizerServiceImplTest, ExecuteTraceQueryUsesSharedInputConversion) {
+    CreateTestGroup("grp1");
+
+    auto register_request = MakeRegisterRequest("grp1", "inst1", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse register_response;
+    RequestContext context("trace1", nullptr);
+    service_->RegisterInstance(&context, &register_request, &register_response);
+    ASSERT_EQ(proto::optimizer::OK, register_response.header().status().code());
+
+    proto::optimizer::TraceQueryRequest request;
+    request.set_instance_id("inst1");
+    request.add_block_keys(1);
+    for (int token_id = 0; token_id < 4; ++token_id) {
+        request.add_token_ids(token_id);
+    }
+
+    proto::optimizer::TraceQueryResponse response;
+    ASSERT_EQ(EC_OK, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(4, response.input_token_len());
+    EXPECT_EQ(1, response.total_blocks());
+}
+
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndInstance) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("kvcm-group");
+    instance->set_instance_id("kvcm-instance");
+    instance->set_block_size(4);
+    auto *spec = instance->add_location_spec_infos();
+    spec->set_name("tp0");
+    spec->set_size(16);
+    auto *spec_group = instance->add_location_spec_groups();
+    spec_group->set_name("serving-state");
+    spec_group->add_spec_names("tp0");
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+    EXPECT_TRUE(unsupported_instance_ids.empty());
+
+    auto stored_group = registry_->GetInstanceGroup("kvcm-group");
+    ASSERT_NE(nullptr, stored_group);
+    ASSERT_EQ(1u, stored_group->capacity_gb().size());
+    EXPECT_DOUBLE_EQ(2.0, stored_group->capacity_gb().front());
+    EXPECT_TRUE(stored_group->enable_prefix_hash());
+    EXPECT_TRUE(stored_group->enable_theoretical_max_cache());
+    EXPECT_EQ(24 * 60 * 60, stored_group->ttl_seconds());
+
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+        EXPECT_EQ("kvcm-group", state.instance_info->instance_group_name());
+        EXPECT_EQ(4, state.instance_info->block_size());
+        ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
+        EXPECT_EQ("serving-state", state.instance_info->location_spec_groups().front().name());
+        EXPECT_EQ("serving-state", state.instance_info->optimizer_state_info().full_location_spec_group_name());
+    }));
+
+    EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+}
+
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroups) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(1024 * 1024 * 1024);
+
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("kvcm-group");
+    instance->set_instance_id("ambiguous-instance");
+    instance->set_block_size(4);
+    for (const auto *spec_name : {"state-a", "state-b"}) {
+        auto *spec = instance->add_location_spec_infos();
+        spec->set_name(spec_name);
+        spec->set_size(16);
+        auto *spec_group = instance->add_location_spec_groups();
+        spec_group->set_name(std::string("group-") + spec_name);
+        spec_group->add_spec_names(spec_name);
+    }
+    auto *supported = configuration.add_instances();
+    supported->set_instance_group_name("kvcm-group");
+    supported->set_instance_id("supported-instance");
+    supported->set_block_size(4);
+    auto *supported_spec = supported->add_location_spec_infos();
+    supported_spec->set_name("tp0");
+    supported_spec->set_size(16);
+    auto *supported_group = supported->add_location_spec_groups();
+    supported_group->set_name("serving-state");
+    supported_group->add_spec_names("tp0");
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+    EXPECT_EQ((std::unordered_set<std::string>{"ambiguous-instance"}), unsupported_instance_ids);
+    EXPECT_NE(EC_OK, manager_->GetInstanceState("ambiguous-instance", [](const InstanceState &) {}));
+    EXPECT_EQ(EC_OK, manager_->GetInstanceState("supported-instance", [](const InstanceState &) {}));
+}
+
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidSupportedInstance) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(1024 * 1024 * 1024);
+
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("kvcm-group");
+    instance->set_instance_id("invalid-instance");
+    instance->set_block_size(4);
+    auto *spec = instance->add_location_spec_infos();
+    spec->set_name("tp0");
+    spec->set_size(16);
+    auto *spec_group = instance->add_location_spec_groups();
+    spec_group->set_name("serving-state");
+    spec_group->add_spec_names("missing-spec");
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+    EXPECT_TRUE(unsupported_instance_ids.empty());
+    EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance", [](const InstanceState &) {}));
 }
 
 TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {
