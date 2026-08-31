@@ -82,7 +82,7 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，旧客户端未设置时间戳时仍回退到 Optimizer 本机墙钟。
 
-在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_id`，单位 byte）。它表示最近一个 `metrics_report_interval_ms` 上报周期内，达到理论无限容量命中数 95% 所需的最小 LRU 容量；每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
 
 
 ### Eviction Policies
