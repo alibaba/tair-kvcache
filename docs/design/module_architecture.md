@@ -43,8 +43,8 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 |---|---|---|
 | **common** | `common/` | 基础设施层：日志、JSON、错误码、Redis 客户端、`RequestContext`（逐请求追踪上下文）、`concurrent_hash_map`、`lru_cache`、`loop_thread`、服务发现、崩溃处理等。几乎所有 C++ 模块都依赖它。 |
 | **metrics** | `metrics/` | 可观测性。`MetricsRegistry`/`MetricsCollector` 收集指标，多种 reporter（kmonitor/local/logging/dummy）上报，`PrometheusExporter` 通过 HTTP 暴露。 |
-| **event** | `event/` | 轻量事件总线。`EventManager` 将领域事件（如 cache 回收事件）分发给注册的 `EventPublisher`（默认 `LogEventPublisher`）。 |
-| **protocol** | `protocol/protobuf/` | gRPC/proto 契约。定义 meta/admin/debug/kv_meta 服务，生成 C++ 与 Python 桩。 |
+| **event** | `event/` | 轻量事件总线。`EventManager` 将领域事件分发给注册的 `EventPublisher`；除默认日志发布器外，`OptimizerEventPublisher` 会将缓存读取事件转换为 protocol 中的 `TraceQueryRequest`，再经 `SubscriptionEventSink` 交给 service 层的 gRPC 流。 |
+| **protocol** | `protocol/protobuf/` | gRPC/proto 契约。定义 meta/admin/debug/kv_meta 以及 optimizer 事件流服务，生成 C++ 与 Python 桩。 |
 
 ### 客户端与连接器
 
@@ -83,7 +83,7 @@ client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点
 service → manager → meta → config → data_storage → common
 ```
 
-- `common`、`protocol` 是最底层的通用模块，被各层广泛依赖。
+- `common`、`protocol` 是最底层的通用模块，被各层广泛依赖；`event` 的 optimizer 发布链路直接使用 `protocol` 定义的 `TraceQueryRequest`。
 - `metrics`、`event` 是通用支撑模块，被 `manager` 与 `service` 复用。
 - `service` 在启动时实例化 `CacheManager`（注入 `MetricsRegistry` + `RegistryManager`），并通过 `config` 的 `LeaderElector` 门控 recover/cleanup。
 
@@ -138,6 +138,7 @@ flowchart TD
 
     %% 通用支撑依赖
     manager --> event
+    event --> protocol
     manager --> metrics
     service --> metrics
     service --> event
