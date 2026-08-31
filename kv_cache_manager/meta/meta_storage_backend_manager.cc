@@ -5,6 +5,7 @@
 #include <climits>
 #include <exception>
 #include <typeinfo>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -797,23 +798,74 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
         validate_id_reads("cache", hot_id_ecs, hot_location_ids);
     }
 
-    std::vector<size_t> whole_key_indexes;
-    std::vector<size_t> target_only_indexes;
+    // A location-level RMW may emit several rows for one key. Classify their
+    // combined target set so deleting the final locations reclaims the key once.
+    struct DeleteGroup {
+        std::vector<size_t> indexes;
+        std::unordered_set<LocationId> target_ids;
+    };
+    std::vector<DeleteGroup> delete_groups;
+    std::unordered_map<KeyType, size_t> delete_group_by_key;
+    delete_groups.reserve(keys.size());
+    delete_group_by_key.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!id_reads_valid[i] || location_ids[i].empty()) {
+        auto [group_it, inserted] = delete_group_by_key.emplace(keys[i], delete_groups.size());
+        if (inserted) {
+            delete_groups.emplace_back();
+        }
+        auto &group = delete_groups[group_it->second];
+        group.indexes.push_back(i);
+        group.target_ids.insert(location_ids[i].begin(), location_ids[i].end());
+    }
+
+    std::vector<size_t> whole_key_indexes;
+    std::vector<std::vector<size_t>> whole_key_group_indexes;
+    std::vector<size_t> target_only_indexes;
+    for (const auto &group : delete_groups) {
+        if (group.target_ids.empty()) {
             continue;
         }
-        const auto layer_has_only_targets = [&](ErrorCode id_ec, const LocationIdVector &existing_ids) {
-            if (id_ec == EC_NOENT) {
-                return true;
+
+        ErrorCode group_error = EC_OK;
+        std::unordered_set<LocationId> persistent_existing_ids;
+        std::unordered_set<LocationId> hot_existing_ids;
+        for (const size_t index : group.indexes) {
+            if (!id_reads_valid[index]) {
+                group_error = results[index];
+                break;
             }
+            if (persistent_id_ecs[index] == EC_OK) {
+                persistent_existing_ids.insert(persistent_location_ids[index].begin(),
+                                               persistent_location_ids[index].end());
+            }
+            if (cache_backend_ && hot_id_ecs[index] == EC_OK) {
+                hot_existing_ids.insert(hot_location_ids[index].begin(), hot_location_ids[index].end());
+            }
+        }
+        if (group_error != EC_OK) {
+            for (const size_t index : group.indexes) {
+                results[index] = group_error;
+            }
+            continue;
+        }
+
+        const auto layer_has_only_targets = [&](const std::unordered_set<LocationId> &existing_ids) {
             return std::all_of(existing_ids.begin(), existing_ids.end(), [&](const LocationId &existing_id) {
-                return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) != location_ids[i].end();
+                return group.target_ids.find(existing_id) != group.target_ids.end();
             });
         };
-        const bool persistent_safe = layer_has_only_targets(persistent_id_ecs[i], persistent_location_ids[i]);
-        const bool hot_safe = !cache_backend_ || layer_has_only_targets(hot_id_ecs[i], hot_location_ids[i]);
-        (persistent_safe && hot_safe ? whole_key_indexes : target_only_indexes).push_back(i);
+        const bool persistent_safe = layer_has_only_targets(persistent_existing_ids);
+        const bool hot_safe = !cache_backend_ || layer_has_only_targets(hot_existing_ids);
+        if (persistent_safe && hot_safe) {
+            whole_key_indexes.push_back(group.indexes.front());
+            whole_key_group_indexes.push_back(group.indexes);
+        } else {
+            for (const size_t index : group.indexes) {
+                if (!location_ids[index].empty()) {
+                    target_only_indexes.push_back(index);
+                }
+            }
+        }
     }
 
     if (!target_only_indexes.empty()) {
@@ -899,15 +951,18 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
         std::unordered_set<KeyType> reclaimed_keys;
         for (size_t i = 0; i < whole_key_indexes.size(); ++i) {
             const size_t original_index = whole_key_indexes[i];
+            ErrorCode group_result = EC_OK;
             if (whole_results[i] != EC_OK && whole_results[i] != EC_NOENT) {
-                results[original_index] = whole_results[i];
-                continue;
+                group_result = whole_results[i];
+            } else {
+                // The preceding expected-value read admitted at least one target.
+                // Count a converged whole-key action once even when one layer was
+                // already missing due to an earlier partial attempt.
+                reclaimed_keys.insert(keys[original_index]);
             }
-            results[original_index] = EC_OK;
-            // The preceding expected-value read admitted at least one target.
-            // Count a converged whole-key action once even when one layer was
-            // already missing due to an earlier partial attempt.
-            reclaimed_keys.insert(keys[original_index]);
+            for (const size_t group_index : whole_key_group_indexes[i]) {
+                results[group_index] = group_result;
+            }
         }
         out_reclaimed_count = static_cast<int32_t>(reclaimed_keys.size());
     }
@@ -1381,7 +1436,8 @@ std::vector<std::vector<ErrorCode>>
 MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_context,
                                                       const KeyVector &keys,
                                                       const LocationIdsPerKey &location_ids,
-                                                      LocationsPerKey &out_locations) noexcept {
+                                                      LocationsPerKey &out_locations,
+                                                      bool require_consistent_layers) noexcept {
     if (keys.size() != location_ids.size()) {
         out_locations.assign(keys.size(), CacheLocationVector{});
         return std::vector<std::vector<ErrorCode>>(keys.size(), std::vector<ErrorCode>{EC_BADARGS});
@@ -1392,9 +1448,9 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
 
     // A unified GC round scans the hot cache, but a stale hot value must not
     // authorize deletion of a newer persistent value left by a partial mirror
-    // failure. Revalidate both layers without touching/backfilling the cache;
-    // one missing copy is safe to converge, while two different present copies
-    // fail closed as a compare mismatch.
+    // failure. Revalidate both layers without touching/backfilling the cache.
+    // Ordinary maintenance may converge one missing copy; strict conditional
+    // mutations require both present copies to match.
     LocationsPerKey hot_locations;
     const auto hot_results =
         cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, hot_locations);
@@ -1461,6 +1517,10 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
             }
             if (hot_ec == EC_NOENT && persistent_ec == EC_NOENT) {
                 results[i][j] = EC_NOENT;
+                continue;
+            }
+            if (require_consistent_layers && (hot_ec != EC_OK || persistent_ec != EC_OK)) {
+                results[i][j] = EC_MISMATCH;
                 continue;
             }
             if (hot_ec == EC_OK && persistent_ec == EC_OK &&

@@ -43,8 +43,12 @@ public:
         ErrorCode ec = EC_OK;
         // [i][j] is the ec of keys[i]'s j-th selected location.
         std::vector<std::vector<ErrorCode>> per_location_error_codes;
+        // Per-key failures after an accepted mutation. Per-location results
+        // remain unchanged so callers can preserve accounting.
+        std::vector<ErrorCode> post_write_error_codes;
         explicit LocationResult(ErrorCode error_code) : ec(error_code) {}
-        explicit LocationResult(const LocationIdsPerKey &location_ids) : ec(EC_OK) {
+        explicit LocationResult(const LocationIdsPerKey &location_ids)
+            : ec(EC_OK), post_write_error_codes(location_ids.size(), EC_OK) {
             per_location_error_codes.resize(location_ids.size());
             for (size_t i = 0; i < location_ids.size(); ++i) {
                 per_location_error_codes[i].assign(location_ids[i].size(), EC_OK);
@@ -110,11 +114,14 @@ public:
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
                                            bool refresh_cache_from_persistent = false) noexcept;
+    // Cached mode normally converges one missing layer. Exact conditional
+    // mutations can request strict layer agreement instead.
     LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
                                                           const KeyVector &keys,
                                                           const LocationIdsPerKey &location_ids,
                                                           const LocationModifierFunc &modifier,
-                                                          bool adjust_reclaimed_key_count = true) noexcept;
+                                                          bool adjust_reclaimed_key_count = true,
+                                                          bool require_consistent_layers = false) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -219,7 +226,8 @@ private:
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
                                                bool refresh_cache_from_persistent,
-                                               bool maintenance_no_touch) noexcept;
+                                               bool maintenance_no_touch,
+                                               bool require_consistent_layers) noexcept;
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;

@@ -183,7 +183,18 @@ DELETE 按 `block_key + medium + spec_names` 删除指定 specs，不存在的�
 - 相同 block key 可以出现在不同 medium；
 - snapshot 不能拆成多个普通请求分页。
 
-### 4.4 响应
+### 4.4 READ_FAILED metadata 清理
+
+`EVENT_BLOCK_READ_FAILED` 用于 reader 上报 `ST_EVENT_REPORT_L2` 中已确认不存在的对象。
+
+- 请求只能包含 READ_FAILED；事件携带 `block_key + spec.name + observed_uri`，不携带 owner 或 medium；
+- KVCM 在同 storage type 的 Location 中，于 metadata shard RMW 内删除完整匹配 `name + URI` 的 spec；
+- 多个精确匹配都会删除；缺失、URI 不匹配和重复报告均为幂等 no-op；删除最后一个 spec 时沿用现有
+  storage usage/key count 记账；
+- 不触碰 reporter 注册、心跳、lifecycle、delta/snapshot fence 或外部 cache bytes；响应 Snapshot 字段保持默认；
+- 功能默认关闭；完整 URI 的 `s_version` 防止旧观察删除已换 URI 的值。
+
+### 4.5 响应
 
 ```proto
 CommonResponseHeader header = 1;
