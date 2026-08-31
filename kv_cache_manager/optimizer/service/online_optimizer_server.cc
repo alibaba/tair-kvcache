@@ -67,13 +67,18 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
 
     service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_);
 
-    if (config_.kvcm_event_subscription().enable()) {
-        kvcm_event_subscriber_ = std::make_unique<KvcmEventSubscriber>(
-            config_.kvcm_event_subscription(), service_impl_, metrics_registry_, metrics_reporter_);
-        if (!kvcm_event_subscriber_->Init()) {
-            KVCM_LOG_ERROR("Failed to init KVCM event subscriber");
+    kvcm_event_subscribers_.clear();
+    kvcm_event_subscribers_.reserve(config_.kvcm_event_subscriptions().size());
+    for (const auto &subscription_config : config_.kvcm_event_subscriptions()) {
+        auto subscriber = std::make_unique<KvcmEventSubscriber>(
+            subscription_config, service_impl_, metrics_registry_, metrics_reporter_);
+        if (!subscriber->Init()) {
+            KVCM_LOG_ERROR("Failed to init KVCM event subscriber for discovery URL[%s]",
+                           subscription_config.service_discovery_url().c_str());
+            kvcm_event_subscribers_.clear();
             return false;
         }
+        kvcm_event_subscribers_.push_back(std::move(subscriber));
     }
 
     KVCM_LOG_INFO("OnlineOptimizerServer initialized");
@@ -132,10 +137,12 @@ bool OnlineOptimizerServer::Start() {
 
     running_ = true;
 
-    if (kvcm_event_subscriber_ && !kvcm_event_subscriber_->Start()) {
-        KVCM_LOG_ERROR("Failed to start KVCM event subscriber");
-        Stop();
-        return false;
+    for (auto &subscriber : kvcm_event_subscribers_) {
+        if (!subscriber->Start()) {
+            KVCM_LOG_ERROR("Failed to start KVCM event subscriber");
+            Stop();
+            return false;
+        }
     }
 
     if (recovery_needed_) {
@@ -174,8 +181,8 @@ void OnlineOptimizerServer::RequestShutdown() {
 void OnlineOptimizerServer::DoStop() {
     running_ = false;
 
-    if (kvcm_event_subscriber_) {
-        kvcm_event_subscriber_->Stop();
+    for (auto &subscriber : kvcm_event_subscribers_) {
+        subscriber->Stop();
     }
 
     // Stop listeners first so no new requests are accepted and in-flight
