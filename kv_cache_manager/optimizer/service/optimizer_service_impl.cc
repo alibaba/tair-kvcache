@@ -7,6 +7,8 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/spec_events/optimizer_query_hit_event.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
@@ -101,8 +103,11 @@ void SetErrorOnCollector(RequestContext *request_context, ErrorCode ec) {
 } // namespace
 
 OptimizerServiceImpl::OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManager> manager,
-                                           std::shared_ptr<OptimizerMetricsReporter> metrics_reporter)
-    : manager_(std::move(manager)), metrics_reporter_(std::move(metrics_reporter)) {}
+                                           std::shared_ptr<OptimizerMetricsReporter> metrics_reporter,
+                                           std::shared_ptr<EventManager> event_manager)
+    : manager_(std::move(manager))
+    , metrics_reporter_(std::move(metrics_reporter))
+    , event_manager_(std::move(event_manager)) {}
 
 // InstanceGroup CRUD
 
@@ -482,6 +487,24 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
     response->mutable_theoretical_result()->set_max_hit_count(result.max_hit_count);
     response->mutable_theoretical_result()->set_current_unique_keys(result.theoretical_unique_keys);
     response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
+
+    if (event_manager_) {
+        auto event = std::make_shared<OptimizerQueryHitEvent>(request.instance_id());
+        event->SetEventTriggerTime();
+        event->SetAdditionalArgs(
+            request.trace_id(), request.timestamp_ns(), response->input_token_len(), response->total_blocks());
+        for (const auto &capacity_result : response->capacity_results()) {
+            event->AddCapacityResult(capacity_result.capacity_gb(),
+                                     capacity_result.cache_hit_count(),
+                                     capacity_result.hit_rate(),
+                                     capacity_result.current_unique_keys());
+        }
+        const auto &theoretical_result = response->theoretical_result();
+        event->SetTheoreticalResult(theoretical_result.max_hit_count(),
+                                    theoretical_result.hit_rate(),
+                                    theoretical_result.current_unique_keys());
+        event_manager_->Publish(event);
+    }
     return EC_OK;
 }
 
