@@ -209,6 +209,14 @@ KvcmEventSubscriptionConfig MakeConfig(const std::string &seed_endpoint, int ref
     return server_config.kvcm_event_subscriptions().front();
 }
 
+KvcmEventSubscriptionConfig MakeMultiCapacityConfig(const std::string &seed_endpoint) {
+    OnlineOptimizerServerConfig server_config;
+    EXPECT_TRUE(server_config.FromJsonString(
+        std::string(R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://)") + seed_endpoint +
+        R"(","consumer_id":"subscriber-test","discovery_refresh_interval_ms":50,"capacity_gb":[1.0,2.0,4.0]}]})"));
+    return server_config.kvcm_event_subscriptions().front();
+}
+
 } // namespace
 
 class KvcmEventSubscriberTest : public TESTBASE {
@@ -278,6 +286,25 @@ TEST_F(KvcmEventSubscriberTest, DiscoversLeaderAndRegistersConfigurationBeforeCo
     subscriber.Stop();
     EXPECT_FALSE(subscriber.running_);
     EXPECT_EQ(nullptr, subscriber.worker_);
+}
+
+TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
+    TestKvcmServer leader;
+    leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
+
+    KvcmEventSubscriber subscriber(
+        MakeMultiCapacityConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.Start());
+
+    ASSERT_TRUE(WaitUntil([this] { return IsRegistered("known"); }));
+    auto group = registry_->GetInstanceGroup("g1");
+    ASSERT_NE(nullptr, group);
+    EXPECT_EQ((std::vector<double>{1.0, 2.0, 4.0}), group->capacity_gb());
+
+    leader.event_service_.Publish(MakeEvent("known", "multi-capacity", 1));
+    ASSERT_TRUE(WaitUntil([this] { return TotalQueries("known") == 1; }));
+    subscriber.Stop();
 }
 
 TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRefresh) {

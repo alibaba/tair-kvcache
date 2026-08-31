@@ -20,6 +20,7 @@ public:
     const std::string &service_discovery_url() const { return service_discovery_url_; }
     const std::string &consumer_id() const { return consumer_id_; }
     int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
+    const std::vector<double> &capacity_gb() const { return capacity_gb_; }
 
 private:
     friend class OnlineOptimizerServerConfig;
@@ -27,6 +28,7 @@ private:
     std::string service_discovery_url_;
     std::string consumer_id_ = "online-optimizer";
     int64_t discovery_refresh_interval_ms_ = 5000;
+    std::vector<double> capacity_gb_;
 };
 
 class OnlineOptimizerServerConfig : public Jsonizable {
