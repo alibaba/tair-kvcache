@@ -127,7 +127,7 @@ TEST_F(LruCacheIndexerTest, MultipleCapacityTiersEviction) {
 TEST_F(LruCacheIndexerTest, LinearStepZeroAllFullAttention) {
     LruCacheIndexer indexer(0);
     constexpr int64_t kOneGB = 1024LL * 1024 * 1024;
-    // linear_step=0: all full attention, simple prefix matching with size_full_only charge.
+    // linear_step=0: all full attention, simple prefix matching with size_full charge.
     indexer.Init({10.0}, kOneGB / 2, kOneGB, 0);
 
     std::vector<int64_t> hit_count;
@@ -552,7 +552,7 @@ TEST_F(LruCacheIndexerTest, LargeLinearStepGroupBehavior) {
     LruCacheIndexer indexer(0);
     constexpr int64_t kOneGB = 1024LL * 1024 * 1024;
     // linear_step=4: step_hit at pos3,7,11,...
-    // Step_hit keys use charge=size_full_linear, others use size_full_only
+    // Step_hit keys use charge=size_full_linear, others use size_full
     indexer.Init({10.0}, kOneGB / 2, kOneGB, 4);
 
     std::vector<int64_t> hit_count;

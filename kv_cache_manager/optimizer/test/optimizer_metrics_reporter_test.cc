@@ -65,8 +65,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportAfterQueries) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 4}, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 4}, 0, 0, result);
 
     reporter_->ReportInterval();
 
@@ -86,7 +86,7 @@ TEST_F(OptimizerMetricsReporterTest, ReportMultipleInstances) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst2"));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2}, result);
+    manager_->TraceQuery("inst1", {1, 2}, 0, 0, result);
 
     reporter_->ReportInterval();
 
@@ -103,8 +103,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalPerCapacityHitRate) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0, 5.0}));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
 
     reporter_->ReportInterval();
 
@@ -275,8 +275,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMaxHitRate) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 0, true));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
 
     reporter_->ReportInterval();
 
@@ -286,12 +286,37 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMaxHitRate) {
     EXPECT_LE(max_rate.Get(), 1.0);
 }
 
+TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
+
+    std::vector<int64_t> keys;
+    for (int64_t key = 1; key <= 20; ++key) {
+        keys.push_back(key);
+    }
+    TraceQueryResult result;
+    manager_->TraceQuery("inst1", keys, 0, 0, result);
+    manager_->TraceQuery("inst1", keys, 0, 0, result);
+
+    reporter_->ReportInterval();
+
+    MetricsTags tags = {{"instance_id", "inst1"}};
+    Gauge mrc = registry_->GetGauge("mrc", tags);
+    EXPECT_DOUBLE_EQ(19.0 * 1024.0, mrc.Get());
+
+    manager_->TraceQuery("inst1", {1}, 0, 0, result);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0 * 1024.0, mrc.Get());
+
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, mrc.Get());
+}
+
 TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiency) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0, 5.0}, 0, true));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
 
     reporter_->ReportInterval();
 
@@ -341,8 +366,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalHitAgeBucketRatio) {
                                    /*linear_step=*/1));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result); // all 3 keys hit
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result); // all 3 keys hit
 
     reporter_->ReportInterval();
 
@@ -361,8 +386,8 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
 
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
+    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
 
     reporter_->ReportInterval();
 

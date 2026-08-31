@@ -250,11 +250,11 @@ capacity_blocks = floor(capacity_bytes / block_bytes)
 capacity_gb uses binary conversion: capacity_bytes = capacity_gb * 1024^3
 ```
 
-`block_bytes` comes from the sum of spec.size of each spec in the full location spec group of instance registration (`size_full_only`). Each row of the facts CSV records `block_bytes`, making facts self-describing: even if the charge estimate is corrected later, historical facts can be re-projected.
+`block_bytes` comes from the sum of spec.size of each spec in the full location spec group of instance registration (`size_full`). Each row of the facts CSV records `block_bytes`, making facts self-describing: even if the charge estimate is corrected later, historical facts can be re-projected.
 
 ### 6.4 Equal-Charge Invariant (Premise of Block-Unit RLE)
 
-The hit curve is in block units and `ProjectBytes` performs a single floor division, which is exact **if and only if** the charges of all participating blocks are exactly equal — full-only instances satisfy this (each block's charge is constantly `size_full_only`, an exact value not an average). For linear/Mamba mixed instances, the per-block charge is unequal, and charge-weighted thresholds must be used instead, which is a separate subsequent task; currently Offline rejects instances with `linear_step != 0`.
+The hit curve is in block units and `ProjectBytes` performs a single floor division, which is exact **if and only if** the charges of all participating blocks are exactly equal — full-only instances satisfy this (each block's charge is constantly `size_full`, an exact value not an average). For linear/Mamba mixed instances, the per-block charge is unequal, and charge-weighted thresholds must be used instead, which is a separate subsequent task; currently Offline rejects instances with `linear_step != 0`.
 
 ---
 

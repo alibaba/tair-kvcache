@@ -62,6 +62,41 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
     return static_cast<int64_t>(lhs * rhs);
 }
 
+void AccumulateMrc(const RequestFact &fact, InstanceState &state) {
+    for (const auto &segment : fact.hit_curve) {
+        if (segment.run_length == 0) {
+            continue;
+        }
+        const uint64_t end_required_blocks = segment.start_required_blocks + segment.run_length - 1;
+        if (end_required_blocks + 1 >= state.mrc_interval_hit_count_deltas.size()) {
+            state.mrc_interval_hit_count_deltas.resize(static_cast<std::size_t>(end_required_blocks + 2), 0);
+        }
+        ++state.mrc_interval_hit_count_deltas[segment.start_required_blocks];
+        --state.mrc_interval_hit_count_deltas[end_required_blocks + 1];
+        state.mrc_interval_total_hits += segment.run_length;
+    }
+}
+
+uint64_t ComputeMrcRequiredBlocks(const InstanceState &state) {
+    if (state.mrc_interval_total_hits == 0) {
+        return 0;
+    }
+
+    // ceil(total * 0.95), written without multiplication to avoid overflow.
+    const uint64_t target_hits = state.mrc_interval_total_hits - state.mrc_interval_total_hits / 20;
+    uint64_t accumulated_hits = 0;
+    int64_t hits_at_required_blocks = 0;
+    for (std::size_t required_blocks = 0; required_blocks < state.mrc_interval_hit_count_deltas.size();
+         ++required_blocks) {
+        hits_at_required_blocks += state.mrc_interval_hit_count_deltas[required_blocks];
+        accumulated_hits += static_cast<uint64_t>(hits_at_required_blocks);
+        if (accumulated_hits >= target_hits) {
+            return required_blocks;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int64_t OnlineOptimizerManager::ComputeSizeForGroup(const std::vector<LocationSpecInfo> &specs,
@@ -143,10 +178,31 @@ ErrorCode OnlineOptimizerManager::RegisterInstance(const OptimizerInstanceInfo &
 
     std::lock_guard admin_guard(admin_ops_mutex_);
 
-    auto instance_group = registry_manager_->GetInstanceGroup(instance_info.instance_group_name());
+    OptimizerInstanceInfo resolved_instance_info = instance_info;
+    if (resolved_instance_info.optimizer_state_info().full_location_spec_group_name().empty()) {
+        if (resolved_instance_info.linear_step() != 0) {
+            KVCM_LOG_ERROR("RegisterInstance failed: instance[%s] with linear_step=%d requires explicit optimizer "
+                           "state",
+                           instance_id.c_str(),
+                           resolved_instance_info.linear_step());
+            return EC_BADARGS;
+        }
+        if (resolved_instance_info.location_spec_groups().size() != 1) {
+            KVCM_LOG_ERROR("RegisterInstance failed: full-only instance[%s] without an explicit full group must have "
+                           "exactly one location spec group, actual=%zu",
+                           instance_id.c_str(),
+                           resolved_instance_info.location_spec_groups().size());
+            return EC_BADARGS;
+        }
+        OptimizerStateInfo state_info;
+        state_info.set_full_location_spec_group_name(resolved_instance_info.location_spec_groups().front().name());
+        resolved_instance_info.set_optimizer_state_info(state_info);
+    }
+
+    auto instance_group = registry_manager_->GetInstanceGroup(resolved_instance_info.instance_group_name());
     if (!instance_group) {
         KVCM_LOG_ERROR("RegisterInstance failed: instance group[%s] not found for instance[%s]",
-                       instance_info.instance_group_name().c_str(),
+                       resolved_instance_info.instance_group_name().c_str(),
                        instance_id.c_str());
         return EC_NOENT;
     }
@@ -154,13 +210,13 @@ ErrorCode OnlineOptimizerManager::RegisterInstance(const OptimizerInstanceInfo &
     // Save old persisted info before overwriting, so we can restore on rollback.
     auto old_instance_info = registry_manager_->GetInstanceInfo(instance_id);
 
-    auto ec = registry_manager_->SaveInstanceInfo(instance_info);
+    auto ec = registry_manager_->SaveInstanceInfo(resolved_instance_info);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("RegisterInstance failed: persist instance_info[%s] failed", instance_id.c_str());
         return ec;
     }
 
-    ec = RegisterInstanceInternal(instance_info, *instance_group, result);
+    ec = RegisterInstanceInternal(resolved_instance_info, *instance_group, result);
     if (ec != EC_OK) {
         // Rollback persistence: restore old record if it existed, else delete
         if (old_instance_info) {
@@ -293,16 +349,16 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
                        instance_id.c_str());
         return EC_BADARGS;
     }
-    int64_t size_full_only = ComputeSizeForGroup(specs, *full_group);
-    if (size_full_only <= 0) {
+    int64_t size_full = ComputeSizeForGroup(specs, *full_group);
+    if (size_full <= 0) {
         KVCM_LOG_ERROR("RegisterInstance failed: invalid full group[%s] size[%ld] for instance[%s]",
                        full_group->name().c_str(),
-                       size_full_only,
+                       size_full,
                        instance_id.c_str());
         return EC_BADARGS;
     }
 
-    int64_t size_full_linear = size_full_only;
+    int64_t size_full_linear = size_full;
     if (!optimizer_state_info.linear_location_spec_group_name().empty()) {
         const auto *linear_group =
             FindLocationSpecGroup(groups, optimizer_state_info.linear_location_spec_group_name());
@@ -325,11 +381,11 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
 
     int64_t estimated_bytes_per_block;
     if (linear_step == 0) {
-        estimated_bytes_per_block = size_full_only;
+        estimated_bytes_per_block = size_full;
     } else if (linear_step == 1) {
         estimated_bytes_per_block = size_full_linear;
     } else {
-        estimated_bytes_per_block = ((linear_step - 1) * size_full_only + size_full_linear) / linear_step;
+        estimated_bytes_per_block = ((linear_step - 1) * size_full + size_full_linear) / linear_step;
     }
 
     if (estimated_bytes_per_block <= 0) {
@@ -348,7 +404,7 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     state->instance_info = std::make_shared<OptimizerInstanceInfo>(instance_info);
     state->instance_group = std::make_shared<OptimizerInstanceGroup>(instance_group);
 
-    state->size_full_only = size_full_only;
+    state->size_full = size_full;
     state->size_full_linear = size_full_linear;
     state->linear_step = linear_step;
     state->total_hits_per_capacity.resize(capacity_gb.size(), 0);
@@ -363,7 +419,7 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         auto indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.eviction_policy(),
                                                                instance_group.enable_theoretical_max_cache(),
                                                                capacity_gb,
-                                                               size_full_only,
+                                                               size_full,
                                                                size_full_linear,
                                                                linear_step,
                                                                instance_group.ttl_seconds());
@@ -380,7 +436,7 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     }
 
     result.estimated_capacity_blocks = estimated_capacity_blocks;
-    result.size_full_only = size_full_only;
+    result.size_full = size_full;
     result.size_full_linear = size_full_linear;
 
     KVCM_LOG_INFO("RegisterInstance OK: instance[%s] group[%s] linear_step=%d estimated_bytes_per_block=%ld caps=%zu",
@@ -419,30 +475,15 @@ ErrorCode OnlineOptimizerManager::RemoveInstance(const std::string &instance_id)
 
 ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
                                              const std::vector<int64_t> &block_keys,
+                                             int64_t input_token_len,
+                                             int64_t timestamp_ns,
                                              TraceQueryResult &result) {
-    std::shared_ptr<InstanceState> state;
-    {
-        std::shared_lock lock(instances_mutex_);
-        auto it = instances_.find(instance_id);
-        if (it == instances_.end()) {
-            return EC_INSTANCE_NOT_EXIST;
-        }
-        state = it->second;
-    }
-
-    const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
-    if (!block_keys.empty() &&
-        block_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / block_keys.size()) {
+    if (input_token_len < 0 || timestamp_ns < 0) {
         return EC_BADARGS;
     }
-    const int64_t input_token_len = static_cast<int64_t>(block_keys.size() * block_size);
-    return TraceQuery(instance_id, block_keys, input_token_len, result);
-}
+    const int64_t replay_timestamp_ns =
+        timestamp_ns == 0 ? static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000 : timestamp_ns;
 
-ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
-                                             const std::vector<int64_t> &block_keys,
-                                             int64_t input_token_len,
-                                             TraceQueryResult &result) {
     std::shared_ptr<InstanceState> state;
     {
         std::shared_lock lock(instances_mutex_);
@@ -451,6 +492,15 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_INSTANCE_NOT_EXIST;
         }
         state = it->second;
+    }
+
+    if (input_token_len == 0) {
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        if (!block_keys.empty() &&
+            block_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / block_keys.size()) {
+            return EC_BADARGS;
+        }
+        input_token_len = static_cast<int64_t>(block_keys.size() * block_size);
     }
 
     std::lock_guard<std::mutex> guard(state->mutex);
@@ -466,10 +516,6 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         if (!state->lite_hit) {
             return EC_ERROR;
         }
-        if (input_token_len < 0) {
-            return EC_BADARGS;
-        }
-
         NormalizedRequest normalized;
         try {
             normalized = NormalizeRequest(block_keys,
@@ -482,8 +528,8 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_BADARGS;
         }
 
-        const RequestFact fact =
-            state->lite_hit->ProcessRequest(normalized.block_keys, TimestampUtil::GetCurrentTimeUs() * 1000);
+        const RequestFact fact = state->lite_hit->ProcessRequest(normalized.block_keys, replay_timestamp_ns);
+        AccumulateMrc(fact, *state);
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
@@ -534,9 +580,10 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     // Legacy analyzers keep their algorithm but share the same prefix-hash
     // preprocessing switch.
     if (state->instance_group->enable_prefix_hash()) {
-        state->indexer->ProcessKeys(ApplyPrefixHash(block_keys), hit_count, max_hit_count);
+        state->indexer->ProcessKeysAtTimestamp(
+            ApplyPrefixHash(block_keys), replay_timestamp_ns, hit_count, max_hit_count);
     } else {
-        state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
+        state->indexer->ProcessKeysAtTimestamp(block_keys, replay_timestamp_ns, hit_count, max_hit_count);
     }
 
     state->indexer->PostQueryMaintenance();
@@ -585,8 +632,8 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.total_blocks_queried = state->total_blocks_queried;
         s.bytes_per_block =
             (state->linear_step == 0)
-                ? state->size_full_only
-                : ((state->linear_step - 1) * state->size_full_only + state->size_full_linear) / state->linear_step;
+                ? state->size_full
+                : ((state->linear_step - 1) * state->size_full + state->size_full_linear) / state->linear_step;
         s.linear_step = state->linear_step;
 
         const auto &caps = state->instance_group->capacity_gb();
@@ -613,8 +660,7 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // set does. Finite tiers are min(U, C) of this same U and need no
             // separate report.
             s.kv_cache_usage_bytes = SaturatingMultiplyToInt64(state->lite_hit->current_unique_blocks(),
-                                                               static_cast<uint64_t>(state->size_full_only));
-
+                                                               static_cast<uint64_t>(state->size_full));
             // Full-attention rates are token based: cumulative hit blocks are
             // converted to tokens with the fixed block size and divided by the
             // cumulative input tokens.
@@ -688,6 +734,28 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
     return EC_OK;
 }
 
+ErrorCode OnlineOptimizerManager::TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics) {
+    std::shared_lock lock(instances_mutex_);
+    metrics.clear();
+    metrics.reserve(instances_.size());
+
+    for (const auto &[id, state] : instances_) {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        if (state->linear_step != 0 || !state->lite_hit) {
+            continue;
+        }
+
+        MrcMetricInfo metric;
+        metric.instance_id = id;
+        metric.capacity_bytes =
+            SaturatingMultiplyToInt64(ComputeMrcRequiredBlocks(*state), static_cast<uint64_t>(state->size_full));
+        metrics.push_back(std::move(metric));
+        state->mrc_interval_hit_count_deltas.clear();
+        state->mrc_interval_total_hits = 0;
+    }
+    return EC_OK;
+}
+
 ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::shared_ptr<InstanceState> state;
     {
@@ -710,7 +778,7 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
             CacheIndexerFactory::CreateCacheIndexer(state->instance_group->eviction_policy(),
                                                     state->instance_group->enable_theoretical_max_cache(),
                                                     state->instance_group->capacity_gb(),
-                                                    state->size_full_only,
+                                                    state->size_full,
                                                     state->size_full_linear,
                                                     state->linear_step,
                                                     state->instance_group->ttl_seconds());
@@ -727,6 +795,8 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     state->total_input_tokens = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);
     state->total_max_hits = 0;
+    state->mrc_interval_hit_count_deltas.clear();
+    state->mrc_interval_total_hits = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

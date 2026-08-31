@@ -233,7 +233,7 @@ TEST_F(LiteHitOfflineRunnerTest, PublishesFactsAndMatchesOnlineReplay) {
     for (const auto &request :
          std::vector<std::pair<std::vector<int64_t>, int64_t>>{{{1, 2, 3}, 13}, {{1, 2, 9}, 12}, {{1, 2, 3}, 13}}) {
         TraceQueryResult result;
-        ASSERT_EQ(EC_OK, manager.TraceQuery("i1", request.first, request.second, result));
+        ASSERT_EQ(EC_OK, manager.TraceQuery("i1", request.first, request.second, 0, result));
         online_cap2_hits += result.hit_count_per_capacity.at(0);
         online_infinite_hits += result.max_hit_count;
     }
