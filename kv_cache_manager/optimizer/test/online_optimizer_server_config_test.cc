@@ -18,6 +18,10 @@ TEST_F(OnlineOptimizerServerConfigTest, DefaultValues) {
     EXPECT_TRUE(config.enable_prometheus());
     EXPECT_EQ("kvcm_optimizer", config.prometheus_prefix());
     EXPECT_EQ(4, config.io_thread_num());
+    EXPECT_FALSE(config.kvcm_event_subscription().enable());
+    EXPECT_TRUE(config.kvcm_event_subscription().service_discovery_url().empty());
+    EXPECT_EQ("online-optimizer", config.kvcm_event_subscription().consumer_id());
+    EXPECT_EQ(5000, config.kvcm_event_subscription().discovery_refresh_interval_ms());
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
@@ -29,7 +33,13 @@ TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
         "metrics_report_interval_ms": 5000,
         "enable_prometheus": false,
         "prometheus_prefix": "my_prefix",
-        "io_thread_num": 8
+        "io_thread_num": 8,
+        "kvcm_event_subscription": {
+            "enable": true,
+            "service_discovery_url": "static://127.0.0.1:6490",
+            "consumer_id": "optimizer-a",
+            "discovery_refresh_interval_ms": 1234
+        }
     })";
 
     OnlineOptimizerServerConfig config;
@@ -42,6 +52,10 @@ TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
     EXPECT_FALSE(config.enable_prometheus());
     EXPECT_EQ("my_prefix", config.prometheus_prefix());
     EXPECT_EQ(8, config.io_thread_num());
+    EXPECT_TRUE(config.kvcm_event_subscription().enable());
+    EXPECT_EQ("static://127.0.0.1:6490", config.kvcm_event_subscription().service_discovery_url());
+    EXPECT_EQ("optimizer-a", config.kvcm_event_subscription().consumer_id());
+    EXPECT_EQ(1234, config.kvcm_event_subscription().discovery_refresh_interval_ms());
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, PartialJsonUsesDefaults) {
@@ -58,6 +72,21 @@ TEST_F(OnlineOptimizerServerConfigTest, PartialJsonUsesDefaults) {
     EXPECT_EQ("local", config.metrics_reporter_type());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, ReparseWithoutSubscriptionRestoresDefaults) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({
+        "kvcm_event_subscription": {
+            "enable": true,
+            "service_discovery_url": "static://127.0.0.1:6381"
+        }
+    })"));
+    ASSERT_TRUE(config.kvcm_event_subscription().enable());
+
+    ASSERT_TRUE(config.FromJsonString(R"({})"));
+    EXPECT_FALSE(config.kvcm_event_subscription().enable());
+    EXPECT_TRUE(config.kvcm_event_subscription().service_discovery_url().empty());
+}
+
 TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
     std::string json = R"({
         "rpc_port": 50099,
@@ -67,7 +96,13 @@ TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
         "metrics_report_interval_ms": 3000,
         "enable_prometheus": true,
         "prometheus_prefix": "test",
-        "io_thread_num": 16
+        "io_thread_num": 16,
+        "kvcm_event_subscription": {
+            "enable": true,
+            "service_discovery_url": "static://127.0.0.1:6490",
+            "consumer_id": "optimizer-b",
+            "discovery_refresh_interval_ms": 4321
+        }
     })";
 
     OnlineOptimizerServerConfig config1;
@@ -85,6 +120,12 @@ TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
     EXPECT_EQ(config1.enable_prometheus(), config2.enable_prometheus());
     EXPECT_EQ(config1.prometheus_prefix(), config2.prometheus_prefix());
     EXPECT_EQ(config1.io_thread_num(), config2.io_thread_num());
+    EXPECT_EQ(config1.kvcm_event_subscription().enable(), config2.kvcm_event_subscription().enable());
+    EXPECT_EQ(config1.kvcm_event_subscription().service_discovery_url(),
+              config2.kvcm_event_subscription().service_discovery_url());
+    EXPECT_EQ(config1.kvcm_event_subscription().consumer_id(), config2.kvcm_event_subscription().consumer_id());
+    EXPECT_EQ(config1.kvcm_event_subscription().discovery_refresh_interval_ms(),
+              config2.kvcm_event_subscription().discovery_refresh_interval_ms());
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, OverrideFromEnvironMap) {
@@ -94,11 +135,28 @@ TEST_F(OnlineOptimizerServerConfigTest, OverrideFromEnvironMap) {
     std::unordered_map<std::string, std::string> environ = {
         {"kvcm_optimizer.rpc_port", "60000"},
         {"kvcm_optimizer.io_thread_num", "16"},
+        {"kvcm_optimizer.kvcm_event_subscription.enable", "true"},
+        {"kvcm_optimizer.kvcm_event_subscription.service_discovery_url", "static://127.0.0.1:6381"},
+        {"kvcm_optimizer.kvcm_event_subscription.consumer_id", "optimizer-env"},
+        {"kvcm_optimizer.kvcm_event_subscription.discovery_refresh_interval_ms", "2500"},
     };
     ASSERT_TRUE(config.OverrideFromEnviron(environ));
     EXPECT_EQ(60000, config.rpc_port());
     EXPECT_EQ(16, config.io_thread_num());
     EXPECT_EQ("file:///tmp", config.registry_storage_uri());
+    EXPECT_TRUE(config.kvcm_event_subscription().enable());
+    EXPECT_EQ("static://127.0.0.1:6381", config.kvcm_event_subscription().service_discovery_url());
+    EXPECT_EQ("optimizer-env", config.kvcm_event_subscription().consumer_id());
+    EXPECT_EQ(2500, config.kvcm_event_subscription().discovery_refresh_interval_ms());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, RejectsEnabledSubscriptionWithoutRequiredValues) {
+    OnlineOptimizerServerConfig config;
+    EXPECT_FALSE(config.FromJsonString(R"({"kvcm_event_subscription":{"enable":true}})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscription":{"enable":true,"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"","discovery_refresh_interval_ms":5000}})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscription":{"enable":true,"service_discovery_url":"static://127.0.0.1:6381","consumer_id":"optimizer","discovery_refresh_interval_ms":0}})"));
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, OverrideFromSystemEnv) {

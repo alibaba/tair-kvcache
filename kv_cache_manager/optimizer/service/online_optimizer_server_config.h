@@ -9,6 +9,27 @@
 
 namespace kv_cache_manager {
 
+class KvcmEventSubscriptionConfig : public Jsonizable {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    bool Validate() const;
+
+    bool enable() const { return enable_; }
+    const std::string &service_discovery_url() const { return service_discovery_url_; }
+    const std::string &consumer_id() const { return consumer_id_; }
+    int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
+
+private:
+    friend class OnlineOptimizerServerConfig;
+
+    bool enable_ = false;
+    std::string service_discovery_url_;
+    std::string consumer_id_ = "online-optimizer";
+    int64_t discovery_refresh_interval_ms_ = 5000;
+};
+
 class OnlineOptimizerServerConfig : public Jsonizable {
 private:
     using EnvironMap = std::unordered_map<std::string, std::string>;
@@ -30,6 +51,7 @@ public:
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     int32_t io_thread_num() const { return io_thread_num_; }
+    const KvcmEventSubscriptionConfig &kvcm_event_subscription() const { return kvcm_event_subscription_; }
 
 private:
     void UpdateEnviron(EnvironMap &environ);
@@ -42,6 +64,7 @@ private:
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm_optimizer";
     int32_t io_thread_num_ = 4;
+    KvcmEventSubscriptionConfig kvcm_event_subscription_;
 
     using SettingFunction = std::function<bool(const std::string &, OnlineOptimizerServerConfig *)>;
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;
