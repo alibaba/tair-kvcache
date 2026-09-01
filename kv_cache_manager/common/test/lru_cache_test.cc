@@ -134,6 +134,26 @@ private:
     Cache::EvictionCallback eviction_callback_;
 };
 
+namespace {
+
+std::string FindKeyOnDifferentShard(LRUCache &cache, const std::string &first_key) {
+    const uint32_t shard_mask = cache.GetNumShards() - 1;
+    const uint32_t first_shard =
+        LRUCacheShard::HashPieceForSharding(LRUCacheShard::ComputeHash(first_key, cache.GetHashSeed())) & shard_mask;
+    for (size_t i = 1; i < 1000; ++i) {
+        std::string candidate = "key_" + std::to_string(i);
+        const uint32_t shard =
+            LRUCacheShard::HashPieceForSharding(LRUCacheShard::ComputeHash(candidate, cache.GetHashSeed())) &
+            shard_mask;
+        if (shard != first_shard) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+} // namespace
+
 TEST_F(LRUCacheTest, BasicLRU) {
     NewCache(5);
     for (char ch = 'a'; ch <= 'e'; ch++) {
@@ -229,6 +249,105 @@ TEST_F(LRUCacheTest, ApplyToEntryNoTouchKeepsUnpinnedPoolChargeConsistent) {
     EXPECT_EQ(60u, cache_->GetUsage());
     EXPECT_EQ(0u, cache_->GetPinnedUsage());
     ValidateLRUList({"a", "b"}, 1, 1, 0);
+}
+
+TEST(LRUCacheBatchTest, SmallBatchScratchScalesWithActiveShards) {
+    auto cache = NewLRUCache(1024 * 1024,
+                             /*num_shard_bits=*/10,
+                             /*strict_capacity_limit=*/false,
+                             /*no_evict_on_insert=*/false);
+    auto *lru_cache = dynamic_cast<LRUCache *>(cache.get());
+    ASSERT_NE(nullptr, lru_cache);
+
+    std::vector<std::string> owned_keys = {"key_0", FindKeyOnDifferentShard(*lru_cache, "key_0")};
+    ASSERT_FALSE(owned_keys.back().empty());
+    for (const auto &key : owned_keys) {
+        ASSERT_EQ(EC_OK, cache->Insert(key, nullptr, &kNoopCacheItemHelper, 1));
+    }
+
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(owned_keys.size(), &scratch);
+    EXPECT_LE(scratch.shard_offsets.capacity(), owned_keys.size() + 1);
+
+    const std::string_view keys[] = {owned_keys[0], owned_keys[1]};
+    Cache::Handle *handles[2] = {};
+    cache->LookupBatchWithScratch(keys, 2, handles, &scratch);
+    ASSERT_NE(nullptr, handles[0]);
+    ASSERT_NE(nullptr, handles[1]);
+    EXPECT_EQ(3u, scratch.shard_offsets.size());
+    cache->ReleaseBatchWithScratch(handles, 2, &scratch);
+
+    Cache::BatchOperationScratch singleton_scratch;
+    cache->PrepareBatchOperationScratch(1, &singleton_scratch);
+    EXPECT_LE(singleton_scratch.shard_offsets.capacity(), 2u);
+    Cache::Handle *singleton_handle = nullptr;
+    cache->LookupBatchWithScratch(keys, 1, &singleton_handle, &singleton_scratch);
+    ASSERT_NE(nullptr, singleton_handle);
+    EXPECT_TRUE(singleton_scratch.shard_offsets.empty());
+    cache->ReleaseBatchWithScratch(&singleton_handle, 1, &singleton_scratch);
+
+    for (const auto &key : owned_keys) {
+        auto *handle = cache->Lookup(key);
+        ASSERT_NE(nullptr, handle);
+        cache->Release(handle);
+    }
+}
+
+TEST(LRUCacheBatchTest, ReleaseReusesLookupShardRuns) {
+    for (const int num_shard_bits : {10, 2}) {
+        SCOPED_TRACE(num_shard_bits);
+        auto cache = NewLRUCache(1024 * 1024,
+                                 num_shard_bits,
+                                 /*strict_capacity_limit=*/false,
+                                 /*no_evict_on_insert=*/false);
+        ASSERT_EQ(EC_OK, cache->Insert("hit", nullptr, &kNoopCacheItemHelper, 1));
+
+        const std::string_view keys[] = {"hit", "miss"};
+        Cache::Handle *handles[2] = {};
+        Cache::BatchOperationScratch scratch;
+        cache->PrepareBatchOperationScratch(2, &scratch);
+        cache->LookupBatchWithScratch(keys, 2, handles, &scratch);
+        ASSERT_NE(nullptr, handles[0]);
+        ASSERT_EQ(nullptr, handles[1]);
+        const auto lookup_order = scratch.ordered_indices;
+        const auto lookup_offsets = scratch.shard_offsets;
+
+        cache->ReleaseBatchWithScratch(handles, 2, &scratch);
+
+        EXPECT_EQ(lookup_order, scratch.ordered_indices);
+        EXPECT_EQ(lookup_offsets, scratch.shard_offsets);
+        cache->Erase("hit");
+        EXPECT_EQ(0u, cache->GetUsage());
+    }
+}
+
+TEST(LRUCacheBatchTest, ReleaseFallsBackWhenHandlesNoLongerMatchLookupShards) {
+    auto cache = NewLRUCache(1024 * 1024,
+                             /*num_shard_bits=*/1,
+                             /*strict_capacity_limit=*/false,
+                             /*no_evict_on_insert=*/false);
+    auto *lru_cache = dynamic_cast<LRUCache *>(cache.get());
+    ASSERT_NE(nullptr, lru_cache);
+
+    std::vector<std::string> owned_keys = {"key_0", FindKeyOnDifferentShard(*lru_cache, "key_0")};
+    ASSERT_FALSE(owned_keys.back().empty());
+    ASSERT_EQ(EC_OK, cache->Insert(owned_keys[0], nullptr, &kNoopCacheItemHelper, 8));
+    ASSERT_EQ(EC_OK, cache->Insert(owned_keys[1], nullptr, &kNoopCacheItemHelper, 1));
+
+    const std::string_view keys[] = {owned_keys[0], owned_keys[1]};
+    Cache::Handle *handles[2] = {};
+    Cache::BatchOperationScratch scratch;
+    cache->PrepareBatchOperationScratch(2, &scratch);
+    cache->LookupBatchWithScratch(keys, 2, handles, &scratch);
+    ASSERT_NE(nullptr, handles[0]);
+    ASSERT_NE(nullptr, handles[1]);
+    cache->Erase(owned_keys[0]);
+    cache->Erase(owned_keys[1]);
+    std::swap(handles[0], handles[1]);
+
+    cache->ReleaseBatchWithScratch(handles, 2, &scratch);
+
+    EXPECT_EQ(0u, cache->GetUsage());
 }
 
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {

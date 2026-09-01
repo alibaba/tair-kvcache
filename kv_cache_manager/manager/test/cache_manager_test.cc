@@ -1161,8 +1161,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
         meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1;  // 已写入的key_count + 1，确保已经写入的是成功的
 
         std::vector<int64_t> keys{1001, 1002};
-        while (GetShardIndex(keys[0], meta_indexer->mutex_shard_mask_) ==
-               GetShardIndex(keys[1], meta_indexer->mutex_shard_mask_)) {
+        while (meta_indexer->GetMutexShardIndex(keys[0]) == meta_indexer->GetMutexShardIndex(keys[1])) {
             ++keys[1];
         }
 
