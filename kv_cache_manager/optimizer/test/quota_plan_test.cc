@@ -27,6 +27,11 @@ OnlineMrcSourceSnapshot Source(const std::string &id, uint64_t hit_at_one, uint6
     source.newest_event_time_ns = 99'000'000'000LL;
     source.accepted_facts = 10;
     source.curve = {{static_cast<uint64_t>(kGiB), 100, hit_at_one}, {static_cast<uint64_t>(2 * kGiB), 100, hit_at_two}};
+    source.enforced_shadow_quota_bytes = kGiB;
+    source.enforced_shadow_generation = 1;
+    source.enforced_shadow_accepted_facts = 10;
+    source.enforced_shadow_input_tokens = 100;
+    source.enforced_shadow_hit_tokens = hit_at_one;
     return source;
 }
 
@@ -68,6 +73,8 @@ TEST(ShadowQuotaPlannerTest, MaximizesHitTokensUnderFixedPoolBudget) {
     EXPECT_EQ(10u, plan.allocations[0].baseline_hit_tokens);
     EXPECT_EQ(5u, plan.allocations[1].baseline_hit_tokens);
     EXPECT_DOUBLE_EQ(7.5, ExpectedHitRateGainPercentagePoints(plan));
+    EXPECT_TRUE(plan.enforced_shadow_baseline_valid);
+    EXPECT_DOUBLE_EQ(7.5, plan.enforced_shadow_baseline_hit_rate_pp);
     EXPECT_FALSE(plan.plan_hash.empty());
 }
 
@@ -368,6 +375,68 @@ TEST(QuotaPlanBenefitTest, RejectsSnapshotWithoutAppliedQuotaPoint) {
     std::string reason;
     EXPECT_FALSE(ComputeRealizedHitRateGain(plan, Snapshot(), &realized, &reason));
     EXPECT_EQ("missing_after_quota_point:source-a", reason);
+}
+
+TEST(QuotaPlanBenefitTest, ComputesActualGainAcrossEnforcedShadowWindows) {
+    PoolQuotaPlan plan;
+    plan.plan_id = "plan-a";
+    plan.pool_id = "pool-a";
+    plan.writes_quota = true;
+    plan.status = "APPLIED";
+    plan.execution_phase = "COMPLETE";
+    plan.quota_transfer_bytes = kGiB;
+    plan.enforced_shadow_baseline_valid = true;
+    plan.enforced_shadow_baseline_input_tokens = 200;
+    plan.enforced_shadow_baseline_hit_tokens = 30;
+    plan.enforced_shadow_baseline_hit_rate_pp = 15.0;
+    plan.allocations = {
+        QuotaAllocation{"target-a", "source-a", "group-a", kGiB, 2 * kGiB},
+        QuotaAllocation{"target-b", "source-b", "group-b", 2 * kGiB, kGiB},
+    };
+
+    OnlineMrcDecisionSnapshot snapshot;
+    snapshot.snapshot_id = 12;
+    auto source_a = Source("source-a", 10, 30);
+    source_a.enforced_shadow_quota_bytes = 2 * kGiB;
+    source_a.enforced_shadow_generation = 2;
+    source_a.enforced_shadow_input_tokens = 120;
+    source_a.enforced_shadow_hit_tokens = 36;
+    auto source_b = Source("source-b", 20, 25);
+    source_b.enforced_shadow_quota_bytes = kGiB;
+    source_b.enforced_shadow_generation = 2;
+    source_b.enforced_shadow_input_tokens = 80;
+    source_b.enforced_shadow_hit_tokens = 24;
+    snapshot.sources = {source_a, source_b};
+
+    QuotaEnforcedShadowHitRateGain actual;
+    std::string reason;
+    ASSERT_TRUE(ComputeEnforcedShadowHitRateGain(plan, snapshot, &actual, &reason));
+    EXPECT_TRUE(reason.empty());
+    EXPECT_EQ(200u, actual.before_input_tokens);
+    EXPECT_EQ(200u, actual.after_input_tokens);
+    EXPECT_DOUBLE_EQ(15.0, actual.before_hit_rate_pp);
+    EXPECT_DOUBLE_EQ(30.0, actual.after_hit_rate_pp);
+    EXPECT_DOUBLE_EQ(15.0, actual.gain_pp);
+}
+
+TEST(QuotaPlanBenefitTest, RejectsActualWindowMeasuredAtWrongQuota) {
+    PoolQuotaPlan plan;
+    plan.writes_quota = true;
+    plan.status = "APPLIED";
+    plan.execution_phase = "COMPLETE";
+    plan.quota_transfer_bytes = kGiB;
+    plan.enforced_shadow_baseline_valid = true;
+    plan.enforced_shadow_baseline_input_tokens = 100;
+    plan.enforced_shadow_baseline_hit_rate_pp = 10.0;
+    plan.allocations = {
+        QuotaAllocation{"target-a", "source-a", "group-a", kGiB, 2 * kGiB},
+    };
+
+    auto snapshot = Snapshot();
+    QuotaEnforcedShadowHitRateGain actual;
+    std::string reason;
+    EXPECT_FALSE(ComputeEnforcedShadowHitRateGain(plan, snapshot, &actual, &reason));
+    EXPECT_EQ("post_resize_enforced_shadow_quota_mismatch:source-a", reason);
 }
 
 } // namespace kv_cache_manager

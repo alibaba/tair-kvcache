@@ -220,6 +220,35 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryBasic) {
     EXPECT_EQ(5, result.total_blocks);
 }
 
+TEST_F(OnlineOptimizerManagerTest, MeasuresExactHitsAtAcknowledgedShadowQuota) {
+    auto info = MakeInfo("i1", "g1", 16, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)}, "lru", true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    constexpr int64_t kBytesPerBlock = 16384;
+    ASSERT_EQ(EC_OK, mgr_->SetEnforcedShadowQuota("i1", 2 * kBytesPerBlock));
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 32, 1, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 32, 2, result));
+
+    const auto snapshot = mgr_->TakeQuotaDecisionSnapshot({{"i1", {2 * kBytesPerBlock}}}, 3);
+    ASSERT_EQ(1u, snapshot.sources.size());
+    const auto &source = snapshot.sources.front();
+    EXPECT_EQ(2 * kBytesPerBlock, source.enforced_shadow_quota_bytes);
+    EXPECT_EQ(1u, source.enforced_shadow_generation);
+    EXPECT_EQ(2u, source.enforced_shadow_accepted_facts);
+    EXPECT_EQ(64u, source.enforced_shadow_input_tokens);
+    EXPECT_EQ(32u, source.enforced_shadow_hit_tokens);
+
+    ASSERT_EQ(EC_OK, mgr_->SetEnforcedShadowQuota("i1", kBytesPerBlock));
+    const auto reset_snapshot = mgr_->TakeQuotaDecisionSnapshot({{"i1", {kBytesPerBlock}}}, 4);
+    ASSERT_EQ(1u, reset_snapshot.sources.size());
+    EXPECT_EQ(2u, reset_snapshot.sources.front().enforced_shadow_generation);
+    EXPECT_EQ(0u, reset_snapshot.sources.front().enforced_shadow_accepted_facts);
+    EXPECT_EQ(0u, reset_snapshot.sources.front().enforced_shadow_input_tokens);
+}
+
 TEST_F(OnlineOptimizerManagerTest, TraceQueryPrefixMatch) {
     auto info = MakeInfo();
     auto group = MakeGroup();

@@ -60,6 +60,15 @@ struct InstanceState {
     uint64_t quota_input_tokens = 0;
     uint64_t quota_accepted_facts = 0;
     int64_t quota_newest_event_ns = 0;
+
+    // Current hard quota acknowledged by KVCM and the exact hit counters
+    // projected at that single enforced capacity. Changing quota starts a new
+    // generation so pre/post-resize windows cannot be mixed.
+    int64_t enforced_shadow_quota_bytes = 0;
+    uint64_t enforced_shadow_generation = 0;
+    uint64_t enforced_shadow_accepted_facts = 0;
+    uint64_t enforced_shadow_input_tokens = 0;
+    uint64_t enforced_shadow_hit_tokens = 0;
 };
 
 struct TraceQueryResult {
@@ -166,6 +175,10 @@ public:
     OnlineMrcDecisionSnapshot
     TakeQuotaDecisionSnapshot(const std::map<std::string, std::vector<uint64_t>> &capacity_bytes_by_source,
                               int64_t now_ns = 0);
+
+    // Updates the single capacity used by the exact online shadow. A quota
+    // change clears the measurement window and advances its generation.
+    ErrorCode SetEnforcedShadowQuota(const std::string &instance_id, int64_t quota_bytes);
 
     ErrorCode ResetStats(const std::string &instance_id);
 

@@ -296,6 +296,27 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
         return;
     }
     const auto observed_quotas = quota_plan_store_->GetObservedQuotas();
+    for (const auto &pool : config_.quota_planner_config().pools) {
+        const auto observed_pool = observed_quotas.find(pool.pool_id);
+        for (const auto &member : pool.members) {
+            int64_t quota_bytes = member.current_quota_bytes;
+            if (observed_pool != observed_quotas.end()) {
+                const auto observed_member = observed_pool->second.find(member.quota_target_id);
+                if (observed_member != observed_pool->second.end() && observed_member->second > 0) {
+                    quota_bytes = observed_member->second;
+                }
+            }
+            const auto ec = manager_->SetEnforcedShadowQuota(member.source_id, quota_bytes);
+            if (ec != EC_OK && ec != EC_INSTANCE_NOT_EXIST) {
+                KVCM_LOG_WARN("quota_decision_audit event=enforced_shadow_quota_sync_failed pool_id=%s "
+                              "source_id=%s quota_bytes=%ld ec=%d",
+                              pool.pool_id.c_str(),
+                              member.source_id.c_str(),
+                              static_cast<long>(quota_bytes),
+                              static_cast<int>(ec));
+            }
+        }
+    }
     std::map<std::string, std::shared_ptr<const PoolQuotaPlan>> applied_plans;
     std::map<std::string, std::set<uint64_t>> capacity_sets_by_source;
     for (const auto &pool : config_.quota_planner_config().pools) {
@@ -337,6 +358,54 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
 
     const auto snapshot = manager_->TakeQuotaDecisionSnapshot(capacities_by_source);
     for (const auto &[pool_id, applied_plan] : applied_plans) {
+        QuotaEnforcedShadowHitRateGain actual;
+        std::string actual_reason;
+        if (!ComputeEnforcedShadowHitRateGain(*applied_plan, snapshot, &actual, &actual_reason)) {
+            KVCM_LOG_WARN("quota_decision_audit event=actual_gain_skipped measurement=enforced_shadow_lru "
+                          "system=KVBrain plan_id=%s plan_hash=%s pool_id=%s snapshot_id=%llu reason=%s",
+                          applied_plan->plan_id.c_str(),
+                          applied_plan->plan_hash.c_str(),
+                          pool_id.c_str(),
+                          static_cast<unsigned long long>(snapshot.snapshot_id),
+                          actual_reason.c_str());
+        } else {
+            KVCM_LOG_INFO("quota_decision_audit event=actual_gain_observed measurement=enforced_shadow_lru "
+                          "system=KVBrain plan_id=%s plan_hash=%s pool_id=%s snapshot_id=%llu "
+                          "before_input_tokens=%llu after_input_tokens=%llu before_hit_rate_pp=%.6f "
+                          "after_hit_rate_pp=%.6f actual_hit_rate_gain_pp=%.6f expected_hit_rate_gain_pp=%.6f",
+                          applied_plan->plan_id.c_str(),
+                          applied_plan->plan_hash.c_str(),
+                          pool_id.c_str(),
+                          static_cast<unsigned long long>(actual.snapshot_id),
+                          static_cast<unsigned long long>(actual.before_input_tokens),
+                          static_cast<unsigned long long>(actual.after_input_tokens),
+                          actual.before_hit_rate_pp,
+                          actual.after_hit_rate_pp,
+                          actual.gain_pp,
+                          applied_plan->expected_hit_rate_gain_pp);
+            if (metrics_registry_) {
+                MetricsTags pool_tags{{"pool_id", pool_id}, {"measurement", "enforced_shadow_lru"}};
+                metrics_registry_->GetCounter("quota_plan.actual_observations_total", pool_tags) += 1;
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.actual_before_hit_rate_pp",
+                                      pool_tags,
+                                      actual.before_hit_rate_pp);
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.actual_after_hit_rate_pp",
+                                      pool_tags,
+                                      actual.after_hit_rate_pp);
+                REPORT_DYNAMIC_GAUGE_(
+                    metrics_registry_, "quota_plan.actual_hit_rate_gain_pp", pool_tags, actual.gain_pp);
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.actual_before_input_tokens",
+                                      pool_tags,
+                                      static_cast<double>(actual.before_input_tokens));
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.actual_after_input_tokens",
+                                      pool_tags,
+                                      static_cast<double>(actual.after_input_tokens));
+            }
+        }
         QuotaRealizedHitRateGain realized;
         std::string reason;
         if (!ComputeRealizedHitRateGain(*applied_plan, snapshot, &realized, &reason)) {
@@ -396,6 +465,7 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
                       "baseline_hit_rate_pp=%.6f target_hit_rate_pp=%.6f expected_hit_rate_gain_pp=%.6f "
                       "movement_penalty_pp=%.6f expected_net_gain_pp=%.6f gain_pp_per_tib_moved=%.6f "
                       "quota_change_bytes=%llu quota_transfer_bytes=%llu stability=%lld/%lld "
+                      "enforced_shadow_baseline_valid=%d enforced_shadow_baseline_hit_rate_pp=%.6f "
                       "capacity_saving_sla_ratio=%.6f sla_required_capacity_bytes=%lld "
                       "sla_capacity_saving_bytes=%lld sla_capacity_deficit_bytes=%lld allocations=%s",
                       plan->plan_id.c_str(),
@@ -416,6 +486,8 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
                       static_cast<unsigned long long>(plan->quota_transfer_bytes),
                       static_cast<long long>(plan->stability_confirmed_plans),
                       static_cast<long long>(plan->stability_required_plans),
+                      static_cast<int>(plan->enforced_shadow_baseline_valid),
+                      plan->enforced_shadow_baseline_hit_rate_pp,
                       plan->capacity_saving_sla_ratio,
                       static_cast<long long>(plan->sla_required_capacity_bytes),
                       static_cast<long long>(plan->sla_capacity_saving_bytes),

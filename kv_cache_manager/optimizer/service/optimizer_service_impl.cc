@@ -724,6 +724,30 @@ void OptimizerServiceImpl::ReportQuotaResizeResult(RequestContext *request_conte
                                                                 request->observed_used_bytes()},
                                               &store_reason)) {
         ec = EC_OK;
+        if (request->observed_quota_bytes() > 0 && manager_) {
+            const auto updated_plan = quota_plan_store_->Get(request->pool_id());
+            if (updated_plan) {
+                const auto allocation_it =
+                    std::find_if(updated_plan->allocations.begin(),
+                                 updated_plan->allocations.end(),
+                                 [&](const QuotaAllocation &allocation) {
+                                     return allocation.quota_target_id == request->quota_target_id();
+                                 });
+                if (allocation_it != updated_plan->allocations.end()) {
+                    const auto shadow_ec =
+                        manager_->SetEnforcedShadowQuota(allocation_it->source_id, request->observed_quota_bytes());
+                    if (shadow_ec != EC_OK) {
+                        KVCM_LOG_WARN("quota_decision_audit event=enforced_shadow_quota_ack_failed pool_id=%s "
+                                      "quota_target_id=%s source_id=%s observed_quota_bytes=%ld ec=%d",
+                                      request->pool_id().c_str(),
+                                      request->quota_target_id().c_str(),
+                                      allocation_it->source_id.c_str(),
+                                      static_cast<long>(request->observed_quota_bytes()),
+                                      static_cast<int>(shadow_ec));
+                    }
+                }
+            }
+        }
         KVCM_LOG_INFO("quota_decision_audit event=resize_result_received plan_id=%s plan_hash=%s pool_id=%s "
                       "quota_target_id=%s leader_epoch=%llu allocation_epoch=%llu phase=%s status=%s reason=%s "
                       "observed_quota_bytes=%ld observed_used_bytes=%ld instance_group_version=%ld",

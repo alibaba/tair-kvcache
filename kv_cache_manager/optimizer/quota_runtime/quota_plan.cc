@@ -17,6 +17,10 @@ constexpr int64_t kNanosPerSecond = 1000000000LL;
 constexpr long double kBytesPerTiB = 1024.0L * 1024.0L * 1024.0L * 1024.0L;
 constexpr long double kScoreEpsilon = 1e-12L;
 
+uint64_t SaturatingAddUint64(uint64_t lhs, uint64_t rhs) {
+    return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
+}
+
 int64_t EffectiveMax(const QuotaPoolMemberConfig &member) {
     return std::min(member.configured_max_quota_bytes, member.hardware_max_quota_bytes);
 }
@@ -109,6 +113,60 @@ bool ComputeRealizedHitRateGain(const PoolQuotaPlan &applied_plan,
     result->input_tokens = static_cast<uint64_t>(input_tokens);
     result->before_hit_rate_pp = static_cast<double>(before_hit_tokens * 100.0L / input_tokens);
     result->after_hit_rate_pp = static_cast<double>(after_hit_tokens * 100.0L / input_tokens);
+    result->gain_pp = result->after_hit_rate_pp - result->before_hit_rate_pp;
+    if (reason) {
+        reason->clear();
+    }
+    return true;
+}
+
+bool ComputeEnforcedShadowHitRateGain(const PoolQuotaPlan &applied_plan,
+                                      const OnlineMrcDecisionSnapshot &snapshot,
+                                      QuotaEnforcedShadowHitRateGain *result,
+                                      std::string *reason) {
+    auto fail = [&](const std::string &message) {
+        if (reason) {
+            *reason = message;
+        }
+        return false;
+    };
+    if (!result) {
+        return fail("null_result");
+    }
+    *result = QuotaEnforcedShadowHitRateGain{};
+    if (!applied_plan.writes_quota || applied_plan.status != "APPLIED" ||
+        applied_plan.execution_phase != "COMPLETE" || applied_plan.quota_transfer_bytes == 0) {
+        return fail("plan_not_applied_resize");
+    }
+    if (!applied_plan.enforced_shadow_baseline_valid ||
+        applied_plan.enforced_shadow_baseline_input_tokens == 0) {
+        return fail("missing_enforced_shadow_baseline");
+    }
+
+    uint64_t after_input_tokens = 0;
+    uint64_t after_hit_tokens = 0;
+    for (const auto &allocation : applied_plan.allocations) {
+        const auto *source = FindSource(snapshot, allocation.source_id);
+        if (!source || source->enforced_shadow_accepted_facts == 0 ||
+            source->enforced_shadow_input_tokens == 0) {
+            return fail("missing_post_resize_enforced_shadow_source:" + allocation.source_id);
+        }
+        if (source->enforced_shadow_quota_bytes != allocation.target_quota_bytes) {
+            return fail("post_resize_enforced_shadow_quota_mismatch:" + allocation.source_id);
+        }
+        after_input_tokens = SaturatingAddUint64(after_input_tokens, source->enforced_shadow_input_tokens);
+        after_hit_tokens = SaturatingAddUint64(after_hit_tokens, source->enforced_shadow_hit_tokens);
+    }
+    if (after_input_tokens == 0) {
+        return fail("empty_post_resize_enforced_shadow_window");
+    }
+
+    result->snapshot_id = snapshot.snapshot_id;
+    result->before_input_tokens = applied_plan.enforced_shadow_baseline_input_tokens;
+    result->after_input_tokens = after_input_tokens;
+    result->before_hit_rate_pp = applied_plan.enforced_shadow_baseline_hit_rate_pp;
+    result->after_hit_rate_pp = static_cast<double>(static_cast<long double>(after_hit_tokens) * 100.0L /
+                                                    static_cast<long double>(after_input_tokens));
     result->gain_pp = result->after_hit_rate_pp - result->before_hit_rate_pp;
     if (reason) {
         reason->clear();
@@ -641,6 +699,31 @@ ShadowQuotaPlanner::BuildPoolPlan(const QuotaPoolConfig &pool,
     plan->baseline_hit_rate_pp = static_cast<double>(baseline_hit_tokens * 100.0L / input_tokens);
     plan->target_hit_rate_pp = static_cast<double>(target_hit_tokens * 100.0L / input_tokens);
     plan->expected_hit_rate_gain_pp = plan->target_hit_rate_pp - plan->baseline_hit_rate_pp;
+
+    uint64_t enforced_shadow_input_tokens = 0;
+    uint64_t enforced_shadow_hit_tokens = 0;
+    bool enforced_shadow_baseline_valid = true;
+    for (const auto &allocation : plan->allocations) {
+        const auto *source = FindSource(snapshot, allocation.source_id);
+        if (!source || source->enforced_shadow_accepted_facts == 0 ||
+            source->enforced_shadow_input_tokens == 0 ||
+            source->enforced_shadow_quota_bytes != allocation.current_quota_bytes) {
+            enforced_shadow_baseline_valid = false;
+            break;
+        }
+        enforced_shadow_input_tokens =
+            SaturatingAddUint64(enforced_shadow_input_tokens, source->enforced_shadow_input_tokens);
+        enforced_shadow_hit_tokens =
+            SaturatingAddUint64(enforced_shadow_hit_tokens, source->enforced_shadow_hit_tokens);
+    }
+    if (enforced_shadow_baseline_valid && enforced_shadow_input_tokens > 0) {
+        plan->enforced_shadow_baseline_valid = true;
+        plan->enforced_shadow_baseline_input_tokens = enforced_shadow_input_tokens;
+        plan->enforced_shadow_baseline_hit_tokens = enforced_shadow_hit_tokens;
+        plan->enforced_shadow_baseline_hit_rate_pp =
+            static_cast<double>(static_cast<long double>(enforced_shadow_hit_tokens) * 100.0L /
+                                static_cast<long double>(enforced_shadow_input_tokens));
+    }
     plan->quota_change_bytes = grow_bytes + shrink_bytes;
     plan->quota_transfer_bytes = std::max(grow_bytes, shrink_bytes);
     const long double transfer_tib = static_cast<long double>(plan->quota_transfer_bytes) / kBytesPerTiB;

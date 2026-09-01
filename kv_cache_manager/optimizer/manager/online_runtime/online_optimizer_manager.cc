@@ -509,6 +509,16 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
+        if (state->enforced_shadow_quota_bytes > 0 && state->size_full > 0) {
+            const uint64_t capacity_blocks =
+                static_cast<uint64_t>(state->enforced_shadow_quota_bytes) / static_cast<uint64_t>(state->size_full);
+            const uint64_t enforced_hits = HitCurveProjector::ProjectBlocks(fact, capacity_blocks);
+            state->enforced_shadow_input_tokens =
+                SaturatingAddUint64(state->enforced_shadow_input_tokens, normalized.input_token_len);
+            state->enforced_shadow_hit_tokens = SaturatingAddUint64(
+                state->enforced_shadow_hit_tokens, SaturatingMultiplyUint64(enforced_hits, block_size));
+            ++state->enforced_shadow_accepted_facts;
+        }
         const double token_denominator = static_cast<double>(normalized.input_token_len);
         result.hit_count_per_capacity.reserve(num_caps);
         result.hit_rate_per_capacity.reserve(num_caps);
@@ -771,6 +781,11 @@ OnlineMrcDecisionSnapshot OnlineOptimizerManager::TakeQuotaDecisionSnapshot(
         const auto hit_blocks = state->quota_mrc_window.TakeHitCounts(capacity_blocks);
         source.newest_event_time_ns = state->quota_newest_event_ns;
         source.accepted_facts = state->quota_accepted_facts;
+        source.enforced_shadow_quota_bytes = state->enforced_shadow_quota_bytes;
+        source.enforced_shadow_generation = state->enforced_shadow_generation;
+        source.enforced_shadow_accepted_facts = state->enforced_shadow_accepted_facts;
+        source.enforced_shadow_input_tokens = state->enforced_shadow_input_tokens;
+        source.enforced_shadow_hit_tokens = state->enforced_shadow_hit_tokens;
         source.curve.reserve(capacity_bytes.size());
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
         for (size_t i = 0; i < capacity_bytes.size(); ++i) {
@@ -781,9 +796,44 @@ OnlineMrcDecisionSnapshot OnlineOptimizerManager::TakeQuotaDecisionSnapshot(
         state->quota_input_tokens = 0;
         state->quota_accepted_facts = 0;
         state->quota_newest_event_ns = 0;
+        state->enforced_shadow_accepted_facts = 0;
+        state->enforced_shadow_input_tokens = 0;
+        state->enforced_shadow_hit_tokens = 0;
         snapshot.sources.push_back(std::move(source));
     }
     return snapshot;
+}
+
+ErrorCode OnlineOptimizerManager::SetEnforcedShadowQuota(const std::string &instance_id, int64_t quota_bytes) {
+    if (quota_bytes <= 0) {
+        return EC_BADARGS;
+    }
+    std::shared_ptr<InstanceState> state;
+    {
+        std::shared_lock lock(instances_mutex_);
+        const auto it = instances_.find(instance_id);
+        if (it == instances_.end() || !it->second) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        state = it->second;
+    }
+    std::lock_guard<std::mutex> guard(state->mutex);
+    if (state->linear_step != 0 || !state->lite_hit || state->size_full <= 0) {
+        return EC_BADARGS;
+    }
+    if (state->enforced_shadow_quota_bytes == quota_bytes) {
+        return EC_OK;
+    }
+    state->enforced_shadow_quota_bytes = quota_bytes;
+    ++state->enforced_shadow_generation;
+    state->enforced_shadow_accepted_facts = 0;
+    state->enforced_shadow_input_tokens = 0;
+    state->enforced_shadow_hit_tokens = 0;
+    KVCM_LOG_INFO("enforced_shadow_quota_updated instance_id=%s quota_bytes=%ld generation=%llu",
+                  instance_id.c_str(),
+                  static_cast<long>(quota_bytes),
+                  static_cast<unsigned long long>(state->enforced_shadow_generation));
+    return EC_OK;
 }
 
 ErrorCode OnlineOptimizerManager::TakeIntervalMetrics(std::vector<IntervalMetricInfo> &metrics) {
@@ -876,6 +926,9 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     state->quota_input_tokens = 0;
     state->quota_accepted_facts = 0;
     state->quota_newest_event_ns = 0;
+    state->enforced_shadow_accepted_facts = 0;
+    state->enforced_shadow_input_tokens = 0;
+    state->enforced_shadow_hit_tokens = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

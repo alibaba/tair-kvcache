@@ -98,6 +98,10 @@ struct PoolQuotaPlan {
     double baseline_hit_rate_pp = 0.0;
     double target_hit_rate_pp = 0.0;
     double expected_hit_rate_gain_pp = 0.0;
+    bool enforced_shadow_baseline_valid = false;
+    uint64_t enforced_shadow_baseline_input_tokens = 0;
+    uint64_t enforced_shadow_baseline_hit_tokens = 0;
+    double enforced_shadow_baseline_hit_rate_pp = 0.0;
     double movement_penalty_pp = 0.0;
     double expected_net_gain_pp = 0.0;
     double gain_pp_per_tib_moved = 0.0;
@@ -156,6 +160,23 @@ bool ComputeRealizedHitRateGain(const PoolQuotaPlan &applied_plan,
                                 const OnlineMrcDecisionSnapshot &snapshot,
                                 QuotaRealizedHitRateGain *result,
                                 std::string *reason = nullptr);
+
+struct QuotaEnforcedShadowHitRateGain {
+    uint64_t snapshot_id = 0;
+    uint64_t before_input_tokens = 0;
+    uint64_t after_input_tokens = 0;
+    double before_hit_rate_pp = 0.0;
+    double after_hit_rate_pp = 0.0;
+    double gain_pp = 0.0;
+};
+
+// Compares two actual online shadow windows. The baseline was measured at the
+// quotas observed when the plan was built; the post window is accepted only
+// when every source was measured at the plan's applied target quota.
+bool ComputeEnforcedShadowHitRateGain(const PoolQuotaPlan &applied_plan,
+                                      const OnlineMrcDecisionSnapshot &snapshot,
+                                      QuotaEnforcedShadowHitRateGain *result,
+                                      std::string *reason = nullptr);
 
 class InMemoryQuotaPlanStore {
 public:
