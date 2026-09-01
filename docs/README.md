@@ -12,6 +12,7 @@
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
 - [Commit 要求](develop/commit_requirements.md) - 提交前检查和 commit message 格式约定
+- [Pull Request 协作指南](develop/pull_request_guidelines.md) - PR 的可评审性、协作表达、标题和双语正文约定
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式
 - [API 文档](api/) - API 接口说明和使用示例
 - [ReportEvent 与查询接口行为](api/report_event.md) - 面向调用方的事件上报、全量对账、查询、错误处理和测试覆盖清单
