@@ -110,6 +110,11 @@ public:
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
                                            bool refresh_cache_from_persistent = false) noexcept;
+    LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
+                                                          const KeyVector &keys,
+                                                          const LocationIdsPerKey &location_ids,
+                                                          const LocationModifierFunc &modifier,
+                                                          bool adjust_reclaimed_key_count = true) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -127,7 +132,6 @@ public:
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
-
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,
@@ -205,7 +209,8 @@ private:
                                                const LocationModifierFunc &modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
-                                               bool refresh_cache_from_persistent) noexcept;
+                                               bool refresh_cache_from_persistent,
+                                               bool maintenance_no_touch) noexcept;
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;
@@ -260,7 +265,8 @@ private:
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
-                                                 Result &result) noexcept;
+                                                 Result &result,
+                                                 bool maintenance_no_touch = false) noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 

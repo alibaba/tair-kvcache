@@ -212,6 +212,13 @@ public:
         return static_cast<Handle *>(result);
     }
 
+    bool ApplyToEntryNoTouch(
+        const std::string_view &key,
+        const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
+        HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
+        return GetShard(hash).ApplyToEntryNoTouch(key, hash, callback);
+    }
+
     bool Exists(const std::string_view &key) override {
         HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
         return GetShard(hash).Exists(key, hash);

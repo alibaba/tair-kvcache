@@ -710,6 +710,66 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceScanReturnsLocationsWithoutTouchingL
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessTime) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_maintenance_target", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto first = std::make_shared<CacheLocation>();
+    first->set_id("loc_first");
+    first->set_status(CacheLocationStatus::CLS_SERVING);
+    auto second = std::make_shared<CacheLocation>();
+    second->set_id("loc_second");
+    second->set_status(CacheLocationStatus::CLS_SERVING);
+    CacheLocationMapVector locations(1);
+    locations[0].emplace(first->id(), first);
+    locations[0].emplace(second->id(), second);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1}, locations, PropertyMapVector(1)));
+
+    auto *backend = GetLocalBackend();
+    auto get_last_access_time = [backend]() {
+        int64_t last_access_time = -1;
+        backend->cache_->ApplyToSingleShard(
+            0, [&last_access_time](std::string_view, Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) {
+                last_access_time = static_cast<MetaMemCacheItem *>(value)->GetLastAccessTime();
+            });
+        return last_access_time;
+    };
+    const int64_t access_before = get_last_access_time();
+    const size_t usage_before = backend->GetMemUsage();
+
+    LocationsPerKey selected;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              backend->GetLocationsForMaintenance(nullptr, {1}, {{"loc_first"}}, selected));
+    ASSERT_EQ(1, selected.size());
+    ASSERT_EQ(1, selected[0].size());
+    ASSERT_TRUE(selected[0][0]);
+    EXPECT_EQ("loc_first", selected[0][0]->id());
+    EXPECT_EQ(access_before, get_last_access_time());
+
+    LocationIdsPerKey location_ids;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->GetLocationIdsForMaintenance(nullptr, {1}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+    EXPECT_THAT(location_ids.front(), UnorderedElementsAre("loc_first", "loc_second"));
+    EXPECT_EQ(access_before, get_last_access_time());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocationsForMaintenance(nullptr, {1}, {{"loc_first"}}));
+    EXPECT_EQ(access_before, get_last_access_time());
+    EXPECT_EQ(usage_before - MetaMemCacheItem::EstimateLocationEntryUsage("loc_first", first), backend->GetMemUsage());
+    LocationsPerKey remaining;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT, EC_OK}}),
+              backend->GetLocationsForMaintenance(nullptr, {1}, {{"loc_first", "loc_second"}}, remaining));
+    ASSERT_EQ(1, remaining.size());
+    ASSERT_EQ(2, remaining[0].size());
+    EXPECT_FALSE(remaining[0][0]);
+    ASSERT_TRUE(remaining[0][1]);
+    EXPECT_EQ("loc_second", remaining[0][1]->id());
+    EXPECT_EQ(access_before, get_last_access_time());
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -1543,16 +1603,17 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string field_name_b_full = PROPERTY_LOCATION_PREFIX + loc_id_b;
     // SplitFieldMaps creates a CacheLocation with id=loc_id_b and no specs.
     // EstimateMemUsage = sizeof(CacheLocation) + loc_id_b.size()
-    // MetaMemCacheItem::Size location overhead = sizeof(void*)*4 + loc_id.size() + EstimateMemUsage
+    // MetaMemCacheItem::Size location overhead = map node + id + shared_ptr + location body.
     size_t loc_mem_usage = sizeof(CacheLocation) + loc_id_b.size();
-    ssize_t expected_delta_upsert = static_cast<ssize_t>(kMapNodeOverhead + loc_id_b.size() + loc_mem_usage);
+    ssize_t expected_delta_upsert =
+        static_cast<ssize_t>(kMapNodeOverhead + loc_id_b.size() + sizeof(CacheLocationConstPtr) + loc_mem_usage);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b_full, loc_value_b}}}));
     size_t usage_after_upsert = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_upsert - usage_after_shrink), expected_delta_upsert);
 
     // --- DeleteLocations: remove loc_b ---
-    // Expected delta: -(sizeof(void*)*4 + loc_id.size() + EstimateMemUsage)
+    // Expected delta is the exact inverse of adding the location entry.
     ssize_t expected_delta_delete = -expected_delta_upsert;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocations(nullptr, {1}, {{loc_id_b}}));
     size_t usage_after_delete = backend->GetMemUsage();

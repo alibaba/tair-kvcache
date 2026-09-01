@@ -176,12 +176,16 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, scan_round_count);
     DECLARE_METRICS(cache_gc, scan_key_count);
     DECLARE_METRICS(cache_gc, candidate_count);
+    DECLARE_METRICS(cache_gc, candidate_dropped_count);
     DECLARE_METRICS(cache_gc, delete_target_count);
     DECLARE_METRICS(cache_gc, delete_result_count);
     DECLARE_METRICS(cache_gc, operation_error_count);
     DECLARE_METRICS(cache_gc, inflight_delete_count);
     DECLARE_METRICS(cache_gc, inflight_delete_age_ms);
     DECLARE_METRICS(cache_gc, round_duration_ms);
+    DECLARE_METRICS(cache_gc, event_report_probe_count);
+    DECLARE_METRICS(cache_gc, event_report_probe_unknown_count);
+    DECLARE_METRICS(cache_gc, event_report_delete_location_count);
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -461,12 +465,16 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, scan_round_count);
     REGISTER_GAUGE_METRIC(cache_gc, scan_key_count);
     REGISTER_GAUGE_METRIC(cache_gc, candidate_count);
+    REGISTER_GAUGE_METRIC(cache_gc, candidate_dropped_count);
     REGISTER_GAUGE_METRIC(cache_gc, delete_target_count);
     REGISTER_GAUGE_METRIC(cache_gc, delete_result_count);
     REGISTER_GAUGE_METRIC(cache_gc, operation_error_count);
     REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_count);
     REGISTER_GAUGE_METRIC(cache_gc, inflight_delete_age_ms);
     REGISTER_GAUGE_METRIC(cache_gc, round_duration_ms);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_unknown_count);
+    REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -915,12 +923,20 @@ void KmonitorMetricsReporter::ReportInterval() {
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");
         report_registry_metric(ctx_->cache_gc_candidate_count_metrics.get(), "cache_gc.candidate_count");
+        report_registry_metric(ctx_->cache_gc_candidate_dropped_count_metrics.get(),
+                               "cache_gc.candidate_dropped_count");
         report_registry_metric(ctx_->cache_gc_delete_target_count_metrics.get(), "cache_gc.delete_target_count");
         report_registry_metric(ctx_->cache_gc_delete_result_count_metrics.get(), "cache_gc.delete_result_count");
         report_registry_metric(ctx_->cache_gc_operation_error_count_metrics.get(), "cache_gc.operation_error_count");
         report_registry_metric(ctx_->cache_gc_inflight_delete_count_metrics.get(), "cache_gc.inflight_delete_count");
         report_registry_metric(ctx_->cache_gc_inflight_delete_age_ms_metrics.get(), "cache_gc.inflight_delete_age_ms");
         report_registry_metric(ctx_->cache_gc_round_duration_ms_metrics.get(), "cache_gc.round_duration_ms");
+        report_registry_metric(ctx_->cache_gc_event_report_probe_count_metrics.get(),
+                               "cache_gc.event_report_probe_count");
+        report_registry_metric(ctx_->cache_gc_event_report_probe_unknown_count_metrics.get(),
+                               "cache_gc.event_report_probe_unknown_count");
+        report_registry_metric(ctx_->cache_gc_event_report_delete_location_count_metrics.get(),
+                               "cache_gc.event_report_delete_location_count");
     } while (false);
 
     do {

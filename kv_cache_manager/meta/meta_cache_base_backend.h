@@ -68,6 +68,15 @@ public:
                                                    const KeyTypeVec &keys,
                                                    const LocationIdsPerKey &location_ids,
                                                    const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    // Conditional no-touch delete used by background metadata maintenance.
+    // EC_OK and EC_NOENT from the persistent layer both authorize the
+    // idempotent cache-side delete; hard failures must be preserved.
+    virtual std::vector<ErrorCode>
+    DeleteLocationsForMaintenance(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 };
 
 } // namespace kv_cache_manager

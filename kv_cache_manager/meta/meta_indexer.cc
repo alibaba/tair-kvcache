@@ -92,8 +92,9 @@ public:
     // spent acquiring all shard mutexes (in microseconds).
     ScopedBatchLock(MetaIndexer &indexer,
                     const std::vector<int32_t> &shard_indexs,
-                    int64_t *out_lock_wait_time_us = nullptr)
-        : indexer_(indexer), shard_indexs_(shard_indexs) {
+                    int64_t *out_lock_wait_time_us = nullptr,
+                    int64_t *out_lock_hold_time_us = nullptr)
+        : indexer_(indexer), shard_indexs_(shard_indexs), out_lock_hold_time_us_(out_lock_hold_time_us) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->lock();
@@ -101,10 +102,14 @@ public:
         if (out_lock_wait_time_us != nullptr) {
             *out_lock_wait_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
         }
+        lock_acquired_at_us_ = TimestampUtil::GetCurrentTimeUs();
     }
     ~ScopedBatchLock() {
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->unlock();
+        }
+        if (out_lock_hold_time_us_ != nullptr) {
+            *out_lock_hold_time_us_ += std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_at_us_);
         }
     }
 
@@ -114,6 +119,8 @@ public:
 private:
     MetaIndexer &indexer_;
     const std::vector<int32_t> &shard_indexs_;
+    int64_t *out_lock_hold_time_us_{nullptr};
+    int64_t lock_acquired_at_us_{0};
 };
 
 MetaIndexer::~MetaIndexer() {
@@ -410,7 +417,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
                                                           const BatchMetaData &delete_batch,
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
-                                                          Result &result) noexcept {
+                                                          Result &result,
+                                                          bool maintenance_no_touch) noexcept {
     if (delete_batch.batch_keys.empty()) {
         return {0, 0};
     }
@@ -421,6 +429,9 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     int32_t reclaimed_count = 0;
     if (delete_batch.batch_location_ids.empty()) {
         delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
+    } else if (maintenance_no_touch) {
+        delete_ecs = backend_manager_->DeleteLocationsForMaintenance(
+            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
     } else {
         delete_ecs = backend_manager_->Delete(
             request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
@@ -614,14 +625,25 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                        modifier,
                                        adjust_reclaimed_key_count,
                                        false,
-                                       refresh_cache_from_persistent);
+                                       refresh_cache_from_persistent,
+                                       false);
+}
+
+MetaIndexer::LocationResult
+MetaIndexer::ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
+                                                    const KeyVector &keys,
+                                                    const LocationIdsPerKey &location_ids,
+                                                    const LocationModifierFunc &modifier,
+                                                    bool adjust_reclaimed_key_count) noexcept {
+    return ReadModifyWriteLocationImpl(
+        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, false, true);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
                                                                         const KeyVector &keys,
                                                                         const LocationIdsPerKey &location_ids,
                                                                         const LocationModifierFunc &modifier) noexcept {
-    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false);
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
@@ -630,7 +652,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      const LocationModifierFunc &modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
-                                                                     bool refresh_cache_from_persistent) noexcept {
+                                                                     bool refresh_cache_from_persistent,
+                                                                     bool maintenance_no_touch) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -673,6 +696,22 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
         const auto &batch_keys = batch.batch_keys;
+        if (maintenance_no_touch && !backend_manager_->Sync(batch_keys)) {
+            // A single async metadata backend may still have an accepted
+            // same-key mutation queued. Reading before that mutation reaches
+            // the persistent view could authorize a stale expected-value
+            // delete which is then queued behind, and removes, the newer
+            // mutation. Drain accepted writes while the shard fence prevents
+            // another same-key mutation from being admitted.
+            PREFIX_INDEXER_LOG(WARN, "maintenance pre-read Sync failed for keys[%lu]", batch_keys.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(),
+                                                                            EC_TIMEOUT);
+                rmw_result.error_codes[global_idx] = EC_TIMEOUT;
+                key_level_failures[global_idx] = true;
+            }
+            continue;
+        }
         LocationsPerKey batch_locations_per_key;
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
@@ -681,8 +720,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
-            refresh_results =
-                backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -692,8 +730,15 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = backend_manager_->GetLocations(
-                ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
+            get_ecs_per_key = maintenance_no_touch
+                                  ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
+                                                                                 batch_keys,
+                                                                                 batch.batch_location_ids,
+                                                                                 batch_locations_per_key)
+                                  : backend_manager_->GetLocations(ephemeral_request_context.get(),
+                                                                   batch_keys,
+                                                                   batch.batch_location_ids,
+                                                                   batch_locations_per_key);
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -880,9 +925,34 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 }
             }
         }
-        const auto [delete_errs, delete_success_count] =
-            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(trace_id,
+                                                                          ephemeral_request_context.get(),
+                                                                          delete_batch,
+                                                                          keys,
+                                                                          stats,
+                                                                          rmw_result,
+                                                                          maintenance_no_touch);
         (void)delete_errs;
+        const bool maintenance_delete_synced = !maintenance_no_touch || delete_batch.batch_keys.empty() ||
+                                               !backend_manager_->RequiresMaintenancePostDeleteSync() ||
+                                               backend_manager_->Sync(delete_batch.batch_keys);
+        if (!maintenance_delete_synced) {
+            // Keep the per-key shard fence until the accepted maintenance
+            // delete reaches its async backend queue barrier. A timeout is an
+            // unknown persistence outcome, so surface a key-level hard result
+            // and let a later GC round reconcile the authoritative metadata
+            // again. Preserve the accepted per-location results and
+            // accounting: ordinary async RMW uses enqueue acceptance as its
+            // accounting boundary, and replacing those results with TIMEOUT
+            // would permanently leak usage when the delete has already been
+            // applied and is therefore absent from the next scan.
+            PREFIX_INDEXER_LOG(WARN,
+                               "maintenance post-delete Sync failed for keys[%lu]",
+                               delete_batch.batch_keys.size());
+            for (const int32_t global_idx : delete_batch.batch_indexs) {
+                key_level_failures[global_idx] = true;
+            }
+        }
         for (const auto &global_index : delete_batch.batch_indexs) {
             if (rmw_result.error_codes[global_index] != EC_OK) {
                 key_level_failures[global_index] = true;
@@ -1280,6 +1350,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     }
     return result;
 }
+
 
 MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {

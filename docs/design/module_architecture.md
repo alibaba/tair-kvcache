@@ -4,7 +4,7 @@
 
 > **维护提示**：当模块的职责、依赖方向或调用关系发生变化，或新增/删除模块时，请同步更新本文档与文末的 Mermaid 图，并同步更新 [AGENTS.md](../../AGENTS.md) 中的缩略图。
 
-相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[后台扫描 GC 设计](cache_garbage_collector.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
+相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[后台扫描 GC 设计](cache_garbage_collector.md)、[EventReport 主动回收纳入后台 GC](event_report_background_gc.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
 
 ---
 
@@ -300,7 +300,7 @@ flowchart LR
 
 ### 4.7 后台 metadata GC
 
-`CacheGarbageCollector` 只在 Leader 上运行，复用公共 `LoopThread`，按 Registry 快照和 backend cursor 串行扫描 authoritative metadata；扫描协调不占用共享的删除 worker。维护扫描不更新在线 LRU/revisit，也不向 local hot cache 回填。V1 识别超过 grace、且不属于活跃 Migration Copy 目标的 `CLS_WRITING`，并对普通 `CLS_SERVING` Location 按 storage 批量调用低成本 `MightExist()`，任一 spec 明确 missing 时选择整个 Location；EventReport 和探测不确定项均跳过。两类候选都通过 `SchedulePlanExecutor::SubmitAsync` 提交扫描时的完整序列化 Location，由 Executor worker 重新读取并以精确值条件 CAS 仲裁并发 Finish、Location 刷新和 Reclaimer。GC 使用固定小窗口管理在途 Future，并以 Instance-aware pending target 覆盖 accepted 到 CAS 的重复窗口；每 tick 最多提交一个请求，窗口满后停止扫描，完整 round 后进入长 cooldown。详细边界见 [后台扫描 GC 设计](cache_garbage_collector.md)。
+`CacheGarbageCollector` 只在 Leader 上运行，复用公共 `LoopThread`，按 Registry 快照和 backend cursor 串行推进统一 maintenance scan；扫描协调不占用共享的删除 worker。dual-backend 模式扫描 no-touch 的内存 hot view，single-backend 模式扫描唯一 backend，因此前者对已淘汰的冷 metadata 只提供 best-effort 收敛。基础 V1 识别超过 grace、且不属于活跃 Migration Copy 目标的 `CLS_WRITING`，并对普通 `CLS_SERVING` Location 按 storage 批量调用低成本 `MightExist()`。EventReport 扩展消费同一个 round/cursor 和 metadata batch，由 `EventReportBackend` 基于 Reporter lifecycle 与 Snapshot generation 返回三态 metadata cleanup 判定，不维护事件 intent 或独立扫描 lane。普通候选通过 `SchedulePlanExecutor::SubmitAsync` 在 worker 中重新读取 authoritative metadata，再执行精确值条件 CAS、物理删除和最终 CAD；EventReport 候选也提交到共享 Executor，由 worker 重新校验 Backend/token/lifecycle lease 后执行 expected-value metadata-only RMW。所有规则共用 Instance 隔离、GC inflight 窗口、target budget 和 pending 去重；本模块不为整个 Executor 增加进程级队列容量限制。详细边界见 [后台扫描 GC 设计](cache_garbage_collector.md) 与 [EventReport 主动回收纳入统一后台 GC](event_report_background_gc.md)。
 
 ### 4.8 HA 故障转移
 

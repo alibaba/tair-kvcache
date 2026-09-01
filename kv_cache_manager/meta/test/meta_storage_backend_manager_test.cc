@@ -288,6 +288,22 @@ public:
     }
 };
 
+class FailOnceWholeKeyDeleteBackend : public MetaDummyBackend {
+public:
+    void FailNextDelete() { fail_next_delete_ = true; }
+
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        if (fail_next_delete_) {
+            fail_next_delete_ = false;
+            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+        }
+        return MetaDummyBackend::Delete(request_context, keys);
+    }
+
+private:
+    bool fail_next_delete_ = false;
+};
+
 struct BackendLifecycleCalls {
     ErrorCode open_result = EC_OK;
     int open_calls = 0;
@@ -973,7 +989,7 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCacheBackfill) {
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersistentFallback) {
     const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_scan";
     std::filesystem::remove(path);
     MetaStorageBackendManager mgr;
@@ -984,6 +1000,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
     auto batch = MakeBatch({777});
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               mgr.persistent_backend_->Put(nullptr, batch.batch_keys, batch.batch_locations, batch.batch_properties));
+    auto cache_batch = MakeBatch({888});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(
+                  nullptr, cache_batch.batch_keys, cache_batch.batch_locations, cache_batch.batch_properties));
 
     std::vector<bool> cache_exists;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
@@ -991,10 +1011,10 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
 
     MaintenanceScanBatch scan_batch;
     ASSERT_EQ(EC_OK, mgr.ScanLocationsForMaintenance(nullptr, SCAN_BASE_CURSOR, 10, scan_batch));
-    ASSERT_EQ((KeyVector{777}), scan_batch.keys);
+    ASSERT_EQ((KeyVector{888}), scan_batch.keys);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), scan_batch.location_results);
-    ASSERT_EQ(1, scan_batch.locations.size());
-    ASSERT_TRUE(scan_batch.locations[0].count("loc_777") > 0);
+    ASSERT_EQ(1u, scan_batch.locations.size());
+    ASSERT_TRUE(scan_batch.locations[0].count("loc_888") > 0);
 
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
@@ -1005,8 +1025,8 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
     ASSERT_EQ(1u, authoritative_locations.size());
     ASSERT_TRUE(authoritative_locations.front().count("loc_777") > 0);
 
-    // An authoritative read remains side-effect free. Maintenance admission
-    // explicitly refreshes only accepted candidate keys before its RMW.
+    // An authoritative read remains side-effect free. Explicit refresh is a
+    // separate online operation; the maintenance RMW does not invoke it.
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{false}), cache_exists);
@@ -1014,6 +1034,244 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentWithoutCa
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{true}), cache_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesPersistentForSingleBackend) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_scan_single";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_single", MakeSingleConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+
+    auto batch = MakeBatch({999});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    MaintenanceScanBatch scan_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanLocationsForMaintenance(nullptr, SCAN_BASE_CURSOR, 10, scan_batch));
+    ASSERT_EQ((KeyVector{999}), scan_batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), scan_batch.location_results);
+    ASSERT_EQ(1u, scan_batch.locations.size());
+    ASSERT_TRUE(scan_batch.locations.front().count("loc_999") > 0);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteMirrorsPersistentAndHotWithoutReceiptState) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_delete";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_delete", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({888});
+    batch.batch_locations[0].emplace("loc_second", MakeLocation("loc_second", "uri_second"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    int32_t reclaimed_count = 0;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.DeleteLocationsForMaintenance(
+                  request_context_.get(), {888}, {{"loc_888"}}, reclaimed_count));
+    EXPECT_EQ(0, reclaimed_count);
+
+    CacheLocationMapVector hot_locations;
+    CacheLocationMapVector persistent_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->GetLocations(nullptr, {888}, hot_locations));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->GetLocations(nullptr, {888}, persistent_locations));
+    ASSERT_EQ(1u, hot_locations.size());
+    ASSERT_EQ(1u, persistent_locations.size());
+    EXPECT_EQ(0u, hot_locations[0].count("loc_888"));
+    EXPECT_EQ(0u, persistent_locations[0].count("loc_888"));
+    EXPECT_EQ(1u, hot_locations[0].count("loc_second"));
+    EXPECT_EQ(1u, persistent_locations[0].count("loc_second"));
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.DeleteLocationsForMaintenance(
+                  request_context_.get(), {888}, {{"loc_second"}}, reclaimed_count));
+    EXPECT_EQ(1, reclaimed_count);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteDefersDuringCachedRecovery) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_recover_guard";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_recover_guard", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({889});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    int32_t reclaimed_count = 0;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OUT_OF_LIMIT}),
+              mgr.DeleteLocationsForMaintenance(
+                  request_context_.get(), {889}, {{"loc_889"}}, reclaimed_count));
+    EXPECT_EQ(0, reclaimed_count);
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    CacheLocationMapVector remaining;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetLocations(nullptr, {889}, remaining));
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(1u, remaining[0].count("loc_889"));
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteConvergesHotCopyAfterPersistentNoent) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_persistent_noent";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_persistent_noent", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto batch = MakeBatch({890});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Delete(nullptr, {890}));
+
+    int32_t reclaimed_count = 0;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.DeleteLocationsForMaintenance(
+                  request_context_.get(), {890}, {{"loc_890"}}, reclaimed_count));
+    EXPECT_EQ(1, reclaimed_count);
+
+    CacheLocationMapVector hot_locations;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}), mgr.cache_backend_->GetLocations(nullptr, {890}, hot_locations));
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceReadRejectsNewerPersistentValueBehindStaleHotCache) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_persistent_newer";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_persistent_newer", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    auto stale = MakeBatch({1000});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), stale));
+    const std::string location_id = "loc_1000";
+
+    CacheLocationMapVector newer_locations(1);
+    PropertyMapVector newer_properties(1);
+    newer_locations[0].emplace(location_id, MakeLocation(location_id, "uri_1000_newer"));
+    newer_properties[0]["p0"] = "p0_1000";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(request_context_.get(), {1000}, newer_locations, newer_properties));
+
+    LocationsPerKey values;
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}),
+              mgr.GetLocationsForMaintenance(nullptr, {1000}, {{location_id}}, values));
+    ASSERT_EQ(1u, values.size());
+    ASSERT_EQ(1u, values.front().size());
+    EXPECT_FALSE(values.front().front());
+
+    LocationsPerKey hot_values;
+    LocationsPerKey persistent_values;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              mgr.cache_backend_->GetLocationsForMaintenance(nullptr, {1000}, {{location_id}}, hot_values));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              mgr.persistent_backend_->GetLocationsForMaintenance(nullptr, {1000}, {{location_id}}, persistent_values));
+    EXPECT_NE(hot_values[0][0]->ToJsonString(), persistent_values[0][0]->ToJsonString());
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteDoesNotReclaimAcrossDivergentLayers) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_divergent_layers";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_divergent", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    BatchMetaData complete;
+    complete.batch_keys = {1001, 1002};
+    complete.batch_indexs = {0, 1};
+    complete.batch_locations.resize(2);
+    complete.batch_properties.resize(2);
+    for (size_t i = 0; i < complete.batch_keys.size(); ++i) {
+        const auto suffix = std::to_string(complete.batch_keys[i]);
+        complete.batch_locations[i].emplace("target_" + suffix,
+                                            MakeLocation("target_" + suffix, "uri_target_" + suffix));
+        complete.batch_locations[i].emplace("other_" + suffix, MakeLocation("other_" + suffix, "uri_other_" + suffix));
+        complete.batch_properties[i]["p0"] = "p0_" + suffix;
+    }
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), complete));
+
+    // key 1001 has a sibling only in hot; key 1002 has a sibling only in persistent.
+    CacheLocationMapVector target_only_locations(1);
+    PropertyMapVector target_only_properties(1);
+    target_only_locations[0].emplace("target_1001", complete.batch_locations[0].at("target_1001"));
+    target_only_properties[0]["p0"] = "p0_1001";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr, {1001}, target_only_locations, target_only_properties));
+    target_only_locations[0].clear();
+    target_only_properties[0].clear();
+    target_only_locations[0].emplace("target_1002", complete.batch_locations[1].at("target_1002"));
+    target_only_properties[0]["p0"] = "p0_1002";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(nullptr, {1002}, target_only_locations, target_only_properties));
+
+    int32_t reclaimed_count = 0;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.DeleteLocationsForMaintenance(
+                  request_context_.get(), {1001, 1002}, {{"target_1001"}, {"target_1002"}}, reclaimed_count));
+    EXPECT_EQ(0, reclaimed_count);
+
+    CacheLocationMapVector persistent_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.persistent_backend_->GetLocations(nullptr, {1001, 1002}, persistent_locations));
+    EXPECT_TRUE(persistent_locations[0].empty());
+    EXPECT_EQ(1u, persistent_locations[1].count("other_1002"));
+    CacheLocationMapVector hot_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.cache_backend_->GetLocations(nullptr, {1001, 1002}, hot_locations));
+    EXPECT_EQ(1u, hot_locations[0].count("other_1001"));
+    EXPECT_TRUE(hot_locations[1].empty());
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceWholeKeyDeleteFailureRemainsRetryable) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_whole_key_retry";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_whole_key_retry", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    ASSERT_EQ(EC_OK, mgr.persistent_backend_->Close());
+    auto failing_backend = std::make_unique<FailOnceWholeKeyDeleteBackend>();
+    ASSERT_EQ(EC_OK, failing_backend->Init("inst_maintenance_whole_key_retry", MakeSingleConfig(path + "_failing")));
+    ASSERT_EQ(EC_OK, failing_backend->Open());
+    auto *failing_backend_ptr = failing_backend.get();
+    mgr.persistent_backend_ = std::move(failing_backend);
+
+    auto batch = MakeBatch({1003});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+    failing_backend_ptr->FailNextDelete();
+
+    int32_t reclaimed_count = 0;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}),
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count));
+    EXPECT_EQ(0, reclaimed_count);
+    CacheLocationMapVector hot_locations;
+    CacheLocationMapVector persistent_locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->GetLocations(nullptr, {1003}, hot_locations));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->GetLocations(nullptr, {1003}, persistent_locations));
+    EXPECT_EQ(1u, hot_locations[0].count("loc_1003"));
+    EXPECT_EQ(1u, persistent_locations[0].count("loc_1003"));
+
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {1003}, {{"loc_1003"}}, reclaimed_count));
+    EXPECT_EQ(1, reclaimed_count);
+    std::vector<bool> exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {1003}, exists));
+    EXPECT_EQ((std::vector<bool>{false}), exists);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Exists(nullptr, {1003}, exists));
+    EXPECT_EQ((std::vector<bool>{false}), exists);
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 

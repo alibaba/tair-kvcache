@@ -341,7 +341,8 @@ public:
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec,
                                    const std::vector<std::vector<std::string>> &expected_location_values = {},
                                    bool adjust_storage_usage = true,
-                                   bool adjust_reclaimed_key_count = true);
+                                   bool adjust_reclaimed_key_count = true,
+                                   bool maintenance_no_touch = false);
     using LocationVisitor =
         std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);

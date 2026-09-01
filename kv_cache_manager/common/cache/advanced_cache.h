@@ -500,6 +500,17 @@ public: // functions
             const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
     }
 
+    // Applies a callback to one existing entry without marking it as a hit or
+    // changing its LRU position. The callback runs while the cache shard is
+    // locked and returns the entry charge delta caused by an in-place update.
+    // Callers must keep the callback bounded and must not call back into this
+    // Cache. Returns false when the key is absent or unsupported.
+    virtual bool ApplyToEntryNoTouch(
+        const std::string_view & /*key*/,
+        const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+        return false;
+    }
+
     // Insert a mapping from key->object only if the key does not already exist.
     // Returns EC_OK on successful insertion, EC_EXIST if the key is already
     // present, or other error codes on failure (e.g. EC_NOSPC).
@@ -775,6 +786,12 @@ public:
             void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
         override {
         target_->ApplyToSingleShard(shard_id, callback);
+    }
+
+    bool ApplyToEntryNoTouch(
+        const std::string_view &key,
+        const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
+        return target_->ApplyToEntryNoTouch(key, callback);
     }
 
     void StartAsyncLookup(AsyncLookupHandle &async_handle) override { target_->StartAsyncLookup(async_handle); }

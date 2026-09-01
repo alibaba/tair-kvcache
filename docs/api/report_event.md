@@ -358,13 +358,13 @@ Snapshot 的完整性规则：
 - `medium` 不能包含 location id 分隔符 `#`；
 - 每个 block 的 specs 必须非空，且 spec name 必须已在
   `RegisterInstance.location_spec_infos` 中注册并且不能重复；
-- `blocks=[]` 表示该 reporter 当前没有任何 cache，会异步清理其全部旧 location。
+- `blocks=[]` 表示该 reporter 当前没有任何 cache；旧 location 会立即从 strict 查询结果隐藏，并由后台 GC 周期回收 metadata。
 
 Snapshot 的更新语义：
 
 - snapshot 中出现的 `block_key + medium` 会原地替换完整 spec 集合；
 - 已存在 block 中被本次省略的 spec 会被替换掉；
-- 整个 snapshot 中被省略的旧 block 由异步 cleanup 最终删除；
+- 整个 snapshot 中被省略的旧 block 由后台 GC 周期 cleanup 最终删除；
 - 成功后返回新的 generation；
 - 失败时不回滚已经完成的部分 metadata 写入，应完整重试。
 
@@ -381,7 +381,7 @@ Snapshot 的更新语义：
 
 - 必须是请求中的唯一事件；
 - 立即把 reporter 标记为不可用并从节点表注销；
-- 查询立即隐藏该 reporter，metadata 异步清理；
+- 查询立即隐藏该 reporter，metadata 由后台 GC 周期清理；
 - 重复 HOST_DOWN 幂等；
 - 同一 KVCM 进程内后续重新使用该 reporter identity 时必须先 REGISTER；KVCM 重启会清空
   进程内 tombstone，下一条合法汇报可以再次懒初始化。
@@ -704,8 +704,8 @@ snapshot 失败、KVCM 重启恢复或 realtime-only reporter 仍使用 soft met
 | registered + available | 所有合法事件按规则执行 | 可见 |
 | heartbeat timeout、仍在 grace | ADD/DELETE/SNAPSHOT 仍可能被接受；HEARTBEAT 可恢复 | 不可见 |
 | grace 内 HEARTBEAT 恢复 | 保留原 generation 和已写 metadata | 重新可见 |
-| 超过 grace 被 unregister | tombstone 后 mutation 返回 `NODE_NOT_REGISTERED` | 不可见，metadata 异步清理 |
-| HOST_DOWN | 立即 unregister，异步清理 | 立即不可见 |
+| 超过 grace 被 unregister | tombstone 后 mutation 返回 `NODE_NOT_REGISTERED` | 不可见，metadata 由后台 GC 周期清理 |
+| HOST_DOWN | 立即 unregister，metadata 由后台 GC 周期清理 | 立即不可见 |
 | tombstone 后重新 REGISTER | 可继续增量；generation 初始为空 | 未清干净的合法历史 metadata 可能重新可见 |
 | KVCM 重启 | 下一条合法事件自动恢复，不要求 REGISTER | 首条事件前隐藏；之后历史 metadata 可能重新可见 |
 
@@ -736,13 +736,19 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 当前或 in-flight spec，清理就保留整个 location，避免误删刚成功的增量。旧 sibling spec
 由后续完整 snapshot 替换或回收。
 
-清理扫描耗时通过
-`event_report.snapshot_cleanup_scan_latency_ms{instance_id,host,type}` 暴露。典型场景下，
-1 个 instance、10 个 reporter、每台 5000 个 block，一次单 reporter snapshot 约产生 5000
-次 metadata replace，并以 1000 key 为批次扫描该 instance 约 5 万个 key。10 台同时完整对账
-约有 5 万次 replace、累计约 50 万次 key 检查；具体 Redis 命令数受 backend batching 影响。
-如果扫描延迟或 cleanup backlog 持续升高，应考虑按 reporter 建反向索引，而不是继续扩大
-全 instance 扫描频率。
+启用 EventReport 后台 GC 扩展后，Snapshot/HOST_DOWN 不再各自触发一次全 Instance 扫描；它们
+只更新 Backend 当前状态，统一 GC 在下一次成功覆盖目标 key 的 shared round 中完成 metadata
+回收。该路径是低优先级 best-effort 收敛，不提供事件级实时 SLA：对 scan view 中持续可见的
+目标，默认 2 小时 round cooldown 下保守量级约为
+`2h + 两段 round 扫描时间 + action 失败后的重新发现`。cached metadata 模式下 GC 只扫描内存 cache，
+不主动加载已淘汰的冷 key，因此这类 persistent-only metadata 不受上述时间上界约束。查询可见性
+不等待 GC，cleanup 延迟或残留只影响 metadata 空间和统计，不会让已判无效的 Reporter/旧
+generation 重新参与 strict 查询。
+
+运维通过 `cache_gc.scan_key_count`、`cache_gc.candidate_count{reason}`、
+`cache_gc.candidate_dropped_count{reason,cause}`、EventReport probe/delete 结果以及共享
+inflight count/age 指标观察扫描成本与积压。若后续形成更短的硬 SLO，应增加独立 cadence 的
+状态驱动扫描源或索引化 Candidate Source，不能恢复“每个事件投递一次全表扫描”。
 
 ## 14. 调用方上线检查清单
 

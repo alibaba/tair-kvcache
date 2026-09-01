@@ -71,6 +71,10 @@ public:
                                   const KeyVector &keys,
                                   const LocationIdsPerKey &location_ids,
                                   int32_t &out_reclaimed_count) noexcept;
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         int32_t &out_reclaimed_count) noexcept;
 
     // ----- Read APIs -----
     std::vector<ErrorCode> Get(RequestContext *request_context,
@@ -99,6 +103,10 @@ public:
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyVector &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
                                                                   const KeyVector &keys,
                                                                   const LocationIdsPerKey &location_ids,
@@ -140,6 +148,8 @@ public:
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
+    // Scan the in-memory cache when dual-backend metadata is configured;
+    // single-backend deployments scan their only persistent backend.
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           int64_t limit,
@@ -153,6 +163,13 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+
+    // A persistent-only backend has no synchronous hot view that can expose an
+    // accepted maintenance delete to the next same-key RMW. Conservatively
+    // retain the trailing barrier there (it is a no-op for synchronous
+    // backends). Cached mode updates the hot view under the shard fence and
+    // preserves persistent write order, so it can unlock without that barrier.
+    bool RequiresMaintenancePostDeleteSync() const noexcept { return cache_backend_ == nullptr; }
 
     // Returns async write stats from persistent backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
@@ -187,7 +204,6 @@ private:
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
                                   const std::vector<ErrorCode> &delete_results) noexcept;
-
     std::string instance_id_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;

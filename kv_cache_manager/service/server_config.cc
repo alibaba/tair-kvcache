@@ -230,6 +230,16 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_gc_max_inflight_delete_requests_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.cache_gc.event_report_cleanup_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_gc_event_report_cleanup_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.cache_gc.event_report_action_batch_size",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_gc_event_report_action_batch_size_ = std::stoull(value);
+         return true;
+     }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -312,12 +322,14 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_pending_bytes_limit_per_group_type_ = 64ULL * 1024 * 1024 * 1024;
     cache_reclaimer_pending_delete_handler_limit_ = 1024;
     cache_reclaimer_pending_bytes_limit_ = 256ULL * 1024 * 1024 * 1024;
-    cache_gc_enabled_ = false;
+    cache_gc_enabled_ = true;
     cache_gc_scan_interval_ms_ = 1000;
-    cache_gc_round_pause_ms_ = 24LL * 60 * 60 * 1000;
+    cache_gc_round_pause_ms_ = 2LL * 60 * 60 * 1000;
     cache_gc_scan_batch_size_ = 256;
     cache_gc_orphan_writing_grace_period_ms_ = 24LL * 60 * 60 * 1000;
     cache_gc_max_inflight_delete_requests_ = 2;
+    cache_gc_event_report_cleanup_enabled_ = true;
+    cache_gc_event_report_action_batch_size_ = 32;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {
@@ -463,18 +475,19 @@ bool ServerConfig::Check() {
     }
 
     if (cache_gc_enabled_ &&
-        (cache_gc_scan_interval_ms_ <= 0 || cache_gc_round_pause_ms_ <= 0 || cache_gc_scan_batch_size_ == 0 ||
+        (cache_gc_scan_interval_ms_ <= 0 || cache_gc_round_pause_ms_ < 0 || cache_gc_scan_batch_size_ == 0 ||
          cache_gc_scan_batch_size_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
          cache_gc_max_inflight_delete_requests_ == 0 ||
          cache_gc_max_inflight_delete_requests_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-         cache_gc_orphan_writing_grace_period_ms_ < kMinCacheGcOrphanWritingGracePeriodMs)) {
+         cache_gc_orphan_writing_grace_period_ms_ < kMinCacheGcOrphanWritingGracePeriodMs ||
+         (cache_gc_event_report_cleanup_enabled_ && cache_gc_event_report_action_batch_size_ == 0))) {
         fprintf(stderr,
-                "Cache GC intervals, batch size and max in-flight requests must be greater than zero, and orphan "
-                "WRITING grace must be at least %ldms\n",
+                "Cache GC scan interval, batch size and max in-flight requests must be greater than zero; round "
+                "pause must be non-negative; orphan WRITING grace must be at least %ldms; EventReport action "
+                "batch size must be greater than zero when enabled\n",
                 kMinCacheGcOrphanWritingGracePeriodMs);
         return false;
     }
-
     return true;
 }
 

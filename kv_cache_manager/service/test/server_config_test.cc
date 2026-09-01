@@ -30,11 +30,12 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(64ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimitPerGroupType());
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
         ASSERT_EQ(256ULL * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimit());
-        ASSERT_FALSE(config.IsCacheGcEnabled());
+        ASSERT_TRUE(config.IsCacheGcEnabled());
         ASSERT_EQ(1000, config.GetCacheGcScanIntervalMs());
-        ASSERT_EQ(86400000, config.GetCacheGcRoundPauseMs());
+        ASSERT_EQ(7200000, config.GetCacheGcRoundPauseMs());
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
+        ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
     }
     // config_file not exist
     {
@@ -240,6 +241,8 @@ TEST_F(ServerConfigTest, TestCacheGcConfig) {
         {"kvcm.cache_gc.scan_batch_size", "7"},
         {"kvcm.cache_gc.orphan_writing_grace_period_ms", "3600000"},
         {"kvcm.cache_gc.max_inflight_delete_requests", "3"},
+        {"kvcm.cache_gc.event_report_cleanup_enabled", "true"},
+        {"kvcm.cache_gc.event_report_action_batch_size", "5"},
     };
     ASSERT_TRUE(config.Parse("", environ));
     ASSERT_TRUE(config.Check());
@@ -249,6 +252,18 @@ TEST_F(ServerConfigTest, TestCacheGcConfig) {
     EXPECT_EQ(7, config.GetCacheGcScanBatchSize());
     EXPECT_EQ(3600000, config.GetCacheGcOrphanWritingGracePeriodMs());
     EXPECT_EQ(3, config.GetCacheGcMaxInflightDeleteRequests());
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+    EXPECT_EQ(5, config.GetCacheGcEventReportActionBatchSize());
+
+    environ["kvcm.cache_gc.round_pause_ms"] = "0";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_TRUE(config.Check());
+
+    environ["kvcm.cache_gc.round_pause_ms"] = "-1";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.round_pause_ms"] = "456";
 
     environ["kvcm.cache_gc.orphan_writing_grace_period_ms"] = "3599999";
     ASSERT_TRUE(config.Parse("", environ));
@@ -268,7 +283,23 @@ TEST_F(ServerConfigTest, TestCacheGcConfig) {
     ASSERT_TRUE(config.Parse("", environ));
     EXPECT_FALSE(config.Check());
 
+    environ["kvcm.cache_gc.max_inflight_delete_requests"] = "3";
+    environ["kvcm.cache_gc.event_report_action_batch_size"] = "0";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_FALSE(config.Check());
+
+    environ["kvcm.cache_gc.event_report_action_batch_size"] = "8";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_TRUE(config.Check());
+
+    environ["kvcm.cache_gc.event_report_action_batch_size"] = "5";
     environ["kvcm.cache_gc.enabled"] = "false";
+    ASSERT_TRUE(config.Parse("", environ));
+    EXPECT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsCacheGcEnabled());
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+
+    environ["kvcm.cache_gc.event_report_cleanup_enabled"] = "false";
     ASSERT_TRUE(config.Parse("", environ));
     EXPECT_TRUE(config.Check());
 }
