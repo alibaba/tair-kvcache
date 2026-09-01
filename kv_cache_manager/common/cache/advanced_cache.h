@@ -52,6 +52,7 @@ public: // types hidden from API client
         std::vector<size_t> shard_offsets;
         std::vector<size_t> cursors;
         std::vector<size_t> ordered_indices;
+        bool lookup_layout_valid = false; // hashes/order/offsets describe the last lookup
     };
 
 public: // types hidden from Cache implementation
