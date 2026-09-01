@@ -76,6 +76,8 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 protected:
+    const std::shared_ptr<MetricsRegistry> &GetMetricsRegistry() const { return metrics_registry_; }
+
     std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEvent(const std::string &instance_id,
                                                                              const std::string &type);
     std::shared_ptr<MetricsCollector> GetTypedMetricsCollectorForReportEventType(const std::string &instance_id,

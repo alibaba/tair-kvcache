@@ -40,7 +40,7 @@ std::string ExtractIpFromPeer(const std::string &peer);
         auto *status = header->mutable_status();                                                                       \
         status->set_code(proto::meta::INSTANCE_NOT_EXIST);                                                             \
         status->set_message("get " #method " metrics collector failed");                                               \
-        RecordServiceFinalResult(metrics_registry_, #method, false);                                                   \
+        RecordServiceFinalResult(GetMetricsRegistry(), #method, false);                                                \
         return return_value;                                                                                           \
     }
 #endif
