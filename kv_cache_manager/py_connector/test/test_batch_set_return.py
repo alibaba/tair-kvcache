@@ -49,8 +49,6 @@ def _build_connector(*, tp_rank=0, tp_world_size=1, kv_factor=2,
     obj.location_spec_size = location_spec_size
     obj.write_timeout_seconds = write_timeout_seconds
     obj.is_mla_model = is_mla_model
-    obj.sdk_get_timeout_ms = 15000
-    obj.sdk_put_timeout_ms = 15000
     obj.backup_pgs = []
     obj.backup_bandwidth = []
     obj._manager_client = MagicMock()

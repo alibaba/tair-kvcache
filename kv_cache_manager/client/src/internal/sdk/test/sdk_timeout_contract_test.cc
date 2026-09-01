@@ -244,9 +244,6 @@ protected:
         }
     };
 
-    // 由毫秒预算构造显式 deadline_ms（绝对 steady_clock 毫秒）。
-    static int64_t DeadlineFromNowMs(int64_t timeout_ms) { return SteadyClockMs() + timeout_ms; }
-
     // 事件轮询等待（替代 sleep 同步；给足余量，绝不依赖"恰好 X ms 后"）。
     static bool WaitFor(const std::atomic<bool> &flag, int timeout_ms) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -284,7 +281,7 @@ TEST_F(SdkTimeoutContractTest, TestRunningTimeoutBoundedReturn) {
     auto buffers = TestBuffers::Make(1, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
@@ -322,7 +319,7 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
     auto buffers = TestBuffers::Make(1, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(50));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
@@ -333,23 +330,6 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
     ASSERT_LT(elapsed_ms, 400);
 
     ASSERT_EQ(ER_OK, blocker.get());
-}
-
-// 3.2 变体：显式传入已过期的 deadline_ms（绝对时间点早于当前时刻）。
-// 任务无论何时被拾起，now >= deadline 恒成立 → 准入检查必然拦截，SDK 从未被调用。
-TEST_F(SdkTimeoutContractTest, TestPreExpiredDeadlineRejectsBeforeIo) {
-    auto ctrl = std::make_shared<FakeSlowSdkControl>();
-    RegisterFakeForTest("nfs_test", ctrl);
-
-    SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 2, 2000, 2000, 0, MakeSingleFileStorageConfigs("nfs_test")));
-
-    auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
-    auto buffers = TestBuffers::Make(1, 1024);
-
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, SteadyClockMs() - 1);
-    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
-    ASSERT_EQ(0, ctrl->get_call_count.load());
 }
 
 // ============================================================================
@@ -376,12 +356,12 @@ TEST_F(SdkTimeoutContractTest, TestHardContractNoBackgroundWriteAfterReturn) {
     }
     auto put_buffers = TestBuffers::Make(kBlockCount, kBlockSize, FakeSlowSdkControl::kTouchByte);
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_OK, sdk_wrapper.Put(uris, put_buffers.buffers, actual_remote_uris, DeadlineFromNowMs(200)));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Put(uris, put_buffers.buffers, actual_remote_uris));
     ASSERT_EQ(kBlockCount, actual_remote_uris->size());
 
     // Get 回读，先验证成功路径数据确实被搬运到 caller buffer。
     auto get_buffers = TestBuffers::Make(kBlockCount, kBlockSize, 0x00);
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, get_buffers.buffers, DeadlineFromNowMs(200)));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, get_buffers.buffers));
     for (size_t i = 0; i < kBlockCount; ++i) {
         ASSERT_TRUE(get_buffers.BlockBytesEqual(i, FakeSlowSdkControl::kTouchByte));
     }
@@ -415,7 +395,7 @@ TEST_F(SdkTimeoutContractTest, TestHardBackendNoWriteAfterTimeoutReturn) {
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024, 0x00);
 
-    ASSERT_EQ(ER_SDK_TIMEOUT, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200)));
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk_wrapper.Get(uris, buffers.buffers));
 
     // 返回后立即覆写哨兵；等待期间 fake 的 sleep（3s）在后台结束。
     constexpr uint8_t kSentinel = 0xA5;
@@ -451,7 +431,7 @@ TEST_F(SdkTimeoutContractTest, TestSoftBackendViolationIsObservable) {
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
 
     // 违约写入在 fake 延迟结束后发生（事件轮询，给足余量）。
@@ -462,26 +442,25 @@ TEST_F(SdkTimeoutContractTest, TestSoftBackendViolationIsObservable) {
 }
 
 // ============================================================================
-// 3.5 deadline 透传
+// 3.5 静态预算注入 → 后端推导
 // ============================================================================
-// fake 在 Get 内观测传入的 deadline_ms：必须有值，且 RemainingMs() 落在 (0, timeout_ms]。
-// W1/W2/W3 的逐 block/逐 key 准入依赖显式参数透传；若 SdkWrapper 忘记把 deadline
-// 传进 SDK，本测试变红。
-TEST_F(SdkTimeoutContractTest, TestDeadlinePropagationIntoSdk) {
+// fake 在 Get 入口从注入预算推导自身 deadline：推导出的预算必须恰好等于
+// client config 配置的 get_timeout_ms。若 SdkWrapper 忘记在 Init 时注入
+// timeout_config，后端将拿不到预算（推导值为默认值），本测试变红。
+TEST_F(SdkTimeoutContractTest, TestBackendDerivesDeadlineFromInjectedBudget) {
     auto ctrl = std::make_shared<FakeSlowSdkControl>();
     RegisterFakeForTest("nfs_test", ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 2000, MakeSingleFileStorageConfigs("nfs_test")));
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 5000, MakeSingleFileStorageConfigs("nfs_test")));
 
     auto uris = std::vector<DataStorageUri>{MakeUri("nfs_test", "nfs/0/0/1", 0, 1024)};
     auto buffers = TestBuffers::Make(1, 1024);
 
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(2000)));
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers));
     ASSERT_EQ(1, ctrl->get_call_count.load());
-    // fake 在池内任务线程中读到了调用方传入的绝对 deadline（未来时刻）。
-    ASSERT_TRUE(ctrl->deadline_set.load());
-    ASSERT_GT(ctrl->observed_deadline_ms.load(), SteadyClockMs());
+    // fake 采纳的预算恰为注入的 5000ms（= client config 的 get_timeout_ms）。
+    ASSERT_EQ(5000, ctrl->derived_get_budget_ms.load());
 }
 
 // ============================================================================
@@ -505,7 +484,7 @@ TEST_F(SdkTimeoutContractTest, TestPerBlockAdmissionStopsMidway) {
     }
     auto buffers = TestBuffers::Make(kBlockCount, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(50));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
 
     // fake 在 ~500ms 处自查过期并停止（事件轮询）。
@@ -548,7 +527,7 @@ TEST_F(SdkTimeoutContractTest, TestMixedBackendsFastCompletesSlowTimesOut) {
     };
     auto buffers = TestBuffers::Make(2, 1024, 0x00);
 
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(200));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     // 快后端已完成：被调用 1 次，其 caller buffer 已被写满 kTouchByte（结果完整可用，
     // 不因慢后端超时而受影响）。
@@ -575,6 +554,9 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathWaitsForInFlightPeer) {
     auto slow_ctrl = std::make_shared<FakeSlowSdkControl>();
     err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR)); // 快速失败
     slow_ctrl->get_delay_ms.store(400);                            // 在飞 peer：睡 400ms
+    // 确定性编排：err 等 slow 真正发起后才报错（否则满载机器上 pickup 竞态会让
+    // stop 先拦下 slow，"等待在飞 peer"的断言对象根本不存在）。
+    err_ctrl->gate_on_peer_calls = &slow_ctrl->get_call_count;
 
     RegisterFakeForTest(kErrHost, err_ctrl);
     RegisterFakeForTest(kSlowHost, slow_ctrl);
@@ -590,7 +572,7 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathWaitsForInFlightPeer) {
     auto buffers = TestBuffers::Make(2, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(3000));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
@@ -613,13 +595,17 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathDrainIsBoundedByDeadline) {
     auto err_ctrl = std::make_shared<FakeSlowSdkControl>();
     auto slow_ctrl = std::make_shared<FakeSlowSdkControl>();
     err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR));
-    slow_ctrl->get_delay_ms.store(3000); // 远超 deadline 的 150ms
+    slow_ctrl->get_delay_ms.store(3000); // 远超 1000ms 的 wrapper 预算
+    err_ctrl->gate_on_peer_calls = &slow_ctrl->get_call_count; // slow 已发起后 err 才报错
 
     RegisterFakeForTest(kErrHost, err_ctrl);
     RegisterFakeForTest(kSlowHost, slow_ctrl);
 
     SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 5000, MakeDualFileStorageConfigs(kErrHost, kSlowHost)));
+    // get_timeout_ms=1000：wrapper deadline = 入口 + 1000ms；err 在 slow 发起后
+    // 立即失败，drain 最多等到 1000ms（1000 的取值兼顾满载机器的 pickup 延迟，
+    // 有界性由"远小于 slow 的 3s"证明）。
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 1000, 1000, MakeDualFileStorageConfigs(kErrHost, kSlowHost)));
 
     std::vector<DataStorageUri> uris = {
         MakeUri(kErrHost, "e/0/0/1", 0, 1024),
@@ -628,13 +614,12 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathDrainIsBoundedByDeadline) {
     auto buffers = TestBuffers::Make(2, 1024);
 
     auto start = std::chrono::steady_clock::now();
-    // 显式 deadline = 150ms；err group 在此之前就会失败，drain 最多等到 150ms。
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(150));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
-    // 返回不得晚于 deadline（150ms）+ 合理调度余量；绝不等待 slow peer 的 3s。
-    ASSERT_LT(elapsed_ms, 1000);
+    // 返回不得晚于 deadline（1000ms）+ 合理调度余量；绝不等待 slow peer 的 3s。
+    ASSERT_LT(elapsed_ms, 2500);
     ASSERT_NE(ER_OK, ec);
     // 收尾：等 slow fake 自行结束，避免线程池析构时任务仍在跑。
     ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 5000));
@@ -677,7 +662,7 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathStopsQueuedTasks) {
     auto buffers = TestBuffers::Make(3, 1024);
 
     // deadline 给足：走普通错误路径（err 是第一个 future，其错误码直接透传）。
-    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(10000));
+    ClientErrorCode ec = sdk_wrapper.Get(uris, buffers.buffers);
     ASSERT_EQ(ER_SDKREAD_ERROR, ec);
     // 核心断言：排在错误之后的 tail group 从未发起 I/O（stop 拦截，而非靠时间准入——
     // 此刻距离 deadline 还有 ~9s，时间准入不会拦）。
@@ -688,88 +673,4 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathStopsQueuedTasks) {
     ASSERT_TRUE(gap_ctrl->get_call_count.load() == 0 || gap_ctrl->get_done.load());
 
     ASSERT_EQ(ER_OK, blocker.get());
-}
-
-// ============================================================================
-// 3.8 SDK 收到的 deadline = min(内部预算, caller deadline)
-// ============================================================================
-// P2 回归：wrapper 必须把 min 后的 effective deadline 下发进 SDK，而不是原始 caller
-// 值。否则 caller deadline 晚于内部预算时，wrapper 已按内部预算超时返回，后台任务
-// 却拿着更晚的 caller deadline 继续写 caller buffer —— 等待上限与准入依据脱钩。
-TEST_F(SdkTimeoutContractTest, TestSdkReceivesMinOfInternalAndCallerDeadline) {
-    auto ctrl = std::make_shared<FakeSlowSdkControl>();
-    RegisterFakeForTest("min_host", ctrl);
-
-    // 内部 get_timeout_ms=300；caller 给 100000ms → SDK 必须观测到 ≈ now+300。
-    SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 300, MakeSingleFileStorageConfigs("min_host")));
-
-    auto uris = std::vector<DataStorageUri>{MakeUri("min_host", "m/0/0/1", 0, 1024)};
-    auto buffers = TestBuffers::Make(1, 1024);
-
-    const int64_t before_ms = SteadyClockMs();
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, DeadlineFromNowMs(100000)));
-    const int64_t after_ms = SteadyClockMs();
-
-    ASSERT_EQ(1, ctrl->get_call_count.load());
-    ASSERT_TRUE(ctrl->deadline_set.load());
-    const int64_t observed = ctrl->observed_deadline_ms.load();
-    // 恰为内部预算：effective 在 Get 内部计算（晚于 before、早于 after）；
-    // 绝不能是 caller 的 100000ms（那意味着等待上限与准入依据脱钩）。
-    ASSERT_GE(observed, before_ms + 300);
-    ASSERT_LE(observed, after_ms + 300);
-}
-
-// caller 传 0（未指定）时，SDK 收到内部预算作为真实 deadline，而不是 0：
-// SDK 层的逐 block / 逐 key 准入同样受静态预算保护（transfer_client.h 注释的语义：
-// "退回 client 配置的静态超时预算"）。修复前 SDK 收到 0，DeadlineExpired 恒为
-// false，准入检查在 deadline_ms=0 的调用下完全失效。
-TEST_F(SdkTimeoutContractTest, TestZeroCallerDeadlineStillPassesInternalBudget) {
-    auto ctrl = std::make_shared<FakeSlowSdkControl>();
-    RegisterFakeForTest("zero_host", ctrl);
-
-    SdkWrapper sdk_wrapper;
-    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 5000, MakeSingleFileStorageConfigs("zero_host")));
-
-    auto uris = std::vector<DataStorageUri>{MakeUri("zero_host", "z/0/0/1", 0, 1024)};
-    auto buffers = TestBuffers::Make(1, 1024);
-
-    const int64_t before_ms = SteadyClockMs();
-    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, buffers.buffers, /*deadline_ms=*/0));
-    const int64_t after_ms = SteadyClockMs();
-
-    // deadline_set 为 true 说明 SDK 拿到的是非 0 的真实 deadline（准入有依据）。
-    ASSERT_TRUE(ctrl->deadline_set.load());
-    const int64_t observed = ctrl->observed_deadline_ms.load();
-    // 且恰为内部预算 ≈ now+5000（在 Get 内部计算，介于 before 与 after 之间）。
-    ASSERT_GE(observed, before_ms + 5000);
-    ASSERT_LE(observed, after_ms + 5000);
-}
-
-// ============================================================================
-// 跨语言时钟同源
-// ============================================================================
-// connector 用 Python 算 deadline_ms，SDK 用 C++ SteadyClockMs() 比较；两者必须
-// 读同一个内核时钟（CLOCK_MONOTONIC），否则 deadline 全线失效。此处直接取
-// common/utils.py 的 deadline_ms_from_now(0) 与 C++ 读数比对。
-TEST_F(SdkTimeoutContractTest, TestPythonAndCppShareSteadyClock) {
-    const char *kScript = "python3 -c \"import time;print(time.monotonic_ns()//1_000_000)\" 2>/dev/null";
-    const int64_t before_ms = SteadyClockMs();
-    FILE *pipe = popen(kScript, "r");
-    if (pipe == nullptr) {
-        GTEST_SKIP() << "python3 unavailable";
-    }
-    char buf[64] = {0};
-    const bool got = fgets(buf, sizeof(buf), pipe) != nullptr;
-    const int rc = pclose(pipe);
-    if (!got || rc != 0) {
-        GTEST_SKIP() << "python3 unavailable";
-    }
-    const int64_t py_ms = std::strtoll(buf, nullptr, 10);
-    const int64_t after_ms = SteadyClockMs();
-
-    // Python 读数必须落在 C++ 前后两次读数之间（允许进程启动开销带来的上界放宽）。
-    ASSERT_GT(py_ms, 0);
-    EXPECT_GE(py_ms, before_ms) << "python monotonic clock is behind C++ steady_clock";
-    EXPECT_LE(py_ms, after_ms) << "python monotonic clock is ahead of C++ steady_clock";
 }

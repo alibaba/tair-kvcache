@@ -125,12 +125,13 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
 SdkType MooncakeSdk::Type() { return SdkType::MOONCAKE; }
 
 ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
-                                 const BlockBuffers &local_buffer,
-                                 int64_t deadline_ms) {
+                                 const BlockBuffers &local_buffer) {
     if (remote_uris.size() != local_buffer.size()) {
         KVCM_LOG_ERROR("mooncake get failed, remote_uris size not equal to local_buffer size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + sdk_backend_config_->timeout_config().get_timeout_ms();
     // 本 SDK 调用内的墙钟起点：超时归因日志的 elapsed_ms 用（不含线程池排队时间，
     // 那是 wrapper 层日志的职责）。
     const auto call_start = std::chrono::steady_clock::now();
@@ -202,14 +203,15 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
 
 ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                  const BlockBuffers &local_buffers,
-                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                                 int64_t deadline_ms) {
+                                 std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
     actual_remote_uris->clear();
     std::vector<Slice_t> slices;
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_WARN("mooncake put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + sdk_backend_config_->timeout_config().put_timeout_ms();
     // 本 SDK 调用内的墙钟起点：超时归因日志的 elapsed_ms 用（不含线程池排队时间）。
     const auto call_start = std::chrono::steady_clock::now();
     // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值

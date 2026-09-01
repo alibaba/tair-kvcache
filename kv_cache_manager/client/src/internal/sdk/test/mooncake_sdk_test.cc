@@ -110,8 +110,8 @@ TEST_F(MooncakeSdkTest, TestPutGetWithCpu) {
     BlockBuffers invalid_local_buffers = {invalid_buf};
 
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Put(remote_uris, invalid_local_buffers, actual_remote_uris, /*deadline_ms=*/0));
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Put(remote_uris, invalid_local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     free(put_buffer);
 
     // get
@@ -121,8 +121,8 @@ TEST_F(MooncakeSdkTest, TestPutGetWithCpu) {
         iov.base = static_cast<char *>(get_buffer) + offset;
         offset += iov.size;
     }
-    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Get(remote_uris, invalid_local_buffers, /*deadline_ms=*/0));
-    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Get(remote_uris, invalid_local_buffers));
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers));
     auto &iov1_res = local_buffers[0].iovs[0];
     ASSERT_EQ(std::memcmp(iov1_res.base, test_data, iov1_res.size), 0);
     auto &iov2_res = local_buffers[0].iovs[1];
@@ -169,7 +169,7 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
     const std::vector<DataStorageUri> &remote_uris = {uri1, uri2};
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
 
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     ASSERT_EQ(actual_remote_uris->size(), 2);
     // 同序契约：actual_remote_uris[i] 与 remote_uris[i] 逐位置对应
     // （Alloc 为恒等赋值，天然满足；断言防止将来改为逐项回填时破坏保序）。
@@ -186,7 +186,7 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
     local_buffers[0].iovs[0].base = get_buffer_1;
     local_buffers[1].iovs[0].base = get_buffer_2;
 
-    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, local_buffers, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, local_buffers));
     auto &iov1_res = local_buffers[0].iovs[0];
     ASSERT_EQ(std::memcmp(iov1_res.base, test_data_1, iov1_res.size), 0);
     auto &iov2_res = local_buffers[1].iovs[0];
@@ -245,8 +245,8 @@ TEST_F(MooncakeSdkTest, TestPutGetWithGpu) {
 
     // put
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Put(remote_uris, invalid_local_buffers, actual_remote_uris, /*deadline_ms=*/0));
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Put(remote_uris, invalid_local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
 
     free(host_put_buffer);
     cudaFree(gpu_put_buffer);
@@ -261,8 +261,8 @@ TEST_F(MooncakeSdkTest, TestPutGetWithGpu) {
         offset += iov.size;
     }
 
-    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Get(remote_uris, invalid_local_buffers, /*deadline_ms=*/0));
-    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_INVALID_PARAMS, sdk.Get(remote_uris, invalid_local_buffers));
+    ASSERT_EQ(ER_OK, sdk.Get(remote_uris, local_buffers));
     void *host_get_buffer = malloc(len1 + len2);
     ASSERT_EQ(cudaMemcpy(host_get_buffer, gpu_get_buffer, len1 + len2, cudaMemcpyDeviceToHost), cudaSuccess);
 
@@ -329,7 +329,7 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithGpu) {
 
     // put
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     ASSERT_EQ(actual_remote_uris->size(), 2);
     // 同序契约：与 CPU 用例同理，逐位置对应。
     ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
@@ -347,7 +347,7 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithGpu) {
     local_buffers[0].iovs[0].base = static_cast<char *>(gpu_get_buffer_1);
     local_buffers[1].iovs[0].base = static_cast<char *>(gpu_get_buffer_2);
 
-    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, local_buffers, /*deadline_ms=*/0));
+    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, local_buffers));
 
     void *host_get_buffer_1 = malloc(len1);
     void *host_get_buffer_2 = malloc(len2);
@@ -392,9 +392,14 @@ TEST_F(MooncakeSdkTest, TestGetSkipsIoWhenDeadlineExpired) {
     iov.ignore = false;
     local_buffers[0].iovs.push_back(iov);
 
-    // 已过期的 deadline：任何一次 I/O 都不允许发起。
+    // 预算已耗尽（负预算 = entry 即过期，测试专用构造）：任何一次 I/O 都不允许发起。
     // 检查先于 mooncake_client_get，返回超时而不是 crash / ER_SDKREAD_ERROR。
-    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, local_buffers, SteadyClockMs() - 1'000));
+    auto expired_cfg = std::make_shared<MooncakeSdkConfig>(*sdk_backend_config_);
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(-1'000);
+    expired_cfg->set_timeout_config(timeout);
+    sdk.sdk_backend_config_ = expired_cfg;
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, local_buffers));
 }
 
 TEST_F(MooncakeSdkTest, TestPutSkipsIoWhenDeadlineExpired) {
@@ -415,9 +420,14 @@ TEST_F(MooncakeSdkTest, TestPutSkipsIoWhenDeadlineExpired) {
     local_buffers[0].iovs.push_back(iov);
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
 
-    // 已过期的 deadline：任何一次 I/O 都不允许发起。
+    // 预算已耗尽（负预算 = entry 即过期，测试专用构造）：任何一次 I/O 都不允许发起。
     // 检查先于 mooncake_client_put，返回超时而不是 crash / ER_SDKWRITE_ERROR。
-    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, local_buffers, actual_remote_uris, SteadyClockMs() - 1'000));
+    auto expired_cfg = std::make_shared<MooncakeSdkConfig>(*sdk_backend_config_);
+    SdkTimeoutConfig timeout;
+    timeout.set_put_timeout_ms(-1'000);
+    expired_cfg->set_timeout_config(timeout);
+    sdk.sdk_backend_config_ = expired_cfg;
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
 }
 
 TEST_F(MooncakeSdkTest, TestPutActualUrisSameOrder) {

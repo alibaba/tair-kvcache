@@ -259,6 +259,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
+    timeout_config_ = sdk_backend_config->timeout_config();
 #if defined(USING_CUDA)
     CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking),
                             ER_CUDA_STREAM_CREATE_ERROR,
@@ -297,12 +298,13 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 SdkType LocalFileSdk::Type() { return SdkType::LOCAL_FILE; }
 
 ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris,
-                                  const BlockBuffers &local_buffers,
-                                  int64_t deadline_ms) {
+                                  const BlockBuffers &local_buffers) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
     auto group_map = SplitByPath(remote_uris, local_buffers);
     size_t done_blocks = 0;
     for (const auto &group : group_map) {
@@ -329,12 +331,13 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
 
 ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                   const BlockBuffers &local_buffers,
-                                  std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                                  int64_t deadline_ms) {
+                                  std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
     // 保序契约：actual_remote_uris[i] 必须对应 remote_uris[i]。
     // 先按总大小 resize，再按 BlockGroup::indices 回填原位；禁止 clear() 后 append
     // （那会依赖 unordered_map 的迭代序，交错多 path 输入必然错位）。

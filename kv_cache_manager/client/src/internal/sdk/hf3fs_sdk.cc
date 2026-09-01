@@ -38,6 +38,7 @@ ClientErrorCode Hf3fsSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_back
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
     config_ = hf3fs_config;
+    timeout_config_ = sdk_backend_config->timeout_config();
 
     auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
     if (!gpu_util->Init()) {
@@ -65,13 +66,14 @@ ClientErrorCode Hf3fsSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_back
     return ER_OK;
 }
 
-ClientErrorCode
-Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms) {
+ClientErrorCode Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_WARN(
             "get failed, size mismatch, uris size: %lu, buffers size: %lu", remote_uris.size(), local_buffers.size());
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
 
     // 逐 block 准入检查：deadline 已过期则不再为后续 block
     // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline（0）时 DeadlineExpired() 恒为 false。
@@ -123,13 +125,14 @@ ClientErrorCode Hf3fsSdk::Get(const DataStorageUri &uri, const BlockBuffer &bloc
 
 ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                               const BlockBuffers &local_buffers,
-                              std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                              int64_t deadline_ms) {
+                              std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_WARN(
             "put failed, size mismatch, uris size: %lu, buffers size: %lu", remote_uris.size(), local_buffers.size());
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
 
     if (Alloc(remote_uris, *actual_remote_uris) != ER_OK) {
         return ER_SDKALLOC_ERROR;

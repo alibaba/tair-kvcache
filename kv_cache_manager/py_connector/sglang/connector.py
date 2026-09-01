@@ -7,7 +7,6 @@ import time
 import json
 
 import torch
-from kv_cache_manager.py_connector.common.utils import deadline_ms_from_now
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -335,9 +334,8 @@ class HiCacheKVCM(HiCacheStorage):
         buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
         assert len(uris) == len(buffers)
         # Perform data transfer
-        get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
         start_time = time.perf_counter()
-        result = self.transfer_client.LoadKvCaches(uris, buffers, deadline_ms=get_deadline_ms)
+        result = self.transfer_client.LoadKvCaches(uris, buffers)
         end_time = time.perf_counter()
         self.prefetch_pgs.append(matched)
         self.prefetch_bandwidth.append(matched * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -411,10 +409,8 @@ class HiCacheKVCM(HiCacheStorage):
                 )
                 assert len(uris) == len(buffers)
 
-                # 读路径：deadline = now + sdk_get_timeout_ms
-                get_deadline_ms = deadline_ms_from_now(self.sdk_get_timeout_ms)
                 start_time = time.perf_counter()
-                load_result = self.transfer_client.LoadKvCaches(uris, buffers, deadline_ms=get_deadline_ms)
+                load_result = self.transfer_client.LoadKvCaches(uris, buffers)
                 end_time = time.perf_counter()
                 flag = (load_result == kvcm_py_client.ClientErrorCode.ER_OK)
                 if flag:
@@ -483,9 +479,7 @@ class HiCacheKVCM(HiCacheStorage):
 
             if self.tp_world_size > 1 and not self.is_mla_model:
                 torch.distributed.broadcast_object_list(
-                    [result, len_prefix, len_new, local_hash],
-                    src=0,
-                    group=self.storage_tp_group,
+                    [result, len_prefix, len_new, local_hash], src=0, group=self.storage_tp_group
                 )
         elif self.is_mla_model:
             logger.warning(f"_batch_set called on non-rank-0 (tp_rank={self.tp_rank}) "
@@ -601,9 +595,8 @@ class HiCacheKVCM(HiCacheStorage):
                     assert len(uris) == len(buffers)
 
                     # Perform data transfer
-                    deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
                     start_time = time.perf_counter()
-                    result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms=deadline_ms)
+                    result = self.transfer_client.SaveKvCaches(uris, buffers)
                     end_time = time.perf_counter()
                     self.backup_pgs.append(num_valid)
                     self.backup_bandwidth.append(num_valid * self.location_spec_size / (1 << 30) / (end_time - start_time))
@@ -797,11 +790,8 @@ class HiCacheKVCM(HiCacheStorage):
                         ptr_list, size_list, components
                     )
                     assert len(uris) == len(buffers)
-                    # DDL_自律 = T_submit + sdk_put_timeout_ms，与 rank0 广播下发的
-                    # DDL_租约取 min（见 _batch_set 注释）。
-                    deadline_ms = deadline_ms_from_now(self.sdk_put_timeout_ms)
                     start_time = time.perf_counter()
-                    save_result = self.transfer_client.SaveKvCaches(uris, buffers, deadline_ms=deadline_ms)
+                    save_result = self.transfer_client.SaveKvCaches(uris, buffers)
                     end_time = time.perf_counter()
                     flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
                     if flag:

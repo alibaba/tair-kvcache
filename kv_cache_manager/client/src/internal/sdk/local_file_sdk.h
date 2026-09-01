@@ -15,12 +15,10 @@ public:
                          const std::shared_ptr<StorageConfig> &storage_config) override;
     SdkType Type() override;
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
-                        const BlockBuffers &local_buffers,
-                        int64_t deadline_ms) override;
+                        const BlockBuffers &local_buffers) override;
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                        int64_t deadline_ms) override;
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
 
 private:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
@@ -32,6 +30,7 @@ private:
 
 private:
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
+    SdkTimeoutConfig timeout_config_; // Init 时由 wrapper 注入的静态超时预算
 #if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;
 #elif defined(USING_MUSA)

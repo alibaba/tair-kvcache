@@ -18,12 +18,10 @@ public:
     ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                          const std::shared_ptr<StorageConfig> &storage_config) override;
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
-                        const BlockBuffers &local_buffers,
-                        int64_t deadline_ms) override;
+                        const BlockBuffers &local_buffers) override;
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                        int64_t deadline_ms) override;
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
 
 protected:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
@@ -49,6 +47,7 @@ private:
 private:
     int64_t byte_size_per_block_;
     std::shared_ptr<Hf3fsSdkConfig> config_;
+    SdkTimeoutConfig timeout_config_; // Init 时由 wrapper 注入的静态超时预算
     std::shared_ptr<Hf3fsUsrbioApi> usrbio_api_;
     Hf3fsIovHandle read_iov_handle_;
     Hf3fsIovHandle write_iov_handle_;

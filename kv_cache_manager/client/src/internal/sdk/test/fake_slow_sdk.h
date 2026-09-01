@@ -8,8 +8,8 @@
 //  - write_after_return                    ：模拟"返回后仍写 caller buffer"的违约
 //                                            （soft 级，如 mooncake）后端
 //  - get_call_count() / put_call_count()   ：断言超时任务从未发起 I/O（准入检查核心验证）
-//  - deadline_set / observed_deadline_ms   ：Get 入口对传入 deadline_ms 的观测
-//                                            （验证 deadline 透传）
+//  - derived_get_budget_ms                 ：Get 从注入预算推导的 deadline 与自身
+//                                            起点的差值（验证静态预算注入→推导）
 //  - touch_buffer_on_get                   ：正常路径写 kTouchByte，验证成功时数据确实被搬运
 // 稳定性约定：所有跨线程控制字段都是 std::atomic（池内工作线程与测试线程共享）；
 // 完成事件用 get_done / write_done / blocks_touched 暴露，测试用轮询替代 sleep 同步，
@@ -40,9 +40,14 @@ struct FakeSlowSdkControl {
     std::atomic<bool> touch_buffer_on_get{false}; // 正常路径：Get 返回前写 kTouchByte
     std::atomic<int> get_result{static_cast<int>(ER_OK)};
 
-    // Get 入口对传入 deadline_ms 的观测（3.5 deadline 透传验证）。
-    std::atomic<bool> deadline_set{false};
-    std::atomic<int64_t> observed_deadline_ms{0};
+    // Get 入口对静态预算的推导观测：deadline（= 自身起点 + 注入预算）与自身起点
+    // 的差值，即后端实际采纳的预算（3.5 静态预算注入→推导验证）。
+    std::atomic<int64_t> derived_get_budget_ms{0};
+
+    // 确定性门控：非空时 Get 在返回结果前等待 *gate_on_peer_calls >= 1（最多 5s）。
+    // 用于"错误发生时 peer 已在飞"的编排，消除线程池 pickup 时序竞态（满载机器上
+    // pickup 可晚于错误返回，导致 peer 被 stop 拦下、测试断言失效）。
+    std::atomic<int> *gate_on_peer_calls{nullptr};
 
     // 事件（原子标志，测试轮询等待；替代"睡 X ms 后断言"的紧耦合时序）。
     std::atomic<bool> get_done{false};     // Get 完全结束（含延迟与违约写入）
@@ -59,16 +64,21 @@ class FakeSlowSdk : public SdkInterface {
 public:
     explicit FakeSlowSdk(std::shared_ptr<FakeSlowSdkControl> ctrl) : ctrl_(std::move(ctrl)) {}
 
-    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &, const std::shared_ptr<StorageConfig> &) override {
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                         const std::shared_ptr<StorageConfig> &) override {
+        if (sdk_backend_config) {
+            timeout_config_ = sdk_backend_config->timeout_config();
+        }
         return ER_OK;
     }
     SdkType Type() override { return SdkType::LOCAL_FILE; }
 
-    ClientErrorCode
-    Get(const std::vector<DataStorageUri> &, const BlockBuffers &local_buffers, int64_t deadline_ms) override {
+    ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &local_buffers) override {
         ctrl_->get_call_count.fetch_add(1);
-        ctrl_->deadline_set.store(deadline_ms > 0);
-        ctrl_->observed_deadline_ms.store(deadline_ms);
+        // 与生产后端一致：从注入预算推导自身 deadline（任务起点起算）。
+        const int64_t start_ms = SteadyClockMs();
+        const int64_t deadline_ms = start_ms + timeout_config_.get_timeout_ms();
+        ctrl_->derived_get_budget_ms.store(deadline_ms - start_ms);
         ctrl_->get_done.store(false);
         ctrl_->write_done.store(false);
         ctrl_->blocks_touched.store(0);
@@ -99,6 +109,13 @@ public:
             return static_cast<ClientErrorCode>(ctrl_->get_result.load());
         }
 
+        // 门控：等待 peer 发起（错误路径测试的确定性编排）。
+        if (ctrl_->gate_on_peer_calls != nullptr) {
+            for (int i = 0; i < 500 && ctrl_->gate_on_peer_calls->load() == 0; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+
         // 正常路径：同步搬运（模拟 hard 后端的同步 I/O —— 返回前数据已交付）。
         if (ctrl_->touch_buffer_on_get.load()) {
             for (size_t i = 0; i < buffers->size(); ++i) {
@@ -125,8 +142,7 @@ public:
 
     ClientErrorCode Put(const std::vector<DataStorageUri> &,
                         const BlockBuffers &,
-                        std::shared_ptr<std::vector<DataStorageUri>>,
-                        int64_t deadline_ms) override {
+                        std::shared_ptr<std::vector<DataStorageUri>>) override {
         ctrl_->put_call_count.fetch_add(1);
         return ER_OK;
     }
@@ -147,6 +163,7 @@ private:
     }
 
     std::shared_ptr<FakeSlowSdkControl> ctrl_;
+    SdkTimeoutConfig timeout_config_; // Init 时由 wrapper 注入的静态超时预算
 };
 
 } // namespace kv_cache_manager

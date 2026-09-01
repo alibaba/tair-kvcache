@@ -102,7 +102,6 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
 
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {
     CHECK_CLIENT(transfer_client_);
-    // 本层不暴露 deadline：沿用 client 配置的静态超时预算。
     return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers);
 }
 

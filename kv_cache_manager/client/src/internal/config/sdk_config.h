@@ -59,11 +59,18 @@ public:
         spec_byte_sizes_per_block_ = value;
     }
 
+    // SdkWrapper 在 Init 阶段（CreateSdk 之前）注入自身配置的静态超时预算。
+    // 后端用它自律：Get/Put 从自身任务起点起算 deadline，预算内完成或内部取消。
+    // 运行时注入字段，不参与 JSON 序列化；不读取它的后端行为不受影响。
+    const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
+    void set_timeout_config(const SdkTimeoutConfig &value) { timeout_config_ = value; }
+
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
+    SdkTimeoutConfig timeout_config_;
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {

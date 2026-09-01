@@ -24,7 +24,6 @@ from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSer
     CoordinateMessage, SendBlockFinishedEvent, LoadBlockFinishedEvent
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.types import KVCacheInfo
-from kv_cache_manager.py_connector.common.utils import deadline_ms_from_now
 from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
 from kv_cache_manager.py_connector.kernel.gather_scatter_helper import CopyBufferAllocator
 
@@ -122,7 +121,7 @@ class DataTransferManager:
 
     def load_task(self, multi_result: MultiResult, task_idx, remote_uris, block_token_indices):
         """加载任务
-
+        
         Args:
             multi_result: 多任务结果管理器
             task_idx: 任务索引
@@ -133,8 +132,6 @@ class DataTransferManager:
 
         copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
         copy_buffers = self._copy_buffer_allocator.get_buffer_by_idx(copy_buffer_indices)
-        # buffer 到手后才起算：本函数是 buffer 的所有者，deadline 之后可安全重用它们。
-        deadline_ms = deadline_ms_from_now(self._extra_config.sdk_get_timeout_ms)
 
         buffers = []
         for copy_buffer in copy_buffers:
@@ -149,7 +146,7 @@ class DataTransferManager:
             buffer.iovs = iovs
             buffers.append(buffer)
         logger.debug("start transfer")
-        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers, deadline_ms=deadline_ms)
+        transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
             with self._device_mod.stream(self._load_stream):
@@ -205,7 +202,7 @@ class DataTransferManager:
         return generate_message
 
     def save_task(self, multi_result: MultiResult, task_idx, remote_uris, block_token_indices,
-                  kvcache_ready_event, deadline_ms):
+                  kvcache_ready_event):
         """保存任务
         
         Args:
@@ -214,7 +211,6 @@ class DataTransferManager:
             remote_uris: 远程URI列表
             block_token_indices: 块令牌索引列表
             kvcache_ready_event: KV缓存就绪事件
-            deadline_ms: 绝对 deadline（steady_clock 毫秒，0=无 deadline）
         """
         logger.debug("save remote_uris:%s, block_token_indices:%s", remote_uris, block_token_indices)
 
@@ -251,7 +247,7 @@ class DataTransferManager:
             buffers.append(buffer)
         logger.debug("start transfer")
 
-        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers, deadline_ms=deadline_ms)
+        transfer_result = self._transfer_client.SaveKvCaches(remote_uris, buffers)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result[0] != kvcm_py_client.ClientErrorCode.ER_OK:
             logger.warning("save task failed, remote_uris:%s, block_token_indices:%s, transfer_result:%s", remote_uris,

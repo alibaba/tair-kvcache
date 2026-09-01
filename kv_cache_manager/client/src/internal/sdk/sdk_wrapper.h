@@ -27,12 +27,10 @@ public:
                          const InitParams &init_params,
                          const SharedMemoryRegistration *shared_memory_registration = nullptr);
 
-    ClientErrorCode
-    Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms);
+    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
-                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
-                        int64_t deadline_ms);
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris);
 
 private:
     enum class OpType : uint8_t {

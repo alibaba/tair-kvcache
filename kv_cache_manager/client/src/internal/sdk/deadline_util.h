@@ -5,7 +5,9 @@
 
 namespace kv_cache_manager {
 
-// deadline_ms：绝对时间点（steady_clock 毫秒），0 = 无 deadline。
+// 后端内部 deadline 的时间域：绝对时间点（steady_clock 毫秒）。
+// 各后端从自身任务起点起算：deadline = SteadyClockMs() + 注入的静态预算。
+// 0 = 无 deadline（仅内部管道使用，如 usrbio 的无超时路径）。
 inline int64_t SteadyClockMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
