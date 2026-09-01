@@ -79,6 +79,7 @@ cc_library(
     ],
     deps = [
         ":cache_location_view",
+        "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
 

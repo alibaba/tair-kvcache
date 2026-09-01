@@ -241,6 +241,10 @@ public:
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
+    WriteLocationManager::SessionStats GetWriteSessionStats() const {
+        return write_location_manager_ ? write_location_manager_->GetSessionStats()
+                                       : WriteLocationManager::SessionStats{};
+    }
 
     // Set revisit interval histogram configuration for per-instance tracking.
     // Must be called before any MetaIndexer is created.

@@ -122,6 +122,18 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetCounter(
             "manager.location_lookup.request_keys_total",
             {{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}}) += 3;
+        metrics_registry_->GetCounter(
+            "service.final_result.requests_total", {{"api_name", "GetCacheLocation"}, {"result", "success"}}) += 1;
+        metrics_registry_->GetCounter(
+            "data_storage.create_result.operations_total",
+            {{"type", "nfs"}, {"unique_name", "test_storage"}, {"result", "success"}}) += 1;
+        metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "started"}}) += 2;
+        metrics_registry_->GetGauge("write_session.inflight_blocks") = 2;
+        metrics_registry_->GetGauge("write_session.oldest_age_seconds") = 1.5;
+        metrics_registry_->GetCounter(
+            "tair_backend.operations_total", {{"operation", "create"}, {"result", "success"}}) += 1;
+        metrics_registry_->GetGauge(
+            "tair_backend.duration_us", {{"operation", "create"}, {"result", "success"}}) = 12;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 
@@ -154,13 +166,27 @@ TEST_F(KmonitorMetricsReporterTest, TestLocationLookupCounterSamplesKeepTagsAndV
     metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags) += 7;
 
     std::vector<std::pair<MetricsTags, double>> samples;
-    reporter_->VisitCounterSamples(
+    reporter_->VisitMetricSamples(
         "manager.location_lookup.keys_total",
         [&samples](const MetricsTags &tags, double value) { samples.emplace_back(tags, value); });
 
     ASSERT_EQ(1u, samples.size());
     EXPECT_EQ(hit_tags, samples.front().first);
     EXPECT_EQ(7.0, samples.front().second);
+}
+
+TEST_F(KmonitorMetricsReporterTest, TestRegistryGaugeSamplesKeepTagsAndValues) {
+    const MetricsTags tags{{"operation", "create"}, {"result", "success"}};
+    metrics_registry_->GetGauge("tair_backend.duration_us", tags) = 17.0;
+
+    std::vector<std::pair<MetricsTags, double>> samples;
+    reporter_->VisitMetricSamples(
+        "tair_backend.duration_us",
+        [&samples](const MetricsTags &sample_tags, double value) { samples.emplace_back(sample_tags, value); });
+
+    ASSERT_EQ(1u, samples.size());
+    EXPECT_EQ(tags, samples.front().first);
+    EXPECT_EQ(17.0, samples.front().second);
 }
 
 TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {

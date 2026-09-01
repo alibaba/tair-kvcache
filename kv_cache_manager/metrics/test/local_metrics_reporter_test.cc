@@ -255,6 +255,7 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
     SET_METRICS_(service_collector, service, error_code, 10.);
 
     RequestContext request_context("event-report-metrics", service_collector);
+    request_context.set_api_name("ReportEvent");
     request_context.set_status_code(10);
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(snapshot_collector);
     {
@@ -266,6 +267,11 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
     EXPECT_DOUBLE_EQ(1., snapshot_collector->get_service_error_code_metrics());
     EXPECT_EQ(1, snapshot_collector->get_service_query_counter_metrics());
     EXPECT_EQ(1, snapshot_collector->get_service_error_counter_metrics());
+    EXPECT_EQ(
+        1u,
+        metrics_registry_
+            ->GetCounter("service.final_result.requests_total", {{"api_name", "ReportEvent"}, {"result", "error"}})
+            .Get());
 }
 
 TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadOfSharedServiceGauge) {
@@ -279,6 +285,7 @@ TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadO
     SET_METRICS_(service_collector, service, error_code, 1.);
 
     RequestContext request_context("event-report-success", service_collector);
+    request_context.set_api_name("ReportHeartbeat");
     request_context.set_status_code(RequestContext::kOkStatusCode);
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(heartbeat_collector);
     { ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get()); }
@@ -286,6 +293,11 @@ TEST_F(LocalMetricsReporterTest, EventReportMetricsUseRequestLocalStatusInsteadO
     EXPECT_DOUBLE_EQ(0., heartbeat_collector->get_service_error_code_metrics());
     EXPECT_EQ(1, heartbeat_collector->get_service_query_counter_metrics());
     EXPECT_EQ(0, heartbeat_collector->get_service_error_counter_metrics());
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("service.final_result.requests_total",
+                               {{"api_name", "ReportHeartbeat"}, {"result", "success"}})
+                  .Get());
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportInterval00) {
@@ -386,7 +398,7 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
 
 TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
     cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
-    cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>();
+    cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>(metrics_registry_);
     cache_manager_->metrics_recorder_ =
         std::make_shared<CacheManagerMetricsRecorder>(cache_manager_->meta_indexer_manager_,
                                                       cache_manager_->write_location_manager_,
@@ -413,8 +425,12 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
     meta_indexer->key_count_.store(5);
     meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024 * 5);
     cache_manager_->metrics_recorder_->Start();
+    cache_manager_->write_location_manager_->Put(
+        "metrics_session", {1, 2}, {"location_1", "location_2"}, 1000, [](auto) {});
     std::this_thread::sleep_for(std::chrono::seconds(6));
     EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
+    EXPECT_EQ(2.0, metrics_registry_->GetGauge("write_session.inflight_blocks").Get());
+    EXPECT_GE(metrics_registry_->GetGauge("write_session.oldest_age_seconds").Get(), 5.0);
     {
         const auto &vec = reporter_->cache_manager_group_interval_metrics_collectors_.GetMetricsCollectors();
         ASSERT_EQ(1, vec.size());

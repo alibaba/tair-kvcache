@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -9,6 +10,13 @@ namespace kv_cache_manager {
 class CacheManager;
 class RequestContext;
 class MetricsReporter;
+class MetricsRegistry;
+
+// Record the terminal result independently from the existing per-query gauges.
+// Entry points also use this helper for readiness/leadership rejection paths
+// that return before ServiceCallGuard can be constructed.
+void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                              const RequestContext *request_context);
 
 class ServiceCallGuard {
 public:

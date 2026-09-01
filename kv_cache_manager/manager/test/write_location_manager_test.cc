@@ -1,5 +1,6 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
 
@@ -43,6 +44,7 @@ TEST_F(WriteLocationManagerTest, ExpireLoopTest) {
         ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
         ASSERT_EQ(std::vector<int64_t>({1, 2, 3}), info->keys);
         ASSERT_EQ(std::vector<std::string>({"id1", "id2", "id3"}), info->location_ids);
+        ASSERT_TRUE(info->expired);
     });
     ASSERT_EQ(1, manager_.ExpireSize());
     std::this_thread::sleep_for(std::chrono::seconds(6));
@@ -112,6 +114,7 @@ TEST_F(WriteLocationManagerTest, DoCleanupTest) {
             ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
             ASSERT_EQ(std::vector<int64_t>({1, 2, 3}), info->keys);
             ASSERT_EQ(std::vector<std::string>({"id1", "id2", "id3"}), info->location_ids);
+            ASSERT_FALSE(info->expired);
         });
 
     manager_.Put(
@@ -130,6 +133,7 @@ TEST_F(WriteLocationManagerTest, DoCleanupTest) {
             ASSERT_FALSE(this->manager_.GetAndDelete("session_3", dummy));
             ASSERT_EQ(std::vector<int64_t>({7, 8, 9}), info->keys);
             ASSERT_EQ(std::vector<std::string>({"id7", "id8", "id9"}), info->location_ids);
+            ASSERT_FALSE(info->expired);
         });
 
     // 验证初始状态
@@ -247,6 +251,21 @@ TEST_F(WriteLocationManagerTest, HasLocationIdAfterDoCleanupTest) {
 
     manager_.DoCleanup();
     ASSERT_FALSE(manager_.HasLocationId("id1"));
+}
+
+TEST_F(WriteLocationManagerTest, SessionStatsAndStartedBlocksMetricsTest) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    WriteLocationManager manager(metrics_registry);
+
+    manager.Put("session_stats", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [](WriteLocationInfoPtr) {});
+    const auto stats = manager.GetSessionStats();
+    EXPECT_EQ(3u, stats.inflight_blocks);
+    EXPECT_GE(stats.oldest_age_seconds, 0.0);
+    EXPECT_EQ(3u, metrics_registry->GetCounter("write_session.blocks_total", {{"result", "started"}}).Get());
+
+    WriteLocationManager::WriteLocationInfo info;
+    ASSERT_TRUE(manager.GetAndDelete("session_stats", info));
+    EXPECT_EQ(0u, manager.GetSessionStats().inflight_blocks);
 }
 
 } // namespace kv_cache_manager

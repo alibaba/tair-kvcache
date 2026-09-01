@@ -65,6 +65,38 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     uris = data_storage_manager.Create(&requesst_context, "storage2", {"key1"}, 128, []() {});
     ASSERT_EQ(0, uris.size());
 
+    const auto nfs_type = ToString(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.operations_total",
+                               {{"result", "unavailable"}, {"type", nfs_type}, {"unique_name", "storage1"}})
+                  .Get());
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.keys_total",
+                               {{"result", "unavailable"}, {"type", nfs_type}, {"unique_name", "storage1"}})
+                  .Get());
+    EXPECT_EQ(128u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.bytes_total",
+                               {{"result", "unavailable"}, {"type", nfs_type}, {"unique_name", "storage1"}})
+                  .Get());
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.operations_total",
+                               {{"result", "success"}, {"type", nfs_type}, {"unique_name", "storage1"}})
+                  .Get());
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.keys_total",
+                               {{"result", "success"}, {"type", nfs_type}, {"unique_name", "storage1"}})
+                  .Get());
+    EXPECT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("data_storage.create_result.operations_total",
+                               {{"result", "not_found"}, {"type", "unknown"}, {"unique_name", "storage2"}})
+                  .Get());
+
     // unregister storage
     ASSERT_EQ(EC_OK, data_storage_manager.UnRegisterStorage("storage1"));
     ASSERT_EQ(EC_NOENT, data_storage_manager.UnRegisterStorage("storage2"));

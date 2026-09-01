@@ -18,10 +18,10 @@ public:
     void ReportInterval() override;
 
 private:
-    using CounterSampleConsumer = std::function<void(const MetricsTags &, double)>;
+    using MetricSampleConsumer = std::function<void(const MetricsTags &, double)>;
 
     bool InitMetrics();
-    void VisitCounterSamples(const char *name, const CounterSampleConsumer &consumer) const;
+    void VisitMetricSamples(const char *name, const MetricSampleConsumer &consumer) const;
 
     struct Context;
     std::unique_ptr<Context> ctx_;

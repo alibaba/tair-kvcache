@@ -42,6 +42,7 @@
         status->set_code(proto::admin::SERVER_NOT_LEADER);                                                             \
         status->set_message("Server is not leader"); /* TODO: return current leader info */                            \
         request_context->set_status_code(status->code());                                                              \
+        RecordServiceFinalResult(metrics_registry_, request_context);                                                   \
         KVCM_LOG_INFO("[traceId: %s] %s rejected: service not ready", request->trace_id().c_str(), api_name);          \
         return;                                                                                                        \
     }                                                                                                                  \

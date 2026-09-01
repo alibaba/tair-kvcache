@@ -238,6 +238,22 @@ TEST_F(AdminServiceImplTest, TestInvalidArgs) {
     }
 }
 
+TEST_F(AdminServiceImplTest, TestLeaderOnlyRejectionRecordsFinalErrorResult) {
+    admin_->DisableLeaderOnlyRequests();
+    auto request_context = std::make_shared<RequestContext>("leader-rejected");
+    auto request = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {1});
+    proto::admin::MigrateCacheResponse response;
+
+    admin_->MigrateCache(request_context.get(), &request, &response);
+
+    EXPECT_EQ(proto::admin::SERVER_NOT_LEADER, response.header().status().code());
+    EXPECT_EQ(
+        1u,
+        metrics_registry_
+            ->GetCounter("service.final_result.requests_total", {{"api_name", "MigrateCache"}, {"result", "error"}})
+            .Get());
+}
+
 TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopy) {
     SeedServingSource(101);
     SeedServingSource(102);

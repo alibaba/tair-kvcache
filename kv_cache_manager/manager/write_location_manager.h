@@ -15,13 +15,16 @@
 
 namespace kv_cache_manager {
 
+class MetricsRegistry;
+
 class WriteLocationManager {
 public:
-    WriteLocationManager();
+    explicit WriteLocationManager(std::shared_ptr<MetricsRegistry> metrics_registry = nullptr);
     ~WriteLocationManager();
     struct WriteLocationInfo {
         std::vector<int64_t> keys;
         std::vector<std::string> location_ids;
+        bool expired = false;
     };
     using CallBack = std::function<void(std::unique_ptr<WriteLocationInfo>)>;
     void Start();
@@ -35,11 +38,17 @@ public:
     bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
     bool HasLocationId(const std::string &location_id) const;
     size_t ExpireSize() const { return session_id_map_.Size(); }
+    struct SessionStats {
+        std::size_t inflight_blocks = 0;
+        double oldest_age_seconds = 0.0;
+    };
+    SessionStats GetSessionStats() const;
 
 private:
     void ExpireLoop();
     void StoreMinNextSleepTimeUs(int64_t next_sleep_time_us);
     struct ExpireUnit {
+        int64_t created_at_us;
         int64_t expire_point;
         std::string write_session_id;
         CallBack callback;
@@ -56,6 +65,7 @@ private:
         void Put(ExpireUnitPtr unit);
         bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
         bool HasLocationId(const std::string &location_id) const;
+        SessionStats GetStats(int64_t now_us) const;
 
     private:
         void AddToLocationIndexUnsafe(const std::vector<std::string> &location_ids);
@@ -76,6 +86,7 @@ private:
     std::atomic_int64_t next_sleep_time_us_;
     std::mutex stop_mutex_;
     std::condition_variable stop_cond_;
+    std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
 } // namespace kv_cache_manager

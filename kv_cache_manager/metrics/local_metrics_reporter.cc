@@ -101,7 +101,7 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 }
 
 void LocalMetricsReporter::ReportInterval() {
-    if (!cache_manager_) {
+    if (!cache_manager_ || !metrics_registry_) {
         return;
     }
 
@@ -110,6 +110,11 @@ void LocalMetricsReporter::ReportInterval() {
     // (which hold the lock as a writer) cannot interleave a tag-filter
     // purge with EmplaceMetricsCollector calls below
     std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
+    const auto write_session_stats = cache_manager_->GetWriteSessionStats();
+    metrics_registry_->GetGauge("write_session.inflight_blocks") =
+        static_cast<double>(write_session_stats.inflight_blocks);
+    metrics_registry_->GetGauge("write_session.oldest_age_seconds") = write_session_stats.oldest_age_seconds;
 
     do {
         // for data storage metrics

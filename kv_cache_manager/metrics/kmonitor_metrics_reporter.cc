@@ -186,6 +186,15 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(manager, location_lookup_keys_total);
     DECLARE_METRICS(manager, location_lookup_requests_total);
     DECLARE_METRICS(manager, location_lookup_request_keys_total);
+    DECLARE_METRICS(service, final_result_requests_total);
+    DECLARE_METRICS(data_storage, create_result_operations_total);
+    DECLARE_METRICS(data_storage, create_result_keys_total);
+    DECLARE_METRICS(data_storage, create_result_bytes_total);
+    DECLARE_METRICS(write_session, blocks_total);
+    DECLARE_METRICS(write_session, inflight_blocks);
+    DECLARE_METRICS(write_session, oldest_age_seconds);
+    DECLARE_METRICS(tair_backend, operations_total);
+    DECLARE_METRICS(tair_backend, duration_us);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -304,6 +313,16 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
 #define REGISTER_GAUGE_METRIC(group, name)                                                                             \
     do {                                                                                                               \
         std::string metric_name = #group "." #name;                                                                    \
+        ctx_->group##_##name##_metrics.reset(reporter->RegisterMetric(metric_name, kmonitor::GAUGE, kmonitor::FATAL)); \
+        if (nullptr == ctx_->group##_##name##_metrics) {                                                               \
+            KVCM_LOG_ERROR("failed to register metric:[%s]", metric_name.c_str());                                     \
+            return false;                                                                                              \
+        }                                                                                                              \
+    } while (0)
+
+#define REGISTER_NAMED_GAUGE_METRIC(group, name, full_name)                                                            \
+    do {                                                                                                               \
+        std::string metric_name = (full_name);                                                                         \
         ctx_->group##_##name##_metrics.reset(reporter->RegisterMetric(metric_name, kmonitor::GAUGE, kmonitor::FATAL)); \
         if (nullptr == ctx_->group##_##name##_metrics) {                                                               \
             KVCM_LOG_ERROR("failed to register metric:[%s]", metric_name.c_str());                                     \
@@ -460,24 +479,30 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_pipeline_error_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
-    ctx_->manager_location_lookup_keys_total_metrics.reset(
-        reporter->RegisterMetric("manager.location_lookup.keys_total", kmonitor::GAUGE, kmonitor::FATAL));
-    ctx_->manager_location_lookup_requests_total_metrics.reset(
-        reporter->RegisterMetric("manager.location_lookup.requests_total", kmonitor::GAUGE, kmonitor::FATAL));
-    ctx_->manager_location_lookup_request_keys_total_metrics.reset(
-        reporter->RegisterMetric("manager.location_lookup.request_keys_total", kmonitor::GAUGE, kmonitor::FATAL));
-    if (!ctx_->manager_location_lookup_keys_total_metrics ||
-        !ctx_->manager_location_lookup_requests_total_metrics ||
-        !ctx_->manager_location_lookup_request_keys_total_metrics) {
-        KVCM_LOG_ERROR("failed to register location lookup metrics");
-        return false;
-    }
+    // MetricsRegistry keeps *_total values as cumulative counters. KMonitor has
+    // no COUNTER type, so publish their cumulative values as GAUGE, matching the
+    // existing cache-reclaimer convention.
+    REGISTER_NAMED_GAUGE_METRIC(manager, location_lookup_keys_total, "manager.location_lookup.keys_total");
+    REGISTER_NAMED_GAUGE_METRIC(manager, location_lookup_requests_total, "manager.location_lookup.requests_total");
+    REGISTER_NAMED_GAUGE_METRIC(
+        manager, location_lookup_request_keys_total, "manager.location_lookup.request_keys_total");
+    REGISTER_NAMED_GAUGE_METRIC(service, final_result_requests_total, "service.final_result.requests_total");
+    REGISTER_NAMED_GAUGE_METRIC(
+        data_storage, create_result_operations_total, "data_storage.create_result.operations_total");
+    REGISTER_NAMED_GAUGE_METRIC(data_storage, create_result_keys_total, "data_storage.create_result.keys_total");
+    REGISTER_NAMED_GAUGE_METRIC(data_storage, create_result_bytes_total, "data_storage.create_result.bytes_total");
+    REGISTER_NAMED_GAUGE_METRIC(write_session, blocks_total, "write_session.blocks_total");
+    REGISTER_NAMED_GAUGE_METRIC(write_session, inflight_blocks, "write_session.inflight_blocks");
+    REGISTER_NAMED_GAUGE_METRIC(write_session, oldest_age_seconds, "write_session.oldest_age_seconds");
+    REGISTER_NAMED_GAUGE_METRIC(tair_backend, operations_total, "tair_backend.operations_total");
+    REGISTER_NAMED_GAUGE_METRIC(tair_backend, duration_us, "tair_backend.duration_us");
 
     return true;
 }
 
 #undef REGISTER_QPS_METRIC
 #undef REGISTER_GAUGE_METRIC
+#undef REGISTER_NAMED_GAUGE_METRIC
 
 #define REPORT_METRICS(group, name, value)                                                                             \
     do {                                                                                                               \
@@ -622,21 +647,35 @@ void KmonitorMetricsReporter::ReportInterval() {
     }
 
     if (metrics_registry_) {
-        const auto report_counter = [this](kmonitor::MutableMetric *metric, const char *name) {
+        const auto report_registry_metric = [this](kmonitor::MutableMetric *metric, const char *name) {
             if (metric == nullptr) {
                 return;
             }
-            VisitCounterSamples(name, [this, metric](const MetricsTags &base_tags, double sample) {
+            VisitMetricSamples(name, [this, metric](const MetricsTags &base_tags, double sample) {
                 const auto tags = ctx_->GetKmonitorTags(base_tags);
                 metric->Report(&tags, sample);
             });
         };
-        report_counter(ctx_->manager_location_lookup_keys_total_metrics.get(),
-                       "manager.location_lookup.keys_total");
-        report_counter(ctx_->manager_location_lookup_requests_total_metrics.get(),
-                       "manager.location_lookup.requests_total");
-        report_counter(ctx_->manager_location_lookup_request_keys_total_metrics.get(),
-                       "manager.location_lookup.request_keys_total");
+        report_registry_metric(ctx_->manager_location_lookup_keys_total_metrics.get(),
+                               "manager.location_lookup.keys_total");
+        report_registry_metric(ctx_->manager_location_lookup_requests_total_metrics.get(),
+                               "manager.location_lookup.requests_total");
+        report_registry_metric(ctx_->manager_location_lookup_request_keys_total_metrics.get(),
+                               "manager.location_lookup.request_keys_total");
+        report_registry_metric(ctx_->service_final_result_requests_total_metrics.get(),
+                               "service.final_result.requests_total");
+        report_registry_metric(ctx_->data_storage_create_result_operations_total_metrics.get(),
+                               "data_storage.create_result.operations_total");
+        report_registry_metric(ctx_->data_storage_create_result_keys_total_metrics.get(),
+                               "data_storage.create_result.keys_total");
+        report_registry_metric(ctx_->data_storage_create_result_bytes_total_metrics.get(),
+                               "data_storage.create_result.bytes_total");
+        report_registry_metric(ctx_->write_session_blocks_total_metrics.get(), "write_session.blocks_total");
+        report_registry_metric(ctx_->write_session_inflight_blocks_metrics.get(), "write_session.inflight_blocks");
+        report_registry_metric(ctx_->write_session_oldest_age_seconds_metrics.get(),
+                               "write_session.oldest_age_seconds");
+        report_registry_metric(ctx_->tair_backend_operations_total_metrics.get(), "tair_backend.operations_total");
+        report_registry_metric(ctx_->tair_backend_duration_us_metrics.get(), "tair_backend.duration_us");
     }
 
     do {
@@ -949,8 +988,7 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 }
 
-void KmonitorMetricsReporter::VisitCounterSamples(const char *name,
-                                                  const CounterSampleConsumer &consumer) const {
+void KmonitorMetricsReporter::VisitMetricSamples(const char *name, const MetricSampleConsumer &consumer) const {
     if (!metrics_registry_ || !consumer) {
         return;
     }
@@ -959,12 +997,15 @@ void KmonitorMetricsReporter::VisitCounterSamples(const char *name,
         return;
     }
     for (const auto &[tags, value] : data->GetMetricsValues()) {
-        if (!value || !value->touched.load(std::memory_order_relaxed) ||
-            !std::holds_alternative<CounterValue>(value->value)) {
+        if (!value || !value->touched.load(std::memory_order_relaxed)) {
             continue;
         }
-        consumer(tags,
-                 static_cast<double>(std::get<CounterValue>(value->value).load(std::memory_order_relaxed)));
+        if (std::holds_alternative<CounterValue>(value->value)) {
+            consumer(tags,
+                     static_cast<double>(std::get<CounterValue>(value->value).load(std::memory_order_relaxed)));
+        } else {
+            consumer(tags, std::get<GaugeValue>(value->value).load(std::memory_order_relaxed));
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
@@ -101,6 +102,21 @@ private:
 
 namespace kv_cache_manager {
 
+void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                              const RequestContext *request_context) {
+    if (!metrics_registry || request_context == nullptr) {
+        return;
+    }
+    try {
+        const bool succeeded = request_context->status_code() == RequestContext::kOkStatusCode;
+        ++metrics_registry->GetCounter(
+            "service.final_result.requests_total",
+            {{"api_name", request_context->api_name()}, {"result", succeeded ? "success" : "error"}});
+    } catch (...) {
+        // Monitoring must never change the service response.
+    }
+}
+
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
                                    RequestContext *request_context,
                                    MetricsReporter *metrics_reporter)
@@ -140,6 +156,7 @@ ServiceCallGuard::~ServiceCallGuard() {
         response_debug_setter_();
     }
     if (metrics_reporter_) {
+        RecordServiceFinalResult(metrics_reporter_->GetMetricsRegistry(), request_context_);
         metrics_reporter_->ReportPerQuery(service_metrics_collector);
         for (const auto &mc : extra_collectors) {
             if (auto *event_metrics_collector = dynamic_cast<EventReportMetricsCollector *>(mc.get())) {

@@ -148,6 +148,49 @@ private:
     bool completed_ = false;
 };
 
+class WriteSessionCompletionMetricsGuard {
+public:
+    WriteSessionCompletionMetricsGuard(MetricsRegistry *registry, std::size_t block_count, bool expired)
+        : registry_(registry), block_count_(block_count), expired_(expired) {}
+
+    ~WriteSessionCompletionMetricsGuard() {
+        if (!completed_) {
+            Record(expired_ ? "expired" : "error", block_count_);
+        }
+    }
+
+    void Complete(std::size_t success_count) {
+        if (completed_) {
+            return;
+        }
+        if (expired_) {
+            Record("expired", block_count_);
+        } else {
+            success_count = std::min(success_count, block_count_);
+            Record("success", success_count);
+            Record("failed", block_count_ - success_count);
+        }
+        completed_ = true;
+    }
+
+private:
+    void Record(const char *result, std::size_t count) noexcept {
+        if (registry_ == nullptr || count == 0) {
+            return;
+        }
+        try {
+            registry_->GetCounter("write_session.blocks_total", {{"result", result}}) += count;
+        } catch (...) {
+            // Monitoring must never change the write-session result.
+        }
+    }
+
+    MetricsRegistry *registry_;
+    std::size_t block_count_;
+    bool expired_;
+    bool completed_ = false;
+};
+
 std::size_t CountUnmaskedKeys(const CacheManager::KeyVector &keys, const BlockMask &block_mask) {
     std::size_t count = 0;
     for (std::size_t index = 0; index < keys.size(); ++index) {
@@ -477,7 +520,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                            std::shared_ptr<RegistryManager> registry_manager,
                            std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
-    , write_location_manager_(std::make_shared<WriteLocationManager>())
+    , write_location_manager_(std::make_shared<WriteLocationManager>(metrics_registry))
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
     , data_storage_selector_(std::make_shared<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
@@ -1461,6 +1504,8 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(
             WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
     }
+    WriteSessionCompletionMetricsGuard write_session_metrics(
+        metrics_registry_.get(), location_info.keys.size(), location_info.expired);
     if (!IsBlockMaskValid(success_block_mask, location_info.keys.size())) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
                                      EC_BADARGS,
@@ -1507,6 +1552,13 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
+    std::size_t serving_success_count = 0;
+    for (std::size_t i = 0; i < success_batch_keys.size(); ++i) {
+        if (i < out_batch_results.size() && !out_batch_results[i].empty() &&
+            out_batch_results[i][0] == ErrorCode::EC_OK) {
+            ++serving_success_count;
+        }
+    }
 
     // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
     // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
@@ -1579,6 +1631,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(finish_write_event);
     }
+    write_session_metrics.Complete(serving_success_count);
     return ec;
 }
 

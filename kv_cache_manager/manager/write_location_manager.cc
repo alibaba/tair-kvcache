@@ -2,6 +2,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
 
 namespace {
@@ -34,6 +35,25 @@ bool WriteLocationManager::SessionIdMap::Empty() const {
     return unit_map_.empty();
 }
 
+WriteLocationManager::SessionStats WriteLocationManager::SessionIdMap::GetStats(int64_t now_us) const {
+    std::unique_lock lock(mux_);
+    SessionStats stats;
+    int64_t oldest_created_at_us = 0;
+    for (const auto &[_, unit] : unit_map_) {
+        if (!unit) {
+            continue;
+        }
+        stats.inflight_blocks += unit->write_location_info.keys.size();
+        if (oldest_created_at_us == 0 || unit->created_at_us < oldest_created_at_us) {
+            oldest_created_at_us = unit->created_at_us;
+        }
+    }
+    if (oldest_created_at_us > 0 && now_us > oldest_created_at_us) {
+        stats.oldest_age_seconds = static_cast<double>(now_us - oldest_created_at_us) / 1000000.0;
+    }
+    return stats;
+}
+
 int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point) {
     std::vector<ExpireUnitPtr> prepare_to_expire_units;
     {
@@ -52,6 +72,7 @@ int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point)
         KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
         std::unique_ptr<WriteLocationInfo> write_location_info = std::make_unique<WriteLocationInfo>();
         *write_location_info = std::move(unit->write_location_info);
+        write_location_info->expired = true;
         unit->callback(std::move(write_location_info));
     }
     {
@@ -108,9 +129,14 @@ bool WriteLocationManager::SessionIdMap::GetAndDelete(const std::string &write_s
     return true;
 }
 
-WriteLocationManager::WriteLocationManager() {
+WriteLocationManager::WriteLocationManager(std::shared_ptr<MetricsRegistry> metrics_registry)
+    : metrics_registry_(std::move(metrics_registry)) {
     next_sleep_time_us_.store(kDefaultExpireLoopSleepTimeUs, std::memory_order_relaxed);
     KVCM_LOG_DEBUG("WriteLocationManager constructed");
+}
+
+WriteLocationManager::SessionStats WriteLocationManager::GetSessionStats() const {
+    return session_id_map_.GetStats(TimestampUtil::GetSteadyTimeUs());
 }
 
 WriteLocationManager::~WriteLocationManager() { Stop(); }
@@ -176,18 +202,27 @@ void WriteLocationManager::Put(const std::string &write_session_id,
                                std::vector<std::string> &&location_ids,
                                int64_t write_timeout_seconds,
                                CallBack callback) {
-    KVCM_LOG_DEBUG("Putting session %s with %zu keys and %zu location_ids, timeout: %ld seconds",
+    KVCM_LOG_DEBUG("Putting session %s with %zu keys and %zu location_ids, timeout: %lld seconds",
                    write_session_id.c_str(),
                    keys.size(),
                    location_ids.size(),
-                   write_timeout_seconds);
+                   static_cast<long long>(write_timeout_seconds));
 
     ExpireUnitPtr unit_ptr = std::make_shared<ExpireUnit>();
     unit_ptr->write_session_id = write_session_id;
-    unit_ptr->expire_point = TimestampUtil::GetSteadyTimeUs() + write_timeout_seconds * 1000 * 1000;
+    unit_ptr->created_at_us = TimestampUtil::GetSteadyTimeUs();
+    unit_ptr->expire_point = unit_ptr->created_at_us + write_timeout_seconds * 1000 * 1000;
     unit_ptr->callback = std::move(callback);
     unit_ptr->write_location_info.keys = std::move(keys);
     unit_ptr->write_location_info.location_ids = std::move(location_ids);
+    if (metrics_registry_ && !unit_ptr->write_location_info.keys.empty()) {
+        try {
+            metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "started"}}) +=
+                unit_ptr->write_location_info.keys.size();
+        } catch (...) {
+            // Monitoring must never prevent a write session from being stored.
+        }
+    }
     session_id_map_.Put(unit_ptr);
     StoreMinNextSleepTimeUs(write_timeout_seconds * 1000 * 1000);
 }

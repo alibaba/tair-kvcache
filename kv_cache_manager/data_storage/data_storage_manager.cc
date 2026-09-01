@@ -1,5 +1,7 @@
 #include "data_storage_manager.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -198,16 +200,41 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
+    const auto record_create_result = [this, &unique_name, size_per_key](const std::string &backend_type,
+                                                                         const std::string &result,
+                                                                         std::size_t operations,
+                                                                         std::size_t key_count) {
+        if (!metrics_registry_) {
+            return;
+        }
+        try {
+            const MetricsTags tags{{"type", backend_type}, {"unique_name", unique_name}, {"result", result}};
+            if (operations > 0) {
+                metrics_registry_->GetCounter("data_storage.create_result.operations_total", tags) += operations;
+            }
+            if (key_count > 0) {
+                metrics_registry_->GetCounter("data_storage.create_result.keys_total", tags) += key_count;
+                metrics_registry_->GetCounter("data_storage.create_result.bytes_total", tags) +=
+                    static_cast<std::uint64_t>(key_count) * static_cast<std::uint64_t>(size_per_key);
+            }
+        } catch (...) {
+            // Monitoring must never change the storage allocation result.
+        }
+    };
     auto iter = storage_map_.find(unique_name);
     if (iter == storage_map_.end()) {
         KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        record_create_result("unknown", "not_found", 1, keys.size());
         return {};
     }
     auto storage_backend = iter->second;
+    const std::string backend_type =
+        storage_backend ? kv_cache_manager::ToString(storage_backend->GetType()) : "unknown";
     // DisableStorage and this check are serialized by rw_lock_. Keep the lock through Create so a
     // target cannot become disabled between admission and backend allocation.
     if (storage_backend == nullptr || !storage_backend->Available()) {
         KVCM_LOG_WARN("Storage name: %s is unavailable, reject create", unique_name.c_str());
+        record_create_result(backend_type, "unavailable", 1, keys.size());
         return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
     }
     const auto dsmc = storage_backend->GetMetricsCollector();
@@ -224,6 +251,16 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
             pair.second.SetHostName(unique_name);
         }
     });
+    const std::size_t success_count = std::min(
+        keys.size(),
+        static_cast<std::size_t>(std::count_if(
+            create_result.begin(), create_result.end(), [](const auto &entry) { return entry.first == EC_OK; })));
+    const std::size_t error_count = keys.size() > success_count ? keys.size() - success_count : 0;
+    const std::string operation_result =
+        success_count == keys.size() ? "success" : (success_count == 0 ? "error" : "partial");
+    record_create_result(backend_type, operation_result, 1, 0);
+    record_create_result(backend_type, "success", 0, success_count);
+    record_create_result(backend_type, "error", 0, error_count);
     return create_result;
 }
 

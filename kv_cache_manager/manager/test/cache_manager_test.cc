@@ -1448,6 +1448,8 @@ TEST_F(CacheManagerTest, TestWriteCacheTimeout) {
     ASSERT_EQ(0, std::get<BlockMaskOffset>(start_write_cache_info.block_mask()));
     ASSERT_EQ(2, cache_locations_view.size());
     std::this_thread::sleep_for(std::chrono::seconds(6));
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "started"}}).Get());
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "expired"}}).Get());
     {
         BlockMask block_mask = static_cast<size_t>(2);
         auto ec = cache_manager_->FinishWriteCache(
@@ -1492,6 +1494,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
             request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
         ASSERT_EQ(EC_OK, ec);
     }
+    EXPECT_EQ(3u, metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "started"}}).Get());
+    EXPECT_EQ(3u, metrics_registry_->GetCounter("write_session.blocks_total", {{"result", "success"}}).Get());
     {
         BlockMask block_mask = static_cast<size_t>(0);
         auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
