@@ -132,6 +132,10 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         # Apply log level with priority: env var > startup param > default
         configure_log_level(self._extra_config.log_level)
 
+        # 写路径租约超时：start_write_cache 请求需要它（见 start_save_kvcache_async）。
+        # 之前只在 WORKER 分支设置且从未被使用（请求里硬编码 30）。
+        self._write_timeout_seconds = self._extra_config.write_timeout_seconds
+
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None
         self._local_block_size = vllm_config.cache_config.block_size
 
@@ -236,7 +240,6 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self._storage_configs = register_response["storage_configs"]
             # data transfer setup
             self._location_spec_name = self._tp_rank_to_spec_name(self._tp_rank)
-            self._write_timeout_seconds = self._extra_config.write_timeout_seconds
 
             sdk_backend_configs = []
 
@@ -770,7 +773,7 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             "instance_id": self._extra_config.instance_id,
             "block_keys": [],
             "token_ids": token_ids,
-            "write_timeout_seconds": 30
+            "write_timeout_seconds": self._write_timeout_seconds
         }
         logger.debug("start_write_cache req: %s", request)
         try:
