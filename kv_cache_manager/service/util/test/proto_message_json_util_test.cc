@@ -1,21 +1,250 @@
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "google/protobuf/arena.h"
+#include "google/protobuf/util/json_util.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
+#include "service/util/fast_proto_json_codec.h"
 #include "service/util/proto_message_json_util.h"
 #include "service/util/test/service_util_test.pb.h"
 
 namespace kv_cache_manager {
 
+namespace {
+
+bool ProtobufToJson(const google::protobuf::Message &message, std::string *json) {
+    google::protobuf::util::JsonPrintOptions options;
+    options.always_print_primitive_fields = true;
+    options.preserve_proto_field_names = true;
+    return google::protobuf::util::MessageToJsonString(message, json, options).ok();
+}
+
+bool ProtobufFromJson(std::string_view json, google::protobuf::Message *message) {
+    google::protobuf::util::JsonParseOptions options;
+    options.ignore_unknown_fields = true;
+    const google::protobuf::StringPiece input(json.data(), static_cast<ptrdiff_t>(json.size()));
+    return google::protobuf::util::JsonStringToMessage(input, message, options).ok();
+}
+
+std::string JsonWithUnknownObjectNesting(int depth) {
+    std::string json = R"({"stringValue":"after","unknown":)";
+    for (int i = 0; i < depth; ++i) {
+        json += R"({"next":)";
+    }
+    json += "null";
+    json.append(depth, '}');
+    json += '}';
+    return json;
+}
+
+std::string JsonWithUnknownArrayNesting(int depth) {
+    std::string json = R"({"stringValue":"after","unknown":)";
+    json.append(depth, '[');
+    json += "null";
+    json.append(depth, ']');
+    json += '}';
+    return json;
+}
+
+} // namespace
+
 class ProtoMessageJsonUtilTest : public TESTBASE {
 public:
 };
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) {
+    proto::meta::ReportEventRequest event_request;
+    auto *event = event_request.add_events();
+    event->set_event_type(proto::meta::EVENT_HEARTBEAT);
+    (*event->mutable_heartbeat()->mutable_system_status())["state"] = "ready";
+    (*event->mutable_heartbeat()->mutable_system_status())["load"] = "7";
+
+    std::string event_json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(event_request, event_json));
+    std::string protobuf_event_json;
+    ASSERT_TRUE(ProtobufToJson(event_request, &protobuf_event_json));
+    EXPECT_EQ(protobuf_event_json, event_json);
+    proto::meta::ReportEventRequest parsed_event;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(event_json, &parsed_event));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(event_request, parsed_event));
+
+    proto::admin::MigrationMarkMethodConfig wrapper_message;
+    wrapper_message.set_enabled(true);
+    wrapper_message.mutable_timeout_ms()->set_value(1234567890123LL);
+    std::string wrapper_json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(wrapper_message, wrapper_json));
+    EXPECT_EQ(R"({"enabled":true,"timeout_ms":"1234567890123"})", wrapper_json);
+    proto::admin::MigrationMarkMethodConfig parsed_wrapper;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypesFallBackToProtobufJsonUtil) {
+    UnsupportedBytesMessage message;
+    message.set_value(std::string("\0\1\2", 3));
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
+
+    std::string json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&message, json));
+    EXPECT_EQ(R"({"value":"AAEC"})", json);
+
+    UnsupportedBytesMessage parsed;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(json, &parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(message, parsed));
+
+    UnsupportedMapBytesMessage map_bytes;
+    (*map_bytes.mutable_value())["key"] = std::string("\0\1\2", 3);
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(map_bytes.GetDescriptor()));
+    std::string protobuf_map_json;
+    std::string compatible_map_json;
+    ASSERT_TRUE(ProtobufToJson(map_bytes, &protobuf_map_json));
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&map_bytes, compatible_map_json));
+    EXPECT_EQ(protobuf_map_json, compatible_map_json);
+    UnsupportedMapBytesMessage parsed_map_bytes;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(compatible_map_json, &parsed_map_bytes));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(map_bytes, parsed_map_bytes));
+
+    UnsupportedNullValueMessage null_value;
+    null_value.set_value(google::protobuf::NULL_VALUE);
+    EXPECT_FALSE(FastProtoJsonCodec::Supports(null_value.GetDescriptor()));
+    std::string protobuf_null_json;
+    std::string compatible_null_json;
+    ASSERT_TRUE(ProtobufToJson(null_value, &protobuf_null_json));
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&null_value, compatible_null_json));
+    EXPECT_EQ(protobuf_null_json, compatible_null_json);
+    UnsupportedNullValueMessage parsed_null_value;
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(compatible_null_json, &parsed_null_value));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(null_value, parsed_null_value));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecParsesArenaMessageTransactionally) {
+    google::protobuf::Arena arena;
+    auto *request = google::protobuf::Arena::CreateMessage<proto::meta::GetCacheLocationsByBackendRequest>(&arena);
+    request->set_trace_id("before");
+    ASSERT_NE(nullptr, request->GetArena());
+
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(
+        R"({"trace_id":"after","instance_id":"instance","query_type":"QT_BATCH_GET","block_keys":["1","2"]})",
+        request));
+    EXPECT_EQ("after", request->trace_id());
+    EXPECT_EQ(2, request->block_keys_size());
+
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(R"({"block_keys":["invalid"]})", request));
+    EXPECT_EQ("after", request->trace_id());
+    EXPECT_EQ(2, request->block_keys_size());
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecBoundsDomNestingBeforeTraversingUnknownFields) {
+    // The root object counts as one level, matching protobuf 3.8's default
+    // maximum of 100 nested JSON objects.
+    const std::string supported_depth = JsonWithUnknownObjectNesting(99);
+    SimpleMessage protobuf_supported;
+    SimpleMessage fast_supported;
+    ASSERT_TRUE(ProtobufFromJson(supported_depth, &protobuf_supported));
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(supported_depth, &fast_supported));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_supported, fast_supported));
+
+    const std::string excessive_object_depth = JsonWithUnknownObjectNesting(100);
+    SimpleMessage protobuf_rejected;
+    EXPECT_FALSE(ProtobufFromJson(excessive_object_depth, &protobuf_rejected));
+    SimpleMessage fast_rejected;
+    fast_rejected.set_stringvalue("before");
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(excessive_object_depth, &fast_rejected));
+    EXPECT_EQ("before", fast_rejected.stringvalue());
+
+    // Protobuf 3.8 does not count arrays in its object recursion limit. The
+    // fast DOM parser bounds both container kinds and delegates this uncommon
+    // shape to protobuf, preserving the public API behavior without building
+    // an arbitrarily deep DOM.
+    const std::string excessive_array_depth = JsonWithUnknownArrayNesting(4096);
+    SimpleMessage protobuf_array;
+    ASSERT_TRUE(ProtobufFromJson(excessive_array_depth, &protobuf_array));
+    SimpleMessage fast_array;
+    fast_array.set_stringvalue("before");
+    EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(excessive_array_depth, &fast_array));
+    EXPECT_EQ("before", fast_array.stringvalue());
+
+    SimpleMessage compatible_array;
+    compatible_array.set_stringvalue("before");
+    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(excessive_array_depth, &compatible_array));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_array, compatible_array));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecPreservesJsonSemanticsWithoutHtmlSafeEscaping) {
+    SimpleMessage source;
+    source.set_stringvalue("</script><value>");
+
+    std::string protobuf_json;
+    std::string fast_json;
+    ASSERT_TRUE(ProtobufToJson(source, &protobuf_json));
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(source, fast_json));
+    EXPECT_NE(protobuf_json, fast_json);
+    EXPECT_NE(std::string::npos, protobuf_json.find(R"(\u003c/script\u003e)"));
+    EXPECT_NE(std::string::npos, fast_json.find("</script>"));
+
+    SimpleMessage protobuf_parsed;
+    SimpleMessage fast_parsed;
+    ASSERT_TRUE(ProtobufFromJson(protobuf_json, &protobuf_parsed));
+    ASSERT_TRUE(ProtobufFromJson(fast_json, &fast_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(source, protobuf_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(source, fast_parsed));
+
+    std::string compatible_json;
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&source, compatible_json));
+    EXPECT_EQ(fast_json, compatible_json);
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecMatchesProtobufForScalarEdgeCases) {
+    SimpleMessage source;
+    source.set_int32value(std::numeric_limits<int32_t>::min());
+    source.set_uint32value(std::numeric_limits<uint32_t>::max());
+    source.set_int64value(std::numeric_limits<int64_t>::min());
+    source.set_uint64value(std::numeric_limits<uint64_t>::max());
+    source.set_doublevalue(std::numeric_limits<double>::infinity());
+    source.set_floatvalue(-std::numeric_limits<float>::infinity());
+    source.set_boolvalue(true);
+    constexpr char kSpecialString[] = "quote:\" slash:\\ newline:\n nul:\0 unicode:雪";
+    source.set_stringvalue(kSpecialString, sizeof(kSpecialString) - 1);
+
+    std::string protobuf_json;
+    std::string fast_json;
+    ASSERT_TRUE(ProtobufToJson(source, &protobuf_json));
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(source, fast_json));
+    EXPECT_EQ(protobuf_json, fast_json);
+
+    const std::string compatible_json =
+        R"({"int32Value":"-2147483648","uint32Value":"4294967295","int64Value":-9223372036854775808,"uint64Value":"18446744073709551615","doubleValue":"Infinity","floatValue":"-Infinity","boolValue":true,"stringValue":"unicode:\u96ea","future":{"ignored":true}})";
+    SimpleMessage protobuf_parsed;
+    SimpleMessage fast_parsed;
+    ASSERT_TRUE(ProtobufFromJson(compatible_json, &protobuf_parsed));
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(compatible_json, &fast_parsed));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, fast_parsed));
+
+    SimpleMessage invalid_utf8;
+    invalid_utf8.set_stringvalue(std::string(1, static_cast<char>(0xff)));
+    std::string protobuf_invalid_json;
+    std::string fast_invalid_json;
+    std::string compatible_invalid_json;
+    ASSERT_TRUE(ProtobufToJson(invalid_utf8, &protobuf_invalid_json));
+    EXPECT_FALSE(FastProtoJsonCodec::TryToJson(invalid_utf8, fast_invalid_json));
+    EXPECT_TRUE(fast_invalid_json.empty());
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&invalid_utf8, compatible_invalid_json));
+    EXPECT_EQ(protobuf_invalid_json, compatible_invalid_json);
+
+    proto::meta::ReportEventRequest invalid_map_utf8;
+    auto *heartbeat = invalid_map_utf8.add_events()->mutable_heartbeat();
+    (*heartbeat->mutable_system_status())["state"] = std::string(1, static_cast<char>(0xff));
+    EXPECT_FALSE(FastProtoJsonCodec::TryToJson(invalid_map_utf8, fast_invalid_json));
+}
 
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonSimple) {
     { // Empty msg
@@ -60,6 +289,15 @@ TEST_F(ProtoMessageJsonUtilTest, TestToJsonNullPtr) {
     std::string json;
     ASSERT_FALSE(ProtoMessageJsonUtil::ToJson(nullptr, json));
     ASSERT_EQ("", json);
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestToJsonPreservesProtobufAppendBehavior) {
+    SimpleMessage message;
+    std::string json = "prefix:";
+    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&message, json));
+    EXPECT_EQ("prefix:{\"int32Value\":0,\"uint32Value\":0,\"int64Value\":\"0\",\"uint64Value\":\"0\","
+              "\"doubleValue\":0,\"floatValue\":0,\"boolValue\":false,\"stringValue\":\"\"}",
+              json);
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonEnum) {
@@ -270,13 +508,17 @@ TEST_F(ProtoMessageJsonUtilTest, TestFromJsonSimple) {
 TEST_F(ProtoMessageJsonUtilTest, TestFromJsonError) {
     {
         SimpleMessage msg;
+        msg.set_int32value(123);
         std::string json = "{\"int32Value\":111,";
         ASSERT_FALSE(ProtoMessageJsonUtil::FromJson(json, &msg));
+        EXPECT_EQ(123, msg.int32value());
     }
     {
         SimpleMessage msg;
+        msg.set_int32value(123);
         std::string json = "{\"int32Value\":\"not_int\"}";
         ASSERT_FALSE(ProtoMessageJsonUtil::FromJson(json, &msg));
+        EXPECT_EQ(123, msg.int32value());
     }
 }
 
@@ -457,7 +699,7 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventLargeInSituJsonParserPreservesEs
     EXPECT_FALSE(ReportEventJsonParser::FromMutableNullTerminatedJson(raw_nul.data(), raw_nul.size(), &fast));
 }
 
-TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMatchesGenericParser) {
+TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMatchesProtobufParser) {
     struct CompatibilityCase {
         const char *name;
         std::string json;
@@ -468,6 +710,8 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
          R"json({"trace_id":"t","instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem?size=1"}]}}],"storage_type":"ST_EVENT_REPORT_L2"})json"},
         {"camel_case_and_numeric_enums",
          R"json({"traceId":"t","instanceId":"i","hostIpPort":"h:1","events":[{"eventType":5,"heartbeat":{"systemStatus":{"state":"ready"}}}],"storageType":8})json"},
+        {"quoted_numeric_enums",
+         R"json({"trace_id":"t","instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"5","heartbeat":{"system_status":{"state":"ready"}}}],"storage_type":"8"})json"},
         {"known_null_fields",
          R"json({"trace_id":null,"instance_id":"i","host_ip_port":"h:1","events":null,"storage_type":null})json"},
         {"unknown_enum_names",
@@ -504,15 +748,31 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
 
     for (const auto &test_case : cases) {
         SCOPED_TRACE(test_case.name);
+        proto::meta::ReportEventRequest protobuf_parsed;
+        const bool protobuf_ok = ProtobufFromJson(test_case.json, &protobuf_parsed);
+
+        // The fast codec may conservatively reject a compatible shape, but it
+        // must never accept input with semantics different from protobuf.
+        proto::meta::ReportEventRequest fast_codec_parsed;
+        const bool fast_codec_ok = FastProtoJsonCodec::TryFromJson(test_case.json, &fast_codec_parsed);
+        if (fast_codec_ok) {
+            ASSERT_TRUE(protobuf_ok);
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, fast_codec_parsed));
+        }
+
         proto::meta::ReportEventRequest generic;
         const bool generic_ok = ProtoMessageJsonUtil::FromJson(test_case.json, &generic);
+        EXPECT_EQ(protobuf_ok, generic_ok);
+        if (protobuf_ok && generic_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, generic));
+        }
 
         proto::meta::ReportEventRequest compatible;
         compatible.set_trace_id("must-be-cleared");
         const bool compatible_ok = ReportEventJsonParser::FromJson(test_case.json, &compatible);
-        EXPECT_EQ(generic_ok, compatible_ok);
-        if (generic_ok && compatible_ok) {
-            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(generic, compatible));
+        EXPECT_EQ(protobuf_ok, compatible_ok);
+        if (protobuf_ok && compatible_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_parsed, compatible));
         }
 
         // Exercise the HTTP-only in-situ path as well. Appending an ignored
@@ -532,16 +792,30 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
         large_json.append(40 * 1024, 'p');
         large_json += R"json("})json";
 
+        proto::meta::ReportEventRequest protobuf_large;
+        const bool protobuf_large_ok = ProtobufFromJson(large_json, &protobuf_large);
+        EXPECT_EQ(protobuf_ok, protobuf_large_ok);
+
+        proto::meta::ReportEventRequest fast_codec_large;
+        const bool fast_codec_large_ok = FastProtoJsonCodec::TryFromJson(large_json, &fast_codec_large);
+        if (fast_codec_large_ok) {
+            ASSERT_TRUE(protobuf_large_ok);
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, fast_codec_large));
+        }
+
         proto::meta::ReportEventRequest generic_large;
         const bool generic_large_ok = ProtoMessageJsonUtil::FromJson(large_json, &generic_large);
-        EXPECT_EQ(generic_ok, generic_large_ok);
+        EXPECT_EQ(protobuf_large_ok, generic_large_ok);
+        if (protobuf_large_ok && generic_large_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, generic_large));
+        }
 
         proto::meta::ReportEventRequest mutable_compatible;
         const bool mutable_ok = ReportEventJsonParser::FromMutableNullTerminatedJson(
             large_json.data(), large_json.size(), &mutable_compatible);
-        EXPECT_EQ(generic_large_ok, mutable_ok);
-        if (generic_large_ok && mutable_ok) {
-            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(generic_large, mutable_compatible));
+        EXPECT_EQ(protobuf_large_ok, mutable_ok);
+        if (protobuf_large_ok && mutable_ok) {
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_large, mutable_compatible));
         }
     }
 }
