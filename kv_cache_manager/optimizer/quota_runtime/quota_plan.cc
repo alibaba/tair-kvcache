@@ -55,6 +55,67 @@ double ExpectedHitRateGainPercentagePoints(const PoolQuotaPlan &plan) {
     return static_cast<double>((target_hit_tokens - baseline_hit_tokens) * 100.0L / input_tokens);
 }
 
+bool ComputeRealizedHitRateGain(const PoolQuotaPlan &applied_plan,
+                                const OnlineMrcDecisionSnapshot &snapshot,
+                                QuotaRealizedHitRateGain *result,
+                                std::string *reason) {
+    auto fail = [&](const std::string &message) {
+        if (reason) {
+            *reason = message;
+        }
+        return false;
+    };
+    if (!result) {
+        return fail("null_result");
+    }
+    *result = QuotaRealizedHitRateGain{};
+    if (!applied_plan.writes_quota || applied_plan.status != "APPLIED" ||
+        applied_plan.execution_phase != "COMPLETE" || applied_plan.quota_transfer_bytes == 0) {
+        return fail("plan_not_applied_resize");
+    }
+
+    long double input_tokens = 0.0L;
+    long double before_hit_tokens = 0.0L;
+    long double after_hit_tokens = 0.0L;
+    for (const auto &allocation : applied_plan.allocations) {
+        const auto *source = FindSource(snapshot, allocation.source_id);
+        if (!source || source->accepted_facts == 0) {
+            return fail("missing_post_resize_source:" + allocation.source_id);
+        }
+        const auto before = std::find_if(source->curve.begin(), source->curve.end(), [&](const auto &point) {
+            return point.capacity_bytes == static_cast<uint64_t>(allocation.current_quota_bytes);
+        });
+        if (before == source->curve.end()) {
+            return fail("missing_before_quota_point:" + allocation.source_id);
+        }
+        const auto after = std::find_if(source->curve.begin(), source->curve.end(), [&](const auto &point) {
+            return point.capacity_bytes == static_cast<uint64_t>(allocation.target_quota_bytes);
+        });
+        if (after == source->curve.end()) {
+            return fail("missing_after_quota_point:" + allocation.source_id);
+        }
+        if (before->input_tokens == 0 || before->input_tokens != after->input_tokens) {
+            return fail("invalid_post_resize_input_tokens:" + allocation.source_id);
+        }
+        input_tokens += static_cast<long double>(before->input_tokens);
+        before_hit_tokens += static_cast<long double>(before->hit_tokens);
+        after_hit_tokens += static_cast<long double>(after->hit_tokens);
+    }
+    if (input_tokens <= 0.0L) {
+        return fail("empty_post_resize_window");
+    }
+
+    result->snapshot_id = snapshot.snapshot_id;
+    result->input_tokens = static_cast<uint64_t>(input_tokens);
+    result->before_hit_rate_pp = static_cast<double>(before_hit_tokens * 100.0L / input_tokens);
+    result->after_hit_rate_pp = static_cast<double>(after_hit_tokens * 100.0L / input_tokens);
+    result->gain_pp = result->after_hit_rate_pp - result->before_hit_rate_pp;
+    if (reason) {
+        reason->clear();
+    }
+    return true;
+}
+
 bool QuotaPoolMemberConfig::FromRapidValue(const rapidjson::Value &value) {
     KVCM_JSON_GET_MACRO(value, "quota_target_id", quota_target_id);
     KVCM_JSON_GET_MACRO(value, "source_id", source_id);

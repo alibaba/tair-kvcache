@@ -323,4 +323,51 @@ TEST(InMemoryQuotaPlanStoreTest, FreezesTransferOnResizeFailure) {
     EXPECT_FALSE(store.Publish(replacement));
 }
 
+TEST(QuotaPlanBenefitTest, ComputesRealizedGainOnOnePostResizeWindow) {
+    PoolQuotaPlan plan;
+    plan.plan_id = "plan-a";
+    plan.pool_id = "pool-a";
+    plan.writes_quota = true;
+    plan.status = "APPLIED";
+    plan.execution_phase = "COMPLETE";
+    plan.quota_transfer_bytes = kGiB;
+    plan.allocations = {
+        QuotaAllocation{"target-a", "source-a", "group-a", kGiB, 2 * kGiB},
+        QuotaAllocation{"target-b", "source-b", "group-b", 2 * kGiB, kGiB},
+    };
+
+    OnlineMrcDecisionSnapshot snapshot;
+    snapshot.snapshot_id = 11;
+    snapshot.sources = {
+        Source("source-a", 10, 30),
+        Source("source-b", 20, 25),
+    };
+
+    QuotaRealizedHitRateGain realized;
+    std::string reason;
+    ASSERT_TRUE(ComputeRealizedHitRateGain(plan, snapshot, &realized, &reason));
+    EXPECT_TRUE(reason.empty());
+    EXPECT_EQ(11u, realized.snapshot_id);
+    EXPECT_EQ(200u, realized.input_tokens);
+    EXPECT_DOUBLE_EQ(17.5, realized.before_hit_rate_pp);
+    EXPECT_DOUBLE_EQ(25.0, realized.after_hit_rate_pp);
+    EXPECT_DOUBLE_EQ(7.5, realized.gain_pp);
+}
+
+TEST(QuotaPlanBenefitTest, RejectsSnapshotWithoutAppliedQuotaPoint) {
+    PoolQuotaPlan plan;
+    plan.writes_quota = true;
+    plan.status = "APPLIED";
+    plan.execution_phase = "COMPLETE";
+    plan.quota_transfer_bytes = kGiB;
+    plan.allocations = {
+        QuotaAllocation{"target-a", "source-a", "group-a", kGiB, 3 * kGiB},
+    };
+
+    QuotaRealizedHitRateGain realized;
+    std::string reason;
+    EXPECT_FALSE(ComputeRealizedHitRateGain(plan, Snapshot(), &realized, &reason));
+    EXPECT_EQ("missing_after_quota_point:source-a", reason);
+}
+
 } // namespace kv_cache_manager

@@ -296,9 +296,20 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
         return;
     }
     const auto observed_quotas = quota_plan_store_->GetObservedQuotas();
+    std::map<std::string, std::shared_ptr<const PoolQuotaPlan>> applied_plans;
     std::map<std::string, std::set<uint64_t>> capacity_sets_by_source;
     for (const auto &pool : config_.quota_planner_config().pools) {
         const auto observed_pool = observed_quotas.find(pool.pool_id);
+        const auto previous_plan = quota_plan_store_->Get(pool.pool_id);
+        if (previous_plan && previous_plan->writes_quota && previous_plan->status == "APPLIED" &&
+            previous_plan->execution_phase == "COMPLETE" && previous_plan->quota_transfer_bytes > 0) {
+            applied_plans.emplace(pool.pool_id, previous_plan);
+            for (const auto &allocation : previous_plan->allocations) {
+                auto &capacities = capacity_sets_by_source[allocation.source_id];
+                capacities.insert(static_cast<uint64_t>(allocation.current_quota_bytes));
+                capacities.insert(static_cast<uint64_t>(allocation.target_quota_bytes));
+            }
+        }
         for (const auto &member : pool.members) {
             const int64_t maximum = std::min(member.configured_max_quota_bytes, member.hardware_max_quota_bytes);
             auto &capacities = capacity_sets_by_source[member.source_id];
@@ -325,6 +336,50 @@ void OnlineOptimizerServer::PlanQuotaOnce() {
     }
 
     const auto snapshot = manager_->TakeQuotaDecisionSnapshot(capacities_by_source);
+    for (const auto &[pool_id, applied_plan] : applied_plans) {
+        QuotaRealizedHitRateGain realized;
+        std::string reason;
+        if (!ComputeRealizedHitRateGain(*applied_plan, snapshot, &realized, &reason)) {
+            KVCM_LOG_WARN("quota_decision_audit event=realized_gain_skipped system=KVBrain plan_id=%s "
+                          "plan_hash=%s pool_id=%s snapshot_id=%llu reason=%s",
+                          applied_plan->plan_id.c_str(),
+                          applied_plan->plan_hash.c_str(),
+                          pool_id.c_str(),
+                          static_cast<unsigned long long>(snapshot.snapshot_id),
+                          reason.c_str());
+            continue;
+        }
+        KVCM_LOG_INFO("quota_decision_audit event=realized_gain_observed system=KVBrain plan_id=%s plan_hash=%s "
+                      "pool_id=%s snapshot_id=%llu input_tokens=%llu before_hit_rate_pp=%.6f "
+                      "after_hit_rate_pp=%.6f realized_hit_rate_gain_pp=%.6f expected_hit_rate_gain_pp=%.6f",
+                      applied_plan->plan_id.c_str(),
+                      applied_plan->plan_hash.c_str(),
+                      pool_id.c_str(),
+                      static_cast<unsigned long long>(realized.snapshot_id),
+                      static_cast<unsigned long long>(realized.input_tokens),
+                      realized.before_hit_rate_pp,
+                      realized.after_hit_rate_pp,
+                      realized.gain_pp,
+                      applied_plan->expected_hit_rate_gain_pp);
+        if (metrics_registry_) {
+            MetricsTags pool_tags{{"pool_id", pool_id}};
+            metrics_registry_->GetCounter("quota_plan.realized_observations_total", pool_tags) += 1;
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.realized_before_hit_rate_pp",
+                                  pool_tags,
+                                  realized.before_hit_rate_pp);
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.realized_after_hit_rate_pp",
+                                  pool_tags,
+                                  realized.after_hit_rate_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.realized_hit_rate_gain_pp", pool_tags, realized.gain_pp);
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.realized_expected_hit_rate_gain_pp",
+                                  pool_tags,
+                                  applied_plan->expected_hit_rate_gain_pp);
+        }
+    }
     for (const auto &plan : quota_planner_->BuildPlans(snapshot, observed_quotas)) {
         if (!quota_plan_store_->Publish(plan)) {
             KVCM_LOG_WARN("quota_decision_audit event=plan_publish_skipped pool_id=%s reason=active_plan",

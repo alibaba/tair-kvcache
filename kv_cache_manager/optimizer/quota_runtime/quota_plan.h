@@ -142,6 +142,21 @@ struct QuotaResizeResult {
 // over the quota observed at decision time, expressed in percentage points.
 double ExpectedHitRateGainPercentagePoints(const PoolQuotaPlan &plan);
 
+struct QuotaRealizedHitRateGain {
+    uint64_t snapshot_id = 0;
+    uint64_t input_tokens = 0;
+    double before_hit_rate_pp = 0.0;
+    double after_hit_rate_pp = 0.0;
+    double gain_pp = 0.0;
+};
+
+// Replays the applied plan's before/after quotas on the same post-resize MRC
+// snapshot, so traffic-window drift is not counted as realized quota benefit.
+bool ComputeRealizedHitRateGain(const PoolQuotaPlan &applied_plan,
+                                const OnlineMrcDecisionSnapshot &snapshot,
+                                QuotaRealizedHitRateGain *result,
+                                std::string *reason = nullptr);
+
 class InMemoryQuotaPlanStore {
 public:
     using ObservedQuotaMap = std::map<std::string, std::map<std::string, int64_t>>;
