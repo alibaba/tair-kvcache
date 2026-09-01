@@ -536,6 +536,36 @@ TEST_F(SchedulePlanExecutorTest, TestDelayExecution) {
         << "ms, actual execution time: " << execution_duration.count() << "ms";
 }
 
+TEST_F(SchedulePlanExecutorTest, TestAdmittedDeleteRetainsIndexerAfterManagerDetach) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    const auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    ASSERT_NE(nullptr, indexer);
+    MetaSearcher meta_searcher(indexer);
+    auto request_context = std::make_shared<RequestContext>("detach_indexer");
+    const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/detach_indexer")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {501}, {location}, location_ids));
+
+    auto future = executor.Submit(CacheMetaDelRequest{
+        .instance_id = kTestInstanceName,
+        .block_keys = {501},
+        .delay = std::chrono::milliseconds(50),
+    });
+    const auto detached_indexer = meta_manager_->ExtractMetaIndexer(kTestInstanceName);
+    EXPECT_EQ(indexer, detached_indexer);
+    EXPECT_EQ(nullptr, meta_manager_->GetMetaIndexer(kTestInstanceName));
+
+    const auto result = future.get();
+    EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+}
+
 // 测试多个延迟任务的执行顺序
 TEST_F(SchedulePlanExecutorTest, TestMultipleDelayedTasksExecutionOrder) {
     // 创建 MetaIndexer

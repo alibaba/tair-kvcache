@@ -325,10 +325,11 @@ private:
                            bool &is_create_success);
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
-    std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
-                                                                      const std::string &instance_id,
-                                                                      const KeyVector &keys,
-                                                                      const TokenIdsVector &tokens) const;
+    std::pair<ErrorCode, std::shared_ptr<MetaSearcher>>
+    CheckInputAndGetMetaSearcher(RequestContext *request_context,
+                                 const std::string &instance_id,
+                                 const KeyVector &keys,
+                                 const TokenIdsVector &tokens) const;
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     ErrorCode CheckLocationSpecGroupNames(RequestContext *request_context,

@@ -551,10 +551,8 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
     }
 
-    const bool do_copy =
-        method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
-    const bool do_mark =
-        method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_copy = method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_mark = method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
 
     // 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
     // 显式 block_keys 优先，否则由 facade 按 rule.sample_count 采样（<=0 用默认）。
@@ -629,15 +627,15 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
     }
     std::vector<LocationSpecGroup> location_spec_groups;
     ProtoConvert::LocationSpecGroupsFromProto(request->location_spec_groups(), location_spec_groups);
-    auto [ec_info, _] = cache_manager_->RegisterInstance(request_context,
-                                                         request->instance_group(),
-                                                         request->instance_id(),
-                                                         request->block_size(),
-                                                         location_spec_infos,
-                                                         model_deployment_req,
-                                                         location_spec_groups,
-                                                         static_cast<CacheManager::QueryType>(
-                                                             request->default_query_type()));
+    auto [ec_info, _] =
+        cache_manager_->RegisterInstance(request_context,
+                                         request->instance_group(),
+                                         request->instance_id(),
+                                         request->block_size(),
+                                         location_spec_infos,
+                                         model_deployment_req,
+                                         location_spec_groups,
+                                         static_cast<CacheManager::QueryType>(request->default_query_type()));
     if (ec_info != EC_OK) {
         status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
@@ -671,11 +669,6 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstance", "instance_id", true);
     }
-    // exclude all metrics-registration sites for the duration of the
-    // removal so InvalidateInstanceMetrics' single tag-filter purge
-    // cannot race with concurrent producers; instance removal is low
-    // frequency, so the wide locking range is acceptable
-    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
     ErrorCode ec_info =
         cache_manager_->RemoveInstance(request_context, request->instance_group(), request->instance_id());
     if (ec_info != EC_OK) {
