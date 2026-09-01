@@ -76,6 +76,7 @@ cc_library(
     srcs = ["common.cc"],
     hdrs = ["common.h"],
     deps = [
+        ":service_call_guard",
         "//kv_cache_manager/metrics:metrics_collector",
     ],
 )

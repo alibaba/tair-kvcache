@@ -10,6 +10,7 @@
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
+#include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/meta_service_metrics_base.h"
 
 using namespace kv_cache_manager;
@@ -112,6 +113,24 @@ TEST_F(MetaServiceMetricsBaseTest, ReportEventMetricsFallbackDoesNotGateRequestV
     auto invalid_request_collector = base_->ResolveReportEventMetricsCollector(request, metrics_type);
     EXPECT_EQ(collector, invalid_request_collector);
     EXPECT_TRUE(metrics_type.empty());
+}
+
+TEST_F(MetaServiceMetricsBaseTest, UnknownInstanceRejectionRecordsFinalErrorResult) {
+    MetaServiceGRpc service(metrics_registry_, nullptr, registry_manager_);
+    service.Init();
+    grpc::ServerContext context;
+    proto::meta::GetCacheLocationRequest request;
+    request.set_trace_id("unknown-instance");
+    request.set_instance_id("unknown-instance");
+    proto::meta::GetCacheLocationResponse response;
+
+    EXPECT_TRUE(service.GetCacheLocation(&context, &request, &response).ok());
+    EXPECT_EQ(proto::meta::INSTANCE_NOT_EXIST, response.header().status().code());
+    EXPECT_EQ(
+        1u,
+        metrics_registry_
+            ->GetCounter("service.final_result.requests_total", {{"api_name", "GetCacheLocation"}, {"result", "error"}})
+            .Get());
 }
 
 TEST_F(MetaServiceMetricsBaseTest, InvalidateCollectorCacheRemovesTypedReportEventEntries) {

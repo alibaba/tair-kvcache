@@ -3,6 +3,7 @@
 #include <string>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/service/util/service_call_guard.h"
 
 namespace kv_cache_manager {
 
@@ -39,6 +40,7 @@ std::string ExtractIpFromPeer(const std::string &peer);
         auto *status = header->mutable_status();                                                                       \
         status->set_code(proto::meta::INSTANCE_NOT_EXIST);                                                             \
         status->set_message("get " #method " metrics collector failed");                                               \
+        RecordServiceFinalResult(metrics_registry_, #method, false);                                                   \
         return return_value;                                                                                           \
     }
 #endif

@@ -103,18 +103,27 @@ private:
 namespace kv_cache_manager {
 
 void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                              const std::string &api_name,
+                              bool succeeded) {
+    if (!metrics_registry || api_name.empty()) {
+        return;
+    }
+    try {
+        ++metrics_registry->GetCounter(
+            "service.final_result.requests_total", {{"api_name", api_name}, {"result", succeeded ? "success" : "error"}});
+    } catch (...) {
+        // Monitoring must never change the service response.
+    }
+}
+
+void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
                               const RequestContext *request_context) {
     if (!metrics_registry || request_context == nullptr) {
         return;
     }
-    try {
-        const bool succeeded = request_context->status_code() == RequestContext::kOkStatusCode;
-        ++metrics_registry->GetCounter(
-            "service.final_result.requests_total",
-            {{"api_name", request_context->api_name()}, {"result", succeeded ? "success" : "error"}});
-    } catch (...) {
-        // Monitoring must never change the service response.
-    }
+    RecordServiceFinalResult(metrics_registry,
+                             request_context->api_name(),
+                             request_context->status_code() == RequestContext::kOkStatusCode);
 }
 
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,

@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -15,6 +16,9 @@ class MetricsRegistry;
 // Record the terminal result independently from the existing per-query gauges.
 // Entry points also use this helper for readiness/leadership rejection paths
 // that return before ServiceCallGuard can be constructed.
+void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
+                              const std::string &api_name,
+                              bool succeeded);
 void RecordServiceFinalResult(const std::shared_ptr<MetricsRegistry> &metrics_registry,
                               const RequestContext *request_context);
 

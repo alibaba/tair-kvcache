@@ -11,6 +11,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service/grpc_service",
         "//kv_cache_manager/service:meta_service_metrics_base",
     ],
 )
