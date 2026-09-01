@@ -1,193 +1,216 @@
-"""缓存管理模块，包含TairKvCacheConnector的本地缓存管理逻辑"""
+"""Manager-side location queries for the external-match hook.
 
-import enum
-import time
+``get_num_new_matched_tokens`` must never block the scheduler loop, so
+queries run on the http executor and the answer is cached per request
+until consumed. The cache is request-lifecycle scoped -- produced by the
+match hook, consumed by ``update_state_after_alloc`` (which turns the
+answer into a LoadRequest) and invalidated when the request retires --
+plus the expiry below, because a queued request can sit between the two
+hooks for arbitrarily long.
+
+**One slot per request, superseded by the newest ask.** The scheduler
+asks twice per request's life: ``get_num_new_matched_tokens`` (with the
+offset) and ``update_state_after_alloc`` (without it). vLLM's contract
+fills the gap: the alloc hook always consumes the answer of the *last*
+match hook that returned a hit -- it passes the matched token count back
+verbatim. So the cache needs no per-offset addressing; a new ask at a
+different offset is a *different* query that supersedes the old one, and
+only the newest ask's answer may ever be consumed.
+
+**Answers expire.** The manager may delete the blocks a cached answer
+points to at any time after it answered, so a hit is served only while
+younger than ``max_answer_age_s``, measured from query issue. An
+expired hit is a miss: the slot is superseded and the query re-issued.
+In-flight queries are never expired -- the client's request timeout
+bounds them.
+
+**Object identity is the version.** A superseded (or invalidated /
+consumed) query must not write its late answer into the new slot. Each
+ask captures the slot object it created; the async callback compares
+identity before writing. A monotonic version number is kept for logs
+only -- correctness never depends on it.
+"""
+
 import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Tuple, Dict
+from typing import Dict, Optional, Tuple
+
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.logger import logger
+
+QUERY_TYPE = "QT_PREFIX_MATCH"
 
 
 @dataclass(frozen=True)
 class QueryCacheKey:
+    """Identity of one location query; different offsets are different queries."""
+
     req_id: str
     query_type: str
     token_length: int
-    computed_manager_block_size: int
-
-
-class QueryCacheStatus(enum.Enum):
-    RUNNING = 0
-    FINISHED = 1
-    NOT_FOUND = 2
+    computed_blocks: int
 
 
 @dataclass
-class QueryCacheValue:
-    locations: list[Any]
-    query_time: float
-    is_done: bool = False
+class _Query:
+    """The request's one active query. ``locations is None`` = in flight."""
+
+    key: QueryCacheKey
+    version: int = 0
+    locations: list = None          # None until the manager answered
+    ask_time: float = 0.0           # monotonic clock, at query issue
 
 
 class LocationQueryManager:
-    """Location请求管理器，负责Location请求和Location信息缓存的管理"""
+    """Per-request location query cache: produce on match, consume on alloc.
 
-    def __init__(self, manager_client: KvCacheManagerClient, http_executor, instance_id: str,
-                 async_get_cache_location: bool):
-        """
-        初始化缓存管理器
-        
-        Args:
-            manager_client: Manager客户端
-            http_executor: HTTP执行器
-            instance_id: 实例ID
-            async_get_cache_location: 是否启用异步GetCacheLocation
-        """
+    One ``_Query`` slot per request. Re-asking the slot's own offset
+    deduplicates (in flight -> wait, answered -> serve while fresh);
+    asking a different offset *supersedes* the slot. An answered hit
+    older than ``max_answer_age_s`` is a miss: the slot is superseded
+    and the query re-issued.
+    """
+
+    def __init__(self, manager_client: KvCacheManagerClient, http_executor,
+                 instance_id: str, async_get_cache_location: bool,
+                 max_answer_age_s: float = 1.0):
         self._manager_client = manager_client
         self._http_executor = http_executor
         self._instance_id = instance_id
         self._async_get_cache_location = async_get_cache_location
-
-        self._local_query_cache_lock = threading.Lock()
-        self._local_query_cache: Dict[QueryCacheKey, QueryCacheValue] = {}
-
-        self._cleanup_stop_event = threading.Event()
-        self._cleanup_thread = threading.Thread(target=self._cleanup_expired_local_cache, daemon=True)
-        self._cleanup_thread.start()
+        self._max_answer_age_s = max_answer_age_s
+        self._lock = threading.Lock()
+        # req_id -> the request's one active query slot.
+        self._queries: Dict[str, _Query] = {}
+        # Hits refused for age and re-fetched.
+        self.stale_supersede_count = 0
 
     def shutdown(self):
-        """关闭缓存管理器"""
-        self._cleanup_stop_event.set()
-        if self._cleanup_thread.is_alive():
-            self._cleanup_thread.join(timeout=2.0)
+        pass
 
-    def _cleanup_expired_local_cache(self):
-        """清理过期的本地缓存条目"""
-        while not self._cleanup_stop_event.wait(1.0):
-            try:
-                current_time = time.time()
-                expired_keys = []
-
-                with self._local_query_cache_lock:
-                    for key, value in self._local_query_cache.items():
-                        # TODO: editable ttl
-                        if current_time - value.query_time > 1:
-                            expired_keys.append(key)
-                    for key in expired_keys:
-                        self._local_query_cache.pop(key)
-
-                if expired_keys:
-                    logger.debug("Cleaned up %d expired query cache entries", len(expired_keys))
-            except Exception as e:
-                logger.warning("Error during query cache cleanup: %s", e)
-
-    def _get_cache_from_manager(self, request, computed_manager_block_size: int, query_key: QueryCacheKey):
-        """
-        从管理器获取缓存位置
-        
-        Args:
-            request: 请求对象
-            computed_manager_block_size: 本地已命中的block数量
-            query_key: 查询键
-        """
-        try:
-            get_request = {
-                "trace_id": request.request_id,
-                "token_ids": request.prompt_token_ids,
-                "instance_id": self._instance_id,
-                "query_type": "QT_PREFIX_MATCH",
-                "block_mask": {
-                    "offset": computed_manager_block_size
-                }
-            }
-            logger.debug("get_kvcache_location request: %s", get_request)
-            result = self._manager_client.get_cache_location(get_request)
-            logger.debug("get_kvcache_location result: %s", result)
-            need_load_locations = result["locations"]
-            with self._local_query_cache_lock:
-                if query_key not in self._local_query_cache:
-                    logger.warning("_local_query_cache not found %s when request finished", request.request_id)
-                    return
-                self._local_query_cache[query_key].locations = need_load_locations
-                self._local_query_cache[query_key].is_done = True
-        except Exception as e:
-            logger.warning("get_cache_location error, request_id: %s, error: %s", request.request_id, e)
-            with self._local_query_cache_lock:
-                if query_key in self._local_query_cache:
-                    self._local_query_cache.pop(query_key)
-
-    def _try_get_locations_from_local_cache(self, query_key: QueryCacheKey) -> Tuple[QueryCacheStatus, list]:
-        """
-        尝试从本地缓存获取位置
-        
-        Args:
-            query_key: 查询键
-            
-        Returns:
-            (状态, 位置列表)
-        """
-        with self._local_query_cache_lock:
-            if query_key not in self._local_query_cache:
-                return QueryCacheStatus.NOT_FOUND, []
-            query_value = self._local_query_cache[query_key]
-            # TODO: editable ttl
-            if time.time() - query_value.query_time > 1:
-                # cache timeout
-                self._local_query_cache.pop(query_key)
-                return QueryCacheStatus.NOT_FOUND, []
-            if query_value.is_done:
-                return QueryCacheStatus.FINISHED, query_value.locations
-            else:
-                return QueryCacheStatus.RUNNING, []
-
-    def get_locations_for_query(self, request, computed_manager_block_size: int) -> Tuple[bool, list]:
-        """
-        获取查询的位置信息
-        
-        Args:
-            request: 请求对象
-            computed_manager_block_size: 本地已命中的block数量
-            
-        Returns:
-            (查询是否完成, 位置列表)
-        """
-        # TODO: async get_kvcache_location
-        query_key = QueryCacheKey(
+    @staticmethod
+    def _key(request, computed_blocks: int) -> QueryCacheKey:
+        return QueryCacheKey(
             req_id=request.request_id,
-            query_type="QT_PREFIX_MATCH",
+            query_type=QUERY_TYPE,
             token_length=len(request.prompt_token_ids),
-            computed_manager_block_size=computed_manager_block_size)
-        try:
-            status, locations = self._try_get_locations_from_local_cache(query_key)
-            if status == QueryCacheStatus.RUNNING:
-                return False, []
-            elif status == QueryCacheStatus.FINISHED:
-                return True, locations
+            computed_blocks=computed_blocks)
 
-            # status == QueryCacheStatus.NOT_FOUND
-            # insert new cache
-            with self._local_query_cache_lock:
-                self._local_query_cache[query_key] = QueryCacheValue(
-                    locations=[], query_time=time.time(), is_done=False)
-            if self._async_get_cache_location:
-                future = self._http_executor.submit(self._get_cache_from_manager, request, computed_manager_block_size,
-                                                    query_key)
-                return False, []
-            else:
-                self._get_cache_from_manager(request, computed_manager_block_size, query_key)
-                # only sync call need check again
-                status, locations = self._try_get_locations_from_local_cache(query_key)
-                if status == QueryCacheStatus.NOT_FOUND:
-                    # do_get_cache_locations error, bypass load
-                    return True, []
-                elif status == QueryCacheStatus.RUNNING:
-                    return False, []
-                elif status == QueryCacheStatus.FINISHED:
-                    return True, locations
+    def _fetch_from_manager(self, request, computed_blocks: int):
+        """Run the actual GetCacheLocation call (http thread or inline)."""
+        get_request = {
+            "trace_id": request.request_id,
+            "token_ids": request.prompt_token_ids,
+            "instance_id": self._instance_id,
+            "query_type": QUERY_TYPE,
+            "block_mask": {"offset": computed_blocks},
+        }
+        logger.debug("get_kvcache_location request: %s", get_request)
+        result = self._manager_client.get_cache_location(get_request)
+        logger.debug("get_kvcache_location result: %s", result)
+        return result["locations"]
+
+    def _query_async(self, request, key: QueryCacheKey, q: _Query) -> None:
+        def run():
+            try:
+                locations = self._fetch_from_manager(request, key.computed_blocks)
+            except Exception as e:
+                logger.warning("get_cache_location error, request_id: %s, error: %s",
+                               request.request_id, e)
+                with self._lock:
+                    # Drop the slot: the next match hook re-issues the query.
+                    if self._queries.get(request.request_id) is q:
+                        self._queries.pop(request.request_id, None)
+                return
+            with self._lock:
+                if self._queries.get(request.request_id) is q:
+                    q.locations = locations
                 else:
-                    logger.warning("unknown local cache query status: %s", status)
-                    return True, []
+                    # Superseded / consumed / invalidated meanwhile: the
+                    # answer of a dead ask must never write into the new
+                    # slot (late answers only win against older asks, never
+                    # against newer ones).
+                    logger.debug("get_cache_location answer dropped: request %s "
+                                 "query v%d was superseded",
+                                 request.request_id, q.version)
+
+        self._http_executor.submit(run)
+
+    def get_locations_for_query(self, request, computed_blocks: int) -> Optional[list]:
+        """Ask (or re-ask) for the request's external match at this offset.
+
+        Returns the locations when a fresh answer is already cached for
+        this exact query key, None while a query is in flight for it (the
+        scheduler re-asks next step), and [] when the query answered "no
+        hit". An ask at a different offset -- or one whose cached answer
+        has expired -- supersedes the slot: a new query starts
+        immediately, and the old answer can no longer be consumed. A
+        failed query drops its slot so the next hook call re-issues.
+        """
+        req_id = request.request_id
+        key = self._key(request, computed_blocks)
+        with self._lock:
+            q = self._queries.get(req_id)
+            if q is not None and q.key == key:
+                if q.locations is None:
+                    # Same query still in flight: dedupe (the scheduler
+                    # re-asks every step; the client timeout bounds it).
+                    return None
+                age = time.monotonic() - q.ask_time
+                if age <= self._max_answer_age_s:
+                    return q.locations
+                # Expired: a miss. Old answers are never served.
+                self.stale_supersede_count += 1
+                logger.info("req:%s location answer expired after %.3fs "
+                            "(max %.3fs); re-querying", req_id, age,
+                            self._max_answer_age_s)
+            # First ask, a different offset, or an expired answer: the
+            # newest ask supersedes.
+            q = _Query(key=key,
+                       version=q.version + 1 if q is not None else 0,
+                       ask_time=time.monotonic())
+            self._queries[req_id] = q
+
+        if self._async_get_cache_location:
+            self._query_async(request, key, q)
+            return None
+        try:
+            locations = self._fetch_from_manager(request, computed_blocks)
         except Exception as e:
-            logger.warning("get_locations_for_query error, request_id: %s, error: %s", request.request_id, e)
-            return True, []
+            logger.warning("get_cache_location error, request_id: %s, error: %s",
+                           req_id, e)
+            with self._lock:
+                if self._queries.get(req_id) is q:
+                    self._queries.pop(req_id, None)
+            return []
+        with self._lock:
+            if self._queries.get(req_id) is q:
+                q.locations = locations
+        return locations
+
+    def store_result(self, req_id: str, locations: list) -> None:
+        """Overwrite the cached answer (the match hook clamps it to a
+        vLLM-safe prefix before the allocation consumes it). The slot is
+        necessarily the query the hook just got its answer from: the hook
+        runs on the scheduler thread and only it supersedes slots."""
+        with self._lock:
+            q = self._queries.get(req_id)
+            if q is not None:
+                q.locations = locations
+
+    def consume_locations(self, req_id: str) -> Optional[Tuple[list, int]]:
+        """Pop the request's answered query: (locations, computed_blocks),
+        or None when nothing is cached (no query was issued / still in
+        flight / already consumed)."""
+        with self._lock:
+            q = self._queries.pop(req_id, None)
+            if q is None or q.locations is None:
+                return None
+            return q.locations, q.key.computed_blocks
+
+    def invalidate(self, req_id: str) -> None:
+        """Drop the request's query: it is going away, and any answer still
+        in flight must not write into a future slot."""
+        with self._lock:
+            self._queries.pop(req_id, None)

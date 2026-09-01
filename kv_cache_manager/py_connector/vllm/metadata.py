@@ -1,59 +1,55 @@
 from dataclasses import dataclass, field
+from typing import List
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 
 @dataclass
 class SaveRequest:
     req_id: str
-    target_locations: list[dict]
-    manager_block_idxes: list
+    # CacheLocation dicts returned by the manager (one per manager block to save),
+    # each carrying location_specs for every registered spec name.
+    target_locations: List[dict]
+    # Manager block indices (into the request's token stream) being saved.
+    manager_block_idxes: List[int]
     write_session_id: str
+    # Per-group block table snapshot taken by the scheduler when the save
+    # instruction is handed to the worker: the gather needs it to translate
+    # manager blocks into physical slots, and the scheduler's ledger is the
+    # only place it exists. The worker keeps no request mirror.
+    all_block_ids: List[List[int]] = field(default_factory=list)
 
 
-@dataclass()
+@dataclass
 class LoadRequest:
     req_id: str
-    manager_block_idxes: list
-    need_load_locations: list[dict]
-    local_block_ids: list = field(default_factory=list)
+    manager_block_idxes: List[int]
+    need_load_locations: List[dict]
+    # Per-group block tables: all_block_ids[group_idx] is the list of local
+    # block ids for that kv_cache_group (filled by the scheduler once vLLM
+    # allocated the blocks). Length 1 for pure-attention models.
+    all_block_ids: List[List[int]] = field(default_factory=list)
 
 
-@dataclass()
+@dataclass
 class FinishRequest:
     req_id: str
 
 
 @dataclass
-class ReqStateToWorker:
-    """发送给工作节点的请求状态数据结构"""
-
-    req_id: str
-    has_saved_block_num: int
-    new_tokens_ids: list = field(default_factory=list)
-    new_local_block_ids: list = field(default_factory=list)
-    resumed_from_preemption: bool = False
-    is_delta: bool = True
-
-@dataclass
 class TairKvCacheConnectorMetadata(KVConnectorMetadata):
-    """TairKvCacheConnector的元数据类，用于在调度器和工作节点之间传递状态"""
-    requests: list[ReqStateToWorker]
+    """Scheduler -> worker metadata for one engine step.
+
+    Three instruction kinds, each consumed by its own worker hook:
+    to_load_requests (start_load_kv), to_save_requests (wait_for_save) and
+    to_finish_requests (get_finished). Every instruction is self-contained
+    -- the worker keeps no per-request mirror of scheduler state."""
 
     def __init__(self, epoch: int):
-        """
-       初始化元数据
-
-       Args:
-           epoch: 当前epoch编号
-       """
         self.epoch = epoch
-        self.requests: list[ReqStateToWorker] = []
-        self.to_load_requests: list[LoadRequest] = []
-        self.to_save_requests: list[SaveRequest] = []
-        self.to_finish_requests: list[FinishRequest] = []
-
-    def add_req_state_to_worker(self, request: ReqStateToWorker):
-        self.requests.append(request)
+        self.to_load_requests: List[LoadRequest] = []
+        self.to_save_requests: List[SaveRequest] = []
+        self.to_finish_requests: List[FinishRequest] = []
 
     def add_load_request(self, request: LoadRequest):
         self.to_load_requests.append(request)
@@ -65,5 +61,7 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         self.to_finish_requests.append(finish_request)
 
     def __repr__(self):
-        return f"TairKvCacheConnectorMetadata(requests={self.requests})"
-
+        return (f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
+                f"load={len(self.to_load_requests)}, "
+                f"save={len(self.to_save_requests)}, "
+                f"finish={len(self.to_finish_requests)})")
