@@ -209,10 +209,11 @@ private:
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;
-    std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
-                                           const LocationIdsPerKey &location_ids,
-                                           CacheLocationMapVector &locations,
-                                           PropertyMapVector &properties) const noexcept;
+    struct IndexBatch {
+        std::vector<int32_t> shard_indices;
+        std::vector<int32_t> global_indices;
+    };
+    std::vector<IndexBatch> MakeBatches(const KeyVector &keys) const noexcept;
 
     ErrorCode RecoverMetaData() noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
@@ -237,6 +238,7 @@ private:
         int64_t index_deserialize_time_us = 0;
         bool has_index_deserialize = false;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t lock_hold_time_us = 0; // accumulated time holding all shard locks in a batch
         int64_t async_enqueue_timeout_key_count = 0;
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
