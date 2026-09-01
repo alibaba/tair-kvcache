@@ -1,0 +1,6 @@
+FROM ghcr.io/alibaba/tair-kvcache-kvcm-dev:optimizer-2026_09_01_10_28-a808b28
+
+LABEL org.opencontainers.image.source=https://github.com/alibaba/tair-kvcache
+LABEL org.opencontainers.image.revision=c3f06fd6aad1d55b09d64535ed9375e3a59420fe
+LABEL org.opencontainers.image.description="KVBrain optimizer with realized quota-resize gain"
+LABEL org.opencontainers.image.licenses=Apache-2.0
