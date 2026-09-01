@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -15,6 +17,7 @@
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
 #include "kv_cache_manager/optimizer/metrics/mrc_window.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_mrc_snapshot.h"
 
 namespace kv_cache_manager {
 
@@ -51,6 +54,12 @@ struct InstanceState {
     int64_t interval_max_hits = 0;
 
     MrcWindow mrc_window;
+    // Independent from the metrics window: reporting must never consume the
+    // data used by quota decisions.
+    MrcWindow quota_mrc_window;
+    uint64_t quota_input_tokens = 0;
+    uint64_t quota_accepted_facts = 0;
+    int64_t quota_newest_event_ns = 0;
 };
 
 struct TraceQueryResult {
@@ -154,6 +163,10 @@ public:
     // Returns and clears the MRC curve accumulated since the previous call.
     ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);
 
+    OnlineMrcDecisionSnapshot
+    TakeQuotaDecisionSnapshot(const std::map<std::string, std::vector<uint64_t>> &capacity_bytes_by_source,
+                              int64_t now_ns = 0);
+
     ErrorCode ResetStats(const std::string &instance_id);
 
     ErrorCode GetInstanceState(const std::string &instance_id,
@@ -179,6 +192,7 @@ private:
     mutable std::mutex admin_ops_mutex_;
     mutable std::shared_mutex instances_mutex_;
     std::unordered_map<std::string, std::shared_ptr<InstanceState>> instances_;
+    std::atomic<uint64_t> quota_snapshot_generation_{0};
 };
 
 } // namespace kv_cache_manager

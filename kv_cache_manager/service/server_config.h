@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kv_cache_manager/service/quota_policy_poller.h"
+
 namespace kv_cache_manager {
 
 class ServerConfig;
@@ -68,6 +70,7 @@ public:
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
     const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
+    QuotaPolicyPollerConfig GetQuotaPolicyPollerConfig() const;
 
     // Parse revisit_interval_buckets config string into sorted vector of doubles.
     // Returns empty vector if config is empty or invalid. Caller is responsible
@@ -128,6 +131,15 @@ private:
     std::string advertised_host_;
     std::string custom_info_;
     std::string revisit_interval_buckets_;
+    bool quota_policy_poller_enable_ = false;
+    bool quota_policy_poller_enable_hard_resize_ = false;
+    std::string quota_policy_poller_optimizer_service_discovery_url_;
+    std::string quota_policy_poller_pool_id_;
+    std::string quota_policy_poller_quota_target_id_;
+    std::string quota_policy_poller_instance_group_;
+    std::string quota_policy_poller_state_file_;
+    int64_t quota_policy_poller_poll_interval_seconds_ = 30;
+    int64_t quota_policy_poller_rpc_timeout_ms_ = 1000;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

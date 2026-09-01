@@ -1,5 +1,7 @@
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
+#include <algorithm>
+#include <chrono>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -9,12 +11,14 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_query_hit_event.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_plan.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
 
 namespace kv_cache_manager {
@@ -104,10 +108,14 @@ void SetErrorOnCollector(RequestContext *request_context, ErrorCode ec) {
 
 OptimizerServiceImpl::OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManager> manager,
                                            std::shared_ptr<OptimizerMetricsReporter> metrics_reporter,
-                                           std::shared_ptr<EventManager> event_manager)
+                                           std::shared_ptr<EventManager> event_manager,
+                                           std::shared_ptr<InMemoryQuotaPlanStore> quota_plan_store,
+                                           std::shared_ptr<MetricsRegistry> metrics_registry)
     : manager_(std::move(manager))
     , metrics_reporter_(std::move(metrics_reporter))
-    , event_manager_(std::move(event_manager)) {}
+    , event_manager_(std::move(event_manager))
+    , quota_plan_store_(std::move(quota_plan_store))
+    , metrics_registry_(std::move(metrics_registry)) {}
 
 // InstanceGroup CRUD
 
@@ -567,6 +575,212 @@ void OptimizerServiceImpl::ResetStats(RequestContext *request_context,
         metrics_reporter_->RemoveInstanceMetrics(instance_id);
     }
 
+    SetPbResponseHeader(response->mutable_header(), ec);
+    request_context->set_status_code(static_cast<int>(ec));
+    SetErrorOnCollector(request_context, ec);
+}
+
+void OptimizerServiceImpl::PullQuotaAllocation(RequestContext *request_context,
+                                               const proto::optimizer::PullQuotaAllocationRequest *request,
+                                               proto::optimizer::PullQuotaAllocationResponse *response) {
+    request_context->set_api_name("PullQuotaAllocation");
+    OptimizerCallGuard guard(request_context, metrics_reporter_.get());
+    if (!quota_plan_store_ || request->pool_id().empty() || request->quota_target_id().empty()) {
+        SetPbResponseHeader(response->mutable_header(), EC_BADARGS);
+        request_context->set_status_code(static_cast<int>(EC_BADARGS));
+        SetErrorOnCollector(request_context, EC_BADARGS);
+        return;
+    }
+    const auto plan = quota_plan_store_->Get(request->pool_id());
+    SetPbResponseHeader(response->mutable_header(), EC_OK);
+    request_context->set_status_code(static_cast<int>(EC_OK));
+    if (!plan) {
+        response->set_pull_status(proto::optimizer::QUOTA_PULL_NO_PLAN);
+        return;
+    }
+    response->set_plan_id(plan->plan_id);
+    response->set_plan_hash(plan->plan_hash);
+    response->set_pool_id(plan->pool_id);
+    response->set_reason(plan->reason);
+    response->set_leader_epoch(plan->leader_epoch);
+    response->set_allocation_epoch(plan->allocation_epoch);
+    response->set_valid_until_ns(plan->valid_until_ns);
+    response->set_executable(plan->executable);
+    response->set_execution_phase(plan->execution_phase);
+    response->set_execution_revision(plan->execution_revision);
+    response->set_release_deadline_ns(plan->release_deadline_ns);
+    response->set_release_consecutive_samples(plan->release_consecutive_samples);
+    response->set_writes_quota(plan->writes_quota);
+
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    if (plan->valid_until_ns <= now_ns) {
+        std::string ignored_reason;
+        quota_plan_store_->RecordResizeResult(QuotaResizeResult{plan->plan_id,
+                                                                plan->plan_hash,
+                                                                plan->pool_id,
+                                                                request->quota_target_id(),
+                                                                plan->leader_epoch,
+                                                                plan->allocation_epoch,
+                                                                plan->execution_revision,
+                                                                "PLAN_TIMEOUT",
+                                                                "plan_expired",
+                                                                request->current_quota_bytes(),
+                                                                request->current_used_bytes()},
+                                              &ignored_reason);
+        response->set_pull_status(proto::optimizer::QUOTA_PULL_FROZEN);
+        response->set_reason("plan_expired");
+        response->set_executable(false);
+        return;
+    }
+    if (request->last_leader_epoch() == plan->leader_epoch &&
+        request->last_allocation_epoch() == plan->allocation_epoch &&
+        request->last_execution_revision() == plan->execution_revision) {
+        response->set_pull_status(proto::optimizer::QUOTA_PULL_NOT_MODIFIED);
+        return;
+    }
+    if (plan->status == "FROZEN" || plan->execution_phase == "FROZEN") {
+        response->set_pull_status(proto::optimizer::QUOTA_PULL_FROZEN);
+        return;
+    }
+    const auto allocation_it =
+        std::find_if(plan->allocations.begin(), plan->allocations.end(), [&](const QuotaAllocation &allocation) {
+            return allocation.quota_target_id == request->quota_target_id();
+        });
+    if (allocation_it == plan->allocations.end()) {
+        response->set_pull_status(proto::optimizer::QUOTA_PULL_FROZEN);
+        response->set_reason("quota_target_not_in_plan");
+        return;
+    }
+    response->set_pull_status(proto::optimizer::QUOTA_PULL_PLAN);
+    auto *allocation = response->mutable_allocation();
+    allocation->set_quota_target_id(allocation_it->quota_target_id);
+    allocation->set_instance_group(allocation_it->instance_group);
+    allocation->set_current_quota_bytes(allocation_it->current_quota_bytes);
+    allocation->set_target_quota_bytes(allocation_it->target_quota_bytes);
+    allocation->set_min_quota_bytes(allocation_it->min_quota_bytes);
+    allocation->set_max_quota_bytes(allocation_it->max_quota_bytes);
+    if (metrics_registry_) {
+        MetricsTags pool_tags{{"pool_id", plan->pool_id}};
+        REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                              "quota_plan.pool_allocatable_bytes",
+                              pool_tags,
+                              static_cast<double>(plan->pool_allocatable_bytes));
+        REPORT_DYNAMIC_GAUGE_(
+            metrics_registry_, "quota_plan.expected_hit_rate_gain_pp", pool_tags, plan->expected_hit_rate_gain_pp);
+        REPORT_DYNAMIC_GAUGE_(
+            metrics_registry_, "quota_plan.expected_net_gain_pp", pool_tags, plan->expected_net_gain_pp);
+        REPORT_DYNAMIC_GAUGE_(
+            metrics_registry_, "quota_plan.gain_pp_per_tib_moved", pool_tags, plan->gain_pp_per_tib_moved);
+        REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                              "quota_plan.quota_transfer_bytes",
+                              pool_tags,
+                              static_cast<double>(plan->quota_transfer_bytes));
+        REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                              "quota_plan.sla_capacity_saving_bytes",
+                              pool_tags,
+                              static_cast<double>(plan->sla_capacity_saving_bytes));
+        MetricsTags target_tags{{"pool_id", plan->pool_id}, {"quota_target_id", allocation_it->quota_target_id}};
+        REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                              "quota_plan.target_quota_bytes",
+                              target_tags,
+                              static_cast<double>(allocation_it->target_quota_bytes));
+    }
+    if (plan->writes_quota) {
+        if (plan->execution_phase == "RECONCILE") {
+            response->set_execution_phase("HOLD");
+            response->set_executable(false);
+            return;
+        }
+        const bool donor = plan->release_required_targets.count(allocation_it->quota_target_id) != 0;
+        const bool receiver = allocation_it->target_quota_bytes > allocation_it->current_quota_bytes;
+        if ((plan->execution_phase == "DONOR_SHRINK" && !donor) ||
+            (plan->execution_phase == "RECEIVER_GROW" && !receiver)) {
+            response->set_execution_phase("HOLD");
+            response->set_executable(false);
+        }
+    }
+}
+
+void OptimizerServiceImpl::ReportQuotaResizeResult(RequestContext *request_context,
+                                                   const proto::optimizer::ReportQuotaResizeResultRequest *request,
+                                                   proto::optimizer::ReportQuotaResizeResultResponse *response) {
+    request_context->set_api_name("ReportQuotaResizeResult");
+    OptimizerCallGuard guard(request_context, metrics_reporter_.get());
+    ErrorCode ec = EC_BADARGS;
+    std::string store_reason;
+    if (quota_plan_store_ && !request->phase().empty() && !request->status().empty() &&
+        quota_plan_store_->RecordResizeResult(QuotaResizeResult{request->plan_id(),
+                                                                request->plan_hash(),
+                                                                request->pool_id(),
+                                                                request->quota_target_id(),
+                                                                request->leader_epoch(),
+                                                                request->allocation_epoch(),
+                                                                request->execution_revision(),
+                                                                request->status(),
+                                                                request->reason(),
+                                                                request->observed_quota_bytes(),
+                                                                request->observed_used_bytes()},
+                                              &store_reason)) {
+        ec = EC_OK;
+        KVCM_LOG_INFO("quota_decision_audit event=resize_result_received plan_id=%s plan_hash=%s pool_id=%s "
+                      "quota_target_id=%s leader_epoch=%llu allocation_epoch=%llu phase=%s status=%s reason=%s "
+                      "observed_quota_bytes=%ld observed_used_bytes=%ld instance_group_version=%ld",
+                      request->plan_id().c_str(),
+                      request->plan_hash().c_str(),
+                      request->pool_id().c_str(),
+                      request->quota_target_id().c_str(),
+                      static_cast<unsigned long long>(request->leader_epoch()),
+                      static_cast<unsigned long long>(request->allocation_epoch()),
+                      request->phase().c_str(),
+                      request->status().c_str(),
+                      request->reason().c_str(),
+                      static_cast<long>(request->observed_quota_bytes()),
+                      static_cast<long>(request->observed_used_bytes()),
+                      static_cast<long>(request->instance_group_version()));
+        if (metrics_registry_) {
+            MetricsTags tags{{"pool_id", request->pool_id()}, {"quota_target_id", request->quota_target_id()}};
+            metrics_registry_->GetCounter("quota_plan.resize_results_total", tags) += 1;
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.observed_quota_bytes",
+                                  tags,
+                                  static_cast<double>(request->observed_quota_bytes()));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.observed_used_bytes",
+                                  tags,
+                                  static_cast<double>(request->observed_used_bytes()));
+            const auto updated_plan = quota_plan_store_->Get(request->pool_id());
+            if (updated_plan) {
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.execution_revision",
+                                      tags,
+                                      static_cast<double>(updated_plan->execution_revision));
+                MetricsTags phase_tags = tags;
+                phase_tags["phase"] = updated_plan->execution_phase;
+                metrics_registry_->GetCounter("quota_plan.phase_observations_total", phase_tags) += 1;
+                if (updated_plan->execution_revision != request->execution_revision()) {
+                    KVCM_LOG_INFO("quota_decision_audit event=execution_phase_transition plan_id=%s plan_hash=%s "
+                                  "pool_id=%s previous_phase=%s next_phase=%s execution_revision=%llu status=%s "
+                                  "reason=%s",
+                                  updated_plan->plan_id.c_str(),
+                                  updated_plan->plan_hash.c_str(),
+                                  updated_plan->pool_id.c_str(),
+                                  request->phase().c_str(),
+                                  updated_plan->execution_phase.c_str(),
+                                  static_cast<unsigned long long>(updated_plan->execution_revision),
+                                  updated_plan->status.c_str(),
+                                  updated_plan->reason.c_str());
+                    metrics_registry_->GetCounter("quota_plan.phase_transitions_total", phase_tags) += 1;
+                }
+            }
+        }
+    } else if (!store_reason.empty()) {
+        KVCM_LOG_WARN("quota_decision_audit event=resize_result_rejected pool_id=%s quota_target_id=%s reason=%s",
+                      request->pool_id().c_str(),
+                      request->quota_target_id().c_str(),
+                      store_reason.c_str());
+    }
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));
     SetErrorOnCollector(request_context, ec);

@@ -273,6 +273,51 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->revisit_interval_buckets_ = value;
          return true;
+     }},
+    {"kvcm.quota_policy_poller.enable",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_enable_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.quota_policy_poller.enable_hard_resize",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_enable_hard_resize_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.quota_policy_poller.optimizer_service_discovery_url",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_optimizer_service_discovery_url_ = value;
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.pool_id",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_pool_id_ = value;
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.quota_target_id",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_quota_target_id_ = value;
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.instance_group",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_instance_group_ = value;
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.state_file",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_state_file_ = value;
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.poll_interval_seconds",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_poll_interval_seconds_ = std::stol(value);
+         return true;
+     }},
+    {"kvcm.quota_policy_poller.rpc_timeout_ms",
+     [](const std::string &value, ServerConfig *config) {
+         config->quota_policy_poller_rpc_timeout_ms_ = std::stol(value);
+         return true;
      }}};
 // clang-format on
 
@@ -420,6 +465,20 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
     }
 }
 
+QuotaPolicyPollerConfig ServerConfig::GetQuotaPolicyPollerConfig() const {
+    QuotaPolicyPollerConfig config;
+    config.enable = quota_policy_poller_enable_;
+    config.enable_hard_resize = quota_policy_poller_enable_hard_resize_;
+    config.optimizer_service_discovery_url = quota_policy_poller_optimizer_service_discovery_url_;
+    config.pool_id = quota_policy_poller_pool_id_;
+    config.quota_target_id = quota_policy_poller_quota_target_id_;
+    config.instance_group = quota_policy_poller_instance_group_;
+    config.state_file = quota_policy_poller_state_file_;
+    config.poll_interval_seconds = quota_policy_poller_poll_interval_seconds_;
+    config.rpc_timeout_ms = quota_policy_poller_rpc_timeout_ms_;
+    return config;
+}
+
 bool ServerConfig::Check() {
     // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
     // falls back to local backend. No validation needed for empty value.
@@ -472,6 +531,22 @@ bool ServerConfig::Check() {
                 "Cache GC intervals, batch size and max in-flight requests must be greater than zero, and orphan "
                 "WRITING grace must be at least %ldms\n",
                 kMinCacheGcOrphanWritingGracePeriodMs);
+        return false;
+    }
+
+    if (quota_policy_poller_enable_hard_resize_ && !quota_policy_poller_enable_) {
+        fprintf(stderr, "hard quota resize requires quota policy poller to be enabled\n");
+        return false;
+    }
+    if (quota_policy_poller_enable_ && quota_policy_poller_optimizer_service_discovery_url_.empty()) {
+        fprintf(stderr, "quota policy poller requires optimizer discovery URL\n");
+        return false;
+    }
+    if (quota_policy_poller_enable_ &&
+        (quota_policy_poller_pool_id_.empty() || quota_policy_poller_quota_target_id_.empty() ||
+         quota_policy_poller_instance_group_.empty() || quota_policy_poller_state_file_.empty() ||
+         quota_policy_poller_poll_interval_seconds_ <= 0 || quota_policy_poller_rpc_timeout_ms_ <= 0)) {
+        fprintf(stderr, "quota policy poller requires identity, state file, and positive cadence/timeout\n");
         return false;
     }
 

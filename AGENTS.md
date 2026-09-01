@@ -37,6 +37,7 @@ flowchart TD
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
     optimizer --> protocol
     optimizer -. SubscribeEvents .-> service
+    service -. PullQuotaAllocation / ReportQuotaResizeResult .-> optimizer
 ```
 
 > 若模块职责、依赖方向或调用关系变动，或新增/删除模块，请同步更新本图与 [docs/design/module_architecture.md](docs/design/module_architecture.md)。

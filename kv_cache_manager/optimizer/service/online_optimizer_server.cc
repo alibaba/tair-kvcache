@@ -3,6 +3,9 @@
 #include <chrono>
 #include <fstream>
 #include <grpcpp/grpcpp.h>
+#include <map>
+#include <set>
+#include <sstream>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
@@ -14,6 +17,7 @@
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_plan.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 #include "kv_cache_manager/optimizer/service/http/optimizer_service_http.h"
@@ -82,7 +86,12 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
         KVCM_LOG_INFO("Optimizer log event publisher registered");
     }
 
-    service_impl_ = std::make_shared<OptimizerServiceImpl>(manager_, metrics_reporter_, event_manager_);
+    if (config_.quota_planner_config().enable) {
+        quota_plan_store_ = std::make_shared<InMemoryQuotaPlanStore>();
+        quota_planner_ = std::make_unique<ShadowQuotaPlanner>(config_.quota_planner_config());
+    }
+    service_impl_ = std::make_shared<OptimizerServiceImpl>(
+        manager_, metrics_reporter_, event_manager_, quota_plan_store_, metrics_registry_);
 
     kvcm_event_subscribers_.clear();
     kvcm_event_subscribers_.reserve(config_.kvcm_event_subscriptions().size());
@@ -178,6 +187,19 @@ bool OnlineOptimizerServer::Start() {
         }
     }
 
+    if (quota_planner_) {
+        PlanQuotaOnce();
+        quota_planner_thread_ =
+            LoopThread::CreateLoopThread([this]() { PlanQuotaOnce(); },
+                                         config_.quota_planner_config().period_seconds * 1000 * 1000,
+                                         "KVBrainQuotaPlanner");
+        if (!quota_planner_thread_) {
+            KVCM_LOG_ERROR("Failed to start KVBrain quota planner");
+            Stop();
+            return false;
+        }
+    }
+
     KVCM_LOG_INFO("OnlineOptimizerServer started: rpc_port=%d http_port=%d", config_.rpc_port(), config_.http_port());
     return true;
 }
@@ -224,6 +246,10 @@ void OnlineOptimizerServer::DoStop() {
         metrics_report_thread_->Stop();
         metrics_report_thread_.reset();
     }
+    if (quota_planner_thread_) {
+        quota_planner_thread_->Stop();
+        quota_planner_thread_.reset();
+    }
     if (kmonitor_metrics_reporter_) {
         kmonitor_metrics_reporter_->Shutdown();
         kmonitor_metrics_reporter_.reset();
@@ -263,6 +289,144 @@ void OnlineOptimizerServer::RecoveryRetryLoop() {
         KVCM_LOG_WARN("Recovery retry attempt %d failed (ec=%d)", attempt, static_cast<int>(ec));
     }
     KVCM_LOG_ERROR("Recovery failed after %d retries, running without persisted state", kMaxRetries);
+}
+
+void OnlineOptimizerServer::PlanQuotaOnce() {
+    if (!manager_ || !quota_planner_ || !quota_plan_store_) {
+        return;
+    }
+    const auto observed_quotas = quota_plan_store_->GetObservedQuotas();
+    std::map<std::string, std::set<uint64_t>> capacity_sets_by_source;
+    for (const auto &pool : config_.quota_planner_config().pools) {
+        const auto observed_pool = observed_quotas.find(pool.pool_id);
+        for (const auto &member : pool.members) {
+            const int64_t maximum = std::min(member.configured_max_quota_bytes, member.hardware_max_quota_bytes);
+            auto &capacities = capacity_sets_by_source[member.source_id];
+            capacities.insert(static_cast<uint64_t>(member.min_quota_bytes));
+            capacities.insert(static_cast<uint64_t>(member.current_quota_bytes));
+            capacities.insert(static_cast<uint64_t>(maximum));
+            if (observed_pool != observed_quotas.end()) {
+                const auto observed_member = observed_pool->second.find(member.quota_target_id);
+                if (observed_member != observed_pool->second.end() && observed_member->second > 0) {
+                    capacities.insert(static_cast<uint64_t>(observed_member->second));
+                }
+            }
+            for (int64_t candidate = member.min_quota_bytes;
+                 candidate < maximum && candidate <= maximum - pool.candidate_step_bytes;
+                 candidate += pool.candidate_step_bytes) {
+                capacities.insert(static_cast<uint64_t>(candidate + pool.candidate_step_bytes));
+            }
+        }
+    }
+
+    std::map<std::string, std::vector<uint64_t>> capacities_by_source;
+    for (const auto &[source_id, capacities] : capacity_sets_by_source) {
+        capacities_by_source.emplace(source_id, std::vector<uint64_t>(capacities.begin(), capacities.end()));
+    }
+
+    const auto snapshot = manager_->TakeQuotaDecisionSnapshot(capacities_by_source);
+    for (const auto &plan : quota_planner_->BuildPlans(snapshot, observed_quotas)) {
+        if (!quota_plan_store_->Publish(plan)) {
+            KVCM_LOG_WARN("quota_decision_audit event=plan_publish_skipped pool_id=%s reason=active_plan",
+                          plan->pool_id.c_str());
+            continue;
+        }
+        std::ostringstream allocations;
+        for (const auto &allocation : plan->allocations) {
+            allocations << allocation.quota_target_id << ':' << allocation.current_quota_bytes << "->"
+                        << allocation.target_quota_bytes << ',';
+        }
+        KVCM_LOG_INFO("quota_decision_audit event=plan_published system=KVBrain plan_id=%s plan_hash=%s pool_id=%s "
+                      "snapshot_id=%llu status=%s phase=%s writes_quota=%d reason=%s "
+                      "baseline_hit_rate_pp=%.6f target_hit_rate_pp=%.6f expected_hit_rate_gain_pp=%.6f "
+                      "movement_penalty_pp=%.6f expected_net_gain_pp=%.6f gain_pp_per_tib_moved=%.6f "
+                      "quota_change_bytes=%llu quota_transfer_bytes=%llu stability=%lld/%lld "
+                      "capacity_saving_sla_ratio=%.6f sla_required_capacity_bytes=%lld "
+                      "sla_capacity_saving_bytes=%lld sla_capacity_deficit_bytes=%lld allocations=%s",
+                      plan->plan_id.c_str(),
+                      plan->plan_hash.c_str(),
+                      plan->pool_id.c_str(),
+                      static_cast<unsigned long long>(plan->mrc_snapshot_id),
+                      plan->status.c_str(),
+                      plan->execution_phase.c_str(),
+                      static_cast<int>(plan->writes_quota),
+                      plan->reason.c_str(),
+                      plan->baseline_hit_rate_pp,
+                      plan->target_hit_rate_pp,
+                      plan->expected_hit_rate_gain_pp,
+                      plan->movement_penalty_pp,
+                      plan->expected_net_gain_pp,
+                      plan->gain_pp_per_tib_moved,
+                      static_cast<unsigned long long>(plan->quota_change_bytes),
+                      static_cast<unsigned long long>(plan->quota_transfer_bytes),
+                      static_cast<long long>(plan->stability_confirmed_plans),
+                      static_cast<long long>(plan->stability_required_plans),
+                      plan->capacity_saving_sla_ratio,
+                      static_cast<long long>(plan->sla_required_capacity_bytes),
+                      static_cast<long long>(plan->sla_capacity_saving_bytes),
+                      static_cast<long long>(plan->sla_capacity_deficit_bytes),
+                      allocations.str().c_str());
+        if (metrics_registry_) {
+            MetricsTags tags{{"pool_id", plan->pool_id}, {"status", plan->status}, {"phase", plan->execution_phase}};
+            metrics_registry_->GetCounter("quota_plan.published_total", tags) += 1;
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.execution_revision",
+                                  tags,
+                                  static_cast<double>(plan->execution_revision));
+            MetricsTags pool_tags{{"pool_id", plan->pool_id}};
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.pool_allocatable_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->pool_allocatable_bytes));
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.expected_hit_rate_gain_pp", pool_tags, plan->expected_hit_rate_gain_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.baseline_hit_rate_pp", pool_tags, plan->baseline_hit_rate_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.target_hit_rate_pp", pool_tags, plan->target_hit_rate_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.movement_penalty_pp", pool_tags, plan->movement_penalty_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.expected_net_gain_pp", pool_tags, plan->expected_net_gain_pp);
+            REPORT_DYNAMIC_GAUGE_(
+                metrics_registry_, "quota_plan.gain_pp_per_tib_moved", pool_tags, plan->gain_pp_per_tib_moved);
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.quota_change_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->quota_change_bytes));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.quota_transfer_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->quota_transfer_bytes));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.stability_confirmed_plans",
+                                  pool_tags,
+                                  static_cast<double>(plan->stability_confirmed_plans));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.stability_required_plans",
+                                  pool_tags,
+                                  static_cast<double>(plan->stability_required_plans));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.sla_required_capacity_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->sla_required_capacity_bytes));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.sla_capacity_saving_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->sla_capacity_saving_bytes));
+            REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                  "quota_plan.sla_capacity_deficit_bytes",
+                                  pool_tags,
+                                  static_cast<double>(plan->sla_capacity_deficit_bytes));
+            for (const auto &allocation : plan->allocations) {
+                MetricsTags target_tags{{"pool_id", plan->pool_id}, {"quota_target_id", allocation.quota_target_id}};
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_,
+                                      "quota_plan.target_quota_bytes",
+                                      target_tags,
+                                      static_cast<double>(allocation.target_quota_bytes));
+            }
+        }
+    }
 }
 
 } // namespace kv_cache_manager

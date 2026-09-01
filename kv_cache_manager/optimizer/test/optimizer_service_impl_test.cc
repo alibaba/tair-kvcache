@@ -1,3 +1,4 @@
+#include <chrono>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -5,8 +6,10 @@
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/event_publisher.h"
 #include "kv_cache_manager/event/spec_events/optimizer_query_hit_event.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_plan.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
@@ -919,6 +922,64 @@ TEST_F(OptimizerServiceImplTest, RegisterInstanceUnsupportedIndexerType) {
     RegisterInstanceResult result;
     ErrorCode ec = manager_->RegisterInstance(info, result);
     EXPECT_EQ(EC_BADARGS, ec);
+}
+
+TEST_F(OptimizerServiceImplTest, PullQuotaAllocationReportsPlanQuotaGauges) {
+    auto plan_store = std::make_shared<InMemoryQuotaPlanStore>();
+    auto metrics = std::make_shared<MetricsRegistry>();
+    auto plan = std::make_shared<PoolQuotaPlan>();
+    plan->plan_id = "plan-1";
+    plan->plan_hash = "hash-1";
+    plan->pool_id = "pool-1";
+    plan->status = "SHADOW_READY";
+    plan->execution_phase = "SHADOW_READY";
+    plan->pool_allocatable_bytes = 60'000'000'000LL;
+    plan->expected_hit_rate_gain_pp = 20.0;
+    plan->expected_net_gain_pp = 19.0;
+    plan->gain_pp_per_tib_moved = 2.0;
+    plan->quota_transfer_bytes = 12'000'000'000ULL;
+    plan->sla_capacity_saving_bytes = 8'000'000'000LL;
+    plan->valid_until_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count() +
+        60'000'000'000LL;
+    plan->allocations.push_back(QuotaAllocation{"target-1",
+                                                "source-1",
+                                                "group-1",
+                                                30'000'000'000LL,
+                                                42'000'000'000LL,
+                                                10'000'000'000LL,
+                                                60'000'000'000LL,
+                                                100,
+                                                80,
+                                                60});
+    ASSERT_TRUE(plan_store->Publish(plan));
+
+    auto service = std::make_shared<OptimizerServiceImpl>(manager_, nullptr, nullptr, plan_store, metrics);
+    proto::optimizer::PullQuotaAllocationRequest request;
+    request.set_trace_id("quota-pull");
+    request.set_pool_id("pool-1");
+    request.set_quota_target_id("target-1");
+    proto::optimizer::PullQuotaAllocationResponse response;
+    RequestContext context("quota-pull", nullptr);
+    service->PullQuotaAllocation(&context, &request, &response);
+
+    EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
+    EXPECT_EQ(proto::optimizer::QUOTA_PULL_PLAN, response.pull_status());
+    ASSERT_TRUE(response.has_allocation());
+    EXPECT_EQ(42'000'000'000LL, response.allocation().target_quota_bytes());
+    EXPECT_DOUBLE_EQ(60'000'000'000.0,
+                     metrics->GetGauge("quota_plan.pool_allocatable_bytes", {{"pool_id", "pool-1"}}).Get());
+    EXPECT_DOUBLE_EQ(20.0, metrics->GetGauge("quota_plan.expected_hit_rate_gain_pp", {{"pool_id", "pool-1"}}).Get());
+    EXPECT_DOUBLE_EQ(19.0, metrics->GetGauge("quota_plan.expected_net_gain_pp", {{"pool_id", "pool-1"}}).Get());
+    EXPECT_DOUBLE_EQ(12'000'000'000.0,
+                     metrics->GetGauge("quota_plan.quota_transfer_bytes", {{"pool_id", "pool-1"}}).Get());
+    EXPECT_DOUBLE_EQ(8'000'000'000.0,
+                     metrics->GetGauge("quota_plan.sla_capacity_saving_bytes", {{"pool_id", "pool-1"}}).Get());
+    EXPECT_DOUBLE_EQ(
+        42'000'000'000.0,
+        metrics->GetGauge("quota_plan.target_quota_bytes", {{"pool_id", "pool-1"}, {"quota_target_id", "target-1"}})
+            .Get());
 }
 
 } // namespace kv_cache_manager

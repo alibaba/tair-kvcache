@@ -171,6 +171,35 @@ TEST_F(OnlineOptimizerServerConfigTest, OverrideFromEnvironMap) {
     EXPECT_TRUE(config.kvcm_event_subscriptions()[1].capacity_gb().empty());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, OverrideQuotaPlannerFromEnvironMap) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({})"));
+
+    std::unordered_map<std::string, std::string> environ = {
+        {"kvcm_optimizer.quota_planner_enable", "true"},
+        {"kvcm_optimizer.quota_planner_enable_hard_resize", "false"},
+        {"kvcm_optimizer.quota_planner_period_seconds", "60"},
+        {"kvcm_optimizer.quota_planner_plan_ttl_seconds", "300"},
+        {"kvcm_optimizer.quota_planner_release_timeout_seconds", "120"},
+        {"kvcm_optimizer.quota_planner_release_consecutive_samples", "4"},
+        {"kvcm_optimizer.quota_planner_pools",
+         R"([{"pool_id":"pool-a","quota_scope":"per_replica","allocatable_bytes":2000,"allocatable_source":"test","candidate_step_bytes":100,"members":[{"quota_target_id":"kvcm-a","source_id":"instance-a","instance_group":"default","quota_scope":"per_replica","current_quota_bytes":1000,"min_quota_bytes":500,"configured_max_quota_bytes":1500,"hardware_max_quota_bytes":1600,"configured_max_source":"test-config","hardware_max_source":"test-hardware"}]}])"},
+    };
+
+    ASSERT_TRUE(config.OverrideFromEnviron(environ));
+    const auto &quota = config.quota_planner_config();
+    EXPECT_TRUE(quota.enable);
+    EXPECT_FALSE(quota.enable_hard_resize);
+    EXPECT_EQ(60, quota.period_seconds);
+    EXPECT_EQ(300, quota.plan_ttl_seconds);
+    EXPECT_EQ(120, quota.release_timeout_seconds);
+    EXPECT_EQ(4, quota.release_consecutive_samples);
+    ASSERT_EQ(1, quota.pools.size());
+    EXPECT_EQ("pool-a", quota.pools[0].pool_id);
+    ASSERT_EQ(1, quota.pools[0].members.size());
+    EXPECT_EQ("kvcm-a", quota.pools[0].members[0].quota_target_id);
+}
+
 TEST_F(OnlineOptimizerServerConfigTest, RejectsInvalidSubscriptions) {
     OnlineOptimizerServerConfig config;
     EXPECT_FALSE(config.FromJsonString(R"({"kvcm_event_subscriptions":[{}]})"));
@@ -219,6 +248,60 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     std::unordered_map<std::string, std::string> empty_environ;
     ASSERT_TRUE(config.OverrideFromEnviron(empty_environ));
     EXPECT_EQ(8888, config.http_port());
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, ParsesHardResizeQuotaPlannerWithAuthoritativeBounds) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({
+        "quota_planner_enable": true,
+        "quota_planner_enable_hard_resize": true,
+        "quota_planner_plan_ttl_seconds": 3600,
+        "quota_planner_release_timeout_seconds": 1800,
+        "quota_planner_pools": [{
+            "pool_id": "pool-a",
+            "quota_scope": "per_replica",
+            "allocatable_bytes": 2000,
+            "allocatable_source": "pool-config",
+            "candidate_step_bytes": 100,
+            "min_expected_hit_rate_gain_pp": 0.1,
+            "min_gain_pp_per_tib_moved": 0.005,
+            "movement_penalty_pp_per_tib": 0.001,
+            "min_quota_transfer_bytes": 50,
+            "stability_required_plans": 3,
+            "stability_tolerance_bytes": 25,
+            "capacity_saving_sla_ratio": 0.99,
+            "members": [{
+                "quota_target_id": "kvcm-a",
+                "source_id": "instance-a",
+                "instance_group": "group-a",
+                "quota_scope": "per_replica",
+                "current_quota_bytes": 1000,
+                "min_quota_bytes": 500,
+                "configured_max_quota_bytes": 1500,
+                "hardware_max_quota_bytes": 1600,
+                "configured_max_source": "instance-group",
+                "hardware_max_source": "node-inventory"
+            }]
+        }]
+    })"));
+    const auto &quota = config.quota_planner_config();
+    ASSERT_TRUE(quota.enable);
+    ASSERT_TRUE(quota.enable_hard_resize);
+    ASSERT_EQ(1, quota.pools.size());
+    EXPECT_EQ(100, quota.pools[0].candidate_step_bytes);
+    EXPECT_DOUBLE_EQ(0.1, quota.pools[0].min_expected_hit_rate_gain_pp);
+    EXPECT_DOUBLE_EQ(0.005, quota.pools[0].min_gain_pp_per_tib_moved);
+    EXPECT_DOUBLE_EQ(0.001, quota.pools[0].movement_penalty_pp_per_tib);
+    EXPECT_EQ(50, quota.pools[0].min_quota_transfer_bytes);
+    EXPECT_EQ(3, quota.pools[0].stability_required_plans);
+    EXPECT_EQ(25, quota.pools[0].stability_tolerance_bytes);
+    EXPECT_DOUBLE_EQ(0.99, quota.pools[0].capacity_saving_sla_ratio);
+    EXPECT_EQ("instance-a", quota.pools[0].members[0].source_id);
+}
+
+TEST_F(OnlineOptimizerServerConfigTest, RejectsHardResizeWithoutPlanner) {
+    OnlineOptimizerServerConfig config;
+    EXPECT_FALSE(config.FromJsonString(R"({"quota_planner_enable_hard_resize": true})"));
 }
 
 } // namespace kv_cache_manager

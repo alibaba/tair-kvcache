@@ -97,7 +97,7 @@ service → manager → meta → config → data_storage → common
 ### 3.3 客户端与 Optimizer
 
 - **client** 是独立的对外分支，仅共享 `common`、`config`、`data_storage`、`protocol` 以及 `service/util:manager_message_proto_util`；**py_connector** 通过 pybind 位于 client 之上。核心服务端不依赖 client。运行时，元数据面经 gRPC（C++ `MetaClient`）或 HTTP（py_connector 的 Python `KvCacheManagerClient`）调用 KVCM 服务，数据面经 C++ `TransferClient` 直接读写存储后端——这几条链路是理解端到端流程的关键（见第 4 节）。
-- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优），并通过独立 online runtime/service 提供实时 TraceQuery。full-attention LRU 的在线多容量统计复用 LiteHit；在线进程还可通过通用服务发现找到全部 KVCM endpoint，在 KVCM 的 Meta gRPC 端口调用 `SubscribeEvents` 并直接回放事件。KVCM 不反向发现 Optimizer。
+- **optimizer** 负责 KVCache 访问 trace 的仿真与优化（命中率/容量分析、逐出与容量参数调优），并通过独立 online runtime/service 提供实时 TraceQuery。full-attention LRU 的在线多容量统计复用 LiteHit；在线进程还可通过通用服务发现找到全部 KVCM endpoint，在 KVCM 的 Meta gRPC 端口调用 `SubscribeEvents` 并直接回放事件。启用 KVBrain 配额控制面后，KVCM Leader 会反向发现 Optimizer，拉取只存于 Optimizer 内存的版本化配额计划，并上报 resize 结果；两条方向相反的运行时链路使用不同服务发现配置。
 
 ### 3.4 模块关系图
 
@@ -168,6 +168,7 @@ flowchart TD
     optimizer --> common
     optimizer --> protocol
     optimizer -. gRPC SubscribeEvents（运行时） .-> service
+    service -. gRPC PullQuotaAllocation / ReportQuotaResizeResult（运行时） .-> optimizer
 
     %% 底层通用模块被广泛依赖
     meta --> common
@@ -315,6 +316,12 @@ flowchart LR
 `CacheManager` 在读取路径产生 `CacheGetEvent`，`EventManager` 将其同时交给各 publisher。启用 optimizer publisher 后，单 worker 按事件顺序转换为 `TraceQueryRequest`，再写入每个 gRPC 订阅者的独立有界队列。KVCM 的 `OptimizerEventStreamService` 注册在现有 Meta gRPC server 上，不新增端口。
 
 Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpoint，再调用 `MetaService.GetClusterInfo` 定位当前 Leader；任意时刻只向 Leader 保持一条 `SubscribeEvents` response stream。supervisor 周期刷新服务发现和 Leader，并通过同一 Meta gRPC 端口上的 `OptimizerEventStreamService.GetConfiguration` 拉取 Instance Group / Instance 快照，按 Group 后 Instance 的顺序自动注册新增配置；未知 `instance_id` 会立即触发一次额外刷新。切主时先同步配置，再迁移 stream。stream 收到事件后直接调用 `OnlineOptimizerManager::TraceQuery`，Optimizer 侧不再增加业务队列。
+
+### 4.10 KVBrain 多 KVCM 配额闭环
+
+Optimizer 为配额决策维护独立于 metrics 上报的 LiteHit/MRC 窗口，按 pool 配置的候选容量网格投影每个 `source_id` 的 token 命中收益，再用固定总预算 DP 最大化总命中 token；同收益时优先选择配额移动量更小的方案。计划保存在进程内存，带 `leader_epoch`、`allocation_epoch`、`execution_revision`、TTL 和计划 hash。当前 `source_id` 必须对应 Optimizer 中的 `instance_id`；代码只校验窗口内存在事件且事件时间新鲜，不声称具备 DashTrace 到 KVCM 的端到端覆盖率证据。
+
+每个 KVCM 仅由 Leader 运行 `QuotaPolicyPoller`，通过服务发现调用 Optimizer 的 `PullQuotaAllocation`，并用 `ReportQuotaResizeResult` 回传实际 quota、使用量和 Instance Group version。真实执行同时要求 Optimizer `quota_planner_enable_hard_resize=true` 与 KVCM `quota_policy_poller.enable_hard_resize=true`。状态机先 `RECONCILE` 全部成员，再让 donor 以 `RegistryManager::UpdateInstanceGroup` 的 version CAS 下调 `InstanceGroup.quota.capacity`；只有当所有 donor 的 `MetaIndexer::GetStorageUsage()` 不高于目标且连续达到配置次数后，Optimizer 才进入 `RECEIVER_GROW`，允许 receiver 扩容。超时、越界、版本冲突和执行失败都会冻结计划，缺失使用量观察则保留同一 revision 重试。日志统一使用 `quota_decision_audit` / `quota_resize_audit`，指标使用 `quota_plan.*` / `quota_resize.*`。
 
 ---
 

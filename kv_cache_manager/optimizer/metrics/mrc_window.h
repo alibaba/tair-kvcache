@@ -24,10 +24,13 @@ class MrcWindow {
 public:
     void Record(const RequestFact &fact);
     std::vector<MrcWindowPoint> Take();
+    // Projects the current window at exact cache capacities and clears it.
+    std::vector<uint64_t> TakeHitCounts(const std::vector<uint64_t> &capacity_blocks);
     void Reset();
 
 private:
     uint64_t ComputeRequiredBlocks(uint32_t target_basis_points) const;
+    uint64_t ComputeHitsAtCapacity(uint64_t capacity_blocks) const;
 
     // Sparse difference points of required capacity -> theoretical hit count.
     std::map<uint64_t, int64_t> hit_count_deltas_;

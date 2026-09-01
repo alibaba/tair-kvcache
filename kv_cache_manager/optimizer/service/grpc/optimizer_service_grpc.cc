@@ -129,4 +129,23 @@ grpc::Status OptimizerServiceGRpc::ResetStats(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status OptimizerServiceGRpc::PullQuotaAllocation(grpc::ServerContext *context,
+                                                       const proto::optimizer::PullQuotaAllocationRequest *request,
+                                                       proto::optimizer::PullQuotaAllocationResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->PullQuotaAllocation(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status
+OptimizerServiceGRpc::ReportQuotaResizeResult(grpc::ServerContext *context,
+                                              const proto::optimizer::ReportQuotaResizeResultRequest *request,
+                                              proto::optimizer::ReportQuotaResizeResultResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->ReportQuotaResizeResult(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

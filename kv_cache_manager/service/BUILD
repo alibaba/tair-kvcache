@@ -1,5 +1,20 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_library(
+    name = "quota_policy_poller",
+    srcs = ["quota_policy_poller.cc"],
+    hdrs = ["quota_policy_poller.h"],
+    deps = [
+        ":grpc_wrapper",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:service_discovery_factory",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/meta:meta",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+    ],
+)
+
 config_setting(
     name = "client_only_header",
     values = {"define": "CLIENT_ONLY_HEADER=true"},
@@ -46,6 +61,7 @@ cc_library(
         "//kv_cache_manager/service/http_service",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:service_call_guard",
+        ":quota_policy_poller",
     ],
 )
 

@@ -33,6 +33,7 @@
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/quota_policy_poller.h"
 
 namespace kv_cache_manager {
 
@@ -107,6 +108,23 @@ bool Server::Init(const ServerConfig &config) {
         boundaries = ServerConfig::GetDefaultRevisitIntervalBuckets();
     }
     cache_manager_->SetRevisitHistogramConfig(boundaries);
+
+    const auto quota_poller_config = config_.GetQuotaPolicyPollerConfig();
+    if (quota_poller_config.enable) {
+        quota_policy_poller_ = std::make_unique<QuotaPolicyPoller>(
+            quota_poller_config,
+            registry_manager_,
+            [this]() {
+                return leader_elector_ && leader_elector_->IsLeader() && registry_manager_ &&
+                       registry_manager_->IsRecoverComplete();
+            },
+            cache_manager_->meta_indexer_manager(),
+            metrics_registry_);
+        if (!quota_policy_poller_->Init()) {
+            KVCM_LOG_ERROR("KVBrain quota policy poller init failed");
+            return false;
+        }
+    }
 
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
@@ -225,6 +243,10 @@ bool Server::Start() {
 
     if (!leader_elector_->Start()) {
         KVCM_LOG_ERROR("leader_elector start failed");
+        return false;
+    }
+    if (quota_policy_poller_ && !quota_policy_poller_->Start()) {
+        KVCM_LOG_ERROR("KVBrain quota policy poller start failed");
         return false;
     }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
@@ -501,6 +523,9 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (quota_policy_poller_) {
+        quota_policy_poller_->Stop();
+    }
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }
