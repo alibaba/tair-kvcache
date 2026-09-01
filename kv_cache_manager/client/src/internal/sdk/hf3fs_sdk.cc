@@ -86,7 +86,13 @@ ClientErrorCode Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, co
                           remote_uris.size());
             return ER_SDK_TIMEOUT;
         }
-        if (Get(remote_uris[i], local_buffers[i], deadline_ms) != ER_OK) {
+        auto ec = Get(remote_uris[i], local_buffers[i], deadline_ms);
+        if (ec != ER_OK) {
+            // WaitIos 到点（泄漏路径）导致的失败须归因为超时，不得吞成普通读错误
+            // —— 与 localfile/mooncake 一致，供 wrapper 层归因。
+            if (DeadlineExpired(deadline_ms)) {
+                return ER_SDK_TIMEOUT;
+            }
             return ER_SDKREAD_ERROR;
         }
     }
@@ -148,7 +154,13 @@ ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                           remote_uris.size());
             return ER_SDK_TIMEOUT;
         }
-        if (Put(remote_uris[i], local_buffers[i], deadline_ms) != ER_OK) {
+        auto ec = Put(remote_uris[i], local_buffers[i], deadline_ms);
+        if (ec != ER_OK) {
+            // WaitIos 到点（泄漏路径）导致的失败须归因为超时，不得吞成普通写错误
+            // —— 与 localfile/mooncake 一致，供 wrapper 层归因。
+            if (DeadlineExpired(deadline_ms)) {
+                return ER_SDK_TIMEOUT;
+            }
             return ER_SDKWRITE_ERROR;
         }
     }

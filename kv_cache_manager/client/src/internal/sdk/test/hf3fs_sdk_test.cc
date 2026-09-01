@@ -1,7 +1,9 @@
 // Basic unit tests for Hf3fsSdk internal helpers
 
+#include <chrono>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <thread>
 
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
@@ -331,12 +333,121 @@ TEST_F(Hf3fsSdkTest, TestPutSkipsRemainingBlocksWhenExpired) {
     }
 }
 
+// 中途超时的错误码契约：WaitIos 到点（部分完成 → 泄漏路径）导致的失败必须是
+// ER_SDK_TIMEOUT，不得吞成 ER_SDKREAD_ERROR/ER_SDKWRITE_ERROR —— 与
+// localfile/mooncake 一致，供 wrapper 层归因。两个用例共用同一确定性编排：
+// 预算 100ms，WaitIos 睡 600ms 后返回部分完成（sleep 只会睡过头不会提前醒，
+// 返回时 deadline 必然已过），同时 RegFd 恰好被调用一次证明 I/O 确实发起过
+// （区别于 entry 准入拦截路径）。
+TEST_F(Hf3fsSdkTest, GetBatch_ReturnTimeout_MidFlightWaitExpiry) {
+    auto path1 = (std::filesystem::path(mount_point_) / "get_midflight/a/x.bin");
+    auto path2 = (std::filesystem::path(mount_point_) / "get_midflight/b/y.bin");
+    std::error_code ec;
+    std::filesystem::create_directories(path1.parent_path(), ec);
+    std::filesystem::create_directories(path2.parent_path(), ec);
+    {
+        std::ofstream f1(path1, std::ios::out | std::ios::binary);
+        f1.seekp(8192 - 1);
+        f1.write("\0", 1);
+    }
+    {
+        std::ofstream f2(path2, std::ios::out | std::ios::binary);
+        f2.seekp(8192 - 1);
+        f2.write("\0", 1);
+    }
+
+    DataStorageUri u1, u2;
+    u1.SetPath(path1.string());
+    u1.SetParam("blkid", "0");
+    u1.SetParam("size", "4096");
+    u2.SetPath(path2.string());
+    u2.SetParam("blkid", "0");
+    u2.SetParam("size", "4096");
+
+    char out1[16] = {0};
+    char out2[16] = {0};
+    BlockBuffer b1, b2;
+    b1.iovs.push_back(Iov{MemoryType::CPU, out1, sizeof(out1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, out2, sizeof(out2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(1).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsDeregFd(::testing::_)).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsIorCreate(::testing::NotNull(), ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsIorDestroy(::testing::NotNull())).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsPrepIo(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsSubmitIos(::testing::_)).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsWaitForIos(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke([](const ::hf3fs_ior *, ::hf3fs_cqe *, int, int, const struct timespec *) {
+            // 部分完成（0 < 已提交数 ≥1）模拟 hf3fs_wait_for_ios 的 abs_timeout 到点症状。
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            return 0;
+        }));
+
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(100);
+    sdk_->timeout_config_ = timeout;
+    auto rc = sdk_->Get(uris, bufs);
+    EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+}
+
+TEST_F(Hf3fsSdkTest, PutBatch_ReturnTimeout_MidFlightWaitExpiry) {
+    DataStorageUri u1, u2;
+    u1.SetPath((std::filesystem::path(mount_point_) / ("put_midflight_" + std::to_string(::getpid()) + "/a/x.bin")).string());
+    u1.SetParam("blkid", "1");
+    u1.SetParam("size", "4096");
+    u2.SetPath((std::filesystem::path(mount_point_) / ("put_midflight_" + std::to_string(::getpid()) + "/b/y.bin")).string());
+    u2.SetParam("blkid", "2");
+    u2.SetParam("size", "4096");
+
+    char data1[16] = {0};
+    char data2[16] = {0};
+    BlockBuffer b1, b2;
+    b1.iovs.push_back(Iov{MemoryType::CPU, data1, sizeof(data1), false});
+    b2.iovs.push_back(Iov{MemoryType::CPU, data2, sizeof(data2), false});
+    BlockBuffers bufs{b1, b2};
+    std::vector<DataStorageUri> uris{u1, u2};
+
+    auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
+    ASSERT_TRUE(mock != nullptr);
+    EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).Times(1).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsDeregFd(::testing::_)).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsIorCreate(::testing::NotNull(), ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsIorDestroy(::testing::NotNull())).Times(::testing::AtLeast(0));
+    EXPECT_CALL(*mock,
+                Hf3fsPrepIo(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsSubmitIos(::testing::_)).WillRepeatedly(::testing::Return(0));
+    EXPECT_CALL(*mock, Hf3fsWaitForIos(::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke([](const ::hf3fs_ior *, ::hf3fs_cqe *, int, int, const struct timespec *) {
+            // 部分完成（0 < 已提交数 ≥1）模拟 hf3fs_wait_for_ios 的 abs_timeout 到点症状。
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            return 0;
+        }));
+
+    SdkTimeoutConfig timeout;
+    timeout.set_put_timeout_ms(100);
+    sdk_->timeout_config_ = timeout;
+    auto out = std::make_shared<std::vector<DataStorageUri>>();
+    auto rc = sdk_->Put(uris, bufs, out);
+    EXPECT_EQ(rc, ER_SDK_TIMEOUT);
+}
+
 // ------------- Get (single) -------------
 TEST_F(Hf3fsSdkTest, Get_ReturnOk_EmptyIovs) {
     DataStorageUri uri;
     uri.SetPath((std::filesystem::path(mount_point_) / "get/empty.dat").string());
     BlockBuffer buf; // empty iovs
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
 }
 
@@ -345,7 +456,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnInvalid_ParamsEmptyPath) {
     uri.SetPath("");
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -355,7 +466,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnInvalid_ParamsNoSize) {
     // no size/blkid param set
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -384,7 +495,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnReadError_RegFdFail) {
     // make RegFd fail (>0)
     EXPECT_CALL(*mock, Hf3fsRegFd(::testing::_, ::testing::_)).WillRepeatedly(::testing::Return(1));
 
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKREAD_ERROR);
 }
 
@@ -456,7 +567,7 @@ TEST_F(Hf3fsSdkTest, Get_ReturnOk_Success) {
             return cqec;
         }));
 
-    auto rc = sdk_->Get(uri, buf);
+    auto rc = sdk_->Get(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     EXPECT_EQ(std::string(outbuf1, sizeof(outbuf1)), std::string(16, 'a'));
     EXPECT_EQ(std::string(outbuf2, sizeof(outbuf2)), std::string(32, 'a'));
@@ -579,7 +690,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnOk_EmptyIovs) {
     DataStorageUri uri;
     uri.SetPath((std::filesystem::path(mount_point_) / "put/empty.dat").string());
     BlockBuffer buf; // empty iovs
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
 }
 
@@ -588,7 +699,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnInvalid_ParamsEmptyPath) {
     uri.SetPath("");
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -598,7 +709,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnInvalid_ParamsNoSize) {
     // no size param set
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, (void *)0x1, 10, false});
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_INVALID_PARAMS);
 }
 
@@ -613,7 +724,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnWriteError_OpenFail) {
     BlockBuffer buf;
     buf.iovs.push_back(Iov{MemoryType::CPU, payload, sizeof(payload), false});
 
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_SDKWRITE_ERROR);
 }
 
@@ -681,7 +792,7 @@ TEST_F(Hf3fsSdkTest, Put_ReturnOk_WriteSuccess) {
             return cqec;
         }));
 
-    auto rc = sdk_->Put(uri, buf);
+    auto rc = sdk_->Put(uri, buf, /*deadline_ms=*/0);
     EXPECT_EQ(rc, ER_OK);
     auto expected_file = std::filesystem::path(uri.GetPath());
     EXPECT_TRUE(std::filesystem::exists(expected_file));
