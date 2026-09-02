@@ -85,6 +85,38 @@ ErrorCode ReadError_stub(void * /*obj*/,
 }
 } // namespace mark_query_read_error_stub
 
+namespace raw_meta_partial_error_stub {
+ErrorCode BatchGetRawMeta_stub(void * /*obj*/,
+                               RequestContext * /*request_context*/,
+                               const KeyVector &keys,
+                               CacheLocationMapVector &out_location_maps,
+                               PropertyMapVector &out_properties,
+                               std::vector<ErrorCode> &out_error_codes) {
+    out_location_maps.assign(keys.size(), {});
+    out_properties.assign(keys.size(), {});
+    out_error_codes.assign(keys.size(), EC_OK);
+
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
+        if (keys[idx] == 22) {
+            out_error_codes[idx] = EC_TIMEOUT;
+            continue;
+        }
+        if (keys[idx] == 33) {
+            out_error_codes[idx] = EC_NOENT;
+            continue;
+        }
+        auto location = std::make_shared<CacheLocation>("location_ok",
+                                                        CacheLocationStatus::CLS_SERVING,
+                                                        DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                        1,
+                                                        std::vector<LocationSpec>{{"tp0", "file:///tmp/key?size=1"}});
+        out_location_maps[idx][location->id()] = std::move(location);
+        out_properties[idx][PROPERTY_PREV_BLOCK_KEY] = "";
+    }
+    return EC_OK;
+}
+} // namespace raw_meta_partial_error_stub
+
 namespace remove_instance_reclaimer_state_stub {
 CacheReclaimer *reclaimer = nullptr;
 bool called = false;
@@ -2169,6 +2201,35 @@ TEST_F(CacheManagerTest, TestGetNotExistCacheMeta) {
             ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_WRITING), meta.at("status"));
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestGetCacheMetaDetailPreservesPartialResults) {
+    Stub stub;
+    stub.set(ADDR(MetaSearcher, BatchGetRawMeta), raw_meta_partial_error_stub::BatchGetRawMeta_stub);
+
+    BlockMask block_mask = static_cast<size_t>(0);
+    auto [ec, details] =
+        cache_manager_->GetCacheMetaDetail(request_context_.get(), "test_instance", {11, 22, 33}, {}, block_mask, 1);
+
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(3, details.size());
+
+    EXPECT_EQ(EC_OK, details[0].error_code);
+    ASSERT_EQ(1, details[0].locations.size());
+    EXPECT_EQ(CacheLocationStatus::CLS_SERVING, details[0].locations[0].status);
+
+    EXPECT_EQ(EC_TIMEOUT, details[1].error_code);
+    EXPECT_TRUE(details[1].locations.empty());
+
+    EXPECT_EQ(EC_OK, details[2].error_code);
+    ASSERT_EQ(1, details[2].locations.size());
+    EXPECT_EQ(CacheLocationStatus::CLS_NOT_FOUND, details[2].locations[0].status);
+
+    auto [all_failed_ec, all_failed_details] =
+        cache_manager_->GetCacheMetaDetail(request_context_.get(), "test_instance", {22}, {}, block_mask, 1);
+    EXPECT_EQ(EC_TIMEOUT, all_failed_ec);
+    ASSERT_EQ(1, all_failed_details.size());
+    EXPECT_EQ(EC_TIMEOUT, all_failed_details[0].error_code);
 }
 
 TEST_F(CacheManagerTest, TestRemoveCache) {

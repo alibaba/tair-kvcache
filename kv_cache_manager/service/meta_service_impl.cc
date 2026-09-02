@@ -689,6 +689,68 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 
+void MetaServiceImpl::GetCacheMetaDetail(RequestContext *request_context,
+                                         const proto::meta::GetCacheMetaDetailRequest *request,
+                                         proto::meta::GetCacheMetaDetailResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetCacheMetaDetail", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    CHECK_FAULT_INJECTION("GetCacheMetaDetail");
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheMetaDetail", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_keys().empty() && request->token_ids().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheMetaDetail", "block_keys and token_ids", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    BlockMask block_mask_req;
+    ProtoConvert::BlockMaskFromProto(&request->block_mask(), block_mask_req);
+    auto [ec_info, cache_meta_details] = cache_manager_->GetCacheMetaDetail(
+        request_context,
+        request->instance_id(),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        block_mask_req,
+        request->detail_level());
+
+    size_t item_error_count = 0;
+    for (const auto &cache_meta_detail : cache_meta_details) {
+        item_error_count += cache_meta_detail.error_code != EC_OK;
+        ProtoConvert::CacheKeyMetaDetailToProto(cache_meta_detail, response->add_items());
+    }
+
+    if (ec_info != EC_OK) {
+        status->set_code(ToMetaPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get cache metadata detail : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetCacheMetaDetail failed, ec: %d, returned %d items with %zu item errors",
+                       request->trace_id().c_str(),
+                       ec_info,
+                       response->items_size(),
+                       item_error_count);
+    } else {
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        if (item_error_count == 0) {
+            status->set_message("Cache metadata detail retrieved successfully");
+        } else {
+            status->set_message("Cache metadata detail retrieved with " + std::to_string(item_error_count) +
+                                " item errors");
+        }
+        KVCM_LOG_INFO("[traceId: %s] GetCacheMetaDetail succeeded, returned %d items with %zu item errors",
+                      request->trace_id().c_str(),
+                      response->items_size(),
+                      item_error_count);
+    }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
 void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
                                       const proto::meta::StartWriteCacheRequest *request,
                                       proto::meta::StartWriteCacheResponse *response) {

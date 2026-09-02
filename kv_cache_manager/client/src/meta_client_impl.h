@@ -44,6 +44,12 @@ public:
                                                 const BlockMask &block_mask,
                                                 int32_t detail_level) override;
 
+    std::pair<ClientErrorCode, CacheMetaDetails> MatchMetaDetail(const std::string &trace_id,
+                                                                 const std::vector<int64_t> &keys,
+                                                                 const std::vector<int64_t> &tokens,
+                                                                 const BlockMask &block_mask,
+                                                                 int32_t detail_level) override;
+
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::vector<int64_t> &keys,
                                 const std::vector<int64_t> &tokens,

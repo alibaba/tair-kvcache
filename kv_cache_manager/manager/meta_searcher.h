@@ -122,6 +122,11 @@ public:
         // EC_OK 时是可供业务使用的 location id；失败时若非空，仅可作为回滚定位符。
         std::string location_id;
     };
+    ErrorCode BatchGetRawMeta(RequestContext *request_context,
+                              const KeyVector &keys,
+                              CacheLocationMapVector &out_location_maps,
+                              PropertyMapVector &out_properties,
+                              std::vector<ErrorCode> &out_error_codes);
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,

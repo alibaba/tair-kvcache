@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <map>
 #include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/data_storage/common_define.h"
 #include "kv_cache_manager/meta/cache_location.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
 
@@ -73,6 +77,25 @@ private:
     std::vector<std::string> metas_;
     CacheLocationViewVecWrapper locations_;
 };
+
+struct CacheLocationMetaDetail {
+    std::string location_id;
+    CacheLocationStatus status = CacheLocationStatus::CLS_NOT_FOUND;
+    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    int32_t spec_size = 0;
+    int64_t create_time = 0;
+    std::vector<LocationSpec> location_specs;
+};
+
+struct CacheKeyMetaDetail {
+    ErrorCode error_code = EC_OK;
+    size_t request_index = 0;
+    KeyType block_key = 0;
+    PropertyMap properties;
+    std::vector<CacheLocationMetaDetail> locations;
+};
+
+using CacheMetaDetailVec = std::vector<CacheKeyMetaDetail>;
 
 class StartWriteCacheInfo {
 public:

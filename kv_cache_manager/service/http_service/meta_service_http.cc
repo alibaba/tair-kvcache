@@ -31,6 +31,8 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getInstanceInfo, GetInstanceInfo, GetInstanceInfo, GetInstanceInfo);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getCacheMetaDetail, GetCacheMetaDetail, GetCacheMetaDetail, GetCacheMetaDetail);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen);
@@ -112,6 +114,23 @@ void MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->GetCacheMeta(request_context, request, response);
+}
+
+void MetaServiceHttp::GetCacheMetaDetail(coro_http::coro_http_connection *http_conn,
+                                         proto::meta::GetCacheMetaDetailRequest *request,
+                                         proto::meta::GetCacheMetaDetailResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheMetaDetail, __NOTHING__);
+    KVCM_LOG_INFO("[traceId: %s] GetCacheMetaDetail called with instance id: %s, block keys count: %d, "
+                  "token ids count: %d, detail level: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->block_keys_size(),
+                  request->token_ids_size(),
+                  request->detail_level());
+    KVCM_LOG_DEBUG("[traceId: %s] GetCacheMetaDetail request details: %s",
+                   request->trace_id().c_str(),
+                   request->ShortDebugString().c_str());
+    meta_service_impl_->GetCacheMetaDetail(request_context, request, response);
 }
 
 void MetaServiceHttp::StartWriteCache(coro_http::coro_http_connection *http_conn,

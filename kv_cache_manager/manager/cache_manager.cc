@@ -750,6 +750,125 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     return {ec, CacheMetaVecWrapper(std::move(metas), std::move(cache_locations))};
 }
 
+std::pair<ErrorCode, CacheMetaDetailVec> CacheManager::GetCacheMetaDetail(RequestContext *request_context,
+                                                                          const std::string &instance_id,
+                                                                          const KeyVector &keys,
+                                                                          const TokenIdsVector &tokens,
+                                                                          const BlockMask &block_mask,
+                                                                          int32_t detail_level /*reserved*/) {
+    SPAN_TRACER(request_context);
+    (void)detail_level;
+    const std::string &trace_id = request_context->trace_id();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(DEBUG, ec, CacheMetaDetailVec, "get cache meta detail failed");
+
+    KeyVector all_keys;
+    if (!keys.empty()) {
+        all_keys = keys;
+    } else {
+        auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(DEBUG, ec_temp, CacheMetaDetailVec, "get cache meta detail failed");
+        all_keys = GenKeyVector(tokens, block_size);
+    }
+
+    KeyVector query_keys;
+    std::vector<size_t> request_indices;
+    query_keys.reserve(all_keys.size());
+    request_indices.reserve(all_keys.size());
+    for (size_t idx = 0; idx < all_keys.size(); ++idx) {
+        if (IsIndexInMaskRange(block_mask, idx)) {
+            continue;
+        }
+        query_keys.push_back(all_keys[idx]);
+        request_indices.push_back(idx);
+    }
+    if (query_keys.empty()) {
+        return {EC_OK, CacheMetaDetailVec()};
+    }
+
+    CacheLocationMapVector location_maps;
+    PropertyMapVector properties;
+    std::vector<ErrorCode> per_key_ecs;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, query_keys.size());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchGetLocation);
+    ec = meta_searcher->BatchGetRawMeta(request_context, query_keys, location_maps, properties, per_key_ecs);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchGetLocation);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(DEBUG, ec, CacheMetaDetailVec, "get cache meta detail failed: BatchGetRawMeta");
+
+    CacheMetaDetailVec details;
+    details.reserve(query_keys.size());
+    for (size_t idx = 0; idx < query_keys.size(); ++idx) {
+        CacheKeyMetaDetail item;
+        item.request_index = request_indices[idx];
+        item.block_key = query_keys[idx];
+
+        if (idx >= per_key_ecs.size()) {
+            item.error_code = EC_MISMATCH;
+            details.push_back(std::move(item));
+            continue;
+        }
+        if (per_key_ecs[idx] != EC_OK && per_key_ecs[idx] != EC_NOENT) {
+            item.error_code = per_key_ecs[idx];
+            details.push_back(std::move(item));
+            continue;
+        }
+        if (idx >= location_maps.size() || idx >= properties.size()) {
+            item.error_code = EC_MISMATCH;
+            details.push_back(std::move(item));
+            continue;
+        }
+        item.properties = properties[idx];
+
+        const bool key_not_found = per_key_ecs[idx] == ErrorCode::EC_NOENT || location_maps[idx].empty();
+        if (key_not_found) {
+            CacheLocationMetaDetail not_found;
+            not_found.status = CacheLocationStatus::CLS_NOT_FOUND;
+            item.locations.push_back(std::move(not_found));
+            details.push_back(std::move(item));
+            continue;
+        }
+
+        std::vector<std::string> location_ids;
+        location_ids.reserve(location_maps[idx].size());
+        for (const auto &[location_id, location] : location_maps[idx]) {
+            if (location) {
+                location_ids.push_back(location_id);
+            }
+        }
+        std::sort(location_ids.begin(), location_ids.end());
+        for (const auto &location_id : location_ids) {
+            const auto location_iter = location_maps[idx].find(location_id);
+            if (location_iter == location_maps[idx].end() || !location_iter->second) {
+                continue;
+            }
+            const auto &raw_location = *location_iter->second;
+            CacheLocationMetaDetail location_detail;
+            location_detail.location_id = raw_location.id().empty() ? location_id : raw_location.id();
+            location_detail.status = raw_location.status();
+            location_detail.type = raw_location.type();
+            location_detail.spec_size = static_cast<int32_t>(raw_location.spec_size());
+            location_detail.create_time = raw_location.create_time();
+            location_detail.location_specs = raw_location.location_specs();
+            item.locations.push_back(std::move(location_detail));
+        }
+        if (item.locations.empty()) {
+            CacheLocationMetaDetail not_found;
+            not_found.status = CacheLocationStatus::CLS_NOT_FOUND;
+            item.locations.push_back(std::move(not_found));
+        }
+        details.push_back(std::move(item));
+    }
+
+    const auto first_item_error =
+        std::find_if(details.begin(), details.end(), [](const auto &item) { return item.error_code != EC_OK; });
+    if (first_item_error != details.end() &&
+        std::all_of(details.begin(), details.end(), [](const auto &item) { return item.error_code != EC_OK; })) {
+        return {first_item_error->error_code, std::move(details)};
+    }
+    return {EC_OK, std::move(details)};
+}
+
 ErrorCode CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
                                                   ServiceMetricsCollector *service_metrics_collector,
                                                   MetaSearcher *meta_searcher,

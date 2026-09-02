@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -82,6 +83,47 @@ struct Metas {
     Locations locations;
     std::vector<std::string> metas;
 };
+
+enum class CacheMetaLocationStatus : int32_t {
+    CLS_NOT_FOUND = 0,
+    CLS_NEW = 1,
+    CLS_WRITING = 2,
+    CLS_SERVING = 3,
+    CLS_DELETING = 4,
+};
+
+enum class CacheMetaStorageType : int32_t {
+    ST_UNSPECIFIED = 0,
+    ST_3FS = 1,
+    ST_MOONCAKE = 2,
+    ST_TAIRMEMPOOL = 3,
+    ST_NFS = 4,
+    ST_VCNS_3FS = 5,
+    ST_DUMMY = 6,
+    ST_EVENT_REPORT_L1P5 = 7,
+    ST_EVENT_REPORT_L2 = 8,
+};
+
+struct CacheMetaLocationDetail {
+    std::string location_id;
+    CacheMetaLocationStatus status{CacheMetaLocationStatus::CLS_NOT_FOUND};
+    CacheMetaStorageType storage_type{CacheMetaStorageType::ST_UNSPECIFIED};
+    int32_t spec_size{0};
+    int64_t create_time{0};
+    Location location_specs;
+};
+
+struct CacheMetaDetailItem {
+    ClientErrorCode error_code{ClientErrorCode::ER_OK};
+    std::string error_message;
+    int32_t request_index{0};
+    int64_t block_key{0};
+    std::string prev_block_key;
+    std::map<std::string, std::string> properties;
+    std::vector<CacheMetaLocationDetail> locations;
+};
+
+using CacheMetaDetails = std::vector<CacheMetaDetailItem>;
 
 using BlockMaskVector = std::vector<bool>;
 using BlockMaskOffset = size_t;
