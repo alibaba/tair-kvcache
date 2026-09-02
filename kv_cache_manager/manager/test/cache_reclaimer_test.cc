@@ -5579,7 +5579,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDHonorsPersistentCopyGuardWithoutActive
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
     ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));

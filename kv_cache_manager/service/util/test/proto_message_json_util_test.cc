@@ -86,6 +86,21 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     proto::admin::MigrationMarkMethodConfig parsed_wrapper;
     ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
+
+    proto::admin::MigrationConfig uint64_wrapper_message;
+    uint64_wrapper_message.mutable_copy_max_inflight_bytes()->set_value(std::numeric_limits<uint64_t>::max());
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(uint64_wrapper_message.GetDescriptor()));
+    std::string uint64_wrapper_json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(uint64_wrapper_message, uint64_wrapper_json));
+    std::string protobuf_uint64_wrapper_json;
+    ASSERT_TRUE(ProtobufToJson(uint64_wrapper_message, &protobuf_uint64_wrapper_json));
+    EXPECT_EQ(protobuf_uint64_wrapper_json, uint64_wrapper_json);
+    EXPECT_NE(
+        std::string::npos,
+        uint64_wrapper_json.find(R"("copy_max_inflight_bytes":"18446744073709551615")"));
+    proto::admin::MigrationConfig parsed_uint64_wrapper;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(uint64_wrapper_json, &parsed_uint64_wrapper));
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(uint64_wrapper_message, parsed_uint64_wrapper));
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypesFallBackToProtobufJsonUtil) {
