@@ -549,7 +549,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
-                                                         BatchMetaData &batch) noexcept {
+                                                         BatchMetaData &batch,
+                                                         MetaAccessIntent intent) noexcept {
     const KeyVector &keys = batch.batch_keys;
     batch.EnsureLocationsAndPropertiesResized();
     CacheLocationMapVector &locations = batch.batch_locations;
@@ -563,7 +564,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         }
     }
     std::vector<ErrorCode> persistent_results =
-        persistent_backend_->Upsert(request_context, keys, locations, properties);
+        persistent_backend_->Upsert(request_context, keys, locations, properties, intent);
     if (persistent_results.size() != keys.size()) {
         KVCM_LOG_ERROR("persistent Upsert results[%lu] mismatch keys[%lu]", persistent_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
@@ -572,7 +573,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         return persistent_results;
     }
     const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-    auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    auto results =
+        cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results, intent);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -1741,6 +1743,175 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetProperties(RequestContext *
         }
     }
     return results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::GetPropertiesForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &field_names,
+    PropertyMapVector &out_properties) noexcept {
+    if (!cache_backend_) {
+        return persistent_backend_->GetPropertiesForMaintenance(request_context, keys, field_names, out_properties);
+    }
+
+    std::vector<ErrorCode> results =
+        cache_backend_->GetPropertiesForMaintenance(request_context, keys, field_names, out_properties);
+    if (results.size() != keys.size() || out_properties.size() != keys.size()) {
+        KVCM_LOG_ERROR("cache maintenance properties results[%zu] properties[%zu] mismatch keys[%zu]",
+                       results.size(),
+                       out_properties.size(),
+                       keys.size());
+        results.assign(keys.size(), EC_MISMATCH);
+        out_properties.assign(keys.size(), PropertyMap{});
+    }
+    const bool requires_process_local_lru =
+        std::find(field_names.begin(), field_names.end(), PROPERTY_LRU_TIME) != field_names.end() &&
+        GetMaintenancePropertyCapability(PROPERTY_LRU_TIME) ==
+            MaintenancePropertyCapability::kProcessLocalVolatile;
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning ||
+        requires_process_local_lru) {
+        // A cache miss means process-local recency is unknown. Persistent
+        // metadata may still contain a field with the same name, but it does
+        // not belong to the current recency epoch and must not authorize an
+        // ENFORCE decision.
+        return results;
+    }
+
+    // Recovery fallback is read-only: unlike online Get, maintenance reads
+    // must never hydrate or promote the hot cache as a side effect.
+    auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    if (missing_keys.empty()) {
+        return results;
+    }
+    PropertyMapVector persistent_properties;
+    std::vector<ErrorCode> persistent_results = persistent_backend_->GetPropertiesForMaintenance(
+        request_context, missing_keys, field_names, persistent_properties);
+    if (persistent_results.size() != missing_keys.size() || persistent_properties.size() != missing_keys.size()) {
+        KVCM_LOG_ERROR("persistent maintenance properties results[%zu] properties[%zu] mismatch keys[%zu]",
+                       persistent_results.size(),
+                       persistent_properties.size(),
+                       missing_keys.size());
+        for (const size_t original_idx : missing_indices) {
+            results[original_idx] = EC_MISMATCH;
+            out_properties[original_idx].clear();
+        }
+        return results;
+    }
+    for (size_t i = 0; i < missing_indices.size(); ++i) {
+        const size_t original_idx = missing_indices[i];
+        results[original_idx] = persistent_results[i];
+        if (persistent_results[i] == EC_OK) {
+            out_properties[original_idx] = std::move(persistent_properties[i]);
+        }
+    }
+    return results;
+}
+
+MaintenanceReadResult MetaStorageBackendManager::GetForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &field_names,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    if (!cache_backend_) {
+        return persistent_backend_->GetForMaintenance(
+            request_context, keys, field_names, out_locations, out_properties);
+    }
+
+    MaintenanceReadResult results =
+        cache_backend_->GetForMaintenance(request_context, keys, field_names, out_locations, out_properties);
+    const bool location_shape_ok =
+        results.location_error_codes.size() == keys.size() && out_locations.size() == keys.size();
+    const bool property_shape_ok =
+        results.property_error_codes.size() == keys.size() && out_properties.size() == keys.size();
+    if (!location_shape_ok) {
+        KVCM_LOG_ERROR("cache maintenance locations results[%zu] values[%zu] mismatch keys[%zu]",
+                       results.location_error_codes.size(),
+                       out_locations.size(),
+                       keys.size());
+        results.location_error_codes.assign(keys.size(), EC_MISMATCH);
+        out_locations.assign(keys.size(), CacheLocationMap{});
+    }
+    if (!property_shape_ok) {
+        KVCM_LOG_ERROR("cache maintenance properties results[%zu] values[%zu] mismatch keys[%zu]",
+                       results.property_error_codes.size(),
+                       out_properties.size(),
+                       keys.size());
+        results.property_error_codes.assign(keys.size(), EC_MISMATCH);
+        out_properties.assign(keys.size(), PropertyMap{});
+    }
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    const bool requires_process_local_lru =
+        std::find(field_names.begin(), field_names.end(), PROPERTY_LRU_TIME) != field_names.end() &&
+        GetMaintenancePropertyCapability(PROPERTY_LRU_TIME) ==
+            MaintenancePropertyCapability::kProcessLocalVolatile;
+
+    // Fetch the union once, then merge each component independently. A
+    // feature failure must not erase a valid location result (SHADOW relies
+    // on that distinction), and neither component is backfilled into cache.
+    KeyTypeVec missing_keys;
+    std::vector<size_t> missing_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results.location_error_codes[i] == EC_NOENT ||
+            (!requires_process_local_lru && results.property_error_codes[i] == EC_NOENT)) {
+            missing_keys.push_back(keys[i]);
+            missing_indices.push_back(i);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    CacheLocationMapVector persistent_locations;
+    PropertyMapVector persistent_properties;
+    MaintenanceReadResult persistent_results = persistent_backend_->GetForMaintenance(
+        request_context, missing_keys, field_names, persistent_locations, persistent_properties);
+    const bool persistent_location_shape_ok = persistent_results.location_error_codes.size() == missing_keys.size() &&
+                                              persistent_locations.size() == missing_keys.size();
+    const bool persistent_property_shape_ok = persistent_results.property_error_codes.size() == missing_keys.size() &&
+                                              persistent_properties.size() == missing_keys.size();
+    for (size_t i = 0; i < missing_indices.size(); ++i) {
+        const size_t original_idx = missing_indices[i];
+        if (results.location_error_codes[original_idx] == EC_NOENT) {
+            if (!persistent_location_shape_ok) {
+                results.location_error_codes[original_idx] = EC_MISMATCH;
+                out_locations[original_idx].clear();
+            } else {
+                results.location_error_codes[original_idx] = persistent_results.location_error_codes[i];
+                if (persistent_results.location_error_codes[i] == EC_OK) {
+                    out_locations[original_idx] = std::move(persistent_locations[i]);
+                }
+            }
+        }
+        if (!requires_process_local_lru && results.property_error_codes[original_idx] == EC_NOENT) {
+            if (!persistent_property_shape_ok) {
+                results.property_error_codes[original_idx] = EC_MISMATCH;
+                out_properties[original_idx].clear();
+            } else {
+                results.property_error_codes[original_idx] = persistent_results.property_error_codes[i];
+                if (persistent_results.property_error_codes[i] == EC_OK) {
+                    out_properties[original_idx] = std::move(persistent_properties[i]);
+                }
+            }
+        }
+    }
+    return results;
+}
+
+MaintenancePropertyCapability MetaStorageBackendManager::GetMaintenancePropertyCapability(
+    const std::string &property_name) const noexcept {
+    if (property_name != PROPERTY_LRU_TIME) {
+        return MaintenancePropertyCapability::kUnsupported;
+    }
+    const MetaStorageBackend *authoritative_backend =
+        cache_backend_ ? static_cast<const MetaStorageBackend *>(cache_backend_.get()) : persistent_backend_.get();
+    if (dynamic_cast<const MetaLocalBackend *>(authoritative_backend) != nullptr) {
+        return MaintenancePropertyCapability::kProcessLocalVolatile;
+    }
+    return MaintenancePropertyCapability::kUnsupported;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Exists(RequestContext *request_context,

@@ -91,6 +91,16 @@ cc_test(
 )
 
 cc_test(
+    name = "MigrationAdmissionInternalTest",
+    srcs = ["migration_admission_internal_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:migration_manager",
+    ],
+)
+
+cc_test(
     name = "MetaSearcherTest",
     srcs = [
         "meta_searcher_test.cc",

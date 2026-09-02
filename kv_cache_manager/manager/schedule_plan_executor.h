@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -59,6 +60,10 @@ struct CacheLocationDelRequest {
     // Optional serialized values observed by the submitter, parallel to
     // location_ids. A location is reclaimed only if it is still unchanged.
     std::vector<std::vector<std::string>> expected_location_values;
+    // Optional create_time generation guard, parallel to location_ids. It is
+    // used by migration-owned source deletion after the active source lease
+    // is released, preventing a reused location id from being reclaimed.
+    std::vector<std::vector<int64_t>> expected_location_create_times;
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
@@ -126,6 +131,8 @@ struct ScheduledTask {
 
 class SchedulePlanExecutor {
 public:
+    using SourceLocationLeaseChecker =
+        std::function<bool(const std::string &, int64_t, const std::string &, int64_t)>;
     explicit SchedulePlanExecutor(unsigned int thread_count,
                                   const std::shared_ptr<MetaIndexerManager> &meta_manager,
                                   const std::shared_ptr<DataStorageManager> &storage_manager,
@@ -150,6 +157,12 @@ public:
                     std::chrono::microseconds delay = std::chrono::microseconds(0),
                     std::function<void()> cancel_task = {});
 
+    void SetSourceLocationLeaseChecker(SourceLocationLeaseChecker checker);
+    // Migration holds the unique side from reservation through its NoTouch
+    // source recheck. Delete admission holds the shared side from its read
+    // through status CAS, closing both possible interleavings.
+    std::unique_lock<std::shared_mutex> AcquireSourceLocationLeaseReservationGuard();
+
 private:
     struct PromiseCompletion;
     struct LocationDelAdmissionResult {
@@ -171,6 +184,8 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable condition_;
     std::atomic<uint64_t> sequence_counter_{0};
+    std::shared_mutex source_location_lease_mutex_;
+    SourceLocationLeaseChecker source_location_lease_checker_;
 
     void WorkerRoutine();
 
@@ -194,6 +209,7 @@ private:
                           const std::vector<int64_t> &block_keys,
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
+                          const std::vector<std::vector<int64_t>> *expected_location_create_times,
                           std::chrono::microseconds delay,
                           bool authoritative_read = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,

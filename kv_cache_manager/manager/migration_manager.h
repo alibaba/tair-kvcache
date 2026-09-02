@@ -20,6 +20,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/config/migration_strategy.h"
+#include "kv_cache_manager/manager/migration_outcome.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -119,11 +120,34 @@ public:
     void OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason);
 
     // ---- Mark 路径（MetaIndexer 持久化：block 级 property，随元数据落 Redis + local cache） ----
-    // 打标/清标走 ReadModifyWriteBlock 只写 property（不动 location）；查标走 GetProperties。
+    // 打标/清标走 maintenance NoTouch block-property RMW（不动 location）；查标走
+    // GetPropertiesForMaintenance，不把迁移状态维护记成业务访问。
     ErrorCode MarkForTieredWrite(const std::string &instance_id,
                                  const std::vector<int64_t> &block_keys,
                                  const std::string &dst_storage_name,
                                  int64_t timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs);
+    enum class MarkWriteStatus {
+        kInserted,
+        kAlreadySameTarget,
+        kConflictDifferentTarget,
+        kMalformedExistingMark,
+        kBlockNotFound,
+        kReadError,
+        kWriteError,
+    };
+    struct MarkWriteOutcome {
+        MarkWriteStatus status = MarkWriteStatus::kReadError;
+        ErrorCode ec = EC_OK;
+    };
+    struct MarkWriteResult {
+        ErrorCode ec = EC_OK;
+        std::vector<MarkWriteOutcome> outcomes;
+    };
+    MarkWriteResult MarkForTieredWriteDetailed(
+        const std::string &instance_id,
+        const std::vector<int64_t> &block_keys,
+        const std::string &dst_storage_name,
+        int64_t timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs);
     bool IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key);
     std::string GetTieredWriteTarget(const std::string &instance_id, int64_t block_key);
     // 按 expected target+deadline 条件清除 mark（不匹配则不清，防止清掉同 block 新 mark）。
@@ -175,6 +199,10 @@ public:
     bool HasActiveCopyTargetLocation(const std::string &instance_id,
                                      int64_t block_key,
                                      const std::string &location_id) const;
+    bool HasActiveCopySourceLocation(const std::string &instance_id,
+                                     int64_t block_key,
+                                     const std::string &location_id,
+                                     int64_t create_time) const;
     size_t ActiveTaskCount() const;
     // 按任务提交时记录的 instance group 统计活跃 Copy，用于统一的 group 级硬限流。
     size_t ActiveTaskCountForGroup(const std::string &instance_group_name) const;
@@ -202,11 +230,14 @@ public:
     struct CopyAdmission {
         CopyAdmissionStatus status = CopyAdmissionStatus::kAccept;
         const CacheLocation *src_location = nullptr; // 仅 kAccept 时有效
+        // 目标 SERVING/WRITING 联合 coverage 尚未覆盖的 source specs。
+        // Dispatch 只复制这些 specs，避免 partial coverage 下重复写低层。
+        std::vector<LocationSpec> missing_specs;
     };
 
     // 在某个候选 block 上做 Copy 准入判断（无副作用）。
     // - instance_id/block_key：候选 block 的实例作用域与 block id；
-    // - loc_map：该 block 当前所有 CacheLocation（来自 MetaSearcher::BatchGetLocation）；
+    // - loc_map：该 block 当前所有 CacheLocation（来自共享 NoTouch snapshot）；
     // - src_storage_name / dst_storage_name：迁移源/目标 storage 的 unique name。
     CopyAdmission CheckCopyAdmission(const std::string &instance_id,
                                      int64_t block_key,
@@ -215,14 +246,15 @@ public:
                                      const std::string &dst_storage_name) const;
 
     // ---- 编排入口（API 触发，供 CacheManager::MigrateCache 薄 facade 调用）----
-    // 承载迁移编排本身：候选选择 + location 批查(MetaSearcher) + 逐 block 准入(CheckCopyAdmission)
-    // + Copy(BatchSubmit)/Mark(MarkForTieredWrite) 分发与 copy 失败回落 + accepted/rejected 统计。
+    // 承载迁移编排本身：候选选择 + NoTouch location/feature 快照 + value/execution 准入
+    // + Copy(BatchSubmit)/条件 Mark 分发与 copy 失败回落 + 分阶段 outcome 统计。
     // 前置条件（instance 存在、meta_indexer 非空、target 已注册、group 有 strategy）由 facade
     // 完成后再调本方法；meta_indexer 由调用方传入（facade 已按 instance 取得并做非空校验）。
     struct MigrateResult {
         ErrorCode ec = EC_OK;
         int64_t accepted = 0;
         int64_t rejected = 0;
+        MigrationOutcomeCounts outcome_counts;
         std::string message;
     };
     MigrateResult MigrateCache(RequestContext *request_context,
@@ -237,13 +269,16 @@ public:
                                const std::vector<int64_t> &explicit_block_keys,
                                int64_t sample_count,
                                std::size_t copy_max_concurrency,
-                               int64_t mark_timeout_ms);
+                               int64_t mark_timeout_ms,
+                               MigrationRetention retention,
+                               const MigrationAdmissionConfig &admission_config);
 
     // ---- 共享迁移分发（Admin MigrateCache 与 CacheReclaimer 两路共用）----
-    // 对已准备好的 (batch, loc_maps) 执行：逐 block 准入(CheckCopyAdmission) + copy/mark 分类
-    // + BatchSubmit + copy 失败回落 mark + MarkForTieredWrite。
-    // 两路差异通过 params 参数化（copy slot 限制 / retention / mark timeout / mark 去重）。
+    // 对 keys 做共享 NoTouch snapshot、value/execution 准入、Copy/Mark 分类、BatchSubmit、
+    // Copy 失败回落条件 Mark；上游不能传入已被 touch 或错位的 location。
+    // 两路差异通过 params 参数化（copy slot 限制 / retention / mark timeout / trigger/budget）。
     struct DispatchBatchParams {
+        enum class Trigger { kAdmin, kReclaimer };
         bool do_copy = false;
         bool do_mark = false;
         // max_copy_slots 是调用方本批次的提前剪枝；copy_limit 是 BatchSubmit 内的原子硬限制。
@@ -251,12 +286,20 @@ public:
         CopyConcurrencyLimit copy_limit;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
-        bool dedup_marks = false; // true=跳过已打标的 block（reclaimer 用；Admin 显式指定 block 不需要）
+        MigrationAdmissionConfig admission;
+        Trigger trigger = Trigger::kAdmin;
+        std::size_t action_budget = SIZE_MAX;
+        std::vector<std::vector<std::string>> pending_location_ids_by_block;
     };
     struct DispatchBatchResult {
+        ErrorCode ec = EC_OK;
         int64_t copy_submitted = 0;
         int64_t copy_failed = 0;
         int64_t mark_submitted = 0;
+        int64_t rejected = 0;
+        int64_t noop = 0;
+        int64_t failed = 0;
+        MigrationOutcomeCounts outcome_counts;
     };
 
     // Reclaimer 只在其单线程中选择候选并生成 pending-delete 快照；Job 跨异步边界后完全
@@ -269,6 +312,7 @@ public:
         std::string target_storage_name;
         std::vector<int64_t> block_keys;
         std::vector<std::vector<std::string>> pending_location_ids_by_block;
+        std::size_t action_budget = SIZE_MAX;
         std::function<void(const DispatchBatchResult &)> on_dispatched;
     };
 
@@ -283,7 +327,6 @@ public:
                                               const std::string &src_name,
                                               const std::string &dst_name,
                                               const std::vector<int64_t> &batch,
-                                              const std::vector<CacheLocationMap> &loc_maps,
                                               const DispatchBatchParams &params);
 
     // ---- 统计 ----
@@ -325,6 +368,7 @@ private:
         std::string dst_storage_name;
         std::string dst_location_id;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+        std::chrono::steady_clock::time_point source_lease_start_time;
         std::chrono::steady_clock::time_point submit_time;
         uint64_t total_bytes = 0;              // 源端各 spec 字节数之和（取自 uri size 参数）
         std::string mark_target;               // 提交时 mark 的 target（空=无 mark，用于 match-clear）
@@ -450,12 +494,26 @@ private:
                                                                     const std::string &src_name,
                                                                     const std::string &dst_name,
                                                                     const std::vector<int64_t> &batch,
-                                                                    const std::vector<CacheLocationMap> &loc_maps,
                                                                     const DispatchBatchParams &params);
     ErrorCode CheckTargetStorageAdmission(const std::string &trace_id,
                                           const std::string &instance_group_name,
                                           const std::string &instance_id,
                                           const std::string &target_storage_name) const;
+    void AddCounterMetric(const std::string &name, MetricsTags tags, std::uint64_t value = 1) const noexcept;
+    void SetGaugeMetric(const std::string &name, MetricsTags tags, double value) const noexcept;
+    void ObserveAdmissionAccessAge(const std::string &src_name,
+                                   const std::string &dst_name,
+                                   const DispatchBatchParams &params,
+                                   std::int64_t age_us) const noexcept;
+    void ObserveSourceLeaseDuration(const std::string &src_name,
+                                    const std::string &dst_name,
+                                    std::int64_t duration_us) const noexcept;
+    DispatchBatchResult FinalizeDispatchMetrics(const std::string &instance_id,
+                                                const std::string &src_name,
+                                                const std::string &dst_name,
+                                                std::size_t candidate_count,
+                                                const DispatchBatchParams &params,
+                                                DispatchBatchResult result) const;
 
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;

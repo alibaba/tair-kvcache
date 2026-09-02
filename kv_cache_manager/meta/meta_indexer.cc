@@ -184,6 +184,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
         return ec;
     }
+    ResetMaintenancePropertyReadinessEpoch();
     KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
                   "], max key count[%lu], "
                   "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
@@ -304,7 +305,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
                                                           Result &result,
-                                                          bool preserve_existing_updates_when_full) noexcept {
+                                                          bool preserve_existing_updates_when_full,
+                                                          MetaAccessIntent intent) noexcept {
     if (upsert_batch.batch_keys.empty()) {
         return {0, 0};
     }
@@ -362,7 +364,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
     }
     if (upsert_ecs.empty() || !existing_update_positions.empty()) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch);
+        std::vector<ErrorCode> backend_ecs = backend_manager_->Upsert(request_context, *backend_batch, intent);
         stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
         if (existing_update_positions.empty()) {
             upsert_ecs = std::move(backend_ecs);
@@ -613,6 +615,162 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     return result;
 }
 
+MetaIndexer::Result MetaIndexer::ReadModifyWriteBlockPropertiesForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &property_names,
+    const BlockPropertyModifierFunc &modifier) noexcept {
+    if (keys.empty()) {
+        return Result(EC_OK);
+    }
+    const auto &trace_id = request_context->trace_id();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+
+    auto ephemeral_metrics_registry = std::make_shared<MetricsRegistry>();
+    auto ephemeral_metrics_collector = std::make_shared<ServiceMetricsCollector>(ephemeral_metrics_registry);
+    ephemeral_metrics_collector->Init();
+    auto ephemeral_request_context =
+        std::make_shared<RequestContext>("read_modify_write_block_properties_for_maintenance",
+                                         ephemeral_metrics_collector);
+
+    static LocationIdsPerKey empty_location_ids;
+    static CacheLocationMapVector empty_locations;
+    static PropertyMapVector empty_properties;
+    std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
+
+    Result result(keys.size());
+    int32_t error_count = 0;
+    RmwStats stats;
+    for (auto &batch : batches) {
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
+        const KeyVector &batch_keys = batch.batch_keys;
+        CacheLocationMapVector existing_locations;
+        PropertyMapVector existing_properties;
+        const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
+        MaintenanceReadResult get_results = backend_manager_->GetForMaintenance(ephemeral_request_context.get(),
+                                                                                 batch_keys,
+                                                                                 property_names,
+                                                                                 existing_locations,
+                                                                                 existing_properties);
+        stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
+        if (get_results.location_error_codes.size() != batch_keys.size() ||
+            get_results.property_error_codes.size() != batch_keys.size() ||
+            existing_locations.size() != batch_keys.size() || existing_properties.size() != batch_keys.size()) {
+            PREFIX_INDEXER_LOG(ERROR,
+                               "maintenance block RMW result size mismatch, keys[%zu], location_ecs[%zu], "
+                               "property_ecs[%zu], locations[%zu], properties[%zu]",
+                               batch_keys.size(),
+                               get_results.location_error_codes.size(),
+                               get_results.property_error_codes.size(),
+                               existing_locations.size(),
+                               existing_properties.size());
+            for (const int32_t global_idx : batch.batch_indexs) {
+                result.error_codes[global_idx] = EC_MISMATCH;
+            }
+            error_count += static_cast<int32_t>(batch.batch_indexs.size());
+            result.ec = EC_MISMATCH;
+            continue;
+        }
+
+        BatchMetaData upsert_batch;
+        BatchMetaData delete_batch;
+        std::vector<int32_t> put_global_indexs;
+        for (size_t i = 0; i < batch_keys.size(); ++i) {
+            const int32_t global_idx = batch.batch_indexs[i];
+            const ErrorCode location_ec = get_results.location_error_codes[i];
+            const ErrorCode property_ec = get_results.property_error_codes[i];
+            ErrorCode get_ec = EC_OK;
+            if (location_ec == EC_NOENT && property_ec == EC_NOENT) {
+                get_ec = EC_NOENT;
+            } else if (location_ec != EC_OK || property_ec != EC_OK) {
+                get_ec = location_ec == property_ec ? location_ec : EC_MISMATCH;
+            }
+
+            LocationIdVector existing_location_ids;
+            if (location_ec == EC_OK) {
+                existing_location_ids.reserve(existing_locations[i].size());
+                for (const auto &[location_id, unused_location] : existing_locations[i]) {
+                    (void)unused_location;
+                    existing_location_ids.emplace_back(location_id);
+                }
+            }
+
+            PropertyMap upsert_property_map;
+            CacheLocationMap out_new_locations;
+            const auto [action, modifier_ec] = modifier(existing_location_ids,
+                                                        existing_properties[i],
+                                                        get_ec,
+                                                        static_cast<size_t>(global_idx),
+                                                        upsert_property_map,
+                                                        out_new_locations);
+            if (action == MA_OK) {
+                if (get_ec != EC_OK && get_ec != EC_NOENT) {
+                    result.error_codes[global_idx] = get_ec;
+                    ++error_count;
+                    continue;
+                }
+                upsert_batch.batch_keys.emplace_back(batch_keys[i]);
+                upsert_batch.batch_indexs.emplace_back(global_idx);
+                upsert_batch.batch_locations.emplace_back(std::move(out_new_locations));
+                upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
+                if (get_ec == EC_NOENT) {
+                    put_global_indexs.emplace_back(global_idx);
+                }
+            } else if (action == MA_DELETE && modifier_ec == EC_OK) {
+                delete_batch.batch_keys.emplace_back(batch_keys[i]);
+                delete_batch.batch_indexs.emplace_back(global_idx);
+            } else if (modifier_ec != EC_OK) {
+                result.error_codes[global_idx] = modifier_ec;
+                ++error_count;
+            }
+        }
+
+        const auto [upsert_errors, put_success_count] = ExecuteRmwUpsert(trace_id,
+                                                                         ephemeral_request_context.get(),
+                                                                         upsert_batch,
+                                                                         put_global_indexs,
+                                                                         keys,
+                                                                         stats,
+                                                                         result,
+                                                                         false,
+                                                                         MetaAccessIntent::kMaintenanceNoTouch);
+        const auto [delete_errors, delete_success_count] = ExecuteRmwDelete(trace_id,
+                                                                            ephemeral_request_context.get(),
+                                                                            delete_batch,
+                                                                            keys,
+                                                                            stats,
+                                                                            result,
+                                                                            true);
+        error_count += upsert_errors + delete_errors;
+        AdjustKeyCountMeta(put_success_count - delete_success_count);
+    }
+
+    EmitRmwMetrics(request_context->metrics_collector(), stats, keys.size());
+    ProcessErrorResult(trace_id, kRmwMetaOperation, error_count, keys.size(), result);
+    return result;
+}
+
+MetaIndexer::Result MetaIndexer::ReadModifyWriteBlockForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const BlockIdsOnlyModifierFunc &modifier) noexcept {
+    auto adapter = [&modifier](const LocationIdVector &existing_location_ids,
+                               const PropertyMap & /*existing_properties*/,
+                               ErrorCode get_ec,
+                               size_t key_index,
+                               PropertyMap &upsert_property_map,
+                               CacheLocationMap &out_new_locations) -> ModifierResult {
+        return modifier(existing_location_ids,
+                        get_ec,
+                        key_index,
+                        upsert_property_map,
+                        out_new_locations);
+    };
+    return ReadModifyWriteBlockPropertiesForMaintenance(request_context, keys, {}, adapter);
+}
+
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext *request_context,
                                                                  const KeyVector &keys,
                                                                  const LocationIdsPerKey &location_ids,
@@ -634,9 +792,16 @@ MetaIndexer::ReadModifyWriteLocationsForMaintenance(RequestContext *request_cont
                                                     const KeyVector &keys,
                                                     const LocationIdsPerKey &location_ids,
                                                     const LocationModifierFunc &modifier,
-                                                    bool adjust_reclaimed_key_count) noexcept {
-    return ReadModifyWriteLocationImpl(
-        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, false, true);
+                                                    bool adjust_reclaimed_key_count,
+                                                    bool refresh_cache_from_persistent) noexcept {
+    return ReadModifyWriteLocationImpl(request_context,
+                                       keys,
+                                       location_ids,
+                                       modifier,
+                                       adjust_reclaimed_key_count,
+                                       false,
+                                       refresh_cache_from_persistent,
+                                       true);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
@@ -913,7 +1078,10 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                        keys,
                                                                        stats,
                                                                        rmw_result,
-                                                                       track_created_key_count);
+                                                                       track_created_key_count,
+                                                                       maintenance_no_touch
+                                                                           ? MetaAccessIntent::kMaintenanceNoTouch
+                                                                           : MetaAccessIntent::kBusinessWrite);
         (void)upsert_errs;
         for (const auto &global_index : upsert_batch.batch_indexs) {
             if (rmw_result.error_codes[global_index] != EC_OK) {
@@ -1881,6 +2049,103 @@ MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,
     int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
     ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
     return result;
+}
+
+MetaIndexer::Result MetaIndexer::GetPropertiesForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &property_names,
+    PropertyMapVector &out_properties) noexcept {
+    if (keys.empty()) {
+        out_properties.clear();
+        return Result(EC_OK);
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    std::vector<ErrorCode> error_codes = backend_manager_->GetPropertiesForMaintenance(
+        request_context, keys, property_names, out_properties);
+    if (error_codes.size() != keys.size() || out_properties.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetPropertiesForMaintenance result size mismatch, keys[%zu], ecs[%zu], properties[%zu]",
+                           keys.size(),
+                           error_codes.size(),
+                           out_properties.size());
+        error_codes.assign(keys.size(), EC_MISMATCH);
+        out_properties.assign(keys.size(), PropertyMap{});
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+    Result result(keys.size());
+    const int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
+    return result;
+}
+
+MetaIndexer::MaintenanceGetResult MetaIndexer::GetForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &property_names,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    if (keys.empty()) {
+        out_locations.clear();
+        out_properties.clear();
+        return MaintenanceGetResult(EC_OK);
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
+    const auto &trace_id = request_context->trace_id();
+    const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+    MaintenanceReadResult backend_result = backend_manager_->GetForMaintenance(
+        request_context, keys, property_names, out_locations, out_properties);
+    if (backend_result.location_error_codes.size() != keys.size() || out_locations.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetForMaintenance location result size mismatch, keys[%zu], ecs[%zu], locations[%zu]",
+                           keys.size(),
+                           backend_result.location_error_codes.size(),
+                           out_locations.size());
+        backend_result.location_error_codes.assign(keys.size(), EC_MISMATCH);
+        out_locations.assign(keys.size(), CacheLocationMap{});
+    }
+    if (backend_result.property_error_codes.size() != keys.size() || out_properties.size() != keys.size()) {
+        PREFIX_INDEXER_LOG(ERROR,
+                           "GetForMaintenance property result size mismatch, keys[%zu], ecs[%zu], properties[%zu]",
+                           keys.size(),
+                           backend_result.property_error_codes.size(),
+                           out_properties.size());
+        backend_result.property_error_codes.assign(keys.size(), EC_MISMATCH);
+        out_properties.assign(keys.size(), PropertyMap{});
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
+
+    MaintenanceGetResult result(keys.size());
+    const int32_t location_error_count = ProcessErrorCodes(
+        trace_id, backend_result.location_error_codes, {}, keys, kGetMetaOperation, result.locations);
+    ProcessErrorResult(trace_id, kGetMetaOperation, location_error_count, keys.size(), result.locations);
+    const int32_t property_error_count = ProcessErrorCodes(
+        trace_id, backend_result.property_error_codes, {}, keys, kGetMetaOperation, result.properties);
+    ProcessErrorResult(trace_id, kGetMetaOperation, property_error_count, keys.size(), result.properties);
+    return result;
+}
+
+MaintenancePropertyReadiness
+MetaIndexer::GetMaintenancePropertyReadiness(const std::string &property_name) const noexcept {
+    MaintenancePropertyReadiness readiness;
+    if (!backend_manager_) {
+        return readiness;
+    }
+    readiness.capability = backend_manager_->GetMaintenancePropertyCapability(property_name);
+    readiness.valid_since_steady_us = maintenance_valid_since_steady_us_.load(std::memory_order_acquire);
+    readiness.generation = maintenance_readiness_generation_.load(std::memory_order_acquire);
+    return readiness;
+}
+
+void MetaIndexer::ResetMaintenancePropertyReadinessEpoch() noexcept {
+    maintenance_valid_since_steady_us_.store(TimestampUtil::GetSteadyTimeUs(), std::memory_order_release);
+    maintenance_readiness_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 ErrorCode MetaIndexer::Scan(RequestContext *request_context,

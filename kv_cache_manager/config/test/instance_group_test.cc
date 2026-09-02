@@ -193,6 +193,46 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, CacheConfigProtoRoundTripPreservesMigrationAdmission) {
+    CacheConfig original;
+    // CacheConfigToProto expects a structurally valid CacheConfig.  The
+    // admission assertions below only exercise migration_config, but the
+    // surrounding reclaim config must still be present.
+    original.set_reclaim_strategy(std::make_shared<CacheReclaimStrategy>());
+    auto strategy = std::make_shared<MigrationStrategy>();
+    strategy->set_source_storage_name("hot");
+    strategy->set_target_storage_name("cold");
+    strategy->set_trigger_threshold(0.7);
+    strategy->mutable_methods().mutable_copy().set_enabled(true);
+    strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH);
+    MigrationAdmissionConfig admission;
+    admission.set_mode(MigrationAdmissionMode::SHADOW);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(3600));
+    admission.set_policies({policy});
+    strategy->set_admission(admission);
+    original.set_migration_strategies({strategy});
+
+    proto::admin::CacheConfig proto_config;
+    ProtoConvert::CacheConfigToProto(original, &proto_config);
+    ASSERT_EQ(1, proto_config.migration_config().strategies_size());
+    const auto &proto_admission = proto_config.migration_config().strategies(0).admission();
+    EXPECT_EQ(proto::admin::MIGRATION_ADMISSION_SHADOW, proto_admission.mode());
+    ASSERT_EQ(1, proto_admission.policies_size());
+    ASSERT_TRUE(proto_admission.policies(0).has_recent_access());
+    EXPECT_EQ(3600, proto_admission.policies(0).recent_access().window_seconds());
+
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&proto_config, restored);
+    ASSERT_EQ(1u, restored.migration_strategies().size());
+    const auto &restored_admission = restored.migration_strategies()[0]->admission();
+    EXPECT_EQ(MigrationAdmissionMode::SHADOW, restored_admission.mode());
+    ASSERT_EQ(1u, restored_admission.policies().size());
+    ASSERT_NE(nullptr, restored_admission.policies()[0]);
+    ASSERT_NE(nullptr, restored_admission.policies()[0]->recent_access());
+    EXPECT_EQ(3600, restored_admission.policies()[0]->recent_access()->window_seconds());
+}
+
 TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings) {
     proto::admin::StorageConfig legacy_proto_config;
     legacy_proto_config.set_global_unique_name("legacy_event_report");

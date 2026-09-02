@@ -1,8 +1,10 @@
 #include "kv_cache_manager/manager/migration_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <tuple>
@@ -23,6 +25,7 @@
 #include "kv_cache_manager/event/spec_events/migration_event.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/migration_admission_internal.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -169,6 +172,29 @@ struct MarkInfo {
     bool expired = false;
 };
 
+struct SpecByteSummary {
+    std::uint64_t bytes = 0;
+    std::uint64_t unknown_specs = 0;
+};
+
+SpecByteSummary SummarizeSpecBytes(const std::vector<LocationSpec> &specs) noexcept {
+    SpecByteSummary summary;
+    for (const auto &spec : specs) {
+        const DataStorageUri uri(spec.uri());
+        const std::string size_value = uri.Valid() ? uri.GetParam("size") : std::string{};
+        std::uint64_t size = 0;
+        const auto [ptr, ec] =
+            std::from_chars(size_value.data(), size_value.data() + size_value.size(), size);
+        if (size_value.empty() || ec != std::errc{} || ptr != size_value.data() + size_value.size() ||
+            size > std::numeric_limits<std::uint64_t>::max() - summary.bytes) {
+            ++summary.unknown_specs;
+            continue;
+        }
+        summary.bytes += size;
+    }
+    return summary;
+}
+
 static MarkInfo ParseMarkFromProperties(const PropertyMap &props, int64_t now_ms) {
     MarkInfo info;
     auto tit = props.find(MigrationManager::PROPERTY_TIERED_WRITE_TARGET);
@@ -226,6 +252,225 @@ std::vector<const CacheLocation *> FindLocationsOnStorage(const CacheLocationMap
     }
     return locations;
 }
+
+std::vector<LocationSpec> FindFirstUncoveredSourceSpecs(const CacheLocationMap &loc_map,
+                                                        const std::string &src_storage_name,
+                                                        const std::string &dst_storage_name) {
+    const auto covered = CollectCoveredSpecNames(
+        loc_map, dst_storage_name, {CacheLocationStatus::CLS_SERVING, CacheLocationStatus::CLS_WRITING});
+    for (const auto *source :
+         FindLocationsOnStorage(loc_map, src_storage_name, {CacheLocationStatus::CLS_SERVING})) {
+        std::vector<LocationSpec> missing_specs;
+        missing_specs.reserve(source->location_specs().size());
+        std::copy_if(source->location_specs().begin(),
+                     source->location_specs().end(),
+                     std::back_inserter(missing_specs),
+                     [&covered](const LocationSpec &spec) { return covered.count(spec.name()) == 0; });
+        if (!missing_specs.empty()) {
+            return missing_specs;
+        }
+    }
+    return {};
+}
+
+void AddOutcome(MigrationOutcomeCounts &outcomes,
+                MigrationOutcomeStage stage,
+                MigrationOutcomeClass outcome_class,
+                MigrationOutcomeReason reason,
+                int64_t count,
+                bool terminal) {
+    if (count <= 0) {
+        return;
+    }
+    const auto existing = std::find_if(outcomes.begin(), outcomes.end(), [&](const MigrationOutcomeCount &item) {
+        return item.stage == stage && item.outcome_class == outcome_class && item.reason == reason &&
+               item.terminal == terminal;
+    });
+    if (existing != outcomes.end()) {
+        existing->count += count;
+        return;
+    }
+    outcomes.push_back(MigrationOutcomeCount{stage, outcome_class, reason, count, terminal});
+}
+
+MigrationOutcomeReason ToOutcomeReason(MigrationAdmissionReason reason) noexcept {
+    switch (reason) {
+    case MigrationAdmissionReason::kSatisfied:
+        return MigrationOutcomeReason::kValueAccepted;
+    case MigrationAdmissionReason::kNotRecent:
+        return MigrationOutcomeReason::kNotRecent;
+    case MigrationAdmissionReason::kFeatureMissing:
+        return MigrationOutcomeReason::kFeatureMissing;
+    case MigrationAdmissionReason::kFeatureInvalid:
+        return MigrationOutcomeReason::kFeatureInvalid;
+    case MigrationAdmissionReason::kFeatureUnsupported:
+        return MigrationOutcomeReason::kFeatureUnsupported;
+    case MigrationAdmissionReason::kFeatureReadError:
+        return MigrationOutcomeReason::kFeatureReadError;
+    case MigrationAdmissionReason::kInsufficientBusinessAccessCount:
+        return MigrationOutcomeReason::kFeatureInvalid;
+    }
+    return MigrationOutcomeReason::kUnspecified;
+}
+
+MigrationOutcomeReason ToOutcomeReason(MigrationManager::CopyAdmissionStatus status) noexcept {
+    switch (status) {
+    case MigrationManager::CopyAdmissionStatus::kAlreadyMigrating:
+        return MigrationOutcomeReason::kAlreadyMigrating;
+    case MigrationManager::CopyAdmissionStatus::kTargetServingExists:
+    case MigrationManager::CopyAdmissionStatus::kTargetWritingExists:
+        return MigrationOutcomeReason::kTargetAlreadyCovered;
+    case MigrationManager::CopyAdmissionStatus::kSourceServingNotFound:
+        return MigrationOutcomeReason::kSourceNotFound;
+    case MigrationManager::CopyAdmissionStatus::kAccept:
+        break;
+    }
+    return MigrationOutcomeReason::kUnspecified;
+}
+
+MigrationOutcomeReason CopySubmitOutcomeReason(ErrorCode ec) noexcept {
+    switch (ec) {
+    case EC_NOENT:
+    case EC_MISMATCH:
+        return MigrationOutcomeReason::kSourceRecheckFailed;
+    case EC_EXIST:
+        return MigrationOutcomeReason::kAlreadyMigrating;
+    case EC_OUT_OF_LIMIT:
+        return MigrationOutcomeReason::kCopySlotExhausted;
+    case EC_NOSPC:
+        return MigrationOutcomeReason::kTargetRejected;
+    default:
+        return MigrationOutcomeReason::kCopySubmitFailed;
+    }
+}
+
+const char *TriggerName(MigrationManager::DispatchBatchParams::Trigger trigger) noexcept {
+    return trigger == MigrationManager::DispatchBatchParams::Trigger::kReclaimer ? "reclaimer" : "admin";
+}
+
+const char *AdmissionModeName(MigrationAdmissionMode mode) noexcept {
+    switch (mode) {
+    case MigrationAdmissionMode::DISABLED:
+        return "disabled";
+    case MigrationAdmissionMode::SHADOW:
+        return "shadow";
+    case MigrationAdmissionMode::ENFORCE:
+        return "enforce";
+    }
+    return "unknown";
+}
+
+const char *OutcomeStageName(MigrationOutcomeStage stage) noexcept {
+    switch (stage) {
+    case MigrationOutcomeStage::kSnapshot:
+        return "snapshot";
+    case MigrationOutcomeStage::kValue:
+        return "value";
+    case MigrationOutcomeStage::kExecution:
+        return "execution";
+    case MigrationOutcomeStage::kCopy:
+        return "copy";
+    case MigrationOutcomeStage::kMark:
+        return "mark";
+    }
+    return "unknown";
+}
+
+const char *OutcomeClassName(MigrationOutcomeClass outcome_class) noexcept {
+    switch (outcome_class) {
+    case MigrationOutcomeClass::kAccepted:
+        return "accepted";
+    case MigrationOutcomeClass::kRejected:
+        return "rejected";
+    case MigrationOutcomeClass::kNoopAlreadySatisfied:
+        return "noop_already_satisfied";
+    case MigrationOutcomeClass::kFailed:
+        return "failed";
+    }
+    return "unknown";
+}
+
+const char *OutcomeReasonName(MigrationOutcomeReason reason) noexcept {
+    switch (reason) {
+    case MigrationOutcomeReason::kUnspecified:
+        return "unspecified";
+    case MigrationOutcomeReason::kNotRecent:
+        return "not_recent";
+    case MigrationOutcomeReason::kFeatureMissing:
+        return "feature_missing";
+    case MigrationOutcomeReason::kFeatureInvalid:
+        return "feature_invalid";
+    case MigrationOutcomeReason::kFeatureUnsupported:
+        return "feature_unsupported";
+    case MigrationOutcomeReason::kFeatureReadError:
+        return "feature_read_error";
+    case MigrationOutcomeReason::kRouteNotReady:
+        return "route_not_ready";
+    case MigrationOutcomeReason::kLocationReadError:
+        return "location_read_error";
+    case MigrationOutcomeReason::kSnapshotShapeError:
+        return "snapshot_shape_error";
+    case MigrationOutcomeReason::kSourceNotFound:
+        return "source_not_found";
+    case MigrationOutcomeReason::kTargetAlreadyCovered:
+        return "target_already_covered";
+    case MigrationOutcomeReason::kAlreadyMigrating:
+        return "already_migrating";
+    case MigrationOutcomeReason::kTargetRejected:
+        return "target_rejected";
+    case MigrationOutcomeReason::kSourceRecheckFailed:
+        return "source_recheck_failed";
+    case MigrationOutcomeReason::kCopySubmitted:
+        return "copy_submitted";
+    case MigrationOutcomeReason::kCopySubmitFailed:
+        return "copy_submit_failed";
+    case MigrationOutcomeReason::kMarkInserted:
+        return "mark_inserted";
+    case MigrationOutcomeReason::kMarkAlreadySameTarget:
+        return "mark_already_same_target";
+    case MigrationOutcomeReason::kMarkConflictDifferentTarget:
+        return "mark_conflict_different_target";
+    case MigrationOutcomeReason::kMarkMalformed:
+        return "mark_malformed";
+    case MigrationOutcomeReason::kBlockNotFound:
+        return "block_not_found";
+    case MigrationOutcomeReason::kMarkReadError:
+        return "mark_read_error";
+    case MigrationOutcomeReason::kMarkWriteError:
+        return "mark_write_error";
+    case MigrationOutcomeReason::kPolicyContractError:
+        return "policy_contract_error";
+    case MigrationOutcomeReason::kBudgetExhausted:
+        return "budget_exhausted";
+    case MigrationOutcomeReason::kValueAccepted:
+        return "value_accepted";
+    case MigrationOutcomeReason::kNoExecutionMethod:
+        return "no_execution_method";
+    case MigrationOutcomeReason::kCopySlotExhausted:
+        return "copy_slot_exhausted";
+    case MigrationOutcomeReason::kDispatchNotAvailable:
+        return "dispatch_not_available";
+    }
+    return "unknown";
+}
+
+const char *FeatureStatusName(MigrationOutcomeReason reason) noexcept {
+    switch (reason) {
+    case MigrationOutcomeReason::kFeatureMissing:
+        return "missing";
+    case MigrationOutcomeReason::kFeatureInvalid:
+        return "invalid";
+    case MigrationOutcomeReason::kFeatureUnsupported:
+        return "unsupported";
+    case MigrationOutcomeReason::kFeatureReadError:
+        return "read_error";
+    case MigrationOutcomeReason::kNotRecent:
+    case MigrationOutcomeReason::kValueAccepted:
+        return "available";
+    default:
+        return nullptr;
+    }
+}
 } // namespace
 
 // Mark 持久化属性名（block 级 property）。带 inner 前缀避免与业务属性冲突。
@@ -263,6 +508,200 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
         m_marks_expired_total_ = metrics_registry_->GetCounter("migration.marks_expired_total");
         m_mark_query_errors_total_ = metrics_registry_->GetCounter("migration.mark_query_errors_total");
     }
+}
+
+void MigrationManager::AddCounterMetric(const std::string &name,
+                                        MetricsTags tags,
+                                        std::uint64_t value) const noexcept {
+    if (!metrics_enabled_ || metrics_registry_ == nullptr || value == 0) {
+        return;
+    }
+    try {
+        metrics_registry_->GetCounter(name, tags) += value;
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("record migration metric %s failed: %s", name.c_str(), e.what());
+    } catch (...) { KVCM_LOG_WARN("record migration metric %s failed with unknown error", name.c_str()); }
+}
+
+void MigrationManager::SetGaugeMetric(const std::string &name, MetricsTags tags, double value) const noexcept {
+    if (!metrics_enabled_ || metrics_registry_ == nullptr) {
+        return;
+    }
+    try {
+        metrics_registry_->GetGauge(name, tags) = value;
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("record migration gauge %s failed: %s", name.c_str(), e.what());
+    } catch (...) { KVCM_LOG_WARN("record migration gauge %s failed with unknown error", name.c_str()); }
+}
+
+void MigrationManager::ObserveAdmissionAccessAge(const std::string &src_name,
+                                                 const std::string &dst_name,
+                                                 const DispatchBatchParams &params,
+                                                 std::int64_t age_us) const noexcept {
+    if (!metrics_enabled_ || metrics_registry_ == nullptr || age_us < 0) {
+        return;
+    }
+    try {
+        static constexpr std::array<std::int64_t, 8> kBucketSeconds = {
+            1, 10, 60, 5 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60, 7 * 24 * 60 * 60};
+        static constexpr const char *kFamily = "migration_admission_access_age_seconds";
+        static constexpr const char *kBucket = "migration_admission_access_age_seconds_bucket";
+        static constexpr const char *kSum = "migration_admission_access_age_seconds_sum";
+        static constexpr const char *kCount = "migration_admission_access_age_seconds_count";
+        metrics_registry_->RegisterHistogramFamily(kFamily);
+        metrics_registry_->MapMetricToFamily(kBucket, kFamily);
+        metrics_registry_->MapMetricToFamily(kSum, kFamily);
+        metrics_registry_->MapMetricToFamily(kCount, kFamily);
+
+        MetricsTags tags{{"trigger", TriggerName(params.trigger)}, {"src", src_name}, {"dst", dst_name}};
+        for (const auto boundary_seconds : kBucketSeconds) {
+            if (age_us <= boundary_seconds * 1000 * 1000) {
+                auto bucket_tags = tags;
+                bucket_tags["le"] = std::to_string(boundary_seconds);
+                ++metrics_registry_->GetCounter(kBucket, bucket_tags);
+            }
+        }
+        auto infinite_tags = tags;
+        infinite_tags["le"] = "+Inf";
+        ++metrics_registry_->GetCounter(kBucket, infinite_tags);
+        metrics_registry_->GetCounter(kSum, tags) += static_cast<std::uint64_t>(age_us);
+        ++metrics_registry_->GetCounter(kCount, tags);
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("record migration admission access age failed: %s", e.what());
+    } catch (...) { KVCM_LOG_WARN("record migration admission access age failed with unknown error"); }
+}
+
+void MigrationManager::ObserveSourceLeaseDuration(const std::string &src_name,
+                                                  const std::string &dst_name,
+                                                  std::int64_t duration_us) const noexcept {
+    if (!metrics_enabled_ || metrics_registry_ == nullptr || duration_us < 0) {
+        return;
+    }
+    try {
+        static constexpr std::array<std::int64_t, 7> kBucketSeconds = {1, 10, 60, 5 * 60, 30 * 60, 60 * 60, 6 * 60 * 60};
+        static constexpr const char *kFamily = "migration_source_lease_duration_seconds";
+        static constexpr const char *kBucket = "migration_source_lease_duration_seconds_bucket";
+        static constexpr const char *kSum = "migration_source_lease_duration_seconds_sum";
+        static constexpr const char *kCount = "migration_source_lease_duration_seconds_count";
+        metrics_registry_->RegisterHistogramFamily(kFamily);
+        metrics_registry_->MapMetricToFamily(kBucket, kFamily);
+        metrics_registry_->MapMetricToFamily(kSum, kFamily);
+        metrics_registry_->MapMetricToFamily(kCount, kFamily);
+
+        MetricsTags tags{{"src", src_name}, {"dst", dst_name}};
+        for (const auto boundary_seconds : kBucketSeconds) {
+            if (duration_us <= boundary_seconds * 1000 * 1000) {
+                auto bucket_tags = tags;
+                bucket_tags["le"] = std::to_string(boundary_seconds);
+                ++metrics_registry_->GetCounter(kBucket, bucket_tags);
+            }
+        }
+        auto infinite_tags = tags;
+        infinite_tags["le"] = "+Inf";
+        ++metrics_registry_->GetCounter(kBucket, infinite_tags);
+        metrics_registry_->GetCounter(kSum, tags) += static_cast<std::uint64_t>(duration_us);
+        ++metrics_registry_->GetCounter(kCount, tags);
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("record migration source lease duration failed: %s", e.what());
+    } catch (...) { KVCM_LOG_WARN("record migration source lease duration failed with unknown error"); }
+}
+
+MigrationManager::DispatchBatchResult MigrationManager::FinalizeDispatchMetrics(
+    const std::string &instance_id,
+    const std::string &src_name,
+    const std::string &dst_name,
+    std::size_t candidate_count,
+    const DispatchBatchParams &params,
+    DispatchBatchResult result) const {
+    MetricsTags route_tags{{"trigger", TriggerName(params.trigger)},
+                           {"src", src_name},
+                           {"dst", dst_name},
+                           {"mode", AdmissionModeName(params.admission.mode())}};
+    AddCounterMetric("migration_admission_candidates_total", route_tags, candidate_count);
+
+    auto pool_tags = route_tags;
+    pool_tags.erase("trigger");
+    pool_tags.erase("mode");
+    pool_tags["stage"] = "sampled";
+    AddCounterMetric("migration_candidate_pool_total", pool_tags, candidate_count);
+
+    std::int64_t terminal_count = 0;
+    std::int64_t dispatched_count = 0;
+    for (const auto &outcome : result.outcome_counts) {
+        auto outcome_tags = route_tags;
+        outcome_tags.erase("mode");
+        outcome_tags["stage"] = OutcomeStageName(outcome.stage);
+        outcome_tags["class"] = OutcomeClassName(outcome.outcome_class);
+        outcome_tags["reason"] = OutcomeReasonName(outcome.reason);
+        outcome_tags["terminal"] = outcome.terminal ? "true" : "false";
+        AddCounterMetric("migration_dispatch_outcomes_total", std::move(outcome_tags), outcome.count);
+
+        if (outcome.terminal) {
+            terminal_count += outcome.count;
+            if (outcome.outcome_class == MigrationOutcomeClass::kAccepted) {
+                dispatched_count += outcome.count;
+            }
+        }
+        if (outcome.stage == MigrationOutcomeStage::kValue &&
+            outcome.reason != MigrationOutcomeReason::kPolicyContractError) {
+            auto policy_tags = route_tags;
+            policy_tags.erase("mode");
+            policy_tags["policy"] = "recent_access";
+            policy_tags["reason"] = OutcomeReasonName(outcome.reason);
+            if (outcome.outcome_class == MigrationOutcomeClass::kAccepted) {
+                policy_tags["verdict"] = "accept";
+                AddCounterMetric("migration_admission_accepted_total", route_tags, outcome.count);
+            } else {
+                policy_tags["verdict"] = outcome.reason == MigrationOutcomeReason::kNotRecent ? "reject" : "unknown";
+                auto rejected_tags = route_tags;
+                rejected_tags["reason"] = OutcomeReasonName(outcome.reason);
+                AddCounterMetric("migration_admission_rejected_total", std::move(rejected_tags), outcome.count);
+            }
+            AddCounterMetric("migration_admission_policy_evaluations_total", std::move(policy_tags), outcome.count);
+        }
+        // Feature transport failures are snapshot failures in ENFORCE and
+        // projected policy UNKNOWNs in SHADOW. Record feature availability
+        // independently of the stage so both shapes share one metric.
+        if (const char *feature_status = FeatureStatusName(outcome.reason); feature_status != nullptr) {
+            MetricsTags feature_tags{{"src", src_name},
+                                     {"dst", dst_name},
+                                     {"feature", "last_access_time"},
+                                     {"status", feature_status}};
+            AddCounterMetric("migration_admission_feature_status_total", std::move(feature_tags), outcome.count);
+        }
+
+        const char *read_component = nullptr;
+        if (outcome.reason == MigrationOutcomeReason::kLocationReadError) {
+            read_component = "location";
+        } else if (outcome.reason == MigrationOutcomeReason::kSnapshotShapeError) {
+            read_component = "snapshot";
+        } else if (outcome.reason == MigrationOutcomeReason::kFeatureReadError) {
+            read_component = "property";
+        }
+        if (read_component != nullptr) {
+            MetricsTags read_tags{{"src", src_name},
+                                  {"dst", dst_name},
+                                  {"component", read_component},
+                                  {"reason", OutcomeReasonName(outcome.reason)}};
+            AddCounterMetric("migration_admission_read_error_total", std::move(read_tags), outcome.count);
+        }
+    }
+
+    pool_tags["stage"] = "dispatched";
+    AddCounterMetric("migration_candidate_pool_total", std::move(pool_tags), dispatched_count);
+    if (terminal_count != static_cast<std::int64_t>(candidate_count)) {
+        auto invariant_tags = route_tags;
+        invariant_tags["reason"] = "terminal_count_mismatch";
+        AddCounterMetric("migration_dispatch_invariant_errors_total", std::move(invariant_tags));
+        KVCM_LOG_ERROR("migration dispatch terminal outcome mismatch for instance %s, route %s -> %s: candidates %zu, "
+                       "terminal %lld",
+                       instance_id.c_str(),
+                       src_name.c_str(),
+                       dst_name.c_str(),
+                       candidate_count,
+                       static_cast<long long>(terminal_count));
+    }
+    return result;
 }
 
 void MigrationManager::UpdateActiveTasksGauge() {
@@ -334,6 +773,23 @@ void MigrationManager::Start() {
         return; // already running
     }
     async_prepare_generation_.fetch_add(1, std::memory_order_acq_rel);
+    if (meta_indexer_manager_ != nullptr) {
+        for (const auto &[unused_instance_id, indexer] : meta_indexer_manager_->GetIndexers()) {
+            (void)unused_instance_id;
+            if (indexer != nullptr) {
+                indexer->ResetMaintenancePropertyReadinessEpoch();
+            }
+        }
+    }
+    if (schedule_plan_executor_ != nullptr) {
+        schedule_plan_executor_->SetSourceLocationLeaseChecker(
+            [this](const std::string &instance_id,
+                   int64_t block_key,
+                   const std::string &location_id,
+                   int64_t create_time) {
+                return HasActiveCopySourceLocation(instance_id, block_key, location_id, create_time);
+            });
+    }
     accepting_copy_submissions_.store(true, std::memory_order_release);
     monitor_thread_ = std::thread([this]() { MonitorLoop(); });
     KVCM_LOG_INFO("MigrationManager started");
@@ -369,6 +825,14 @@ void MigrationManager::Stop() {
         active_tasks_by_instance_.clear();
         UpdateActiveTasksGauge();
     }
+    // Keep the checker installed until every lifecycle-protected submit and
+    // monitor completion has stopped and the active lease table is empty.
+    // Clearing it earlier opens a shutdown-only window in which an already
+    // admitted submit still prepares Copy while delete admission no longer
+    // recognizes its source lease.
+    if (schedule_plan_executor_ != nullptr) {
+        schedule_plan_executor_->SetSourceLocationLeaseChecker({});
+    }
     if (dropped > 0) {
         KVCM_LOG_WARN("MigrationManager stopped with %zu active copy task(s) dropped; "
                       "WRITING dst locations will be reclaimed as orphans",
@@ -399,27 +863,28 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     }
 
     // 1. 读取源 location specs + create_time。
-    // 如果调用方已在 admission 阶段取得 src_specs，直接使用并跳过冗余 BatchGetLocation；
-    // public 单条 Submit 仍允许不带快照，此时在这里重读源 location。private BatchSubmit 不走本函数。
+    // 如果调用方已在 admission 阶段取得 src_specs，直接使用并跳过冗余读取；
+    // public 单条 Submit 仍允许不带快照，此时也必须通过 NoTouch 接口重读源 location。
     const std::vector<LocationSpec> *src_specs_ptr = nullptr;
     int64_t src_create_time = 0;
     if (!request.src_specs.empty()) {
         src_specs_ptr = &request.src_specs;
         src_create_time = request.src_create_time;
     } else {
-        MetaSearcher meta_searcher_for_src(indexer);
-        auto ctx_for_src =
-            std::make_shared<RequestContext>(trace_id.empty() ? "migration_prepare" : trace_id);
-        std::vector<CacheLocationMap> location_maps;
-        BlockMask empty_mask;
-        ErrorCode ec =
-            meta_searcher_for_src.BatchGetLocation(ctx_for_src.get(), {request.block_key}, empty_mask, location_maps);
-        if (ec != EC_OK || location_maps.empty()) {
-            KVCM_LOG_WARN("[%s] BatchGetLocation failed for block_key %ld, ec %d",
+        RequestContext source_context(trace_id.empty() ? "migration_prepare" : trace_id);
+        CacheLocationMapVector location_maps;
+        PropertyMapVector unused_properties;
+        const auto source_read = indexer->GetForMaintenance(
+            &source_context, {request.block_key}, {}, location_maps, unused_properties);
+        const ErrorCode source_ec = source_read.locations.error_codes.size() == 1
+                                        ? source_read.locations.error_codes.front()
+                                        : EC_MISMATCH;
+        if (source_ec != EC_OK || location_maps.size() != 1) {
+            KVCM_LOG_WARN("[%s] NoTouch source location read failed for block_key %ld, ec %d",
                           trace_id.c_str(),
                           request.block_key,
-                          ec);
-            return EC_NOENT;
+                          source_ec);
+            return source_ec == EC_NOENT ? EC_NOENT : EC_ERROR;
         }
         auto src_iter = location_maps[0].find(request.src_location_id);
         if (src_iter == location_maps[0].end()) {
@@ -516,7 +981,8 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
         dst_location->push_location_spec(std::move(spec));
     }
     std::vector<MetaSearcher::AddLocationResult> add_results;
-    ErrorCode ec = meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results);
+    ErrorCode ec =
+        meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results, true);
     if (add_results.size() != 1) {
         KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for block_key %ld: expected 1, got %zu; "
                       "retaining allocated URIs",
@@ -581,11 +1047,15 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     if (GetIndexer(request.instance_id) == nullptr) {
         return EC_INSTANCE_NOT_EXIST;
     }
+    if (schedule_plan_executor_ == nullptr) {
+        return EC_ERROR;
+    }
     if (const auto target_ec = CheckTargetStorageAdmission(
             trace_id, request.instance_group_name, request.instance_id, request.dst_storage_name);
         target_ec != EC_OK) {
         return target_ec;
     }
+    auto source_lease_guard = schedule_plan_executor_->AcquireSourceLocationLeaseReservationGuard();
     {
         std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
         // shared lock 可能排在一次 Stop 后才拿到，必须在真正准入点复查。
@@ -612,6 +1082,60 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
             return EC_EXIST;
         }
     }
+
+    // Reservation and this exact NoTouch recheck are atomic with respect to
+    // every automatic delete admission. Once the guard is released, the
+    // active task's (id, create_time) source lease makes later deletes skip it.
+    auto indexer = GetIndexer(request.instance_id);
+    CacheLocationMapVector source_location_maps;
+    PropertyMapVector unused_properties;
+    RequestContext source_recheck_context(trace_id.empty() ? "migration_source_recheck" : trace_id);
+    const auto source_read = indexer->GetForMaintenance(&source_recheck_context,
+                                                        {request.block_key},
+                                                        {},
+                                                        source_location_maps,
+                                                        unused_properties);
+    ErrorCode source_check_ec = EC_OK;
+    const CacheLocation *source_location = nullptr;
+    if (source_read.locations.error_codes.size() != 1 || source_location_maps.size() != 1) {
+        source_check_ec = EC_ERROR;
+    } else if (source_read.locations.error_codes[0] != EC_OK) {
+        source_check_ec = source_read.locations.error_codes[0] == EC_NOENT
+                              ? EC_NOENT
+                              : source_read.locations.error_codes[0];
+    } else {
+        const auto source_iter = source_location_maps[0].find(request.src_location_id);
+        if (source_iter != source_location_maps[0].end() && source_iter->second != nullptr) {
+            source_location = source_iter->second.get();
+        } else {
+            source_check_ec = EC_NOENT;
+        }
+    }
+    const bool source_matches = source_location != nullptr && source_location->status() == CLS_SERVING &&
+                                source_location->create_time() > 0 &&
+                                (request.src_create_time <= 0 ||
+                                 request.src_create_time == source_location->create_time());
+    if (source_check_ec != EC_OK || !source_matches || source_location->location_specs().empty()) {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        RemovePreparingTaskLocked(request.instance_id, request.block_key);
+        return source_check_ec != EC_OK ? source_check_ec : EC_MISMATCH;
+    }
+    request.src_create_time = source_location->create_time();
+    request.src_specs = source_location->location_specs();
+    {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        const auto instance_iter = active_tasks_by_instance_.find(request.instance_id);
+        if (instance_iter == active_tasks_by_instance_.end()) {
+            return EC_ERROR;
+        }
+        const auto task_iter = instance_iter->second.find(request.block_key);
+        if (task_iter == instance_iter->second.end() || task_iter->second.state != CopyTaskState::kPreparing) {
+            RemovePreparingTaskLocked(request.instance_id, request.block_key);
+            return EC_ERROR;
+        }
+        task_iter->second.src_create_time = request.src_create_time;
+    }
+    source_lease_guard.unlock();
     auto release_preparing = [&]() {
         std::lock_guard<std::mutex> lock(task_mutex_);
         RemovePreparingTaskLocked(request.instance_id, request.block_key);
@@ -771,7 +1295,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                                     return request.instance_id == first_req.instance_id &&
                                            request.dst_storage_name == first_req.dst_storage_name &&
                                            !request.src_location_id.empty() && !request.src_storage_name.empty() &&
-                                           !request.src_specs.empty();
+                                           !request.src_specs.empty() && request.src_create_time > 0;
                                 });
     if (!prepared_batch) {
         KVCM_LOG_WARN(
@@ -804,6 +1328,13 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         }
         return collect_results();
     }
+    if (schedule_plan_executor_ == nullptr) {
+        for (auto &item : items) {
+            item.MarkFailed(EC_ERROR);
+        }
+        return collect_results();
+    }
+    auto source_lease_guard = schedule_plan_executor_->AcquireSourceLocationLeaseReservationGuard();
 
     // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + draining gate + preparing reservation ----
     // 所有 eligible item 必须在释放短准入锁、执行任何 batch Create/AddLocation 前进入
@@ -876,6 +1407,57 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         release_all_preparing();
         return collect_results();
     }
+
+    // ---- phase 0.5: exact source generation recheck, before target allocation ----
+    // The reservation guard is still held, so delete admission cannot pass
+    // its lease check and CAS between this read and lease publication.
+    KeyVector source_recheck_keys;
+    std::vector<BatchCopyItem *> source_recheck_items;
+    for (auto &item : items) {
+        if (item.eligible) {
+            source_recheck_keys.push_back(item.request.block_key);
+            source_recheck_items.push_back(&item);
+        }
+    }
+    if (!source_recheck_keys.empty()) {
+        CacheLocationMapVector source_location_maps;
+        PropertyMapVector unused_properties;
+        RequestContext source_recheck_context(trace_id.empty() ? "migration_batch_source_recheck" : trace_id);
+        const auto source_read = indexer->GetForMaintenance(&source_recheck_context,
+                                                            source_recheck_keys,
+                                                            {},
+                                                            source_location_maps,
+                                                            unused_properties);
+        const bool shape_ok = source_read.locations.error_codes.size() == source_recheck_items.size() &&
+                              source_location_maps.size() == source_recheck_items.size();
+        for (size_t i = 0; i < source_recheck_items.size(); ++i) {
+            auto &item = *source_recheck_items[i];
+            ErrorCode source_check_ec = EC_OK;
+            const CacheLocation *source_location = nullptr;
+            if (!shape_ok) {
+                source_check_ec = EC_ERROR;
+            } else if (source_read.locations.error_codes[i] != EC_OK) {
+                source_check_ec = source_read.locations.error_codes[i] == EC_NOENT
+                                      ? EC_NOENT
+                                      : source_read.locations.error_codes[i];
+            } else {
+                const auto source_iter = source_location_maps[i].find(item.request.src_location_id);
+                if (source_iter != source_location_maps[i].end() && source_iter->second != nullptr) {
+                    source_location = source_iter->second.get();
+                } else {
+                    source_check_ec = EC_NOENT;
+                }
+            }
+            if (source_check_ec != EC_OK || source_location == nullptr ||
+                source_location->status() != CLS_SERVING ||
+                source_location->create_time() != item.request.src_create_time) {
+                item.MarkFailed(source_check_ec != EC_OK ? source_check_ec : EC_MISMATCH);
+                release_preparing(item);
+            }
+        }
+    }
+    source_lease_guard.unlock();
+
     auto dst_backend = data_storage_manager_ ? data_storage_manager_->GetDataStorageBackend(first_req.dst_storage_name)
                                              : nullptr;
     if (!dst_backend) {
@@ -1024,7 +1606,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         MetaSearcher meta_searcher(indexer);
         std::vector<MetaSearcher::AddLocationResult> add_results;
         ErrorCode add_ec =
-            meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, add_results);
+            meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, add_results, true);
         if (add_results.size() != add_items.size()) {
             KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for migration batch: expected %zu, "
                           "got %zu, aggregate ec %d; retaining allocated URIs",
@@ -1194,12 +1776,13 @@ bool MigrationManager::IsSourceLocationServing(const CopyTaskContext &ctx) const
         return false;
     }
 
-    MetaSearcher meta_searcher(indexer);
     auto rc = std::make_shared<RequestContext>("migration_check_source");
     std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    ErrorCode ec = meta_searcher.BatchGetLocation(rc.get(), {ctx.block_key}, empty_mask, location_maps);
-    if (ec != EC_OK || location_maps.empty()) {
+    PropertyMapVector unused_properties;
+    const auto read_result =
+        indexer->GetForMaintenance(rc.get(), {ctx.block_key}, {}, location_maps, unused_properties);
+    if (read_result.locations.error_codes.size() != 1 || read_result.locations.error_codes[0] != EC_OK ||
+        location_maps.size() != 1) {
         return false;
     }
     auto iter = location_maps[0].find(ctx.src_location_id);
@@ -1225,6 +1808,11 @@ void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, cons
                                     .count();
     if (metrics_enabled_) {
         ++m_tasks_completed_failed_;
+    }
+    if (fail_reason == "source_lost") {
+        AddCounterMetric("migration_copy_source_lost_written_bytes_total",
+                         {{"src", ctx.src_storage_name}, {"dst", ctx.dst_storage_name}},
+                         ctx.total_bytes);
     }
     if (event_manager_ != nullptr) {
         auto ev = std::make_shared<MigrationCompletedEvent>(ctx.instance_id);
@@ -1282,7 +1870,8 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
             {MetaSearcher::LocationCASTask{ctx.dst_location_id, CLS_WRITING, CLS_SERVING}}};
         std::vector<std::vector<ErrorCode>> cas_results;
-        ErrorCode ec = meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas_tasks, cas_results);
+        ErrorCode ec =
+            meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas_tasks, cas_results, false, true);
         promoted = (ec == EC_OK && !cas_results.empty() && !cas_results[0].empty() && cas_results[0][0] == EC_OK);
     }
 
@@ -1300,15 +1889,14 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         ClearTieredWriteMarkIfMatchInternal(ctx.instance_id, block_key, ctx.mark_target, ctx.mark_deadline_ms);
     }
 
-    // 按 retention 处理源端。
-    if (ctx.retention == MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE) {
-        SubmitSourceLocationDelete(ctx);
-    }
-
-    // 最后移除活跃任务。
+    // 先释放 active task/source lease，再提交带 create_time generation guard
+    // 的源删除。否则删除 admission 会正确地把本任务自己的源删除也挡掉。
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
         RemoveActiveTaskLocked(ctx.instance_id, block_key);
+    }
+    if (ctx.retention == MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE) {
+        SubmitSourceLocationDelete(ctx);
     }
     stat_copy_completed_.fetch_add(1, std::memory_order_relaxed);
     const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1386,6 +1974,7 @@ void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.src_location_id}};
+    del_req.expected_location_create_times = {{ctx.src_create_time}};
     schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation);
 }
 
@@ -1441,8 +2030,25 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
                                                const std::vector<int64_t> &block_keys,
                                                const std::string &dst_storage_name,
                                                int64_t timeout_ms) {
+    return MarkForTieredWriteDetailed(instance_id, block_keys, dst_storage_name, timeout_ms).ec;
+}
+
+MigrationManager::MarkWriteResult MigrationManager::MarkForTieredWriteDetailed(
+    const std::string &instance_id,
+    const std::vector<int64_t> &block_keys,
+    const std::string &dst_storage_name,
+    int64_t timeout_ms) {
+    MarkWriteResult write_result;
+    write_result.outcomes.resize(block_keys.size());
     if (dst_storage_name.empty() || block_keys.empty()) {
-        return EC_OK;
+        if (dst_storage_name.empty() && !block_keys.empty()) {
+            write_result.ec = EC_BADARGS;
+            for (auto &outcome : write_result.outcomes) {
+                outcome.status = MarkWriteStatus::kWriteError;
+                outcome.ec = EC_BADARGS;
+            }
+        }
+        return write_result;
     }
     // 新 Mark 只写入当前可分配的 target；已存在 Mark 遇到 quota 满或 unavailable 时由消费
     // 路径暂时忽略并保留，待容量/可用性恢复后自愈。
@@ -1453,7 +2059,12 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
                       dst_storage_name.c_str(),
                       instance_id.c_str(),
                       target_ec);
-        return target_ec;
+        write_result.ec = target_ec;
+        for (auto &outcome : write_result.outcomes) {
+            outcome.status = MarkWriteStatus::kWriteError;
+            outcome.ec = target_ec;
+        }
+        return write_result;
     }
     if (timeout_ms <= 0) {
         timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
@@ -1461,48 +2072,94 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     auto indexer = GetIndexer(instance_id);
     if (indexer == nullptr) {
         KVCM_LOG_WARN("MarkForTieredWrite: meta indexer not found for instance %s", instance_id.c_str());
-        return EC_INSTANCE_NOT_EXIST;
+        write_result.ec = EC_INSTANCE_NOT_EXIST;
+        for (auto &outcome : write_result.outcomes) {
+            outcome.status = MarkWriteStatus::kReadError;
+            outcome.ec = EC_INSTANCE_NOT_EXIST;
+        }
+        return write_result;
     }
     const int64_t now_ms = TimestampUtil::GetCurrentTimeMs();
     if (timeout_ms > std::numeric_limits<int64_t>::max() - now_ms) {
         KVCM_LOG_WARN(
             "MarkForTieredWrite: timeout %ld overflows deadline for instance %s", timeout_ms, instance_id.c_str());
-        return EC_BADARGS;
+        write_result.ec = EC_BADARGS;
+        for (auto &outcome : write_result.outcomes) {
+            outcome.status = MarkWriteStatus::kWriteError;
+            outcome.ec = EC_BADARGS;
+        }
+        return write_result;
     }
     const int64_t deadline_ms = now_ms + timeout_ms;
-    // 记录实际成功打标的 key index，供 stat/expiry/event 仅按 actual 口径更新。
-    // modifier 在 RMW 批次内按 global_idx 回调，顺序对齐 block_keys。
-    std::vector<bool> mark_succeeded(block_keys.size(), false);
-    // RMW：只写 property（out_new_locations 留空，不动 location）。不存在的 block 跳过（不给空 block 打标）。
-    auto modifier = [&dst_storage_name, deadline_ms, &mark_succeeded](const LocationIdVector & /*existing*/,
-                                                                     ErrorCode get_ec,
-                                                                     size_t idx,
-                                                                     PropertyMap &upsert_property_map,
-                                                                     CacheLocationMap & /*out_new*/) -> ModifierResult {
+    // 条件判断和 property 写入共享同一个 metadata shard 临界区。预查询只用于减少 I/O，
+    // 不承担并发正确性；modifier 只记录计划结果，最终以逐 key backend commit 为准。
+    auto modifier = [&dst_storage_name, now_ms, deadline_ms, &write_result](
+                        const LocationIdVector & /*existing*/,
+                        const PropertyMap &existing_properties,
+                        ErrorCode get_ec,
+                        size_t idx,
+                        PropertyMap &upsert_property_map,
+                        CacheLocationMap & /*out_new*/) -> ModifierResult {
+        auto &outcome = write_result.outcomes[idx];
         if (get_ec == EC_NOENT) {
+            outcome.status = MarkWriteStatus::kBlockNotFound;
+            outcome.ec = EC_NOENT;
             return {MA_SKIP, EC_OK};
         }
         if (get_ec != EC_OK) {
+            outcome.status = MarkWriteStatus::kReadError;
+            outcome.ec = get_ec;
             return {MA_FAIL, get_ec};
+        }
+        const MarkInfo existing_mark = ParseMarkFromProperties(existing_properties, now_ms);
+        if (existing_mark.malformed) {
+            outcome.status = MarkWriteStatus::kMalformedExistingMark;
+            return {MA_SKIP, EC_OK};
+        }
+        if (!existing_mark.target.empty() && !existing_mark.expired) {
+            outcome.status = existing_mark.target == dst_storage_name
+                                 ? MarkWriteStatus::kAlreadySameTarget
+                                 : MarkWriteStatus::kConflictDifferentTarget;
+            return {MA_SKIP, EC_OK};
         }
         upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = dst_storage_name;
         upsert_property_map[PROPERTY_TIERED_WRITE_DEADLINE_MS] = std::to_string(deadline_ms);
-        if (idx < mark_succeeded.size()) {
-            mark_succeeded[idx] = true;
-        }
+        outcome.status = MarkWriteStatus::kInserted;
         return {MA_OK, EC_OK};
     };
     RequestContext rc("migration_mark");
     KeyVector keys(block_keys.begin(), block_keys.end());
-    auto result = indexer->ReadModifyWriteBlock(&rc, keys, modifier);
-    // stat/expiry/event 按实际成功数更新（actual 口径），不再用 block_keys.size()（request 口径）。
-    const size_t actual_marked = static_cast<size_t>(std::count(mark_succeeded.begin(), mark_succeeded.end(), true));
+    auto result = indexer->ReadModifyWriteBlockPropertiesForMaintenance(
+        &rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, modifier);
+
+    size_t actual_marked = 0;
+    size_t io_error_count = 0;
+    for (size_t i = 0; i < write_result.outcomes.size(); ++i) {
+        auto &outcome = write_result.outcomes[i];
+        const ErrorCode commit_ec = i < result.error_codes.size() ? result.error_codes[i] : EC_MISMATCH;
+        if (outcome.status == MarkWriteStatus::kInserted && commit_ec != EC_OK) {
+            outcome.status = MarkWriteStatus::kWriteError;
+            outcome.ec = commit_ec;
+        }
+        if (outcome.status == MarkWriteStatus::kReadError && outcome.ec == EC_OK) {
+            outcome.ec = commit_ec != EC_OK ? commit_ec : (result.ec == EC_OK ? EC_ERROR : result.ec);
+        }
+        if (outcome.status == MarkWriteStatus::kInserted) {
+            ++actual_marked;
+        } else if (outcome.status == MarkWriteStatus::kReadError ||
+                   outcome.status == MarkWriteStatus::kWriteError) {
+            ++io_error_count;
+        }
+    }
+    write_result.ec = io_error_count == 0
+                          ? EC_OK
+                          : (io_error_count == write_result.outcomes.size() ? EC_ERROR : EC_PARTIAL_OK);
     if (actual_marked > 0) {
         stat_marks_added_.fetch_add(actual_marked, std::memory_order_relaxed);
     }
     UpdateMarksActiveGauge();
     for (size_t i = 0; i < block_keys.size(); ++i) {
-        if (!mark_succeeded[i]) {
+        if (write_result.outcomes[i].status != MarkWriteStatus::kInserted) {
             continue;
         }
         EnqueueMarkExpiry(instance_id, block_keys[i], dst_storage_name, deadline_ms);
@@ -1513,7 +2170,7 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
             event_manager_->Publish(ev);
         }
     }
-    return result.ec;
+    return write_result;
 }
 
 bool MigrationManager::ClearTieredWriteMarkIfMatch(const std::string &instance_id,
@@ -1538,9 +2195,7 @@ std::string MigrationManager::GetTieredWriteTarget(const std::string &instance_i
     return (ec == EC_OK && !results.empty() && results[0].HasValidMark()) ? results[0].target : std::string();
 }
 
-// match 检查在 RMW modifier 闭包内执行（shard lock 保原子），不需要外部 mark_mutex_。
-// modifier 内通过捕获的 indexer 读 GetProperties（GetProperties 不走 shard lock，不死锁），
-// 读-比较-写三步在同一个 shard lock 内完成，与 BatchCASLocationStatus 同模式。
+// match 检查与写空值在同一个 maintenance block/property RMW 内完成；读取和写入均不 touch。
 bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &instance_id,
                                                            int64_t block_key,
                                                            const std::string &expected_target,
@@ -1557,9 +2212,10 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
         return false;
     }
 
-    bool cleared = false;
-    auto modifier = [&indexer, block_key, &expected_target, expected_deadline_ms, expect_malformed, &cleared](
+    bool planned_clear = false;
+    auto modifier = [&expected_target, expected_deadline_ms, expect_malformed, &planned_clear](
                         const LocationIdVector & /*existing*/,
+                        const PropertyMap &existing_properties,
                         ErrorCode get_ec,
                         size_t /*idx*/,
                         PropertyMap &upsert_property_map,
@@ -1567,26 +2223,23 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
         if (get_ec != EC_OK) {
             return {MA_SKIP, EC_OK};
         }
-        RequestContext check_rc("migration_match_clear_check");
-        PropertyMapVector check_props;
-        const auto check_result = indexer->GetProperties(&check_rc, {block_key},
-            {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, check_props);
-        if (check_result.ec != EC_OK || check_result.error_codes.size() != 1 || check_result.error_codes[0] != EC_OK ||
-            check_props.size() != 1) {
-            return {MA_SKIP, EC_OK};
-        }
-        auto mark = ParseMarkFromProperties(check_props[0], 0);
+        const auto mark = ParseMarkFromProperties(existing_properties, 0);
         if (mark.target != expected_target ||
             (expect_malformed ? !mark.malformed : mark.deadline_ms != expected_deadline_ms)) {
             return {MA_SKIP, EC_OK};
         }
         upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = "";
         upsert_property_map[PROPERTY_TIERED_WRITE_DEADLINE_MS] = "";
-        cleared = true;
+        planned_clear = true;
         return {MA_OK, EC_OK};
     };
     RequestContext rc("migration_conditional_clear_mark");
-    indexer->ReadModifyWriteBlock(&rc, {block_key}, modifier);
+    const auto rmw_result = indexer->ReadModifyWriteBlockPropertiesForMaintenance(
+        &rc,
+        {block_key},
+        {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS},
+        modifier);
+    const bool cleared = planned_clear && rmw_result.error_codes.size() == 1 && rmw_result.error_codes[0] == EC_OK;
     if (cleared && !expect_malformed) {
         stat_marks_cleared_.fetch_add(1, std::memory_order_relaxed);
         UpdateMarksActiveGauge();
@@ -1644,8 +2297,8 @@ ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instan
     RequestContext rc("migration_query_mark_batch");
     KeyVector keys(block_keys.begin(), block_keys.end());
     PropertyMapVector props;
-    const auto query_result =
-        indexer->GetProperties(&rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
+    const auto query_result = indexer->GetPropertiesForMaintenance(
+        &rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
     if (query_result.error_codes.size() != block_keys.size() || props.size() != block_keys.size()) {
         KVCM_LOG_WARN("mark query result shape mismatch for instance %s: keys %zu, per_key_ec %zu, props %zu, "
                       "aggregate ec %d",
@@ -1854,6 +2507,7 @@ bool MigrationManager::ReservePreparingTaskLocked(const MigrationRequest &reques
     ctx.dst_storage_name = request.dst_storage_name;
     ctx.retention = request.retention;
     ctx.state = CopyTaskState::kPreparing;
+    ctx.source_lease_start_time = std::chrono::steady_clock::now();
     // InsertActiveTaskLocked 在同一个 task_mutex_ 临界区内完成存在性检查与插入，避免 check-then-insert 窗口。
     return InsertActiveTaskLocked(std::move(ctx));
 }
@@ -1867,7 +2521,9 @@ bool MigrationManager::UpdatePreparingTaskLocked(const CopyTaskContext &ctx) {
     if (task_iter == instance_iter->second.end() || task_iter->second.state != CopyTaskState::kPreparing) {
         return false;
     }
+    const auto source_lease_start_time = task_iter->second.source_lease_start_time;
     task_iter->second = ctx;
+    task_iter->second.source_lease_start_time = source_lease_start_time;
     task_iter->second.state = CopyTaskState::kPreparing;
     return true;
 }
@@ -1903,14 +2559,24 @@ bool MigrationManager::RemoveActiveTaskLocked(const std::string &instance_id, in
     if (instance_iter == active_tasks_by_instance_.end()) {
         return false;
     }
-    const size_t erased = instance_iter->second.erase(block_key);
-    if (erased == 0) {
+    const auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end()) {
         return false;
     }
+    const CopyTaskContext removed_task = task_iter->second;
+    instance_iter->second.erase(task_iter);
     if (instance_iter->second.empty()) {
         active_tasks_by_instance_.erase(instance_iter); // 内层空则收回外层，避免 stale 空 map
     }
     UpdateActiveTasksGauge();
+    if (removed_task.source_lease_start_time.time_since_epoch().count() != 0) {
+        const auto lease_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() -
+                                           removed_task.source_lease_start_time)
+                                           .count();
+        ObserveSourceLeaseDuration(
+            removed_task.src_storage_name, removed_task.dst_storage_name, lease_duration_us);
+    }
     return true;
 }
 
@@ -2001,6 +2667,40 @@ bool MigrationManager::HasActiveCopyTargetLocation(const std::string &instance_i
         return true;
     }
     return task.dst_location_id == location_id;
+}
+
+bool MigrationManager::HasActiveCopySourceLocation(const std::string &instance_id,
+                                                   int64_t block_key,
+                                                   const std::string &location_id,
+                                                   int64_t create_time) const {
+    if (location_id.empty() || create_time <= 0) {
+        return false;
+    }
+    std::string src_storage_name;
+    std::string dst_storage_name;
+    bool leased = false;
+    {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        const auto instance_iter = active_tasks_by_instance_.find(instance_id);
+        if (instance_iter == active_tasks_by_instance_.end()) {
+            return false;
+        }
+        const auto task_iter = instance_iter->second.find(block_key);
+        if (task_iter == instance_iter->second.end()) {
+            return false;
+        }
+        const CopyTaskContext &task = task_iter->second;
+        leased = task.src_location_id == location_id && task.src_create_time == create_time;
+        if (leased) {
+            src_storage_name = task.src_storage_name;
+            dst_storage_name = task.dst_storage_name;
+        }
+    }
+    if (leased) {
+        AddCounterMetric("migration_source_lease_conflicts_total",
+                         {{"src", src_storage_name}, {"dst", dst_storage_name}, {"deleter", "scheduled_delete"}});
+    }
+    return leased;
 }
 
 size_t MigrationManager::ActiveTaskCountUnsafe() const {
@@ -2131,7 +2831,13 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
             continue;
         }
         // 该 source 既未被 SERVING 也未被 SERVING∪WRITING 联合覆盖 → 需要 copy。
-        return {CopyAdmissionStatus::kAccept, src_loc};
+        std::vector<LocationSpec> missing_specs;
+        missing_specs.reserve(src_loc->location_specs().size());
+        std::copy_if(src_loc->location_specs().begin(),
+                     src_loc->location_specs().end(),
+                     std::back_inserter(missing_specs),
+                     [&all_covered](const LocationSpec &spec) { return all_covered.count(spec.name()) == 0; });
+        return {CopyAdmissionStatus::kAccept, src_loc, std::move(missing_specs)};
     }
 
     // 循环走完未 return kAccept：每个 source 都被 serving∪writing 覆盖。
@@ -2167,6 +2873,17 @@ MigrationManager::SelectMigrationCandidateKeys(RequestContext *request_context,
         KVCM_LOG_WARN("[%s] MigrateCache sample keys failed, ec %d", trace_id.c_str(), ec);
         return {ec, {}};
     }
+    // Sampling backends may return the same block more than once. Preserve
+    // first-seen order so a block consumes one action/Copy slot and receives
+    // exactly one terminal outcome, just like explicit Admin keys and the
+    // Reclaimer candidate builder.
+    std::unordered_set<int64_t> seen;
+    seen.reserve(candidate_keys.size());
+    candidate_keys.erase(
+        std::remove_if(candidate_keys.begin(),
+                       candidate_keys.end(),
+                       [&seen](int64_t block_key) { return !seen.insert(block_key).second; }),
+        candidate_keys.end());
     return {EC_OK, std::move(candidate_keys)};
 }
 
@@ -2313,34 +3030,6 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
             return {};
         }
 
-        const auto indexer = meta_indexer_manager_->GetMetaIndexer(job.instance_id);
-        if (!indexer) {
-            return {};
-        }
-        MetaSearcher meta_searcher(indexer);
-        std::vector<CacheLocationMap> loc_maps;
-        BlockMask empty_mask;
-        if (meta_searcher.BatchGetLocation(request_context.get(), job.block_keys, empty_mask, loc_maps) != EC_OK ||
-            loc_maps.size() != job.block_keys.size()) {
-            return {};
-        }
-
-        for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
-            if (job.pending_location_ids_by_block[block_idx].empty()) {
-                continue;
-            }
-            const std::unordered_set<std::string> pending_ids(job.pending_location_ids_by_block[block_idx].begin(),
-                                                              job.pending_location_ids_by_block[block_idx].end());
-            auto &loc_map = loc_maps[block_idx];
-            for (auto it = loc_map.begin(); it != loc_map.end();) {
-                if (pending_ids.count(it->first) > 0) {
-                    it = loc_map.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-
         const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
         const std::size_t max_concurrent_copy =
             configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
@@ -2352,13 +3041,15 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
         params.max_copy_slots = max_concurrent_copy > active_copy_count ? max_concurrent_copy - active_copy_count : 0;
         params.retention = current_strategy->retention();
         params.mark_timeout_ms = current_strategy->methods().mark().timeout_ms();
-        params.dedup_marks = true;
+        params.admission = current_strategy->admission();
+        params.trigger = DispatchBatchParams::Trigger::kReclaimer;
+        params.action_budget = job.action_budget;
+        params.pending_location_ids_by_block = std::move(job.pending_location_ids_by_block);
         return DispatchMigrationBatchWithLifecycleLockHeld(job.trace_id,
                                                             job.instance_id,
                                                             job.source_storage_name,
                                                             job.target_storage_name,
                                                             job.block_keys,
-                                                            loc_maps,
                                                             params);
     };
 
@@ -2387,7 +3078,9 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
                                                               const std::vector<int64_t> &explicit_block_keys,
                                                               int64_t sample_count,
                                                               std::size_t copy_max_concurrency,
-                                                              int64_t mark_timeout_ms) {
+                                                              int64_t mark_timeout_ms,
+                                                              MigrationRetention retention,
+                                                              const MigrationAdmissionConfig &admission_config) {
     MigrateResult result;
 
     // meta_indexer 由 facade 保证非空（instance 存在性已前置校验）；防御性再查一次。
@@ -2406,7 +3099,6 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
         return result;
     }
 
-    const int64_t total = static_cast<int64_t>(candidate_keys.size());
     if (candidate_keys.empty()) {
         result.ec = EC_OK;
         result.accepted = 0;
@@ -2415,30 +3107,25 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
         return result;
     }
 
-    // 2. 取各 block 的 location，准入过滤（在源 storage 上、SERVING、未在迁移中、目标无副本）。
-    MetaSearcher meta_searcher(meta_indexer);
-    std::vector<CacheLocationMap> loc_maps;
-    BlockMask empty_mask;
-    if (const auto ec = meta_searcher.BatchGetLocation(request_context, candidate_keys, empty_mask, loc_maps);
-        ec != EC_OK || loc_maps.size() != candidate_keys.size()) {
-        result.ec = EC_ERROR;
-        result.message = "get cache location failed";
-        return result;
-    }
-
     // 准入、分发和 fallback 委派共享 DispatchMigrationBatch。
     DispatchBatchParams params;
     params.do_copy = do_copy;
     params.do_mark = do_mark;
     params.copy_limit = CopyConcurrencyLimit{instance_group_name, copy_max_concurrency};
+    params.retention = retention;
     params.mark_timeout_ms = mark_timeout_ms;
-    const auto dispatch =
-        DispatchMigrationBatch(trace_id, instance_id, src_name, dst_name, candidate_keys, loc_maps, params);
+    params.admission = admission_config;
+    params.trigger = DispatchBatchParams::Trigger::kAdmin;
+    const auto dispatch = DispatchMigrationBatch(trace_id, instance_id, src_name, dst_name, candidate_keys, params);
 
-    result.ec = EC_OK;
+    result.ec = dispatch.ec;
     result.accepted = dispatch.copy_submitted + dispatch.mark_submitted;
-    result.rejected = total - result.accepted;
-    result.message = "migrate cache dispatched";
+    // Legacy projection: rejected means "did not create a new Copy/Mark" and
+    // therefore includes precise rejected/noop/failed terminal classes. New
+    // callers should use outcome_counts for the authoritative breakdown.
+    result.rejected = dispatch.rejected + dispatch.noop + dispatch.failed;
+    result.outcome_counts = dispatch.outcome_counts;
+    result.message = dispatch.ec == EC_OK ? "migrate cache dispatched" : "migration dispatch failed";
     return result;
 }
 
@@ -2448,23 +3135,50 @@ MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatch(
     const std::string &src_name,
     const std::string &dst_name,
     const std::vector<int64_t> &batch,
-    const std::vector<CacheLocationMap> &loc_maps,
     const DispatchBatchParams &params) {
     DispatchBatchResult result;
-    if (batch.empty() || loc_maps.size() != batch.size()) {
-        return result;
+    if (batch.empty()) {
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+    }
+    if (!params.pending_location_ids_by_block.empty() &&
+        params.pending_location_ids_by_block.size() != batch.size()) {
+        result.ec = EC_BADARGS;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kSnapshotShapeError,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
     }
     if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
-        return result;
+        result.ec = EC_ERROR;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kDispatchNotAvailable,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
     }
     // Copy 与 Mark 必须位于同一个 leader-lifecycle barrier 内。否则 Stop 可能在异步 Job
     // 完成 fresh read 后关闭 Copy gate，但 Job 仍继续写入 Mark。
     std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
     if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
-        return result;
+        result.ec = EC_ERROR;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kDispatchNotAvailable,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
     }
     return DispatchMigrationBatchWithLifecycleLockHeld(
-        trace_id, instance_id, src_name, dst_name, batch, loc_maps, params);
+        trace_id, instance_id, src_name, dst_name, batch, params);
 }
 
 MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatchWithLifecycleLockHeld(
@@ -2473,45 +3187,351 @@ MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatchWi
     const std::string &src_name,
     const std::string &dst_name,
     const std::vector<int64_t> &batch,
-    const std::vector<CacheLocationMap> &loc_maps,
     const DispatchBatchParams &params) {
     DispatchBatchResult result;
-    if (batch.empty() || loc_maps.size() != batch.size()) {
+    if (batch.empty()) {
         return result;
     }
+    if (!params.pending_location_ids_by_block.empty() &&
+        params.pending_location_ids_by_block.size() != batch.size()) {
+        result.ec = EC_BADARGS;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kSnapshotShapeError,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+    }
+    const auto indexer = GetIndexer(instance_id);
+    if (indexer == nullptr) {
+        result.ec = EC_INSTANCE_NOT_EXIST;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kDispatchNotAvailable,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+    }
 
-    // 10a: mark 去重用 batch 查询替代逐 block IsMarkedForTieredWrite（N 次 meta 往返 → 1 次）。
-    std::unordered_set<int64_t> already_marked;
-    std::unordered_set<int64_t> mark_query_failed;
-    if (params.do_mark && params.dedup_marks) {
-        std::vector<MarkQueryResult> mark_results;
-        const auto mark_query_ec = BatchGetTieredWriteTargets(instance_id, batch, mark_results);
-        if (mark_query_ec != EC_OK) {
-            KVCM_LOG_WARN("[%s] mark dedup query partially failed for instance %s, ec %d; failed keys will retry",
+    std::string policy_error;
+    auto policy = MigrationAdmissionPolicyFactory::Build(params.admission, policy_error);
+    if (params.admission.mode() != MigrationAdmissionMode::DISABLED && policy == nullptr) {
+        KVCM_LOG_WARN("[%s] invalid migration admission policy for %s -> %s: %s",
+                      trace_id.c_str(),
+                      src_name.c_str(),
+                      dst_name.c_str(),
+                      policy_error.c_str());
+        if (params.admission.mode() != MigrationAdmissionMode::SHADOW) {
+            result.ec = EC_CONFIG_ERROR;
+            result.failed = static_cast<int64_t>(batch.size());
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kValue,
+                       MigrationOutcomeClass::kFailed,
+                       MigrationOutcomeReason::kPolicyContractError,
+                       result.failed,
+                       true);
+            return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+        }
+        // SHADOW is behavior-neutral even when a malformed/recovered config
+        // reaches this defensive runtime check. Record the projected fault and
+        // continue through the legacy location/execution path.
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kValue,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kPolicyContractError,
+                   static_cast<int64_t>(batch.size()),
+                   false);
+    }
+
+    const MigrationAdmissionFeatureSet required_features =
+        policy ? policy->RequiredFeatures() : MigrationAdmissionFeatureSet{};
+    std::vector<std::string> property_names;
+    bool last_access_provider_ready = true;
+    if (required_features.test(static_cast<size_t>(MigrationAdmissionFeature::kLastAccessTime))) {
+        property_names.push_back(PROPERTY_LRU_TIME);
+        const auto readiness = indexer->GetMaintenancePropertyReadiness(PROPERTY_LRU_TIME);
+        last_access_provider_ready = readiness.capability == MaintenancePropertyCapability::kDurableAcrossRecovery;
+        if (readiness.capability == MaintenancePropertyCapability::kProcessLocalVolatile) {
+            const auto &policies = params.admission.policies();
+            const int64_t window_seconds = policies.empty() || policies.front() == nullptr ||
+                                                   policies.front()->recent_access() == nullptr
+                                               ? 0
+                                               : policies.front()->recent_access()->window_seconds();
+            const int64_t steady_now = TimestampUtil::GetSteadyTimeUs();
+            const bool window_valid = window_seconds > 0 &&
+                                      window_seconds <= std::numeric_limits<int64_t>::max() / (1000 * 1000);
+            last_access_provider_ready = window_valid && readiness.valid_since_steady_us > 0 &&
+                                         steady_now >= readiness.valid_since_steady_us &&
+                                         steady_now - readiness.valid_since_steady_us >=
+                                             window_seconds * 1000 * 1000;
+        }
+        MetricsTags readiness_tags{{"instance", instance_id},
+                                   {"src", src_name},
+                                   {"dst", dst_name},
+                                   {"feature", "last_access_time"}};
+        SetGaugeMetric("migration_admission_readiness", readiness_tags, last_access_provider_ready ? 1.0 : 0.0);
+        if (!last_access_provider_ready) {
+            readiness_tags["reason"] =
+                readiness.capability == MaintenancePropertyCapability::kUnsupported ? "unsupported" : "warmup";
+            AddCounterMetric("migration_admission_readiness_not_ready_total", std::move(readiness_tags));
+        }
+        if (params.admission.mode() == MigrationAdmissionMode::ENFORCE && !last_access_provider_ready) {
+            result.ec = readiness.capability == MaintenancePropertyCapability::kUnsupported ? EC_CONFIG_ERROR
+                                                                                             : EC_ERROR;
+            result.failed = static_cast<int64_t>(batch.size());
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kSnapshot,
+                       MigrationOutcomeClass::kFailed,
+                       MigrationOutcomeReason::kRouteNotReady,
+                       result.failed,
+                       true);
+            KVCM_LOG_WARN("[%s] migration admission route not ready for instance %s, src %s, dst %s, "
+                          "capability %d, generation %llu",
                           trace_id.c_str(),
                           instance_id.c_str(),
-                          mark_query_ec);
-        }
-        for (std::size_t i = 0; i < batch.size() && i < mark_results.size(); ++i) {
-            if (mark_results[i].HasValidMark()) {
-                already_marked.insert(batch[i]);
-            } else if (mark_results[i].IsReadError()) {
-                // 无法确认已有 mark 时不覆盖未知状态，留待下一轮 reclaimer 重试。
-                mark_query_failed.insert(batch[i]);
-            }
+                          src_name.c_str(),
+                          dst_name.c_str(),
+                          static_cast<int>(readiness.capability),
+                          static_cast<unsigned long long>(readiness.generation));
+            return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
         }
     }
 
-    // 准入过滤 + 收集 copy / mark 候选
+    CacheLocationMapVector location_maps;
+    PropertyMapVector property_maps;
+    RequestContext snapshot_context(trace_id.empty() ? "migration_admission_snapshot" : trace_id);
+    const auto snapshot_result =
+        indexer->GetForMaintenance(&snapshot_context, batch, property_names, location_maps, property_maps);
+    if (snapshot_result.locations.error_codes.size() != batch.size() || location_maps.size() != batch.size() ||
+        snapshot_result.properties.error_codes.size() != batch.size() || property_maps.size() != batch.size()) {
+        result.ec = EC_MISMATCH;
+        result.failed = static_cast<int64_t>(batch.size());
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kSnapshot,
+                   MigrationOutcomeClass::kFailed,
+                   MigrationOutcomeReason::kSnapshotShapeError,
+                   result.failed,
+                   true);
+        return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+    }
+
+    struct PreparedCandidate {
+        size_t original_index = 0;
+        int64_t block_key = 0;
+        CacheLocationMap locations;
+        MigrationCandidateFeatures features;
+        int64_t last_access_time_us = 0;
+    };
+    std::vector<PreparedCandidate> location_valid_candidates;
+    std::vector<MigrationCandidateFeatures> policy_inputs;
+    location_valid_candidates.reserve(batch.size());
+    policy_inputs.reserve(batch.size());
+    int64_t hard_location_failures = 0;
+    int64_t hard_feature_failures = 0;
+    const int64_t admission_now_us = TimestampUtil::GetCurrentTimeUs();
+    for (size_t i = 0; i < batch.size(); ++i) {
+        const ErrorCode location_ec = snapshot_result.locations.error_codes[i];
+        if (location_ec != EC_OK) {
+            if (location_ec == EC_NOENT) {
+                ++result.rejected;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kSnapshot,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kSourceNotFound,
+                           1,
+                           true);
+            } else {
+                ++result.failed;
+                ++hard_location_failures;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kSnapshot,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kLocationReadError,
+                           1,
+                           true);
+            }
+            continue;
+        }
+        PreparedCandidate candidate;
+        candidate.original_index = i;
+        candidate.block_key = batch[i];
+        candidate.locations = std::move(location_maps[i]);
+        bool terminal_feature_failure = false;
+
+        if (required_features.test(static_cast<size_t>(MigrationAdmissionFeature::kLastAccessTime))) {
+            ObservedFeature feature;
+            if (!last_access_provider_ready) {
+                feature.status = ObservedFeatureStatus::kUnsupported;
+            } else if (snapshot_result.properties.error_codes[i] == EC_NOENT) {
+                // In a dual backend, location may be recovered from the
+                // persistent side while process-local recency remains
+                // intentionally unavailable. That is a missing feature, not
+                // an infrastructure read failure.
+                feature.status = ObservedFeatureStatus::kMissing;
+            } else if (snapshot_result.properties.error_codes[i] != EC_OK) {
+                feature.status = ObservedFeatureStatus::kReadError;
+                if (params.admission.mode() == MigrationAdmissionMode::ENFORCE) {
+                    ++hard_feature_failures;
+                    ++result.failed;
+                    terminal_feature_failure = true;
+                    AddOutcome(result.outcome_counts,
+                               MigrationOutcomeStage::kSnapshot,
+                               MigrationOutcomeClass::kFailed,
+                               MigrationOutcomeReason::kFeatureReadError,
+                               1,
+                               true);
+                }
+            } else {
+                const auto property = property_maps[i].find(PROPERTY_LRU_TIME);
+                if (property == property_maps[i].end()) {
+                    feature.status = ObservedFeatureStatus::kMissing;
+                } else if (const auto value = ParsePositiveInt64(property->second); value.has_value()) {
+                    feature.status = ObservedFeatureStatus::kAvailable;
+                    feature.value = *value;
+                    candidate.last_access_time_us = *value;
+                    if (*value <= admission_now_us) {
+                        ObserveAdmissionAccessAge(src_name, dst_name, params, admission_now_us - *value);
+                    }
+                } else {
+                    feature.status = ObservedFeatureStatus::kInvalid;
+                }
+            }
+            candidate.features.Set(MigrationAdmissionFeature::kLastAccessTime, std::move(feature));
+        }
+        if (terminal_feature_failure) {
+            continue;
+        }
+        policy_inputs.push_back(candidate.features);
+        location_valid_candidates.push_back(std::move(candidate));
+    }
+    const int64_t hard_snapshot_failures = hard_location_failures + hard_feature_failures;
+    if (hard_snapshot_failures > 0) {
+        result.ec = hard_snapshot_failures == static_cast<int64_t>(batch.size()) ? EC_ERROR : EC_PARTIAL_OK;
+    }
+
+    std::vector<MigrationAdmissionDecision> decisions;
+    if (policy != nullptr) {
+        decisions = policy->EvaluateBatch(policy_inputs, MigrationAdmissionContext{admission_now_us});
+        if (decisions.size() != location_valid_candidates.size()) {
+            if (params.admission.mode() == MigrationAdmissionMode::ENFORCE) {
+                result.ec = EC_ERROR;
+                result.failed += static_cast<int64_t>(location_valid_candidates.size());
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kValue,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kPolicyContractError,
+                           static_cast<int64_t>(location_valid_candidates.size()),
+                           true);
+                return FinalizeDispatchMetrics(
+                    instance_id, src_name, dst_name, batch.size(), params, std::move(result));
+            }
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kValue,
+                       MigrationOutcomeClass::kFailed,
+                       MigrationOutcomeReason::kPolicyContractError,
+                       static_cast<int64_t>(location_valid_candidates.size()),
+                       false);
+            decisions.clear();
+        }
+    }
+
+    std::vector<PreparedCandidate> execution_candidates;
+    execution_candidates.reserve(location_valid_candidates.size());
+    for (size_t i = 0; i < location_valid_candidates.size(); ++i) {
+        const bool has_decision = i < decisions.size();
+        if (has_decision) {
+            const bool accepted = decisions[i].verdict == MigrationAdmissionVerdict::kAccept;
+            const bool terminal = params.admission.mode() == MigrationAdmissionMode::ENFORCE && !accepted;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kValue,
+                       accepted ? MigrationOutcomeClass::kAccepted : MigrationOutcomeClass::kRejected,
+                       ToOutcomeReason(decisions[i].reason),
+                       1,
+                       terminal);
+            if (params.do_copy) {
+                const auto projected_specs = FindFirstUncoveredSourceSpecs(
+                    location_valid_candidates[i].locations, src_name, dst_name);
+                const auto projected = SummarizeSpecBytes(projected_specs);
+                const MetricsTags byte_tags{{"src", src_name},
+                                             {"dst", dst_name},
+                                             {"decision", accepted ? "value_accept" : "value_reject"}};
+                AddCounterMetric("migration_copy_planned_bytes_total", byte_tags, projected.bytes);
+                AddCounterMetric(
+                    "migration_copy_planned_bytes_unknown_specs_total", byte_tags, projected.unknown_specs);
+            }
+        }
+        if (params.admission.mode() == MigrationAdmissionMode::ENFORCE &&
+            (!has_decision || decisions[i].verdict != MigrationAdmissionVerdict::kAccept)) {
+            ++result.rejected;
+            continue;
+        }
+        execution_candidates.push_back(std::move(location_valid_candidates[i]));
+    }
+    AddCounterMetric("migration_candidate_pool_total",
+                     {{"src", src_name}, {"dst", dst_name}, {"stage", "value_qualified"}},
+                     execution_candidates.size());
+    if (params.trigger == DispatchBatchParams::Trigger::kReclaimer &&
+        params.admission.mode() == MigrationAdmissionMode::ENFORCE) {
+        std::stable_sort(execution_candidates.begin(),
+                         execution_candidates.end(),
+                         [](const PreparedCandidate &lhs, const PreparedCandidate &rhs) {
+                             return lhs.last_access_time_us < rhs.last_access_time_us;
+                         });
+    }
+    if (params.trigger == DispatchBatchParams::Trigger::kReclaimer &&
+        execution_candidates.size() > params.action_budget) {
+        const int64_t budget_rejected =
+            static_cast<int64_t>(execution_candidates.size() - params.action_budget);
+        result.rejected += budget_rejected;
+        AddOutcome(result.outcome_counts,
+                   MigrationOutcomeStage::kExecution,
+                   MigrationOutcomeClass::kRejected,
+                   MigrationOutcomeReason::kBudgetExhausted,
+                   budget_rejected,
+                   true);
+        execution_candidates.resize(params.action_budget);
+    }
+
+    // Execution admission consumes the exact locations from the same final
+    // NoTouch snapshot. Pending reclaimer deletions are filtered only now,
+    // after the aligned snapshot has been built.
     std::vector<MigrationRequest> copy_reqs;
     std::vector<int64_t> copy_block_keys;
     std::vector<int64_t> mark_keys;
-    for (std::size_t i = 0; i < batch.size(); ++i) {
-        const int64_t block_key = batch[i];
-        const auto admission = CheckCopyAdmission(instance_id, block_key, loc_maps[i], src_name, dst_name);
+    std::unordered_map<int64_t, SpecByteSummary> eligible_spec_bytes_by_block;
+    for (auto &candidate : execution_candidates) {
+        if (!params.pending_location_ids_by_block.empty()) {
+            for (const auto &pending_id : params.pending_location_ids_by_block[candidate.original_index]) {
+                candidate.locations.erase(pending_id);
+            }
+        }
+        const int64_t block_key = candidate.block_key;
+        const auto admission = CheckCopyAdmission(instance_id, block_key, candidate.locations, src_name, dst_name);
         if (admission.status != CopyAdmissionStatus::kAccept || admission.src_location == nullptr) {
+            ++result.rejected;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kExecution,
+                       MigrationOutcomeClass::kRejected,
+                       ToOutcomeReason(admission.status),
+                       1,
+                       true);
             continue;
         }
+        if (admission.missing_specs.empty()) {
+            ++result.rejected;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kExecution,
+                       MigrationOutcomeClass::kRejected,
+                       MigrationOutcomeReason::kTargetAlreadyCovered,
+                       1,
+                       true);
+            continue;
+        }
+        eligible_spec_bytes_by_block[block_key] = SummarizeSpecBytes(admission.missing_specs);
         if (params.do_copy && copy_reqs.size() < params.max_copy_slots) {
             MigrationRequest req;
             req.instance_group_name = params.copy_limit.instance_group_name;
@@ -2521,38 +3541,197 @@ MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatchWi
             req.src_storage_name = src_name;
             req.dst_storage_name = dst_name;
             req.retention = params.retention;
-            req.src_specs = admission.src_location->location_specs();
+            req.src_specs = admission.missing_specs;
             req.src_create_time = admission.src_location->create_time();
             copy_block_keys.push_back(block_key);
             copy_reqs.push_back(std::move(req));
+            const auto &planned = eligible_spec_bytes_by_block[block_key];
+            const MetricsTags byte_tags{{"src", src_name}, {"dst", dst_name}, {"decision", "dispatched"}};
+            AddCounterMetric("migration_copy_planned_bytes_total", byte_tags, planned.bytes);
+            AddCounterMetric(
+                "migration_copy_planned_bytes_unknown_specs_total", byte_tags, planned.unknown_specs);
             continue; // Copy 优先：已进入 copy 的 block 不再重复 mark。
         }
-        if (params.do_mark && already_marked.count(block_key) == 0 && mark_query_failed.count(block_key) == 0) {
+        if (params.do_mark) {
             mark_keys.push_back(block_key);
+        } else {
+            ++result.rejected;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kExecution,
+                       MigrationOutcomeClass::kRejected,
+                       params.do_copy ? MigrationOutcomeReason::kCopySlotExhausted
+                                      : MigrationOutcomeReason::kNoExecutionMethod,
+                       1,
+                       true);
         }
     }
 
     // 分发
     if (!copy_reqs.empty()) {
         const auto results = BatchSubmit(trace_id, std::move(copy_reqs), params.copy_limit, true);
-        for (std::size_t i = 0; i < results.size(); ++i) {
+        const std::size_t aligned_result_count = std::min(results.size(), copy_block_keys.size());
+        for (std::size_t i = 0; i < aligned_result_count; ++i) {
             if (results[i] == EC_OK) {
                 ++result.copy_submitted;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kCopy,
+                           MigrationOutcomeClass::kAccepted,
+                           MigrationOutcomeReason::kCopySubmitted,
+                           1,
+                           true);
             } else {
                 ++result.copy_failed;
                 if (params.do_mark && i < copy_block_keys.size()) {
+                    AddOutcome(result.outcome_counts,
+                               MigrationOutcomeStage::kCopy,
+                               MigrationOutcomeClass::kFailed,
+                               CopySubmitOutcomeReason(results[i]),
+                               1,
+                               false);
                     mark_keys.push_back(copy_block_keys[i]); // copy 失败时 fallback 到 mark
+                } else if (results[i] == EC_OUT_OF_LIMIT || results[i] == EC_EXIST ||
+                           results[i] == EC_NOENT || results[i] == EC_NOSPC) {
+                    // 并发额度、重复任务、源状态或目标配额已不满足都是
+                    // execution/target admission reject，不是基础设施故障。这也保证
+                    // legacy accepted/rejected 响应不会遗漏这些候选。
+                    ++result.rejected;
+                    AddOutcome(result.outcome_counts,
+                               MigrationOutcomeStage::kCopy,
+                               MigrationOutcomeClass::kRejected,
+                               CopySubmitOutcomeReason(results[i]),
+                               1,
+                               true);
+                } else {
+                    ++result.failed;
+                    AddOutcome(result.outcome_counts,
+                               MigrationOutcomeStage::kCopy,
+                               MigrationOutcomeClass::kFailed,
+                               CopySubmitOutcomeReason(results[i]),
+                               1,
+                               true);
                 }
             }
         }
-    }
-    if (params.do_mark && !mark_keys.empty()) {
-        const auto mark_ec = MarkForTieredWrite(instance_id, mark_keys, dst_name, params.mark_timeout_ms);
-        if (mark_ec == EC_OK) {
-            result.mark_submitted = static_cast<int64_t>(mark_keys.size());
+        if (aligned_result_count < copy_block_keys.size()) {
+            const int64_t missing_results = static_cast<int64_t>(copy_block_keys.size() - aligned_result_count);
+            result.failed += missing_results;
+            result.ec = result.ec == EC_OK ? EC_MISMATCH : EC_ERROR;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kCopy,
+                       MigrationOutcomeClass::kFailed,
+                       MigrationOutcomeReason::kCopySubmitFailed,
+                       missing_results,
+                       true);
         }
     }
-    return result;
+    if (params.do_mark && !mark_keys.empty()) {
+        std::uint64_t mark_eligible_bytes = 0;
+        std::uint64_t mark_unknown_specs = 0;
+        for (const auto block_key : mark_keys) {
+            if (const auto summary = eligible_spec_bytes_by_block.find(block_key);
+                summary != eligible_spec_bytes_by_block.end()) {
+                mark_unknown_specs += summary->second.unknown_specs;
+                if (summary->second.bytes > std::numeric_limits<std::uint64_t>::max() - mark_eligible_bytes) {
+                    ++mark_unknown_specs;
+                } else {
+                    mark_eligible_bytes += summary->second.bytes;
+                }
+            }
+        }
+        const MetricsTags byte_tags{{"src", src_name}, {"dst", dst_name}, {"decision", "eligible"}};
+        AddCounterMetric("migration_mark_eligible_source_bytes_total", byte_tags, mark_eligible_bytes);
+        AddCounterMetric(
+            "migration_mark_eligible_source_bytes_unknown_specs_total", byte_tags, mark_unknown_specs);
+        const auto mark_result =
+            MarkForTieredWriteDetailed(instance_id, mark_keys, dst_name, params.mark_timeout_ms);
+        const std::size_t aligned_outcome_count = std::min(mark_result.outcomes.size(), mark_keys.size());
+        for (std::size_t i = 0; i < aligned_outcome_count; ++i) {
+            const auto &outcome = mark_result.outcomes[i];
+            switch (outcome.status) {
+            case MarkWriteStatus::kInserted:
+                ++result.mark_submitted;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kAccepted,
+                           MigrationOutcomeReason::kMarkInserted,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kAlreadySameTarget:
+                ++result.noop;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kNoopAlreadySatisfied,
+                           MigrationOutcomeReason::kMarkAlreadySameTarget,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kConflictDifferentTarget:
+                ++result.rejected;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kMarkConflictDifferentTarget,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kMalformedExistingMark:
+                ++result.rejected;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kMarkMalformed,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kBlockNotFound:
+                ++result.rejected;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kBlockNotFound,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kWriteError:
+                ++result.failed;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kMarkWriteError,
+                           1,
+                           true);
+                break;
+            case MarkWriteStatus::kReadError:
+                ++result.failed;
+                AddOutcome(result.outcome_counts,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kMarkReadError,
+                           1,
+                           true);
+                break;
+            }
+        }
+        if (aligned_outcome_count < mark_keys.size()) {
+            const int64_t missing_outcomes = static_cast<int64_t>(mark_keys.size() - aligned_outcome_count);
+            result.failed += missing_outcomes;
+            result.ec = result.ec == EC_OK ? EC_MISMATCH : EC_ERROR;
+            AddOutcome(result.outcome_counts,
+                       MigrationOutcomeStage::kMark,
+                       MigrationOutcomeClass::kFailed,
+                       MigrationOutcomeReason::kMarkWriteError,
+                       missing_outcomes,
+                       true);
+        }
+        if (mark_result.ec != EC_OK) {
+            result.ec = result.ec == EC_OK ? mark_result.ec : EC_ERROR;
+        }
+    }
+    if (result.failed > 0) {
+        result.ec = result.failed == static_cast<int64_t>(batch.size()) ? EC_ERROR : EC_PARTIAL_OK;
+    }
+    return FinalizeDispatchMetrics(instance_id, src_name, dst_name, batch.size(), params, std::move(result));
 }
 
 MigrationManager::MigrationStats MigrationManager::GetStats() const {

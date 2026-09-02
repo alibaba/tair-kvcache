@@ -1184,7 +1184,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
         if (cancelled->load(std::memory_order_relaxed) || (bounded_waves && (!IsRunning() || IsPaused()))) {
             return ErrorCode::EC_ERROR;
         }
-        if (const auto res = meta_indexer->GetProperties(request_context.get(), keys, {PROPERTY_LRU_TIME}, maps);
+        if (const auto res =
+                meta_indexer->GetPropertiesForMaintenance(request_context.get(), keys, {PROPERTY_LRU_TIME}, maps);
             res.ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN,
                         "get properties failed, error code: [%d], proceed with empty lru_time",
@@ -1422,22 +1423,24 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
         key_tp_vec.emplace_back(k, lru_ts);
     }
 
-    if (sampled_keys.size() > batching_size) {
-        std::sort(key_tp_vec.begin(),
-                  key_tp_vec.end(),
-                  [](const std::pair<std::int64_t, std::int64_t> &a,
-                     const std::pair<std::int64_t, std::int64_t> &b) -> bool { return a.second < b.second; });
-    }
+    std::stable_sort(key_tp_vec.begin(),
+                     key_tp_vec.end(),
+                     [](const std::pair<std::int64_t, std::int64_t> &a,
+                        const std::pair<std::int64_t, std::int64_t> &b) -> bool { return a.second < b.second; });
 
     // constitute the batch to be submitted for deleting
     // the first N timestamp would be picked out
     const std::size_t effective_batch_size = std::min(batching_size, sampled_keys.size());
-    std::unordered_set<std::int64_t> deduped_batch;
+    std::unordered_set<std::int64_t> seen_keys;
+    seen_keys.reserve(effective_batch_size);
+    out_batch.clear();
+    out_batch.reserve(effective_batch_size);
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t age_sum = 0;
     int64_t age_count = 0;
     for (const auto &[key, tp] : key_tp_vec) {
-        if (auto [_, r] = deduped_batch.insert(key); r) {
+        if (seen_keys.insert(key).second) {
+            out_batch.push_back(key);
             if (tp > 0) {
                 const int64_t age = now_us - tp;
                 out_lru_age_stats.min_us = std::min(out_lru_age_stats.min_us, age);
@@ -1445,13 +1448,13 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
                 age_sum += age;
                 ++age_count;
             }
-            if (deduped_batch.size() == effective_batch_size) {
+            if (out_batch.size() == effective_batch_size) {
                 break;
             }
         }
     }
 
-    if (deduped_batch.empty()) {
+    if (out_batch.empty()) {
         out_batch.clear();
         out_lru_age_stats.Clear();
         return true;
@@ -1463,13 +1466,13 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
         out_lru_age_stats.Clear();
     }
 
-    if (deduped_batch.size() < batching_size) {
-        if (deduped_batch.size() != sampled_keys.size()) {
+    if (out_batch.size() < batching_size) {
+        if (out_batch.size() != sampled_keys.size()) {
             // sampled_keys contains duplicated keys, log the event
             LOG_WITH_ID(DEBUG,
                         "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
                         "sampled keys size: [%zu], intended batching size: [%zu]",
-                        deduped_batch.size(),
+                        out_batch.size(),
                         sampled_keys.size(),
                         batching_size);
         } else {
@@ -1479,13 +1482,12 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
             LOG_WITH_ID(DEBUG,
                         "shortened batch size, final batch size: [%zu], "
                         "sampled keys size: [%zu], intended batching size: [%zu]",
-                        deduped_batch.size(),
+                        out_batch.size(),
                         sampled_keys.size(),
                         batching_size);
         }
     }
 
-    out_batch.assign(deduped_batch.begin(), deduped_batch.end());
     return true;
 }
 
@@ -1815,7 +1817,8 @@ void CacheReclaimer::TryMigrateOnGroup(
         bool ok = false;
         std::vector<std::int64_t> batch;
     };
-    std::unordered_map<std::string, CachedMigrationBatch> migration_batch_cache;
+    std::unordered_map<std::string, CachedMigrationBatch> limited_migration_batch_cache;
+    std::unordered_map<std::string, CachedMigrationBatch> full_migration_pool_cache;
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
@@ -1894,10 +1897,13 @@ void CacheReclaimer::TryMigrateOnGroup(
             if (copy_enabled && !mark_enabled && available_copy_slots == 0) {
                 break;
             }
-            auto &cached = migration_batch_cache[instance_info->instance_id()];
+            const bool full_candidate_pool = strategy->admission().mode() != MigrationAdmissionMode::DISABLED;
+            auto &batch_cache = full_candidate_pool ? full_migration_pool_cache : limited_migration_batch_cache;
+            auto &cached = batch_cache[instance_info->instance_id()];
             if (!cached.built) {
                 cached.built = true;
-                cached.ok = BuildMigrationCandidateBatch(request_context, instance_info, cached.batch);
+                cached.ok =
+                    BuildMigrationCandidateBatch(request_context, instance_info, full_candidate_pool, cached.batch);
             }
             if (!cached.ok || cached.batch.empty()) {
                 continue;
@@ -1912,6 +1918,7 @@ void CacheReclaimer::TryMigrateOnGroup(
 
 bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
                                                   const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  bool full_candidate_pool,
                                                   std::vector<std::int64_t> &out_batch) noexcept {
     out_batch.clear();
     if (instance_info == nullptr) {
@@ -1925,7 +1932,17 @@ bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestC
         return false;
     }
     AgeStats lru_age_stats;
-    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats)) {
+    const bool batch_made = full_candidate_pool
+                                ? MakeBatchByLRUWithSize(request_context.get(),
+                                                         instance_info,
+                                                         keys,
+                                                         maps,
+                                                         std::numeric_limits<std::size_t>::max(),
+                                                         out_batch,
+                                                         lru_age_stats)
+                                : MakeBatchByLRU(
+                                      request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats);
+    if (!batch_made) {
         return false;
     }
     return true;
@@ -1979,6 +1996,7 @@ bool CacheReclaimer::SubmitMigrationPrepareJob(const std::shared_ptr<RequestCont
     job.source_storage_name = src_name;
     job.target_storage_name = dst_name;
     job.block_keys = batch;
+    job.action_budget = batching_size_.load();
     // pending_locations_ 由 Reclaimer cron 单线程维护。这里只复制与本 batch 相关的前缀范围；
     // executor worker 不得读取 CacheReclaimer 的任何可变状态。
     job.pending_location_ids_by_block = SnapshotPendingLocations(ins_id, batch);

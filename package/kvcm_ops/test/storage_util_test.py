@@ -22,6 +22,33 @@ from kvcm_ops.kvcm.storage.update_storage import create_update_storage_data
 from kvcm_ops.kvcm.instance_group.util import CacheConfig
 
 
+class CacheConfigRoundTripTest(unittest.TestCase):
+    def test_migration_config_and_unknown_fields_are_preserved(self):
+        raw = CacheConfig().to_json_data()
+        raw["migration_config"] = {
+            "copy_max_concurrency": 3,
+            "mark_clear_policy": "MIGRATION_MARK_CLEAR_ON_NEXT_WRITE_SUCCESS",
+            "strategies": [{
+                "source_storage_name": "hot_01",
+                "target_storage_name": "cold_01",
+                "admission": {
+                    "mode": "MIGRATION_ADMISSION_SHADOW",
+                    "policies": [{"recent_access": {"window_seconds": "3600", "future_leaf": 7}}],
+                },
+            }],
+            "future_config": {"enabled": True},
+        }
+        raw["future_cache_field"] = {"value": 9}
+
+        parsed = CacheConfig.from_json_data(raw)
+        parsed._meta_indexer_config._max_key_count = 123
+        serialized = parsed.to_json_data()
+
+        self.assertEqual(raw["migration_config"], serialized["migration_config"])
+        self.assertEqual(raw["future_cache_field"], serialized["future_cache_field"])
+        self.assertEqual(123, serialized["meta_indexer_config"]["max_key_count"])
+
+
 class EventReportStorageArgsTest(unittest.TestCase):
     def _parse_args(self, *args):
         parser = argparse.ArgumentParser()

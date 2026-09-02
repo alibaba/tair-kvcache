@@ -272,6 +272,16 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             migration_strategy->methods().mark().timeout_ms());
         proto_migration_strategy->set_retention(
             static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
+        auto *proto_admission = proto_migration_strategy->mutable_admission();
+        proto_admission->set_mode(
+            static_cast<proto::admin::MigrationAdmissionMode>(migration_strategy->admission().mode()));
+        for (const auto &policy : migration_strategy->admission().policies()) {
+            if (policy == nullptr || policy->recent_access() == nullptr) {
+                continue;
+            }
+            proto_admission->add_policies()->mutable_recent_access()->set_window_seconds(
+                policy->recent_access()->window_seconds());
+        }
     }
 }
 
@@ -360,6 +370,20 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
         }
         migration_strategy->set_methods(methods);
         migration_strategy->set_retention(static_cast<MigrationRetention>(proto_migration_strategy.retention()));
+        MigrationAdmissionConfig admission;
+        admission.set_mode(static_cast<MigrationAdmissionMode>(proto_migration_strategy.admission().mode()));
+        std::vector<std::shared_ptr<MigrationAdmissionPolicyConfig>> policies;
+        policies.reserve(proto_migration_strategy.admission().policies_size());
+        for (const auto &proto_policy : proto_migration_strategy.admission().policies()) {
+            auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+            if (proto_policy.has_recent_access()) {
+                policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(
+                    proto_policy.recent_access().window_seconds()));
+            }
+            policies.push_back(std::move(policy));
+        }
+        admission.set_policies(policies);
+        migration_strategy->set_admission(admission);
         migration_strategies.push_back(migration_strategy);
     }
     cache_config_info.set_migration_strategies(migration_strategies);

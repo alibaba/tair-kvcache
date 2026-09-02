@@ -42,6 +42,35 @@ using FieldMapVec = std::vector<FieldMap>;
 using PropertyMap = FieldMap;
 using PropertyMapVector = std::vector<PropertyMap>;
 
+// Access bookkeeping intent shared by meta reads and mutations. Maintenance
+// operations may still change metadata, but must not promote the LRU entry,
+// refresh last-access time, update revisit metrics or future business-hit data.
+enum class MetaAccessIntent : std::uint8_t {
+    kBusinessRead,
+    kBusinessWrite,
+    kMaintenanceNoTouch,
+};
+
+enum class MaintenancePropertyCapability : std::uint8_t {
+    kUnsupported,
+    kProcessLocalVolatile,
+    kDurableAcrossRecovery,
+};
+
+struct MaintenancePropertyReadiness {
+    MaintenancePropertyCapability capability = MaintenancePropertyCapability::kUnsupported;
+    std::int64_t valid_since_steady_us = 0;
+    std::uint64_t generation = 0;
+};
+
+// Backend-level component results for a no-touch point read. Both vectors are
+// positional with the input keys; location and property failures are kept
+// separate so SHADOW mode can remain behavior-neutral on feature failures.
+struct MaintenanceReadResult {
+    std::vector<ErrorCode> location_error_codes;
+    std::vector<ErrorCode> property_error_codes;
+};
+
 // ---------- Location primitives ----------
 using LocationId = std::string;
 using LocationIdVector = std::vector<LocationId>;
@@ -92,6 +121,16 @@ using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVe
                                                               size_t /*key_index*/,
                                                               PropertyMap & /*upsert_property_map*/,
                                                               CacheLocationMap & /*out_new_locations*/)>;
+
+// Block/property maintenance RMW. Existing values are read under the
+// MetaIndexer shard lock and the resulting upsert is committed without touch.
+using BlockPropertyModifierFunc =
+    std::function<ModifierResult(const LocationIdVector & /*existing_location_ids*/,
+                                 const PropertyMap & /*existing_properties*/,
+                                 ErrorCode /*get_ec*/,
+                                 size_t /*key_index*/,
+                                 PropertyMap & /*upsert_property_map*/,
+                                 CacheLocationMap & /*out_new_locations*/)>;
 
 // Note: an earlier `BlockModifierFunc` variant (sees the entire CacheLocationMap
 // of one block_key) was removed because nothing in the codebase ever used

@@ -251,6 +251,28 @@ message MigrationMethodConfigs {
     MigrationMarkMethodConfig mark = 2;
 }
 
+enum MigrationAdmissionMode {
+    MIGRATION_ADMISSION_DISABLED = 0;
+    MIGRATION_ADMISSION_SHADOW = 1;
+    MIGRATION_ADMISSION_ENFORCE = 2;
+}
+
+message RecentAccessAdmissionConfig {
+    int64 window_seconds = 1;
+}
+
+message MigrationAdmissionPolicyConfig {
+    oneof policy {
+        RecentAccessAdmissionConfig recent_access = 1;
+    }
+}
+
+message MigrationAdmissionConfig {
+    MigrationAdmissionMode mode = 1;
+    // V1 requires exactly one recent_access policy in SHADOW/ENFORCE.
+    repeated MigrationAdmissionPolicyConfig policies = 2;
+}
+
 // 单条迁移规则，绑定一个源 storage
 message MigrationStrategy {
     string source_storage_name = 1;   // 源 storage（热层）unique name
@@ -258,6 +280,7 @@ message MigrationStrategy {
     double trigger_threshold = 3;     // 水位触发阈值（迁移区间下界），如 0.70
     MigrationMethodConfigs method_configs = 4;
     MigrationRetention retention = 5;
+    MigrationAdmissionConfig admission = 6;
 }
 
 message MigrationConfig {
@@ -447,10 +470,70 @@ message MigrateCacheRequest {
     MigrationMethod method = 7;    // COPY / MARK / BOTH
 }
 
+enum MigrationOutcomeStage {
+    MIGRATION_OUTCOME_STAGE_UNSPECIFIED = 0;
+    MIGRATION_OUTCOME_STAGE_SNAPSHOT = 1;
+    MIGRATION_OUTCOME_STAGE_VALUE = 2;
+    MIGRATION_OUTCOME_STAGE_EXECUTION = 3;
+    MIGRATION_OUTCOME_STAGE_COPY = 4;
+    MIGRATION_OUTCOME_STAGE_MARK = 5;
+}
+
+enum MigrationOutcomeClass {
+    MIGRATION_OUTCOME_CLASS_UNSPECIFIED = 0;
+    MIGRATION_OUTCOME_CLASS_ACCEPTED = 1;
+    MIGRATION_OUTCOME_CLASS_REJECTED = 2;
+    MIGRATION_OUTCOME_CLASS_NOOP_ALREADY_SATISFIED = 3;
+    MIGRATION_OUTCOME_CLASS_FAILED = 4;
+}
+
+enum MigrationOutcomeReason {
+    MIGRATION_OUTCOME_REASON_UNSPECIFIED = 0;
+    MIGRATION_OUTCOME_REASON_NOT_RECENT = 1;
+    MIGRATION_OUTCOME_REASON_FEATURE_MISSING = 2;
+    MIGRATION_OUTCOME_REASON_FEATURE_INVALID = 3;
+    MIGRATION_OUTCOME_REASON_FEATURE_UNSUPPORTED = 4;
+    MIGRATION_OUTCOME_REASON_FEATURE_READ_ERROR = 5;
+    MIGRATION_OUTCOME_REASON_ROUTE_NOT_READY = 6;
+    MIGRATION_OUTCOME_REASON_LOCATION_READ_ERROR = 7;
+    MIGRATION_OUTCOME_REASON_SNAPSHOT_SHAPE_ERROR = 8;
+    MIGRATION_OUTCOME_REASON_SOURCE_NOT_FOUND = 9;
+    MIGRATION_OUTCOME_REASON_TARGET_ALREADY_COVERED = 10;
+    MIGRATION_OUTCOME_REASON_ALREADY_MIGRATING = 11;
+    MIGRATION_OUTCOME_REASON_TARGET_REJECTED = 12;
+    MIGRATION_OUTCOME_REASON_SOURCE_RECHECK_FAILED = 13;
+    MIGRATION_OUTCOME_REASON_COPY_SUBMITTED = 14;
+    MIGRATION_OUTCOME_REASON_COPY_SUBMIT_FAILED = 15;
+    MIGRATION_OUTCOME_REASON_MARK_INSERTED = 16;
+    MIGRATION_OUTCOME_REASON_MARK_ALREADY_SAME_TARGET = 17;
+    MIGRATION_OUTCOME_REASON_MARK_CONFLICT_DIFFERENT_TARGET = 18;
+    MIGRATION_OUTCOME_REASON_MARK_MALFORMED = 19;
+    MIGRATION_OUTCOME_REASON_BLOCK_NOT_FOUND = 20;
+    MIGRATION_OUTCOME_REASON_MARK_READ_ERROR = 21;
+    MIGRATION_OUTCOME_REASON_MARK_WRITE_ERROR = 22;
+    MIGRATION_OUTCOME_REASON_POLICY_CONTRACT_ERROR = 23;
+    MIGRATION_OUTCOME_REASON_BUDGET_EXHAUSTED = 24;
+    MIGRATION_OUTCOME_REASON_VALUE_ACCEPTED = 25;
+    MIGRATION_OUTCOME_REASON_NO_EXECUTION_METHOD = 26;
+    MIGRATION_OUTCOME_REASON_COPY_SLOT_EXHAUSTED = 27;
+    MIGRATION_OUTCOME_REASON_DISPATCH_NOT_AVAILABLE = 28;
+}
+
+message MigrationOutcomeCount {
+    MigrationOutcomeStage stage = 1;
+    MigrationOutcomeClass outcome_class = 2;
+    MigrationOutcomeReason reason = 3;
+    int64 count = 4;
+    bool terminal = 5;
+}
+
 message MigrateCacheResponse {
     CommonResponseHeader header = 1;
     int64 accepted = 2; // 接受并投递的 block 数
-    int64 rejected = 3; // 被准入策略 / 校验拒绝的 block 数
+    // Legacy “未产生新 Copy/Mark”汇总；包含 reject、already-satisfied no-op 和 failed。
+    // 精确口径使用 outcome_counts。
+    int64 rejected = 3;
+    repeated MigrationOutcomeCount outcome_counts = 4;
 }
 
 message ModelDeployment {

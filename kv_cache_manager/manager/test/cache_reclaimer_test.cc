@@ -340,6 +340,15 @@ MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
     return result;
 }
 
+MetaIndexer::Result MetaIndexer_GetPropertiesForMaintenance_stub(
+    void *obj,
+    RequestContext *rc,
+    const KeyVector &k,
+    const std::vector<std::string> &p,
+    PropertyMapVector &out_properties) noexcept {
+    return MetaIndexer_GetProperties_stub(obj, rc, k, p, out_properties);
+}
+
 /* ---------------- MetaIndexer_RandomSample_stub ---------------- */
 
 std::chrono::milliseconds mi_randsample_delay{0};
@@ -449,6 +458,36 @@ ErrorCode MetaSearcher_BatchGetLocation_stub(void *obj,
     return batch_get_loc_result;
 }
 
+MetaIndexer::MaintenanceGetResult MetaIndexer_GetForMaintenance_stub(
+    void * /*obj*/,
+    RequestContext * /*rc*/,
+    const KeyVector &keys,
+    const std::vector<std::string> & /*property_names*/,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    if (batch_get_loc_result == EC_OK && batch_get_loc_out_maps.size() == keys.size()) {
+        out_locations = batch_get_loc_out_maps;
+    } else {
+        out_locations.assign(keys.size(), CacheLocationMap{});
+    }
+    if (get_result == EC_OK && get_out_properties.size() == keys.size()) {
+        out_properties = get_out_properties;
+    } else {
+        out_properties.assign(keys.size(), PropertyMap{});
+    }
+
+    MetaIndexer::MaintenanceGetResult result(keys.size());
+    if (batch_get_loc_result != EC_OK) {
+        result.locations.ec = batch_get_loc_result;
+        std::fill(result.locations.error_codes.begin(), result.locations.error_codes.end(), batch_get_loc_result);
+    }
+    if (get_result != EC_OK) {
+        result.properties.ec = get_result;
+        std::fill(result.properties.error_codes.begin(), result.properties.error_codes.end(), get_result);
+    }
+    return result;
+}
+
 std::vector<MigrationManager::MigrationRequest> captured_copy_reqs;
 std::vector<std::vector<MigrationManager::MigrationRequest>> captured_copy_req_batches;
 std::vector<MigrationManager::CopyConcurrencyLimit> captured_copy_limits;
@@ -466,6 +505,8 @@ public:
                   SchedulePlanExecutor_SubmitAsync_stub);
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
+        stub_.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), MetaIndexer_GetPropertiesForMaintenance_stub);
+        stub_.set(ADDR(MetaIndexer, GetForMaintenance), MetaIndexer_GetForMaintenance_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
         stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
@@ -667,6 +708,8 @@ public:
         stub_.reset(static_cast<spe_submit_async_loc>(ADDR(SchedulePlanExecutor, SubmitAsync)));
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
+        stub_.reset(ADDR(MetaIndexer, GetPropertiesForMaintenance));
+        stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
@@ -5789,11 +5832,8 @@ CacheLocationConstPtr MakeServingLoc(const std::string &id, const std::string &s
 //   12             -> 仅在 other_storage(非源)
 //   13             -> hot_01 + cold_01(目标已有 WRITING location)
 //   40             -> 仅在 hot_02
-ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
-                                            RequestContext *rc,
-                                            const std::vector<std::int64_t> &kv,
-                                            const BlockMask &bm,
-                                            std::vector<CacheLocationMap> &out_loc_maps) {
+void BuildMigrateTestLocationMaps(const std::vector<std::int64_t> &kv,
+                                  std::vector<CacheLocationMap> &out_loc_maps) {
     ++batch_get_loc_call_counter;
     out_loc_maps.clear();
     for (const auto k : kv) {
@@ -5838,7 +5878,18 @@ ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
         }
         out_loc_maps.emplace_back(std::move(m));
     }
-    return ErrorCode::EC_OK;
+}
+
+MetaIndexer::MaintenanceGetResult MigrateTest_GetForMaintenance_stub(
+    void * /*obj*/,
+    RequestContext * /*rc*/,
+    const KeyVector &keys,
+    const std::vector<std::string> & /*property_names*/,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    BuildMigrateTestLocationMaps(keys, out_locations);
+    out_properties.assign(keys.size(), PropertyMap{});
+    return MetaIndexer::MaintenanceGetResult(keys.size());
 }
 
 namespace {
@@ -5847,18 +5898,21 @@ std::condition_variable async_prepare_read_cv;
 bool async_prepare_read_started = false;
 bool release_async_prepare_read = false;
 
-ErrorCode BlockingMigrateTest_BatchGetLocation_stub(void *obj,
-                                                    RequestContext *rc,
-                                                    const std::vector<std::int64_t> &kv,
-                                                    const BlockMask &bm,
-                                                    std::vector<CacheLocationMap> &out_loc_maps) {
+MetaIndexer::MaintenanceGetResult BlockingMigrateTest_GetForMaintenance_stub(
+    void *obj,
+    RequestContext *rc,
+    const KeyVector &keys,
+    const std::vector<std::string> &property_names,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
     {
         std::unique_lock<std::mutex> lock(async_prepare_read_mutex);
         async_prepare_read_started = true;
         async_prepare_read_cv.notify_all();
         async_prepare_read_cv.wait(lock, []() { return release_async_prepare_read; });
     }
-    return MigrateTest_BatchGetLocation_stub(obj, rc, kv, bm, out_loc_maps);
+    return MigrateTest_GetForMaintenance_stub(
+        obj, rc, keys, property_names, out_locations, out_properties);
 }
 } // namespace
 
@@ -5876,17 +5930,23 @@ std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
     return std::vector<ErrorCode>(requests.size(), ErrorCode::EC_OK);
 }
 
-ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
-                                                   const std::string &instance_id,
-                                                   const std::vector<std::int64_t> &block_keys,
-                                                   const std::string &dst_storage_name,
-                                                   int64_t timeout_ms) {
+MigrationManager::MarkWriteResult MigrationManager_MarkForTieredWriteDetailed_stub(
+    void *obj,
+    const std::string &instance_id,
+    const std::vector<std::int64_t> &block_keys,
+    const std::string &dst_storage_name,
+    int64_t timeout_ms) {
     static_cast<void>(obj);
     static_cast<void>(instance_id);
     static_cast<void>(timeout_ms);
     captured_mark_keys = block_keys;
     captured_mark_target = dst_storage_name;
-    return ErrorCode::EC_OK;
+    MigrationManager::MarkWriteResult result;
+    result.outcomes.resize(block_keys.size());
+    for (auto &outcome : result.outcomes) {
+        outcome.status = MigrationManager::MarkWriteStatus::kInserted;
+    }
+    return result;
 }
 
 std::vector<std::int64_t> captured_async_prepare_keys;
@@ -5915,12 +5975,13 @@ MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, 
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
-    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWriteDetailed),
+              MigrationManager_MarkForTieredWriteDetailed_stub);
 
     cache_reclaimer_->job_state_flag_ = true; // 让 IsRunning() 为真，无需启动 cron 线程
 
     const auto ins_info = InstanceInfoFactory();
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     const auto configure_strategy = [&](const MigrationStrategy &strategy, const std::size_t copy_limit) {
         auto instance_group = InstanceGroupFactory();
         auto config = std::make_shared<CacheConfig>();
@@ -5940,6 +6001,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
         configure_strategy(strategy, 5);
+        ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 4));
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -5976,6 +6038,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
         configure_strategy(strategy, 2);
+        ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -5996,6 +6059,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ false, /*mark*/ true);
         configure_strategy(strategy, 1);
+        ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -6015,6 +6079,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
 
         const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true);
         configure_strategy(strategy, 2);
+        ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
         ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
         ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -6031,9 +6096,9 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         ASSERT_EQ("cold_01", captured_mark_target);
     }
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
-    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWriteDetailed));
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimAdmissionExcludesVictimFromSameRoundMigration) {
@@ -6137,7 +6202,7 @@ TEST_F(CacheReclaimerTest, TestFairReclaimStillRunsMigrationBelowReclaimThreshol
 }
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPendingSnapshotRemainsBlockScoped) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
     cache_reclaimer_->job_state_flag_ = true;
 
@@ -6159,6 +6224,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPendingSnapshotRemainsBlockScoped) 
     cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), 62, "dst_62"});
 
     captured_copy_reqs.clear();
+    ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, {60, 61, 62}));
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -6166,7 +6232,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPendingSnapshotRemainsBlockScoped) 
     EXPECT_EQ(61, captured_copy_reqs[0].block_key);
     EXPECT_EQ(62, captured_copy_reqs[1].block_key);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
@@ -6228,9 +6294,10 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareCoalescesAndRevalidatesStrat
 }
 
 TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareRejectsAmbiguousRoute) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
-    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWriteDetailed),
+              MigrationManager_MarkForTieredWriteDetailed_stub);
 
     const auto ins_info = InstanceInfoFactory();
     const auto copy_strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
@@ -6264,9 +6331,9 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareRejectsAmbiguousRoute) {
     EXPECT_TRUE(captured_copy_reqs.empty());
     EXPECT_TRUE(captured_mark_keys.empty());
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
-    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWriteDetailed));
 }
 
 TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) {
@@ -6286,7 +6353,7 @@ TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) 
         async_prepare_read_started = false;
         release_async_prepare_read = false;
     }
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), BlockingMigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), BlockingMigrateTest_GetForMaintenance_stub);
 
     MigrationManager::AsyncMigrationPrepareJob job;
     job.trace_id = request_context_->trace_id();
@@ -6331,7 +6398,7 @@ TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) 
 }
 
 TEST_F(CacheReclaimerTest, TestQueuedAsyncMigrationFromPreviousGenerationIsDiscarded) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
 
     const auto ins_info = InstanceInfoFactory();
@@ -6393,7 +6460,7 @@ TEST_F(CacheReclaimerTest, TestQueuedAsyncMigrationFromPreviousGenerationIsDisca
     ASSERT_EQ(1u, captured_copy_req_batches[0].size());
     EXPECT_EQ(10, captured_copy_req_batches[0][0].block_key);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
@@ -6467,7 +6534,7 @@ TEST_F(CacheReclaimerTest, TestPendingLocationSnapshotIsScopedByInstanceAndBlock
 }
 
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossTicks) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
     cache_reclaimer_->job_state_flag_ = true;
     rm_->data_storage_manager_ = dsm_;
@@ -6549,12 +6616,12 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
     EXPECT_EQ(0, sampled_when_full) << "a full pending budget must prune before candidate sampling";
     EXPECT_TRUE(became_idle);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategies) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
 
     cache_reclaimer_->job_state_flag_ = true;
@@ -6622,15 +6689,16 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
         ASSERT_EQ(2u, limit.max_concurrency);
     }
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
 // 水位低于 trigger_threshold 时 TryMigrateOnGroup 不下发任何 copy/mark。
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsBelowThreshold) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
-    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWriteDetailed),
+              MigrationManager_MarkForTieredWriteDetailed_stub);
 
     cache_reclaimer_->job_state_flag_ = true;
     rm_->data_storage_manager_ = dsm_;
@@ -6677,16 +6745,17 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsBelowThreshold) {
     ASSERT_EQ(0, sample_reclaim_call_counter); // 未触发采样
     ASSERT_EQ(0, batch_get_loc_call_counter);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
-    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWriteDetailed));
 }
 
 // quota 中不含源 storage 对应 type 时（capacity<=0），TryMigrateOnGroup 跳过该 strategy。
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsWhenNoCapacity) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
-    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWriteDetailed),
+              MigrationManager_MarkForTieredWriteDetailed_stub);
 
     cache_reclaimer_->job_state_flag_ = true;
     rm_->data_storage_manager_ = dsm_;
@@ -6730,14 +6799,14 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsWhenNoCapacity) {
     ASSERT_EQ(0, sample_reclaim_call_counter);
     ASSERT_EQ(0, batch_get_loc_call_counter);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
-    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWriteDetailed));
 }
 
 // VCNS_HF3FS 在水位/用量统计上归并到 HF3FS；迁移策略查 source type quota 时也应一致归并。
 TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota) {
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
 
     cache_reclaimer_->job_state_flag_ = true;
@@ -6783,7 +6852,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
     ASSERT_EQ(50, captured_copy_reqs[0].block_key);
     ASSERT_EQ("hot_vcns", captured_copy_reqs[0].src_storage_name);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
@@ -6815,10 +6884,11 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationCopyFailureFallsBackToMark) {
     captured_mark_keys.clear();
     captured_mark_target.clear();
 
-    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MetaIndexer, GetForMaintenance), MigrateTest_GetForMaintenance_stub);
     // 用部分失败的 BatchSubmit stub
     stub_.set(ADDR(MigrationManager, BatchSubmit), BatchSubmit_PartialFail_stub);
-    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWriteDetailed),
+              MigrationManager_MarkForTieredWriteDetailed_stub);
 
     // batch = {20, 21, 22}：全部合格，group copy slots 足够。
     const std::vector<std::int64_t> batch = {20, 21, 22};
@@ -6832,6 +6902,7 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationCopyFailureFallsBackToMark) {
     instance_group->set_cache_config(config);
     EnableAsyncMigration(instance_group, ins_info);
 
+    ASSERT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     ASSERT_TRUE(cache_reclaimer_->SubmitMigrationPrepareJob(request_context_, ins_info, strategy, batch));
     ASSERT_TRUE(WaitForAsyncMigrationIdle());
 
@@ -6842,9 +6913,9 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationCopyFailureFallsBackToMark) {
     ASSERT_EQ(21, captured_mark_keys[0]);
     ASSERT_EQ("cold_01", captured_mark_target);
 
-    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MetaIndexer, GetForMaintenance));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
-    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWriteDetailed));
 }
 
 // multi-cold union：多个 cold SERVING location 联合覆盖 hot 的多 specs 时允许删除 hot。

@@ -122,6 +122,16 @@ SchedulePlanExecutor::SchedulePlanExecutor(unsigned int thread_count,
                   thread_count,
                   migration_worker_budget_);
 }
+
+void SchedulePlanExecutor::SetSourceLocationLeaseChecker(SourceLocationLeaseChecker checker) {
+    std::unique_lock<std::shared_mutex> lock(source_location_lease_mutex_);
+    source_location_lease_checker_ = std::move(checker);
+}
+
+std::unique_lock<std::shared_mutex> SchedulePlanExecutor::AcquireSourceLocationLeaseReservationGuard() {
+    return std::unique_lock<std::shared_mutex>(source_location_lease_mutex_);
+}
+
 void SchedulePlanExecutor::Stop() {
     KVCM_LOG_DEBUG("Stopping SchedulePlanExecutor...");
     std::vector<std::function<void()>> cancel_tasks;
@@ -453,103 +463,11 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
     KVCM_LOG_DEBUG("Submitting meta delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
-
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
-    std::future<PlanExecuteResult> future = promise->get_future();
-
-    if (stop_) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
-        return future;
-    }
-
-    // 1. sync set block status to deleting
-    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
-    if (indexer == nullptr) {
-        HandleErrorPromise(promise, ErrorCode::EC_NOENT, "MetaIndexer %s not found", task.instance_id.c_str());
-        return future;
-    }
-
-    MetaSearcher meta_searcher(indexer);
-
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
-    ErrorCode get_locations_ec =
-        meta_searcher.BatchGetLocation(request_context.get(), task.block_keys, empty_mask, location_maps);
-    if (get_locations_ec != ErrorCode::EC_OK) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "Failed to get block locations");
-        return future;
-    }
-
-    std::vector<int64_t> batch_cas_block_keys;
-    std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
-    for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
-        std::vector<MetaSearcher::LocationCASTask> cas_tasks;
-        for (const auto &loc_kv : location_maps[block_key_idx]) {
-            if (!loc_kv.second) {
-                continue;
-            }
-            cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING});
-        }
-        if (cas_tasks.empty()) {
-            continue;
-        }
-        batch_cas_block_keys.emplace_back(task.block_keys[block_key_idx]);
-        batch_cas_tasks.emplace_back(std::move(cas_tasks));
-    }
-
-    if (batch_cas_block_keys.empty()) {
-        promise->set_value({ErrorCode::EC_OK, ""});
-        return future;
-    }
-
-    std::vector<std::vector<ErrorCode>> cas_results;
-    ErrorCode update_ec =
-        meta_searcher.BatchCASLocationStatus(request_context.get(), batch_cas_block_keys, batch_cas_tasks, cas_results);
-    if (update_ec != ErrorCode::EC_OK) {
-        KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
-    }
-
-    std::string error_message;
-    CacheLocationDelRequest actual_task{task.instance_id, {}, {}, task.delay};
-    if (!FillActualTask(batch_cas_block_keys, batch_cas_tasks, cas_results, actual_task, error_message)) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "FillActualTask error: %s", error_message.c_str());
-        return future;
-    }
-    if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
-        return future;
-    }
-
-    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
-    if (!indexer->Sync(actual_task.block_keys)) {
-        HandleErrorPromise(promise,
-                           ErrorCode::EC_ERROR,
-                           "Sync failed or timed out for location delete, instance[%s]",
-                           task.instance_id.c_str());
-        return future;
-    }
-
-    KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
-                   static_cast<long long>(task.delay.count()));
-
-    auto execute_task = [this, promise, actual_task]() {
-        try {
-            promise->set_value(DoLocationDelTask(actual_task));
-        } catch (const std::exception &e) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw exception: %s", e.what());
-        } catch (...) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw unknown exception");
-        }
-    };
-    auto cancel_task = [promise]() {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before task execution.");
-    };
-    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task, task_class);
-    if (!submit_result) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit task failed");
-        return future;
-    }
+    auto future = promise->get_future();
+    auto completion = std::make_shared<PromiseCompletion>(promise);
+    RunDeleteAdmission(
+        completion, task.delay, [this, &task]() { return PrepareDeleteTask(task); }, task_class);
     return future;
 }
 
@@ -601,36 +519,45 @@ bool SchedulePlanExecutor::FillActualTask(
 }
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheMetaDelRequest &task) {
-    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false);
+    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, nullptr, task.delay, false);
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
     if (task.block_keys.size() != task.location_ids.size() ||
-        (!task.expected_location_values.empty() && task.block_keys.size() != task.expected_location_values.size())) {
+        (!task.expected_location_values.empty() && task.block_keys.size() != task.expected_location_values.size()) ||
+        (!task.expected_location_create_times.empty() &&
+         task.block_keys.size() != task.expected_location_create_times.size())) {
         LocationDelAdmissionResult admission_result;
         admission_result.result = MakeErrorResult(
-            ErrorCode::EC_BADARGS, "block_keys, location_ids and expected_location_values sizes do not match");
+            ErrorCode::EC_BADARGS,
+            "block_keys, location_ids and optional expected location guards sizes do not match");
         return admission_result;
     }
-    if (!task.expected_location_values.empty()) {
+    if (!task.expected_location_values.empty() || !task.expected_location_create_times.empty()) {
         for (size_t i = 0; i < task.location_ids.size(); ++i) {
-            if (task.location_ids[i].size() != task.expected_location_values[i].size()) {
+            if ((!task.expected_location_values.empty() &&
+                 task.location_ids[i].size() != task.expected_location_values[i].size()) ||
+                (!task.expected_location_create_times.empty() &&
+                 task.location_ids[i].size() != task.expected_location_create_times[i].size())) {
                 LocationDelAdmissionResult admission_result;
                 admission_result.result = MakeErrorResult(
                     ErrorCode::EC_BADARGS,
                     StringUtil::FormatString(
-                        "location_ids and expected_location_values sizes do not match at index %zu", i));
+                        "location_ids and expected location guards sizes do not match at index %zu", i));
                 return admission_result;
             }
         }
     }
     const auto *expected_location_values =
         task.expected_location_values.empty() ? nullptr : &task.expected_location_values;
+    const auto *expected_location_create_times =
+        task.expected_location_create_times.empty() ? nullptr : &task.expected_location_create_times;
     auto result = PrepareDeleteTaskImpl(task.instance_id,
                                         task.block_keys,
                                         &task.location_ids,
                                         expected_location_values,
+                                        expected_location_create_times,
                                         task.delay,
                                         task.authoritative_read);
     result.actual_task.metadata_only = task.metadata_only;
@@ -642,6 +569,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<int64_t> &block_keys,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
+                                            const std::vector<std::vector<int64_t>> *expected_location_create_times,
                                             std::chrono::microseconds delay,
                                             bool authoritative_read) {
     LocationDelAdmissionResult admission_result;
@@ -651,6 +579,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         admission_result.result = MakeErrorResult(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
         return admission_result;
     }
+    std::shared_lock<std::shared_mutex> source_lease_guard(source_location_lease_mutex_);
     std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(instance_id);
     if (!indexer) {
         admission_result.result = MakeErrorResult(
@@ -660,7 +589,6 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
 
     MetaSearcher meta_searcher(indexer);
     std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
     auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
     ErrorCode get_locations_ec = ErrorCode::EC_OK;
     if (authoritative_read) {
@@ -676,7 +604,19 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             }
         }
     } else {
-        get_locations_ec = meta_searcher.BatchGetLocation(request_context.get(), block_keys, empty_mask, location_maps);
+        PropertyMapVector unused_properties;
+        const auto get_result =
+            indexer->GetForMaintenance(request_context.get(), block_keys, {}, location_maps, unused_properties);
+        if (get_result.locations.error_codes.size() != block_keys.size()) {
+            get_locations_ec = ErrorCode::EC_ERROR;
+        } else {
+            for (const ErrorCode ec : get_result.locations.error_codes) {
+                if (ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT) {
+                    get_locations_ec = ErrorCode::EC_ERROR;
+                    break;
+                }
+            }
+        }
     }
     if (get_locations_ec != ErrorCode::EC_OK) {
         admission_result.result = MakeErrorResult(
@@ -707,6 +647,13 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                                     (*expected_location_values)[block_key_idx][i]);
             }
         }
+        std::unordered_map<std::string, int64_t> expected_create_times_by_location;
+        if (expected_location_create_times != nullptr) {
+            for (size_t i = 0; i < (*target_location_ids)[block_key_idx].size(); ++i) {
+                expected_create_times_by_location.emplace((*target_location_ids)[block_key_idx][i],
+                                                          (*expected_location_create_times)[block_key_idx][i]);
+            }
+        }
         auto block_key = block_keys[block_key_idx];
         auto &location_map = location_maps[block_key_idx];
         std::vector<MetaSearcher::LocationCASTask> location_cas_tasks;
@@ -720,6 +667,16 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             }
             if (target_location_ids != nullptr && target_ids.find(location.id()) == target_ids.end()) {
                 continue;
+            }
+            if (source_location_lease_checker_ &&
+                source_location_lease_checker_(instance_id, block_key, location.id(), location.create_time())) {
+                continue;
+            }
+            if (expected_location_create_times != nullptr) {
+                const auto expected = expected_create_times_by_location.find(location.id());
+                if (expected == expected_create_times_by_location.end() || location.create_time() != expected->second) {
+                    continue;
+                }
             }
             std::string expected_location_value;
             if (expected_location_values != nullptr) {
@@ -746,7 +703,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
 
     std::vector<std::vector<ErrorCode>> batch_results;
     ErrorCode update_ec = meta_searcher.BatchCASLocationStatus(
-        request_context.get(), batch_cas_block_keys, batch_cas_tasks, batch_results, authoritative_read);
+        request_context.get(), batch_cas_block_keys, batch_cas_tasks, batch_results, authoritative_read, true);
+    source_lease_guard.unlock();
     if (update_ec != ErrorCode::EC_OK) {
         KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
     }

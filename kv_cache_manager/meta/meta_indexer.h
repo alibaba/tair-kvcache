@@ -38,6 +38,13 @@ public:
         explicit Result(size_t count) : ec(EC_OK), error_codes(count, EC_OK) {}
     };
 
+    struct MaintenanceGetResult {
+        Result locations;
+        Result properties;
+        explicit MaintenanceGetResult(ErrorCode error_code) : locations(error_code), properties(error_code) {}
+        explicit MaintenanceGetResult(size_t count) : locations(count), properties(count) {}
+    };
+
     // Per-(key, location_id) result for location-granularity APIs.
     struct LocationResult {
         ErrorCode ec = EC_OK;
@@ -103,6 +110,13 @@ public:
     Result ReadModifyWriteBlock(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const BlockIdsOnlyModifierFunc &modifier) noexcept;
+    Result ReadModifyWriteBlockForMaintenance(RequestContext *request_context,
+                                              const KeyVector &keys,
+                                              const BlockIdsOnlyModifierFunc &modifier) noexcept;
+    Result ReadModifyWriteBlockPropertiesForMaintenance(RequestContext *request_context,
+                                                        const KeyVector &keys,
+                                                        const std::vector<std::string> &property_names,
+                                                        const BlockPropertyModifierFunc &modifier) noexcept;
     // Location-level RMW: modifier sees per-key CacheLocation vector.
     LocationResult ReadModifyWriteLocation(RequestContext *request_context,
                                            const KeyVector &keys,
@@ -114,7 +128,8 @@ public:
                                                           const KeyVector &keys,
                                                           const LocationIdsPerKey &location_ids,
                                                           const LocationModifierFunc &modifier,
-                                                          bool adjust_reclaimed_key_count = true) noexcept;
+                                                          bool adjust_reclaimed_key_count = true,
+                                                          bool refresh_cache_from_persistent = false) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -163,6 +178,18 @@ public:
                          const KeyVector &keys,
                          const std::vector<std::string> &property_names,
                          PropertyMapVector &out_properties) noexcept;
+    Result GetPropertiesForMaintenance(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const std::vector<std::string> &property_names,
+                                       PropertyMapVector &out_properties) noexcept;
+    MaintenanceGetResult GetForMaintenance(RequestContext *request_context,
+                                           const KeyVector &keys,
+                                           const std::vector<std::string> &property_names,
+                                           CacheLocationMapVector &out_locations,
+                                           PropertyMapVector &out_properties) noexcept;
+    [[nodiscard]] MaintenancePropertyReadiness
+    GetMaintenancePropertyReadiness(const std::string &property_name) const noexcept;
+    void ResetMaintenancePropertyReadinessEpoch() noexcept;
     ErrorCode Scan(RequestContext *request_context,
                    const std::string &cursor,
                    const size_t limit,
@@ -258,7 +285,8 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result,
-                                                 bool preserve_existing_updates_when_full = false) noexcept;
+                                                 bool preserve_existing_updates_when_full = false,
+                                                 MetaAccessIntent intent = MetaAccessIntent::kBusinessWrite) noexcept;
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
                                                  RequestContext *request_context,
@@ -276,6 +304,8 @@ private:
     std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
+    std::atomic<int64_t> maintenance_valid_since_steady_us_ = {0};
+    std::atomic<uint64_t> maintenance_readiness_generation_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;

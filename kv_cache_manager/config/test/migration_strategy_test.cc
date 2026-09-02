@@ -50,6 +50,12 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
     methods.mutable_mark().set_timeout_ms(12345);
     strategy.set_methods(methods);
     strategy.set_retention(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH);
+    MigrationAdmissionConfig admission;
+    admission.set_mode(MigrationAdmissionMode::SHADOW);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(3600));
+    admission.set_policies({policy});
+    strategy.set_admission(admission);
 
     MigrationStrategy parsed;
     ASSERT_TRUE(parsed.FromJsonString(strategy.ToJsonString()));
@@ -60,6 +66,43 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
     ASSERT_TRUE(parsed.methods().mark().enabled());
     ASSERT_EQ(12345, parsed.methods().mark().timeout_ms());
     ASSERT_EQ(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH, parsed.retention());
+    ASSERT_EQ(MigrationAdmissionMode::SHADOW, parsed.admission().mode());
+    ASSERT_EQ(1u, parsed.admission().policies().size());
+    ASSERT_EQ(3600, parsed.admission().policies()[0]->recent_access()->window_seconds());
+}
+
+TEST_F(MigrationStrategyTest, TestAdmissionDefaultsAndValidation) {
+    MigrationStrategy disabled;
+    disabled.set_source_storage_name("hot");
+    disabled.set_target_storage_name("cold");
+    disabled.set_trigger_threshold(0.7);
+    disabled.mutable_methods().mutable_mark().set_enabled(true);
+    std::string invalid_fields;
+    ASSERT_TRUE(disabled.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    ASSERT_EQ(MigrationAdmissionMode::DISABLED, disabled.admission().mode());
+    ASSERT_TRUE(disabled.admission().policies().empty());
+
+    MigrationAdmissionConfig enabled_without_policy;
+    enabled_without_policy.set_mode(MigrationAdmissionMode::ENFORCE);
+    invalid_fields.clear();
+    EXPECT_FALSE(enabled_without_policy.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("policies_count"));
+
+    MigrationAdmissionConfig invalid_window;
+    invalid_window.set_mode(MigrationAdmissionMode::SHADOW);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(0));
+    invalid_window.set_policies({policy});
+    invalid_fields.clear();
+    EXPECT_FALSE(invalid_window.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("window_seconds"));
+
+    MigrationAdmissionConfig valid;
+    valid.set_mode(MigrationAdmissionMode::ENFORCE);
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(60));
+    valid.set_policies({policy});
+    invalid_fields.clear();
+    EXPECT_TRUE(valid.ValidateRequiredFields(invalid_fields)) << invalid_fields;
 }
 
 // 校验：各类非法配置都应被拒绝

@@ -172,9 +172,12 @@ ErrorCode MetaLocalBackend::Close() noexcept {
 
 ErrorCode MetaLocalBackend::CreateAndInsert(std::string_view key_sv,
                                             const CacheLocationMap &locations,
-                                            const PropertyMap &properties) {
+                                            const PropertyMap &properties,
+                                            MetaAccessIntent intent) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
-    item->TouchAccessTime();
+    if (intent != MetaAccessIntent::kMaintenanceNoTouch) {
+        item->TouchAccessTime();
+    }
     size_t charge = item->Size();
     // We must pass &handle (not nullptr) so that when strict_capacity_limit
     // is enabled and capacity is exceeded, Insert returns EC_NOSPC instead
@@ -332,9 +335,59 @@ ErrorCode MetaLocalBackend::UpsertSingleLocationForOneKey(KeyType key,
 // Per-key helpers
 // ---------------------------------------------------------------------------
 
-ErrorCode
-MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties) {
+ErrorCode MetaLocalBackend::UpsertForOneKey(KeyType key,
+                                            const CacheLocationMap &locations,
+                                            const PropertyMap &properties,
+                                            MetaAccessIntent intent) {
     std::string_view key_sv = KeyToView(key);
+    if (intent == MetaAccessIntent::kMaintenanceNoTouch) {
+        ErrorCode result = EC_OK;
+        const bool found = cache_->ApplyToEntryNoTouch(
+            key_sv,
+            [&](Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+                if (value == nullptr) {
+                    result = EC_ERROR;
+                    return 0;
+                }
+                auto *item = static_cast<MetaMemCacheItem *>(value);
+                ssize_t charge_delta = 0;
+                std::unique_lock lock(item->GetMutex());
+                auto &existing_locations = item->GetMutableLocations();
+                for (const auto &[location_id, location] : locations) {
+                    const auto existing = existing_locations.find(location_id);
+                    const ssize_t new_usage =
+                        location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
+                    if (existing == existing_locations.end()) {
+                        charge_delta +=
+                            static_cast<ssize_t>(sizeof(void *) * 4 + location_id.size()) + new_usage;
+                        existing_locations.emplace(location_id, location);
+                    } else {
+                        const ssize_t old_usage = existing->second
+                                                      ? static_cast<ssize_t>(existing->second->EstimateMemUsage())
+                                                      : 0;
+                        existing->second = location;
+                        charge_delta += new_usage - old_usage;
+                    }
+                }
+                auto &existing_properties = item->GetMutableProperties();
+                for (const auto &[name, value_string] : properties) {
+                    const auto existing = existing_properties.find(name);
+                    if (existing == existing_properties.end()) {
+                        charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + name.size() + value_string.size());
+                        existing_properties.emplace(name, value_string);
+                    } else {
+                        charge_delta += static_cast<ssize_t>(value_string.size()) -
+                                        static_cast<ssize_t>(existing->second.size());
+                        existing->second = value_string;
+                    }
+                }
+                return charge_delta;
+            });
+        if (found) {
+            return result;
+        }
+        return CreateAndInsert(key_sv, locations, properties, intent);
+    }
     ErrorCode update_ec = UpdateInPlace(key_sv, locations, properties);
     if (update_ec != EC_OK && update_ec != EC_NOENT) {
         KVCM_LOG_ERROR("local backend fail to update key[%ld] in upsert, ec[%d]", key, update_ec);
@@ -343,7 +396,7 @@ MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations
     if (update_ec == EC_OK) {
         return EC_OK;
     }
-    ErrorCode insert_ec = CreateAndInsert(key_sv, locations, properties);
+    ErrorCode insert_ec = CreateAndInsert(key_sv, locations, properties, intent);
     if (insert_ec != EC_OK) {
         KVCM_LOG_ERROR("local backend fail to insert key[%ld] in upsert, ec[%d]", key, insert_ec);
         return insert_ec;
@@ -480,6 +533,24 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
     assert(missing_count == handles.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = CreateAndInsert(key_views[i], locations[i], properties[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties,
+                                                MetaAccessIntent intent) noexcept {
+    if (intent != MetaAccessIntent::kMaintenanceNoTouch) {
+        return Upsert(request_context, keys, locations, properties);
+    }
+    if (keys.size() != locations.size() || keys.size() != properties.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = UpsertForOneKey(keys[i], locations[i], properties[i], intent);
     }
     return results;
 }
@@ -719,6 +790,28 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
     return results;
 }
 
+std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties,
+                                                const std::vector<ErrorCode> &previous_error_codes,
+                                                MetaAccessIntent intent) noexcept {
+    if (intent != MetaAccessIntent::kMaintenanceNoTouch) {
+        return Upsert(request_context, keys, locations, properties, previous_error_codes);
+    }
+    if (keys.size() != locations.size() || keys.size() != properties.size() ||
+        keys.size() != previous_error_codes.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = previous_error_codes[i] == EC_OK
+                         ? UpsertForOneKey(keys[i], locations[i], properties[i], intent)
+                         : previous_error_codes[i];
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::Delete(RequestContext *request_context,
                                                 const KeyTypeVec &keys,
                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept {
@@ -808,7 +901,9 @@ ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
 }
 
 ErrorCode MetaLocalBackend::GetForOneKeyForMaintenance(KeyType key,
+                                                       const std::vector<std::string> *field_names,
                                                        CacheLocationMap *out_location_map,
+                                                       PropertyMap *out_property_map,
                                                        std::vector<LocationId> *out_location_ids) {
     ErrorCode result = EC_OK;
     const bool found = cache_->ApplyToEntryNoTouch(
@@ -828,6 +923,25 @@ ErrorCode MetaLocalBackend::GetForOneKeyForMaintenance(KeyType key,
                 out_location_ids->reserve(locations.size());
                 for (const auto &[location_id, _] : locations) {
                     out_location_ids->push_back(location_id);
+                }
+            }
+            if (out_property_map) {
+                const int64_t stored_time = item->GetLastAccessTime();
+                if (field_names) {
+                    const auto &properties = item->GetProperties();
+                    for (const auto &field_name : *field_names) {
+                        if (field_name == PROPERTY_LRU_TIME) {
+                            (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
+                            continue;
+                        }
+                        const auto property = properties.find(field_name);
+                        if (property != properties.end()) {
+                            out_property_map->emplace(property->first, property->second);
+                        }
+                    }
+                } else {
+                    *out_property_map = item->GetProperties();
+                    (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
                 }
             }
             return 0;
@@ -1210,7 +1324,7 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationIdsForMaintenance(RequestCon
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_location_ids.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = GetForOneKeyForMaintenance(keys[i], nullptr, &out_location_ids[i]);
+        results[i] = GetForOneKeyForMaintenance(keys[i], nullptr, nullptr, nullptr, &out_location_ids[i]);
     }
     return results;
 }
@@ -1277,6 +1391,40 @@ std::vector<ErrorCode> MetaLocalBackend::GetProperties(RequestContext * /*reques
         results[i] = GetForOneKey(keys[i], &field_names, nullptr, &out_properties[i], nullptr);
     }
     return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetPropertiesForMaintenance(
+    RequestContext * /*request_context*/,
+    const KeyTypeVec &keys,
+    const std::vector<std::string> &field_names,
+    PropertyMapVector &out_properties) noexcept {
+    out_properties.assign(keys.size(), PropertyMap{});
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] =
+            GetForOneKeyForMaintenance(keys[i], &field_names, nullptr, &out_properties[i], nullptr);
+    }
+    return results;
+}
+
+MaintenanceReadResult MetaLocalBackend::GetForMaintenance(
+    RequestContext * /*request_context*/,
+    const KeyTypeVec &keys,
+    const std::vector<std::string> &field_names,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    out_properties.assign(keys.size(), PropertyMap{});
+    MaintenanceReadResult result;
+    result.location_error_codes.assign(keys.size(), EC_OK);
+    result.property_error_codes.assign(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const ErrorCode ec = GetForOneKeyForMaintenance(
+            keys[i], &field_names, &out_locations[i], &out_properties[i], nullptr);
+        result.location_error_codes[i] = ec;
+        result.property_error_codes[i] = ec;
+    }
+    return result;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Exists(RequestContext * /*request_context*/,
@@ -1384,7 +1532,7 @@ ErrorCode MetaLocalBackend::ScanLocationsForMaintenance(RequestContext * /*reque
         // then pins the exact shard operation without promoting the entry.
         for (const KeyType key : shard_keys) {
             CacheLocationMap locations;
-            const ErrorCode ec = GetForOneKeyForMaintenance(key, &locations, nullptr);
+            const ErrorCode ec = GetForOneKeyForMaintenance(key, nullptr, &locations, nullptr, nullptr);
             out.keys.push_back(key);
             out.locations.emplace_back(std::move(locations));
             out.location_results.push_back(ec);

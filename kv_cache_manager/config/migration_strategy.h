@@ -22,6 +22,76 @@ enum class MigrationMarkClearPolicy {
     CLEAR_ON_FULL_BLOCK_COVERED = 1, // target CacheLocation 覆盖完整 block 后清标
 };
 
+// 迁移价值准入模式。准入只作用于 source -> target 的迁移写入，不影响普通热层写入。
+enum class MigrationAdmissionMode {
+    DISABLED = 0,
+    SHADOW = 1,
+    ENFORCE = 2,
+};
+
+class RecentAccessAdmissionConfig : public Jsonizable {
+public:
+    RecentAccessAdmissionConfig() = default;
+    explicit RecentAccessAdmissionConfig(int64_t window_seconds)
+        : window_seconds_(window_seconds) {}
+    ~RecentAccessAdmissionConfig() override;
+
+    int64_t window_seconds() const { return window_seconds_; }
+    void set_window_seconds(int64_t window_seconds) { window_seconds_ = window_seconds; }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+
+private:
+    int64_t window_seconds_ = 0;
+};
+
+// V1 的公开配置保留 oneof 风格的 leaf 容器，但只接受 recent_access。
+// 第二个真实策略落地前不公开组合语义。
+class MigrationAdmissionPolicyConfig : public Jsonizable {
+public:
+    MigrationAdmissionPolicyConfig() = default;
+    MigrationAdmissionPolicyConfig(const MigrationAdmissionPolicyConfig &other);
+    MigrationAdmissionPolicyConfig &operator=(const MigrationAdmissionPolicyConfig &other);
+    ~MigrationAdmissionPolicyConfig() override;
+
+    const std::shared_ptr<RecentAccessAdmissionConfig> &recent_access() const { return recent_access_; }
+    void set_recent_access(const std::shared_ptr<RecentAccessAdmissionConfig> &recent_access) {
+        recent_access_ = recent_access;
+    }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+
+private:
+    std::shared_ptr<RecentAccessAdmissionConfig> recent_access_;
+};
+
+class MigrationAdmissionConfig : public Jsonizable {
+public:
+    MigrationAdmissionConfig() = default;
+    MigrationAdmissionConfig(const MigrationAdmissionConfig &other);
+    MigrationAdmissionConfig &operator=(const MigrationAdmissionConfig &other);
+    ~MigrationAdmissionConfig() override;
+
+    MigrationAdmissionMode mode() const { return mode_; }
+    const std::vector<std::shared_ptr<MigrationAdmissionPolicyConfig>> &policies() const { return policies_; }
+    void set_mode(MigrationAdmissionMode mode) { mode_ = mode; }
+    void set_policies(const std::vector<std::shared_ptr<MigrationAdmissionPolicyConfig>> &policies) {
+        policies_ = policies;
+    }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+
+private:
+    MigrationAdmissionMode mode_ = MigrationAdmissionMode::DISABLED;
+    std::vector<std::shared_ptr<MigrationAdmissionPolicyConfig>> policies_;
+};
+
 // Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage。
 class MigrationCopyMethod : public Jsonizable {
 public:
@@ -100,6 +170,8 @@ public:
     const MigrationMethods &methods() const { return methods_; }
     MigrationMethods &mutable_methods() { return methods_; }
     MigrationRetention retention() const { return retention_; }
+    const MigrationAdmissionConfig &admission() const { return admission_; }
+    MigrationAdmissionConfig &mutable_admission() { return admission_; }
 
     // Setters
     void set_source_storage_name(const std::string &name) { source_storage_name_ = name; }
@@ -107,6 +179,7 @@ public:
     void set_trigger_threshold(double trigger_threshold) { trigger_threshold_ = trigger_threshold; }
     void set_methods(const MigrationMethods &methods) { methods_ = methods; }
     void set_retention(MigrationRetention retention) { retention_ = retention; }
+    void set_admission(const MigrationAdmissionConfig &admission) { admission_ = admission; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
@@ -118,6 +191,7 @@ private:
     double trigger_threshold_ = 0.0;
     MigrationMethods methods_;
     MigrationRetention retention_ = MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED;
+    MigrationAdmissionConfig admission_;
 };
 
 class MigrationConfig : public Jsonizable {

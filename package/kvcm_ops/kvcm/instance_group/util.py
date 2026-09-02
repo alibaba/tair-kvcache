@@ -1,4 +1,5 @@
 import argparse
+import copy
 import math
 from ..common.json_data import *
 from ..common.common_args import *
@@ -318,18 +319,25 @@ class CacheConfig(JsonData):
     def __init__(self,
                  data_storage_strategy: str = "CPS_PREFER_3FS",
                  reclaim_strategy: ReclaimStrategy = ReclaimStrategy(),
-                 meta_indexer_config: MetaIndexerConfig = MetaIndexerConfig()):
+                 meta_indexer_config: MetaIndexerConfig = MetaIndexerConfig(),
+                 extra_fields=None):
         self._data_storage_strategy = data_storage_strategy
         self._reclaim_strategy = reclaim_strategy
         self._meta_indexer_config = meta_indexer_config
+        # Preserve server fields that this client version does not model. In
+        # particular migration_config (including admission and future leaves)
+        # must survive a read-modify-update of an unrelated setting.
+        self._extra_fields = copy.deepcopy(extra_fields) if extra_fields is not None else {}
         self.check()
 
     def to_json_data(self) -> dict:
-        return {
+        result = copy.deepcopy(self._extra_fields)
+        result.update({
             "reclaim_strategy": self._reclaim_strategy.to_json_data(),
             "data_storage_strategy": self._data_storage_strategy,
             "meta_indexer_config": self._meta_indexer_config.to_json_data()
-        }
+        })
+        return result
 
     def check(self) -> bool:
         _data_storage_strategy = self._data_storage_strategy.upper()
@@ -348,13 +356,18 @@ class CacheConfig(JsonData):
 
     @classmethod
     def from_json_data(cls, json_data: dict):
+        data_storage_strategy = "CPS_PREFER_3FS"
+        reclaim_strategy = ReclaimStrategy()
+        meta_indexer_config = MetaIndexerConfig()
         if JsonData.expect_exist("data_storage_strategy", json_data, str):
             data_storage_strategy = json_data["data_storage_strategy"]
         if JsonData.expect_exist("reclaim_strategy", json_data, dict):
             reclaim_strategy = ReclaimStrategy.from_json_data(json_data["reclaim_strategy"])
         if JsonData.expect_exist("meta_indexer_config", json_data, dict):
             meta_indexer_config = MetaIndexerConfig.from_json_data(json_data["meta_indexer_config"])
-        return cls(data_storage_strategy, reclaim_strategy, meta_indexer_config)
+        known_fields = {"data_storage_strategy", "reclaim_strategy", "meta_indexer_config"}
+        extra_fields = {key: value for key, value in json_data.items() if key not in known_fields}
+        return cls(data_storage_strategy, reclaim_strategy, meta_indexer_config, extra_fields)
 
 
 # Aligned with server-side StringUtil::ParseBucketBoundaries: comma separated,

@@ -10,6 +10,7 @@
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
+- [基于访问特征的迁移准入策略](design/migration_admission_strategy.md) - 面向 Copy/Mark 下沉候选，以类型化特征和可扩展策略降低低层写量与 DWPD
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置

@@ -150,8 +150,15 @@ cc_library(
 
 cc_library(
     name = "migration_manager",
-    srcs = ["migration_manager.cc"],
-    hdrs = ["migration_manager.h"],
+    srcs = [
+        "migration_admission_internal.cc",
+        "migration_manager.cc",
+    ],
+    hdrs = [
+        "migration_admission_internal.h",
+        "migration_manager.h",
+        "migration_outcome.h",
+    ],
     deps = [
         ":data_storage_selector",
         ":meta_searcher",

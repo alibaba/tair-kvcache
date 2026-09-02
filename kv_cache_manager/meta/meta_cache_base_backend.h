@@ -60,6 +60,15 @@ public:
                                           const PropertyMapVector &properties,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 
+    virtual std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector &locations,
+                                          const PropertyMapVector &properties,
+                                          const std::vector<ErrorCode> &previous_error_codes,
+                                          MetaAccessIntent /*intent*/) noexcept {
+        return Upsert(request_context, keys, locations, properties, previous_error_codes);
+    }
+
     virtual std::vector<ErrorCode> Delete(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
