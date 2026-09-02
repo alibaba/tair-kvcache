@@ -28,7 +28,6 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
-#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -58,8 +57,7 @@ namespace {
 
 struct KeySamplingResult {
     kv_cache_manager::ErrorCode ec;
-    std::shared_ptr<std::vector<std::int64_t>> keys;
-    std::shared_ptr<std::vector<std::map<std::string, std::string>>> maps;
+    std::shared_ptr<kv_cache_manager::ReclaimCandidateVector> candidates;
 };
 
 } // namespace
@@ -946,22 +944,21 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     // 1. get the sampled block keys and the LRU timestamp info from
     // the meta indexer
     const std::int64_t begin_tp_sample = TimestampUtil::GetSteadyTimeUs();
     const bool sampled = use_fair_budget
-                             ? DoKeySamplingWithSize(request_context, instance_info, sampling_size, true, keys, maps)
-                             : DoKeySampling(request_context, instance_info, keys, maps);
+                             ? DoKeySamplingWithSize(request_context, instance_info, sampling_size, true, candidates)
+                             : DoKeySampling(request_context, instance_info, candidates);
     if (!sampled) {
         LOG_WITH_ID(DEBUG, "key sampling failed");
         return false;
     }
     METRICS_(cache_reclaimer, reclaim_lru_sample_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_sample);
-    LOG_WITH_ID(DEBUG, "[%zu] key(s) sampled", keys.size());
+    LOG_WITH_ID(DEBUG, "[%zu] reclaim candidate(s) sampled", candidates.size());
 
     // init the deleting request with content to be filled later
     // here the cache location form of deleting request is used to
@@ -976,8 +973,8 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     const bool batch_made =
         use_fair_budget
             ? MakeBatchByLRUWithSize(
-                  request_context.get(), instance_info, keys, maps, batching_size, request.block_keys, lru_age_stats)
-            : MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys, lru_age_stats);
+                  request_context.get(), instance_info, candidates, batching_size, request.block_keys, lru_age_stats)
+            : MakeBatchByLRU(request_context.get(), instance_info, candidates, request.block_keys, lru_age_stats);
     if (!batch_made) {
         LOG_WITH_ID(DEBUG, "make batch failed");
         return false;
@@ -1130,17 +1127,15 @@ void CacheReclaimer::ReclaimCron() noexcept {
 
 bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                                    const std::shared_ptr<const InstanceInfo> &instance_info,
-                                   std::vector<std::int64_t> &out_keys,
-                                   std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
-    return DoKeySamplingWithSize(request_context, instance_info, 0, false, out_keys, out_maps);
+                                   ReclaimCandidateVector &out_candidates) noexcept {
+    return DoKeySamplingWithSize(request_context, instance_info, 0, false, out_candidates);
 }
 
 bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext> &request_context,
                                            const std::shared_ptr<const InstanceInfo> &instance_info,
                                            const std::size_t total_sampling_size,
                                            const bool bounded_waves,
-                                           std::vector<std::int64_t> &out_keys,
-                                           std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
+                                           ReclaimCandidateVector &out_candidates) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1162,58 +1157,41 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
 
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
     auto sample = [this, request_context, ins_id, ins_gr, meta_indexer, cancelled, bounded_waves](
-                      std::size_t sampling_sz,
-                      std::vector<std::int64_t> &keys,
-                      std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
+                      const std::size_t sampling_sz, ReclaimCandidateVector &candidates) -> ErrorCode {
         if (cancelled->load(std::memory_order_relaxed) || (bounded_waves && (!IsRunning() || IsPaused()))) {
             return ErrorCode::EC_ERROR;
         }
-        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context.get(), sampling_sz, keys);
+        if (const auto ec = meta_indexer->SampleReclaimCandidates(request_context.get(), sampling_sz, candidates);
             ec != ErrorCode::EC_OK) {
-            LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
+            LOG_WITH_ID(WARN, "reclaim candidate sampling failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
         }
-        if (keys.empty()) {
-            LOG_WITH_ID(DEBUG, "random sample got empty keys");
+        if (candidates.empty()) {
+            LOG_WITH_ID(DEBUG, "reclaim candidate sampling got no candidates");
             return ErrorCode::EC_NOENT;
         }
-        if (keys.size() != sampling_sz) {
-            LOG_WITH_ID(DEBUG, "random sample key size mismatch, expect: [%zu], got: [%zu]", sampling_sz, keys.size());
+        if (candidates.size() != sampling_sz) {
+            LOG_WITH_ID(DEBUG,
+                        "reclaim candidate sample size mismatch, expect: [%zu], got: [%zu]",
+                        sampling_sz,
+                        candidates.size());
         }
-
         if (cancelled->load(std::memory_order_relaxed) || (bounded_waves && (!IsRunning() || IsPaused()))) {
             return ErrorCode::EC_ERROR;
-        }
-        if (const auto res = meta_indexer->GetProperties(request_context.get(), keys, {PROPERTY_LRU_TIME}, maps);
-            res.ec != ErrorCode::EC_OK) {
-            LOG_WITH_ID(WARN,
-                        "get properties failed, error code: [%d], proceed with empty lru_time",
-                        static_cast<std::int32_t>(res.ec));
-            maps.clear();
-            maps.resize(keys.size());
-        } else if (keys.size() != maps.size()) {
-            LOG_WITH_ID(
-                WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys.size(), maps.size());
-            maps.clear();
-            maps.resize(keys.size());
         }
         return ErrorCode::EC_OK;
     };
 
-    out_keys.clear();
-    out_keys.reserve(total_sampling_sz);
-    out_maps.clear();
-    out_maps.reserve(total_sampling_sz);
+    out_candidates.clear();
+    out_candidates.reserve(total_sampling_sz);
     const std::size_t worker_sz = (total_sampling_sz + sampling_sz_per_task - 1) / sampling_sz_per_task;
     if (worker_sz == 1 && !bounded_waves) {
-        return sample(total_sampling_sz, out_keys, out_maps) == ErrorCode::EC_OK;
+        return sample(total_sampling_sz, out_candidates) == ErrorCode::EC_OK;
     }
 
     if (bounded_waves) {
-        std::vector<std::int64_t> sampled_keys;
-        sampled_keys.reserve(total_sampling_sz);
-        std::vector<std::map<std::string, std::string>> sampled_maps;
-        sampled_maps.reserve(total_sampling_sz);
+        ReclaimCandidateVector sampled_candidates;
+        sampled_candidates.reserve(total_sampling_sz);
 
         std::size_t sampling_sz_todo = total_sampling_sz;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(future_timeout_ms_.load());
@@ -1238,17 +1216,14 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
                 futures.emplace_back(promise->get_future());
                 in_flight_sampling_tasks_.fetch_add(1);
                 SubmitTask([this, sample, sampling_sz, promise]() {
-                    std::vector<std::int64_t> keys;
-                    std::vector<std::map<std::string, std::string>> maps;
-                    const auto ec = sample(sampling_sz, keys, maps);
+                    ReclaimCandidateVector candidates;
+                    const auto ec = sample(sampling_sz, candidates);
                     in_flight_sampling_tasks_.fetch_sub(1);
                     if (ec != ErrorCode::EC_OK) {
-                        promise->set_value({ec, nullptr, nullptr});
+                        promise->set_value({ec, nullptr});
                     } else {
                         promise->set_value(
-                            {ErrorCode::EC_OK,
-                             std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
-                             std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
+                            {ErrorCode::EC_OK, std::make_shared<ReclaimCandidateVector>(std::move(candidates))});
                     }
                 });
                 sampling_sz_todo -= sampling_sz;
@@ -1275,23 +1250,18 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
                     cancelled->store(true, std::memory_order_relaxed);
                     break;
                 }
-                sampled_keys.insert(sampled_keys.end(),
-                                    std::make_move_iterator(key_sampling_result.keys->begin()),
-                                    std::make_move_iterator(key_sampling_result.keys->end()));
-                sampled_maps.insert(sampled_maps.end(),
-                                    std::make_move_iterator(key_sampling_result.maps->begin()),
-                                    std::make_move_iterator(key_sampling_result.maps->end()));
+                sampled_candidates.insert(sampled_candidates.end(),
+                                          std::make_move_iterator(key_sampling_result.candidates->begin()),
+                                          std::make_move_iterator(key_sampling_result.candidates->end()));
             }
             if (!wave_succeeded) {
                 cancelled->store(true, std::memory_order_relaxed);
-                out_keys.clear();
-                out_maps.clear();
+                out_candidates.clear();
                 return false;
             }
         }
 
-        out_keys = std::move(sampled_keys);
-        out_maps = std::move(sampled_maps);
+        out_candidates = std::move(sampled_candidates);
         return true;
     }
 
@@ -1312,17 +1282,13 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
         std::size_t sampling_sz = (i == worker_sz - 1) ? sampling_sz_todo : sampling_sz_per_task;
         in_flight_sampling_tasks_.fetch_add(1);
         SubmitTask([this, sample, sampling_sz, promise]() {
-            std::vector<std::int64_t> keys;
-            std::vector<std::map<std::string, std::string>> maps;
-            const auto ec = sample(sampling_sz, keys, maps);
+            ReclaimCandidateVector candidates;
+            const auto ec = sample(sampling_sz, candidates);
             in_flight_sampling_tasks_.fetch_sub(1);
             if (ec != ErrorCode::EC_OK) {
-                promise->set_value({ec, nullptr, nullptr});
+                promise->set_value({ec, nullptr});
             } else {
-                promise->set_value(
-                    {ErrorCode::EC_OK,
-                     std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
-                     std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
+                promise->set_value({ErrorCode::EC_OK, std::make_shared<ReclaimCandidateVector>(std::move(candidates))});
             }
         });
         sampling_sz_todo -= sampling_sz;
@@ -1347,12 +1313,9 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
             if (auto key_sampling_res = fut.get(); key_sampling_res.ec != ErrorCode::EC_OK) {
                 result = false;
             } else {
-                out_keys.insert(out_keys.end(),
-                                std::make_move_iterator(key_sampling_res.keys->begin()),
-                                std::make_move_iterator(key_sampling_res.keys->end()));
-                out_maps.insert(out_maps.end(),
-                                std::make_move_iterator(key_sampling_res.maps->begin()),
-                                std::make_move_iterator(key_sampling_res.maps->end()));
+                out_candidates.insert(out_candidates.end(),
+                                      std::make_move_iterator(key_sampling_res.candidates->begin()),
+                                      std::make_move_iterator(key_sampling_res.candidates->end()));
             }
         } else {
             result = false;
@@ -1368,19 +1331,17 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
 
 bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
                                     const std::shared_ptr<const InstanceInfo> &instance_info,
-                                    const std::vector<std::int64_t> &sampled_keys,
-                                    const std::vector<std::map<std::string, std::string>> &property_maps,
+                                    const ReclaimCandidateVector &candidates,
                                     std::vector<std::int64_t> &out_batch,
                                     AgeStats &out_lru_age_stats) const noexcept {
     const std::size_t batching_size = batching_size_.load();
     return MakeBatchByLRUWithSize(
-        request_context, instance_info, sampled_keys, property_maps, batching_size, out_batch, out_lru_age_stats);
+        request_context, instance_info, candidates, batching_size, out_batch, out_lru_age_stats);
 }
 
 bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_context,
                                             const std::shared_ptr<const InstanceInfo> &instance_info,
-                                            const std::vector<std::int64_t> &sampled_keys,
-                                            const std::vector<std::map<std::string, std::string>> &property_maps,
+                                            const ReclaimCandidateVector &candidates,
                                             const std::size_t batching_size,
                                             std::vector<std::int64_t> &out_batch,
                                             AgeStats &out_lru_age_stats) const noexcept {
@@ -1390,39 +1351,16 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
         return true;
     }
 
-    // invariant:
-    // the 2 vectors' size must be guaranteed to be equal, and the
-    // content must be guaranteed to be correlative when iterated by
-    // index
-    assert(sampled_keys.size() == property_maps.size());
-
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
     std::vector<std::pair<std::int64_t, std::int64_t>> key_tp_vec; // vector of {key, last_access_time}
-    key_tp_vec.reserve(sampled_keys.size());
-
-    for (std::size_t i = 0; i != sampled_keys.size(); ++i) {
-        const auto &k = sampled_keys[i];
-        const auto &m = property_maps[i];
-        int64_t lru_ts = 0;
-        // if PROPERTY_LRU_TIME is not found, use 0 as the timestamp, the reclaim strategy will degrade
-        if (const auto it = m.find(PROPERTY_LRU_TIME); it != m.end()) {
-            // the PROPERTY_LRU_TIME value is represented as an int64_t type
-            // timepoint string; parse them into integers
-            const auto &lru_ts_str = it->second;
-            if (!StringUtil::StrToInt64(lru_ts_str.c_str(), lru_ts)) {
-                INTERVAL_LOG_WITH_ID(
-                    WARN, 10000, "lru_time str [%s] to int64 failed, use 0 instead", lru_ts_str.c_str());
-                lru_ts = 0;
-            }
-        } else {
-            INTERVAL_LOG_WITH_ID(WARN, 10000, "PROPERTY_LRU_TIME not found, use 0 instead");
-        }
-        key_tp_vec.emplace_back(k, lru_ts);
+    key_tp_vec.reserve(candidates.size());
+    for (const auto &candidate : candidates) {
+        key_tp_vec.emplace_back(candidate.key, candidate.last_access_time_us);
     }
 
-    if (sampled_keys.size() > batching_size) {
+    if (candidates.size() > batching_size) {
         std::sort(key_tp_vec.begin(),
                   key_tp_vec.end(),
                   [](const std::pair<std::int64_t, std::int64_t> &a,
@@ -1431,7 +1369,7 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
 
     // constitute the batch to be submitted for deleting
     // the first N timestamp would be picked out
-    const std::size_t effective_batch_size = std::min(batching_size, sampled_keys.size());
+    const std::size_t effective_batch_size = std::min(batching_size, candidates.size());
     std::unordered_set<std::int64_t> deduped_batch;
     const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
     int64_t age_sum = 0;
@@ -1464,23 +1402,23 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
     }
 
     if (deduped_batch.size() < batching_size) {
-        if (deduped_batch.size() != sampled_keys.size()) {
-            // sampled_keys contains duplicated keys, log the event
+        if (deduped_batch.size() != candidates.size()) {
+            // candidates contains duplicated keys, log the event
             LOG_WITH_ID(DEBUG,
                         "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
-                        "sampled keys size: [%zu], intended batching size: [%zu]",
+                        "candidate size: [%zu], intended batching size: [%zu]",
                         deduped_batch.size(),
-                        sampled_keys.size(),
+                        candidates.size(),
                         batching_size);
         } else {
-            // the batch size is equal to the size of sampled keys;
+            // the batch size is equal to the number of candidates;
             // * possibility 1: not enough keys sampled
             // * possibility 2: sampling_size_ < batching_size_
             LOG_WITH_ID(DEBUG,
                         "shortened batch size, final batch size: [%zu], "
-                        "sampled keys size: [%zu], intended batching size: [%zu]",
+                        "candidate size: [%zu], intended batching size: [%zu]",
                         deduped_batch.size(),
-                        sampled_keys.size(),
+                        candidates.size(),
                         batching_size);
         }
     }
@@ -1919,13 +1857,12 @@ bool CacheReclaimer::BuildMigrationCandidateBatch(const std::shared_ptr<RequestC
     }
 
     // 采样 + LRU 取最冷 batch（复用回收侧的采样与排序）。
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
-    if (!DoKeySampling(request_context, instance_info, keys, maps)) {
+    ReclaimCandidateVector candidates;
+    if (!DoKeySampling(request_context, instance_info, candidates)) {
         return false;
     }
     AgeStats lru_age_stats;
-    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, out_batch, lru_age_stats)) {
+    if (!MakeBatchByLRU(request_context.get(), instance_info, candidates, out_batch, lru_age_stats)) {
         return false;
     }
     return true;

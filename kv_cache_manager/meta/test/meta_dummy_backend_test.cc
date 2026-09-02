@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -353,6 +354,25 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 2, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 3, ErrorCode::EC_OK, {1, 2});
+
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    auto snapshot_lru_times = [backend]() {
+        std::map<KeyType, std::string> lru_times;
+        backend->table_.ForEachKV([&lru_times](const KeyType &key, const DummyItem &item) {
+            lru_times[key] = item.properties.at(PROPERTY_LRU_TIME);
+            return true;
+        });
+        return lru_times;
+    };
+    const auto lru_times_before = snapshot_lru_times();
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(2, candidates.size());
+    for (const auto &candidate : candidates) {
+        ASSERT_TRUE(lru_times_before.count(candidate.key) > 0);
+        EXPECT_EQ(std::stoll(lru_times_before.at(candidate.key)), candidate.last_access_time_us);
+    }
+    EXPECT_EQ(lru_times_before, snapshot_lru_times());
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }

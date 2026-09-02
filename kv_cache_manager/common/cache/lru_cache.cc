@@ -849,6 +849,24 @@ size_t LRUCacheShard::GetOldestKeys(size_t count, std::vector<std::string> &out_
     return collected;
 }
 
+size_t LRUCacheShard::ApplyToOldestEntries(
+    size_t count,
+    const std::function<
+        void(const std::string_view &key, Cache::ObjectPtr value, size_t charge, const Cache::CacheItemHelper *helper)>
+        &callback) {
+    std::lock_guard<std::mutex> l(mutex_);
+    size_t visited = 0;
+    LRUHandle *current = lru_.next;
+    while (current != &lru_ && visited < count) {
+        if (current->InCache()) {
+            callback(current->key(), current->value, current->GetCharge(metadata_charge_policy_), current->helper);
+            ++visited;
+        }
+        current = current->next;
+    }
+    return visited;
+}
+
 void LRUCacheShard::SetTailChangeCallback(uint32_t shard_id, const Cache::TailChangeCallback &callback) {
     std::lock_guard<std::mutex> l(mutex_);
     shard_id_ = shard_id;
@@ -1161,6 +1179,18 @@ size_t LRUCache::GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vect
         return 0;
     }
     return GetShard(shard_id).GetOldestKeys(count, out_keys);
+}
+
+size_t LRUCache::ApplyToOldestEntriesInShard(
+    uint32_t shard_id,
+    size_t count,
+    const std::function<
+        void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback) {
+    const uint32_t num_shards = GetNumShards();
+    if (shard_id >= num_shards || count == 0 || !callback) {
+        return 0;
+    }
+    return GetShard(shard_id).ApplyToOldestEntries(count, callback);
 }
 
 void LRUCache::SetTailChangeCallback(TailChangeCallback callback) {

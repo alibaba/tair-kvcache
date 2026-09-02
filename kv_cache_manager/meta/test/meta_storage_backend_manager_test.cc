@@ -328,6 +328,27 @@ private:
     std::shared_ptr<BackendLifecycleCalls> calls_;
 };
 
+class RecordingReclaimBackend : public MetaLocalBackend {
+public:
+    explicit RecordingReclaimBackend(const KeyType key) : key_(key) {}
+
+    ErrorCode
+    SampleReclaimCandidates(RequestContext *, int64_t count, ReclaimCandidateVector &out_candidates) noexcept override {
+        ++calls_;
+        out_candidates.clear();
+        if (count > 0) {
+            out_candidates.push_back({key_, key_ * 10});
+        }
+        return EC_OK;
+    }
+
+    int calls() const { return calls_; }
+
+private:
+    KeyType key_;
+    int calls_ = 0;
+};
+
 } // namespace
 
 class MetaStorageBackendManagerTest : public TESTBASE {
@@ -458,6 +479,31 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     ASSERT_EQ(EC_OK, mgr.Open());
     WaitRunning(mgr);
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesOneBackendForWholeOperation) {
+    MetaStorageBackendManager mgr;
+    auto persistent = std::make_unique<RecordingReclaimBackend>(11);
+    auto cache = std::make_unique<RecordingReclaimBackend>(22);
+    auto *persistent_ptr = persistent.get();
+    auto *cache_ptr = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+
+    ReclaimCandidateVector candidates;
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(1, persistent_ptr->calls());
+    EXPECT_EQ(0, cache_ptr->calls());
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(22, candidates.front().key);
+    EXPECT_EQ(1, persistent_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->calls());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestInitIsTransactionalAndOneShot) {
@@ -1070,14 +1116,12 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteMirrorsPersistentAndH
 
     int32_t reclaimed_count = 0;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {888}, {{"loc_888"}}, reclaimed_count));
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {888}, {{"loc_888"}}, reclaimed_count));
     EXPECT_EQ(0, reclaimed_count);
 
     CacheLocationMapVector hot_locations;
     CacheLocationMapVector persistent_locations;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.cache_backend_->GetLocations(nullptr, {888}, hot_locations));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->GetLocations(nullptr, {888}, hot_locations));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               mgr.persistent_backend_->GetLocations(nullptr, {888}, persistent_locations));
     ASSERT_EQ(1u, hot_locations.size());
@@ -1088,8 +1132,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteMirrorsPersistentAndH
     EXPECT_EQ(1u, persistent_locations[0].count("loc_second"));
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {888}, {{"loc_second"}}, reclaimed_count));
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {888}, {{"loc_second"}}, reclaimed_count));
     EXPECT_EQ(1, reclaimed_count);
     ASSERT_EQ(EC_OK, mgr.Close());
 }
@@ -1107,8 +1150,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteDefersDuringCachedRec
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
     int32_t reclaimed_count = 0;
     EXPECT_EQ((std::vector<ErrorCode>{EC_OUT_OF_LIMIT}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {889}, {{"loc_889"}}, reclaimed_count));
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {889}, {{"loc_889"}}, reclaimed_count));
     EXPECT_EQ(0, reclaimed_count);
 
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
@@ -1133,8 +1175,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceDeleteConvergesHotCopyAfter
 
     int32_t reclaimed_count = 0;
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.DeleteLocationsForMaintenance(
-                  request_context_.get(), {890}, {{"loc_890"}}, reclaimed_count));
+              mgr.DeleteLocationsForMaintenance(request_context_.get(), {890}, {{"loc_890"}}, reclaimed_count));
     EXPECT_EQ(1, reclaimed_count);
 
     CacheLocationMapVector hot_locations;

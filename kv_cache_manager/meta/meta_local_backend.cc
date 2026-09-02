@@ -1466,6 +1466,45 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context
     return EC_OK;
 }
 
+ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
+                                                    const int64_t count,
+                                                    ReclaimCandidateVector &out_candidates) noexcept {
+    out_candidates.clear();
+    if (!cache_) {
+        KVCM_LOG_ERROR("local backend not inited");
+        return EC_ERROR;
+    }
+    if (count <= 0) {
+        return EC_OK;
+    }
+
+    const size_t num_shards = shard_mask_ + 1;
+    size_t num_rounds = std::min(sample_times_, num_shards);
+    num_rounds = std::min(num_rounds, static_cast<size_t>(count));
+    const int64_t per_round_count = (count + static_cast<int64_t>(num_rounds) - 1) / static_cast<int64_t>(num_rounds);
+    std::vector<std::pair<int64_t, uint32_t>> shard_times;
+    shard_times.reserve(num_shards);
+    for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
+        const int64_t access_time = shard_oldest_access_time_[shard_id].load(std::memory_order_relaxed);
+        if (access_time < INT64_MAX) {
+            shard_times.emplace_back(access_time, shard_id);
+        }
+    }
+    if (shard_times.empty()) {
+        return EC_OK;
+    }
+
+    const size_t select_count = std::min(num_rounds, shard_times.size());
+    std::partial_sort(shard_times.begin(), shard_times.begin() + select_count, shard_times.end());
+    int64_t remaining = count;
+    for (size_t i = 0; i < select_count && remaining > 0; ++i) {
+        const size_t batch = static_cast<size_t>(std::min(per_round_count, remaining));
+        const size_t collected = CollectOldestReclaimCandidatesFromShard(shard_times[i].second, batch, out_candidates);
+        remaining -= static_cast<int64_t>(collected);
+    }
+    return EC_OK;
+}
+
 // return OK to avoid error in MetaIndexer::PersistMetaData()
 ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcept { return EC_OK; }
 
@@ -1500,6 +1539,25 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
         }
     }
     return string_keys.size();
+}
+
+size_t MetaLocalBackend::CollectOldestReclaimCandidatesFromShard(const uint32_t shard_id,
+                                                                 const size_t count,
+                                                                 ReclaimCandidateVector &out_candidates) {
+    const size_t initial_size = out_candidates.size();
+    cache_->ApplyToOldestEntriesInShard(shard_id,
+                                        count,
+                                        [&out_candidates](const std::string_view &key,
+                                                          Cache::ObjectPtr value,
+                                                          size_t /*charge*/,
+                                                          const Cache::CacheItemHelper * /*helper*/) {
+                                            if (key.size() != sizeof(KeyType) || value == nullptr) {
+                                                return;
+                                            }
+                                            const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                                            out_candidates.push_back({ViewToKey(key), item->GetLastAccessTime()});
+                                        });
+    return out_candidates.size() - initial_size;
 }
 
 } // namespace kv_cache_manager

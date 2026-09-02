@@ -386,6 +386,14 @@ public: // other function definitions
     // Returns the number of keys actually collected.
     size_t GetOldestKeys(size_t count, std::vector<std::string> &out_keys);
 
+    // Applies `callback` to up to `count` oldest in-cache entries while
+    // holding the shard mutex. Does not promote or otherwise touch entries.
+    size_t ApplyToOldestEntries(
+        size_t count,
+        const std::function<void(
+            const std::string_view &key, Cache::ObjectPtr value, size_t charge, const Cache::CacheItemHelper *helper)>
+            &callback);
+
     // Set the shard id and tail-change callback for this shard.
     // The callback is invoked inside the shard mutex whenever the LRU tail changes.
     void SetTailChangeCallback(uint32_t shard_id, const Cache::TailChangeCallback &callback);
@@ -538,6 +546,13 @@ public:
 
     // Returns up to `count` oldest keys from the specified shard.
     size_t GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vector<std::string> &out_keys) override;
+
+    size_t ApplyToOldestEntriesInShard(
+        uint32_t shard_id,
+        size_t count,
+        const std::function<
+            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
+        override;
 
     // Register a callback invoked whenever the LRU tail of any shard changes.
     void SetTailChangeCallback(TailChangeCallback callback) override;

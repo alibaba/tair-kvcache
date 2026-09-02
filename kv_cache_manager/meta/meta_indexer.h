@@ -175,6 +175,9 @@ public:
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates) const noexcept;
 
     // Reuses the same bounded executor for CPU-only query projection/reduction.
     // Directly constructed test/indexer instances without an executor retain
