@@ -29,3 +29,9 @@ py_test(
     srcs = ["test/storage_util_test.py"],
     deps = [":kvcm_ops_lib"],
 )
+
+py_test(
+    name = "instance_group_fairness_test",
+    srcs = ["test/instance_group_fairness_test.py"],
+    deps = [":kvcm_ops_lib"],
+)
