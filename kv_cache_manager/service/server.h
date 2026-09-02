@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 
+#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/service/server_config.h"
 
@@ -50,6 +51,7 @@ private:
 
     void OnBecomeLeader();
     void OnNoLongerLeader();
+    void AbortLeaderRecovery(const char *stage, ErrorCode ec);
 
 private:
     const std::string kLeaderLockKey = "_TAIR_KVCM_LEADER_KEY";

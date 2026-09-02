@@ -19,6 +19,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
@@ -582,6 +583,72 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
                   static_cast<int>(method),
                   static_cast<long long>(result.accepted),
                   static_cast<long long>(result.rejected));
+}
+
+void AdminServiceImpl::ListAsyncCopyQuarantine(
+    RequestContext *request_context,
+    const proto::admin::ListAsyncCopyQuarantineRequest *request,
+    proto::admin::ListAsyncCopyQuarantineResponse *response) {
+    API_CALL_GUARD("ListAsyncCopyQuarantine", true);
+    auto *status = response->mutable_header()->mutable_status();
+    auto migration_manager = cache_manager_ ? cache_manager_->migration_manager() : nullptr;
+    if (!migration_manager) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("MigrationManager is unavailable");
+        request_context->set_status_code(status->code());
+        return;
+    }
+    const auto records = migration_manager->ListAsyncCopyQuarantine(request->instance_group_name());
+    for (const auto &record : records) {
+        auto *out = response->add_records();
+        out->set_instance_group_name(record.instance_group_name);
+        out->set_instance_id(record.instance_id);
+        out->set_block_key(record.block_key);
+        out->set_target_location_id(record.target_location_id);
+        const auto &guard = record.guard;
+        out->set_guard_state(static_cast<int32_t>(guard.state()));
+        out->set_operation_id(guard.operation_id());
+        out->set_source_location_id(guard.source_location_id());
+        out->set_source_location_create_time(guard.source_location_create_time());
+        out->set_source_storage_name(guard.source_storage_name());
+        out->set_target_storage_name(guard.target_storage_name());
+        out->set_total_bytes(guard.total_bytes());
+        for (const auto &task_id : guard.backend_task_ids()) {
+            out->add_backend_task_ids(task_id);
+        }
+        out->set_create_time_us(guard.create_time_us());
+        out->set_update_time_us(guard.update_time_us());
+        out->set_last_error(guard.last_error());
+    }
+    status->set_code(proto::admin::OK);
+    status->set_message("Asynchronous Copy quarantine listed successfully");
+    request_context->set_status_code(status->code());
+}
+
+void AdminServiceImpl::BreakGlassReleaseAsyncCopy(
+    RequestContext *request_context,
+    const proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+    proto::admin::CommonResponse *response) {
+    API_CALL_GUARD("BreakGlassReleaseAsyncCopy", true);
+    auto *status = response->mutable_header()->mutable_status();
+    if (request->operation_id().empty() || request->operator_name().empty() ||
+        request->external_fencing_evidence().empty() || !request->external_fencing_confirmed()) {
+        status->set_code(proto::admin::INVALID_ARGUMENT);
+        status->set_message(
+            "operation_id, operator_name, external_fencing_evidence and external_fencing_confirmed=true are required");
+        request_context->set_status_code(status->code());
+        return;
+    }
+    auto migration_manager = cache_manager_ ? cache_manager_->migration_manager() : nullptr;
+    const auto ec = migration_manager
+                        ? migration_manager->BreakGlassReleaseAsyncCopy(request->operation_id(),
+                                                                       request->operator_name(),
+                                                                       request->external_fencing_evidence())
+                        : EC_ERROR;
+    status->set_code(ec == EC_OK ? proto::admin::OK : ToAdminPbError(ec));
+    status->set_message(ec == EC_OK ? "Asynchronous Copy quarantine released after external fencing"
+                                    : "Failed to release asynchronous Copy quarantine");
+    request_context->set_status_code(status->code());
 }
 
 // Instance相关接口实现

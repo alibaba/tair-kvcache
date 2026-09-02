@@ -7,6 +7,7 @@
 - [ReportEvent / GetHostCacheState 小 block 性能记录](design/report_event_performance.md) - local/Redis 指标解释、锁与可见性语义、有界并发、容量基准及后续优化边界
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
+- [KVCM × PACE CopyGA 异步化设计](design/async_copyga.md) - 复用 PACE 现有异步接口的 KVCM 端到端异步方案、持久 guard fencing、drain-safe 回收、quarantine 容量门控与恢复
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
 

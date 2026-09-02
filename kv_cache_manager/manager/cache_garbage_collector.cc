@@ -570,8 +570,17 @@ CacheLocationDelRequest CacheGarbageCollector::BuildDeleteRequest(const std::str
             }
             continue;
         }
+        const auto &location_map = batch.locations[i];
         for (const auto &[location_id, location] : batch.locations[i]) {
             if (!location || location_id.empty() || location->id().empty() || location_id != location->id()) {
+                continue;
+            }
+            if (location->has_migration_copy_guard()) {
+                // The guard is persistent and therefore remains authoritative
+                // even after MigrationManager's in-memory active table is lost.
+                continue;
+            }
+            if (FindPersistentMigrationSourcePin(*location, location_map) != nullptr) {
                 continue;
             }
 
@@ -740,7 +749,8 @@ bool CacheGarbageCollector::IsOrphanWriting(const std::string &map_location_id,
                                             const CacheLocation &location,
                                             const int64_t now_us) const noexcept {
     if (map_location_id.empty() || location.id().empty() || map_location_id != location.id() ||
-        location.status() != CLS_WRITING || location.create_time() <= 0 || now_us < location.create_time()) {
+        location.status() != CLS_WRITING || location.has_migration_copy_guard() || location.create_time() <= 0 ||
+        now_us < location.create_time()) {
         return false;
     }
     const int64_t age_us = now_us - location.create_time();

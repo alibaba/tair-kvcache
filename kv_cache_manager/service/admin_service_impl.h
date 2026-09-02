@@ -68,6 +68,12 @@ public:
     void MigrateCache(RequestContext *request_context,
                       const proto::admin::MigrateCacheRequest *request,
                       proto::admin::MigrateCacheResponse *response);
+    void ListAsyncCopyQuarantine(RequestContext *request_context,
+                                 const proto::admin::ListAsyncCopyQuarantineRequest *request,
+                                 proto::admin::ListAsyncCopyQuarantineResponse *response);
+    void BreakGlassReleaseAsyncCopy(RequestContext *request_context,
+                                    const proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+                                    proto::admin::CommonResponse *response);
 
     void RegisterInstance(RequestContext *request_context,
                           const proto::admin::RegisterInstanceRequest *request,

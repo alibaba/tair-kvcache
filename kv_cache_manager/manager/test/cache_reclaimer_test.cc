@@ -405,6 +405,21 @@ MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int
     return result;
 }
 
+/* ---------------- MetaIndexer_ScanLocationsForMaintenance_stub ---------------- */
+
+ErrorCode MetaIndexer_ScanLocationsForMaintenance_stub(void *,
+                                                       RequestContext *,
+                                                       const std::string &,
+                                                       std::size_t,
+                                                       MaintenanceScanBatch &out) noexcept {
+    // MigrationManager::Start performs a source-of-truth guard recovery scan.
+    // This fixture intentionally uses an uninitialized dummy MetaIndexer, so
+    // expose an empty, completed scan unless an individual test overrides it.
+    out.Clear();
+    out.next_cursor = SCAN_BASE_CURSOR;
+    return ErrorCode::EC_OK;
+}
+
 /* ---------------- MetaIndexer KeyCount stubs ---------------- */
 
 std::size_t key_count;
@@ -468,6 +483,7 @@ public:
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
         stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
+        stub_.set(ADDR(MetaIndexer, ScanLocationsForMaintenance), MetaIndexer_ScanLocationsForMaintenance_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -669,6 +685,7 @@ public:
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+        stub_.reset(ADDR(MetaIndexer, ScanLocationsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -831,6 +848,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
     stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+    stub_.reset(ADDR(MetaIndexer, ScanLocationsForMaintenance));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -5526,6 +5544,47 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     EXPECT_EQ("orphan_writing", out[1][0]);
     EXPECT_TRUE(out[2].empty()) << "active client write location should not be treated as orphan";
     EXPECT_TRUE(out[3].empty()) << "preparing copy target should be protected before location id is bound";
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDHonorsPersistentCopyGuardWithoutActiveTask) {
+    const auto ins_info = InstanceInfoFactory();
+    const int64_t source_create_time = 123;
+    auto source = std::make_shared<CacheLocation>(
+        "persistent_source",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot/persistent_source")});
+    source->set_create_time(source_create_time);
+    auto target = std::make_shared<CacheLocation>(
+        "persistent_target",
+        CacheLocationStatus::CLS_WRITING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold/persistent_target")});
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
+    guard.set_operation_id("persistent-operation");
+    guard.set_source_location_id(source->id());
+    guard.set_source_location_create_time(source_create_time);
+    guard.set_source_storage_name("hot");
+    guard.set_target_storage_name("cold");
+    target->set_migration_copy_guard(guard);
+
+    CacheLocationMap loc_map;
+    loc_map.emplace(source->id(), source);
+    loc_map.emplace(target->id(), target);
+    batch_get_loc_out_maps = {loc_map};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(FilterLocations(ins_info, {46}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_TRUE(out[0].empty()) << "persistent guard must fence both target and exact source after restart";
 }
 
 /* -------- keep_both 分层淘汰优先级（多副本保冷弃热）stub + test -------- */
