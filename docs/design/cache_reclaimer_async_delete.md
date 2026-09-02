@@ -224,10 +224,9 @@ size 的 Location 按 0 bytes 记账，但仍加入 pending 并受数量上限�
 EventReport Location 由外部 reporter 拥有，只能由 ReportEvent snapshot、delta 或 host lifecycle 清理，不能进入
 通用物理存储回收请求。它仍然是 metadata key 上的有效 Location：若一个 block 同时包含 EventReport 与普通
 Location，删除全部普通 Location 后 key 仍然存在，因此不得产生 `predicted_deleted_keys` credit。EventReport usage
-不参与按 storage type 的水位，但仍计入 group 总 byte 水位；通用 Reclaimer 即使因此触发，也只能选择普通
-Location，EventReport-only 场景会按 no-progress 退避，不能进入物理删除。EventReport Location 也不能作为
-migration cold-tier spec coverage。key-count 水位继续使用 MetaIndexer 的官方总 key 数，无法证明可删除时保持
-fail-closed、允许保守多触发而不能提前抵扣。
+既不参与按 storage type 的水位，也不计入 group 总 byte 水位，避免 reporter 拥有的外部缓存触发 KVCM 通用
+物理回收。EventReport Location 也不能作为 migration cold-tier spec coverage。key-count 水位继续使用
+MetaIndexer 的官方总 key 数，无法证明可删除时保持 fail-closed、允许保守多触发而不能提前抵扣。
 
 水位判断改为：
 
@@ -372,7 +371,7 @@ V1 提供以下指标：
 16. Admission 已进入队列但尚未执行时停止 Executor，cancel callback 使 Future 以错误终态完成。
 17. EventReport Location 不进入物理删除请求，但与普通 Location 共存时仍阻止错误的
     `predicted_deleted_keys` credit。
-18. EventReport usage 仍可触发 group 总 byte 水位，但不触发 EventReport storage-type 水位。
+18. EventReport usage 不触发 group 总 byte 水位或 EventReport storage-type 水位。
 19. reporter URI host 即使与 migration target storage 同名，也不能补齐 cold-tier spec coverage。
 
 ### 8.2 集成测试关注点

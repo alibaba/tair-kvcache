@@ -2422,11 +2422,9 @@ bool CacheReclaimer::BuildFairReclaimPlan(const RequestContext *request_context,
             }
             break;
         case FairWeightDimension::GROUP_BYTES:
-            // EventReport bytes remain part of the official group watermark, but their
-            // reporter-owned locations cannot be deleted by the generic Reclaimer. Keep
-            // the trigger unchanged while assigning fair responsibility only by bytes
-            // that this path can actually reclaim. VCNS_HF3FS aliases the HF3FS slot and
-            // must be skipped to avoid double counting.
+            // Group byte watermarks exclude reporter-owned EventReport usage. Keep the
+            // fair weight on the same quota-chargeable storage types. VCNS_HF3FS aliases
+            // the HF3FS slot and must be skipped to avoid double counting.
             for (std::size_t type_index = 1; type_index < static_cast<std::size_t>(DataStorageType::COUNT);
                  ++type_index) {
                 const auto type = static_cast<DataStorageType>(type_index);

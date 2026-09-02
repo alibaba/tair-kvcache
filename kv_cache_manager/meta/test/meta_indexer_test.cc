@@ -937,7 +937,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -949,6 +949,12 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
@@ -970,13 +976,22 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
 
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
         ASSERT_EQ(300, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
 
         std::uint64_t expect_usage = 0;
-        for (const auto &v : expected_usage_vec) {
-            expect_usage += v;
+        for (std::size_t i = 0; i < expected_usage_vec.size(); ++i) {
+            const auto usage_type = static_cast<DataStorageType>(i);
+            if (!IsEventReportStorageType(usage_type)) {
+                expect_usage += expected_usage_vec[i];
+            }
         }
         ASSERT_EQ(expect_usage, meta_indexer_->GetStorageUsage());
     }

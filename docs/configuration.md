@@ -227,7 +227,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
         "global_quota_group_name": "default_quota_group", # 暂未使用
         "max_instance_count": 100, # 与该group绑定的instance数量上限
         "quota": { # 该instance group的用量quota配置，该配置与下列行为相关：写入行为，数据回收（逐出）时机
-            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端
+            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端（除去EventReport）
             "quota_config": [ # 分storage type的quota值，同样由各个instance的用量累加得到，超过该quota后停止往该storage type的后端写入
                 {
                     "storage_type": "file",
