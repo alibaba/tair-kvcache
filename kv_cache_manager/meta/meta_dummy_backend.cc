@@ -492,7 +492,9 @@ ErrorCode MetaDummyBackend::SampleReclaimCandidates(RequestContext * /*request_c
         }
         int64_t last_access_time_us = 0;
         if (const auto it = item.properties.find(PROPERTY_LRU_TIME); it != item.properties.end()) {
-            StringUtil::StrToInt64(it->second.c_str(), last_access_time_us);
+            if (!StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+                last_access_time_us = 0;
+            }
         }
         out_candidates.push_back({key, last_access_time_us});
         return true;

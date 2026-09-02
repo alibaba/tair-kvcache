@@ -377,6 +377,31 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestSampleReclaimCandidatesDegradesMalformedTimestampsToZero) {
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_reclaim_timestamp_parse", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2, 3}, CacheLocationMapVector(3), PropertyMapVector(3)));
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    ASSERT_TRUE(
+        backend->table_.FindAndModify(1, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "123bad"; }));
+    ASSERT_TRUE(backend->table_.FindAndModify(
+        2, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "9223372036854775808"; }));
+    ASSERT_TRUE(backend->table_.FindAndModify(
+        3, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "-9223372036854775809"; }));
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates));
+    ASSERT_EQ(3, candidates.size());
+    for (const auto &candidate : candidates) {
+        EXPECT_EQ(0, candidate.last_access_time_us) << candidate.key;
+    }
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestRecover) {
     for (std::int32_t i = 0; i != 10; ++i) {
         ConstructMetaStorageBackend(); // new meta storage backend
