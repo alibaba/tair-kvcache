@@ -4087,6 +4087,49 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
 }
 
+TEST_F(CacheReclaimerTest, TestFairReclaimActivatesAfterGroupQuotaShrink) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    get_out_properties.clear();
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"thirty_bytes",
+         MakeCacheLocation("thirty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=30")},
+    }};
+
+    const auto small = InstanceInfoFactory();
+    small->set_instance_id("small");
+    const auto large = InstanceInfoFactory();
+    large->set_instance_id("large");
+    AddMetaIndexerForInstance(small->instance_id(), 20);
+    AddMetaIndexerForInstance(large->instance_id(), 80);
+    instance_infos = {small, large};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(200);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+
+    const auto before_resize = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_FALSE(before_resize.water_level_exceeded);
+    EXPECT_FALSE(before_resize.made_progress);
+    EXPECT_EQ(0, SubmittedDelRequestCount());
+
+    // QuotaPolicyPoller changes this group-level hard quota with a version CAS.
+    // The next reclaimer round must use the lower quota and retain the default
+    // usage-proportional policy across all Instances in the group.
+    group->quota_.set_capacity(100);
+    const auto after_resize = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(after_resize.water_level_exceeded);
+    EXPECT_TRUE(after_resize.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().front().instance_id);
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_count_metrics());
+}
+
 TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {
     cache_reclaimer_->job_state_flag_ = true;
     spe_submit_auto_complete = false;
