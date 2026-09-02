@@ -247,7 +247,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 "trigger_strategy": {
                     "used_percentage": 0.8 # 控制数据用量水位，当用量达到或超过quota * percentage时将触发回收（逐出）
                 },
-                "delay_before_delete_ms": 1000 # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "delay_before_delete_ms": 1000, # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "instance_reclaim_budget_policy": 0 # 0=USAGE_PROPORTIONAL（默认，按用量分配）；1=FIXED_PER_INSTANCE（旧的固定 per-instance 行为）
             },
             # cache_prefer_strategy与storage candidates一起控制storage backend选择策略，可选值如下：
             # enum class CachePreferStrategy {
@@ -288,6 +289,12 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+`instance_reclaim_budget_policy=USAGE_PROPORTIONAL`（内部持久化值为 `0`）时，Reclaimer 按各
+Instance 在当前超水位维度上的用量计算预算份额。
+服务级 `key_sampling_size_total` 和 `del_batch_size` 仍是单个 Instance 一次请求的 sample/batch
+上限，不会因 Group 内 Instance 数量或用量倾斜而放大；超出上限的理论份额留给后续 reclaim 轮次。
+设为 `FIXED_PER_INSTANCE`（内部持久化值为 `1`）时，完整使用旧的固定 per-instance 预算和遍历顺序。
 
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage

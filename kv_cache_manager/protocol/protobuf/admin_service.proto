@@ -191,6 +191,11 @@ enum ReclaimPolicy {
     POLICY_TTL = 3;
 }
 
+enum InstanceReclaimBudgetPolicy {
+    USAGE_PROPORTIONAL = 0;
+    FIXED_PER_INSTANCE = 1;
+}
+
 message QuotaConfig {
     StorageType storage_type = 1;
     int64 capacity = 2;
@@ -209,6 +214,7 @@ message CacheReclaimStrategy {
     int32 reclaim_step_size = 5;       // 每次回收的步长绝对值,如100GiB
     int32 reclaim_step_percentage = 6; // 每次回收的步长相对比例,如回收5%的数据量
     int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
+    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = 8;
 }
 
 // ===== 多层存储迁移（Tiered Storage Migration）配置 =====

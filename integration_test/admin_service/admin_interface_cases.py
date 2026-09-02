@@ -187,6 +187,7 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
                     "trigger_period_seconds": 60,
                     "reclaim_step_size": 512 * 1024 * 1024,
                     "reclaim_step_percentage": 5,
+                    "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL",
                 },
                 "data_storage_strategy": 2,  # CPS_PREFER_3FS
                 "meta_indexer_config": {
