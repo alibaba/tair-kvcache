@@ -118,6 +118,47 @@ public:
                             uint64_t &out_retry_after_ms,
                             uint64_t *out_lifecycle_generation = nullptr);
     using LifecycleMutationLease = std::shared_ptr<std::shared_lock<std::shared_mutex>>;
+    using MaintenanceBackendLease = std::shared_ptr<std::shared_lock<std::shared_mutex>>;
+    enum class CleanupLeaseAcquireResult {
+        kAcquired,
+        kBusy,
+        kStale,
+    };
+    enum class MaintenanceCleanupDecision {
+        kKeep,
+        kDeleteMetadata,
+        kUnknown,
+    };
+    enum class MaintenanceCleanupReason {
+        kStaleSnapshot,
+        kDownHost,
+        kRecoveryAbsentHost,
+    };
+    enum class MaintenanceProbeUnknownReason {
+        kNone,
+        kBackendUnavailable,
+        kReporterIdentityMalformed,
+        kSnapshotState,
+        kLocationMalformed,
+        kRecoveryGrace,
+    };
+    struct MaintenanceLocationProbe {
+        std::string instance_id;
+        std::string location_id;
+        std::vector<std::string> storage_uris;
+    };
+    struct MaintenanceCleanupToken {
+        MaintenanceCleanupReason reason{MaintenanceCleanupReason::kStaleSnapshot};
+        ReporterSnapshotKey reporter_key;
+        uint64_t lifecycle_generation{0};
+        std::string committed_version;
+        uint64_t snapshot_attempt_epoch{0};
+    };
+    struct MaintenanceLocationProbeResult {
+        MaintenanceCleanupDecision decision{MaintenanceCleanupDecision::kUnknown};
+        MaintenanceProbeUnknownReason unknown_reason{MaintenanceProbeUnknownReason::kNone};
+        MaintenanceCleanupToken token;
+    };
     ErrorCode AcquireLifecycleMutationLease(const ReporterSnapshotKey &reporter_key,
                                             uint64_t expected_generation,
                                             LifecycleMutationLease &out_lease) const;
@@ -137,6 +178,25 @@ public:
     ErrorCode CommitSnapshotVersionIfGeneration(const ReporterSnapshotKey &reporter_key,
                                                 const std::string &version,
                                                 uint64_t expected_generation);
+    CleanupLeaseAcquireResult AcquireDownLifecycleCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                                               uint64_t expected_generation,
+                                                               LifecycleMutationLease &out_lease) const;
+    CleanupLeaseAcquireResult AcquireAbsentReporterCleanupLease(const ReporterSnapshotKey &reporter_key,
+                                                                uint64_t &out_generation,
+                                                                LifecycleMutationLease &out_lease);
+    // Background maintenance uses one periodic metadata scan for every
+    // storage type. EventReport keeps its liveness/snapshot policy here and
+    // returns only conservative metadata-cleanup decisions to the scanner.
+    std::vector<MaintenanceLocationProbeResult>
+    ProbeLocationsForMaintenance(const std::vector<MaintenanceLocationProbe> &probes);
+    void ResetMaintenanceRecoveryGrace() noexcept;
+    int64_t GetMaintenanceRecoveryGraceRemainingMs() const noexcept;
+    // Pins this exact Backend incarnation in the available state while a
+    // maintenance action validates reporter tokens and mutates metadata.
+    // Dynamic disable and Close wait for the retained read lease.
+    CleanupLeaseAcquireResult AcquireMaintenanceBackendLease(MaintenanceBackendLease &out_lease) const;
+    CleanupLeaseAcquireResult AcquireMaintenanceCleanupLease(const MaintenanceCleanupToken &token,
+                                                             LifecycleMutationLease &out_lease);
     bool CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     void AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
     std::string GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const;
@@ -157,6 +217,8 @@ public:
     // for every (block, location).
     void GetQueryVisibilitySnapshot(const std::string &instance_id, QueryVisibilitySnapshot &out_snapshot) const;
     uint64_t GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const;
+    int64_t GetHeartbeatTimeoutMs() const noexcept { return heartbeat_timeout_ms_; }
+    int64_t GetCleanupGraceMs() const noexcept { return cleanup_grace_ms_; }
     void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
     void SetSnapshotDeltaDrainTimeoutMsForTest(int64_t timeout_ms);
     DataStorageType GetStorageType() const;
@@ -212,6 +274,10 @@ private:
 
     EventReportStorageSpec spec_;
 
+    // Cleanup takes backend availability -> reporter lifecycle -> metadata.
+    // SetAvailable(false)/Close take the matching writer before retiring the
+    // backend, so a same-name replacement cannot cross an authorized action.
+    mutable std::shared_mutex maintenance_backend_mutex_;
     mutable std::shared_mutex nodes_mutex_;
     // Final metadata writes may already hold a MetaIndexer lock, while host
     // cleanup deliberately holds a lifecycle lease before taking metadata
@@ -227,6 +293,11 @@ private:
     // report after process restart can lazily rebuild the node.
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
+    // A new Leader cannot distinguish a reporter that is still recovering
+    // from one that disappeared before failover. During this backend-wide
+    // grace, EventReport probes return unknown while other shared-GC rules
+    // continue to run.
+    std::atomic<int64_t> maintenance_recovery_deadline_ms_{0};
     struct SnapshotVersionState {
         // Process-local reporter state, not a distributed lock. KVCM restart
         // clears this state; the first valid delta or snapshot rebuilds it.

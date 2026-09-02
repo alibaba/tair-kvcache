@@ -39,9 +39,16 @@ cc_library(
 
 cc_library(
     name = "cache_garbage_collector",
-    srcs = ["cache_garbage_collector.cc"],
-    hdrs = ["cache_garbage_collector.h"],
+    srcs = [
+        "cache_garbage_collector.cc",
+        "event_report_cleanup_util.cc",
+    ],
+    hdrs = [
+        "cache_garbage_collector.h",
+        "event_report_cleanup_util.h",
+    ],
     deps = [
+        ":meta_searcher",
         ":migration_manager",
         ":schedule_plan_executor",
         "//kv_cache_manager/common",

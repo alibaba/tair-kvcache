@@ -3387,7 +3387,8 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
                                              std::vector<std::vector<ErrorCode>> &out_per_location_ec,
                                              const std::vector<std::vector<std::string>> &expected_location_values,
                                              bool adjust_storage_usage,
-                                             bool adjust_reclaimed_key_count) {
+                                             bool adjust_reclaimed_key_count,
+                                             bool maintenance_no_touch) {
     if (keys.size() != location_ids_per_key.size()) {
         return EC_BADARGS;
     }
@@ -3459,8 +3460,11 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    auto result = meta_indexer_->ReadModifyWriteLocation(
-        request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count);
+    auto result = maintenance_no_touch
+                      ? meta_indexer_->ReadModifyWriteLocationsForMaintenance(
+                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count)
+                      : meta_indexer_->ReadModifyWriteLocation(
+                            request_context, keys, location_ids_per_key, modifier, adjust_reclaimed_key_count);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_per_location_ec = std::move(result.per_location_error_codes);
 
@@ -3485,6 +3489,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
     }
     return result.ec;
 }
+
 
 ErrorCode
 MetaSearcher::VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor) {

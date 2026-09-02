@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -17,6 +18,7 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
@@ -75,6 +77,29 @@
 namespace {
 kv_cache_manager::proto::admin::ErrorCode ToAdminPbError(kv_cache_manager::ErrorCode ec) {
     return kv_cache_manager::ToPbError<kv_cache_manager::proto::admin::ErrorCode>(ec);
+}
+
+bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::RegistryManager> &registry_manager,
+                                      const kv_cache_manager::InstanceGroup &group,
+                                      std::string &invalid_fields) {
+    const auto storage_manager = registry_manager ? registry_manager->data_storage_manager() : nullptr;
+    if (!storage_manager) {
+        return true;
+    }
+    std::map<kv_cache_manager::DataStorageType, std::string> owner_by_type;
+    for (const auto &storage_name : group.event_report_storage_candidates()) {
+        const auto backend = std::dynamic_pointer_cast<kv_cache_manager::EventReportBackend>(
+            storage_manager->GetDataStorageBackend(storage_name));
+        if (!backend) {
+            continue;
+        }
+        const auto [it, inserted] = owner_by_type.emplace(backend->GetStorageType(), storage_name);
+        if (!inserted && it->second != storage_name) {
+            invalid_fields += "{InstanceGroup: {event_report_storage_candidates_duplicate_type}}";
+            return false;
+        }
+    }
+    return true;
 }
 } // anonymous namespace
 
@@ -285,6 +310,9 @@ void AdminServiceImpl::CreateInstanceGroup(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
         return;
     }
+    if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
+    }
     ErrorCode ec_info = registry_manager_->CreateInstanceGroup(request_context, instance_group_req);
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -314,6 +342,9 @@ void AdminServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
     }
     ProtoConvert::InstanceGroupFromProto(&request->instance_group(), instance_group_req);
     if (!instance_group_req.ValidateRequiredFields(invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
+    }
+    if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
     }
     ErrorCode ec_info =

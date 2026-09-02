@@ -204,6 +204,33 @@ TEST_F(LRUCacheTest, BatchReleaseFreesEntryErasedWhilePinned) {
     ValidateLRUList({"b"}, 0, 1);
 }
 
+TEST_F(LRUCacheTest, ApplyToEntryNoTouchKeepsUnpinnedPoolChargeConsistent) {
+    NewCache(100, /* high_pri_pool_ratio */ 0.50, /* low_pri_pool_ratio */ 0.50);
+    Insert("a", Cache::Priority::HIGH, 20);
+    ASSERT_EQ(20u, cache_->GetUsage());
+    ASSERT_EQ(0u, cache_->GetPinnedUsage());
+    ValidateLRUList({"a"}, 1, 0, 0);
+
+    ASSERT_TRUE(cache_->ApplyToEntryNoTouch(
+        "a", 0, [](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) { return -10; }));
+    EXPECT_EQ(10u, cache_->GetUsage());
+    EXPECT_EQ(0u, cache_->GetPinnedUsage());
+    ValidateLRUList({"a"}, 1, 0, 0);
+
+    ASSERT_TRUE(cache_->ApplyToEntryNoTouch(
+        "a", 0, [](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) { return 20; }));
+    EXPECT_EQ(30u, cache_->GetUsage());
+    EXPECT_EQ(0u, cache_->GetPinnedUsage());
+    ValidateLRUList({"a"}, 1, 0, 0);
+
+    // A later insertion exercises MaintainPoolSize and LRU_Remove using the
+    // adjusted charge; stale pool counters would corrupt these transitions.
+    Insert("b", Cache::Priority::HIGH, 30);
+    EXPECT_EQ(60u, cache_->GetUsage());
+    EXPECT_EQ(0u, cache_->GetPinnedUsage());
+    ValidateLRUList({"a", "b"}, 1, 1, 0);
+}
+
 TEST_F(LRUCacheTest, LowPriorityMidpointInsertion) {
     // Allocate 2 cache entries to high-pri pool and 3 to low-pri pool.
     NewCache(5, /* high_pri_pool_ratio */ 0.40, /* low_pri_pool_ratio */ 0.60);

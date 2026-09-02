@@ -331,6 +331,12 @@ public: // Function definitions expected as parameter to ShardedCache
                      size_t count,
                      Cache::Handle **out_handles);
 
+    bool ApplyToEntryNoTouch(
+        const std::string_view &key,
+        uint32_t hash,
+        const std::function<ssize_t(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
+            &callback);
+
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     void ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count);
     bool Ref(LRUHandle *handle);

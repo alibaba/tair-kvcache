@@ -720,6 +720,187 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     return results;
 }
 
+std::vector<ErrorCode>
+MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         int32_t &out_reclaimed_count) noexcept {
+    out_reclaimed_count = 0;
+    if (keys.empty()) {
+        return {};
+    }
+    if (keys.size() != location_ids.size()) {
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        // A recover task can still publish an older persistent snapshot into
+        // the hot cache. Retry this best-effort action after recovery rather
+        // than backfilling or touching cache state from maintenance.
+        return std::vector<ErrorCode>(keys.size(), EC_OUT_OF_LIMIT);
+    }
+
+    // Decide target-only versus whole-key deletion from both layers before
+    // mutating either one. Looking only at the hot cache can erase a newer
+    // persistent sibling; deleting targets first and reclaiming the key later
+    // can also hide a failed whole-key delete from subsequent GC rounds.
+    LocationIdsPerKey persistent_location_ids;
+    const std::vector<ErrorCode> persistent_id_ecs =
+        persistent_backend_->GetLocationIdsForMaintenance(request_context, keys, persistent_location_ids);
+    LocationIdsPerKey hot_location_ids;
+    std::vector<ErrorCode> hot_id_ecs;
+    if (cache_backend_) {
+        hot_id_ecs = cache_backend_->GetLocationIdsForMaintenance(request_context, keys, hot_location_ids);
+    }
+
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::vector<bool> id_reads_valid(keys.size(), true);
+    const auto validate_id_reads =
+        [&](const char *layer, const std::vector<ErrorCode> &id_ecs, const LocationIdsPerKey &ids) {
+            if (id_ecs.size() != keys.size() || ids.size() != keys.size()) {
+                KVCM_LOG_ERROR("%s maintenance location-id results[%lu] values[%lu] mismatch keys[%lu]",
+                               layer,
+                               id_ecs.size(),
+                               ids.size(),
+                               keys.size());
+                std::fill(results.begin(), results.end(), EC_ERROR);
+                std::fill(id_reads_valid.begin(), id_reads_valid.end(), false);
+                return;
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (id_ecs[i] != EC_OK && id_ecs[i] != EC_NOENT) {
+                    results[i] = id_ecs[i];
+                    id_reads_valid[i] = false;
+                } else if (id_ecs[i] == EC_NOENT && !ids[i].empty()) {
+                    KVCM_LOG_ERROR(
+                        "%s maintenance location-id read returned NOENT with values for key[%ld]", layer, keys[i]);
+                    results[i] = EC_ERROR;
+                    id_reads_valid[i] = false;
+                }
+            }
+        };
+    validate_id_reads("persistent", persistent_id_ecs, persistent_location_ids);
+    if (cache_backend_) {
+        validate_id_reads("cache", hot_id_ecs, hot_location_ids);
+    }
+
+    std::vector<size_t> whole_key_indexes;
+    std::vector<size_t> target_only_indexes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!id_reads_valid[i] || location_ids[i].empty()) {
+            continue;
+        }
+        const auto layer_has_only_targets = [&](ErrorCode id_ec, const LocationIdVector &existing_ids) {
+            if (id_ec == EC_NOENT) {
+                return true;
+            }
+            return std::all_of(existing_ids.begin(), existing_ids.end(), [&](const LocationId &existing_id) {
+                return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) != location_ids[i].end();
+            });
+        };
+        const bool persistent_safe = layer_has_only_targets(persistent_id_ecs[i], persistent_location_ids[i]);
+        const bool hot_safe = !cache_backend_ || layer_has_only_targets(hot_id_ecs[i], hot_location_ids[i]);
+        (persistent_safe && hot_safe ? whole_key_indexes : target_only_indexes).push_back(i);
+    }
+
+    if (!target_only_indexes.empty()) {
+        KeyVector target_keys;
+        LocationIdsPerKey target_location_ids;
+        target_keys.reserve(target_only_indexes.size());
+        target_location_ids.reserve(target_only_indexes.size());
+        for (const size_t index : target_only_indexes) {
+            target_keys.push_back(keys[index]);
+            target_location_ids.push_back(location_ids[index]);
+        }
+
+        std::vector<ErrorCode> persistent_results =
+            persistent_backend_->DeleteLocationsForMaintenance(request_context, target_keys, target_location_ids);
+        if (persistent_results.size() != target_only_indexes.size()) {
+            KVCM_LOG_ERROR("persistent maintenance target delete results[%lu] mismatch keys[%lu]",
+                           persistent_results.size(),
+                           target_only_indexes.size());
+            persistent_results.assign(target_only_indexes.size(), EC_ERROR);
+        }
+        std::vector<ErrorCode> target_results = persistent_results;
+        if (cache_backend_) {
+            target_results = cache_backend_->DeleteLocationsForMaintenance(
+                request_context, target_keys, target_location_ids, persistent_results);
+            if (target_results.size() != target_only_indexes.size()) {
+                KVCM_LOG_ERROR("cache maintenance target delete results[%lu] mismatch keys[%lu]",
+                               target_results.size(),
+                               target_only_indexes.size());
+                target_results.assign(target_only_indexes.size(), EC_ERROR);
+            }
+        }
+        for (size_t i = 0; i < target_only_indexes.size(); ++i) {
+            const ErrorCode persistent_ec = persistent_results[i];
+            const ErrorCode hot_ec = target_results[i];
+            if (persistent_ec != EC_OK && persistent_ec != EC_NOENT) {
+                results[target_only_indexes[i]] = persistent_ec;
+            } else if (hot_ec != EC_OK && hot_ec != EC_NOENT) {
+                results[target_only_indexes[i]] = hot_ec;
+            } else if (persistent_ec == EC_OK || hot_ec == EC_OK) {
+                // Either layer actually removed the logical target. Report
+                // success so storage usage is accounted exactly once even if
+                // the other layer had already converged to NOENT.
+                results[target_only_indexes[i]] = EC_OK;
+            } else {
+                results[target_only_indexes[i]] = EC_NOENT;
+            }
+        }
+    }
+
+    if (!whole_key_indexes.empty()) {
+        KeyVector whole_keys;
+        whole_keys.reserve(whole_key_indexes.size());
+        for (const size_t index : whole_key_indexes) {
+            whole_keys.push_back(keys[index]);
+        }
+
+        std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(request_context, whole_keys);
+        if (persistent_results.size() != whole_key_indexes.size()) {
+            KVCM_LOG_ERROR("persistent maintenance whole-key delete results[%lu] mismatch keys[%lu]",
+                           persistent_results.size(),
+                           whole_key_indexes.size());
+            persistent_results.assign(whole_key_indexes.size(), EC_ERROR);
+        }
+        std::vector<ErrorCode> whole_results = persistent_results;
+        if (cache_backend_) {
+            // A key already absent from persistent still needs its hot copy
+            // removed. Normalize only this idempotent maintenance gate.
+            auto cache_gate = persistent_results;
+            for (auto &ec : cache_gate) {
+                if (ec == EC_NOENT) {
+                    ec = EC_OK;
+                }
+            }
+            whole_results = cache_backend_->Delete(request_context, whole_keys, cache_gate);
+            if (whole_results.size() != whole_key_indexes.size()) {
+                KVCM_LOG_ERROR("cache maintenance whole-key delete results[%lu] mismatch keys[%lu]",
+                               whole_results.size(),
+                               whole_key_indexes.size());
+                whole_results.assign(whole_key_indexes.size(), EC_ERROR);
+            }
+        }
+
+        std::unordered_set<KeyType> reclaimed_keys;
+        for (size_t i = 0; i < whole_key_indexes.size(); ++i) {
+            const size_t original_index = whole_key_indexes[i];
+            if (whole_results[i] != EC_OK && whole_results[i] != EC_NOENT) {
+                results[original_index] = whole_results[i];
+                continue;
+            }
+            results[original_index] = EC_OK;
+            // The preceding expected-value read admitted at least one target.
+            // Count a converged whole-key action once even when one layer was
+            // already missing due to an earlier partial attempt.
+            reclaimed_keys.insert(keys[original_index]);
+        }
+        out_reclaimed_count = static_cast<int32_t>(reclaimed_keys.size());
+    }
+    return results;
+}
+
+
 int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          const std::vector<ErrorCode> &delete_results) noexcept {
@@ -1184,6 +1365,104 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
 }
 
 std::vector<std::vector<ErrorCode>>
+MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const LocationIdsPerKey &location_ids,
+                                                      LocationsPerKey &out_locations) noexcept {
+    if (keys.size() != location_ids.size()) {
+        out_locations.assign(keys.size(), CacheLocationVector{});
+        return std::vector<std::vector<ErrorCode>>(keys.size(), std::vector<ErrorCode>{EC_BADARGS});
+    }
+    if (!cache_backend_) {
+        return persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    }
+
+    // A unified GC round scans the hot cache, but a stale hot value must not
+    // authorize deletion of a newer persistent value left by a partial mirror
+    // failure. Revalidate both layers without touching/backfilling the cache;
+    // one missing copy is safe to converge, while two different present copies
+    // fail closed as a compare mismatch.
+    LocationsPerKey hot_locations;
+    const auto hot_results =
+        cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, hot_locations);
+    LocationsPerKey persistent_locations;
+    const auto persistent_results =
+        persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, persistent_locations);
+
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
+    const bool outer_shape_valid = hot_results.size() == keys.size() && hot_locations.size() == keys.size() &&
+                                   persistent_results.size() == keys.size() &&
+                                   persistent_locations.size() == keys.size();
+    if (!outer_shape_valid) {
+        KVCM_LOG_ERROR("maintenance target read shape mismatch, keys[%lu] hot_ecs[%lu] hot_values[%lu] "
+                       "persistent_ecs[%lu] persistent_values[%lu]",
+                       keys.size(),
+                       hot_results.size(),
+                       hot_locations.size(),
+                       persistent_results.size(),
+                       persistent_locations.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i].assign(location_ids[i].size(), EC_ERROR);
+            out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
+        }
+        return results;
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i].assign(location_ids[i].size(), EC_ERROR);
+        out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
+        if (hot_results[i].size() != location_ids[i].size() || hot_locations[i].size() != location_ids[i].size() ||
+            persistent_results[i].size() != location_ids[i].size() ||
+            persistent_locations[i].size() != location_ids[i].size()) {
+            KVCM_LOG_ERROR("maintenance target read key[%ld] shape mismatch, ids[%lu] hot_ecs[%lu] hot_values[%lu] "
+                           "persistent_ecs[%lu] persistent_values[%lu]",
+                           keys[i],
+                           location_ids[i].size(),
+                           hot_results[i].size(),
+                           hot_locations[i].size(),
+                           persistent_results[i].size(),
+                           persistent_locations[i].size());
+            continue;
+        }
+
+        for (size_t j = 0; j < location_ids[i].size(); ++j) {
+            const auto validate_layer = [&](ErrorCode ec, const CacheLocationConstPtr &location) {
+                if (ec == EC_NOENT) {
+                    return location ? EC_ERROR : EC_NOENT;
+                }
+                if (ec != EC_OK) {
+                    return ec;
+                }
+                return location && location->id() == location_ids[i][j] ? EC_OK : EC_ERROR;
+            };
+            const ErrorCode hot_ec = validate_layer(hot_results[i][j], hot_locations[i][j]);
+            const ErrorCode persistent_ec = validate_layer(persistent_results[i][j], persistent_locations[i][j]);
+            if (hot_ec != EC_OK && hot_ec != EC_NOENT) {
+                results[i][j] = hot_ec;
+                continue;
+            }
+            if (persistent_ec != EC_OK && persistent_ec != EC_NOENT) {
+                results[i][j] = persistent_ec;
+                continue;
+            }
+            if (hot_ec == EC_NOENT && persistent_ec == EC_NOENT) {
+                results[i][j] = EC_NOENT;
+                continue;
+            }
+            if (hot_ec == EC_OK && persistent_ec == EC_OK &&
+                hot_locations[i][j]->ToJsonString() != persistent_locations[i][j]->ToJsonString()) {
+                results[i][j] = EC_MISMATCH;
+                continue;
+            }
+            results[i][j] = EC_OK;
+            out_locations[i][j] = hot_ec == EC_OK ? hot_locations[i][j] : persistent_locations[i][j];
+        }
+    }
+    return results;
+}
+
+std::vector<std::vector<ErrorCode>>
 MetaStorageBackendManager::GetLocationsWithKeyStatus(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
@@ -1534,13 +1813,19 @@ ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext 
                                                                  const int64_t limit,
                                                                  MaintenanceScanBatch &out) noexcept {
     out.Clear();
-    if (!persistent_backend_) {
-        KVCM_LOG_ERROR("maintenance scan failed, persistent backend is null, instance[%s]", instance_id_.c_str());
+    // In dual-backend mode the in-memory backend is the GC discovery view.
+    // It is expected to contain the useful metadata working set and avoids a
+    // periodic full scan against Redis. Missing or evicted keys are an
+    // accepted best-effort tradeoff; deletion admission still performs an
+    // expected-value RMW under the ordinary metadata mutation fence.
+    MetaStorageBackend *scan_backend = cache_backend_ ? cache_backend_.get() : persistent_backend_.get();
+    if (!scan_backend) {
+        KVCM_LOG_ERROR("maintenance scan failed, scan backend is null, instance[%s]", instance_id_.c_str());
         return EC_ERROR;
     }
 
     MaintenanceScanBatch batch;
-    ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
+    ErrorCode ec = scan_backend->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
     if (ec != EC_OK) {
         return ec;
     }

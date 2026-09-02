@@ -33,6 +33,18 @@ cc_test(
 )
 
 cc_test(
+    name = "EventReportCleanupUtilTest",
+    srcs = ["event_report_cleanup_util_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_garbage_collector",
+        "//kv_cache_manager/meta:cache_location",
+    ],
+)
+
+cc_test(
     name = "DataStorageSelectorTest",
     srcs = [
         "data_storage_selector_test.cc",

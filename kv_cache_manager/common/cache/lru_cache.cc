@@ -497,6 +497,52 @@ void LRUCacheShard::LookupBatch(const std::string_view *keys,
     }
 }
 
+bool LRUCacheShard::ApplyToEntryNoTouch(
+    const std::string_view &key,
+    uint32_t hash,
+    const std::function<ssize_t(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)> &callback) {
+    std::lock_guard<std::mutex> l(mutex_);
+    LRUHandle *e = table_.Lookup(key, hash);
+    if (e == nullptr) {
+        return false;
+    }
+    assert(e->InCache());
+    const bool in_lru = !e->HasRefs();
+    const ssize_t delta = callback(e->value, e->total_charge, e->helper);
+    if (delta > 0) {
+        const size_t increase = static_cast<size_t>(delta);
+        e->total_charge += increase;
+        usage_ += increase;
+        if (in_lru) {
+            lru_usage_ += increase;
+            if (e->InHighPriPool()) {
+                high_pri_pool_usage_ += increase;
+            } else if (e->InLowPriPool()) {
+                low_pri_pool_usage_ += increase;
+            }
+            MaintainPoolSize();
+        }
+    } else if (delta < 0) {
+        size_t decrease = static_cast<size_t>(-delta);
+        decrease = std::min(decrease, e->total_charge);
+        decrease = std::min(decrease, usage_);
+        e->total_charge -= decrease;
+        usage_ -= decrease;
+        if (in_lru) {
+            assert(lru_usage_ >= decrease);
+            lru_usage_ -= decrease;
+            if (e->InHighPriPool()) {
+                assert(high_pri_pool_usage_ >= decrease);
+                high_pri_pool_usage_ -= decrease;
+            } else if (e->InLowPriPool()) {
+                assert(low_pri_pool_usage_ >= decrease);
+                low_pri_pool_usage_ -= decrease;
+            }
+        }
+    }
+    return true;
+}
+
 bool LRUCacheShard::Ref(LRUHandle *e) {
     std::lock_guard<std::mutex> l(mutex_);
     // To create another reference - entry must be already externally referenced.

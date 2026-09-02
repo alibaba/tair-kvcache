@@ -571,6 +571,54 @@ TEST_F(EventReportBackendTest, LifecycleCleanupLeaseDoesNotBlockUnrelatedReporte
     EXPECT_EQ(EC_OK, backend.AcquireLifecycleMutationLease(reporter_b, generation_b, mutation_lease_b));
 }
 
+TEST_F(EventReportBackendTest, GcCleanupLeasesDistinguishBusyFromStaleLifecycle) {
+    EventReportBackend backend(metrics_registry_);
+    const ReporterSnapshotKey reporter{"gc-cleanup-lease", "10.0.0.95:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
+    const uint64_t active_generation = backend.GetNodeGeneration(reporter.instance_id, reporter.host_ip_port);
+
+    EventReportBackend::LifecycleMutationLease lease;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireDownLifecycleCleanupLease(reporter, active_generation, lease));
+
+    uint64_t down_generation = 0;
+    ASSERT_EQ(EC_OK, backend.UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, down_generation));
+
+    const auto fence = backend.FindLifecycleFence(reporter);
+    ASSERT_TRUE(fence);
+    std::promise<void> writer_acquired;
+    std::promise<void> release_writer;
+    const auto release_writer_future = release_writer.get_future().share();
+    auto writer = std::async(std::launch::async, [fence, &writer_acquired, release_writer_future] {
+        std::unique_lock<std::shared_mutex> lock(fence->mutex);
+        writer_acquired.set_value();
+        release_writer_future.wait();
+    });
+    ASSERT_EQ(std::future_status::ready, writer_acquired.get_future().wait_for(1s));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireDownLifecycleCleanupLease(reporter, down_generation, lease));
+    release_writer.set_value();
+    ASSERT_EQ(std::future_status::ready, writer.wait_for(1s));
+    writer.get();
+
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireDownLifecycleCleanupLease(reporter, down_generation, lease));
+    lease.reset();
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireDownLifecycleCleanupLease(reporter, down_generation, lease));
+
+    const ReporterSnapshotKey absent_reporter{"gc-cleanup-lease", "10.0.0.96:8080"};
+    uint64_t absent_generation = 99;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireAbsentReporterCleanupLease(absent_reporter, absent_generation, lease));
+    EXPECT_EQ(0, absent_generation);
+    lease.reset();
+    ASSERT_EQ(EC_OK, backend.RegisterNode(absent_reporter.instance_id, absent_reporter.host_ip_port, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireAbsentReporterCleanupLease(absent_reporter, absent_generation, lease));
+}
+
 TEST_F(EventReportBackendTest, EnsureNodeRegisteredMergesNewMediums) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered("medium-merge", "10.0.0.91:8080", {"mem"}));
@@ -2070,6 +2118,210 @@ TEST(EventReportBackendSnapshotTest, MightExistBatchPreservesOrderAcrossTokenAnd
     backend.SetNodeUnavailable(reporter_b.instance_id, reporter_b.host_ip_port);
     EXPECT_EQ((std::vector<bool>{true, false, false, false, false, true}),
               backend.MightExist({current_a_uri, old_a_uri, unknown_uri, current_b_uri, malformed_uri, current_a_uri}));
+}
+
+TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosedForMalformedMetadata) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 1000), "trace"));
+    backend.SetSnapshotMinIntervalMsForTest(0);
+
+    const ReporterSnapshotKey reporter{"instance-a", "10.0.0.90:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
+    const std::string location_id = backend.BuildLocationId("mem", reporter.host_ip_port);
+
+    auto commit_snapshot = [&]() {
+        std::string token;
+        uint64_t retry_after_ms = 0;
+        EXPECT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter, token, retry_after_ms));
+        EXPECT_TRUE(backend.CommitSnapshotVersion(reporter, token));
+        return token;
+    };
+    const std::string old_version = commit_snapshot();
+    const std::string current_version = commit_snapshot();
+
+    auto versioned_uri = [](const std::string &version) {
+        std::string uri;
+        EXPECT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri("event_report://physical-cache:9600/mem", version, uri));
+        return uri;
+    };
+    const std::string old_uri = versioned_uri(old_version);
+    const std::string current_uri = versioned_uri(current_version);
+    const std::string malformed_uri = current_uri + "&s_version=" + current_version;
+    const std::string malformed_legacy_uri = "not-a-uri";
+
+    const std::vector<EventReportBackend::MaintenanceLocationProbe> probes{
+        {reporter.instance_id, location_id, {current_uri}},
+        {reporter.instance_id, location_id, {old_uri}},
+        {reporter.instance_id, location_id, {old_uri, current_uri}},
+        {reporter.instance_id, location_id, {current_uri, malformed_uri}},
+        {reporter.instance_id, location_id, {malformed_uri}},
+        {reporter.instance_id, location_id, {"event_report://physical-cache:9600/mem"}},
+        {reporter.instance_id, "malformed-location-id", {old_uri}},
+        {reporter.instance_id, location_id, {malformed_legacy_uri}},
+    };
+    const auto results = backend.ProbeLocationsForMaintenance(probes);
+    ASSERT_EQ(probes.size(), results.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, results[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, results[1].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupReason::kStaleSnapshot, results[1].token.reason);
+    EXPECT_EQ(current_version, results[1].token.committed_version);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, results[2].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, results[3].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[4].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kLocationMalformed, results[4].unknown_reason);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, results[5].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[6].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kReporterIdentityMalformed, results[6].unknown_reason);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, results[7].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kLocationMalformed, results[7].unknown_reason);
+
+    EventReportBackend::LifecycleMutationLease lease;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceCleanupLease(results[1].token, lease));
+    lease.reset();
+
+    std::string next_version;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter, next_version, retry_after_ms));
+    const auto in_flight_result =
+        backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {versioned_uri(next_version)}}});
+    ASSERT_EQ(1u, in_flight_result.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, in_flight_result[0].decision);
+
+    const auto candidate_before_abort =
+        backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {old_uri}}});
+    ASSERT_EQ(1u, candidate_before_abort.size());
+    ASSERT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, candidate_before_abort[0].decision);
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireMaintenanceCleanupLease(results[1].token, lease));
+    ASSERT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceCleanupLease(candidate_before_abort[0].token, lease));
+    std::promise<void> abort_started;
+    auto abort_started_future = abort_started.get_future();
+    auto abort_future = std::async(std::launch::async, [&]() {
+        abort_started.set_value();
+        backend.AbortSnapshotVersion(reporter, next_version);
+    });
+    abort_started_future.wait();
+    EXPECT_EQ(std::future_status::timeout, abort_future.wait_for(20ms));
+    lease.reset();
+    ASSERT_EQ(std::future_status::ready, abort_future.wait_for(1s));
+    abort_future.get();
+    const auto soft_result = backend.ProbeLocationsForMaintenance({{reporter.instance_id, location_id, {old_uri}}});
+    ASSERT_EQ(1u, soft_result.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, soft_result[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kSnapshotState, soft_result[0].unknown_reason);
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireMaintenanceCleanupLease(candidate_before_abort[0].token, lease));
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, MaintenanceProbeRespectsUnavailableDownAndRecoveryLifecycle) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 1000), "trace"));
+
+    const std::string instance_id = "instance-a";
+    const std::string down_host = "10.0.0.91:8080";
+    const std::string down_location_id = backend.BuildLocationId("mem", down_host);
+    const EventReportBackend::MaintenanceLocationProbe down_probe{
+        instance_id, down_location_id, {"event_report://physical-cache:9600/mem"}};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, down_host, {"mem"}));
+    backend.SetNodeUnavailable(instance_id, down_host);
+    auto result = backend.ProbeLocationsForMaintenance({down_probe});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kKeep, result[0].decision);
+
+    uint64_t down_generation = 0;
+    ASSERT_EQ(EC_OK, backend.UnregisterNodeForHostDown(instance_id, down_host, down_generation));
+    result = backend.ProbeLocationsForMaintenance({down_probe});
+    ASSERT_EQ(1u, result.size());
+    ASSERT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, result[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupReason::kDownHost, result[0].token.reason);
+    EXPECT_EQ(down_generation, result[0].token.lifecycle_generation);
+    const auto down_token = result[0].token;
+
+    EventReportBackend::LifecycleMutationLease lease;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceCleanupLease(down_token, lease));
+    lease.reset();
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, down_host, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireMaintenanceCleanupLease(down_token, lease));
+
+    const std::string absent_host = "10.0.0.92:8080";
+    const EventReportBackend::MaintenanceLocationProbe absent_probe{
+        instance_id,
+        backend.BuildLocationId("mem", absent_host),
+        {"event_report://physical-cache:9600/mem"},
+    };
+    backend.ResetMaintenanceRecoveryGrace();
+    result = backend.ProbeLocationsForMaintenance({absent_probe});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, result[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kRecoveryGrace, result[0].unknown_reason);
+
+    backend.maintenance_recovery_deadline_ms_.store(0, std::memory_order_release);
+    result = backend.ProbeLocationsForMaintenance({absent_probe});
+    ASSERT_EQ(1u, result.size());
+    ASSERT_EQ(EventReportBackend::MaintenanceCleanupDecision::kDeleteMetadata, result[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupReason::kRecoveryAbsentHost, result[0].token.reason);
+    const auto absent_token = result[0].token;
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceCleanupLease(absent_token, lease));
+    lease.reset();
+
+    backend.SetAvailable(false);
+    backend.SetAvailable(true);
+    EXPECT_GT(backend.GetMaintenanceRecoveryGraceRemainingMs(), 0);
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireMaintenanceCleanupLease(absent_token, lease));
+    backend.maintenance_recovery_deadline_ms_.store(0, std::memory_order_release);
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceCleanupLease(absent_token, lease));
+    lease.reset();
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, absent_host, {"mem"}));
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kStale,
+              backend.AcquireMaintenanceCleanupLease(absent_token, lease));
+
+    backend.SetAvailable(false);
+    result = backend.ProbeLocationsForMaintenance({down_probe});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_EQ(EventReportBackend::MaintenanceCleanupDecision::kUnknown, result[0].decision);
+    EXPECT_EQ(EventReportBackend::MaintenanceProbeUnknownReason::kBackendUnavailable, result[0].unknown_reason);
+    backend.maintenance_recovery_deadline_ms_.store(0, std::memory_order_release);
+    backend.SetAvailable(true);
+    EXPECT_GT(backend.GetMaintenanceRecoveryGraceRemainingMs(), 0);
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, MaintenanceBackendLeaseFencesDynamicDisable) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
+
+    EventReportBackend::MaintenanceBackendLease lease;
+    ASSERT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceBackendLease(lease));
+
+    std::promise<void> disable_started;
+    auto disable = std::async(std::launch::async, [&backend, &disable_started] {
+        disable_started.set_value();
+        backend.SetAvailable(false);
+    });
+    ASSERT_EQ(std::future_status::ready, disable_started.get_future().wait_for(1s));
+    EXPECT_EQ(std::future_status::timeout, disable.wait_for(20ms));
+    lease.reset();
+    ASSERT_EQ(std::future_status::ready, disable.wait_for(1s));
+    disable.get();
+    EXPECT_FALSE(backend.Available());
+
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kBusy,
+              backend.AcquireMaintenanceBackendLease(lease));
+    backend.SetAvailable(true);
+    EXPECT_EQ(EventReportBackend::CleanupLeaseAcquireResult::kAcquired,
+              backend.AcquireMaintenanceBackendLease(lease));
+    lease.reset();
+    ASSERT_EQ(EC_OK, backend.Close());
 }
 
 TEST(EventReportBackendSnapshotTest, MightExistUsesTokenOwnerAcrossInstancesAndPreservesCommittedOnAbort) {
