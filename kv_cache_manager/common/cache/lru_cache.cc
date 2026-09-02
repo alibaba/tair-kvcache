@@ -117,7 +117,7 @@ void LRUHandleTable::Resize() {
 
     uint32_t old_length = uint32_t{1} << length_bits_;
     int new_length_bits = length_bits_ + 1;
-    std::unique_ptr<LRUHandle *[]> new_list { new LRUHandle *[size_t{1} << new_length_bits] {} };
+    std::unique_ptr<LRUHandle *[]> new_list{new LRUHandle *[size_t{1} << new_length_bits] {}};
     [[maybe_unused]] uint32_t count = 0;
     for (uint32_t i = 0; i < old_length; i++) {
         LRUHandle *h = list_[i];
@@ -163,6 +163,7 @@ LRUCacheShard::LRUCacheShard(size_t capacity,
     // Make empty circular linked list.
     lru_.next = &lru_;
     lru_.prev = &lru_;
+    oldest_sampling_cursor_ = &lru_;
     lru_low_pri_ = &lru_;
     lru_bottom_pri_ = &lru_;
     SetCapacity(capacity);
@@ -258,6 +259,9 @@ void LRUCacheShard::LRU_Remove(LRUHandle *e) {
     assert(e->next != nullptr);
     assert(e->prev != nullptr);
     bool was_tail = (lru_.next == e);
+    if (oldest_sampling_cursor_ == e) {
+        oldest_sampling_cursor_ = e->next;
+    }
     if (lru_low_pri_ == e) {
         lru_low_pri_ = e->prev;
     }
@@ -849,21 +853,32 @@ size_t LRUCacheShard::GetOldestKeys(size_t count, std::vector<std::string> &out_
     return collected;
 }
 
-size_t LRUCacheShard::ApplyToOldestEntries(
+size_t LRUCacheShard::ApplyToNextOldestEntries(
     size_t count,
     const std::function<
         void(const std::string_view &key, Cache::ObjectPtr value, size_t charge, const Cache::CacheItemHelper *helper)>
         &callback) {
     std::lock_guard<std::mutex> l(mutex_);
     size_t visited = 0;
-    LRUHandle *current = lru_.next;
+    LRUHandle *current = oldest_sampling_cursor_;
+    if (current == &lru_) {
+        current = lru_.next;
+    }
+    LRUHandle *const start = current;
     while (current != &lru_ && visited < count) {
         if (current->InCache()) {
             callback(current->key(), current->value, current->GetCharge(metadata_charge_policy_), current->helper);
             ++visited;
         }
         current = current->next;
+        if (current == &lru_) {
+            current = lru_.next;
+        }
+        if (current == start) {
+            break;
+        }
     }
+    oldest_sampling_cursor_ = current;
     return visited;
 }
 
@@ -1181,7 +1196,7 @@ size_t LRUCache::GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vect
     return GetShard(shard_id).GetOldestKeys(count, out_keys);
 }
 
-size_t LRUCache::ApplyToOldestEntriesInShard(
+size_t LRUCache::ApplyToNextOldestEntriesInShard(
     uint32_t shard_id,
     size_t count,
     const std::function<
@@ -1190,7 +1205,7 @@ size_t LRUCache::ApplyToOldestEntriesInShard(
     if (shard_id >= num_shards || count == 0 || !callback) {
         return 0;
     }
-    return GetShard(shard_id).ApplyToOldestEntries(count, callback);
+    return GetShard(shard_id).ApplyToNextOldestEntries(count, callback);
 }
 
 void LRUCache::SetTailChangeCallback(TailChangeCallback callback) {

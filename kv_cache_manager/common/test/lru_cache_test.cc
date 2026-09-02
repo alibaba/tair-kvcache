@@ -64,6 +64,15 @@ public:
 
     void Erase(const std::string &key) { cache_->Erase(key, 0 /*hash*/); }
 
+    std::vector<std::string> ScanNextOldest(size_t count) {
+        std::vector<std::string> keys;
+        cache_->ApplyToNextOldestEntries(
+            count, [&keys](const std::string_view &key, Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) {
+                keys.emplace_back(key);
+            });
+        return keys;
+    }
+
     void ValidateLRUList(std::vector<std::string> keys,
                          size_t num_high_pri_pool_keys = 0,
                          size_t num_low_pri_pool_keys = 0,
@@ -178,6 +187,33 @@ TEST_F(LRUCacheTest, BasicLRU) {
     ValidateLRUList({"y", "e", "z", "d", "u"}, 0, 5);
     Insert("v");
     ValidateLRUList({"e", "z", "d", "u", "v"}, 0, 5);
+}
+
+TEST_F(LRUCacheTest, OldestSamplingCursorAdvancesAndWrapsWithoutChangingLruOrder) {
+    NewCache(5);
+    for (char ch = 'a'; ch <= 'e'; ++ch) {
+        Insert(ch);
+    }
+
+    EXPECT_EQ((std::vector<std::string>{"a", "b"}), ScanNextOldest(2));
+    ValidateLRUList({"a", "b", "c", "d", "e"}, 0, 5);
+    EXPECT_EQ((std::vector<std::string>{"c", "d"}), ScanNextOldest(2));
+    EXPECT_EQ((std::vector<std::string>{"e", "a"}), ScanNextOldest(2));
+    EXPECT_EQ((std::vector<std::string>{"b", "c"}), ScanNextOldest(2));
+    EXPECT_EQ((std::vector<std::string>{"d", "e", "a", "b", "c"}), ScanNextOldest(10));
+    ValidateLRUList({"a", "b", "c", "d", "e"}, 0, 5);
+}
+
+TEST_F(LRUCacheTest, OldestSamplingCursorAdvancesWhenNextEntryIsRemoved) {
+    NewCache(5);
+    for (char ch = 'a'; ch <= 'e'; ++ch) {
+        Insert(ch);
+    }
+
+    EXPECT_EQ((std::vector<std::string>{"a"}), ScanNextOldest(1));
+    Erase("b");
+    EXPECT_EQ((std::vector<std::string>{"c", "d"}), ScanNextOldest(2));
+    ValidateLRUList({"a", "c", "d", "e"}, 0, 4);
 }
 
 TEST_F(LRUCacheTest, BatchLookupAndReleasePreserveReferencesAndLruOrder) {

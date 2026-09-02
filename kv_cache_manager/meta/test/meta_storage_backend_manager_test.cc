@@ -330,7 +330,10 @@ private:
 
 class RecordingReclaimBackend : public MetaLocalBackend {
 public:
-    explicit RecordingReclaimBackend(const KeyType key) : key_(key) {}
+    explicit RecordingReclaimBackend(const KeyType key,
+                                     const int64_t lookup_timestamp = 0,
+                                     const ErrorCode lookup_result = EC_OK)
+        : key_(key), lookup_timestamp_(lookup_timestamp), lookup_result_(lookup_result) {}
 
     ErrorCode
     SampleReclaimCandidates(RequestContext *, int64_t count, ReclaimCandidateVector &out_candidates) noexcept override {
@@ -343,10 +346,21 @@ public:
     }
 
     int calls() const { return calls_; }
+    int timestamp_lookup_calls() const { return timestamp_lookup_calls_; }
+
+    std::vector<ErrorCode> GetLastAccessTimesForMaintenance(
+        RequestContext *, const KeyTypeVec &keys, std::vector<int64_t> &out_last_access_times) noexcept override {
+        ++timestamp_lookup_calls_;
+        out_last_access_times.assign(keys.size(), lookup_timestamp_);
+        return std::vector<ErrorCode>(keys.size(), lookup_result_);
+    }
 
 private:
     KeyType key_;
+    int64_t lookup_timestamp_;
+    ErrorCode lookup_result_;
     int calls_ = 0;
+    int timestamp_lookup_calls_ = 0;
 };
 
 } // namespace
@@ -481,10 +495,10 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesOneBackendForWholeOperation) {
+TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTimeDuringRecovery) {
     MetaStorageBackendManager mgr;
     auto persistent = std::make_unique<RecordingReclaimBackend>(11);
-    auto cache = std::make_unique<RecordingReclaimBackend>(22);
+    auto cache = std::make_unique<RecordingReclaimBackend>(22, 999);
     auto *persistent_ptr = persistent.get();
     auto *cache_ptr = cache.get();
     mgr.persistent_backend_ = std::move(persistent);
@@ -495,15 +509,49 @@ TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesOneBackendF
     ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
     ASSERT_EQ(1, candidates.size());
     EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(999, candidates.front().last_access_time_us);
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(0, cache_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
 
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
     ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
     ASSERT_EQ(1, candidates.size());
     EXPECT_EQ(22, candidates.front().key);
+    EXPECT_EQ(220, candidates.front().last_access_time_us);
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(1, cache_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesFallsBackForRecoveryCacheMiss) {
+    MetaStorageBackendManager mgr;
+    auto persistent = std::make_unique<RecordingReclaimBackend>(11);
+    auto cache = std::make_unique<RecordingReclaimBackend>(22, 0, EC_NOENT);
+    auto *cache_ptr = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(110, candidates.front().last_access_time_us);
+    EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesStopsOnRecoveryCacheReadFailure) {
+    MetaStorageBackendManager mgr;
+    auto persistent = std::make_unique<RecordingReclaimBackend>(11);
+    auto cache = std::make_unique<RecordingReclaimBackend>(22, 0, EC_ERROR);
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+
+    ReclaimCandidateVector candidates;
+    EXPECT_EQ(EC_ERROR, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
+    EXPECT_TRUE(candidates.empty());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestInitIsTransactionalAndOneShot) {

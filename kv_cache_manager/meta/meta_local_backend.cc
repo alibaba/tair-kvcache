@@ -85,6 +85,7 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     size_t capacity = META_LOCAL_BACKEND_DEFAULT_CAPACITY;
     int32_t num_shard_bits = META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS;
     sample_times_ = META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES;
+    reclaim_sample_shard_cursor_.store(0, std::memory_order_relaxed);
 
     const std::string &storage_uri = config->GetStorageUri();
     if (!storage_uri.empty()) {
@@ -1495,14 +1496,50 @@ ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_c
     }
 
     const size_t select_count = std::min(num_rounds, shard_times.size());
-    std::partial_sort(shard_times.begin(), shard_times.begin() + select_count, shard_times.end());
+    std::sort(shard_times.begin(), shard_times.end());
+    const size_t start =
+        reclaim_sample_shard_cursor_.fetch_add(select_count, std::memory_order_relaxed) % shard_times.size();
     int64_t remaining = count;
     for (size_t i = 0; i < select_count && remaining > 0; ++i) {
         const size_t batch = static_cast<size_t>(std::min(per_round_count, remaining));
-        const size_t collected = CollectOldestReclaimCandidatesFromShard(shard_times[i].second, batch, out_candidates);
+        const size_t shard_index = (start + i) % shard_times.size();
+        const size_t collected =
+            CollectNextReclaimCandidatesFromShard(shard_times[shard_index].second, batch, out_candidates);
         remaining -= static_cast<int64_t>(collected);
     }
     return EC_OK;
+}
+
+std::vector<ErrorCode>
+MetaLocalBackend::GetLastAccessTimesForMaintenance(RequestContext * /*request_context*/,
+                                                   const KeyTypeVec &keys,
+                                                   std::vector<int64_t> &out_last_access_times) noexcept {
+    out_last_access_times.assign(keys.size(), 0);
+    std::vector<ErrorCode> results(keys.size(), EC_NOENT);
+    if (!cache_) {
+        std::fill(results.begin(), results.end(), EC_ERROR);
+        return results;
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = cache_->ApplyToEntryNoTouch(
+            KeyToView(keys[i]),
+            [&results, &out_last_access_times, i](
+                Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+                if (value == nullptr) {
+                    results[i] = EC_ERROR;
+                    return 0;
+                }
+                const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                out_last_access_times[i] = item->GetLastAccessTime();
+                results[i] = EC_OK;
+                return 0;
+            });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
 }
 
 // return OK to avoid error in MetaIndexer::PersistMetaData()
@@ -1541,22 +1578,22 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
     return string_keys.size();
 }
 
-size_t MetaLocalBackend::CollectOldestReclaimCandidatesFromShard(const uint32_t shard_id,
-                                                                 const size_t count,
-                                                                 ReclaimCandidateVector &out_candidates) {
+size_t MetaLocalBackend::CollectNextReclaimCandidatesFromShard(const uint32_t shard_id,
+                                                               const size_t count,
+                                                               ReclaimCandidateVector &out_candidates) {
     const size_t initial_size = out_candidates.size();
-    cache_->ApplyToOldestEntriesInShard(shard_id,
-                                        count,
-                                        [&out_candidates](const std::string_view &key,
-                                                          Cache::ObjectPtr value,
-                                                          size_t /*charge*/,
-                                                          const Cache::CacheItemHelper * /*helper*/) {
-                                            if (key.size() != sizeof(KeyType) || value == nullptr) {
-                                                return;
-                                            }
-                                            const auto *item = static_cast<const MetaMemCacheItem *>(value);
-                                            out_candidates.push_back({ViewToKey(key), item->GetLastAccessTime()});
-                                        });
+    cache_->ApplyToNextOldestEntriesInShard(shard_id,
+                                            count,
+                                            [&out_candidates](const std::string_view &key,
+                                                              Cache::ObjectPtr value,
+                                                              size_t /*charge*/,
+                                                              const Cache::CacheItemHelper * /*helper*/) {
+                                                if (key.size() != sizeof(KeyType) || value == nullptr) {
+                                                    return;
+                                                }
+                                                const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                                                out_candidates.push_back({ViewToKey(key), item->GetLastAccessTime()});
+                                            });
     return out_candidates.size() - initial_size;
 }
 
