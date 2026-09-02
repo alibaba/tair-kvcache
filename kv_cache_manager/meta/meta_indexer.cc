@@ -104,9 +104,9 @@ public:
                     int64_t *out_lock_hold_time_us = nullptr)
         : indexer_(indexer), shard_indexs_(shard_indexs), out_lock_hold_time_us_(out_lock_hold_time_us) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
-        for (const int32_t shardIdx : shard_indexs_) {
-            indexer_.mutex_shards_[shardIdx]->lock();
-        }
+        // for (const int32_t shardIdx : shard_indexs_) {
+        //     indexer_.mutex_shards_[shardIdx]->lock();
+        // }
         lock_acquired_time_us_ = TimestampUtil::GetCurrentTimeUs();
         if (out_lock_wait_time_us != nullptr) {
             *out_lock_wait_time_us += lock_acquired_time_us_ - begin;
@@ -116,9 +116,9 @@ public:
         if (out_lock_hold_time_us_ != nullptr) {
             *out_lock_hold_time_us_ += TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_;
         }
-        for (const int32_t shardIdx : shard_indexs_) {
-            indexer_.mutex_shards_[shardIdx]->unlock();
-        }
+        // for (const int32_t shardIdx : shard_indexs_) {
+        //     indexer_.mutex_shards_[shardIdx]->unlock();
+        // }
     }
 
     ScopedBatchLock(const ScopedBatchLock &) = delete;
