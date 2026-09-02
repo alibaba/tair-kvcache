@@ -195,6 +195,10 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_instance, async_pipeline_error_count);
     DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
 
+    DECLARE_METRICS(manager, location_lookup_keys_total);
+    DECLARE_METRICS(manager, location_lookup_requests_total);
+    DECLARE_METRICS(manager, location_lookup_request_keys_total);
+
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
             size_t hash = 0;
@@ -480,6 +484,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_pipeline_error_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
+    ctx_->manager_location_lookup_keys_total_metrics.reset(
+        reporter->RegisterMetric("manager.location_lookup.keys_total", kmonitor::GAUGE, kmonitor::FATAL));
+    ctx_->manager_location_lookup_requests_total_metrics.reset(
+        reporter->RegisterMetric("manager.location_lookup.requests_total", kmonitor::GAUGE, kmonitor::FATAL));
+    ctx_->manager_location_lookup_request_keys_total_metrics.reset(
+        reporter->RegisterMetric("manager.location_lookup.request_keys_total", kmonitor::GAUGE, kmonitor::FATAL));
+    if (!ctx_->manager_location_lookup_keys_total_metrics ||
+        !ctx_->manager_location_lookup_requests_total_metrics ||
+        !ctx_->manager_location_lookup_request_keys_total_metrics) {
+        KVCM_LOG_ERROR("failed to register location lookup metrics");
+        return false;
+    }
+
     return true;
 }
 
@@ -626,6 +643,24 @@ void KmonitorMetricsReporter::ReportInterval() {
     if (!ctx_->kmonitor) {
         KVCM_LOG_WARN("kmonitor is null, ReportInterval ignored.");
         return;
+    }
+
+    if (metrics_registry_) {
+        const auto report_counter = [this](kmonitor::MutableMetric *metric, const char *name) {
+            if (metric == nullptr) {
+                return;
+            }
+            VisitCounterSamples(name, [this, metric](const MetricsTags &base_tags, double sample) {
+                const auto tags = ctx_->GetKmonitorTags(base_tags);
+                metric->Report(&tags, sample);
+            });
+        };
+        report_counter(ctx_->manager_location_lookup_keys_total_metrics.get(),
+                       "manager.location_lookup.keys_total");
+        report_counter(ctx_->manager_location_lookup_requests_total_metrics.get(),
+                       "manager.location_lookup.requests_total");
+        report_counter(ctx_->manager_location_lookup_request_keys_total_metrics.get(),
+                       "manager.location_lookup.request_keys_total");
     }
 
     do {
@@ -977,6 +1012,25 @@ void KmonitorMetricsReporter::ReportInterval() {
             }
         }
     } while (false);
+}
+
+void KmonitorMetricsReporter::VisitCounterSamples(const char *name,
+                                                  const CounterSampleConsumer &consumer) const {
+    if (!metrics_registry_ || !consumer) {
+        return;
+    }
+    const auto data = metrics_registry_->GetMetricsData(name);
+    if (data == nullptr) {
+        return;
+    }
+    for (const auto &[tags, value] : data->GetMetricsValues()) {
+        if (!value || !value->touched.load(std::memory_order_relaxed) ||
+            !std::holds_alternative<CounterValue>(value->value)) {
+            continue;
+        }
+        consumer(tags,
+                 static_cast<double>(std::get<CounterValue>(value->value).load(std::memory_order_relaxed)));
+    }
 }
 
 } // namespace kv_cache_manager

@@ -81,7 +81,8 @@ public:
                           const KeyVector &keys,
                           const BlockMask &input_mask,
                           CacheLocationVector &out_locations,
-                          SelectLocationPolicy *policy) const;
+                          SelectLocationPolicy *policy,
+                          std::size_t *out_error_key_count = nullptr) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
@@ -92,7 +93,8 @@ public:
                                             SelectLocationPolicy *policy,
                                             const std::vector<BackendSelector> &selectors,
                                             const std::vector<std::string> &requested_spec_names = {},
-                                            const BlockMask &input_mask = BlockMask{}) const;
+                                            const BlockMask &input_mask = BlockMask{},
+                                            std::vector<bool> *out_had_usable_locations = nullptr) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,
@@ -386,7 +388,8 @@ private:
     ErrorCode PrefixMatchBestLocationImpl(RequestContext *request_context,
                                           const KeyVector &keys,
                                           CacheLocationVector &out_locations,
-                                          SelectLocationPolicy *policy) const;
+                                          SelectLocationPolicy *policy,
+                                          std::size_t *out_error_key_count) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;

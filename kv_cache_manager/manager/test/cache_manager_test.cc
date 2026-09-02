@@ -41,6 +41,7 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 
@@ -222,6 +223,11 @@ public:
         fail_key_on_next_upsert_ = key;
     }
 
+    void FailKeyOnNextLocationRead(int64_t key) {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        fail_key_on_next_location_read_ = key;
+    }
+
     size_t GetSyncCallCount() {
         std::lock_guard<std::mutex> lock(control_mutex_);
         return sync_call_count_;
@@ -280,7 +286,22 @@ public:
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override {
         MaybeBlockLocationRead();
-        return MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+        auto results = MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+        std::optional<int64_t> failed_key;
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            failed_key = fail_key_on_next_location_read_;
+            fail_key_on_next_location_read_.reset();
+        }
+        if (failed_key.has_value()) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (keys[i] == failed_key.value()) {
+                    results[i] = EC_TIMEOUT;
+                    out_locations[i].clear();
+                }
+            }
+        }
+        return results;
     }
 
     std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
@@ -341,6 +362,7 @@ private:
     bool location_read_entered_ = false;
     bool release_location_read_ = false;
     std::optional<int64_t> fail_key_on_next_upsert_;
+    std::optional<int64_t> fail_key_on_next_location_read_;
     size_t sync_call_count_ = 0;
 };
 
@@ -580,14 +602,15 @@ public:
         return snapshot_response.committed_snapshot_version();
     }
 
-    ControllableMetaLocalBackend *InstallControllableMetaBackend() {
-        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ControllableMetaLocalBackend *
+    InstallControllableMetaBackend(const std::string &instance_id = "test_instance") {
+        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance_id);
         if (!indexer) {
             return nullptr;
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto controlled = std::make_unique<ControllableMetaLocalBackend>();
-        if (controlled->Init("test_instance", config) != EC_OK || controlled->Open() != EC_OK) {
+        if (controlled->Init(instance_id, config) != EC_OK || controlled->Open() != EC_OK) {
             return nullptr;
         }
         auto *controlled_raw = controlled.get();
@@ -1629,6 +1652,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters) {
     COPY_METRICS_(svc_collector.get(), manager, get_cache_location_hit_block_counter, hit_counter);
     EXPECT_EQ(6u, query_counter.Get());
     EXPECT_EQ(5u, hit_counter.Get());
+
+    const MetricsTags request_tags{{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}};
+    auto hit_tags = request_tags;
+    hit_tags.emplace("result", "hit");
+    auto miss_tags = request_tags;
+    miss_tags.emplace("result", "miss");
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("manager.location_lookup.requests_total", request_tags).Get());
+    EXPECT_EQ(6u, metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", request_tags).Get());
+    EXPECT_EQ(5u, metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags).Get());
+    EXPECT_EQ(1u, metrics_registry_->GetCounter("manager.location_lookup.keys_total", miss_tags).Get());
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_BatchGet) {
@@ -1680,14 +1713,62 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_BatchGet) {
     EXPECT_EQ(2u, hit_counter.Get());
 }
 
+TEST_F(CacheManagerTest, TestLocationLookupMetricsClassifyPrefixMetadataError) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    auto *controlled_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, controlled_backend);
+
+    std::vector<int64_t> keys{1, 2, 3};
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMaskOffset{3}));
+
+    controlled_backend->FailKeyOnNextLocationRead(2);
+    auto [ec, result] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                         "test_instance",
+                                                         CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                         keys,
+                                                         {},
+                                                         BlockMaskOffset{0},
+                                                         0,
+                                                         {});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, result.cache_locations_view().size());
+
+    const MetricsTags request_tags{{"api_name", "GetCacheLocation"}, {"instance_id", "test_instance"}};
+    auto hit_tags = request_tags;
+    hit_tags.emplace("result", "hit");
+    auto miss_tags = request_tags;
+    miss_tags.emplace("result", "miss");
+    auto error_tags = request_tags;
+    error_tags.emplace("result", "error");
+    EXPECT_EQ(1u, metrics_registry_->GetCounter("manager.location_lookup.requests_total", request_tags).Get());
+    EXPECT_EQ(3u, metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", request_tags).Get());
+    EXPECT_EQ(1u, metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags).Get());
+    EXPECT_EQ(0u, metrics_registry_->GetCounter("manager.location_lookup.keys_total", miss_tags).Get());
+    EXPECT_EQ(2u, metrics_registry_->GetCounter("manager.location_lookup.keys_total", error_tags).Get());
+}
+
 TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_ErrorPath) {
     auto svc_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
     ASSERT_TRUE(svc_collector->Init());
     auto metrics_ctx = std::make_unique<RequestContext>("error_path_test", svc_collector);
 
-    // Query non-existent instance → should fail and NOT increment counters
+    // Invalid instance ids must not create unbounded instance-tagged series.
     std::vector<int64_t> query_keys{1, 2, 3};
     BlockMask block_mask = static_cast<size_t>(0);
+    const auto registry_size_before = metrics_registry_->GetSize();
     auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
                                                          "nonexistent_instance",
                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1698,11 +1779,103 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_ErrorPath) {
                                                          {});
     EXPECT_NE(EC_OK, ec);
 
+    for (int index = 0; index < 64; ++index) {
+        EXPECT_NE(EC_OK,
+                  cache_manager_
+                      ->GetCacheLocation(metrics_ctx.get(),
+                                         "invalid_instance_" + std::to_string(index),
+                                         CacheManager::QueryType::QT_PREFIX_MATCH,
+                                         query_keys,
+                                         {},
+                                         block_mask,
+                                         0,
+                                         {})
+                      .first);
+    }
+
     Counter query_counter, hit_counter;
     COPY_METRICS_(svc_collector.get(), manager, get_cache_location_query_block_counter, query_counter);
     COPY_METRICS_(svc_collector.get(), manager, get_cache_location_hit_block_counter, hit_counter);
     EXPECT_EQ(0u, query_counter.Get());
     EXPECT_EQ(0u, hit_counter.Get());
+    EXPECT_EQ(registry_size_before, metrics_registry_->GetSize());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("manager.location_lookup.requests_total"));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("manager.location_lookup.request_keys_total"));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("manager.location_lookup.keys_total"));
+}
+
+TEST_F(CacheManagerTest, TestLocationLookupMetricsDoNotReappearAfterInstancePurge) {
+    const std::string instance_id = "location_lookup_lifecycle_instance";
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    auto *controlled_backend = InstallControllableMetaBackend(instance_id);
+    ASSERT_NE(nullptr, controlled_backend);
+    controlled_backend->BlockNextLocationRead();
+
+    CacheManager *manager = cache_manager_.get();
+    auto query_future = std::async(std::launch::async, [manager, instance_id]() {
+        RequestContext context("location_lookup_lifecycle_query");
+        return manager->GetCacheLocation(&context,
+                                         instance_id,
+                                         CacheManager::QueryType::QT_PREFIX_MATCH,
+                                         {1, 2, 3},
+                                         {},
+                                         BlockMaskOffset{0},
+                                         0,
+                                         {});
+    });
+    if (!controlled_backend->WaitUntilLocationReadEntered(std::chrono::seconds(2))) {
+        controlled_backend->ReleaseLocationRead();
+        FAIL() << "location query did not reach the controlled metadata read";
+    }
+
+    std::promise<void> purge_started;
+    auto purge_started_future = purge_started.get_future();
+    auto purge_future = std::async(std::launch::async,
+                                   [manager, instance_id, &purge_started]() {
+        purge_started.set_value();
+        std::unique_lock<std::shared_mutex> lifecycle_guard(manager->metrics_lifecycle()->mut_);
+        RequestContext remove_context("location_lookup_lifecycle_remove");
+        return manager->RemoveInstance(&remove_context, "default", instance_id);
+    });
+    purge_started_future.wait();
+    EXPECT_EQ(std::future_status::timeout, purge_future.wait_for(std::chrono::milliseconds(50)));
+
+    controlled_backend->ReleaseLocationRead();
+    EXPECT_EQ(EC_OK, query_future.get().first);
+    ASSERT_EQ(std::future_status::ready, purge_future.wait_for(std::chrono::seconds(2)));
+    EXPECT_EQ(EC_OK, purge_future.get());
+
+    RequestContext post_remove_context("location_lookup_after_remove");
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST,
+              cache_manager_
+                  ->GetCacheLocation(&post_remove_context,
+                                     instance_id,
+                                     CacheManager::QueryType::QT_PREFIX_MATCH,
+                                     {1, 2, 3},
+                                     {},
+                                     BlockMaskOffset{0},
+                                     0,
+                                     {})
+                  .first);
+
+    std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
+    metrics_registry_->GetAllMetrics(all_metrics);
+    for (const auto &[name, tags, value] : all_metrics) {
+        (void) name;
+        (void) value;
+        auto instance_tag = tags.find("instance_id");
+        if (instance_tag != tags.end()) {
+            EXPECT_NE(instance_id, instance_tag->second);
+        }
+    }
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
@@ -7746,6 +7919,21 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
     }
     {
         const BlockMask implicit_empty_mask = BlockMaskVector{};
+        const MetricsTags request_tags{{"api_name", "GetCacheLocationsByBackend"}, {"instance_id", instance_id}};
+        auto hit_tags = request_tags;
+        hit_tags.emplace("result", "hit");
+        auto miss_tags = request_tags;
+        miss_tags.emplace("result", "miss");
+        auto filtered_tags = request_tags;
+        filtered_tags.emplace("result", "filtered");
+        const auto requests_before =
+            metrics_registry_->GetCounter("manager.location_lookup.requests_total", request_tags).Get();
+        const auto request_keys_before =
+            metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", request_tags).Get();
+        const auto hits_before = metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags).Get();
+        const auto misses_before = metrics_registry_->GetCounter("manager.location_lookup.keys_total", miss_tags).Get();
+        const auto filtered_before =
+            metrics_registry_->GetCounter("manager.location_lookup.keys_total", filtered_tags).Get();
         auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
                                                                      instance_id,
                                                                      CacheManager::QueryType::QT_BATCH_GET,
@@ -7757,10 +7945,33 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
                                                                      nfs_selectors);
         EXPECT_EQ(EC_OK, ec);
         EXPECT_EQ(all_keys.size(), locs.size());
+        EXPECT_EQ(requests_before + 1,
+                  metrics_registry_->GetCounter("manager.location_lookup.requests_total", request_tags).Get());
+        EXPECT_EQ(request_keys_before + all_keys.size(),
+                  metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", request_tags).Get());
+        EXPECT_EQ(hits_before + 3,
+                  metrics_registry_->GetCounter("manager.location_lookup.keys_total", hit_tags).Get());
+        EXPECT_EQ(misses_before,
+                  metrics_registry_->GetCounter("manager.location_lookup.keys_total", miss_tags).Get());
+        EXPECT_EQ(filtered_before + 2,
+                  metrics_registry_->GetCounter("manager.location_lookup.keys_total", filtered_tags).Get());
     }
 
     // Masked entries stay positionally aligned but do not expose a remote
     // location. Both vector and prefix-offset forms are supported.
+    const MetricsTags masked_request_tags{{"api_name", "GetCacheLocationsByBackend"}, {"instance_id", instance_id}};
+    auto masked_hit_tags = masked_request_tags;
+    masked_hit_tags.emplace("result", "hit");
+    auto masked_filtered_tags = masked_request_tags;
+    masked_filtered_tags.emplace("result", "filtered");
+    const auto masked_requests_before =
+        metrics_registry_->GetCounter("manager.location_lookup.requests_total", masked_request_tags).Get();
+    const auto masked_request_keys_before =
+        metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", masked_request_tags).Get();
+    const auto masked_hits_before =
+        metrics_registry_->GetCounter("manager.location_lookup.keys_total", masked_hit_tags).Get();
+    const auto masked_filtered_before =
+        metrics_registry_->GetCounter("manager.location_lookup.keys_total", masked_filtered_tags).Get();
     for (const BlockMask &mask : std::vector<BlockMask>{
              BlockMaskVector{true, false, true, false, true},
              BlockMaskOffset{2},
@@ -7782,6 +7993,14 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
             }
         }
     }
+    EXPECT_EQ(masked_requests_before + 2,
+              metrics_registry_->GetCounter("manager.location_lookup.requests_total", masked_request_tags).Get());
+    EXPECT_EQ(masked_request_keys_before + 5,
+              metrics_registry_->GetCounter("manager.location_lookup.request_keys_total", masked_request_tags).Get());
+    EXPECT_EQ(masked_hits_before + 2,
+              metrics_registry_->GetCounter("manager.location_lookup.keys_total", masked_hit_tags).Get());
+    EXPECT_EQ(masked_filtered_before + 3,
+              metrics_registry_->GetCounter("manager.location_lookup.keys_total", masked_filtered_tags).Get());
 
     // --- Test 2: EVENT_REPORT PREFIX + NFS (NFS on 300,500,700 should not affect event report peer selection) ---
     {
