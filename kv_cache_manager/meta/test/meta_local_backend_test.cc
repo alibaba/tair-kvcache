@@ -786,6 +786,64 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesDoesNotTouchLruState) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_reclaim_candidates_no_touch", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto histogram = std::make_shared<RevisitIntervalHistogram>();
+    ASSERT_TRUE(histogram->Init(registry, {1.0, 10.0}, "test_reclaim_candidates_no_touch"));
+    GetLocalBackend()->SetRevisitHistogram(histogram);
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    usleep(1000);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2"}}}));
+
+    auto snapshot_access_times = [backend = GetLocalBackend()]() {
+        std::map<KeyType, int64_t> access_times;
+        backend->cache_->ApplyToSingleShard(
+            0,
+            [&access_times](
+                const std::string_view &key, Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) {
+                access_times[MetaLocalBackend::ViewToKey(key)] =
+                    static_cast<const MetaMemCacheItem *>(value)->GetLastAccessTime();
+            });
+        return access_times;
+    };
+
+    KeyVector order_before;
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimKeys(nullptr, 2, order_before));
+    ASSERT_EQ((KeyVector{1, 2}), order_before);
+    const auto access_times_before = snapshot_access_times();
+    ASSERT_EQ(2, access_times_before.size());
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(1, candidates[0].key);
+    EXPECT_EQ(access_times_before.at(1), candidates[0].last_access_time_us);
+    EXPECT_EQ(2, candidates[1].key);
+    EXPECT_EQ(access_times_before.at(2), candidates[1].last_access_time_us);
+    EXPECT_EQ(0, histogram->GetCount());
+    EXPECT_EQ(access_times_before, snapshot_access_times());
+
+    KeyVector order_after;
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimKeys(nullptr, 2, order_after));
+    EXPECT_EQ(order_before, order_after);
+
+    usleep(1000);
+    PropertyMapVector properties;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              GetLocalBackend()->GetProperties(nullptr, {1}, {PROPERTY_URI}, properties));
+    EXPECT_EQ(1, histogram->GetCount());
+    EXPECT_GT(snapshot_access_times().at(1), access_times_before.at(1));
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemFieldMap) {
     // Verify MetaMemCacheItem stores locations and properties separately.
     CacheLocationMap locations;

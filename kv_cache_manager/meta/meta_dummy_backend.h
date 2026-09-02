@@ -101,6 +101,9 @@ public:
     ErrorCode RandomSample(RequestContext *request_context, std::int64_t count, KeyTypeVec &out_keys) noexcept override;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, std::int64_t count, KeyTypeVec &out_keys) noexcept override;
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      std::int64_t count,
+                                      ReclaimCandidateVector &out_candidates) noexcept override;
 
     // =====================================================================
     // Metadata APIs

@@ -273,6 +273,9 @@ public:
     ErrorCode SampleReclaimKeys(RequestContext *request_context,
                                 const int64_t count,
                                 std::vector<KeyType> &out_keys) noexcept override;
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
@@ -293,6 +296,8 @@ private:
     }
 
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
+    size_t
+    CollectOldestReclaimCandidatesFromShard(uint32_t shard_id, size_t count, ReclaimCandidateVector &out_candidates);
     ErrorCode
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode

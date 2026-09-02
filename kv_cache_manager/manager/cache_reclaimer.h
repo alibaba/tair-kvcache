@@ -23,6 +23,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -650,27 +651,23 @@ private:
     // below are helper routines for internal usage
     bool DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                        const std::shared_ptr<const InstanceInfo> &instance_info,
-                       std::vector<std::int64_t> &out_keys,
-                       std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
+                       ReclaimCandidateVector &out_candidates) noexcept;
 
     bool DoKeySamplingWithSize(const std::shared_ptr<RequestContext> &request_context,
                                const std::shared_ptr<const InstanceInfo> &instance_info,
                                std::size_t total_sampling_size,
                                bool bounded_waves,
-                               std::vector<std::int64_t> &out_keys,
-                               std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
+                               ReclaimCandidateVector &out_candidates) noexcept;
 
     bool MakeBatchByLRU(const RequestContext *request_context,
                         const std::shared_ptr<const InstanceInfo> &instance_info,
-                        const std::vector<std::int64_t> &sampled_keys,
-                        const std::vector<std::map<std::string, std::string>> &property_maps,
+                        const ReclaimCandidateVector &candidates,
                         std::vector<std::int64_t> &out_batch,
                         AgeStats &out_lru_age_stats) const noexcept;
 
     bool MakeBatchByLRUWithSize(const RequestContext *request_context,
                                 const std::shared_ptr<const InstanceInfo> &instance_info,
-                                const std::vector<std::int64_t> &sampled_keys,
-                                const std::vector<std::map<std::string, std::string>> &property_maps,
+                                const ReclaimCandidateVector &candidates,
                                 std::size_t batching_size,
                                 std::vector<std::int64_t> &out_batch,
                                 AgeStats &out_lru_age_stats) const noexcept;

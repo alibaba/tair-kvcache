@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
@@ -316,12 +317,14 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_stub(void *obj, c
 std::chrono::milliseconds mi_getprop_delay{0};
 ErrorCode get_result;
 PropertyMapVector get_out_properties;
+std::atomic<int> mi_getprop_call_count{0};
 
 MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
                                                    RequestContext *rc,
                                                    const KeyVector &k,
                                                    const std::vector<std::string> &p,
                                                    PropertyMapVector &out_properties) noexcept {
+    ++mi_getprop_call_count;
     if (get_result == ErrorCode::EC_OK) {
         if (k.size() == get_out_properties.size()) {
             out_properties = get_out_properties;
@@ -362,7 +365,7 @@ MetaIndexer_RandomSample_stub(void *obj, RequestContext *rc, const std::size_t c
     return random_sample_result;
 }
 
-/* ---------------- MetaIndexer_SampleReclaimKeys_stub ---------------- */
+/* ---------------- MetaIndexer_SampleReclaimCandidates_stub ---------------- */
 
 std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
@@ -374,8 +377,10 @@ int sample_reclaim_call_counter;
 std::mutex sample_reclaim_requests_mutex;
 std::vector<std::pair<std::string, std::int64_t>> sample_reclaim_requests;
 
-ErrorCode
-MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
+ErrorCode MetaIndexer_SampleReclaimCandidates_stub(void *obj,
+                                                   RequestContext *rc,
+                                                   const std::int64_t c,
+                                                   ReclaimCandidateVector &out_candidates) noexcept {
     ++sample_reclaim_call_counter;
     ErrorCode result = sample_reclaim_result;
     std::chrono::milliseconds delay = mi_sample_reclaim_delay;
@@ -392,16 +397,32 @@ MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int
         }
     }
     if (result == ErrorCode::EC_OK) {
+        KeyVector sampled_keys;
         if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
-            out_keys = sample_reclaim_keys;
+            sampled_keys = sample_reclaim_keys;
         } else if (c == 11) {
             // special case
-            out_keys = sample_reclaim_keys;
+            sampled_keys = sample_reclaim_keys;
         } else {
-            out_keys = KeyVector(c);
+            sampled_keys = KeyVector(c);
+        }
+        out_candidates.clear();
+        out_candidates.reserve(sampled_keys.size());
+        const bool properties_available =
+            get_result == ErrorCode::EC_OK && sampled_keys.size() == get_out_properties.size();
+        for (size_t i = 0; i < sampled_keys.size(); ++i) {
+            int64_t last_access_time_us = 0;
+            if (properties_available) {
+                const auto it = get_out_properties[i].find(PROPERTY_LRU_TIME);
+                if (it != get_out_properties[i].end()) {
+                    StringUtil::StrToInt64(it->second.c_str(), last_access_time_us);
+                }
+            }
+            out_candidates.push_back({sampled_keys[i], last_access_time_us});
         }
     }
     std::this_thread::sleep_for(delay);
+    std::this_thread::sleep_for(mi_getprop_delay);
     return result;
 }
 
@@ -467,7 +488,7 @@ public:
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
-        stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
+        stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), MetaIndexer_SampleReclaimCandidates_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -508,6 +529,7 @@ public:
         spe_submit_accepted_by_instance.clear();
         spe_submit_accepted_callback = {};
         get_result = ErrorCode::EC_OK;
+        mi_getprop_call_count.store(0);
         random_sample_result = ErrorCode::EC_OK;
         sample_reclaim_result = ErrorCode::EC_OK;
         batch_get_loc_result = ErrorCode::EC_OK;
@@ -668,7 +690,7 @@ public:
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
-        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -830,7 +852,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
-    stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+    stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -2285,40 +2307,24 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
     ASSERT_TRUE(VecContains(req.block_keys, 9)); // time point -> 2
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
-    // set up test data
+TEST_F(CacheReclaimerTest, TestCandidateTimestampFailureDegradesToZeroWithoutGetPropertiesCall) {
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-
-    // configure the GetProperties stub to return an error
     get_result = ErrorCode::EC_ERROR;
+    cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+    cache_reclaimer_->sampling_size_per_task_.store(sample_reclaim_keys.size());
 
-    // update the trigger strategy to trigger the reclaiming
-
-    // use instance 0 from setup()
-    // construct instance 1
-    const auto ins_info = InstanceInfoFactory();
-    ins_info->set_instance_id("test_instance_id_2");
-    instance_infos.emplace_back(ins_info);
-
-    instance_groups.clear();
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->quota_.set_capacity(2048);
-    instance_groups.emplace_back(ins_group);
-
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    ASSERT_TRUE(cache_reclaimer_->IsRunning()); // the worker thread should still be running
-
-    cache_reclaimer_->Stop();
-
-    // no deletion requests should be submitted when GetProperties fails
-    ASSERT_TRUE(HasNoSubmittedDelRequests());
+    ReclaimCandidateVector candidates;
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+    ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EXPECT_EQ(sample_reclaim_keys[i], candidates[i].key);
+        EXPECT_EQ(0, candidates[i].last_access_time_us);
+    }
+    EXPECT_EQ(0, mi_getprop_call_count.load());
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimFailure) {
-    // configure the SampleReclaim stub to return an error
+TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimCandidatesFailure) {
+    // configure the SampleReclaimCandidates stub to return an error
     sample_reclaim_result = ErrorCode::EC_ERROR;
 
     // update the trigger strategy to trigger the reclaiming
@@ -4869,86 +4875,75 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
-        ASSERT_EQ(get_out_properties.size(), maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            EXPECT_EQ(sample_reclaim_keys[i], candidates[i].key);
+            EXPECT_EQ(static_cast<int64_t>(i), candidates[i].last_access_time_us);
+        }
     }
 
     {
         cache_reclaimer_->sampling_size_.store(0);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ReclaimCandidateVector candidates;
+        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     }
 
     {
         cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(0); // 0 means single thread key sampling
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
-        ASSERT_EQ(get_out_properties.size(), maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
     }
     {
         // sampling_size <= sampling_size_per_task means single thread key sampling
         cache_reclaimer_->sampling_size_.store(1000);
         cache_reclaimer_->sampling_size_per_task_.store(1000);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1000, keys.size());
-        ASSERT_EQ(1000, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1000, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(1000);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1000, keys.size());
-        ASSERT_EQ(1000, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1000, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(999);
         cache_reclaimer_->sampling_size_per_task_.store(99);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(999, keys.size());
-        ASSERT_EQ(999, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(999, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(1001);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1001, keys.size());
-        ASSERT_EQ(1001, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1001, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(1);
         cache_reclaimer_->sampling_size_per_task_.store(999);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1, keys.size());
-        ASSERT_EQ(1, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1, candidates.size());
     }
 
     {
@@ -4960,11 +4955,9 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         // the specially crafted size 11 would cause the mock func return 10 sampled keys
         // 10 * 9 + 1 = 91
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(91, keys.size());
-        ASSERT_EQ(91, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(91, candidates.size());
     }
 }
 
@@ -4976,10 +4969,9 @@ TEST_F(CacheReclaimerTest, TestFairKeySamplingSubmitsBoundedWaves) {
     get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
     mi_sample_reclaim_delay = std::chrono::milliseconds(300);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
     auto sampling_future = std::async(std::launch::async, [&] {
-        return cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, keys, maps);
+        return cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, candidates);
     });
 
     // Before the first tasks can finish, only one wave (two tasks) may
@@ -4992,8 +4984,7 @@ TEST_F(CacheReclaimerTest, TestFairKeySamplingSubmitsBoundedWaves) {
         },
         std::chrono::milliseconds(200)));
     EXPECT_TRUE(sampling_future.get());
-    EXPECT_EQ(5, keys.size());
-    EXPECT_EQ(5, maps.size());
+    EXPECT_EQ(5, candidates.size());
 }
 
 TEST_F(CacheReclaimerTest, TestFairKeySamplingFailureClearsPartialWaveResults) {
@@ -5008,12 +4999,10 @@ TEST_F(CacheReclaimerTest, TestFairKeySamplingFailureClearsPartialWaveResults) {
         ErrorCode::EC_OK,
     };
 
-    std::vector<std::int64_t> keys = {999};
-    std::vector<std::map<std::string, std::string>> maps = {{{"stale", "value"}}};
+    ReclaimCandidateVector candidates = {{999, 999}};
     EXPECT_FALSE(
-        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, keys, maps));
-    EXPECT_TRUE(keys.empty());
-    EXPECT_TRUE(maps.empty());
+        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, candidates));
+    EXPECT_TRUE(candidates.empty());
     EXPECT_EQ(4, SampleReclaimRequestsSnapshot().size());
     EXPECT_EQ(0, cache_reclaimer_->in_flight_sampling_tasks_.load());
 }
@@ -5029,23 +5018,21 @@ TEST_F(CacheReclaimerTest, TestFairKeySamplingTimeoutClearsPartialWaveResults) {
         std::chrono::milliseconds{500},
     };
 
-    std::vector<std::int64_t> keys = {999};
-    std::vector<std::map<std::string, std::string>> maps = {{{"stale", "value"}}};
+    ReclaimCandidateVector candidates = {{999, 999}};
     const auto begin = std::chrono::steady_clock::now();
     EXPECT_FALSE(
-        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 2, true, keys, maps));
+        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 2, true, candidates));
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     EXPECT_LT(elapsed, std::chrono::milliseconds{300});
-    EXPECT_TRUE(keys.empty());
-    EXPECT_TRUE(maps.empty());
+    EXPECT_TRUE(candidates.empty());
     EXPECT_EQ(2, SampleReclaimRequestsSnapshot().size());
 
     ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; },
                           std::chrono::milliseconds{1000}));
 }
 
-TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs) {
-    // when SampleReclaimKeys blocks longer than the future timeout,
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimCandidatesHangs) {
+    // when SampleReclaimCandidates blocks longer than the future timeout,
     // DoKeySampling should return false instead of blocking forever
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -5069,11 +5056,10 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should return within the timeout budget (~50ms), not wait for the full 500ms task
@@ -5088,8 +5074,9 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
     }
 }
 
-TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
-    // when GetProperties blocks longer than the future timeout,
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_CandidateTimestampReadHangs) {
+    // The backend's timestamp read remains covered by the combined candidate
+    // call and must not let DoKeySampling block past its future timeout.
     // DoKeySampling should return false instead of blocking forever
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -5105,18 +5092,17 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
         {{PROPERTY_LRU_TIME, "9"}},
     };
 
-    // set a very short future timeout (50ms) and a long GetProperties delay (500ms)
+    // set a very short future timeout (50ms) and a long timestamp read delay (500ms)
     cache_reclaimer_->future_timeout_ms_.store(50);
     mi_getprop_delay = std::chrono::milliseconds{500};
 
-    // use multi-thread path with sampling_size > batching_size to trigger GetProperties
+    // use multi-thread path so the candidate calls are bounded by futures
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
     cache_reclaimer_->batching_size_.store(1);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ReclaimCandidateVector candidates;
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
 
     // wait for background tasks to finish naturally
     while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
@@ -5150,10 +5136,9 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) 
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-    ASSERT_EQ(10u, keys.size());
+    ReclaimCandidateVector candidates;
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+    ASSERT_EQ(10u, candidates.size());
 
     // all tasks completed, in-flight should be zero
     ASSERT_EQ(0u, cache_reclaimer_->in_flight_sampling_tasks_.load());
@@ -5184,11 +5169,10 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_DeadlineBoundsAllFutur
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(2); // 5 tasks
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should be bounded by ~100ms deadline, not 500ms (5 tasks * 100ms)
@@ -5225,12 +5209,11 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard)
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     // should immediately return false without submitting new work
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     ASSERT_LT(elapsed, std::chrono::milliseconds(50));
 
@@ -5240,52 +5223,17 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard)
 
 TEST_F(CacheReclaimerTest, TestDupKeys) {
     {
-        sample_reclaim_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "2"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "3"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "4"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "5"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "6"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "7"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "8"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {0, 1}, {0, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6}, {7, 7}, {8, 8}, {9, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
-        cache_reclaimer_->batching_size_.store(sample_reclaim_keys.size());
+        cache_reclaimer_->batching_size_.store(candidates.size());
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
-            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
-        // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
         EXPECT_GT(lru_age_stats.min_us, 0);
         EXPECT_GT(lru_age_stats.max_us, 0);
@@ -5296,50 +5244,16 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "0"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "2"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "3"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "4"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "5"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "6"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "7"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "8"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7}, {1, 8}, {1, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
-            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -5349,50 +5263,16 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "10"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {2, 10}, {1, 9}, {1, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
-            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1

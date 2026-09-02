@@ -720,11 +720,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     return results;
 }
 
-std::vector<ErrorCode>
-MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
-                                                         const KeyVector &keys,
-                                                         const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                                                const KeyVector &keys,
+                                                                                const LocationIdsPerKey &location_ids,
+                                                                                int32_t &out_reclaimed_count) noexcept {
     out_reclaimed_count = 0;
     if (keys.empty()) {
         return {};
@@ -899,7 +898,6 @@ MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request
     }
     return results;
 }
-
 
 int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request_context,
                                                          const KeyVector &keys,
@@ -1866,6 +1864,23 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
         return cache_backend_->SampleReclaimKeys(request_context, count, out_keys);
     }
     return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
+}
+
+ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,
+                                                             const int64_t count,
+                                                             ReclaimCandidateVector &out_candidates) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    // Select the backend once for both key sampling and timestamp collection.
+    // During recovery, the persistent backend remains the complete source of
+    // truth; after recovery, the hot cache owns the LRU ordering.
+    MetaStorageBackend *backend = persistent_backend_.get();
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        backend = cache_backend_.get();
+    }
+    return backend->SampleReclaimCandidates(request_context, count, out_candidates);
 }
 
 ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noexcept {
