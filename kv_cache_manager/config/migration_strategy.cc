@@ -126,8 +126,11 @@ bool MigrationAdmissionConfig::ValidateRequiredFields(std::string &invalid_field
         valid = false;
         local_invalid_fields += "{mode}";
     }
-    if (policies_.size() > 1 ||
-        (mode_ != MigrationAdmissionMode::DISABLED && policies_.size() != 1)) {
+    // DISABLED may carry one validated dormant policy so operators can stage
+    // policy parameters before switching to SHADOW. The factory intentionally
+    // avoids constructing it until the mode is enabled, while JSON/proto keep
+    // round-tripping the configuration.
+    if (policies_.size() > 1 || (mode_ != MigrationAdmissionMode::DISABLED && policies_.size() != 1)) {
         valid = false;
         local_invalid_fields += "{policies_count}";
     }

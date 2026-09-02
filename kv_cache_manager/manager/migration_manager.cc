@@ -1111,10 +1111,15 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
             source_check_ec = EC_NOENT;
         }
     }
-    const bool source_matches = source_location != nullptr && source_location->status() == CLS_SERVING &&
-                                source_location->create_time() > 0 &&
-                                (request.src_create_time <= 0 ||
-                                 request.src_create_time == source_location->create_time());
+    // A prepared request always carries an exact generation, including the
+    // legacy value zero. An unprepared public Submit binds to the generation
+    // returned by this recheck; zero must not act as a wildcard for prepared
+    // requests or a same-id replacement could be accepted accidentally.
+    const bool has_prepared_source_snapshot = !request.src_specs.empty();
+    const bool source_matches =
+        source_location != nullptr && source_location->status() == CLS_SERVING &&
+        (!has_prepared_source_snapshot ||
+         (request.src_create_time >= 0 && request.src_create_time == source_location->create_time()));
     if (source_check_ec != EC_OK || !source_matches || source_location->location_specs().empty()) {
         std::lock_guard<std::mutex> lock(task_mutex_);
         RemovePreparingTaskLocked(request.instance_id, request.block_key);
@@ -1295,7 +1300,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                                     return request.instance_id == first_req.instance_id &&
                                            request.dst_storage_name == first_req.dst_storage_name &&
                                            !request.src_location_id.empty() && !request.src_storage_name.empty() &&
-                                           !request.src_specs.empty() && request.src_create_time > 0;
+                                           !request.src_specs.empty() && request.src_create_time >= 0;
                                 });
     if (!prepared_batch) {
         KVCM_LOG_WARN(

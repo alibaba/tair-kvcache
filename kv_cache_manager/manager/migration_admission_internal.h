@@ -74,11 +74,6 @@ enum class MigrationAdmissionVerdict {
     kUnknown,
 };
 
-enum class MigrationAdmissionPolicyType {
-    kRecentAccess,
-    kMinimumBusinessAccessCount,
-};
-
 enum class MigrationAdmissionReason {
     kSatisfied,
     kNotRecent,
@@ -91,7 +86,6 @@ enum class MigrationAdmissionReason {
 
 struct MigrationAdmissionDecision {
     MigrationAdmissionVerdict verdict = MigrationAdmissionVerdict::kUnknown;
-    MigrationAdmissionPolicyType policy_type = MigrationAdmissionPolicyType::kRecentAccess;
     MigrationAdmissionReason reason = MigrationAdmissionReason::kFeatureMissing;
 };
 

@@ -5,6 +5,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -672,11 +673,13 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                 source_location_lease_checker_(instance_id, block_key, location.id(), location.create_time())) {
                 continue;
             }
+            std::optional<int64_t> expected_create_time;
             if (expected_location_create_times != nullptr) {
                 const auto expected = expected_create_times_by_location.find(location.id());
-                if (expected == expected_create_times_by_location.end() || location.create_time() != expected->second) {
+                if (expected == expected_create_times_by_location.end()) {
                     continue;
                 }
+                expected_create_time = expected->second;
             }
             std::string expected_location_value;
             if (expected_location_values != nullptr) {
@@ -689,7 +692,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             location_cas_tasks.push_back({location.id(),
                                           location.status(),
                                           CacheLocationStatus::CLS_DELETING,
-                                          std::move(expected_location_value)});
+                                          std::move(expected_location_value),
+                                          expected_create_time});
         }
         if (location_cas_tasks.empty()) {
             continue;

@@ -2138,13 +2138,46 @@ MetaIndexer::GetMaintenancePropertyReadiness(const std::string &property_name) c
         return readiness;
     }
     readiness.capability = backend_manager_->GetMaintenancePropertyCapability(property_name);
-    readiness.valid_since_steady_us = maintenance_valid_since_steady_us_.load(std::memory_order_acquire);
+    if (readiness.capability == MaintenancePropertyCapability::kProcessLocalVolatile) {
+        // A cached backend opens before its asynchronous persistent-to-local
+        // recovery finishes. Do not let that time count toward recency
+        // warmup: late backfills receive process-local timestamps and must age
+        // for a full window after recovery is known complete.
+        if (backend_manager_->GetRecoverState() != MetaStorageBackendManager::RecoverState::kRunning) {
+            if (maintenance_valid_since_steady_us_.exchange(0, std::memory_order_acq_rel) != 0) {
+                maintenance_readiness_generation_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            readiness.valid_since_steady_us = 0;
+            readiness.generation = maintenance_readiness_generation_.load(std::memory_order_acquire);
+            return readiness;
+        }
+        int64_t valid_since = maintenance_valid_since_steady_us_.load(std::memory_order_acquire);
+        if (valid_since == 0) {
+            const int64_t recovery_complete_epoch = std::max<int64_t>(1, TimestampUtil::GetSteadyTimeUs());
+            int64_t expected = 0;
+            if (maintenance_valid_since_steady_us_.compare_exchange_strong(
+                    expected, recovery_complete_epoch, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                maintenance_readiness_generation_.fetch_add(1, std::memory_order_acq_rel);
+                valid_since = recovery_complete_epoch;
+            } else {
+                valid_since = expected;
+            }
+        }
+        readiness.valid_since_steady_us = valid_since;
+    } else {
+        readiness.valid_since_steady_us = maintenance_valid_since_steady_us_.load(std::memory_order_acquire);
+    }
     readiness.generation = maintenance_readiness_generation_.load(std::memory_order_acquire);
     return readiness;
 }
 
 void MetaIndexer::ResetMaintenancePropertyReadinessEpoch() noexcept {
-    maintenance_valid_since_steady_us_.store(TimestampUtil::GetSteadyTimeUs(), std::memory_order_release);
+    int64_t valid_since = 0;
+    if (backend_manager_ == nullptr ||
+        backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning) {
+        valid_since = std::max<int64_t>(1, TimestampUtil::GetSteadyTimeUs());
+    }
+    maintenance_valid_since_steady_us_.store(valid_since, std::memory_order_release);
     maintenance_readiness_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 

@@ -581,6 +581,30 @@ public:
         return (it == maps[0].end()) ? nullptr : it->second;
     }
 
+    void SetLocationCreateTimeForTest(int64_t block_key, const std::string &location_id, int64_t create_time) {
+        auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+        ASSERT_NE(nullptr, indexer);
+        auto modifier = [create_time](const std::vector<ErrorCode> &get_ecs,
+                                      const LocationIdVector &location_ids,
+                                      size_t /*key_index*/,
+                                      CacheLocationVector &locations,
+                                      PropertyMap & /*upsert_properties*/) -> LocationModifierResult {
+            if (get_ecs.size() != 1 || location_ids.size() != 1 || locations.size() != 1 || get_ecs[0] != EC_OK ||
+                locations[0] == nullptr) {
+                return {MA_FAIL, {EC_MISMATCH}};
+            }
+            auto replacement = std::make_shared<CacheLocation>(*locations[0]);
+            replacement->set_create_time(create_time);
+            locations[0] = std::move(replacement);
+            return {MA_OK, {EC_OK}};
+        };
+        RequestContext rc("set_location_create_time_for_test");
+        const auto result =
+            indexer->ReadModifyWriteLocationsForMaintenance(&rc, {block_key}, {{location_id}}, modifier, false);
+        ASSERT_EQ(EC_OK, result.ec);
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), result.per_location_error_codes);
+    }
+
     CacheLocationMap GetLocationMap(int64_t block_key) {
         auto request_context = std::make_shared<RequestContext>("get_location_map");
         MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
@@ -1365,15 +1389,20 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeMismatch) {
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
-// create_time=0 边界：源和 ctx 都默认 0，0==0 应视为匹配并正常 promote。
+// create_time=0 边界：模拟升级前持久化的 legacy Location。零是一个明确的旧 generation，
+// 不应被当作缺失字段或通配符。
 TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ct0_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "ct0_cold/"));
 
     int64_t block_key = 270;
-    // create_time=0(默认,不设)
     std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    // BatchAddLocation 会为新 Location 自动赋时；显式改回 0 才能真实覆盖 legacy 数据。
+    SetLocationCreateTimeForTest(block_key, src_loc, 0);
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(0, source->create_time());
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
     MigrationManager::MigrationRequest req;
@@ -1393,6 +1422,67 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
     ASSERT_EQ(1u, mgr.GetStats().copy_completed);
     ASSERT_EQ(0u, mgr.GetStats().copy_failed);
     ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
+}
+
+TEST_F(MigrationManagerTest, TestBatchSubmitAcceptsLegacyZeroSourceGeneration) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_cold/"));
+
+    const int64_t block_key = 271;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    SetLocationCreateTimeForTest(block_key, src_loc, 0);
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(0, source->create_time());
+
+    MigrationManager::MigrationRequest request;
+    request.instance_id = kInstance;
+    request.block_key = block_key;
+    request.src_location_id = src_loc;
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    request.src_specs = source->location_specs();
+    request.src_create_time = source->create_time();
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("legacy_zero_generation", {request});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+
+    mgr.OnTaskSuccess(kInstance, block_key);
+    ASSERT_EQ(1u, mgr.GetStats().copy_completed);
+    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, src_loc) == CLS_NOT_FOUND; }));
+}
+
+TEST_F(MigrationManagerTest, TestBatchSubmitDoesNotTreatZeroSourceGenerationAsWildcard) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_mismatch_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_mismatch_cold/"));
+
+    const int64_t block_key = 272;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_GT(source->create_time(), 0);
+
+    MigrationManager::MigrationRequest request;
+    request.instance_id = kInstance;
+    request.block_key = block_key;
+    request.src_location_id = src_loc;
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    request.src_specs = source->location_specs();
+    request.src_create_time = 0;
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("zero_generation_is_exact", {request});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), results);
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
 }
 
 TEST_F(MigrationManagerTest, TestSubmitThenFail) {

@@ -1466,7 +1466,7 @@ bool CacheReclaimer::MakeBatchByLRUWithSize(const RequestContext *request_contex
         out_lru_age_stats.Clear();
     }
 
-    if (out_batch.size() < batching_size) {
+    if (batching_size != std::numeric_limits<std::size_t>::max() && out_batch.size() < batching_size) {
         if (out_batch.size() != sampled_keys.size()) {
             // sampled_keys contains duplicated keys, log the event
             LOG_WITH_ID(DEBUG,

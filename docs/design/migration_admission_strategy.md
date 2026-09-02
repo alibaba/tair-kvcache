@@ -366,11 +366,6 @@ enum class MigrationAdmissionVerdict {
     kUnknown,
 };
 
-enum class MigrationAdmissionPolicyType {
-    kRecentAccess,
-    kMinimumBusinessAccessCount, // V2 启用
-};
-
 enum class MigrationAdmissionReason {
     kSatisfied,
     kNotRecent,
@@ -383,7 +378,6 @@ enum class MigrationAdmissionReason {
 
 struct MigrationAdmissionDecision {
     MigrationAdmissionVerdict verdict = MigrationAdmissionVerdict::kUnknown;
-    MigrationAdmissionPolicyType policy_type = MigrationAdmissionPolicyType::kRecentAccess;
     MigrationAdmissionReason reason = MigrationAdmissionReason::kFeatureMissing;
 };
 
@@ -524,9 +518,11 @@ lease contract：
 2. reservation 后立即通过 NoTouch 读取精确重检 source id、`CLS_SERVING` 和 create_time；失败则在任何目标分配前回滚 task/lease。
 3. Reclaimer、GC 以及其他会删除普通 Location 的自动维护路径，必须在真正的 metadata CAS/物理删除前检查 lease。只在候选采样时检查不够，因为删除请求可能早于 lease 入队、晚于 lease 获取后才执行。
 4. 已经排队的删除请求若在执行时发现 lease，必须跳过或延后，并重新读取状态，不能继续使用旧删除快照。
-5. Copy 成功后仍保留现有 source id/status/create_time 完成检查。目标 promote 为 SERVING 后，task owner 才能先结束源保护，再按精确 generation 条件删除 retention 指定的源；通用删除路径不能借此获得绕过 lease 的能力。
+5. Copy 成功后仍保留现有 source id/status/create_time 完成检查。目标 promote 为 SERVING 后，task owner 才能先结束源保护，再按精确 generation 条件删除 retention 指定的源；generation 条件必须在改变 Location status 的同一次 metadata RMW/CAS 内比较，不能只在 CAS 前读取并比较。通用删除路径不能借此获得绕过 lease 的能力。
 6. promote、失败、取消、prepare 回滚和超时等所有 terminal path 都必须释放 lease。若 task-owned 源删除异步执行，释放与提交条件删除的顺序必须保证目标已经 SERVING，且删除仍校验 source id/create_time。
 7. 显式管理删除若被定义为强制操作，应先取消并收敛对应 Copy，再删除源；不能静默绕过 lease。
+
+`create_time == 0` 是升级前 Location 可能存在的合法 legacy generation，不是“未提供”或通配符。prepared Copy 必须精确携带并比较 0；只有兼容性的单条 `Submit` 在明确未携带 prepared source snapshot 时，才从 reservation 后的 NoTouch 重检结果绑定当前 generation。
 
 该 lease 保护的是“Copy 读取期间源数据仍有效”，不是长期 pin。需记录 source-lease conflict、deferred delete、lease duration 和 `migration_copy_source_lost_written_bytes_total`，以发现任务泄漏或异常写放大。
 
@@ -708,16 +704,18 @@ MaintenancePropertyReadiness GetMaintenancePropertyReadiness(
     const std::string &property_name) const noexcept;
 ```
 
-Meta 层不识别 `MigrationAdmissionFeature`；manager/collector 把 `kLastAccessTime` 映射到 `PROPERTY_LRU_TIME`，再解释 capability。`valid_since_steady_us` 在进程启动、Leader generation 变化、hot cache 重建或其他破坏时间连续性的恢复事件后重置。warmup 时长使用 monotonic/steady clock，不能受 wall clock 回拨影响；policy 的 access age 仍按 `PROPERTY_LRU_TIME` 的 wall-clock 口径计算并校验未来时间。
+Meta 层不识别 `MigrationAdmissionFeature`；manager/collector 把 `kLastAccessTime` 映射到 `PROPERTY_LRU_TIME`，再解释 capability。`valid_since_steady_us` 在进程启动、Leader generation 变化、hot cache 重建或其他破坏时间连续性的恢复事件后重置。cached/dual backend 的异步 persistent-to-local 恢复期间必须保持为 0；恢复成功后才发布新 epoch，并从该时刻重新等待完整 window，不能把异步回填时间算进 warmup。warmup 时长使用 monotonic/steady clock，不能受 wall clock 回拨影响；policy 的 access age 仍按 `PROPERTY_LRU_TIME` 的 wall-clock 口径计算并校验未来时间。
 
 ENFORCE readiness 规则：
 
 1. 静态不支持 NoTouch property 或时间语义的 backend，配置校验/激活时拒绝 ENFORCE；SHADOW 可运行并记录 unsupported。
-2. process-local 时间只有在 `steady_now - valid_since_steady >= window` 时 ready；窗口被调大后按新窗口重新判断。
+2. process-local 时间只有在 backend 恢复完成、`valid_since_steady > 0` 且 `steady_now - valid_since_steady >= window` 时 ready；窗口被调大后按新窗口重新判断。
 3. runtime gate 每个 batch 都检查，不能只在配置写入时检查，因为已存在的 ENFORCE 配置会跨进程重启继续存在。
 4. ENFORCE route 未 ready 时进入显式 `NOT_READY`/suspended 状态：不把所有 key 计成普通 UNKNOWN reject。Admin 返回非 OK readiness 错误，Reclaimer 跳过该 route 并记录 reason。
 5. SHADOW 未 ready 时仍执行原有迁移，只记录预计 UNKNOWN 和 readiness 状态，保持行为中性。
 6. `kDurableAcrossRecovery` 只有在 backend 确实保存同一时间口径并通过恢复测试后才能免 warmup，不能仅因 property 可读取就宣称 durable。
+
+V1 的配置激活门禁按 `MetaIndexerConfig` 判断：纯 `local`，以及 `cached` 且有效 `cache_type` 为 `local`（缺省亦为 `local`）支持 recent-access；纯 Redis/async Redis/dummy 或 cached 的非 Local cache 不允许激活 ENFORCE。该静态门禁不替代每批 runtime readiness 检查。
 
 必须提供 route/instance 级 readiness gauge、not-ready reason 和 epoch age，防止 ENFORCE 因重启或误配置静默停止全部迁移。
 
@@ -784,6 +782,8 @@ MigrateCache
 8. 所有成功、失败、取消和超时出口释放 task/lease。
 
 价值拒绝发生在以上状态变化之前，不需要新增清理或回滚。reservation 后的源重检失败也必须发生在目标分配前；但只有删除路径共同遵守 lease 才能封闭重检后的竞态，单独增加一次重读不够。
+
+一次 Copy request 只绑定一个精确的 source Location generation。若同一 block 的多个 source Location 分别包含尚未覆盖的 specs，本轮选择第一个可执行 source 并只复制它的缺失 specs；后续迁移轮次基于更新后的 target coverage 再选择下一个 source。这是增量覆盖语义，不会把未选 source 的 specs 当作已经迁移。
 
 ### 8.4 Mark + StartWriteCache 路径
 
@@ -899,6 +899,7 @@ public:
 
 - 老配置缺少 admission 时等价于 DISABLED；
 - DISABLED 不构造 policy、不读取额外 feature，不改变候选的价值准入结果；迁移内部 location/Mark 改用 NoTouch 是独立的准确性修正，在 DISABLED 下也保留；
+- DISABLED 可保留一个参数合法的 dormant policy，便于先下发策略再切 SHADOW；该 policy 仍需校验并完整 round-trip，但在 mode 切换前不构造、不读取 feature；
 - SHADOW 读取并计算策略，但仍让候选进入现有执行准入；
 - ENFORCE 才从 Copy/Mark 候选中删除 policy REJECT/UNKNOWN 的 key；
 - SHADOW/ENFORCE 下 policies 为空、长度不等于 1、未知/empty oneof、非 recent-access 类型或参数非法，配置校验失败；
@@ -1007,7 +1008,7 @@ DispatchMigrationBatch(block_keys, params):
 1. policy 无 I/O、无可变状态，只消费当前 batch 的 typed features、evaluation context 和 immutable policy config。
 2. Local backend 对单 key 的 NoTouch snapshot 在同一 entry callback 中取 location 和 property；cached/dual backend 遵循在线 point-read 的 view/recovery 选择，可能组合 persistent location 与 hot-cache feature，不承诺跨 backend 事务快照，但必须分别返回两部分状态，也不得把 fallback 伪装成近期访问。
 3. NoTouch snapshot 与 task reservation 之间不建立事务。Copy 先用 snapshot 做快速 execution check；reservation 获取源 lease 后再 NoTouch 重检源 generation，随后由删除路径在整个 task 生命周期内遵守 lease。单次重检不能替代 lease。
-4. 源 lease 的匹配维度至少是 `(instance_id, block_key, location_id, create_time)`。相同 id 被复用时不能保护新一代 Location；pending delete 在最终执行时也必须重新检查 lease。
+4. 源 lease 的匹配维度至少是 `(instance_id, block_key, location_id, create_time)`。相同 id 被复用时不能保护新一代 Location；pending delete 在最终执行时也必须重新检查 lease，并在改变状态的同一次 CAS/RMW 内比较 expected create_time。legacy generation 0 同样精确匹配，不能被解释为“忽略 generation”。
 5. 临界窗口内一次业务访问与价值准入并发，允许该 block 本轮多迁移或少迁移一次，后续轮次会重新判断；maintenance mutation 不得通过保存/恢复时间覆盖这次真实访问。
 6. Instance 相同 block key 不能共享 features、lease 或结果。
 7. Leader 切换/进程重启可能重置进程内 LRU 时间；runtime readiness gate 重置 epoch，并让已有 ENFORCE route 进入显式 NOT_READY，而不是依靠人工操作或把所有 key 静默记为 UNKNOWN reject。
@@ -1255,6 +1256,7 @@ message MigrateCacheResponse {
 17. promote、prepare rollback、Copy 失败、取消、超时和 shutdown 均释放 source lease，无永久 pin；
 18. Mark batch 混合 INSERTED/ALREADY/CONFLICT/NOT_FOUND/WRITE_ERROR 时，返回、expiry、event 和 metrics 只按逐 key commit outcome 更新；
 19. Copy 成功后 source_lost 会清理目标并记录实际浪费写字节，不把它算成 value reject。
+20. prepared source generation 为 legacy 0 时可正常提交、完成和条件删除；同 id 被替换成其他 generation 时，最终删除 CAS 必须失败且不能删除替代 Location。
 
 ### 14.5 StartWrite/集成
 
@@ -1272,7 +1274,7 @@ message MigrateCacheResponse {
 
 1. unsupported backend 拒绝 ENFORCE 激活，SHADOW 仍执行原迁移并记录 unsupported；
 2. process-local recency epoch 未满 window 时 ENFORCE route 为 NOT_READY，Admin 返回非 OK、Reclaimer 跳过且不生成大量普通 UNKNOWN reject；
-3. 进程重启、Leader generation 变化和 hot cache 重建会重置 epoch；满一个 window 后自动恢复 READY；
+3. 进程重启、Leader generation 变化和 hot cache 重建会重置 epoch；异步恢复期间 epoch 保持无效，恢复完成后重新起算，满一个 window 后自动恢复 READY；
 4. 动态增大 window 会重新触发 readiness 判断；缩小 window 不伪造历史时间；
 5. durable capability 只有通过恢复连续性测试的 backend 才可免 warmup；
 6. readiness gauge、reason counter 和 epoch age 与实际 route 状态一致。
@@ -1295,8 +1297,9 @@ message MigrateCacheResponse {
 3. Dummy tiered-storage 默认模式运行 12 个场景：6 个 Admin/写路径场景通过，6 个 Reclaimer gated 场景按预期跳过；开启 `KVCM_TIERED_RUN_RECLAIMER_E2E=1` 后 11 个通过，1 个 F-25 场景按文档 intentional skip；
 4. main 的公平回收让 Reclaimer 能在 spec-group Admin 用例的两次手工 Copy 之间合法完成剩余 Copy，使第二次 Admin 请求返回 `SOURCE_NOT_FOUND`。这是外部 E2E harness 未隔离两个迁移 actor 的竞态；参照相邻 Admin Copy 用例，验证时仅在远端临时将该 route 的 `trigger_threshold` 设为 `0.99`，确保 Admin 是唯一迁移者。此 harness 调整不进入实现提交；
 5. E2E 覆盖 Admin Copy/Mark、spec-group partial coverage、Mark 消费/清理，以及 Reclaimer Copy、DELETE_SOURCE、KEEP_BOTH、BOTH fallback 和 Mark expiry；
-6. rebase 前的 `//kv_cache_manager/...` 回归共 114 个 test target：111 个通过、1 个按配置跳过，2 个失败已在干净基线复现为 internal PACE stub 类型问题。rebase 后尝试重跑全量时，main 新增的 Python external repository 依赖未在 202 新 output base 中缓存，清华 PyPI 镜像对 `requests==2.32.5` 返回 HTTP 403，已有 internal output base 又缺少新的 `orjson` repository，因此全量 target 在 analysis/fetch 阶段被环境阻断，不宣称 rebase 后的全量回归已通过；
-7. 以上是 Dummy backend 的功能与状态机回归，不替代生产 SHADOW 数据观测、真实 PACE 写量验证或 DWPD 评估。
+6. 针对 review 修复，在同一 202 容器重跑 config、MetaIndexer、MetaLocalBackend、MetaSearcher、MigrationManager、SchedulePlanExecutor、CacheReclaimer 和 metrics 8 个 target，全部通过；补充零代际精确匹配反例后再次单独运行 `MigrationManagerTest` 通过，并重新构建 `//kv_cache_manager:kv_cache_manager_bin` 成功；
+7. rebase 前的 `//kv_cache_manager/...` 回归共 114 个 test target：111 个通过、1 个按配置跳过，2 个失败已在干净基线复现为 internal PACE stub 类型问题。rebase 后尝试重跑全量时，main 新增的 Python external repository 依赖未在 202 新 output base 中缓存，清华 PyPI 镜像对 `requests==2.32.5` 返回 HTTP 403，已有 internal output base 又缺少新的 `orjson` repository，因此全量 target 在 analysis/fetch 阶段被环境阻断，不宣称 rebase 后的全量回归已通过；
+8. 以上是 Dummy backend 的功能与状态机回归，不替代生产 SHADOW 数据观测、真实 PACE 写量验证或 DWPD 评估。
 
 ## 15. V2 及后续：扩展访问策略
 

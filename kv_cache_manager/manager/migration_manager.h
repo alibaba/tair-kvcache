@@ -67,6 +67,8 @@ public:
         // DispatchMigrationBatch 生成的 prepared request 必须非空；单条 Submit 可留空，由
         // PrepareCopyTask 兼容性地重读 meta。
         std::vector<LocationSpec> src_specs;
+        // Exact source generation for prepared requests. Zero is valid for
+        // legacy locations and must not be treated as an omitted guard.
         int64_t src_create_time = 0;
     };
 
@@ -363,7 +365,8 @@ private:
         std::string instance_id;
         int64_t block_key = 0;
         std::string src_location_id;
-        int64_t src_create_time = 0; // 提交时源 location 的 create_time，OnTaskSuccess 比对以防 id 复用
+        // 提交时源 location 的精确 generation（legacy 0 也有效），用于防止 location id 复用。
+        int64_t src_create_time = 0;
         std::string src_storage_name;
         std::string dst_storage_name;
         std::string dst_location_id;

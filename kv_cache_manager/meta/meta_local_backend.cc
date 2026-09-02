@@ -355,16 +355,14 @@ ErrorCode MetaLocalBackend::UpsertForOneKey(KeyType key,
                 auto &existing_locations = item->GetMutableLocations();
                 for (const auto &[location_id, location] : locations) {
                     const auto existing = existing_locations.find(location_id);
-                    const ssize_t new_usage =
-                        location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
+                    const ssize_t new_usage = location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
                     if (existing == existing_locations.end()) {
                         charge_delta +=
-                            static_cast<ssize_t>(sizeof(void *) * 4 + location_id.size()) + new_usage;
+                            static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(location_id, location));
                         existing_locations.emplace(location_id, location);
                     } else {
-                        const ssize_t old_usage = existing->second
-                                                      ? static_cast<ssize_t>(existing->second->EstimateMemUsage())
-                                                      : 0;
+                        const ssize_t old_usage =
+                            existing->second ? static_cast<ssize_t>(existing->second->EstimateMemUsage()) : 0;
                         existing->second = location;
                         charge_delta += new_usage - old_usage;
                     }

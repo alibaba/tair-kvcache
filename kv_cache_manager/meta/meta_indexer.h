@@ -304,8 +304,10 @@ private:
     std::shared_ptr<QueryExecutor> query_executor_;
 
     std::atomic<int64_t> key_count_ = {0};
-    std::atomic<int64_t> maintenance_valid_since_steady_us_ = {0};
-    std::atomic<uint64_t> maintenance_readiness_generation_ = {0};
+    // Mutable because the first readiness query after asynchronous cache
+    // recovery publishes a conservative epoch without changing logical meta.
+    mutable std::atomic<int64_t> maintenance_valid_since_steady_us_ = {0};
+    mutable std::atomic<uint64_t> maintenance_readiness_generation_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;

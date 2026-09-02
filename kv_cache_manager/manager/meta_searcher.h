@@ -322,6 +322,10 @@ public:
         // This closes the gap between a cleanup scan and its status CAS when
         // a stable location id is refreshed by a newer snapshot.
         std::string expected_location_value;
+        // Optional generation checked in the same metadata RMW as the status
+        // transition. Zero is a valid legacy generation, so absence must be
+        // represented separately instead of using zero as a sentinel.
+        std::optional<int64_t> expected_create_time;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,

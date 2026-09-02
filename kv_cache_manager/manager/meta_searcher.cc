@@ -3265,6 +3265,8 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
             const auto &task = batch_tasks[key_index][loc_index];
             if ((!task.expected_location_value.empty() &&
                  locs[loc_index]->ToJsonString() != task.expected_location_value) ||
+                (task.expected_create_time.has_value() &&
+                 locs[loc_index]->create_time() != *task.expected_create_time) ||
                 locs[loc_index]->status() != task.old_status) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
             } else {

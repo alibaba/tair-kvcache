@@ -3802,6 +3802,41 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksExactLocationValue) {
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
 }
 
+TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksCreateTimeInsideRmw) {
+    MetaSearcher::KeyVector keys = {151};
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    CacheLocationVector locations = {location};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const int64_t create_time = location_maps[0].at(location_ids[0])->create_time();
+    ASSERT_GT(create_time, 0);
+
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> mismatch_tasks = {{
+        MetaSearcher::LocationCASTask{location_ids[0], CLS_WRITING, CLS_DELETING, "", create_time + 1},
+    }};
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, mismatch_tasks, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(CLS_WRITING, location_maps[0].at(location_ids[0])->status());
+
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> matching_tasks = {{
+        MetaSearcher::LocationCASTask{location_ids[0], CLS_WRITING, CLS_DELETING, "", create_time},
+    }};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, matching_tasks, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+}
+
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
     // 准备测试数据
     MetaSearcher::KeyVector keys = {400, 500, 600};
