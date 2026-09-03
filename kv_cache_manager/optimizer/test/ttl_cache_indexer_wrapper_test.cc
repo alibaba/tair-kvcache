@@ -40,6 +40,36 @@ TEST_F(TtlCacheIndexerWrapperTest, BasicExpiration) {
     EXPECT_EQ(3, wrapper.ttl_eviction_count());
 }
 
+TEST_F(TtlCacheIndexerWrapperTest, ExplicitTimestampOverridesLocalClock) {
+    auto clock = []() { return int64_t(1); };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer(), 10, clock);
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+    wrapper.ProcessKeysAtTimestamp({1}, 1000LL * 1000000000, hit_count, max_hit);
+    wrapper.ProcessKeysAtTimestamp({1}, 1005LL * 1000000000, hit_count, max_hit);
+    EXPECT_EQ(1, hit_count[0]);
+
+    wrapper.ProcessKeysAtTimestamp({1}, 1015LL * 1000000000, hit_count, max_hit);
+    EXPECT_EQ(0, hit_count[0]);
+    EXPECT_EQ(1, wrapper.ttl_eviction_count());
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, OutOfOrderTimestampDoesNotMoveTtlBackward) {
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer(), 10, []() { return int64_t(1); });
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+    wrapper.ProcessKeysAtTimestamp({1}, 1000LL * 1000000000, hit_count, max_hit);
+    wrapper.ProcessKeysAtTimestamp({1}, 1005LL * 1000000000, hit_count, max_hit);
+    EXPECT_EQ(1, hit_count[0]);
+
+    wrapper.ProcessKeysAtTimestamp({1}, 1002LL * 1000000000, hit_count, max_hit);
+    EXPECT_EQ(1, hit_count[0]);
+    wrapper.ProcessKeysAtTimestamp({1}, 1015LL * 1000000000, hit_count, max_hit);
+    EXPECT_EQ(0, hit_count[0]);
+}
+
 TEST_F(TtlCacheIndexerWrapperTest, SlidingTtlRefreshesExpiry) {
     int64_t now = 1000;
     auto clock = [&now]() { return now; };

@@ -138,8 +138,8 @@ ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
 `ProtoMessageJsonUtil` 会对 KVCM 当前协议使用的类型直接做 protobuf Reflection 与 RapidJSON
 之间的转换。新增或修改字段时需要确认其类型是否在以下支持范围内：
 
-- `int32`、`uint32`、`int64`、`uint64`、`float`、`double`、`bool`、`string` 和普通 enum
-  （不含 `google.protobuf.NullValue`）；
+- `int32`、`uint32`、`int64`、`uint64`、`float`、`double`、`bool`、`string`、以 Base64 JSON
+  字符串表示的 `bytes`，以及普通 enum（不含 `google.protobuf.NullValue`）；
 - 普通嵌套 message、repeated 和 oneof；
 - `map<string, string>`；
 - `google.protobuf.Int32Value` 和 `google.protobuf.Int64Value`。
@@ -162,7 +162,7 @@ JSON 语义相同、两边输出均可由另一边解析回原消息。
 顶层 message，并递归构造其嵌套类型。
 
 不在列表内的类型仍会回退到 protobuf 3.8 的通用 JSON 实现，功能不受影响，但 access log
-等热点路径无法获得加速。引入例如 `bytes`、其他 map 形态或其他 well-known type 时，应同时补充
+等热点路径无法获得加速。引入例如其他 map 形态或其他 well-known type 时，应同时补充
 `FastProtoJsonCodec` 的实现与兼容性测试，或者在评审中明确接受相关 message 回退，并调整上述测试。
 
 ### 5. 构建和测试

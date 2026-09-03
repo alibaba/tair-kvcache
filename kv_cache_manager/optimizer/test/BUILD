@@ -248,6 +248,8 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/event/spec_events",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer:optimizer_service_impl",
         "//kv_cache_manager/optimizer/config",
@@ -266,10 +268,20 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
-        "//kv_cache_manager/optimizer:optimizer_metrics_collector",
-        "//kv_cache_manager/optimizer:optimizer_metrics_reporter",
+        "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",
+        "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+    ],
+)
+
+cc_test(
+    name = "MrcWindowTest",
+    srcs = ["mrc_window_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+        "//kv_cache_manager/optimizer/metrics:mrc_window",
     ],
 )
 
@@ -283,5 +295,44 @@ cc_test(
         "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/optimizer:online_optimizer_server_config",
+    ],
+)
+
+cc_test(
+    name = "KvcmEventSubscriberTest",
+    srcs = [
+        "kvcm_event_subscriber_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
+        "//kv_cache_manager/common:static_service_discovery",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/optimizer:kvcm_event_subscriber",
+        "//kv_cache_manager/optimizer:online_optimizer_server_config",
+        "//kv_cache_manager/optimizer/metrics:optimizer_metrics_reporter",
+        "//kv_cache_manager/optimizer:optimizer_service_impl",
+        "//kv_cache_manager/optimizer/config:online_optimizer_config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "@grpc//:grpc++",
+    ],
+)
+
+cc_test(
+    name = "OnlineOptimizerServerEventSubscriptionTest",
+    srcs = [
+        "online_optimizer_server_event_subscription_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/optimizer:kvcm_event_subscriber",
+        "//kv_cache_manager/optimizer:online_optimizer_server",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "@grpc//:grpc++",
     ],
 )

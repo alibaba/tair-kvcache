@@ -4,6 +4,7 @@ filegroup(
     name = "default_optimizer_confs",
     srcs = [
         "default_optimizer_config.json",
+        "//package/etc:default_logger_config.conf",
     ],
     visibility = ["//visibility:public"],
 )
