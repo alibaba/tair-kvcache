@@ -35,6 +35,16 @@ using KeyVector = std::vector<KeyType>;
 // still reference the old `KeyTypeVec` spelling.
 using KeyTypeVec = KeyVector;
 
+// A key selected for LRU reclamation together with the access timestamp used
+// to rank it. A zero timestamp means that the backend could not provide a
+// usable value; callers preserve the historical best-effort behavior by
+// treating such candidates as the oldest entries.
+struct ReclaimCandidate {
+    KeyType key = 0;
+    int64_t last_access_time_us = 0;
+};
+using ReclaimCandidateVector = std::vector<ReclaimCandidate>;
+
 using FieldMap = std::map<std::string, std::string>;
 using FieldMapVec = std::vector<FieldMap>;
 

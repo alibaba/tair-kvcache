@@ -958,13 +958,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 }
             }
         }
-        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(trace_id,
-                                                                          ephemeral_request_context.get(),
-                                                                          delete_batch,
-                                                                          keys,
-                                                                          stats,
-                                                                          rmw_result,
-                                                                          maintenance_no_touch);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(
+            trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result, maintenance_no_touch);
         (void)delete_errs;
         const bool maintenance_delete_synced = !maintenance_no_touch || delete_batch.batch_keys.empty() ||
                                                !backend_manager_->RequiresMaintenancePostDeleteSync() ||
@@ -979,9 +974,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             // accounting boundary, and replacing those results with TIMEOUT
             // would permanently leak usage when the delete has already been
             // applied and is therefore absent from the next scan.
-            PREFIX_INDEXER_LOG(WARN,
-                               "maintenance post-delete Sync failed for keys[%lu]",
-                               delete_batch.batch_keys.size());
+            PREFIX_INDEXER_LOG(
+                WARN, "maintenance post-delete Sync failed for keys[%lu]", delete_batch.batch_keys.size());
             for (const int32_t global_idx : delete_batch.batch_indexs) {
                 key_level_failures[global_idx] = true;
             }
@@ -1350,7 +1344,6 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     }
     return result;
 }
-
 
 MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {
@@ -1956,6 +1949,23 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
                        instance_id_.c_str(),
                        count,
                        out_keys.size());
+    }
+    return ec;
+}
+
+ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
+                                               const int64_t count,
+                                               ReclaimCandidateVector &out_candidates) const noexcept {
+    out_candidates.clear();
+    if (count > 0) {
+        out_candidates.reserve(static_cast<size_t>(count));
+    }
+    const ErrorCode ec = backend_manager_->SampleReclaimCandidates(request_context, count, out_candidates);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim candidates failed, count[%lu] candidate size[%lu]",
+                       instance_id_.c_str(),
+                       count,
+                       out_candidates.size());
     }
     return ec;
 }

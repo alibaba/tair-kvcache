@@ -386,6 +386,16 @@ public: // other function definitions
     // Returns the number of keys actually collected.
     size_t GetOldestKeys(size_t count, std::vector<std::string> &out_keys);
 
+    // Applies `callback` to the next `count` entries in an oldest-to-newest
+    // sampling scan while holding the shard mutex. A scan may wrap once but
+    // visits each entry at most once. The independent cursor is advanced
+    // without promoting or otherwise touching entries.
+    size_t ApplyToNextOldestEntries(
+        size_t count,
+        const std::function<void(
+            const std::string_view &key, Cache::ObjectPtr value, size_t charge, const Cache::CacheItemHelper *helper)>
+            &callback);
+
     // Set the shard id and tail-change callback for this shard.
     // The callback is invoked inside the shard mutex whenever the LRU tail changes.
     void SetTailChangeCallback(uint32_t shard_id, const Cache::TailChangeCallback &callback);
@@ -461,6 +471,11 @@ private:
     // lru.prev is newest entry, lru.next is oldest entry.
     // LRU contains items which can be evicted, ie reference only by cache
     LRUHandle lru_;
+
+    // Next entry in the no-touch oldest-to-newest sampling scan. This pointer
+    // is protected by mutex_ and is advanced before a pointed-to LRU entry is
+    // unlinked, so it never outlives an entry.
+    LRUHandle *oldest_sampling_cursor_;
 
     // Pointer to head of low-pri pool in LRU list.
     LRUHandle *lru_low_pri_;
@@ -538,6 +553,13 @@ public:
 
     // Returns up to `count` oldest keys from the specified shard.
     size_t GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vector<std::string> &out_keys) override;
+
+    size_t ApplyToNextOldestEntriesInShard(
+        uint32_t shard_id,
+        size_t count,
+        const std::function<
+            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
+        override;
 
     // Register a callback invoked whenever the LRU tail of any shard changes.
     void SetTailChangeCallback(TailChangeCallback callback) override;

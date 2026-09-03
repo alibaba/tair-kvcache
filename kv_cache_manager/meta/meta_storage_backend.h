@@ -451,6 +451,18 @@ public:
     virtual ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
 
+    // Samples reclaim candidates and returns the timestamp used for LRU
+    // ranking as part of the same logical operation. Implementations must not
+    // update access timestamps, promote entries in an LRU list, or observe a
+    // revisit interval. A composite backend may merge a complete persistent
+    // key sample with newer no-touch cache timestamps. If sampling succeeds
+    // but a timestamp is unavailable or malformed, the candidate is returned
+    // with last_access_time_us == 0 to preserve the reclaimer's historical
+    // best-effort degradation.
+    virtual ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                              int64_t count,
+                                              ReclaimCandidateVector &out_candidates) noexcept = 0;
+
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）
     // =====================================================================

@@ -479,6 +479,29 @@ ErrorCode MetaDummyBackend::SampleReclaimKeys(RequestContext *request_context,
     return RandomSample(request_context, count, out_keys);
 }
 
+ErrorCode MetaDummyBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
+                                                    const std::int64_t count,
+                                                    ReclaimCandidateVector &out_candidates) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    table_.ForEachKV([&](const KeyType &key, const DummyItem &item) {
+        if (static_cast<int64_t>(out_candidates.size()) >= count) {
+            return false;
+        }
+        int64_t last_access_time_us = 0;
+        if (const auto it = item.properties.find(PROPERTY_LRU_TIME); it != item.properties.end()) {
+            if (!StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+                last_access_time_us = 0;
+            }
+        }
+        out_candidates.push_back({key, last_access_time_us});
+        return true;
+    });
+    return EC_OK;
+}
+
 // ---------------------------------------------------------------------------
 // Metadata operations
 // ---------------------------------------------------------------------------

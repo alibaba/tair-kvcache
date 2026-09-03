@@ -720,11 +720,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     return results;
 }
 
-std::vector<ErrorCode>
-MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
-                                                         const KeyVector &keys,
-                                                         const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                                                const KeyVector &keys,
+                                                                                const LocationIdsPerKey &location_ids,
+                                                                                int32_t &out_reclaimed_count) noexcept {
     out_reclaimed_count = 0;
     if (keys.empty()) {
         return {};
@@ -899,7 +898,6 @@ MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request
     }
     return results;
 }
-
 
 int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request_context,
                                                          const KeyVector &keys,
@@ -1866,6 +1864,66 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
         return cache_backend_->SampleReclaimKeys(request_context, count, out_keys);
     }
     return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
+}
+
+ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,
+                                                             const int64_t count,
+                                                             ReclaimCandidateVector &out_candidates) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    if (!cache_backend_) {
+        return persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+    }
+
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+    }
+
+    // The persistent layer is the only complete key source while recovery is
+    // still backfilling the hot cache. Its timestamps can be stale, however,
+    // so overlay every cache hit with the current in-memory timestamp using a
+    // no-touch exact-key lookup. Cache misses retain the persistent timestamp.
+    ErrorCode ec = persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+    if (ec != EC_OK) {
+        out_candidates.clear();
+        return ec;
+    }
+    if (out_candidates.empty()) {
+        return EC_OK;
+    }
+
+    KeyTypeVec keys;
+    keys.reserve(out_candidates.size());
+    for (const auto &candidate : out_candidates) {
+        keys.push_back(candidate.key);
+    }
+
+    std::vector<int64_t> cache_access_times;
+    const std::vector<ErrorCode> cache_results =
+        cache_backend_->GetLastAccessTimesForMaintenance(request_context, keys, cache_access_times);
+    if (cache_results.size() != out_candidates.size() || cache_access_times.size() != out_candidates.size()) {
+        KVCM_LOG_ERROR("cache reclaim timestamp results[%lu] timestamps[%lu] mismatch candidates[%lu]",
+                       cache_results.size(),
+                       cache_access_times.size(),
+                       out_candidates.size());
+        out_candidates.clear();
+        return EC_ERROR;
+    }
+
+    for (size_t i = 0; i < out_candidates.size(); ++i) {
+        if (cache_results[i] == EC_OK) {
+            out_candidates[i].last_access_time_us = cache_access_times[i];
+        } else if (cache_results[i] != EC_NOENT) {
+            KVCM_LOG_ERROR("cache reclaim timestamp lookup failed, key[%ld] ec[%d]",
+                           out_candidates[i].key,
+                           static_cast<int>(cache_results[i]));
+            out_candidates.clear();
+            return cache_results[i];
+        }
+    }
+    return EC_OK;
 }
 
 ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noexcept {
