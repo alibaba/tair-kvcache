@@ -481,14 +481,26 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
             // applying the reporter generation fence. Reuse that result.
             const bool specs_already_validated =
                 request_check_location != nullptr && is_event_report && location_info.has_reporter_identity;
+            const auto visit_logical_hosts = [&](std::string_view spec_name) {
+                if (location_info.logical_hosts && !location_info.logical_hosts->empty()) {
+                    for (const auto &logical_host : *location_info.logical_hosts) {
+                        visitor(std::string_view(logical_host),
+                                spec_name,
+                                is_vineyard,
+                                location_info.reporter_host);
+                    }
+                    return;
+                }
+                visitor(location_info.reporter_host, spec_name, is_vineyard, location_info.reporter_host);
+            };
             if (!visit_spec_names) {
                 if (specs_already_validated) {
-                    visitor(location_info.reporter_host, std::string_view{}, is_vineyard);
+                    visit_logical_hosts(std::string_view{});
                     continue;
                 }
                 for (const auto &spec : loc->location_specs()) {
                     if (StandardUri(spec.uri()).Valid()) {
-                        visitor(location_info.reporter_host, std::string_view{}, is_vineyard);
+                        visit_logical_hosts(std::string_view{});
                         break;
                     }
                 }
@@ -498,7 +510,7 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
                 if (!specs_already_validated && !StandardUri(spec.uri()).Valid()) {
                     continue;
                 }
-                visitor(location_info.reporter_host, std::string_view(spec.name()), is_vineyard);
+                visit_logical_hosts(std::string_view(spec.name()));
             }
             continue;
         }
@@ -510,7 +522,7 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
             }
             const std::string host = uri.GetHostPort();
             if (!host.empty()) {
-                visitor(std::string_view(host), std::string_view(spec.name()), false);
+                visitor(std::string_view(host), std::string_view(spec.name()), false, std::string_view(host));
             }
         }
     }
@@ -527,7 +539,9 @@ void BuildHostsForOneKey(const LocationRange &locations,
                             request_check_location,
                             medium_set,
                             false,
-                            [&hosts](std::string_view host, std::string_view, bool) { hosts.emplace_back(host); });
+                            [&hosts](std::string_view host, std::string_view, bool, std::string_view) {
+                                hosts.emplace_back(host);
+                            });
     std::sort(hosts.begin(), hosts.end());
     hosts.erase(std::unique(hosts.begin(), hosts.end()), hosts.end());
 }
@@ -544,7 +558,8 @@ void BuildCandidatePresenceForOneKey(const LocationRange &locations,
                             request_check_location,
                             medium_set,
                             false,
-                            [&candidate_hosts, presence_words](std::string_view host, std::string_view, bool) {
+                            [&candidate_hosts, presence_words](
+                                std::string_view host, std::string_view, bool, std::string_view) {
                                 const auto it =
                                     std::lower_bound(candidate_hosts.begin(),
                                                      candidate_hosts.end(),
@@ -601,11 +616,17 @@ void BuildHostSpecNamesForOneKey(const LocationRange &locations,
         request_check_location,
         medium_set,
         true,
-        [&host_specs, &vineyard_host_specs](std::string_view host, std::string_view spec_name, bool is_vineyard) {
+        [&host_specs, &vineyard_host_specs](std::string_view host,
+                                           std::string_view spec_name,
+                                           bool is_vineyard,
+                                           std::string_view physical_reporter) {
             auto &local_names = host_specs[std::string(host)];
             local_names.emplace(spec_name);
             if (is_vineyard) {
-                vineyard_host_specs[std::string(host)].emplace(spec_name);
+                // Keep one P2P candidate per physical EventReport reporter.
+                // A shared L2 reporter may project onto several logical ranks,
+                // but must not become several Vineyard peers.
+                vineyard_host_specs[std::string(physical_reporter)].emplace(spec_name);
             }
         });
 }
@@ -1114,7 +1135,7 @@ ErrorCode PrefixMatchWithMambaByHostWithoutP2P(MetaIndexer *meta_indexer,
                 medium_set,
                 true,
                 [&candidate_hosts, &required_spec_names, &seen_words, &host_present, spec_word_count](
-                    std::string_view host, std::string_view spec_name, bool) {
+                    std::string_view host, std::string_view spec_name, bool, std::string_view) {
                     const auto host_it = std::lower_bound(candidate_hosts.begin(),
                                                           candidate_hosts.end(),
                                                           host,
