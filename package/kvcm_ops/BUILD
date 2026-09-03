@@ -19,9 +19,34 @@ py_wheel(
     name = "kvcm_ops_wheel",
     distribution = "kvcm_ops",
     python_tag = "py3",
+    requires_file = "//open_source/deps:requirements_kvcm_ops.txt",
     strip_path_prefixes = ["package"],
     version = "0.1.0",
     deps = [":kvcm_ops_lib"],
+)
+
+py_test(
+    name = "wheel_metadata_test",
+    size = "small",
+    srcs = ["test/wheel_metadata_test.py"],
+    args = [
+        "$(location :kvcm_ops_wheel)",
+        "$(location //open_source/deps:requirements_kvcm_ops.txt)",
+    ],
+    data = [
+        ":kvcm_ops_wheel",
+        "//open_source/deps:requirements_kvcm_ops.txt",
+    ],
+    main = "test/wheel_metadata_test.py",
+)
+
+py_test(
+    name = "wheel_install_test",
+    size = "medium",
+    srcs = ["test/wheel_install_test.py"],
+    args = ["$(location :kvcm_ops_wheel)"],
+    data = [":kvcm_ops_wheel"],
+    main = "test/wheel_install_test.py",
 )
 
 py_test(
