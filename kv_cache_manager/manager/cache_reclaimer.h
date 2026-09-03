@@ -66,10 +66,10 @@ struct PlanExecuteResult;
 
 struct CacheReclaimerAsyncDeleteConfig {
     std::uint64_t inflight_delete_timeout_ms{60000};
-    std::uint64_t pending_location_limit_per_group_type{100000};
-    std::uint64_t pending_bytes_limit_per_group_type{64ULL * 1024 * 1024 * 1024};
+    std::uint64_t pending_location_limit_per_group_type{20000};
+    std::uint64_t pending_bytes_limit_per_group_type{1ULL * 1024 * 1024 * 1024 * 1024};
     std::uint64_t pending_delete_handler_limit{1024};
-    std::uint64_t pending_bytes_limit{256ULL * 1024 * 1024 * 1024};
+    std::uint64_t pending_bytes_limit{4ULL * 1024 * 1024 * 1024 * 1024};
 };
 
 /**
