@@ -36,6 +36,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+        ASSERT_FALSE(config.IsReadFailureInvalidationEnabled());
     }
     // config_file not exist
     {
@@ -302,6 +303,16 @@ TEST_F(ServerConfigTest, TestCacheGcConfig) {
     environ["kvcm.cache_gc.event_report_cleanup_enabled"] = "false";
     ASSERT_TRUE(config.Parse("", environ));
     EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, TestReadFailureInvalidationConfig) {
+    ServerConfig enabled;
+    ASSERT_TRUE(enabled.Parse("", {{"kvcm.event_report.read_failure_enabled", "true"}}));
+    ASSERT_TRUE(enabled.Check());
+    EXPECT_TRUE(enabled.IsReadFailureInvalidationEnabled());
+
+    ServerConfig malformed;
+    EXPECT_FALSE(malformed.Parse("", {{"kvcm.event_report.read_failure_enabled", "1"}}));
 }
 
 TEST_F(ServerConfigTest, TestMalformedNumericEnvironmentValueReturnsParseError) {

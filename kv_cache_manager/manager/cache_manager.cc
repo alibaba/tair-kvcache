@@ -448,7 +448,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint32_t meta_query_worker_count,
                         std::size_t meta_query_parallel_threshold,
                         std::size_t meta_query_chunk_size,
-                        CacheGarbageCollector::Config cache_gc_config) {
+                        CacheGarbageCollector::Config cache_gc_config,
+                        ReadFailureInvalidationConfig read_failure_invalidation_config) {
     if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
         schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
         KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
@@ -456,6 +457,7 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                        schedule_plan_migration_worker_budget);
         return false;
     }
+    read_failure_invalidation_config_ = read_failure_invalidation_config;
     if (meta_query_worker_count == 0 || meta_query_worker_count > 64 || meta_query_parallel_threshold == 0 ||
         meta_query_chunk_size == 0 || meta_query_chunk_size > meta_query_parallel_threshold ||
         !meta_indexer_manager_->ConfigureQueryExecutor(
@@ -657,7 +659,6 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
 
     InvalidateInstanceMetrics(instance_id);
-
     ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
     PREFIX_LOG(INFO, "remove instance OK");
@@ -2630,7 +2631,312 @@ bool IsEventReportLocationReadable(const CacheLocation &location,
     return contains_readable_version;
 }
 
+bool IsValidObservedReadFailureUri(const std::string &uri) {
+    std::string_view snapshot_version;
+    return SnapshotUriUtils::InspectSnapshotUriForVisibility(uri, snapshot_version) && !snapshot_version.empty();
+}
+
 } // namespace
+
+ErrorCode CacheManager::ReportBlockReadFailures(RequestContext *request_context,
+                                                const proto::meta::ReportEventRequest *request,
+                                                proto::meta::ReportEventResponse *response,
+                                                DataStorageType requested_type) {
+    const std::string &trace_id = request_context->trace_id();
+    const std::string &instance_id = request->instance_id();
+    const std::string &observer = request->host_ip_port();
+    auto *response_status = response->mutable_header()->mutable_status();
+    const std::string metrics_type = ToString(requested_type);
+    auto record_outcome = [&](const char *outcome, std::size_t count) {
+        if (!metrics_registry_ || count == 0) {
+            return;
+        }
+        std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
+        const std::string instance_group = registry_manager_->GetInstanceGroupName(instance_id);
+        if (instance_group.empty()) {
+            return;
+        }
+        MetricsTags tags = {{"instance_group", instance_group},
+                            {"instance_id", instance_id},
+                            {"type", metrics_type},
+                            {"outcome", outcome}};
+        metrics_registry_->GetCounter("event_report.read_failure_spec_counter", tags) += count;
+    };
+    auto reject = [&](ErrorCode ec,
+                      proto::meta::ErrorCode pb_ec,
+                      const char *outcome,
+                      const std::string &message,
+                      std::size_t count) {
+        record_outcome(outcome, std::max<std::size_t>(count, 1));
+        response_status->set_code(pb_ec);
+        response_status->set_message(message);
+        KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_READ_FAILED rejected: %s, instance [%s], observer [%s], "
+                      "storage_type [%s]",
+                      trace_id.c_str(),
+                      message.c_str(),
+                      instance_id.c_str(),
+                      observer.c_str(),
+                      metrics_type.c_str());
+        return ec;
+    };
+
+    if (requested_type != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+        return reject(EC_BADARGS,
+                      proto::meta::INVALID_ARGUMENT,
+                      "invalid",
+                      "EVENT_BLOCK_READ_FAILED supports only ST_EVENT_REPORT_L2",
+                      1);
+    }
+
+    std::size_t declared_spec_count = 0;
+    for (const auto &event : request->events()) {
+        if (event.event_type() != proto::meta::EVENT_BLOCK_READ_FAILED || !event.has_block_read_failed()) {
+            return reject(EC_BADARGS,
+                          proto::meta::INVALID_ARGUMENT,
+                          "invalid",
+                          "EVENT_BLOCK_READ_FAILED cannot be mixed with other events or payloads",
+                          declared_spec_count);
+        }
+        declared_spec_count += static_cast<std::size_t>(event.block_read_failed().specs_size());
+    }
+    if (registry_manager_->GetInstanceGroupName(instance_id).empty()) {
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("instance metadata not found for read-failure invalidation");
+        return EC_INSTANCE_NOT_EXIST;
+    }
+    if (!read_failure_invalidation_config_.enabled) {
+        return reject(EC_BADARGS,
+                      proto::meta::INVALID_ARGUMENT,
+                      "disabled",
+                      "read-failure invalidation is disabled",
+                      declared_spec_count);
+    }
+
+    struct ReadFailureObservation {
+        std::string name;
+        std::string observed_uri;
+        int event_index = 0;
+    };
+    struct ReadFailureBlock {
+        int64_t block_key = 0;
+        std::vector<ReadFailureObservation> observations;
+    };
+    std::vector<ReadFailureBlock> blocks;
+    std::unordered_map<int64_t, std::size_t> block_indices;
+    blocks.reserve(request->events_size());
+    block_indices.reserve(request->events_size());
+    std::size_t requested_spec_count = 0;
+    for (int event_index = 0; event_index < request->events_size(); ++event_index) {
+        const auto &event = request->events(event_index);
+        const auto &params = event.block_read_failed();
+        int64_t block_key = 0;
+        if (!ParseInt64(params.block_key(), block_key) || params.specs_size() == 0) {
+            return reject(EC_BADARGS,
+                          proto::meta::INVALID_ARGUMENT,
+                          "invalid",
+                          "invalid read-failure block_key or empty specs",
+                          requested_spec_count);
+        }
+        auto [block_it, inserted] = block_indices.emplace(block_key, blocks.size());
+        if (inserted) {
+            blocks.push_back(ReadFailureBlock{block_key, {}});
+        }
+        auto &observations = blocks[block_it->second].observations;
+        observations.reserve(observations.size() + params.specs_size());
+        for (const auto &spec : params.specs()) {
+            ++requested_spec_count;
+            if (spec.name().empty() || !IsValidObservedReadFailureUri(spec.observed_uri())) {
+                return reject(EC_BADARGS,
+                              proto::meta::INVALID_ARGUMENT,
+                              "invalid",
+                              "invalid read-failure spec name or observed_uri",
+                              requested_spec_count);
+            }
+            observations.push_back(ReadFailureObservation{spec.name(), spec.observed_uri(), event_index});
+        }
+    }
+    record_outcome("requested", requested_spec_count);
+
+    auto event_backend = LookupEventReportBackend(registry_manager_, instance_id, requested_type, true);
+    if (!event_backend) {
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("EventReportBackend not found for read-failure invalidation");
+        return EC_INSTANCE_NOT_EXIST;
+    }
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!meta_searcher || !instance_info) {
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("instance metadata not found for read-failure invalidation");
+        return EC_INSTANCE_NOT_EXIST;
+    }
+    KeyVector keys;
+    keys.reserve(blocks.size());
+    for (const auto &block : blocks) {
+        keys.push_back(block.block_key);
+    }
+    std::vector<CacheLocationMap> location_maps;
+    std::vector<ErrorCode> read_results;
+    const ErrorCode discovery_ec =
+        meta_searcher->BatchGetLocation(request_context, keys, BlockMask{}, location_maps, &read_results);
+    if (discovery_ec != EC_OK || location_maps.size() != keys.size() || read_results.size() != keys.size()) {
+        response_status->set_code(proto::meta::INTERNAL_ERROR);
+        response_status->set_message("failed to discover read-failure candidate locations");
+        return discovery_ec == EC_OK ? EC_MISMATCH : discovery_ec;
+    }
+
+    std::vector<ErrorCode> per_item_ec(request->events_size(), EC_OK);
+    std::vector<MetaSearcher::ConditionalSpecRemovalOutcome> aggregate_outcomes(
+        requested_spec_count, MetaSearcher::ConditionalSpecRemovalOutcome::kNoent);
+    std::vector<std::pair<std::size_t, std::size_t>> observation_offsets(blocks.size());
+    std::size_t observation_offset = 0;
+    for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        observation_offsets[block_index] = {observation_offset, blocks[block_index].observations.size()};
+        observation_offset += blocks[block_index].observations.size();
+        if (read_results[block_index] != EC_OK && read_results[block_index] != EC_NOENT) {
+            for (const auto &observation : blocks[block_index].observations) {
+                per_item_ec[observation.event_index] = read_results[block_index];
+            }
+        }
+    }
+
+    KeyVector mutation_keys;
+    std::vector<std::vector<MetaSearcher::ConditionalDeleteLocationSpecsTask>> mutation_tasks;
+    std::vector<std::size_t> mutation_to_block;
+    for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        if (read_results[block_index] != EC_OK) {
+            continue;
+        }
+        std::vector<MetaSearcher::ConditionalDeleteLocationSpecsTask> tasks;
+        for (const auto &[location_id, location] : location_maps[block_index]) {
+            if (!location || location->type() != requested_type) {
+                continue;
+            }
+            MetaSearcher::ConditionalDeleteLocationSpecsTask task;
+            task.location_id = location_id;
+            task.type = requested_type;
+            task.specs.reserve(blocks[block_index].observations.size());
+            for (const auto &observation : blocks[block_index].observations) {
+                task.specs.push_back({observation.name, observation.observed_uri});
+            }
+            tasks.push_back(std::move(task));
+        }
+        if (!tasks.empty()) {
+            mutation_keys.push_back(blocks[block_index].block_key);
+            mutation_tasks.push_back(std::move(tasks));
+            mutation_to_block.push_back(block_index);
+        }
+    }
+
+    std::size_t applied_count = 0;
+    if (!mutation_keys.empty()) {
+        std::vector<std::vector<MetaSearcher::ConditionalDeleteLocationSpecsResult>> mutation_results;
+        const ErrorCode mutation_ec = meta_searcher->BatchDeleteLocationSpecsIfMatch(
+            request_context, mutation_keys, mutation_tasks, mutation_results);
+        if (mutation_results.size() != mutation_keys.size()) {
+            response_status->set_code(proto::meta::INTERNAL_ERROR);
+            response_status->set_message("read-failure mutation result size mismatch");
+            return mutation_ec == EC_OK ? EC_MISMATCH : mutation_ec;
+        }
+        for (std::size_t mutation_index = 0; mutation_index < mutation_results.size(); ++mutation_index) {
+            const std::size_t block_index = mutation_to_block[mutation_index];
+            const auto [block_offset, block_observation_count] = observation_offsets[block_index];
+            if (mutation_results[mutation_index].size() != mutation_tasks[mutation_index].size()) {
+                for (const auto &observation : blocks[block_index].observations) {
+                    per_item_ec[observation.event_index] = EC_MISMATCH;
+                }
+                continue;
+            }
+            for (const auto &task_result : mutation_results[mutation_index]) {
+                if (task_result.ec != EC_OK || task_result.spec_outcomes.size() != block_observation_count) {
+                    const ErrorCode ec = task_result.ec == EC_OK ? EC_MISMATCH : task_result.ec;
+                    for (const auto &observation : blocks[block_index].observations) {
+                        per_item_ec[observation.event_index] = ec;
+                    }
+                    continue;
+                }
+                applied_count += task_result.removed_spec_count;
+                for (std::size_t spec_index = 0; spec_index < task_result.spec_outcomes.size(); ++spec_index) {
+                    aggregate_outcomes[block_offset + spec_index] =
+                        std::max(aggregate_outcomes[block_offset + spec_index], task_result.spec_outcomes[spec_index]);
+                }
+            }
+        }
+        if (mutation_ec != EC_OK && mutation_ec != EC_PARTIAL_OK) {
+            for (std::size_t mutation_index = 0; mutation_index < mutation_to_block.size(); ++mutation_index) {
+                const auto &block = blocks[mutation_to_block[mutation_index]];
+                for (const auto &observation : block.observations) {
+                    if (per_item_ec[observation.event_index] == EC_OK) {
+                        per_item_ec[observation.event_index] = mutation_ec;
+                    }
+                }
+            }
+        }
+    }
+
+    std::size_t noent_count = 0;
+    std::size_t mismatch_count = 0;
+    std::size_t error_count = 0;
+    for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        const auto [block_offset, block_observation_count] = observation_offsets[block_index];
+        for (std::size_t spec_index = 0; spec_index < block_observation_count; ++spec_index) {
+            if (per_item_ec[blocks[block_index].observations[spec_index].event_index] != EC_OK) {
+                ++error_count;
+                continue;
+            }
+            const auto outcome = aggregate_outcomes[block_offset + spec_index];
+            if (outcome == MetaSearcher::ConditionalSpecRemovalOutcome::kMismatch) {
+                ++mismatch_count;
+            } else if (outcome == MetaSearcher::ConditionalSpecRemovalOutcome::kNoent) {
+                ++noent_count;
+            }
+        }
+    }
+    record_outcome("applied", applied_count);
+    record_outcome("noent", noent_count);
+    record_outcome("mismatch", mismatch_count);
+    record_outcome("error", error_count);
+    KVCM_LOG_INFO("trace_id [%s] | EVENT_BLOCK_READ_FAILED: requested=%zu applied=%zu noent=%zu mismatch=%zu "
+                  "error=%zu, instance [%s], observer [%s], storage_type [%s]",
+                  trace_id.c_str(),
+                  requested_spec_count,
+                  applied_count,
+                  noent_count,
+                  mismatch_count,
+                  error_count,
+                  instance_id.c_str(),
+                  observer.c_str(),
+                  metrics_type.c_str());
+
+    auto map_error = [](ErrorCode ec) {
+        switch (ec) {
+        case EC_OK:
+            return proto::meta::OK;
+        case EC_BADARGS:
+            return proto::meta::INVALID_ARGUMENT;
+        case EC_INSTANCE_NOT_EXIST:
+            return proto::meta::INSTANCE_NOT_EXIST;
+        default:
+            return proto::meta::INTERNAL_ERROR;
+        }
+    };
+    ErrorCode first_failure = EC_OK;
+    for (const ErrorCode ec : per_item_ec) {
+        if (ec != EC_OK && first_failure == EC_OK) {
+            first_failure = ec;
+        }
+    }
+    if (first_failure != EC_OK) {
+        for (const ErrorCode ec : per_item_ec) {
+            response->add_item_results(map_error(ec));
+        }
+        response_status->set_code(map_error(first_failure));
+        response_status->set_message("read-failure invalidation partially failed; see item_results");
+        return EC_PARTIAL_OK;
+    }
+    response_status->set_code(proto::meta::OK);
+    return EC_OK;
+}
 
 ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                                     const proto::meta::ReportEventRequest *request,
@@ -2655,6 +2961,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     bool has_snapshot_event = false;
     bool has_delta_event = false;
     bool has_host_down_event = false;
+    bool has_read_failure_event = false;
     int snapshot_event_count = 0;
     for (const auto &event : request->events()) {
         if (event.event_type() == proto::meta::EVENT_BLOCK_SNAPSHOT) {
@@ -2664,18 +2971,20 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         has_delta_event = has_delta_event || event.event_type() == proto::meta::EVENT_BLOCK_ADD ||
                           event.event_type() == proto::meta::EVENT_BLOCK_DELETE;
         has_host_down_event = has_host_down_event || event.event_type() == proto::meta::EVENT_HOST_DOWN;
+        has_read_failure_event = has_read_failure_event || event.event_type() == proto::meta::EVENT_BLOCK_READ_FAILED ||
+                                 event.has_block_read_failed();
     }
-    if (has_snapshot_event && has_delta_event) {
+    if (!has_read_failure_event && has_snapshot_event && has_delta_event) {
         response_status->set_code(proto::meta::INVALID_ARGUMENT);
         response_status->set_message("snapshot and delta mutations must use separate ReportEvent requests");
         return EC_BADARGS;
     }
-    if (snapshot_event_count > 1) {
+    if (!has_read_failure_event && snapshot_event_count > 1) {
         response_status->set_code(proto::meta::INVALID_ARGUMENT);
         response_status->set_message("a ReportEvent request may contain only one complete snapshot");
         return EC_BADARGS;
     }
-    if (has_host_down_event && request->events_size() != 1) {
+    if (!has_read_failure_event && has_host_down_event && request->events_size() != 1) {
         response_status->set_code(proto::meta::INVALID_ARGUMENT);
         response_status->set_message("host-down must be the only event in a ReportEvent request");
         return EC_BADARGS;
@@ -2705,6 +3014,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         response_status->set_message("unsupported event-report storage_type: " +
                                      std::to_string(static_cast<int>(request->storage_type())));
         return EC_BADARGS;
+    }
+
+    // READ_FAILED is observer-side compensation, not a reporter mutation. It
+    // must branch before snapshot response refresh, cleanup callback setup, or
+    // any reporter registration/lifecycle/generation call below.
+    if (has_read_failure_event) {
+        return ReportBlockReadFailures(request_context, request, response, requested_type);
     }
 
     auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id, requested_type, true);

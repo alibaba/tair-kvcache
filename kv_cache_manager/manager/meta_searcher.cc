@@ -2045,8 +2045,12 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
 ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const BlockMask &input_mask,
-                                         std::vector<CacheLocationMap> &out_location_maps) {
+                                         std::vector<CacheLocationMap> &out_location_maps,
+                                         std::vector<ErrorCode> *out_per_key_ec) {
     out_location_maps.clear();
+    if (out_per_key_ec) {
+        out_per_key_ec->clear();
+    }
 
     KeyVector query_keys;
     for (size_t idx = 0; idx < keys.size(); idx++) {
@@ -2063,6 +2067,9 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     auto result = meta_indexer_->GetLocations(request_context, query_keys, out_location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    if (out_per_key_ec) {
+        *out_per_key_ec = result.error_codes;
+    }
     for (size_t idx = 0; idx < query_keys.size(); idx++) {
         if (result.error_codes[idx] != ErrorCode::EC_OK && result.error_codes[idx] != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN(
@@ -3142,6 +3149,186 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
+}
+
+ErrorCode MetaSearcher::BatchDeleteLocationSpecsIfMatch(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::vector<ConditionalDeleteLocationSpecsTask>> &tasks_per_key,
+    std::vector<std::vector<ConditionalDeleteLocationSpecsResult>> &out_batch_results) {
+    if (keys.size() != tasks_per_key.size()) {
+        return EC_BADARGS;
+    }
+    out_batch_results.clear();
+    out_batch_results.resize(keys.size());
+
+    bool invalid_input = false;
+    std::unordered_set<int64_t> seen_keys;
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        auto &results = out_batch_results[key_index];
+        results.resize(tasks_per_key[key_index].size());
+        if (!seen_keys.insert(keys[key_index]).second) {
+            invalid_input = true;
+        }
+        std::unordered_set<std::string_view> seen_location_ids;
+        if (tasks_per_key[key_index].size() > 1) {
+            seen_location_ids.reserve(tasks_per_key[key_index].size());
+        }
+        for (size_t task_index = 0; task_index < tasks_per_key[key_index].size(); ++task_index) {
+            const auto &task = tasks_per_key[key_index][task_index];
+            results[task_index].spec_outcomes.assign(task.specs.size(), ConditionalSpecRemovalOutcome::kNoent);
+            if (task.location_id.empty() || task.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||
+                task.specs.empty() || !seen_location_ids.insert(task.location_id).second) {
+                invalid_input = true;
+            }
+            for (const auto &spec : task.specs) {
+                if (spec.name.empty() || spec.expected_uri.empty()) {
+                    invalid_input = true;
+                }
+            }
+        }
+    }
+    if (invalid_input) {
+        for (auto &per_key_results : out_batch_results) {
+            for (auto &result : per_key_results) {
+                result.ec = EC_BADARGS;
+            }
+        }
+        return EC_BADARGS;
+    }
+
+    KeyVector flat_keys;
+    LocationIdsPerKey flat_location_ids;
+    std::vector<std::pair<size_t, size_t>> flat_to_original_task_indices;
+    std::vector<std::pair<DataStorageType, std::uint64_t>> flat_deleted_specs_size;
+    std::vector<std::size_t> flat_removed_spec_count;
+    // Build name lookup tables before metadata shard locks are acquired.  The
+    // modifier still compares the complete URI inside the RMW.
+    using SpecIndicesByName = std::unordered_multimap<std::string_view, size_t>;
+    std::vector<SpecIndicesByName> flat_spec_indices_by_name;
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        for (size_t task_index = 0; task_index < tasks_per_key[key_index].size(); ++task_index) {
+            const auto &task = tasks_per_key[key_index][task_index];
+            flat_keys.push_back(keys[key_index]);
+            flat_location_ids.push_back({task.location_id});
+            flat_to_original_task_indices.emplace_back(key_index, task_index);
+            flat_deleted_specs_size.emplace_back(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0);
+            flat_removed_spec_count.push_back(0);
+            flat_spec_indices_by_name.emplace_back();
+            auto &spec_indices_by_name = flat_spec_indices_by_name.back();
+            spec_indices_by_name.reserve(task.specs.size());
+            for (size_t spec_index = 0; spec_index < task.specs.size(); ++spec_index) {
+                spec_indices_by_name.emplace(task.specs[spec_index].name, spec_index);
+            }
+        }
+    }
+    if (flat_keys.empty()) {
+        return EC_OK;
+    }
+
+    auto modifier = [&tasks_per_key,
+                     &out_batch_results,
+                     &flat_to_original_task_indices,
+                     &flat_deleted_specs_size,
+                     &flat_removed_spec_count,
+                     &flat_spec_indices_by_name](const std::vector<ErrorCode> &get_ecs,
+                                               const LocationIdVector &location_ids,
+                                               size_t flat_index,
+                                               CacheLocationVector &locations,
+                                               PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        if (location_ids.size() != 1 || flat_index >= flat_to_original_task_indices.size() ||
+            flat_index >= flat_spec_indices_by_name.size()) {
+            return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), EC_ERROR)};
+        }
+        const auto [key_index, task_index] = flat_to_original_task_indices[flat_index];
+        const auto &task = tasks_per_key[key_index][task_index];
+        auto &task_result = out_batch_results[key_index][task_index];
+        const ErrorCode get_ec = get_ecs.empty() ? EC_ERROR : get_ecs.front();
+        if (get_ec != EC_OK) {
+            const ErrorCode result_ec = get_ec == EC_NOENT ? EC_OK : get_ec;
+            return {ModifierAction::MA_SKIP, {result_ec}};
+        }
+        if (locations.empty() || !locations.front() || locations.front()->type() != task.type) {
+            return {ModifierAction::MA_SKIP, {EC_OK}};
+        }
+
+        const auto &old_location = locations.front();
+        const auto &spec_indices_by_name = flat_spec_indices_by_name[flat_index];
+        std::vector<LocationSpec> kept_specs;
+        std::vector<LocationSpec> deleted_specs;
+        kept_specs.reserve(old_location->location_specs().size());
+        deleted_specs.reserve(old_location->location_specs().size());
+        for (const auto &current_spec : old_location->location_specs()) {
+            bool remove = false;
+            const auto [begin, end] = spec_indices_by_name.equal_range(current_spec.name());
+            for (auto it = begin; it != end; ++it) {
+                const size_t spec_index = it->second;
+                const auto &expected = task.specs[spec_index];
+                auto &outcome = task_result.spec_outcomes[spec_index];
+                if (current_spec.uri() == expected.expected_uri) {
+                    outcome = ConditionalSpecRemovalOutcome::kApplied;
+                    remove = true;
+                } else if (outcome != ConditionalSpecRemovalOutcome::kApplied) {
+                    outcome = ConditionalSpecRemovalOutcome::kMismatch;
+                }
+            }
+            if (remove) {
+                deleted_specs.emplace_back(current_spec.name(), current_spec.uri());
+            } else {
+                kept_specs.emplace_back(current_spec.name(), current_spec.uri());
+            }
+        }
+        if (deleted_specs.empty()) {
+            return {ModifierAction::MA_SKIP, {EC_OK}};
+        }
+
+        const std::uint64_t deleted_size = GetLocationSpecsSize(deleted_specs);
+        flat_deleted_specs_size[flat_index] = {old_location->type(), deleted_size};
+        flat_removed_spec_count[flat_index] = deleted_specs.size();
+        if (kept_specs.empty()) {
+            return {ModifierAction::MA_DELETE, {EC_OK}};
+        }
+
+        std::uint64_t validated_total_size = 0;
+        const bool old_specs_validated = old_location->GetValidatedTotalSize(validated_total_size);
+        auto new_location = std::make_shared<CacheLocation>(*old_location);
+        new_location->set_location_specs(std::move(kept_specs));
+        new_location->set_spec_size(new_location->location_specs().size());
+        if (old_specs_validated && deleted_size <= validated_total_size) {
+            new_location->set_validated_total_size(validated_total_size - deleted_size);
+        }
+        locations.front() = std::move(new_location);
+        return {ModifierAction::MA_OK, {EC_OK}};
+    };
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, flat_keys, flat_location_ids, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+
+    bool malformed_result = result.per_location_error_codes.size() != flat_to_original_task_indices.size();
+    for (size_t flat_index = 0; flat_index < flat_to_original_task_indices.size(); ++flat_index) {
+        const auto [key_index, task_index] = flat_to_original_task_indices[flat_index];
+        auto &task_result = out_batch_results[key_index][task_index];
+        if (flat_index >= result.per_location_error_codes.size() ||
+            result.per_location_error_codes[flat_index].size() != 1) {
+            task_result.ec = EC_MISMATCH;
+            malformed_result = true;
+            continue;
+        }
+        task_result.ec = result.per_location_error_codes[flat_index].front();
+        if (task_result.ec == EC_OK &&
+            flat_deleted_specs_size[flat_index].first != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+            meta_indexer_->SubStorageUsageByType(flat_deleted_specs_size[flat_index].first,
+                                                 flat_deleted_specs_size[flat_index].second);
+            task_result.removed_spec_count = flat_removed_spec_count[flat_index];
+        }
+    }
+
+    if (result.ec != EC_OK) {
+        KVCM_LOG_WARN("BatchDeleteLocationSpecsIfMatch RMW failed, ec: %d", result.ec);
+    }
+    return malformed_result ? EC_MISMATCH : result.ec;
 }
 
 ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_context,

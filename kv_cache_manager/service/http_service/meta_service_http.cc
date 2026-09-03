@@ -198,6 +198,8 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
             if (first_event.block_snapshot().blocks_size() > 0) {
                 first_block_key = first_event.block_snapshot().blocks(0).block_key();
             }
+        } else if (first_event.has_block_read_failed()) {
+            first_block_key = first_event.block_read_failed().block_key();
         }
     }
     KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d, "

@@ -134,6 +134,9 @@ const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
     if (event.has_block_snapshot() && event.block_snapshot().blocks_size() > 0) {
         return event.block_snapshot().blocks(0).block_key().c_str();
     }
+    if (event.has_block_read_failed()) {
+        return event.block_read_failed().block_key().c_str();
+    }
     return "";
 }
 
@@ -148,6 +151,8 @@ std::string BuildReportEventRequestAccessLogSummary(const proto::meta::ReportEve
     int block_add_count = 0;
     int block_delete_count = 0;
     int block_snapshot_count = 0;
+    int block_read_failed_count = 0;
+    int read_failure_spec_count = 0;
     int unknown_count = 0;
     std::string first_event_type = "N/A";
     std::string first_block_key = "N/A";
@@ -181,6 +186,12 @@ std::string BuildReportEventRequestAccessLogSummary(const proto::meta::ReportEve
         case proto::meta::EVENT_BLOCK_SNAPSHOT:
             ++block_snapshot_count;
             break;
+        case proto::meta::EVENT_BLOCK_READ_FAILED:
+            ++block_read_failed_count;
+            if (event.has_block_read_failed()) {
+                read_failure_spec_count += event.block_read_failed().specs_size();
+            }
+            break;
         default:
             ++unknown_count;
             break;
@@ -212,6 +223,10 @@ std::string BuildReportEventRequestAccessLogSummary(const proto::meta::ReportEve
     writer.Int(block_delete_count);
     writer.Key("block_snapshot_count");
     writer.Int(block_snapshot_count);
+    writer.Key("block_read_failed_count");
+    writer.Int(block_read_failed_count);
+    writer.Key("read_failure_spec_count");
+    writer.Int(read_failure_spec_count);
     writer.Key("unknown_count");
     writer.Int(unknown_count);
     writer.Key("first_event_type");

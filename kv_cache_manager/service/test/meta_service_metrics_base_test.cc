@@ -161,6 +161,9 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesCollectorsOnlyForBlockMutationEventTy
     snapshot_event->mutable_block_snapshot()->add_blocks()->set_block_key("1");
     snapshot_event->mutable_block_snapshot()->add_blocks()->set_block_key("2");
     request.add_events()->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *read_failure = request.add_events();
+    read_failure->set_event_type(proto::meta::EVENT_BLOCK_READ_FAILED);
+    read_failure->mutable_block_read_failed()->set_block_key("3");
     request.add_events()->set_event_type(proto::meta::EVENT_HEARTBEAT);
     request.add_events()->set_event_type(static_cast<proto::meta::ReportEventType>(99));
     RequestContext request_context("trace");
@@ -168,7 +171,7 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesCollectorsOnlyForBlockMutationEventTy
     base_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &request_context);
 
     const auto collectors = request_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
-    ASSERT_EQ(1, collectors.size());
+    ASSERT_EQ(2, collectors.size());
     std::set<std::string> event_types;
     for (const auto &collector : collectors) {
         auto *event_collector = dynamic_cast<EventReportMetricsCollector *>(collector.get());
@@ -178,9 +181,12 @@ TEST_F(MetaServiceMetricsBaseTest, AttachesCollectorsOnlyForBlockMutationEventTy
         if (event_type == "block_snapshot") {
             EXPECT_TRUE(event_collector->HasRequestKeyCountSample());
             EXPECT_DOUBLE_EQ(2., event_collector->GetRequestKeyCountSample());
+        } else if (event_type == "block_read_failed") {
+            EXPECT_TRUE(event_collector->HasRequestKeyCountSample());
+            EXPECT_DOUBLE_EQ(1., event_collector->GetRequestKeyCountSample());
         }
     }
-    EXPECT_EQ((std::set<std::string>{"block_snapshot"}), event_types);
+    EXPECT_EQ((std::set<std::string>{"block_read_failed", "block_snapshot"}), event_types);
 }
 
 TEST_F(MetaServiceMetricsBaseTest, AttachedEventCollectorsHaveRequestLocalSamplesAndSharedCounters) {

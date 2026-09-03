@@ -386,6 +386,39 @@ Snapshot 的更新语义：
 - 同一 KVCM 进程内后续重新使用该 reporter identity 时必须先 REGISTER；KVCM 重启会清空
   进程内 tombstone，下一条合法汇报可以再次懒初始化。
 
+### 5.7 EVENT_BLOCK_READ_FAILED
+
+```json
+{
+  "event_type": "EVENT_BLOCK_READ_FAILED",
+  "block_read_failed": {
+    "block_key": "123",
+    "specs": [
+      {
+        "name": "F0",
+        "observed_uri": "event_report://10.0.0.8:9600/gpu/123?s_version=0123456789abcdef0123456789abcdef"
+      }
+    ]
+  }
+}
+```
+
+要求：
+
+- `storage_type` 必须是 `ST_EVENT_REPORT_L2`，请求中只能包含 READ_FAILED；
+- `block_key` 必须是可解析的十进制整数文本，`specs` 非空；
+- 每个 `spec.name` 非空；配置迁移后已不在当前 `RegisterInstance.location_spec_infos` 中的旧 name 仍可上报；
+- `observed_uri` 必须是 KVCM 原样返回的完整 URI，且只包含一个合法的 32 位十六进制 `s_version`。
+
+行为：
+
+- reader 用它报告 KVCM 已返回、但远端 Vineyard daemon 明确不存在的对象；事件不携带 owner 或 medium；
+- 服务端只处理该 block 下同 storage type 的 Location，并在 metadata RMW 内删除完整匹配
+  `name + observed_uri` 的 spec；多个精确匹配都会删除，同名不同 URI、目标缺失和重复报告均为幂等 no-op；
+- 只修改 metadata，不删除外部 cache bytes，也不触碰 reporter/observer 注册、心跳、lifecycle、delta
+  fence 或 Snapshot；响应中的 `committed_snapshot_version` 为空，`snapshot_required=false`；
+- 功能默认关闭；未启用时返回 `INVALID_ARGUMENT` 且不执行 metadata mutation。
+
 ## 6. 请求组合与批处理
 
 | 请求内容 | 行为 |
@@ -397,6 +430,8 @@ Snapshot 的更新语义：
 | SNAPSHOT + ADD/DELETE | 整个请求在写入前返回 `INVALID_ARGUMENT` |
 | 两个 SNAPSHOT | 整个请求在写入前返回 `INVALID_ARGUMENT` |
 | HOST_DOWN + 任意其他事件 | 整个请求在写入前返回 `INVALID_ARGUMENT` |
+| READ_FAILED + 任意其他事件 | 整个请求在写入前返回 `INVALID_ARGUMENT` |
+| 多个 READ_FAILED | 允许；作为一个普通稀疏条件失效批次处理 |
 | 空 events | no-op success；不查 backend，也不刷新节点或 generation，响应状态字段保持默认值 |
 
 同一请求内，如果相同 `block_key + medium + spec.name` 被多次修改，最后一次操作获胜。例如：
@@ -548,13 +583,15 @@ REGISTER 成功后重试该 ADD。
 - `retry_after_ms` 只在 `SNAPSHOT_RATE_LIMITED` 时有业务含义；
 - proto JSON 的 `uint64` 可能编码成字符串，调用方应同时兼容字符串和数字；
 - `extra_info` 是 InstanceGroup 透传的 opaque JSON，不能用于核心流程判断。
+- READ_FAILED-only 响应不读取 observer 的 Snapshot 状态，`committed_snapshot_version` 与
+  `snapshot_required` 均保持默认值。
 
 ## 10. 错误码与调用方动作
 
 | 错误码 | 含义 | 建议动作 |
 | --- | --- | --- |
 | `OK` | 全部事件成功 | 正常继续 |
-| `INVALID_ARGUMENT` | 请求形状或某事件参数非法 | 不盲重试；修正失败项 |
+| `INVALID_ARGUMENT` | 请求形状、事件参数非法，或 READ_FAILED 未启用 | 不盲重试；修正请求或启用功能 |
 | `INSTANCE_NOT_EXIST` | instance、MetaSearcher 或指定 storage type backend 不存在 | 检查 Instance/InstanceGroup/storage 配置 |
 | `NODE_NOT_REGISTERED` | 同一进程内 reporter 已被 HOST_DOWN/grace cleanup tombstone | 确认节点确实重新上线后先单独 REGISTER，成功后再按原顺序重试失败的 mutation |
 | `SNAPSHOT_IN_PROGRESS` | 同 reporter 已有 snapshot、snapshot 未能及时排空已准入 delta，或 delta 未能及时等到 snapshot 完成 | 按失败事件类型退避重试：SNAPSHOT 重发完整全量，ADD/DELETE 幂等重试失败项 |
@@ -767,6 +804,7 @@ inflight count/age 指标观察扫描成本与积压。若后续形成更短的�
 - [ ] HOST_DOWN 单独发送
 - [ ] GetHostCacheState 使用有序 block keys，并正确处理 prefix 含义
 - [ ] metadata 命中后的物理 cache 读取失败按 miss 处理
+- [ ] READ_FAILED 只由 KVCM L2 查询观察和远端 `/exists` 明确 missing 共同触发
 
 ## 15. 自动化测试覆盖矩阵
 

@@ -242,6 +242,7 @@ bool ParseEventType(const JsonValue &value, proto::meta::ReportEventType &out) {
         case proto::meta::EVENT_HOST_DOWN:
         case proto::meta::EVENT_HEARTBEAT:
         case proto::meta::EVENT_BLOCK_SNAPSHOT:
+        case proto::meta::EVENT_BLOCK_READ_FAILED:
             out = static_cast<proto::meta::ReportEventType>(value.GetInt());
             return true;
         default:
@@ -266,6 +267,8 @@ bool ParseEventType(const JsonValue &value, proto::meta::ReportEventType &out) {
         out = proto::meta::EVENT_HEARTBEAT;
     } else if (name == "EVENT_BLOCK_SNAPSHOT") {
         out = proto::meta::EVENT_BLOCK_SNAPSHOT;
+    } else if (name == "EVENT_BLOCK_READ_FAILED") {
+        out = proto::meta::EVENT_BLOCK_READ_FAILED;
     } else {
         return false;
     }
@@ -408,6 +411,59 @@ bool ParseBlockDelete(const JsonValue &value, proto::meta::BlockDeleteEventParam
     return true;
 }
 
+bool ParseObservedReadFailureSpec(const JsonValue &value, proto::meta::ObservedReadFailureSpec *out) {
+    if (!value.IsObject() || !out) {
+        return false;
+    }
+    bool seen_name = false;
+    bool seen_observed_uri = false;
+    for (const auto &member : value.GetObject()) {
+        if (NameIs(member.name, "name")) {
+            if (seen_name ||
+                !SetString(member.value, [out](const char *data, size_t size) { out->set_name(data, size); })) {
+                return false;
+            }
+            seen_name = true;
+        } else if (NameIs(member.name, "observed_uri", "observedUri")) {
+            if (seen_observed_uri ||
+                !SetString(member.value, [out](const char *data, size_t size) { out->set_observed_uri(data, size); })) {
+                return false;
+            }
+            seen_observed_uri = true;
+        }
+    }
+    return true;
+}
+
+bool ParseBlockReadFailed(const JsonValue &value, proto::meta::BlockReadFailedEventParams *out) {
+    if (!value.IsObject() || !out) {
+        return false;
+    }
+    bool seen_block_key = false;
+    bool seen_specs = false;
+    for (const auto &member : value.GetObject()) {
+        if (NameIs(member.name, "block_key", "blockKey")) {
+            if (seen_block_key ||
+                !SetString(member.value, [out](const char *data, size_t size) { out->set_block_key(data, size); })) {
+                return false;
+            }
+            seen_block_key = true;
+        } else if (NameIs(member.name, "specs")) {
+            if (seen_specs || !member.value.IsArray()) {
+                return false;
+            }
+            seen_specs = true;
+            out->mutable_specs()->Reserve(static_cast<int>(member.value.Size()));
+            for (const auto &spec : member.value.GetArray()) {
+                if (!ParseObservedReadFailureSpec(spec, out->add_specs())) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool ParseSnapshotItem(const JsonValue &value, proto::meta::BlockSnapshotItem *out) {
     if (!value.IsObject() || !out) {
         return false;
@@ -541,6 +597,11 @@ bool ParseEvent(const JsonValue &value, proto::meta::EventItem *out) {
             seen_params = true;
         } else if (NameIs(member.name, "block_snapshot", "blockSnapshot")) {
             if (seen_params || !ParseBlockSnapshot(member.value, out->mutable_block_snapshot())) {
+                return false;
+            }
+            seen_params = true;
+        } else if (NameIs(member.name, "block_read_failed", "blockReadFailed")) {
+            if (seen_params || !ParseBlockReadFailed(member.value, out->mutable_block_read_failed())) {
                 return false;
             }
             seen_params = true;
