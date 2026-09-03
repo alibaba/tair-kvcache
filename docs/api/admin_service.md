@@ -340,6 +340,49 @@ curl -g -vvv -X POST http://localhost:6492/api/removeCache \
 }'
 ```
 
+## List Async Copy Quarantine
+
+Lists asynchronous Copy operations whose remote drain cannot yet be proven. An empty
+`instance_group_name` lists every group. This API is read-only; timeout or record age does not make a target safe to
+reuse.
+
+```bash
+curl -g -vvv -X POST http://localhost:6492/api/listAsyncCopyQuarantine \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "list_async_copy_quarantine_01",
+    "instance_group_name": "test_group"
+}'
+```
+
+Each returned record identifies the exact operation, source and target locations, backend task IDs, guarded bytes,
+guard timestamps and the last error.
+
+## Break-glass Release Async Copy
+
+This is a privileged recovery API for an `UNKNOWN` asynchronous Copy guard. Use it only after an independent external
+fencing procedure proves that the old remote operation can never resume writing its target. Operator confirmation or
+elapsed time alone is not sufficient evidence. The request is rejected unless all evidence fields are non-empty and
+`external_fencing_confirmed` is `true`.
+
+```bash
+curl -g -vvv -X POST http://localhost:6492/api/breakGlassReleaseAsyncCopy \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "break_glass_async_copy_01",
+    "operation_id": "operation-id-from-list-api",
+    "operator_name": "operator-name",
+    "external_fencing_evidence": "change-ticket-or-fencing-record",
+    "external_fencing_confirmed": true
+}'
+```
+
+The Manager performs an exact compare-and-set on operation ID and guard state, writes an audit log, and only then
+releases the quarantined target. See [KVCM × PACE CopyGA asynchronous design](../design/async_copyga.md) for the guard,
+recovery and rollback contract.
+
 ## Register Instance
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/registerInstance \

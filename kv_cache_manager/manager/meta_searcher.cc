@@ -3261,13 +3261,27 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
             const auto &task = batch_tasks[key_index][loc_index];
             if ((!task.expected_location_value.empty() &&
                  locs[loc_index]->ToJsonString() != task.expected_location_value) ||
-                locs[loc_index]->status() != task.old_status) {
+                locs[loc_index]->status() != task.old_status ||
+                (task.expected_migration_copy_guard_absent &&
+                 locs[loc_index]->has_migration_copy_guard()) ||
+                (!task.expected_operation_id.empty() &&
+                 (!locs[loc_index]->has_migration_copy_guard() ||
+                  locs[loc_index]->migration_copy_guard().operation_id() != task.expected_operation_id)) ||
+                (task.expected_migration_copy_guard_state != MigrationCopyGuardState::MCGS_NONE &&
+                 (!locs[loc_index]->has_migration_copy_guard() ||
+                  locs[loc_index]->migration_copy_guard().state() !=
+                      task.expected_migration_copy_guard_state))) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
             } else {
                 updated = true;
                 // COW: copy the location, modify the copy, replace the pointer
                 auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
                 new_loc->set_status(task.new_status);
+                if (task.clear_migration_copy_guard) {
+                    new_loc->clear_migration_copy_guard();
+                } else if (task.new_migration_copy_guard) {
+                    new_loc->set_migration_copy_guard(*task.new_migration_copy_guard);
+                }
                 locs[loc_index] = std::move(new_loc);
             }
         }

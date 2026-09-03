@@ -42,6 +42,8 @@ bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
     return true;
 }
 
+bool MetaIndexer_Sync_fail_stub(void * /*obj*/, const KeyVector & /*keys*/) noexcept { return false; }
+
 std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_throw_stub(void *obj, const std::string &instance_id) {
     (void)obj;
     (void)instance_id;
@@ -343,6 +345,70 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     }
     // 等待任务完成 (即使DataStorageManager为nullptr，任务也会完成，只是存储删除会失败)
     future.get();
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMetaDeleteSkipsGuardedTargetAndItsExactSource) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(EC_OK, CreateDataStorage());
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    auto request_context = std::make_shared<RequestContext>("guarded_source_delete");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    constexpr int64_t block_key = 201;
+
+    auto source =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        std::vector<LocationSpec>{SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "TP0", "nfs://nfs_01/guarded_source")});
+    source->set_status(CLS_SERVING);
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {source}, source_ids));
+    ASSERT_EQ(1u, source_ids.size());
+    std::vector<std::vector<ErrorCode>> source_cas_results;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher.BatchCASLocationStatus(request_context.get(),
+                  {block_key},
+                  {{MetaSearcher::LocationCASTask{source_ids[0], CLS_WRITING, CLS_SERVING}}},
+                  source_cas_results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), source_cas_results);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    const auto persisted_source = location_maps[0].at(source_ids[0]);
+
+    auto target =
+        std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        std::vector<LocationSpec>{SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "TP0", "nfs://nfs_01/guarded_target")});
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
+    guard.set_operation_id("guarded-delete-operation");
+    guard.set_source_location_id(persisted_source->id());
+    guard.set_source_location_create_time(persisted_source->create_time());
+    guard.set_source_storage_name("nfs_01");
+    guard.set_target_storage_name("nfs_01");
+    target->set_migration_copy_guard(guard);
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {target}, target_ids));
+
+    const auto result = executor
+                            .Submit(CacheMetaDelRequest{
+                                            .instance_id = kTestInstanceName,
+                                            .block_keys = {block_key},
+                                        })
+                            .get();
+    ASSERT_EQ(EC_OK, result.status);
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(2u, location_maps[0].size());
+    EXPECT_EQ(CLS_SERVING, location_maps[0].at(source_ids[0])->status());
+    EXPECT_EQ(CLS_WRITING, location_maps[0].at(target_ids[0])->status());
+    EXPECT_TRUE(location_maps[0].at(target_ids[0])->has_migration_copy_guard());
 }
 // 测试一个block_key对应多个location的情况
 TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
@@ -1008,6 +1074,88 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRejectsInvalidRequ
     EXPECT_FALSE(submit_result.future.valid());
 }
 
+TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteFailureRetainsMetadataForResume) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+
+    class FailFirstDeleteBackend : public DataStorageBackend {
+    public:
+        FailFirstDeleteBackend() : DataStorageBackend(nullptr) {
+            config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+            config_.set_global_unique_name("retry_delete");
+            SetOpen(true);
+            SetAvailable(true);
+        }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return true; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+            return {};
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            const auto result = delete_calls_++ == 0 ? EC_ERROR : EC_OK;
+            return std::vector<ErrorCode>(uris.size(), result);
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<bool>(uris.size(), true);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::atomic<size_t> delete_calls_{0};
+
+    private:
+        StorageConfig config_;
+    };
+
+    auto backend = std::make_shared<FailFirstDeleteBackend>();
+    data_storage_manager_->storage_map_["retry_delete"] = backend;
+    auto request_context = std::make_shared<RequestContext>("physical_delete_retry");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    constexpr int64_t block_key = 703;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("tp0", "dummy://retry_delete/cache/block703?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+        .location_ids = {{location_ids.front()}},
+    };
+    const auto first = executor.SubmitLocationDelete(request, ScheduleTaskClass::kMigrationContinuation).get();
+    EXPECT_EQ(EC_PARTIAL_OK, first.status);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    EXPECT_EQ(CLS_DELETING, location_maps.front().at(location_ids.front())->status());
+
+    request.authoritative_read = true;
+    request.resume_deleting = true;
+    const auto retry = executor.SubmitLocationDelete(request, ScheduleTaskClass::kMigrationContinuation).get();
+    EXPECT_EQ(EC_OK, retry.status) << retry.error_message;
+    EXPECT_EQ(2u, backend->delete_calls_.load());
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
+}
+
 // 测试CacheLocationDelRequest的Submit方法 - 非存在实例
 TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequestNonExistInstance) {
     CreateMetaIndexer(kTestInstanceName, "local");
@@ -1151,6 +1299,50 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncAdmissionRunsOnWorkerAndReturnsQ
     release_blocker.set_value();
     const auto result = submit_result.future.get();
     EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+}
+
+TEST_F(SchedulePlanExecutorTest, TestPreparedDeleteDoesNotDependOnRedundantSync) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+
+    auto request_context = std::make_shared<RequestContext>("prepared_delete_without_sync");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("test_loc", "dummy://cold/prepared-delete?size=1")});
+    location->set_status(CacheLocationStatus::CLS_DELETING);
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {905}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchCASLocationStatus(
+                  request_context.get(),
+                  {905},
+                  {{MetaSearcher::LocationCASTask{location_ids.front(), CLS_WRITING, CLS_DELETING}}},
+                  cas_results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), cas_results);
+
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_fail_stub);
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {905},
+        .location_ids = {{location_ids.front()}},
+        .metadata_only = true,
+        .prepared_deleting = true,
+    };
+    auto result = executor.SubmitLocationDelete(request, ScheduleTaskClass::kMigrationContinuation).get();
+    EXPECT_EQ(ErrorCode::EC_OK, result.status) << result.error_message;
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {905}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
 }
 
 TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncMetaSelectsAllLocationsAndSkipsDeleting) {
