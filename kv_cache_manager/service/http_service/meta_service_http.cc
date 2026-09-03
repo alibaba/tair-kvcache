@@ -14,7 +14,7 @@
 
 namespace kv_cache_manager {
 
-#define __NOTHING__
+#define __NOTHING__ std::nullopt
 
 MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
@@ -52,9 +52,9 @@ void MetaServiceHttp::RegisterHandler() {
         Post, getHostCacheState, GetHostCacheState, GetHostCacheState, GetHostCacheState);
 }
 
-void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
-                                       proto::meta::RegisterInstanceRequest *request,
-                                       proto::meta::RegisterInstanceResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
+                                                                      proto::meta::RegisterInstanceRequest *request,
+                                                                      proto::meta::RegisterInstanceResponse *response) {
     API_CONTEXT_INIT_HTTP(RegisterInstance);
     KVCM_LOG_INFO("[traceId: %s] RegisterInstance called with instance id: %s, instance group: %s",
                   request->trace_id().c_str(),
@@ -64,42 +64,49 @@ void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_con
                    request->trace_id().c_str(),
                    request->model_deployment().ShortDebugString().c_str());
     meta_service_impl_->RegisterInstance(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetInstanceInfo(coro_http::coro_http_connection *http_conn,
-                                      proto::meta::GetInstanceInfoRequest *request,
-                                      proto::meta::GetInstanceInfoResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::GetInstanceInfo(coro_http::coro_http_connection *http_conn,
+                                                                     proto::meta::GetInstanceInfoRequest *request,
+                                                                     proto::meta::GetInstanceInfoResponse *response) {
     API_CONTEXT_INIT_HTTP(GetInstanceInfo);
     KVCM_LOG_INFO("[traceId: %s] GetInstanceInfo called with instance id: %s",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     meta_service_impl_->GetInstanceInfo(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_conn,
-                                       proto::meta::GetCacheLocationRequest *request,
-                                       proto::meta::GetCacheLocationResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_conn,
+                                                                      proto::meta::GetCacheLocationRequest *request,
+                                                                      proto::meta::GetCacheLocationResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocation, __NOTHING__);
     meta_service_impl_->GetCacheLocation(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
-                                          proto::meta::GetCacheLocationLenRequest *request,
-                                          proto::meta::GetCacheLocationLenResponse *response) {
+CoroHttpService::CachedJsonResponse
+MetaServiceHttp::GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
+                                     proto::meta::GetCacheLocationLenRequest *request,
+                                     proto::meta::GetCacheLocationLenResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocationLen, __NOTHING__);
     meta_service_impl_->GetCacheLocationLen(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
-                                                 proto::meta::GetCacheLocationsByBackendRequest *request,
-                                                 proto::meta::GetCacheLocationsByBackendResponse *response) {
+CoroHttpService::CachedJsonResponse
+MetaServiceHttp::GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
+                                            proto::meta::GetCacheLocationsByBackendRequest *request,
+                                            proto::meta::GetCacheLocationsByBackendResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocationsByBackend, __NOTHING__);
     meta_service_impl_->GetCacheLocationsByBackend(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
-                                   proto::meta::GetCacheMetaRequest *request,
-                                   proto::meta::GetCacheMetaResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
+                                                                  proto::meta::GetCacheMetaRequest *request,
+                                                                  proto::meta::GetCacheMetaResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheMeta, __NOTHING__);
     KVCM_LOG_INFO("[traceId: %s] GetCacheMeta called with instance id: %s, block keys count: %d, "
                   "token ids count: %d, detail level: %d",
@@ -112,21 +119,23 @@ void MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->GetCacheMeta(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::StartWriteCache(coro_http::coro_http_connection *http_conn,
-                                      proto::meta::StartWriteCacheRequest *request,
-                                      proto::meta::StartWriteCacheResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::StartWriteCache(coro_http::coro_http_connection *http_conn,
+                                                                     proto::meta::StartWriteCacheRequest *request,
+                                                                     proto::meta::StartWriteCacheResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(StartWriteCache, __NOTHING__);
     KVCM_LOG_DEBUG("[traceId: %s] StartWriteCache request details: %s",
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->StartWriteCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::FinishWriteCache(coro_http::coro_http_connection *http_conn,
-                                       proto::meta::FinishWriteCacheRequest *request,
-                                       proto::meta::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::FinishWriteCache(coro_http::coro_http_connection *http_conn,
+                                                                      proto::meta::FinishWriteCacheRequest *request,
+                                                                      proto::meta::CommonResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(FinishWriteCache, __NOTHING__);
     KVCM_LOG_INFO("[traceId: %s] FinishWriteCache called with instance id: %s, write session id: %s",
                   request->trace_id().c_str(),
@@ -136,11 +145,12 @@ void MetaServiceHttp::FinishWriteCache(coro_http::coro_http_connection *http_con
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->FinishWriteCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
-                                  proto::meta::RemoveCacheRequest *request,
-                                  proto::meta::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
+                                                                 proto::meta::RemoveCacheRequest *request,
+                                                                 proto::meta::CommonResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(RemoveCache, __NOTHING__);
     KVCM_LOG_INFO("[traceId: %s] RemoveCache called with instance id: %s, block keys count: %d, "
                   "token ids count: %d",
@@ -152,21 +162,23 @@ void MetaServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->RemoveCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::TrimCache(coro_http::coro_http_connection *http_conn,
-                                proto::meta::TrimCacheRequest *request,
-                                proto::meta::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::TrimCache(coro_http::coro_http_connection *http_conn,
+                                                               proto::meta::TrimCacheRequest *request,
+                                                               proto::meta::CommonResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(TrimCache, __NOTHING__);
     KVCM_LOG_DEBUG("[traceId: %s] TrimCache request details: %s",
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->TrimCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
-                                     proto::meta::GetClusterInfoRequest *request,
-                                     proto::meta::GetClusterInfoResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
+                                                                    proto::meta::GetClusterInfoRequest *request,
+                                                                    proto::meta::GetClusterInfoResponse *response) {
     // instance_id 可能尚未注册（如 RegisterInstance 之前），此时 fallback 到全局 collector
     auto metrics_collector = get_metrics_collector_from_map_for_GetClusterInfo(request->instance_id());
     if (metrics_collector == nullptr) {
@@ -177,11 +189,12 @@ void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->GetClusterInfo(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
-                                  proto::meta::ReportEventRequest *request,
-                                  proto::meta::ReportEventResponse *response) {
+CoroHttpService::CachedJsonResponse MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
+                                                                 proto::meta::ReportEventRequest *request,
+                                                                 proto::meta::ReportEventResponse *response) {
     std::string metrics_type;
     auto metrics_collector = ResolveReportEventMetricsCollector(*request, metrics_type);
     API_CONTEXT_INIT(metrics_collector, GetHttpClientIp, http_conn)
@@ -210,17 +223,20 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                    first_block_key.c_str());
     AttachReportEventTypeMetricsCollectors(*request, metrics_type, request_context);
     meta_service_impl_->ReportEvent(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,
-                                        proto::meta::GetHostCacheStateRequest *request,
-                                        proto::meta::GetHostCacheStateResponse *response) {
+CoroHttpService::CachedJsonResponse
+MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,
+                                   proto::meta::GetHostCacheStateRequest *request,
+                                   proto::meta::GetHostCacheStateResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetHostCacheState, __NOTHING__);
     KVCM_LOG_DEBUG("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
                    request->trace_id().c_str(),
                    request->instance_id().c_str(),
                    request->block_cache_keys_size());
     meta_service_impl_->GetHostCacheState(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
 } // namespace kv_cache_manager

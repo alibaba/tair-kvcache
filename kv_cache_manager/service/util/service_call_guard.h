@@ -16,7 +16,7 @@ public:
     ServiceCallGuard(CacheManager *cache_manager,
                      RequestContext *request_context,
                      MetricsReporter *metrics_reporter,
-                     std::function<void()> response_debug_setter);
+                     std::function<void()> completion_callback);
 
     ~ServiceCallGuard();
     void PrintAccessLog(RequestContext *request_context);
@@ -25,7 +25,7 @@ private:
     CacheManager *cache_manager_;
     RequestContext *request_context_;
     MetricsReporter *metrics_reporter_;
-    std::function<void()> response_debug_setter_;
+    std::function<void()> completion_callback_;
     // Records per-request begin timestamp; writes (now - begin) to
     // service.query_rt_us when the scope ends.  Explicitly reset in
     // ~ServiceCallGuard() before ReportPerQuery, so declaration order

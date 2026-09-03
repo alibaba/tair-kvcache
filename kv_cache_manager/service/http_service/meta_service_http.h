@@ -23,49 +23,49 @@ public:
     void Init() override;
     void RegisterHandler() override;
 
-    void RegisterInstance(coro_http::coro_http_connection *http_conn,
-                          proto::meta::RegisterInstanceRequest *request,
-                          proto::meta::RegisterInstanceResponse *response);
+    CachedJsonResponse RegisterInstance(coro_http::coro_http_connection *http_conn,
+                                        proto::meta::RegisterInstanceRequest *request,
+                                        proto::meta::RegisterInstanceResponse *response);
 
-    void GetInstanceInfo(coro_http::coro_http_connection *http_conn,
-                         proto::meta::GetInstanceInfoRequest *request,
-                         proto::meta::GetInstanceInfoResponse *response);
-    void GetCacheMeta(coro_http::coro_http_connection *http_conn,
-                      proto::meta::GetCacheMetaRequest *request,
-                      proto::meta::GetCacheMetaResponse *response);
-    void GetCacheLocation(coro_http::coro_http_connection *http_conn,
-                          proto::meta::GetCacheLocationRequest *request,
-                          proto::meta::GetCacheLocationResponse *response);
-    void GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
-                             proto::meta::GetCacheLocationLenRequest *request,
-                             proto::meta::GetCacheLocationLenResponse *response);
-    void GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
-                                    proto::meta::GetCacheLocationsByBackendRequest *request,
-                                    proto::meta::GetCacheLocationsByBackendResponse *response);
-    void StartWriteCache(coro_http::coro_http_connection *http_conn,
-                         proto::meta::StartWriteCacheRequest *request,
-                         proto::meta::StartWriteCacheResponse *response);
+    CachedJsonResponse GetInstanceInfo(coro_http::coro_http_connection *http_conn,
+                                       proto::meta::GetInstanceInfoRequest *request,
+                                       proto::meta::GetInstanceInfoResponse *response);
+    CachedJsonResponse GetCacheMeta(coro_http::coro_http_connection *http_conn,
+                                    proto::meta::GetCacheMetaRequest *request,
+                                    proto::meta::GetCacheMetaResponse *response);
+    CachedJsonResponse GetCacheLocation(coro_http::coro_http_connection *http_conn,
+                                        proto::meta::GetCacheLocationRequest *request,
+                                        proto::meta::GetCacheLocationResponse *response);
+    CachedJsonResponse GetCacheLocationLen(coro_http::coro_http_connection *http_conn,
+                                           proto::meta::GetCacheLocationLenRequest *request,
+                                           proto::meta::GetCacheLocationLenResponse *response);
+    CachedJsonResponse GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
+                                                  proto::meta::GetCacheLocationsByBackendRequest *request,
+                                                  proto::meta::GetCacheLocationsByBackendResponse *response);
+    CachedJsonResponse StartWriteCache(coro_http::coro_http_connection *http_conn,
+                                       proto::meta::StartWriteCacheRequest *request,
+                                       proto::meta::StartWriteCacheResponse *response);
 
-    void FinishWriteCache(coro_http::coro_http_connection *http_conn,
-                          proto::meta::FinishWriteCacheRequest *request,
-                          proto::meta::CommonResponse *response);
-    void RemoveCache(coro_http::coro_http_connection *http_conn,
-                     proto::meta::RemoveCacheRequest *request,
-                     proto::meta::CommonResponse *response);
-    void TrimCache(coro_http::coro_http_connection *http_conn,
-                   proto::meta::TrimCacheRequest *request,
-                   proto::meta::CommonResponse *response);
-    void GetClusterInfo(coro_http::coro_http_connection *http_conn,
-                        proto::meta::GetClusterInfoRequest *request,
-                        proto::meta::GetClusterInfoResponse *response);
+    CachedJsonResponse FinishWriteCache(coro_http::coro_http_connection *http_conn,
+                                        proto::meta::FinishWriteCacheRequest *request,
+                                        proto::meta::CommonResponse *response);
+    CachedJsonResponse RemoveCache(coro_http::coro_http_connection *http_conn,
+                                   proto::meta::RemoveCacheRequest *request,
+                                   proto::meta::CommonResponse *response);
+    CachedJsonResponse TrimCache(coro_http::coro_http_connection *http_conn,
+                                 proto::meta::TrimCacheRequest *request,
+                                 proto::meta::CommonResponse *response);
+    CachedJsonResponse GetClusterInfo(coro_http::coro_http_connection *http_conn,
+                                      proto::meta::GetClusterInfoRequest *request,
+                                      proto::meta::GetClusterInfoResponse *response);
 
-    void ReportEvent(coro_http::coro_http_connection *http_conn,
-                     proto::meta::ReportEventRequest *request,
-                     proto::meta::ReportEventResponse *response);
+    CachedJsonResponse ReportEvent(coro_http::coro_http_connection *http_conn,
+                                   proto::meta::ReportEventRequest *request,
+                                   proto::meta::ReportEventResponse *response);
 
-    void GetHostCacheState(coro_http::coro_http_connection *http_conn,
-                           proto::meta::GetHostCacheStateRequest *request,
-                           proto::meta::GetHostCacheStateResponse *response);
+    CachedJsonResponse GetHostCacheState(coro_http::coro_http_connection *http_conn,
+                                         proto::meta::GetHostCacheStateRequest *request,
+                                         proto::meta::GetHostCacheStateResponse *response);
 
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;

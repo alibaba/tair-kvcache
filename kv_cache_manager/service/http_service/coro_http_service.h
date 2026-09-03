@@ -2,11 +2,13 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "google/protobuf/arena.h"
 #include "google/protobuf/message.h"
@@ -22,6 +24,7 @@ class CoroHttpService {
 public:
     using HandlerType =
         std::function<async_simple::coro::Lazy<void>(coro_http::coro_http_request &, coro_http::coro_http_response &)>;
+    using CachedJsonResponse = std::optional<std::string>;
 
     CoroHttpService() = default;
     virtual ~CoroHttpService() = default;
@@ -41,15 +44,11 @@ protected:
     void RegisterPostHandler(const std::string &api, HandlerType handler);
     HandlerType WrapWithLogger(const std::string &api, HandlerType handler);
 
-    template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
-    HandlerType GetHandler(
-        std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-            ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback);
-    template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
-    HandlerType GetArenaHandler(
-        std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-            ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback,
-        bool (*request_parser)(char *, size_t, PbRequestMessage *) = nullptr);
+    template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>
+    HandlerType GetHandler(Callback callback);
+    template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>
+    HandlerType GetArenaHandler(Callback callback,
+                                bool (*request_parser)(char *, size_t, PbRequestMessage *) = nullptr);
 
 private:
     std::unordered_map<std::string, HandlerType> get_handlers_{};
@@ -57,12 +56,19 @@ private:
     std::unique_ptr<coro_http::coro_http_server> server_{};
 };
 
-template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
-CoroHttpService::HandlerType CoroHttpService::GetHandler(
-    std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-        ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback) {
-    return [this, callback](coro_http::coro_http_request &req,
-                            coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>
+CoroHttpService::HandlerType CoroHttpService::GetHandler(Callback callback) {
+    static_assert(std::is_base_of_v<CoroHttpService, ServiceType>);
+    using CallbackResult = std::invoke_result_t<Callback,
+                                                ServiceType *,
+                                                coro_http::coro_http_connection *,
+                                                PbRequestMessage *,
+                                                PbResponseMessage *>;
+    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse>,
+                  "HTTP callbacks must return void or CachedJsonResponse");
+    return [this,
+            callback = std::move(callback)](coro_http::coro_http_request &req,
+                                            coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
         PbRequestMessage pb_req;
         PbResponseMessage pb_res;
 
@@ -74,9 +80,19 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(
             co_return;
         }
 
-        callback(static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+        CachedJsonResponse cached_response;
+        if constexpr (std::is_void_v<CallbackResult>) {
+            std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+        } else {
+            cached_response = std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+        }
 
-        if (!ProtoMessageJsonUtil::ToJson(&pb_res, json_res)) {
+        // Full protobuf responses are serialized lazily for the access log and
+        // moved here. Summary-only or failed serialization falls back to the
+        // transport's normal protobuf conversion.
+        if (cached_response.has_value()) {
+            json_res = std::move(*cached_response);
+        } else if (!ProtoMessageJsonUtil::ToJson(&pb_res, json_res)) {
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
             co_return;
@@ -88,13 +104,20 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(
     };
 }
 
-template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
-CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
-    std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-        ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback,
-    bool (*request_parser)(char *, size_t, PbRequestMessage *)) {
-    return [this, callback, request_parser](coro_http::coro_http_request &req,
-                                            coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>
+CoroHttpService::HandlerType
+CoroHttpService::GetArenaHandler(Callback callback, bool (*request_parser)(char *, size_t, PbRequestMessage *)) {
+    static_assert(std::is_base_of_v<CoroHttpService, ServiceType>);
+    using CallbackResult = std::invoke_result_t<Callback,
+                                                ServiceType *,
+                                                coro_http::coro_http_connection *,
+                                                PbRequestMessage *,
+                                                PbResponseMessage *>;
+    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse>,
+                  "HTTP callbacks must return void or CachedJsonResponse");
+    return [this, callback = std::move(callback), request_parser](
+               coro_http::coro_http_request &req,
+               coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
         // Large ReportEvent requests contain tens of thousands of nested
         // protobuf messages. Keeping them on a request-scoped arena avoids a
         // separate malloc/free for every EventItem/spec and releases all
@@ -130,13 +153,22 @@ CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
             co_return;
         }
 
-        callback(static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+        CachedJsonResponse cached_response;
+        if constexpr (std::is_void_v<CallbackResult>) {
+            std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+        } else {
+            cached_response = std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+        }
 
-        json_res.reserve(512);
-        if (!ProtoMessageJsonUtil::ToJson(pb_res, json_res)) {
-            json_res = "{}";
-            res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
-            co_return;
+        if (cached_response.has_value()) {
+            json_res = std::move(*cached_response);
+        } else {
+            json_res.reserve(512);
+            if (!ProtoMessageJsonUtil::ToJson(pb_res, json_res)) {
+                json_res = "{}";
+                res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
+                co_return;
+            }
         }
         res.add_header("Content-Type", "application/json");
         res.set_status_and_content(coro_http::status_type::ok, json_res);

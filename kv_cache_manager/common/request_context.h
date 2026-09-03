@@ -1,7 +1,10 @@
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include "kv_cache_manager/common/tracer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -22,6 +25,24 @@ namespace kv_cache_manager {
 
 class RequestContext : std::enable_shared_from_this<RequestContext> {
 public:
+    struct JsonFragment {
+        std::string json;
+        // True only when the producer completed a full JSON object.
+        bool valid = false;
+    };
+
+    // The response generator is request-local and may capture the response
+    // protobuf object. It is evaluated at most once before that object leaves
+    // the synchronous service call.
+    using ResponseJsonGenerator = std::function<JsonFragment()>;
+
+    enum class ResponseJsonKind {
+        // Summaries are valid access-log fragments but not the full wire body.
+        kAccessLogSummary,
+        // The fragment is the canonical full protobuf JSON.
+        kFullMessage,
+    };
+
     // All public KVCM service protocols use numeric value 1 for their OK enum.
     // Keep the convention here so request-local observability does not mistake
     // proto3's default UNSPECIFIED=0 for success.
@@ -41,20 +62,41 @@ public:
     const std::string &api_name() const { return api_name_; }
     const std::string &client_ip() const { return client_ip_; }
     const int status_code() const { return status_code_; }
-    const std::string &request_debug() const { return request_debug_; }
-    const std::string &response_debug() const { return response_debug_; }
+    const JsonFragment &request_debug_json() const { return request_debug_json_; }
+    const JsonFragment &response_debug_json() const { return response_debug_json_.Get(); }
     bool need_span_tracer() const { return need_span_tracer_; }
     SpanTracer *parent_span_tracer() const { return parent_span_tracer_; }
     std::string EndAndGetSpanTracerDebugStr() const;
     void set_api_name(const std::string &value) { api_name_ = value; }
     void set_client_ip(const std::string &value) { client_ip_ = value; }
     void set_status_code(int value) { status_code_ = value; }
-    void set_request_debug(const std::string &value) { request_debug_ = value; }
-    void set_response_debug(const std::string &value) { response_debug_ = value; }
+    void set_request_debug_json(JsonFragment fragment) { request_debug_json_ = std::move(fragment); }
+    void set_response_debug_json_generator(ResponseJsonGenerator generator,
+                                           ResponseJsonKind kind = ResponseJsonKind::kAccessLogSummary) {
+        response_debug_json_.SetGenerator(std::move(generator), kind);
+    }
+    void MaterializeResponseJson() const;
+    // Must be called only after ServiceCallGuard has written the access log.
+    std::optional<std::string> TakeReusableResponseJson();
     void set_parent_span_tracer(SpanTracer *tracer) const { parent_span_tracer_ = tracer; }
     ErrorTracer *error_tracer() { return error_tracer_.get(); }
 
 private:
+    class LazyResponseJsonCache {
+    public:
+        // Not thread-safe: this request-local cache is lazily mutated through
+        // const accessors and must only be used by the request's owning thread.
+        void SetGenerator(ResponseJsonGenerator generator, ResponseJsonKind kind);
+        const JsonFragment &Get() const;
+        std::optional<std::string> TakeIfReusable();
+
+    private:
+        mutable JsonFragment fragment_;
+        mutable ResponseJsonGenerator generator_;
+        mutable bool materialized_ = true;
+        ResponseJsonKind kind_ = ResponseJsonKind::kAccessLogSummary;
+    };
+
     bool need_span_tracer_ = false;
     std::string trace_id_;   // 用户传递的trace_id
     std::string request_id_; // 为每一次请求生成的request_id
@@ -62,8 +104,8 @@ private:
     std::string api_name_; // 调用的接口名称
     std::string client_ip_;
     int status_code_{0};
-    std::string request_debug_;
-    std::string response_debug_;
+    JsonFragment request_debug_json_;
+    LazyResponseJsonCache response_debug_json_;
     const std::shared_ptr<MetricsCollector> metrics_collector_; // the master metrics collector for this request context
     MetricsCollectors metrics_collectors_vehicle_;              // for carrying other metrics collectors for reporting
     std::shared_ptr<QueryTracer> query_tracer_;                 // 和LOG结合，可以把LOG输出给用户

@@ -26,6 +26,54 @@ TEST_F(RequestContextTest, TestSimple) {
     ASSERT_EQ(nullptr, request_context.metrics_collector());
 }
 
+TEST_F(RequestContextTest, ResponseJsonIsMaterializedOnce) {
+    RequestContext request_context("fake_trace_id");
+    int response_serializations = 0;
+
+    request_context.set_request_debug_json({R"({"request":true})", true});
+    request_context.set_response_debug_json_generator(
+        [&response_serializations]() {
+            ++response_serializations;
+            return RequestContext::JsonFragment{R"({"response":true})", true};
+        },
+        RequestContext::ResponseJsonKind::kFullMessage);
+
+    EXPECT_EQ(0, response_serializations);
+    request_context.MaterializeResponseJson();
+    EXPECT_EQ(1, response_serializations);
+
+    EXPECT_EQ(R"({"request":true})", request_context.request_debug_json().json);
+    EXPECT_EQ(R"({"response":true})", request_context.response_debug_json().json);
+    EXPECT_EQ(1, response_serializations);
+
+    auto cached_response = request_context.TakeReusableResponseJson();
+    ASSERT_TRUE(cached_response.has_value());
+    EXPECT_EQ(R"({"response":true})", *cached_response);
+    EXPECT_FALSE(request_context.TakeReusableResponseJson().has_value());
+}
+
+TEST_F(RequestContextTest, AccessLogSummaryIsNotReusable) {
+    RequestContext request_context("fake_trace_id");
+    request_context.set_response_debug_json_generator(
+        []() { return RequestContext::JsonFragment{R"({"summary":true})", true}; },
+        RequestContext::ResponseJsonKind::kAccessLogSummary);
+
+    EXPECT_EQ(R"({"summary":true})", request_context.response_debug_json().json);
+    EXPECT_FALSE(request_context.TakeReusableResponseJson().has_value());
+    EXPECT_EQ(R"({"summary":true})", request_context.response_debug_json().json);
+}
+
+TEST_F(RequestContextTest, FailedResponseJsonIsNotReusable) {
+    RequestContext request_context("fake_trace_id");
+    request_context.set_response_debug_json_generator(
+        []() { return RequestContext::JsonFragment{R"({"partial":)", false}; },
+        RequestContext::ResponseJsonKind::kFullMessage);
+
+    request_context.MaterializeResponseJson();
+    EXPECT_FALSE(request_context.response_debug_json().valid);
+    EXPECT_FALSE(request_context.TakeReusableResponseJson().has_value());
+}
+
 class SpanTracerTest {
 public:
     void Function1(RequestContext *request_context) {
