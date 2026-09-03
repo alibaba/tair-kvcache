@@ -148,9 +148,9 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `data_storage.healthy_status` | gauge | Storage backend health (1/0) |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
-| `cache_manager_group.usage_ratio` | gauge | Group capacity usage ratio |
+| `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
-| `cache_manager_instance.byte_size` | gauge | Per-instance byte size |
+| `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.

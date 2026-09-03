@@ -1817,7 +1817,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     }
 }
 
-TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerStorageTypeWaterLevel) {
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerByteWaterLevel) {
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 90);
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 90);
 
@@ -1838,9 +1838,41 @@ TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerStorageTypeWaterLev
                                                                    instance_group->cache_config()->reclaim_strategy(),
                                                                    instance_infos);
     ASSERT_NE(nullptr, water_level);
-    EXPECT_TRUE(water_level->GetGeneralWaterLevelExceed());
+    EXPECT_FALSE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(water_level->GetGeneralWaterLevelExceed());
     EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
     EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotInflateMixedGroupByteWaterLevel) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 40);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 40);
+
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(100);
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+
+    auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                             instance_group->name(),
+                                                             instance_group->quota(),
+                                                             instance_group->cache_config()->reclaim_strategy(),
+                                                             instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_FALSE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water_level));
+
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 80);
+    water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                        instance_group->name(),
+                                                        instance_group->quota(),
+                                                        instance_group->cache_config()->reclaim_strategy(),
+                                                        instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_TRUE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_TRUE(CacheReclaimer::IsTriggerReclaiming(water_level));
 }
 
 TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevels) {
