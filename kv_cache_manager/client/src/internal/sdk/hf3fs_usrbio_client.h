@@ -82,6 +82,8 @@ private:
 
     // file related
     bool Open(bool write = false);
+    // dereg_fd=false：跳过 Hf3fsDeregFd（仍 close fd；kernel 对 in-flight I/O 持有
+    // struct file 引用，close 本身安全）。已提交 I/O 的失败路径必须走 false。
     bool Close(bool dereg_fd = true);
     bool Fsync() const;
     void Del() const;
@@ -94,6 +96,12 @@ private:
     Hf3fsIovHandle write_iov_handle_;
 
     int fd_{-1};
+    // 提交事实标志：本 client 已向 3FS 提交过 I/O 请求后置位。此后任何失败路径
+    // 都不得释放 iov/ior、也不得 DeregFd —— 3FS 无取消语义，请求可能仍在飞，
+    // 引用着这些资源（泄漏优于 UAF，见 docs/design/client_sdk_io_contract.md）。
+    // 判定依据是"是否提交过"而非时钟：wait 用 CLOCK_REALTIME、deadline 用
+    // CLOCK_MONOTONIC，墙钟跳变会让时钟判定与真实 in-flight 状态脱节。
+    mutable bool ios_submitted_{false};
     std::shared_ptr<Hf3fsUsrbioApi> usrbio_api_;
 
     const int32_t kDefaultReadSizePerIo{1ULL << 20};  // 1MB

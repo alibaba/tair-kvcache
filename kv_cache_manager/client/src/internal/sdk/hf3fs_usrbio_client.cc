@@ -31,7 +31,8 @@ Hf3fsUsrbioClient::Hf3fsUsrbioClient(const Hf3fsFileConfig &config,
 }
 
 Hf3fsUsrbioClient::~Hf3fsUsrbioClient() {
-    Close();
+    // 读路径失败后 client 随 shared_ptr 析构；已提交请求时不 DeregFd（同 Write）。
+    Close(/*dereg_fd=*/!ios_submitted_);
     usrbio_api_.reset();
 }
 
@@ -92,11 +93,12 @@ bool Hf3fsUsrbioClient::DoRead(const std::vector<Iov> &iovs, int64_t deadline_ms
     }
 
     if (!ReadFrom3FS(handle, segments, deadline_ms)) {
-        // Deadline 过期导致 WaitIos 超时 → 3FS 可能仍有 I/O 在飞。
-        // 释放 iov/ior 会导致已提交的 3FS 请求写已释放内存（UAF）。
+        // 提交事实判定（不用时钟）：只要提交过请求就泄漏 —— wait 的 abs_timeout 用
+        // CLOCK_REALTIME、deadline 用 CLOCK_MONOTONIC，墙钟跳变会让时钟判定与真实
+        // in-flight 状态脱节；WaitIos 负返回（错误）时排水状态同样未知。
         // 泄漏优于 UAF，详见 known limitations。
-        if (DeadlineExpired(deadline_ms)) {
-            KVCM_LOG_WARN("do read deadline expired, leaking iov/ior for file: %s to avoid UAF "
+        if (ios_submitted_) {
+            KVCM_LOG_WARN("do read failed with ios submitted, leaking iov/ior for file: %s to avoid UAF "
                           "(iov_size=%zu, ior_entries=%d)",
                           filepath_.c_str(),
                           handle->iov_handle.iov_size,
@@ -178,6 +180,7 @@ bool Hf3fsUsrbioClient::ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle,
                 read_success = false;
                 break;
             }
+            ios_submitted_ = true; // 已提交：此后失败路径不得释放 iov/ior 与 fd 注册
 
             // submit_io_count 达到最大或者没得读
             if (!WaitIos(handle->ior_handle, submit_io_count, deadline_ms, /*for_read=*/true)) {
@@ -192,6 +195,11 @@ bool Hf3fsUsrbioClient::ReadFrom3FS(const std::shared_ptr<Hf3fsHandle> &handle,
         }
     }
 
+    // 成功返回 = 本轮提交的请求已全部被 WaitIos 确认完成，无在飞 I/O；
+    // 复位提交标志，使后续失败路径（以及析构的 fd 归还）恢复正常的资源释放。
+    if (read_success) {
+        ios_submitted_ = false;
+    }
     return read_success;
 }
 
@@ -208,7 +216,9 @@ bool Hf3fsUsrbioClient::Write(const std::vector<Iov> &iovs, int64_t deadline_ms)
     }
 
     if (!DoWrite(iovs, deadline_ms)) {
-        Close();
+        // 已提交请求的失败路径：只 close fd（kernel 对 in-flight I/O 持有 struct file
+        // 引用，close 安全），不 DeregFd —— fd 注册表可能仍被在飞请求引用。
+        Close(/*dereg_fd=*/!ios_submitted_);
         return false;
     }
 
@@ -242,13 +252,17 @@ bool Hf3fsUsrbioClient::DoWrite(const std::vector<Iov> &iovs, int64_t deadline_m
     CopyIovs(iovs, handle->iov_handle, false);
 
     bool success = WriteTo3FS(handle, segments, deadline_ms);
-    if (!success && DeadlineExpired(deadline_ms)) {
-        // Deadline 过期导致 3FS 写超时 → 泄漏 iov/ior 避免 UAF。
-        KVCM_LOG_WARN("do write deadline expired, leaking iov/ior for file: %s to avoid UAF "
-                      "(iov_size=%zu, ior_entries=%d)",
-                      filepath_.c_str(),
-                      handle->iov_handle.iov_size,
-                      handle->ior_handle.ior_entries);
+    if (!success) {
+        // 提交事实判定（同 DoRead）：提交过即泄漏，不用时钟代理。
+        if (ios_submitted_) {
+            KVCM_LOG_WARN("do write failed with ios submitted, leaking iov/ior for file: %s to avoid UAF "
+                          "(iov_size=%zu, ior_entries=%d)",
+                          filepath_.c_str(),
+                          handle->iov_handle.iov_size,
+                          handle->ior_handle.ior_entries);
+        } else {
+            ReleaseIovIor(handle);
+        }
         return false;
     }
     ReleaseIovIor(handle);
@@ -316,6 +330,7 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
                 write_success = false;
                 break;
             }
+            ios_submitted_ = true; // 已提交：此后失败路径不得释放 iov/ior 与 fd 注册
 
             if (!WaitIos(handle->ior_handle, submit_io_count, deadline_ms, /*for_read=*/false)) {
                 write_success = false;
@@ -330,6 +345,10 @@ bool Hf3fsUsrbioClient::WriteTo3FS(const std::shared_ptr<Hf3fsHandle> &handle,
         }
     }
 
+    // 成功返回 = 本轮提交的请求已全部被 WaitIos 确认完成（同 ReadFrom3FS）。
+    if (write_success) {
+        ios_submitted_ = false;
+    }
     return write_success;
 }
 

@@ -96,6 +96,12 @@ cc_test(
         ],
     }),
     copts = ["-fno-access-control"],
+    # 同 hf3fs_usrbio_client_test：超时/失败路径的设计内泄漏豁免。
+    env = select({
+        ":enable_hf3fs": {"LSAN_OPTIONS": "suppressions=$(location lsan_suppressions.txt)"},
+        "//conditions:default": {},
+    }),
+    data = ["lsan_suppressions.txt"],
     deps = [
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/client/src/internal/sdk/test/mock:mock_hf3fs",
@@ -114,6 +120,13 @@ cc_test(
         ],
     }),
     copts = ["-fno-access-control"],
+    # asan 下，超时/失败路径的 iov/ior、fd 注册按设计泄漏（提交事实判定），
+    # LSAN 按该文件豁免，其余泄漏照常报错。
+    env = select({
+        ":enable_hf3fs": {"LSAN_OPTIONS": "suppressions=$(location lsan_suppressions.txt)"},
+        "//conditions:default": {},
+    }),
+    data = ["lsan_suppressions.txt"],
     deps = [
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/client/src/internal/sdk/test/mock:mock_hf3fs",

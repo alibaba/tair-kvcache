@@ -144,6 +144,7 @@ TEST_F(Hf3fsUsrbioClientTest, Read_ReturnTrue_Success) {
                     cqes[i].result = 1;
                 return min_results;
             }));
+    // 成功完成：I/O 已排水，析构时正常 Dereg。
     EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
     EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
 
@@ -180,7 +181,8 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_ReadFrom3FSFail) {
     EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(testing::Return(0));
-    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
+    // 已提交后失败：iov/ior 一律泄漏（提交事实判定），不得 Destroy。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(0);
 
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 128, false}};
     EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
@@ -350,8 +352,9 @@ TEST_F(Hf3fsUsrbioClientTest, Write_ReturnFalse_DoWriteFail) {
     }
 
     // ReleaseIovIor() happens before Close(), so IorDestroy is expected before DeregFd; allow any order
-    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
-    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
+    // 已提交后失败（WaitForIos 返回 0 = 不完整）：iov/ior 与 fd 注册一并泄漏。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(0);
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
 
     auto buffer1 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
     auto buffer2 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
@@ -428,7 +431,8 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_WriteTo3FSFail_Wait) {
     EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(testing::Return(0)); // triggers WaitIos false
-    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
+    // 已提交后失败：iov/ior 泄漏（提交事实判定），不得 Destroy。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(0);
 
     auto buffer1 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
     auto buffer2 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
@@ -781,8 +785,9 @@ TEST_F(Hf3fsUsrbioClientTest, TestReadTimeoutDoesNotCopyToCaller) {
     // 模拟超时：返回 0 个完成（少于 min_results）
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(testing::Return(0));
-    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
-    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
+    // 已提交后超时：iov/ior 与 fd 注册一并泄漏（提交事实判定）。
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(0);
 
     {
         // 有 deadline（未过期），走超时等待路径
@@ -794,6 +799,56 @@ TEST_F(Hf3fsUsrbioClientTest, TestReadTimeoutDoesNotCopyToCaller) {
             EXPECT_EQ(b, 0xEE);
         }
     }
+}
+
+// 提交事实生命周期（C1/C2 回归守卫）：成功完成 → 标志复位，析构正常 Dereg；
+// 提交后失败 → iov/ior 与 fd 注册全部泄漏。同一 client 上先后两次 Read 验证
+// 标志在成功路径被复位（否则第二次的失败路径会错误地走释放分支——旧 bug 形态）。
+TEST_F(Hf3fsUsrbioClientTest, SubmittedFlagLifecycle_SuccessResetsThenFailureLeaks) {
+    {
+        std::ofstream f(client_->filepath_, std::ios::binary | std::ios::trunc);
+        std::string blob(32, '\xAB');
+        f.write(blob.data(), blob.size());
+    }
+
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+    EXPECT_CALL(*api, Hf3fsRegFd(testing::_, testing::_)).WillOnce(testing::Return(0));
+    EXPECT_CALL(
+        *api, Hf3fsIorCreate(testing::_, testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api,
+                Hf3fsPrepIo(testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
+    // 第一次调用全部完成（成功），之后全部不完成（失败）。
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *) {
+                for (int i = 0; i < min_results; ++i)
+                    cqes[i].result = 1;
+                return min_results;
+            }))
+        .WillRepeatedly(testing::Return(0));
+    // 释放路径只允许发生在成功调用上（IorDestroy 恰一次）。Dereg 的期望在测试尾部
+    // 断言（第二次失败置位标志后，析构不 Dereg —— 见下）。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(1);
+
+    // 第一次：成功 → 提交标志复位（本断言不直接可见，由第二次调用间接验证）。
+    {
+        std::vector<uint8_t> buf(16, 0);
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_TRUE(client_->Read(iovs, SteadyClockMs() + 5000));
+    }
+    // 第二次：提交后失败 → 若标志未被复位，此处会走释放分支（IorDestroy 二次调用，
+    // 上面的 Times(1) 会捕获）；正确行为是泄漏。
+    {
+        std::vector<uint8_t> buf(16, 0xEE);
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_FALSE(client_->Read(iovs, SteadyClockMs() + 5000));
+    }
+    // 第二次失败将标志重新置位（有在飞请求），析构不 DeregFd —— fd 注册随本次
+    // 失败泄漏（C1 语义：泄漏优于 UAF）。成功那轮的 IorDestroy 已发生（恰一次）。
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
 }
 
 // ---------- BuildContiguousSegments ----------
