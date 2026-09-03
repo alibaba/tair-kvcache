@@ -1,5 +1,11 @@
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 #include "kv_cache_manager/common/unittest.h"
 #ifdef USING_CUDA
@@ -7,6 +13,10 @@
 #endif
 
 using namespace kv_cache_manager;
+
+// 说明：GPU 相关用例（TestPutGetWithGpu 等）需要 GPU 环境与
+// --config=client_with_cuda 构建（默认 --config=client 无 CUDA，用例自动跳过）；
+// 无 CUDA 环境只保证非 GPU 用例 + 编译通过。
 
 class LocalFileSdkTest : public TESTBASE {
 public:
@@ -21,6 +31,55 @@ private:
     std::string root_path_;
     std::shared_ptr<NfsSdkConfig> sdk_backend_config_;
 };
+
+namespace {
+
+DataStorageUri MakeUri(const std::string &file_path, uint64_t blkid, size_t size = 1024) {
+    DataStorageUri uri("file://" + file_path);
+    uri.SetParam("blkid", std::to_string(blkid));
+    uri.SetParam("size", std::to_string(size));
+    return uri;
+}
+
+// 稀疏文件：只分配空间不写数据，读回全零；比逐字节写文件快几个数量级。
+void CreateSparseFile(const std::string &file_path, size_t size) {
+    std::filesystem::create_directories(std::filesystem::path(file_path).parent_path());
+    int fd = ::open(file_path.c_str(), O_CREAT | O_RDWR, 0644);
+    ASSERT_TRUE(fd >= 0) << "open " << file_path << " failed";
+    ASSERT_EQ(::fallocate(fd, 0, 0, static_cast<off_t>(size)), 0) << "fallocate " << file_path << " failed";
+    ::close(fd);
+}
+
+BlockBuffer MakeCpuBuffer(size_t size, unsigned char fill) {
+    BlockBuffer buf;
+    Iov iov;
+    iov.base = malloc(size);
+    std::memset(iov.base, fill, size);
+    iov.size = size;
+    iov.type = MemoryType::CPU;
+    iov.ignore = false;
+    buf.iovs.push_back(iov);
+    return buf;
+}
+
+void AssertBufferAllBytes(const BlockBuffer &buf, unsigned char expect) {
+    for (const auto &iov : buf.iovs) {
+        const auto *p = static_cast<const unsigned char *>(iov.base);
+        for (size_t j = 0; j < iov.size; ++j) {
+            ASSERT_EQ(p[j], expect);
+        }
+    }
+}
+
+void FreeBuffers(BlockBuffers &buffers) {
+    for (auto &buf : buffers) {
+        for (auto &iov : buf.iovs) {
+            free(iov.base);
+        }
+    }
+}
+
+} // namespace
 
 TEST_F(LocalFileSdkTest, TestInit) {
     LocalFileSdk sdk;
@@ -90,81 +149,6 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     auto &iov2_res = local_buffers[0].iovs[1];
     ASSERT_EQ(std::memcmp(iov2_res.base, test_data_2, iov2_res.size), 0);
     free(get_buffer);
-}
-
-// 同 backend（同一次 Put 调用）内多个不同 path 交错出现、且 payload 各不相同。
-// 修复前 SplitByPath 按 unordered_map 迭代顺序回填 actual_remote_uris，导致
-// 返回顺序与输入顺序不一致；本测试固定"同序契约"：actual_remote_uris[i] 必须
-// 对应 remote_uris[i]，且数据真正写入各自 path 对应的文件。
-TEST_F(LocalFileSdkTest, TestPutMultiPathInterleavedOrdering) {
-    LocalFileSdk sdk;
-    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
-
-    // 交错输入：fileA(blk0), fileB(blk0), fileA(blk1)
-    DataStorageUri uri_a0("file://" + root_path_ + "/multi_path/fileA");
-    uri_a0.SetParam("blkid", "0");
-    uri_a0.SetParam("size", "1024");
-    DataStorageUri uri_b0("file://" + root_path_ + "/multi_path/fileB");
-    uri_b0.SetParam("blkid", "0");
-    uri_b0.SetParam("size", "1024");
-    DataStorageUri uri_a1("file://" + root_path_ + "/multi_path/fileA");
-    uri_a1.SetParam("blkid", "1");
-    uri_a1.SetParam("size", "1024");
-
-    const char *payload_a0 = "payload for fileA block0";
-    const char *payload_b0 = "payload for fileB block0";
-    const char *payload_a1 = "payload for fileA block1";
-    size_t len_a0 = strlen(payload_a0);
-    size_t len_b0 = strlen(payload_b0);
-    size_t len_a1 = strlen(payload_a1);
-
-    // 三个 block 使用相互独立、内容各异的 buffer
-    void *buf_a0 = malloc(1024);
-    void *buf_b0 = malloc(1024);
-    void *buf_a1 = malloc(1024);
-    std::memcpy(buf_a0, payload_a0, len_a0);
-    std::memcpy(buf_b0, payload_b0, len_b0);
-    std::memcpy(buf_a1, payload_a1, len_a1);
-
-    auto make_buffer = [](void *base, size_t size) {
-        BlockBuffer bb;
-        Iov iov;
-        iov.base = base;
-        iov.size = size;
-        iov.type = MemoryType::CPU;
-        iov.ignore = false;
-        bb.iovs.push_back(iov);
-        return bb;
-    };
-
-    std::vector<DataStorageUri> remote_uris = {uri_a0, uri_b0, uri_a1};
-    BlockBuffers local_buffers = {make_buffer(buf_a0, len_a0), make_buffer(buf_b0, len_b0), make_buffer(buf_a1, len_a1)};
-
-    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
-
-    // 同序契约：返回顺序必须与输入一致
-    ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
-    EXPECT_EQ(actual_remote_uris->at(0).ToUriString(), uri_a0.ToUriString());
-    EXPECT_EQ(actual_remote_uris->at(1).ToUriString(), uri_b0.ToUriString());
-    EXPECT_EQ(actual_remote_uris->at(2).ToUriString(), uri_a1.ToUriString());
-
-    // 用全新的 buffer 读回，验证数据确实写入了各自 path 的文件
-    void *get_a0 = malloc(1024);
-    void *get_b0 = malloc(1024);
-    void *get_a1 = malloc(1024);
-    BlockBuffers get_buffers = {make_buffer(get_a0, len_a0), make_buffer(get_b0, len_b0), make_buffer(get_a1, len_a1)};
-    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, get_buffers));
-    EXPECT_EQ(std::memcmp(get_a0, payload_a0, len_a0), 0);
-    EXPECT_EQ(std::memcmp(get_b0, payload_b0, len_b0), 0);
-    EXPECT_EQ(std::memcmp(get_a1, payload_a1, len_a1), 0);
-
-    free(buf_a0);
-    free(buf_b0);
-    free(buf_a1);
-    free(get_a0);
-    free(get_b0);
-    free(get_a1);
 }
 
 TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
@@ -245,5 +229,245 @@ TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
     cudaFree(gpu_get_buffer);
 #else
     GTEST_SKIP() << "CUDA not enabled, skipping GPU buffer test";
+#endif
+}
+
+// 在组级准入处立即返回超时，且一个 block 都不搬（caller buffer 哨兵值完好）。
+TEST_F(LocalFileSdkTest, TestGetTimeoutStopsEarly) {
+    constexpr size_t kBlockSize = 1024;
+    constexpr size_t kNumBlocks = 4;
+    std::string file_path = root_path_ + "/local_file/timeout_early.txt";
+    CreateSparseFile(file_path, kNumBlocks * kBlockSize);
+
+    std::vector<DataStorageUri> remote_uris;
+    BlockBuffers buffers;
+    for (uint64_t i = 0; i < kNumBlocks; ++i) {
+        remote_uris.push_back(MakeUri(file_path, i));
+        buffers.push_back(MakeCpuBuffer(kBlockSize, 0xA5)); // 哨兵值
+    }
+
+    LocalFileSdk sdk;
+    auto cfg = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    // 负预算 = entry 即过期（等价于旧的"传入已过期 deadline"参数）。生产中预算
+    // 恒为正且从后端自身起点起算，该场景由 wrapper 拾起准入拦截。
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(-1'000);
+    cfg->set_timeout_config(timeout);
+    ASSERT_EQ(ER_OK, sdk.Init(cfg, nullptr));
+    {
+        // 预算已耗尽：任何 I/O 都不应发起。
+        ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers));
+    }
+    for (const auto &buf : buffers) {
+        AssertBufferAllBytes(buf, 0xA5); // 一个 block 都没搬
+    }
+    FreeBuffers(buffers);
+}
+
+// 布局：块 0..7 为 1KB 快块（预算内必被搬完，读稀疏文件得全零）；块 8 为 512MB 大块
+// （首次触碰稀疏文件 + 写 512MB 目标页，至少 ~10ms，预算 8ms 内必然搬不完）；
+// 块 9..16 为 1KB 哨兵块（超时后必须保持完好）。
+// 预算 8ms 的选择依据：远大于 open/mmap + 8KB 头块搬运（~0.1-0.5ms），
+// 远小于 512MB 搬运时间，两个方向的裕度都 >10 倍，避免机器快慢导致抖动。
+TEST_F(LocalFileSdkTest, TestGetTimeoutMidway) {
+    constexpr size_t kBlockSize = 1024;
+    constexpr size_t kHeadBlocks = 8;
+    constexpr size_t kTailBlocks = 8;
+    constexpr size_t kBigBlockSize = 512 * 1024 * 1024;
+    std::string file_path = root_path_ + "/local_file/timeout_midway.txt";
+    size_t file_size = kHeadBlocks * kBlockSize + kBigBlockSize + kTailBlocks * kBlockSize;
+    CreateSparseFile(file_path, file_size);
+
+    std::vector<DataStorageUri> remote_uris;
+    BlockBuffers buffers;
+    for (uint64_t i = 0; i < kHeadBlocks; ++i) {
+        remote_uris.push_back(MakeUri(file_path, i));
+        buffers.push_back(MakeCpuBuffer(kBlockSize, 0x5A)); // 头块：会被搬成 0x00
+    }
+    remote_uris.push_back(MakeUri(file_path, kHeadBlocks));
+    buffers.push_back(MakeCpuBuffer(kBigBlockSize, 0x5A)); // 大块：预算内搬不完
+    for (uint64_t i = kHeadBlocks + 1; i < kHeadBlocks + 1 + kTailBlocks; ++i) {
+        remote_uris.push_back(MakeUri(file_path, i));
+        buffers.push_back(MakeCpuBuffer(kBlockSize, 0xA5)); // 尾块：必须保持哨兵完好
+    }
+
+    LocalFileSdk sdk;
+    auto cfg = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(8); // 预算 8ms（从 SDK 入口起算，与旧参数语义一致）
+    cfg->set_timeout_config(timeout);
+    ASSERT_EQ(ER_OK, sdk.Init(cfg, nullptr));
+    { ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, buffers)); }
+    // 头块已搬（稀疏文件读回全零）→ 证明是"中途停下"而不是"入口就返回"。
+    // 注意：仅非 CUDA 构建可断言 —— GPU 构建下 Init 会对 512MB mmap 做
+    // cudaHostRegister（本机实测 ~224ms），预算在第一个 block 之前就被注册消耗掉，
+    // 此时"零块已搬"同样是正确的准入行为（入口即超时场景由 TestGetTimeoutStopsEarly 覆盖）。
+#ifndef USING_CUDA
+    for (size_t i = 0; i < kHeadBlocks; ++i) {
+        AssertBufferAllBytes(buffers[i], 0x00);
+    }
+#endif
+    // 尾块哨兵完好 → 证明超时后没有继续搬运（逐 block 检查真的停下来了）。
+    for (size_t i = kHeadBlocks + 1; i < buffers.size(); ++i) {
+        AssertBufferAllBytes(buffers[i], 0xA5);
+    }
+    FreeBuffers(buffers);
+}
+
+// 对称场景：已过期的 deadline 必须让 Put 在组级准入处立即返回超时，
+// 且不执行 Alloc（文件不被创建）、不写数据。
+TEST_F(LocalFileSdkTest, TestPutTimeoutStopsEarly) {
+    constexpr size_t kBlockSize = 1024;
+    std::string file_path = root_path_ + "/local_file/timeout_put_early.txt";
+    std::filesystem::remove(file_path); // 确保文件不存在，验证 Alloc 未被调用
+
+    std::vector<DataStorageUri> remote_uris = {MakeUri(file_path, 0)};
+    BlockBuffers buffers = {MakeCpuBuffer(kBlockSize, 0x5A)};
+
+    LocalFileSdk sdk;
+    auto cfg = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    // 负预算 = entry 即过期（同 TestGetTimeoutStopsEarly 的构造方式）。
+    SdkTimeoutConfig timeout;
+    timeout.set_put_timeout_ms(-1'000);
+    cfg->set_timeout_config(timeout);
+    ASSERT_EQ(ER_OK, sdk.Init(cfg, nullptr));
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    { ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, buffers, actual_remote_uris)); }
+    // 准入拦截发生在 Alloc/写文件之前。
+    ASSERT_FALSE(std::filesystem::exists(file_path));
+    FreeBuffers(buffers);
+}
+
+// 同 backend（同一次 Put 调用）内多个不同 path 交错出现、且 payload 各不相同。
+// 修复前 SplitByPath 按 unordered_map 迭代顺序回填 actual_remote_uris，导致
+// 返回顺序与输入顺序不一致；本测试固定"同序契约"：actual_remote_uris[i] 必须
+// 对应 remote_uris[i]，且数据真正写入各自 path 对应的文件。
+TEST_F(LocalFileSdkTest, TestPutMultiPathInterleavedOrdering) {
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    // 交错输入：fileA(blk0), fileB(blk0), fileA(blk1)
+    DataStorageUri uri_a0("file://" + root_path_ + "/multi_path/fileA");
+    uri_a0.SetParam("blkid", "0");
+    uri_a0.SetParam("size", "1024");
+    DataStorageUri uri_b0("file://" + root_path_ + "/multi_path/fileB");
+    uri_b0.SetParam("blkid", "0");
+    uri_b0.SetParam("size", "1024");
+    DataStorageUri uri_a1("file://" + root_path_ + "/multi_path/fileA");
+    uri_a1.SetParam("blkid", "1");
+    uri_a1.SetParam("size", "1024");
+
+    const char *payload_a0 = "payload for fileA block0";
+    const char *payload_b0 = "payload for fileB block0";
+    const char *payload_a1 = "payload for fileA block1";
+    size_t len_a0 = strlen(payload_a0);
+    size_t len_b0 = strlen(payload_b0);
+    size_t len_a1 = strlen(payload_a1);
+
+    // 三个 block 使用相互独立、内容各异的 buffer
+    void *buf_a0 = malloc(1024);
+    void *buf_b0 = malloc(1024);
+    void *buf_a1 = malloc(1024);
+    std::memcpy(buf_a0, payload_a0, len_a0);
+    std::memcpy(buf_b0, payload_b0, len_b0);
+    std::memcpy(buf_a1, payload_a1, len_a1);
+
+    auto make_buffer = [](void *base, size_t size) {
+        BlockBuffer bb;
+        Iov iov;
+        iov.base = base;
+        iov.size = size;
+        iov.type = MemoryType::CPU;
+        iov.ignore = false;
+        bb.iovs.push_back(iov);
+        return bb;
+    };
+
+    std::vector<DataStorageUri> remote_uris = {uri_a0, uri_b0, uri_a1};
+    BlockBuffers local_buffers = {
+        make_buffer(buf_a0, len_a0), make_buffer(buf_b0, len_b0), make_buffer(buf_a1, len_a1)};
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+
+    // 同序契约：返回顺序必须与输入一致
+    ASSERT_EQ(actual_remote_uris->size(), remote_uris.size());
+    EXPECT_EQ(actual_remote_uris->at(0).ToUriString(), uri_a0.ToUriString());
+    EXPECT_EQ(actual_remote_uris->at(1).ToUriString(), uri_b0.ToUriString());
+    EXPECT_EQ(actual_remote_uris->at(2).ToUriString(), uri_a1.ToUriString());
+
+    // 用全新的 buffer 读回，验证数据确实写入了各自 path 的文件
+    void *get_a0 = malloc(1024);
+    void *get_b0 = malloc(1024);
+    void *get_a1 = malloc(1024);
+    BlockBuffers get_buffers = {make_buffer(get_a0, len_a0), make_buffer(get_b0, len_b0), make_buffer(get_a1, len_a1)};
+    ASSERT_EQ(ER_OK, sdk.Get(*actual_remote_uris, get_buffers));
+    EXPECT_EQ(std::memcmp(get_a0, payload_a0, len_a0), 0);
+    EXPECT_EQ(std::memcmp(get_b0, payload_b0, len_b0), 0);
+    EXPECT_EQ(std::memcmp(get_a1, payload_a1, len_a1), 0);
+
+    free(buf_a0);
+    free(buf_b0);
+    free(buf_a1);
+    free(get_a0);
+    free(get_b0);
+    free(get_a1);
+}
+
+// 场景：块 0 的 256MB GPU async copy 已入队（DMA 需数 ms），块 1 URI size 非法触发
+// 既有错误分支提前返回 —— 断言返回后 SDK 私有 stream 空闲（cudaStreamQuery 成功），
+// 证明 GpuStreamDrainGuard 在 munmap 之前完成了 cudaStreamSynchronize。
+// 若 guard 缺失，此处 256MB DMA 仍在飞，cudaStreamQuery 必然返回 cudaErrorNotReady。
+TEST_F(LocalFileSdkTest, TestGpuAbortPathDrainsStream) {
+#ifdef USING_CUDA
+    constexpr size_t kBigBlockSize = 256 * 1024 * 1024;
+    std::string file_path = root_path_ + "/local_file/gpu_abort.txt";
+    CreateSparseFile(file_path, kBigBlockSize);
+
+    LocalFileSdk sdk;
+    if (sdk.Init(sdk_backend_config_, nullptr) != ER_OK) {
+        GTEST_SKIP() << "no usable GPU, skipping GPU abort drain test";
+    }
+    std::vector<DataStorageUri> remote_uris;
+    BlockBuffers buffers;
+    // 块 0：合法大块，GPU async copy 入队。
+    remote_uris.push_back(MakeUri(file_path, 0));
+    void *gpu_buf0 = nullptr;
+    if (cudaMalloc(&gpu_buf0, kBigBlockSize) != cudaSuccess) {
+        GTEST_SKIP() << "no usable GPU, skipping GPU abort drain test";
+    }
+    {
+        BlockBuffer buf;
+        Iov iov;
+        iov.base = gpu_buf0;
+        iov.size = kBigBlockSize;
+        iov.type = MemoryType::GPU;
+        iov.ignore = false;
+        buf.iovs.push_back(iov);
+        buffers.push_back(buf);
+    }
+    // 块 1：URI size 非法（不在 spec 内）→ 块 0 入队后必然提前返回 ER_INVALID_PARAMS。
+    remote_uris.push_back(MakeUri(file_path, 1, /*size=*/1023));
+    void *gpu_buf1 = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_buf1, 4096), cudaSuccess);
+    {
+        BlockBuffer buf;
+        Iov iov;
+        iov.base = gpu_buf1;
+        iov.size = 4096;
+        iov.type = MemoryType::GPU;
+        iov.ignore = false;
+        buf.iovs.push_back(iov);
+        buffers.push_back(buf);
+    }
+
+    ASSERT_EQ(ER_SDKREAD_ERROR, sdk.Get(remote_uris, buffers));
+    // hard 契约：返回后 SDK stream 必须已同步（否则 256MB DMA 仍在写 caller 显存）。
+    ASSERT_EQ(cudaStreamQuery(sdk.cuda_stream_), cudaSuccess);
+
+    cudaFree(gpu_buf0);
+    cudaFree(gpu_buf1);
+#else
+    GTEST_SKIP() << "CUDA not enabled, skipping GPU abort drain test";
 #endif
 }

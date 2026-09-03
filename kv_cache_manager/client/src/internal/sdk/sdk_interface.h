@@ -11,6 +11,14 @@
 
 namespace kv_cache_manager {
 
+// 各存储后端 SDK 的统一接口。
+// 超时契约（静态，无调用参数）：SdkWrapper 在 Init 阶段把自身配置的静态预算注入
+// SdkBackendConfig::timeout_config()（get/put_timeout_ms）。后端从自身任务起点
+// 起算 deadline，在预算内完成或内部取消；到点后不得再触碰 caller 的 local
+// buffers。能做到的（localfile/hf3fs）须如实做到，做不到的（mooncake，上游无
+// 取消语义）须声明 soft 并输出可归因日志。不读取该字段的后端（tair_mempool）
+// 自行管理内部超时，要求其内部超时严格小于 wrapper 预算。
+// 规范全文见 docs/design/client_sdk_io_contract.md。
 class SdkInterface {
 public:
     SdkInterface() {}
@@ -30,6 +38,7 @@ public:
     // 实现不得按内部分组（如按 path 聚合）的迭代顺序回填 actual_remote_uris；
     // 即使同一请求内多个 block 落在不同 path（交错出现），也必须保证上述同序性。
     // 上层 SdkWrapper 依赖该契约把各 SDK 的返回值回填到原始请求位置。
+    // 超时路径必须输出可归因日志（超时契约见类前注释）。
     virtual ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) = 0;
     // actual_remote_uris是实际存储的远端地址
     virtual ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
@@ -41,6 +50,7 @@ protected:
                                   std::vector<DataStorageUri> &alloc_uris) = 0;
 
     using GroupMap = std::unordered_map<std::string, BlockGroup>;
+    // 按 path 分组，并记录每个元素在原始入参中的下标到 BlockGroup::indices。
     GroupMap SplitByPath(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
 };
 

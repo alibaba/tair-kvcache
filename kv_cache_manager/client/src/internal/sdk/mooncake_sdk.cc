@@ -1,9 +1,38 @@
 #include "mooncake_sdk.h"
 
+#include <chrono>
 #include <random>
 #include <sstream>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
+
 namespace kv_cache_manager {
+
+namespace {
+// 超时归因日志：定位哪个 block/key 被拒、哪块 caller buffer 可能仍在被 DMA 写。
+void LogSoftTimeout(bool is_get,
+                    size_t done,
+                    size_t total,
+                    size_t refused_block_idx,
+                    const std::string &key,
+                    const void *caller_buffer,
+                    size_t buffer_size,
+                    int64_t elapsed_ms) {
+    KVCM_LOG_WARN("mooncake %s timeout: done=%zu/%zu refused_block_idx=%zu key=%s "
+                  "caller_buffer=%p caller_buffer_size=%zu elapsed_ms=%lld "
+                  "soft-contract: in-flight RDMA cannot be cancelled, blocks [0,%zu) may still be written",
+                  is_get ? "get" : "put",
+                  done,
+                  total,
+                  refused_block_idx,
+                  key.c_str(),
+                  caller_buffer,
+                  buffer_size,
+                  static_cast<long long>(elapsed_ms),
+                  done);
+}
+} // namespace
+
 MooncakeRemoteItem MooncakeRemoteItem::FromUri(const DataStorageUri &storage_uri) {
     MooncakeRemoteItem item;
     item.key = storage_uri.GetParam("key");
@@ -95,11 +124,17 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
 
 SdkType MooncakeSdk::Type() { return SdkType::MOONCAKE; }
 
-ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffer) {
+ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
+                                 const BlockBuffers &local_buffer) {
     if (remote_uris.size() != local_buffer.size()) {
         KVCM_LOG_ERROR("mooncake get failed, remote_uris size not equal to local_buffer size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + sdk_backend_config_->timeout_config().get_timeout_ms();
+    // 本 SDK 调用内的墙钟起点：超时归因日志的 elapsed_ms 用（不含线程池排队时间，
+    // 那是 wrapper 层日志的职责）。
+    const auto call_start = std::chrono::steady_clock::now();
     // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
     int64_t max_allowed_size = 0;
     for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
@@ -126,6 +161,37 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
                 max_allowed_size);
             return ER_INVALID_PARAMS;
         }
+        // ============================================================
+        // 逐 key 准入检查（核心）：slices 直接指向 caller 的 iov.base，网卡 DMA 直接
+        // 写 caller 内存，而上游无法取消已下发的传输。
+        // 因此在每次 mooncake_client_get 之前检查 deadline_ms：已过期立即返回超时、
+        // 不发这次 I/O。效果：超时时刻最多只有 1 个 block 的 DMA 在飞（正在执行的
+        // 那次），其余全部未发起 —— 暴露面从 128 个 block 降到 ≤1 个（降两个数量级）。
+        // 这个检查看似"每个 key 都查一次"很啰嗦，但正是它把静默污染窗口关到最小；
+        // 删掉它，超时后 128 个 block 全部可能仍在写 caller buffer。
+        // ============================================================
+        if (DeadlineExpired(deadline_ms)) {
+            const void *caller_buffer = nullptr;
+            for (const auto &iov : local_buffer[i].iovs) {
+                if (iov.base != nullptr) {
+                    caller_buffer = iov.base;
+                    break;
+                }
+            }
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - call_start)
+                    .count();
+            // 已下发的 blocks [0, i) 可能仍有在飞 DMA 写 caller buffer，返回后无法保证安全。
+            LogSoftTimeout(/*is_get=*/true,
+                           /*done=*/i,
+                           remote_uris.size(),
+                           i,
+                           item.key,
+                           caller_buffer,
+                           read_len,
+                           elapsed_ms);
+            return ER_SDK_TIMEOUT;
+        }
         ErrorCode_t err = mooncake_client_get(client_, item.key.c_str(), slices.data(), slices.size());
         if (err != MOONCAKE_ERROR_OK) {
             KVCM_LOG_WARN("mooncake get item failed, key: [%s], mooncake errorcode: [%d]", item.key.c_str(), err);
@@ -144,6 +210,10 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_WARN("mooncake put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + sdk_backend_config_->timeout_config().put_timeout_ms();
+    // 本 SDK 调用内的墙钟起点：超时归因日志的 elapsed_ms 用（不含线程池排队时间）。
+    const auto call_start = std::chrono::steady_clock::now();
     // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
     int64_t max_allowed_size = 0;
     for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
@@ -169,6 +239,33 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                 max_allowed_size);
             return ER_INVALID_PARAMS;
         }
+        // ============================================================
+        // 逐 key 准入检查（与 Get 同理，见上）：put 时网卡 DMA 读 caller 内存，
+        // 超时返回后若 caller 复用/改写该内存，与在飞 DMA 构成数据竞争；上游无法
+        // 取消，因此每次 mooncake_client_put 之前必须检查 deadline_ms，已过期立即返回。
+        // 效果：暴露面从 128 个 block 降到 ≤1 个。
+        // ============================================================
+        if (DeadlineExpired(deadline_ms)) {
+            const void *caller_buffer = nullptr;
+            for (const auto &iov : local_buffers[i].iovs) {
+                if (iov.base != nullptr) {
+                    caller_buffer = iov.base;
+                    break;
+                }
+            }
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - call_start)
+                    .count();
+            LogSoftTimeout(/*is_get=*/false,
+                           /*done=*/i,
+                           remote_uris.size(),
+                           i,
+                           item.key,
+                           caller_buffer,
+                           write_len,
+                           elapsed_ms);
+            return ER_SDK_TIMEOUT;
+        }
         ReplicateConfig_t cfg;
         cfg.replica_num = sdk_backend_config_->put_replica_num();
         auto err = mooncake_client_put(client_, item.key.c_str(), slices.data(), slices.size(), cfg);
@@ -177,6 +274,9 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
             return ER_SDKWRITE_ERROR;
         }
     }
+    // 保序契约：actual_remote_uris 与 remote_uris 同序 —— Alloc 是整体赋值
+    // （alloc_uris = remote_uris），顺序天然正确；将来若 local alloc 改为逐项回填，
+    // 必须按下标回填原位（下标是 block 的唯一身份，见 sdk_type.h BlockGroup::indices）。
     return Alloc(remote_uris, *actual_remote_uris);
 }
 

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/mooncake_sdk.h"
 #include "kv_cache_manager/common/unittest.h"
 #ifdef USING_CUDA
@@ -62,7 +63,7 @@ TEST_F(MooncakeSdkTest, TestInit) {
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, storage_config_));
     ASSERT_EQ(ER_OK, sdk.Close());
     // success
-    auto client_buffer_allocator = std::make_shared<char[]>(128 * 1024 * 1024);
+    auto client_buffer_allocator = std::shared_ptr<char[]>(new char[128 * 1024 * 1024]);
     sdk_backend_config_->set_local_mem_ptr(client_buffer_allocator.get());
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, storage_config_));
     sdk_backend_config_->set_local_mem_ptr(nullptr);
@@ -70,7 +71,7 @@ TEST_F(MooncakeSdkTest, TestInit) {
 
 TEST_F(MooncakeSdkTest, TestPutGetWithCpu) {
     MooncakeSdk sdk;
-    auto client_buffer_allocator = std::make_shared<char[]>(128 * 1024 * 1024);
+    auto client_buffer_allocator = std::shared_ptr<char[]>(new char[128 * 1024 * 1024]);
     sdk_backend_config_->set_local_mem_ptr(client_buffer_allocator.get());
     sdk_backend_config_->set_self_location_spec_name("tp2_F0");
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, storage_config_));
@@ -131,7 +132,7 @@ TEST_F(MooncakeSdkTest, TestPutGetWithCpu) {
 
 TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
     MooncakeSdk sdk;
-    auto client_buffer_allocator = std::make_shared<char[]>(128 * 1024 * 1024);
+    auto client_buffer_allocator = std::shared_ptr<char[]>(new char[128 * 1024 * 1024]);
     sdk_backend_config_->set_local_mem_ptr(client_buffer_allocator.get());
     sdk_backend_config_->set_self_location_spec_name("tp3_F0");
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, storage_config_));
@@ -171,6 +172,7 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithCpu) {
     ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     ASSERT_EQ(actual_remote_uris->size(), 2);
     // 同序契约：actual_remote_uris[i] 与 remote_uris[i] 逐位置对应
+    // （Alloc 为恒等赋值，天然满足；断言防止将来改为逐项回填时破坏保序）。
     ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
     ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), uri2.ToUriString());
 
@@ -329,6 +331,9 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithGpu) {
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
     ASSERT_EQ(ER_OK, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
     ASSERT_EQ(actual_remote_uris->size(), 2);
+    // 同序契约：与 CPU 用例同理，逐位置对应。
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), uri1.ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), uri2.ToUriString());
     free(host_put_buffer_1);
     free(host_put_buffer_2);
     cudaFree(gpu_put_buffer_1);
@@ -361,4 +366,85 @@ TEST_F(MooncakeSdkTest, TestMultipleUriWithGpu) {
 #else
     GTEST_SKIP() << "CUDA not enabled, skipping GPU buffer test";
 #endif
+}
+
+// ===========================================================================
+// 无 mooncake 服务也能跑的用例：逐 key 准入检查发生在 mooncake_client_get/put
+// 之前，因此不需要真实服务。通过 -fno-access-control 直接注入 sdk_backend_config_
+// 绕过 Init（client_ 保持 nullptr —— 若检查失效走到网络调用，nullptr 解引用会
+// crash 而不是返回 ER_SDK_TIMEOUT，所以"返回超时码"本身就是"检查先于 I/O"的证明）。
+// ===========================================================================
+
+TEST_F(MooncakeSdkTest, TestGetSkipsIoWhenDeadlineExpired) {
+    MooncakeSdk sdk;
+    // 注入配置绕过 Init：不需要真实 mooncake 服务。
+    sdk.sdk_backend_config_ = sdk_backend_config_;
+    sdk.storage_config_ = storage_config_;
+
+    const std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("mooncake://na61_mc_bucket_01?key=expired_get_key")};
+    std::vector<char> storage(1024);
+    BlockBuffers local_buffers(1);
+    Iov iov;
+    iov.base = storage.data();
+    iov.size = storage.size();
+    iov.type = MemoryType::CPU;
+    iov.ignore = false;
+    local_buffers[0].iovs.push_back(iov);
+
+    // 预算已耗尽（负预算 = entry 即过期，测试专用构造）：任何一次 I/O 都不允许发起。
+    // 检查先于 mooncake_client_get，返回超时而不是 crash / ER_SDKREAD_ERROR。
+    auto expired_cfg = std::make_shared<MooncakeSdkConfig>(*sdk_backend_config_);
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(-1'000);
+    expired_cfg->set_timeout_config(timeout);
+    sdk.sdk_backend_config_ = expired_cfg;
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Get(remote_uris, local_buffers));
+}
+
+TEST_F(MooncakeSdkTest, TestPutSkipsIoWhenDeadlineExpired) {
+    MooncakeSdk sdk;
+    // 注入配置绕过 Init：不需要真实 mooncake 服务。
+    sdk.sdk_backend_config_ = sdk_backend_config_;
+    sdk.storage_config_ = storage_config_;
+
+    const std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("mooncake://na61_mc_bucket_01?key=expired_put_key")};
+    std::vector<char> storage(1024);
+    BlockBuffers local_buffers(1);
+    Iov iov;
+    iov.base = storage.data();
+    iov.size = storage.size();
+    iov.type = MemoryType::CPU;
+    iov.ignore = false;
+    local_buffers[0].iovs.push_back(iov);
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+
+    // 预算已耗尽（负预算 = entry 即过期，测试专用构造）：任何一次 I/O 都不允许发起。
+    // 检查先于 mooncake_client_put，返回超时而不是 crash / ER_SDKWRITE_ERROR。
+    auto expired_cfg = std::make_shared<MooncakeSdkConfig>(*sdk_backend_config_);
+    SdkTimeoutConfig timeout;
+    timeout.set_put_timeout_ms(-1'000);
+    expired_cfg->set_timeout_config(timeout);
+    sdk.sdk_backend_config_ = expired_cfg;
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+}
+
+TEST_F(MooncakeSdkTest, TestPutActualUrisSameOrder) {
+    // 保序契约：Put 的 actual_remote_uris 由
+    // 末尾的 Alloc 整体赋值（alloc_uris = remote_uris）填充，顺序与 remote_uris 天然
+    // 一致。直接测 Alloc（protected，经 -fno-access-control 访问），不需要 mooncake 服务。
+    MooncakeSdk sdk;
+    const std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("mooncake://na61_mc_bucket_01?key=k0"),
+        DataStorageUri("mooncake://na61_mc_bucket_01?key=k1"),
+        DataStorageUri("mooncake://na61_mc_bucket_01?key=k2"),
+    };
+    std::vector<DataStorageUri> actual_uris;
+    ASSERT_EQ(ER_OK, sdk.Alloc(remote_uris, actual_uris));
+    // 逐一同序断言：actual_uris[i] 必须对应 remote_uris[i]（下标即 block 身份）。
+    ASSERT_EQ(remote_uris.size(), actual_uris.size());
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        ASSERT_EQ(remote_uris[i].ToUriString(), actual_uris[i].ToUriString());
+    }
 }
