@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | V1 已实现，包含 `CacheMetaDelRequest` 异步接口；未来扩展未纳入 |
-| 更新时间 | 2026-07-17 |
+| 更新时间 | 2026-09-03 |
 | 涉及模块 | `manager`、`meta`、`metrics`、`service` |
 | 关联需求 | [CacheReclaimer 过度逐出优化](https://project.aone.alibaba-inc.com/v2/project/2137612/req/74289896)、[Reclaimer 删除请求提交异步化改造](https://project.aone.alibaba-inc.com/v2/project/2137612/req/80484236) |
 | 历史参考 | [PR #161](https://github.com/alibaba/tair-kvcache/pull/161) |
@@ -416,10 +416,14 @@ V1 默认参数：
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
 | `inflight_delete_timeout_ms` | 60000 | 删除 delay 之外允许 credit 继续生效的时间 |
-| `pending_location_limit_per_group_type` | 100000 | 单 Group × BaseStorageType 的 pending Location 上限 |
-| `pending_bytes_limit_per_group_type` | 64 GiB | 单 Group × BaseStorageType 的 pending bytes 上限 |
+| `pending_location_limit_per_group_type` | 20000 | 单 Group × BaseStorageType 的 pending Location 上限 |
+| `pending_bytes_limit_per_group_type` | 1 TiB | 单 Group × BaseStorageType 的 pending bytes 上限 |
 | `pending_delete_handler_limit` | 1024 | 进程级 pending 请求上限 |
-| `pending_bytes_limit` | 256 GiB | 进程级 pending bytes 上限 |
+| `pending_bytes_limit` | 4 TiB | 进程级 pending bytes 上限 |
+
+2026-09-03 调整默认值时，将单 Group × BaseStorageType 的 bytes 窗口从 64 GiB 放大到 1 TiB，避免大
+Location 场景过早被 bytes 限流；同时将 Location 数量上限从 100000 收紧到 20000，继续约束小 Location
+场景的并发删除规模。进程级 bytes 上限按原 1:4 比例同步设为 4 TiB，handler 上限保持 1024 不变。
 
 no-progress 默认复用 `cache_reclaimer_idle_interval_ms`；该值为 0 时使用 1ms 的安全下限。
 

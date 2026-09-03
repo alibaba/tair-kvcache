@@ -114,12 +114,12 @@ kvcm.meta_query.chunk_size=128
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 
 # 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
-kvcm.cache_reclaimer.pending_location_limit_per_group_type=100000
-kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
+kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
+kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
 
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
-kvcm.cache_reclaimer.pending_bytes_limit=274877906944
+kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
 
 # leader 后台 metadata GC，默认开启。处理超过 grace 的 CLS_WRITING、
 # MightExist 明确 missing 的普通 CLS_SERVING 以及 EventReport metadata 回收。

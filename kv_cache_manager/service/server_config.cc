@@ -318,10 +318,10 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_idle_interval_ms_ = 100;
     cache_reclaimer_worker_size_ = 16;
     cache_reclaimer_inflight_delete_timeout_ms_ = 60000;
-    cache_reclaimer_pending_location_limit_per_group_type_ = 100000;
-    cache_reclaimer_pending_bytes_limit_per_group_type_ = 64ULL * 1024 * 1024 * 1024;
+    cache_reclaimer_pending_location_limit_per_group_type_ = 20000;
+    cache_reclaimer_pending_bytes_limit_per_group_type_ = 1ULL * 1024 * 1024 * 1024 * 1024;
     cache_reclaimer_pending_delete_handler_limit_ = 1024;
-    cache_reclaimer_pending_bytes_limit_ = 256ULL * 1024 * 1024 * 1024;
+    cache_reclaimer_pending_bytes_limit_ = 4ULL * 1024 * 1024 * 1024 * 1024;
     cache_gc_enabled_ = true;
     cache_gc_scan_interval_ms_ = 1000;
     cache_gc_round_pause_ms_ = 2LL * 60 * 60 * 1000;
