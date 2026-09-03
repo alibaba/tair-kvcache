@@ -113,12 +113,12 @@ message OptimizerRegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5;   // KVCM 风格 spec 定义
     repeated LocationSpecGroup location_spec_groups = 6; // KVCM 风格 spec group 定义
     OptimizerStateInfo optimizer_state_info = 7; // 显式声明 optimizer full/linear 状态如何映射到 KVCM group
-    int32 linear_step = 8;       // 0 表示 full-only；>0 表示每 linear_step 个 block 产生一次 full+linear checkpoint
+    int32 linear_step = 8;       // 0 表示 full-only；>0 表示每 linear_step 个 **token** 产生一次 Linear 状态（须为 block_size 的整数倍，Linear 状态只落在完整 block 边界）
 }
 
 message OptimizerRegisterInstanceResponse {
     CommonResponseHeader header = 1;
-    repeated int64 estimated_capacity_blocks = 2; // 各档容量按 average block size 折算的 block 数
+    repeated int64 estimated_capacity_blocks = 2; // 兼容展示字段，不参与命中计算。full-attention：由 byte 容量精确派生；linear：仅估算（Full block 与 Linear 状态字节不等）
     int64 size_full_only = 3;           // 仅 full spec 的单 block 字节数
     int64 size_full_linear = 4;         // full+linear 混合的单 block 字节数
 }

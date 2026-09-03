@@ -2,7 +2,7 @@
 
 > [中文](README_zh.md) | English
 
-LiteHit is a lightweight, exact LRU hit-rate analyzer for full-attention KVCache blocks. The core replays a trace only once, producing **capacity-independent facts** for each request (`RequestFact`, a hit curve encoded as arithmetic-segment RLE); the hit count for any capacity is derived after the fact from the facts by the stateless projector `HitCurveProjector`. The core never receives a capacity list, nor does it accumulate any per-capacity results.
+LiteHit is a lightweight, exact LRU hit-rate analyzer for full-attention and linear/Mamba KVCache. The two models share one weighted recency core that replays a trace only once, producing **capacity-independent facts** for each request; the hit count for any capacity is derived after the fact from the facts by the stateless projector `HitCurveProjector`. The core never receives a capacity list, nor does it accumulate any per-capacity results. The core produces a total-byte-axis `RequestFact` by default; only Full-only instances losslessly compress it into a block-axis `FullRequestFact` RLE.
 
 The problem LiteHit solves is:
 
@@ -16,12 +16,12 @@ how to replay the trace only once and precisely answer, for "any" LRU capacity:
 Capacity no longer needs to be given before the analysis starts.
 ```
 
-The first phase only supports the following model:
+The currently supported model is:
 
-- full attention;
-- every complete block has the same KVCache charge (equal charge, see 6.4);
+- full attention (every complete block has the same charge, see 6.4);
+- linear/Mamba (Full blocks and Linear states carry different charges, sharing one weighted LRU pool);
 - exact LRU, with in-request reverse-order submission;
-- does not handle linear attention / Mamba, blocks of different sizes, admission, prefetch, or multi-level cache policies; TTL support is "one fixed TTL per group" layered on top of LRU (see §7 TTL Replay), and does not support query-time scanning of arbitrary TTLs.
+- does not handle admission, prefetch, or multi-level cache policies; TTL support is "one fixed TTL per group", applying to both Full blocks and Linear states (see §7 TTL Replay), and does not support query-time scanning of arbitrary TTLs.
 
 ## 0. Architecture Overview
 
@@ -34,9 +34,10 @@ The first phase only supports the following model:
                  └───────────────┬────────────────────────────┘
                                  │ NormalizedRequest
                  ┌───────────────▼────────────────────────────┐
-                 │ LiteHit core (capacity-independent)         │
-                 │  ProcessRequest(block_keys) → RequestFact   │
-                 │  state: Fenwick + last_positions            │
+                 │ TtlLiteHit decorator (fixed TTL; 0=pass-through)│
+                 ├────────────────────────────────────────────┤
+                 │ LiteHit core (time-free, shared Full/Mamba) │
+                 │ WeightedLruPool + Linear state policy      │
                  └───────┬───────────────────────┬────────────┘
                          │ RequestFact           │ RequestFact
             Online path  │                       │  Offline path
@@ -54,9 +55,9 @@ The first phase only supports the following model:
 
 Three inviolable layering constraints:
 
-1. **Core is capacity-independent**: `LiteHit::ProcessRequest` only receives block keys and returns a `RequestFact`; there is no capacity parameter.
+1. **The core is capacity-independent**: `LiteHit::ProcessRequest` only receives block keys and returns a `RequestFact`; there is no capacity parameter.
 2. **Projection is the sole entry point**: all "capacity → hit block count" conversions must go through `HitCurveProjector`; Online and facts query share the same implementation, and no component is allowed to implement boundary logic on its own.
-3. **Byte conversion happens only at the projection boundary**: the core and facts are all in block units; `ProjectBytes` performs a single floor division using `block_bytes` at projection time.
+3. **byte-step is the default fact**: the core first produces the `RequestFact` on the total-byte axis; only the Full-only equal-charge case uses `ProcessFullRequest` to convert it into block-axis RLE.
 
 ---
 
@@ -171,7 +172,7 @@ The Fenwick is not a cache; it is merely an order-statistics representation of t
 
 ---
 
-## 5. RequestFact: Hit Curve Encoded as Arithmetic-Segment RLE
+## 5. RequestFact: byte-step by Default, Full-only Compressible to RLE
 
 ### 5.1 From Per-Block Thresholds to Hit Curve
 
@@ -187,11 +188,11 @@ The sequence `prefix_required[1..h]` (h being the length before cold truncation)
 hit_blocks(C) = |{ j : prefix_required[j] <= C }|
 ```
 
-This monotonic step function is the **hit curve** of this request — it is the entire fact of this request.
+This monotonic step function is the **hit curve** of this request — it is the entire fact of this request. The core records each threshold directly as `{min_total_capacity_bytes, hit_blocks}`, forming the default byte-step `RequestFact`.
 
-### 5.2 Under the Contract, Thresholds Are Strictly Increasing ⇒ Arithmetic-Segment RLE Is Lossless
+### 5.2 Full-only: Under the Contract, Thresholds Are Strictly Increasing ⇒ Arithmetic-Segment RLE Is Lossless
 
-Under reverse-order submission, the minimum hit capacity of a later block on the chain is **strictly greater** than that of an earlier block (each block deeper adds at least its parent key within the snapshot interval), so for contract inputs `prefix_required` is strictly increasing. A stronger structural property is: adjacent blocks on the chain occupy **consecutive** positions in the global LRU, and the threshold only jumps at "queue-jumping" points (positions where sibling branches interleave). So consecutive `+1` thresholds are compressed into one arithmetic segment:
+Under reverse-order submission, the minimum hit capacity of a later block on the chain is **strictly greater** than that of an earlier block (each block deeper adds at least its parent key within the snapshot interval), so for contract inputs `prefix_required` is strictly increasing. In Full-only every object carries the same charge, so byte thresholds divide exactly by `full_charge_bytes`; consecutive `+1` block thresholds are then compressed into one arithmetic segment:
 
 ```text
 HitCurveSegment { start_required_blocks, run_length }
@@ -214,11 +215,11 @@ For contract inputs this defense is always a no-op; for non-contract inputs it o
 ### 5.4 HitCurveProjector
 
 ```cpp
-ProjectBlocks(fact, capacity_blocks)   // linear scan along segments:
-                                       // hits += min(run_length, C - start + 1), until start > C
-ProjectBytes(fact, capacity_bytes, block_bytes)
-                                       // = ProjectBlocks(fact, floor(bytes / block_bytes))
-ProjectInfinite(fact)                  // = Σ run_length (no capacity miss, only cold miss)
+ProjectBytes(fact, capacity_bytes)              // default byte-step
+ProjectInfinite(fact)                           // last point of the byte-step curve
+ProjectFullBlocks(full_fact, capacity_blocks)   // Full-only RLE
+ProjectFullBytes(full_fact, bytes, block_bytes) // floor, then project the RLE
+ProjectFullInfinite(full_fact)                  // Σ run_length of the RLE
 ```
 
 An empty curve means the request head is cold, and hits are 0 at any capacity.
@@ -250,11 +251,11 @@ capacity_blocks = floor(capacity_bytes / block_bytes)
 capacity_gb uses binary conversion: capacity_bytes = capacity_gb * 1024^3
 ```
 
-`block_bytes` comes from the sum of spec.size of each spec in the full location spec group of instance registration (`size_full_only`). Each row of the facts CSV records `block_bytes`, making facts self-describing: even if the charge estimate is corrected later, historical facts can be re-projected.
+Online keeps only `capacity_bytes` for both Full-only and Linear instances; no Full-specific block capacity is stored ahead of time. `block_bytes` comes from the sum of spec.size of each spec in the full location spec group of instance registration (the charge of one Full block); only the final projection of Full RLE performs the floor above. Each row of the facts CSV records `block_bytes`, making facts self-describing: even if the charge estimate is corrected later, historical facts can be re-projected.
 
 ### 6.4 Equal-Charge Invariant (Premise of Block-Unit RLE)
 
-The hit curve is in block units and `ProjectBytes` performs a single floor division, which is exact **if and only if** the charges of all participating blocks are exactly equal — full-only instances satisfy this (each block's charge is constantly `size_full_only`, an exact value not an average). For linear/Mamba mixed instances, the per-block charge is unequal, and charge-weighted thresholds must be used instead, which is a separate subsequent task; currently Offline rejects instances with `linear_step != 0`.
+Full RLE is in block units and `ProjectFullBytes` performs a single floor division, which is exact **if and only if** the charges of all participating objects are exactly equal — full-attention instances satisfy this. For linear/Mamba the Full block and Linear state charges differ, so the default `RequestFact` is kept and projected directly on the **total byte-capacity axis**, with no average-block conversion.
 
 ---
 
@@ -275,7 +276,7 @@ batch window = pipeline_worker_count * 256 entries
 
 **Fanout mode**: when `fanout_all_instances = true`, each request is broadcast to all lanes (each lane has independent LRU state and independent facts rows); combined with multiple instances of different `block_size`, a single replay can scan multiple analysis granities over the same trace; mutually exclusive with `override_instance_id`. The facts query summary is grouped by instance (one row per instance + one total row), and fanout results are directly readable.
 
-**TTL replay**: when the instance group config has `ttl_seconds != 0`, the `LiteHit` core of that group's lanes layers a fixed TTL on top (consistent with the online `TtlCacheIndexerWrapper` semantics: a block survives while strictly less than TTL since its last access; expired blocks are misses at any capacity and truncate the prefix like cold blocks; every access (hit or miss) refreshes last_access; time is taken from the trace timestamp, and replay is deterministic). Age is monotonic along the LRU stack, and expired blocks do not raise the reuse distance of surviving blocks, so a single replay remains exact for the joint metric of "fixed TTL × arbitrary capacity", and facts are still ordinary hit curve rows. TTL is a replay-time parameter, taken directly from the group's `ttl_seconds`; to scan multiple TTLs, configure multiple groups each with a different `ttl_seconds` (can be combined with fanout to complete in a single replay).
+**TTL replay**: each lane wraps the time-free `LiteHit` core with `TtlLiteHit`; with `ttl_seconds == 0` the decorator is a transparent pass-through. Full blocks and Linear states share the same request-time epochs; an object whose age reaches the TTL drops out of the weighted LRU's visible set. Full blocks are touched on every request, while Linear states are touched only when written at periodic positions or the request tail. Time is taken from the trace timestamp, so replay is deterministic. Expired objects do not raise the capacity threshold of surviving objects, so a single replay remains exact for "fixed TTL × arbitrary capacity". To scan multiple TTLs, configure multiple groups.
 
 **Fail-fast**: timestamp out of order, unknown instance, length validation failure, zero valid rows in the whole file — any of these fails the whole thing with a reason — facts are an all-or-nothing reconciliation ledger, and silent row loss is not allowed.
 
@@ -287,7 +288,7 @@ batch window = pipeline_worker_count * 256 entries
 trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,hit_curve
 ```
 
-`hit_curve` is a quoted JSON array `[[start_required_blocks, run_length], ...]`; string fields are quote-escaped per CSV rules. Each row is independently parseable, self-describing, and re-projectable.
+`hit_curve` is a quoted JSON array: default byte-step rows use `bytes:[[min_capacity_bytes, hit_blocks], ...]`; Full-only rows use `rle:[[start_required_blocks, run_length], ...]`. The reader also accepts the legacy `mamba:` byte-step and unprefixed Full RLE. String fields are quote-escaped per CSV rules.
 
 ### 7.2 facts query Tool
 
@@ -306,16 +307,17 @@ Memory is only O(number of instances × number of capacity slots) cumulative int
 
 ## 8. Online Integration
 
-The Online Optimizer's full-attention `InstanceState` directly holds a `LiteHit` (when the group config has `ttl_seconds != 0`, a fixed TTL is layered on with wall-clock time, with metrics consistent with the linear path's `TtlCacheIndexerWrapper`). Each TraceQuery:
+Each `InstanceState` of the Online Optimizer holds one `TtlLiteHit` decorator with a single `LiteHit` core inside. Whenever an instance group config has `ttl_seconds != 0`, a fixed TTL is applied with wall-clock time; with TTL 0 the decorator passes straight through to the core. Semantics match offline replay, only the time source differs. Each TraceQuery:
 
 ```text
-NormalizeRequest → ProcessRequest → obtain RequestFact
-  ├─ for each configured capacity slot: ProjectBlocks(fact, lite_hit_capacity_blocks[i])
-  ├─ theoretical upper bound: ProjectInfinite(fact)
+NormalizeRequest
+  ├─ linear: ProcessRequest → RequestFact → ProjectBytes
+  ├─ Full-only: ProcessFullRequest → FullRequestFact → ProjectFullBytes
+  ├─ theoretical upper bound: ProjectInfinite / ProjectFullInfinite of the corresponding fact
   └─ update cumulative integers: total_queries / total_input_tokens / total_hits per slot
 ```
 
-Online does not persist facts (facts persistence is currently Offline-exclusive); the hit rate of `ListInstances` is derived from cumulative integers (`total_hits * block_size_tokens / total_input_tokens`). linear attention continues to go through the legacy indexer path (when prefix hash is enabled, only `ApplyPrefixHash` is performed).
+Online does not persist facts (facts persistence is currently Offline-exclusive); the hit rate of `ListInstances` is derived from cumulative integers (`total_hits * block_size_tokens / total_input_tokens`). linear attention enables the Linear state policy and projects the byte-step directly; the TTL watermark filters both Full and Linear objects, and the resident bytes, unique Full blocks and TTL evictions in the statistics are all computed over the filtered working set.
 
 ---
 
@@ -325,8 +327,9 @@ Let N = total number of block accesses, U = number of historically distinct bloc
 
 ```text
 ProcessRequest: O(m log U) (m is the number of request blocks)
-ProjectBlocks:  O(S), independent of capacity value
-core persistent state: Fenwick + last_positions, O(U)
+ProjectBytes / ProjectFullBytes: O(S), independent of capacity value
+core persistent state: WeightedLruPool (Fenwick + typed positions), O(U)
+TTL decorator: request-time epochs + alive-position watermark, O(Q)
 ```
 
 **No capacity-based pruning**: capacity is only known after the fact, and any key may be used by some future large-capacity query, so the core retains all historical unique keys (this is the inherent cost of capacity independence). The compaction in Section 4 only reclaims abandoned positions, it does not delete keys. `memory_usage_bytes()` / `current_unique_blocks()` provide observability.
@@ -366,7 +369,7 @@ Request 3's curve `[[1,2],[4,1]]` reads directly: capacity 2, 3 hits 2 blocks (t
 
 Unit tests (`LiteHitTest` / `LiteHitOfflineRunnerTest`) cover:
 
-1. **oracle comparison**: under contract inputs (random tree-shaped chains + `ApplyPrefixHash`), `ProjectBlocks` is **exactly identical** to naive multi-capacity LRU (snapshot evaluation + reverse-order per-block touch) at capacities {0,1,2,4,9,∞};
+1. **oracle comparison**: under contract inputs (random tree-shaped chains + `ApplyPrefixHash`), `ProjectFullBlocks` is **exactly identical** to naive multi-capacity LRU (snapshot evaluation + reverse-order per-block touch) at capacities {0,1,2,4,9,∞};
 2. non-contract input projection ≤ oracle (monotonic defense is pessimistic, never optimistic), infinite capacity still exact;
 3. RLE shape: whole-chain replay single segment, queue-jump breaks segments, adjacent segments cannot be merged;
 4. projection boundaries: capacity 0, segment boundaries, byte floor conversion;
@@ -401,5 +404,5 @@ The three most easily confused points:
    at the cost of not being able to do capacity-based pruning.
 2. block_size_tokens converts tokens, block_bytes converts capacity; they cannot replace each other.
 3. The losslessness of arithmetic-segment RLE depends on the prefix hash contract + reverse-order submission + equal charge;
-   mixed charge (linear/Mamba) must be designed separately.
+   mixed charge (linear/Mamba) reuses the same core but encodes an explicit step curve on the total-byte axis.
 ```

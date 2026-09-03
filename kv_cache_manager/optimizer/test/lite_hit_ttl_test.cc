@@ -8,7 +8,7 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
-#include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit_ttl.h"
 
 namespace kv_cache_manager {
 
@@ -19,7 +19,7 @@ namespace {
 // blocks are all seen, alive (age strictly below TTL) and within the top C
 // of the recency stack on the request-start snapshot. Commits touch
 // tail-to-head (chain head most recent) and refresh last_access for every
-// block, matching the LiteHit contract and the online TTL wrapper.
+// block, matching the LiteHit contract and the TTL decorator.
 class NaiveLruTtlOracle {
 public:
     uint64_t Evaluate(const std::vector<int64_t> &keys, int64_t now_ns, uint64_t ttl_ns, uint64_t capacity) const {
@@ -80,115 +80,134 @@ private:
 class LiteHitTtlTest : public TESTBASE {};
 
 TEST_F(LiteHitTtlTest, StrictDeadlineBoundary) {
-    LiteHit core(2000);
-    EXPECT_TRUE(core.ProcessRequest({1, 2, 3}, 1000).hit_curve.empty()); // cold
+    TtlLiteHit core(2000);
+    EXPECT_TRUE(core.ProcessFullRequest({1, 2, 3}, 1000).hit_curve.empty()); // cold
     // Ages 1999 < 2000: alive, normal LRU curve.
-    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), core.ProcessRequest({1, 2, 3}, 2999).hit_curve);
+    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), core.ProcessFullRequest({1, 2, 3}, 2999).hit_curve);
     // Ages exactly 2000: deadline reached, miss (matches the online wrapper).
-    EXPECT_TRUE(core.ProcessRequest({1, 2, 3}, 4999).hit_curve.empty());
+    EXPECT_TRUE(core.ProcessFullRequest({1, 2, 3}, 4999).hit_curve.empty());
     // The expired access still refreshed last_access.
-    EXPECT_EQ(3, HitCurveProjector::ProjectInfinite(core.ProcessRequest({1, 2, 3}, 5000)));
+    EXPECT_EQ(3, HitCurveProjector::ProjectFullInfinite(core.ProcessFullRequest({1, 2, 3}, 5000)));
 }
 
 TEST_F(LiteHitTtlTest, ExpiredBlockStopsThePrefixLikeAColdOne) {
-    LiteHit core(2500);
-    core.ProcessRequest({10, 11}, 1000);
-    core.ProcessRequest({10, 11, 12}, 3000); // all refreshed at 3000
+    TtlLiteHit core(2500);
+    core.ProcessFullRequest({10, 11}, 1000);
+    core.ProcessFullRequest({10, 11, 12}, 3000); // all refreshed at 3000
     // At 5600 every block is 2600 old: dead despite being LRU-resident.
-    EXPECT_TRUE(core.ProcessRequest({10, 11, 12}, 5600).hit_curve.empty());
+    EXPECT_TRUE(core.ProcessFullRequest({10, 11, 12}, 5600).hit_curve.empty());
 }
 
 TEST_F(LiteHitTtlTest, TtlZeroIsPureLru) {
-    LiteHit core; // default: no TTL, timestamps ignored
-    core.ProcessRequest({1, 2, 3}, 1000);
-    const RequestFact fact = core.ProcessRequest({1, 2, 3}, 1000000000000);
+    TtlLiteHit core; // default: no TTL, timestamps ignored
+    core.ProcessFullRequest({1, 2, 3}, 1000);
+    const FullRequestFact fact = core.ProcessFullRequest({1, 2, 3}, 1000000000000);
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), fact.hit_curve);
 }
 
+TEST_F(LiteHitTtlTest, DisabledDecoratorMatchesBareLinearCore) {
+    LiteHit::CacheObjectConfig object_config;
+    object_config.full_charge_bytes = 10;
+    object_config.linear_charge_bytes = 2;
+    object_config.linear_step_blocks = 2;
+    LiteHit bare(object_config);
+    TtlLiteHit decorated(object_config, /*ttl_ns=*/0);
+
+    const std::vector<std::vector<int64_t>> requests = {{1, 2, 3}, {1, 2}, {1, 2, 3}, {4, 5}};
+    int64_t now_ns = 1000;
+    for (const auto &request : requests) {
+        EXPECT_EQ(bare.ProcessRequest(request).points, decorated.ProcessRequest(request, now_ns).points);
+        EXPECT_EQ(bare.current_unique_blocks(), decorated.current_unique_blocks());
+        EXPECT_EQ(bare.resident_bytes(), decorated.resident_bytes());
+        now_ns += 1000000;
+    }
+    EXPECT_EQ(0, decorated.ttl_expired_blocks());
+}
+
 TEST_F(LiteHitTtlTest, ResetClearsTtlState) {
-    LiteHit core(1000000);
-    core.ProcessRequest({1, 2}, 1000);
+    TtlLiteHit core(1000000);
+    core.ProcessFullRequest({1, 2}, 1000);
     EXPECT_EQ(2, core.current_unique_blocks());
     core.Reset();
     EXPECT_EQ(0, core.current_unique_blocks());
-    EXPECT_TRUE(core.ProcessRequest({1, 2}, 2000).hit_curve.empty());
+    EXPECT_TRUE(core.ProcessFullRequest({1, 2}, 2000).hit_curve.empty());
 }
 
 TEST_F(LiteHitTtlTest, UniqueBlocksExcludeExpired) {
-    LiteHit core(1000);
-    core.ProcessRequest({1, 2, 3}, 0);
+    TtlLiteHit core(1000);
+    core.ProcessFullRequest({1, 2, 3}, 0);
     EXPECT_EQ(3, core.current_unique_blocks());
     // All three expire; only the new key is alive even though the expired
     // table entries linger until compaction.
-    core.ProcessRequest({100}, 5000);
+    core.ProcessFullRequest({100}, 5000);
     EXPECT_EQ(1, core.current_unique_blocks());
 }
 
 TEST_F(LiteHitTtlTest, CompactionDropsExpiredEntries) {
-    LiteHit core(1000);
+    TtlLiteHit core(1000);
     for (int64_t r = 0; r < 600; ++r) {
         std::vector<int64_t> keys;
         keys.reserve(10);
         for (int64_t i = 0; i < 10; ++i) {
             keys.push_back(1000000 + r * 100 + i);
         }
-        core.ProcessRequest(keys, 0);
+        core.ProcessFullRequest(keys, 0);
     }
     EXPECT_EQ(6000, core.current_unique_blocks());
     // Every block expires; the next request pushes the state past the
     // compaction threshold and the dead entries are dropped, not carried.
-    core.ProcessRequest({1, 2, 3}, 5000);
+    core.ProcessFullRequest({1, 2, 3}, 5000);
     EXPECT_EQ(3, core.current_unique_blocks());
-    EXPECT_EQ(3u, core.last_positions_.size());
+    EXPECT_EQ(3u, core.core_.pool_.full_positions_.size());
     // The bucket array shrinks with the entries instead of staying at the
     // 6000-key high-water mark.
-    EXPECT_LT(core.last_positions_.bucket_count(), 1000u);
+    EXPECT_LT(core.core_.pool_.full_positions_.bucket_count(), 1000u);
     // Semantics survive the cleanup: dropped keys stay cold, alive ones hit
     // (the re-committed cold key occupies MRU, shifting thresholds by one).
-    EXPECT_TRUE(core.ProcessRequest({1000000}, 5001).hit_curve.empty());
-    EXPECT_EQ((std::vector<HitCurveSegment>{{2, 3}}), core.ProcessRequest({1, 2, 3}, 5001).hit_curve);
+    EXPECT_TRUE(core.ProcessFullRequest({1000000}, 5001).hit_curve.empty());
+    EXPECT_EQ((std::vector<HitCurveSegment>{{2, 3}}), core.ProcessFullRequest({1, 2, 3}, 5001).hit_curve);
 }
 
 TEST_F(LiteHitTtlTest, CompactionCollapsesEmptyEpochs) {
-    LiteHit core(1000000000); // TTL far beyond the replayed horizon
+    TtlLiteHit core(1000000000); // TTL far beyond the replayed horizon
     // A single hot key with a distinct timestamp per request: every commit
     // moves the marker and leaves the previous epoch's range empty. Without
     // the compaction dedupe the deque would hold one epoch per request.
     for (int64_t t = 1; t <= 10000; ++t) {
-        core.ProcessRequest({7}, t);
+        core.ProcessFullRequest({7}, t);
     }
-    EXPECT_LE(core.position_epochs_.size(), 4200u);
+    EXPECT_LE(core.ttl_state_.position_epochs_.size(), 4200u);
     EXPECT_EQ(1, core.current_unique_blocks());
     // Exactness survives the collapse: alive within TTL, dead at the strict
     // deadline measured from the true last access.
-    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), core.ProcessRequest({7}, 10001).hit_curve);
-    EXPECT_TRUE(core.ProcessRequest({7}, 10001 + 1000000000).hit_curve.empty());
+    EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), core.ProcessFullRequest({7}, 10001).hit_curve);
+    EXPECT_TRUE(core.ProcessFullRequest({7}, 10001 + 1000000000).hit_curve.empty());
 }
 
 TEST_F(LiteHitTtlTest, AdvanceTimeRefreshesUniqueCount) {
-    LiteHit core(1000);
-    core.ProcessRequest({1, 2}, 0);
+    TtlLiteHit core(1000);
+    core.ProcessFullRequest({1, 2}, 0);
     EXPECT_EQ(2, core.current_unique_blocks());
     core.AdvanceTime(999); // ages 999 < 1000: still alive
     EXPECT_EQ(2, core.current_unique_blocks());
     core.AdvanceTime(1000); // strict deadline: dead without any request
     EXPECT_EQ(0, core.current_unique_blocks());
     // Re-access after the observational advance still revives normally.
-    core.ProcessRequest({1}, 1000);
+    core.ProcessFullRequest({1}, 1000);
     EXPECT_EQ(1, core.current_unique_blocks());
 
-    LiteHit pure_lru;
-    pure_lru.ProcessRequest({1, 2}, 0);
+    TtlLiteHit pure_lru;
+    pure_lru.ProcessFullRequest({1, 2}, 0);
     pure_lru.AdvanceTime(1000000000); // no TTL: a pure no-op
     EXPECT_EQ(2, pure_lru.current_unique_blocks());
 }
 
 TEST_F(LiteHitTtlTest, CountsTtlExpiredBlocks) {
-    LiteHit core(1000);
-    core.ProcessRequest({1, 2, 3}, 0);
+    TtlLiteHit core(1000);
+    core.ProcessFullRequest({1, 2, 3}, 0);
     EXPECT_EQ(0, core.ttl_expired_blocks());
     // All three reached the deadline; key 1 revives after being counted.
-    core.ProcessRequest({1}, 2000);
+    core.ProcessFullRequest({1}, 2000);
     EXPECT_EQ(3, core.ttl_expired_blocks());
     // Repeated advances must not double count the already-swept markers.
     core.AdvanceTime(2500);
@@ -210,9 +229,9 @@ TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
 
     // One core per fixed TTL; commits are TTL-independent, so every core and
     // the single oracle share the same recency and last-access evolution.
-    std::vector<std::unique_ptr<LiteHit>> cores;
+    std::vector<std::unique_ptr<TtlLiteHit>> cores;
     for (uint64_t ttl : ttls) {
-        cores.push_back(std::make_unique<LiteHit>(ttl));
+        cores.push_back(std::make_unique<TtlLiteHit>(ttl));
     }
     NaiveLruTtlOracle oracle;
     // Naive harvest model per TTL: a tracked key leaves the alive set and
@@ -245,11 +264,11 @@ TEST_F(LiteHitTtlTest, RandomizedMatchesNaiveJointOracle) {
                     ++it;
                 }
             }
-            const RequestFact fact = cores[t]->ProcessRequest(keys, now);
+            const FullRequestFact fact = cores[t]->ProcessFullRequest(keys, now);
             ASSERT_EQ(naive_expired[t], cores[t]->ttl_expired_blocks()) << "step " << step << " ttl " << ttls[t];
             for (uint64_t capacity : capacities) {
                 ASSERT_EQ(oracle.Evaluate(keys, now, ttls[t], capacity),
-                          HitCurveProjector::ProjectBlocks(fact, capacity))
+                          HitCurveProjector::ProjectFullBlocks(fact, capacity))
                     << "step " << step << " ttl " << ttls[t] << " capacity " << capacity;
             }
             naive_alive[t].insert(keys.begin(), keys.end());

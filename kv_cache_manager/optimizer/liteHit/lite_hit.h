@@ -2,123 +2,74 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <unordered_map>
 #include <vector>
 
-#include "kv_cache_manager/optimizer/liteHit/dynamic_fenwick_tree.h"
 #include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit_linear.h"
+#include "kv_cache_manager/optimizer/liteHit/weighted_lru_pool.h"
 
 namespace kv_cache_manager {
 
-// LiteHit is an exact LRU replay core for equal-charge full-attention
-// blocks. It keeps one global LRU order and, per request, emits
-// capacity-independent facts (RequestFact); it never receives a capacity
-// list and never accumulates per-capacity results. Any capacity is answered
-// afterwards by projecting the facts with HitCurveProjector.
+// One capacity-independent LRU replay core for both Full-only and Mamba
+// instances. All cache objects share one weighted recency pool. Full-only is
+// the uniform-charge specialization where every covered prefix position is a
+// restore point; Mamba adds Linear state objects and only their resident
+// positions are restore points.
 //
-// An optional fixed TTL adds the online TtlCacheIndexerWrapper semantics on
-// top of the LRU stack: a block whose age since last access reached the TTL
-// is a miss for every capacity, every access (hit or miss) refreshes
-// last_access, and time is the caller-provided trace timestamp so the replay
-// stays deterministic. Ages are monotone along the LRU stack (younger blocks
-// are always fresher), so expired blocks never inflate the reuse distance of
-// alive ones and one replay stays exact for every capacity under the fixed
-// TTL.
-//
-// The TTL needs no per-key timestamps: marker positions are assigned
-// monotonically, so a block's last access time is the commit time of the
-// request that assigned its current position. A small epoch deque maps
-// position ranges to commit timestamps; expired epochs advance a single
-// dead-below watermark and liveness is one integer comparison. The extra
-// state is O(distinct commit timestamps inside one TTL window), independent
-// of the number of unique blocks.
+// RequestFact is always evaluated on the byte axis. Full-only callers may
+// losslessly encode it afterwards as FullRequestFact block-axis RLE. Linear
+// state scheduling owns no duplicate LRU state. TTL is deliberately outside
+// this core and is provided by the TtlLiteHit decorator.
 class LiteHit {
 public:
-    // ttl_ns == 0 disables the TTL (pure LRU).
-    explicit LiteHit(uint64_t ttl_ns = 0) : ttl_ns_(ttl_ns) {}
+    // Describes the byte charge and placement of objects in the shared LRU
+    // pool. It is not a general LiteHit runtime configuration.
+    struct CacheObjectConfig {
+        uint64_t full_charge_bytes = 1;
+        uint64_t linear_charge_bytes = 0; // 0 = Full-only
+        uint64_t linear_step_blocks = 0;
+    };
 
-    // One call is one request boundary. block_keys must be the normalized
-    // prefix-chained keys of all complete blocks of the request, in request
-    // order; input length parsing, validation, and prefix hashing happen in
-    // the shared preprocessing outside the core. now_ns is the request trace
-    // timestamp (time-sorted); it is only consulted when a TTL is configured.
-    //
-    // Phase 1 evaluates the prefix hit curve against the request-start LRU
-    // snapshot; with a TTL an expired block stops the prefix like a cold
-    // one. Phase 2 commits every complete block tail-to-head (reverse
-    // request order), including blocks after the first miss. With
-    // prefix-chained keys a chain head is therefore always newer than its
-    // resident descendants, so the global LRU victim is always a leaf,
-    // matching leaf-first eviction used by production prefix caches
-    // (vLLM free-queue order, SGLang radix cache).
-    //
-    // Under the prefix-hash contract per-block thresholds strictly increase,
-    // so the arithmetic-run RLE in RequestFact is lossless. Non-contract
-    // input (duplicate keys inside a request) is first defensively merged to
-    // its longest prefix per threshold and then encoded monotonically; the
-    // projection is never optimistic.
-    RequestFact ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns = 0);
+    // Full-only constructor; unit charge preserves the public block-axis
+    // FullRequestFact contract.
+    LiteHit();
+    explicit LiteHit(const CacheObjectConfig &object_config);
+
+    // Default path for every instance kind: explicit byte-axis step curve.
+    RequestFact ProcessRequest(const std::vector<int64_t> &block_keys);
+
+    // Full-only specialization: losslessly encodes the default byte-step fact
+    // as block-axis RLE. Mixed Full/Linear charge cannot use this encoding.
+    FullRequestFact ProcessFullRequest(const std::vector<int64_t> &block_keys);
 
     void Reset();
 
-    uint64_t ttl_ns() const { return ttl_ns_; }
+    bool uses_linear() const { return linear_policy_.enabled(); }
 
-    // Advances the TTL watermark to now_ns without processing a request, so
-    // observability reads reflect the current time instead of the last
-    // request's. No-op without a TTL.
-    void AdvanceTime(int64_t now_ns) {
-        if (ttl_ns_ > 0) {
-            AdvanceTtlWatermark(now_ns);
-        }
-    }
+    // Full objects currently resident. Linear state objects are excluded.
+    uint64_t current_unique_blocks() const;
 
-    // Unique blocks currently alive: expired markers below the TTL watermark
-    // are excluded even though their table entries linger until compaction.
-    uint64_t current_unique_blocks() const { return alive_marker_count(); }
+    // Resident Full objects under one total byte capacity. Linear state bytes
+    // consume the same budget even though Linear objects are not counted.
+    uint64_t FullObjectsWithinTotalBytes(uint64_t total_capacity_bytes) const;
 
-    // Cumulative blocks that reached the TTL deadline without a refreshing
-    // access; counted when the watermark sweeps over them, matching the
-    // online TtlCacheIndexerWrapper eviction statistics. A revived block
-    // counts again on its next expiry.
-    uint64_t ttl_expired_blocks() const { return ttl_expired_blocks_; }
-
-    // Coarse memory estimate for observability. It is derived from the state
-    // already required by the algorithm and does not retain extra trace data.
+    // Infinite-capacity resident working set, including Linear state bytes.
+    uint64_t resident_bytes() const;
     uint64_t memory_usage_bytes() const;
 
 private:
-    struct SnapshotEntry {
-        bool is_resident = false;
-        uint64_t required_blocks = 0;
-    };
+    friend class TtlLiteHit;
 
-    // Positions in [start_position, next epoch's start_position) were
-    // assigned by a commit at timestamp_ns; timestamps are non-decreasing
-    // along the deque.
-    struct PositionEpoch {
-        std::size_t start_position = 0;
-        int64_t timestamp_ns = 0;
-    };
+    RequestFact ProcessRequest(const std::vector<int64_t> &block_keys, std::size_t alive_from_position);
+    FullRequestFact ProcessFullRequest(const std::vector<int64_t> &block_keys, std::size_t alive_from_position);
+    RequestFact EvaluateRecoveryCurve(const std::vector<int64_t> &block_keys, std::size_t alive_from_position) const;
+    FullRequestFact EncodeFullFact(const RequestFact &byte_fact) const;
+    WeightedLruPool::PositionRemap CommitRequest(const std::vector<int64_t> &block_keys,
+                                                 std::size_t alive_from_position);
 
-    RequestFact BuildHitCurve(const std::vector<int64_t> &block_keys) const;
-    void CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns);
-    void MaybeCompactPositions();
-    uint64_t ReuseDistance(std::size_t previous_position) const;
-    // Resident markers at or above the TTL watermark (all markers when no
-    // watermark is active).
-    uint64_t alive_marker_count() const;
-    // Pops expired epochs and advances dead_below_position_.
-    void AdvanceTtlWatermark(int64_t now_ns);
-
-    uint64_t ttl_ns_ = 0;
-    DynamicFenwickTree fenwick_;
-    std::unordered_map<int64_t, std::size_t> last_positions_;
-    // TTL state (empty when ttl_ns_ == 0): markers below the watermark are
-    // expired.
-    std::deque<PositionEpoch> position_epochs_;
-    std::size_t dead_below_position_ = 0;
-    uint64_t ttl_expired_blocks_ = 0;
+    CacheObjectConfig object_config_;
+    WeightedLruPool pool_;
+    LiteHitLinearPolicy linear_policy_;
 };
 
 } // namespace kv_cache_manager

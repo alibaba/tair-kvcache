@@ -33,8 +33,14 @@ protected:
     proto::optimizer::OptimizerRegisterInstanceRequest MakeRegisterRequest(const std::string &group,
                                                                            const std::string &instance_id,
                                                                            int32_t block_size,
-                                                                           int32_t linear_step = 1,
+                                                                           int32_t linear_step = -1,
                                                                            int64_t extra_spec_size = 0) {
+        // linear_step counts tokens; -1 = auto: linear instances (with an
+        // extra Linear spec) default to one Linear state per block, plain
+        // instances stay full-attention.
+        if (linear_step < 0) {
+            linear_step = extra_spec_size > 0 ? block_size : 0;
+        }
         proto::optimizer::OptimizerRegisterInstanceRequest req;
         req.set_trace_id("test-trace");
         req.set_instance_group(group);
@@ -523,7 +529,7 @@ TEST_F(OptimizerServiceImplTest, ResetStatsNonExistent) {
 TEST_F(OptimizerServiceImplTest, RegisterWithLinearStep) {
     CreateTestGroup("grp_ls", 1.0);
 
-    auto req = MakeRegisterRequest("grp_ls", "inst1", 1024, 4, 256);
+    auto req = MakeRegisterRequest("grp_ls", "inst1", 1024, /*linear_step tokens=*/4096, 256);
 
     proto::optimizer::OptimizerRegisterInstanceResponse resp;
     RequestContext ctx("trace1", nullptr);
@@ -536,7 +542,7 @@ TEST_F(OptimizerServiceImplTest, RegisterWithLinearStep) {
 TEST_F(OptimizerServiceImplTest, GetInstanceSuccess) {
     CreateTestGroup("grp1");
 
-    auto reg_req = MakeRegisterRequest("grp1", "inst1", 128, 2, 64);
+    auto reg_req = MakeRegisterRequest("grp1", "inst1", 128, /*linear_step tokens=*/256, 64);
 
     proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
     RequestContext ctx1("t1", nullptr);
@@ -554,7 +560,7 @@ TEST_F(OptimizerServiceImplTest, GetInstanceSuccess) {
     EXPECT_EQ("grp1", get_resp.instance_group());
     EXPECT_EQ("inst1", get_resp.instance_id());
     EXPECT_EQ(128, get_resp.block_size());
-    EXPECT_EQ(2, get_resp.linear_step());
+    EXPECT_EQ(256, get_resp.linear_step());
 
     ASSERT_EQ(2, get_resp.location_spec_infos_size());
     EXPECT_EQ("tp0", get_resp.location_spec_infos(0).name());

@@ -331,32 +331,6 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalCapacityEfficiencySkippedWhen
     EXPECT_DOUBLE_EQ(0.0, hit_rate.Get());
 }
 
-TEST_F(OptimizerMetricsReporterTest, ReportIntervalHitAgeBucketRatio) {
-    // TTL > 0 triggers TtlCacheIndexerWrapper, enabling age-bucket tracking
-    ASSERT_EQ(EC_OK,
-              RegisterTestInstance("inst1",
-                                   {1.0},
-                                   /*ttl_seconds=*/3600,
-                                   /*enable_theoretical_max_cache=*/false,
-                                   /*linear_step=*/1));
-
-    TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, result); // all 3 keys hit
-
-    reporter_->ReportInterval();
-
-    // With near-zero age, all hits should fall in the first bucket (threshold=5s)
-    MetricsTags bucket_tags = {{"instance_id", "inst1"}, {"age_bucket", "5s"}};
-    Gauge bucket_ratio = registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags);
-    EXPECT_GT(bucket_ratio.Get(), 0.0);
-
-    // The "inf" bucket should have ratio = 0 (no hits that old)
-    MetricsTags inf_tags = {{"instance_id", "inst1"}, {"age_bucket", "inf"}};
-    Gauge inf_ratio = registry_->GetGauge("trace_query_hit_age_bucket_ratio", inf_tags);
-    EXPECT_DOUBLE_EQ(0.0, inf_ratio.Get());
-}
-
 TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
 

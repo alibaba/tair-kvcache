@@ -48,7 +48,6 @@ struct OptimizerMetricsReporter::KmonContext {
     DECLARE_METRICS(query, capacity_efficiency);
 
     DECLARE_METRICS(trace, query_capacity_efficiency);
-    DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -218,8 +217,6 @@ bool OptimizerMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(query, max_hit_rate);
     REGISTER_GAUGE_METRIC(query, capacity_efficiency);
 
-    REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
-
     KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
     return true;
 }
@@ -311,14 +308,6 @@ void OptimizerMetricsReporter::ReportInterval() {
                 achievement = cap_info.hit_rate / s.max_hit_rate;
             }
         }
-
-        for (const auto &bucket : s.hit_age_bucket_ratios) {
-            std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
-            Gauge bucket_ratio = metrics_registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags);
-            bucket_ratio = bucket.ratio;
-        }
     }
 
     // --- Kmonitor ---
@@ -352,14 +341,6 @@ void OptimizerMetricsReporter::ReportInterval() {
             if (s.max_hit_rate > 0) {
                 kmon_ctx_->trace_query_capacity_efficiency_metrics->Report(&ktags, cap_info.hit_rate / s.max_hit_rate);
             }
-        }
-
-        for (const auto &bucket : s.hit_age_bucket_ratios) {
-            std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
-            kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(bucket_tags);
-            kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&ktags, bucket.ratio);
         }
     }
 }
