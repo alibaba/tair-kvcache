@@ -1079,6 +1079,54 @@ TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {
     }
 }
 
+// A token-only StartWriteCache (block_keys empty, keys derived from token_ids)
+// must accept per-block location_spec_group_names: the size check has to count
+// blocks, not the empty block_keys vector. Regression for hybrid connectors,
+// which announce per-block spec coverage on token-only writes.
+TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupNamesWithTokenIdsOnly) {
+    constexpr int64_t kBlockSize = 4;
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_attn", 512),
+        LocationSpecInfo("tp0_state", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("attn", {"tp0_attn"}),
+        LocationSpecGroup("full", {"tp0_attn", "tp0_state"}),
+    };
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "token_only_sg",
+                                               kBlockSize,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // 3 blocks of tokens, no block_keys: the middle block carries no state.
+    CacheManager::TokenIdsVector tokens;
+    for (int64_t i = 0; i < 3 * kBlockSize; ++i) {
+        tokens.push_back(i);
+    }
+    const std::vector<std::string> group_names{"full", "attn", "full"};
+    auto [ec, info] = cache_manager_->StartWriteCache(
+        request_context_.get(), "token_only_sg", {}, tokens, group_names, 100000000);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &locs = info.locations().cache_locations_view();
+    ASSERT_EQ(3u, locs.size());
+    // Each block is allocated exactly the specs of its announced group, so the
+    // state-less block is never published as holding a state.
+    ASSERT_EQ(2, locs[0].spec_size());
+    ASSERT_EQ(1, locs[1].spec_size());
+    ASSERT_EQ(2, locs[2].spec_size());
+    ASSERT_EQ("tp0_attn", locs[1].location_specs()[0].name());
+
+    // A mismatched length must still be rejected.
+    auto [ec_bad, info_bad] = cache_manager_->StartWriteCache(
+        request_context_.get(), "token_only_sg", {}, tokens, {"full"}, 100000000);
+    ASSERT_NE(EC_OK, ec_bad);
+}
+
 TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,
@@ -1113,8 +1161,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
         meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1;  // 已写入的key_count + 1，确保已经写入的是成功的
 
         std::vector<int64_t> keys{1001, 1002};
-        while (GetShardIndex(keys[0], meta_indexer->mutex_shard_mask_) ==
-               GetShardIndex(keys[1], meta_indexer->mutex_shard_mask_)) {
+        while (meta_indexer->GetMutexShardIndex(keys[0]) == meta_indexer->GetMutexShardIndex(keys[1])) {
             ++keys[1];
         }
 
@@ -2726,6 +2773,34 @@ TEST(ReportEventContractTest, SnapshotAndResponseFieldNumbersMatchContract) {
     EXPECT_EQ(6, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("extra_info")->number());
 }
 
+TEST_F(CacheManagerTest, TestLegacyEventCleanupCallbackIsSafeAfterCacheManagerDestruction) {
+    auto backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, backend);
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("test_instance");
+    request.set_host_ip_port("10.0.0.1:9000");
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *event = request.add_events();
+    event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    event->mutable_node_register()->add_mediums("mem");
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+
+    EventReportBackend::CleanupCallback copied_callback;
+    {
+        std::lock_guard<std::mutex> lock(backend->cleanup_cb_mutex_);
+        copied_callback = backend->cleanup_callback_;
+    }
+    ASSERT_TRUE(copied_callback);
+
+    // EventReportBackend invokes a copied callback outside its callback lock.
+    // Model that exact shutdown race: CacheManager clears and destroys GC,
+    // then the already-copied callback returns without touching either object.
+    cache_manager_.reset();
+    EXPECT_NO_THROW(copied_callback("test_instance", "10.0.0.1:9000", 1));
+    backend->Close();
+}
+
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed) {
     auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
@@ -4077,6 +4152,18 @@ TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutat
     EXPECT_EQ(0, delete_response.item_results_size());
     EXPECT_TRUE(QueryEventReportUris({delete_key}).empty());
 
+    CacheGarbageCollector::Config gc_config;
+    gc_config.enabled = true;
+    gc_config.event_report_cleanup_enabled = true;
+    auto collector = std::make_shared<CacheGarbageCollector>(gc_config,
+                                                             registry_manager_,
+                                                             cache_manager_->meta_indexer_manager_,
+                                                             registry_manager_->data_storage_manager(),
+                                                             cache_manager_->schedule_plan_executor_,
+                                                             metrics_registry_,
+                                                             cache_manager_->migration_manager_);
+    cache_manager_->cache_garbage_collector_ = collector;
+
     event_backend->SetNodeUnavailable("test_instance", host);
     auto heartbeat_then_snapshot = MakeSnapshotRequest(host, {{snapshot_key, "heartbeat_then_snapshot"}});
     const auto snapshot_event = heartbeat_then_snapshot.events(0);
@@ -4091,6 +4178,9 @@ TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutat
     EXPECT_EQ(0, snapshot_response.item_results_size());
     EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(snapshot_response.committed_snapshot_version()));
     ASSERT_EQ(1u, QueryEventReportUris({snapshot_key}).size());
+    EXPECT_EQ(snapshot_response.committed_snapshot_version(),
+              event_backend->GetSnapshotVersion({"test_instance", host}));
+    EXPECT_FALSE(event_backend->IsCleanupCallbackSet());
 }
 
 TEST_F(CacheManagerTest, TestReportEventRegisterThenFirstDeltaInSameRequest) {

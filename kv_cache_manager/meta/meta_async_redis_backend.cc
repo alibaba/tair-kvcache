@@ -236,6 +236,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
         sub_op.keys.reserve(indices.size());
         if (!op.field_maps.empty()) {
             sub_op.field_maps.reserve(indices.size());
+            sub_op.locations.reserve(indices.size());
         }
         if (!op.field_names_vec.empty()) {
             sub_op.field_names_vec.reserve(indices.size());
@@ -244,6 +245,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             sub_op.keys.push_back(op.keys[idx]);
             if (!op.field_maps.empty()) {
                 sub_op.field_maps.push_back(std::move(op.field_maps[idx]));
+                sub_op.locations.push_back(std::move(op.locations[idx]));
             }
             if (!op.field_names_vec.empty()) {
                 sub_op.field_names_vec.push_back(std::move(op.field_names_vec[idx]));
@@ -277,18 +279,11 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext *request_contex
                                                   const KeyTypeVec &keys,
                                                   const CacheLocationMapVector &locations,
                                                   const PropertyMapVector &properties) noexcept {
-    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     WriteOp op;
     op.type = WriteOpType::kPut;
     op.keys = keys;
-    op.field_maps.resize(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
-    }
-    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
-    auto *service_metrics_collector =
-        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
+    op.field_maps = properties;
+    op.locations = locations;
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
@@ -296,18 +291,11 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
                                                      const KeyTypeVec &keys,
                                                      const CacheLocationMapVector &locations,
                                                      const PropertyMapVector &properties) noexcept {
-    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     WriteOp op;
     op.type = WriteOpType::kUpsert;
     op.keys = keys;
-    op.field_maps.resize(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
-    }
-    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
-    auto *service_metrics_collector =
-        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
+    op.field_maps = properties;
+    op.locations = locations;
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
@@ -727,8 +715,14 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
     KVCM_LOG_INFO("async redis consumer[%d] stopped, instance[%s]", queue_id, instance_id_.c_str());
 }
 
-void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArgs> &cmds) {
+void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds) {
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, op.keys);
+
+    if (!op.field_maps.empty()) {
+        for (size_t i = 0; i < op.keys.size(); ++i) {
+            op.field_maps[i] = SerializeToFieldMap(op.locations[i], std::move(op.field_maps[i]));
+        }
+    }
 
     switch (op.type) {
     case WriteOpType::kPut:
@@ -744,6 +738,8 @@ void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArg
         RedisClient::BuildHashDeleteCmds(full_keys, op.field_names_vec, cmds);
         break;
     }
+    op.locations.clear();
+    op.field_maps.clear();
 }
 
 void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys) {

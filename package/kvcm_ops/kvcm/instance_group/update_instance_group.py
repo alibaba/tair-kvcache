@@ -37,6 +37,9 @@ def main():
         current._cache_config._reclaim_strategy._reclaim_policy = args.reclaim_policy
     if hasattr(args, "reclaim_used_percentage"):
         current._cache_config._reclaim_strategy._trigger_used_percentage = args.reclaim_used_percentage
+    if hasattr(args, "instance_reclaim_budget_policy"):
+        current._cache_config._reclaim_strategy._instance_reclaim_budget_policy = \
+            args.instance_reclaim_budget_policy
     if hasattr(args, "data_storage_strategy"):
         current._cache_config._data_storage_strategy = args.data_storage_strategy
     if hasattr(args, "max_key_count"):
@@ -60,6 +63,8 @@ def main():
         current._extra_info = json.dumps(existing, ensure_ascii=False)
     if hasattr(args, "event_report_storage_candidates"):
         current._event_report_storage_candidates = args.event_report_storage_candidates
+    if hasattr(args, "revisit_interval_buckets"):
+        current._revisit_interval_buckets = args.revisit_interval_buckets
     current.check()
     current_version = current._version
     current._version += 1

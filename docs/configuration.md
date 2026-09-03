@@ -121,19 +121,25 @@ kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
 kvcm.cache_reclaimer.pending_bytes_limit=274877906944
 
-# leader 后台 metadata GC，默认关闭。V1 处理超过 grace 的 CLS_WRITING，
-# 以及 MightExist 明确 missing 的普通 CLS_SERVING Location（EventReport 除外）。
-kvcm.cache_gc.enabled=false
+# leader 后台 metadata GC，默认开启。处理超过 grace 的 CLS_WRITING、
+# MightExist 明确 missing 的普通 CLS_SERVING 以及 EventReport metadata 回收。
+kvcm.cache_gc.enabled=true
 # active round 的 tick 间隔；每个 tick 最多推进一个 backend batch。
 kvcm.cache_gc.scan_interval_ms=1000
-# 一个 full round 完成后的 cooldown，默认 24 小时。
-kvcm.cache_gc.round_pause_ms=86400000
-# backend key 数 hint，同时限制单次删除请求的 Location target 数。
+# 一个 full round 完成后的 cooldown，默认 2 小时；0 表示下一 tick 可开始新 round。
+kvcm.cache_gc.round_pause_ms=7200000
+# backend key 数 hint，同时限制单 tick 两类 action 合计的 Location target 数。
 kvcm.cache_gc.scan_batch_size=256
 # orphan WRITING grace，最小 1 小时（3600000ms），默认 24 小时。
 kvcm.cache_gc.orphan_writing_grace_period_ms=86400000
-# GC 在途删除请求硬上限；默认 2。一个慢请求只占一个槽位，全部槽位占满后暂停扫描。
+# 普通删除与 EventReport metadata action 共用的 GC 在途硬上限；默认 2。
+# 一个慢 action 只占一个槽位，全部槽位占满后暂停扫描。
 kvcm.cache_gc.max_inflight_delete_requests=2
+# 迁移期开关：由常规 GC round 基于 EventReportBackend 当前状态统一回收 metadata；
+# 默认开启，但仍受 kvcm.cache_gc.enabled 总开关控制；总开关关闭时保留 legacy 路径。
+kvcm.cache_gc.event_report_cleanup_enabled=true
+# 每个 GC tick 最多提交的 EventReport metadata Block key 数；Location 总数仍受 scan_batch_size 限制。
+kvcm.cache_gc.event_report_action_batch_size=32
 
 # 可选值有dummy，local，logging，kmonitor；若不配置或配置为空，默认使用local
 kvcm.metrics.reporter_type=local
@@ -221,7 +227,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
         "global_quota_group_name": "default_quota_group", # 暂未使用
         "max_instance_count": 100, # 与该group绑定的instance数量上限
         "quota": { # 该instance group的用量quota配置，该配置与下列行为相关：写入行为，数据回收（逐出）时机
-            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端
+            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端（除去EventReport）
             "quota_config": [ # 分storage type的quota值，同样由各个instance的用量累加得到，超过该quota后停止往该storage type的后端写入
                 {
                     "storage_type": "file",
@@ -247,7 +253,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 "trigger_strategy": {
                     "used_percentage": 0.8 # 控制数据用量水位，当用量达到或超过quota * percentage时将触发回收（逐出）
                 },
-                "delay_before_delete_ms": 1000 # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "delay_before_delete_ms": 1000, # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "instance_reclaim_budget_policy": 0 # 0=USAGE_PROPORTIONAL（默认，按用量分配）；1=FIXED_PER_INSTANCE（旧的固定 per-instance 行为）
             },
             # cache_prefer_strategy与storage candidates一起控制storage backend选择策略，可选值如下：
             # enum class CachePreferStrategy {
@@ -288,6 +295,12 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+`instance_reclaim_budget_policy=USAGE_PROPORTIONAL`（内部持久化值为 `0`）时，Reclaimer 按各
+Instance 在当前超水位维度上的用量计算预算份额。
+服务级 `key_sampling_size_total` 和 `del_batch_size` 仍是单个 Instance 一次请求的 sample/batch
+上限，不会因 Group 内 Instance 数量或用量倾斜而放大；超出上限的理论份额留给后续 reclaim 轮次。
+设为 `FIXED_PER_INSTANCE`（内部持久化值为 `1`）时，完整使用旧的固定 per-instance 预算和遍历顺序。
 
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage

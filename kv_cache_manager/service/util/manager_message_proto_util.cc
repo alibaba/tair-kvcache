@@ -216,6 +216,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
     reclaim_strategy->set_reclaim_step_size(cache_config_info.reclaim_strategy()->reclaim_step_size());
     reclaim_strategy->set_reclaim_step_percentage(cache_config_info.reclaim_strategy()->reclaim_step_percentage());
     reclaim_strategy->set_delay_before_delete_ms(cache_config_info.reclaim_strategy()->delay_before_delete_ms());
+    reclaim_strategy->set_instance_reclaim_budget_policy(static_cast<proto::admin::InstanceReclaimBudgetPolicy>(
+        cache_config_info.reclaim_strategy()->instance_reclaim_budget_policy()));
 
     // 转换data_storage_strategy (cache_prefer_strategy)
     proto_cache_config->set_data_storage_strategy(
@@ -291,6 +293,8 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     reclaim_strategy->set_reclaim_step_size(proto_cache_config->reclaim_strategy().reclaim_step_size());
     reclaim_strategy->set_reclaim_step_percentage(proto_cache_config->reclaim_strategy().reclaim_step_percentage());
     reclaim_strategy->set_delay_before_delete_ms(proto_cache_config->reclaim_strategy().delay_before_delete_ms());
+    reclaim_strategy->set_instance_reclaim_budget_policy(static_cast<InstanceReclaimBudgetPolicy>(
+        proto_cache_config->reclaim_strategy().instance_reclaim_budget_policy()));
 
     cache_config_info.set_reclaim_strategy(reclaim_strategy);
 

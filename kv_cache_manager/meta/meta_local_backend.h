@@ -23,14 +23,18 @@
 namespace kv_cache_manager {
 
 struct MetaMemCacheItem {
+    static size_t EstimateLocationEntryUsage(const std::string &location_id, const CacheLocationConstPtr &location) {
+        return sizeof(void *) * 4 + location_id.size() + sizeof(CacheLocationConstPtr) +
+               (location ? location->EstimateMemUsage() : 0);
+    }
+
     // Estimates total memory footprint including the heap memory owned by
     // CacheLocationMap and PropertyMap entries, used as the "charge" for LRU cache eviction accounting.
     size_t Size() const {
         size_t total = sizeof(MetaMemCacheItem);
         for (const auto &[location_id, location] : locations_) {
             // unordered_map node overhead + key string heap + shared_ptr overhead + CacheLocation footprint
-            total += sizeof(void *) * 4 + location_id.size() + sizeof(CacheLocationConstPtr) +
-                     (location ? location->EstimateMemUsage() : 0);
+            total += EstimateLocationEntryUsage(location_id, location);
         }
         for (const auto &[prop_name, prop_value] : properties_) {
             total += sizeof(void *) * 4 + prop_name.size() + prop_value.size();
@@ -226,9 +230,16 @@ public:
                                                  std::vector<ErrorCode> &out_key_error_codes,
                                                  std::vector<ErrorCode> &out_results,
                                                  SingleLocationRmwScratch &scratch) noexcept;
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept override;
+    std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
+                                                        const KeyTypeVec &keys,
+                                                        LocationIdsPerKey &out_location_ids) noexcept override;
     std::vector<ErrorCode> GetProperties(RequestContext *request_context,
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
@@ -248,6 +259,14 @@ public:
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept override;
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept override;
+    std::vector<ErrorCode>
+    DeleteLocationsForMaintenance(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     ErrorCode RandomSample(RequestContext *request_context,
                            const int64_t count,
                            std::vector<KeyType> &out_keys) noexcept override;
@@ -314,6 +333,9 @@ private:
                            CacheLocationMap *out_location_map,
                            PropertyMap *out_property_map,
                            std::vector<LocationId> *out_location_ids);
+    ErrorCode GetForOneKeyForMaintenance(KeyType key,
+                                         CacheLocationMap *out_location_map,
+                                         std::vector<LocationId> *out_location_ids);
 
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;

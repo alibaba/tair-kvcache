@@ -294,4 +294,51 @@ TEST_F(InstanceGroupTest, LegacyTairMempoolProtoWithoutStorageTypeRemainsDramTyp
     EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
 }
 
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPerInstance) {
+    CacheConfig original;
+    auto reclaim_strategy = std::make_shared<CacheReclaimStrategy>();
+    reclaim_strategy->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
+    original.set_reclaim_strategy(reclaim_strategy);
+
+    proto::admin::CacheConfig proto_config;
+    ProtoConvert::CacheConfigToProto(original, &proto_config);
+    EXPECT_EQ(proto::admin::FIXED_PER_INSTANCE, proto_config.reclaim_strategy().instance_reclaim_budget_policy());
+
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&proto_config, restored);
+    ASSERT_NE(nullptr, restored.reclaim_strategy());
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE,
+              restored.reclaim_strategy()->instance_reclaim_budget_policy());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoDefaultsToUsageProportional) {
+    proto::admin::CacheConfig proto_config;
+    proto_config.mutable_reclaim_strategy();
+
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&proto_config, restored);
+    ASSERT_NE(nullptr, restored.reclaim_strategy());
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
+              restored.reclaim_strategy()->instance_reclaim_budget_policy());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyJsonDefaultsToUsageProportionalAndAcceptsFixedPerInstance) {
+    CacheReclaimStrategy reclaim_strategy;
+    ASSERT_TRUE(reclaim_strategy.FromJsonString("{}"));
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL, reclaim_strategy.instance_reclaim_budget_policy());
+
+    ASSERT_TRUE(reclaim_strategy.FromJsonString(R"({"instance_reclaim_budget_policy": 1})"));
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE, reclaim_strategy.instance_reclaim_budget_policy());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyValidationRejectsUnknownValue) {
+    CacheReclaimStrategy reclaim_strategy;
+    reclaim_strategy.set_storage_unique_name("nfs_01");
+    reclaim_strategy.set_instance_reclaim_budget_policy(static_cast<InstanceReclaimBudgetPolicy>(999));
+
+    std::string invalid_fields;
+    EXPECT_FALSE(reclaim_strategy.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("instance_reclaim_budget_policy"));
+}
+
 } // namespace kv_cache_manager

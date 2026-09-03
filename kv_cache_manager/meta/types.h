@@ -56,9 +56,9 @@ using LocationsPerKey = std::vector<CacheLocationVector>;
 // explicit handle release. These views must never escape that interval.
 using CacheLocationViewVector = std::vector<const CacheLocation *>;
 
-// A maintenance scan reads keys and their locations from the authoritative
-// backend without updating online access/LRU state. The three vectors are
-// always index-aligned when the scan succeeds.
+// A maintenance scan reads keys and locations from the backend selected by
+// MetaStorageBackendManager without updating online access/LRU state. The
+// three vectors are always index-aligned when the scan succeeds.
 struct MaintenanceScanBatch {
     std::string next_cursor;
     KeyVector keys;

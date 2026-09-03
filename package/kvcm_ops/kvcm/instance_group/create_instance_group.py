@@ -72,7 +72,8 @@ def create_instance_group(args) -> InstanceGroup:
     instance_group_quota = InstanceGroupQuota(args.quota_capacity, args.quota_configs)
     reclaim_strategy = ReclaimStrategy(storage_unique_name=args.storage_candidates[0],
                                        reclaim_policy=args.reclaim_policy,
-                                       trigger_used_percentage=args.reclaim_used_percentage)
+                                       trigger_used_percentage=args.reclaim_used_percentage,
+                                       instance_reclaim_budget_policy=args.instance_reclaim_budget_policy)
     meta_cache_policy_config = MetaCachePolicyConfig(capacity=args.search_cache_capacity,
                                                      cache_shard_bits=args.search_cache_shard_bits)
     meta_indexer_config = MetaIndexerConfig(max_key_count=args.max_key_count,
@@ -92,7 +93,8 @@ def create_instance_group(args) -> InstanceGroup:
                                    user_data=args.user_data,
                                    version=1,
                                    extra_info=args.extra_info,
-                                   event_report_storage_candidates=args.event_report_storage_candidates)
+                                   event_report_storage_candidates=args.event_report_storage_candidates,
+                                   revisit_interval_buckets=args.revisit_interval_buckets)
     return instance_group
 
 

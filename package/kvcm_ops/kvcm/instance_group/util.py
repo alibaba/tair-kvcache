@@ -1,4 +1,5 @@
 import argparse
+import math
 from ..common.json_data import *
 from ..common.common_args import *
 
@@ -101,7 +102,8 @@ class ReclaimStrategy(JsonData):
                  trigger_period_seconds: int = 0,
                  reclaim_step_size: int = 0,
                  reclaim_step_percentage: float = 0.0,
-                 delay_before_delete_ms: int = 1000
+                 delay_before_delete_ms: int = 1000,
+                 instance_reclaim_budget_policy: str = "USAGE_PROPORTIONAL",
                  ):
         self._storage_unique_name = storage_unique_name
         self._reclaim_policy = reclaim_policy
@@ -111,6 +113,7 @@ class ReclaimStrategy(JsonData):
         self._reclaim_step_size = reclaim_step_size
         self._reclaim_step_percentage = reclaim_step_percentage
         self._delay_before_delete_ms = delay_before_delete_ms
+        self._instance_reclaim_budget_policy = instance_reclaim_budget_policy
         self.check()
 
     def to_json_data(self) -> dict:
@@ -124,7 +127,8 @@ class ReclaimStrategy(JsonData):
             "trigger_period_seconds": self._trigger_period_seconds,
             "reclaim_step_size": self._reclaim_step_size,
             "reclaim_step_percentage": self._reclaim_step_percentage,
-            "delay_before_delete_ms": self._delay_before_delete_ms
+            "delay_before_delete_ms": self._delay_before_delete_ms,
+            "instance_reclaim_budget_policy": self._instance_reclaim_budget_policy,
         }
 
     def check(self) -> bool:
@@ -132,6 +136,12 @@ class ReclaimStrategy(JsonData):
         if _reclaim_policy not in ["POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
             raise RuntimeError(f"reclaim_policy {_reclaim_policy} invalid, support POLICY_LRU|POLICY_LFU|POLICY_TTL")
         self._reclaim_policy = _reclaim_policy
+        if not isinstance(self._instance_reclaim_budget_policy, str):
+            raise RuntimeError("instance_reclaim_budget_policy must be a string")
+        self._instance_reclaim_budget_policy = self._instance_reclaim_budget_policy.strip().upper()
+        if self._instance_reclaim_budget_policy not in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+            raise RuntimeError(
+                "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
         return True
 
     @classmethod
@@ -154,6 +164,9 @@ class ReclaimStrategy(JsonData):
             reclaim_step_percentage = float(json_data["reclaim_step_percentage"])
         if JsonData.expect_exist("delay_before_delete_ms", json_data, (str, int)):
             delay_before_delete_ms = int(json_data["delay_before_delete_ms"])
+        instance_reclaim_budget_policy = "USAGE_PROPORTIONAL"
+        if JsonData.maybe_exist("instance_reclaim_budget_policy", json_data, str):
+            instance_reclaim_budget_policy = json_data["instance_reclaim_budget_policy"]
         return cls(
             storage_unique_name,
             reclaim_policy,
@@ -162,7 +175,18 @@ class ReclaimStrategy(JsonData):
             trigger_period_seconds,
             reclaim_step_size,
             reclaim_step_percentage,
-            delay_before_delete_ms)
+            delay_before_delete_ms,
+            instance_reclaim_budget_policy)
+
+
+def instance_reclaim_budget_policy_value(value: str) -> str:
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError("instance_reclaim_budget_policy must be a string")
+    normalized = value.strip().upper()
+    if normalized in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+        return normalized
+    raise argparse.ArgumentTypeError(
+        "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
 
 
 class MetaStorageBackendConfig(JsonData):
@@ -333,6 +357,36 @@ class CacheConfig(JsonData):
         return cls(data_storage_strategy, reclaim_strategy, meta_indexer_config)
 
 
+# Aligned with server-side StringUtil::ParseBucketBoundaries: comma separated,
+# each token must fully parse to a finite positive number, strictly ascending.
+def parse_bucket_boundaries(value: str):
+    boundaries = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"empty token in bucket boundaries: '{value}'")
+        try:
+            number = float(token)
+        except ValueError as exc:
+            raise ValueError(f"invalid number '{token}' in bucket boundaries: '{value}'") from exc
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"bucket boundary '{token}' must be a finite positive number: '{value}'")
+        if boundaries and number <= boundaries[-1]:
+            raise ValueError(f"bucket boundaries must be strictly ascending: '{value}'")
+        boundaries.append(number)
+    return boundaries
+
+
+def revisit_interval_buckets_value(value: str) -> str:
+    if value == "":
+        return ""  # empty means server-side default buckets
+    try:
+        parse_bucket_boundaries(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid revisit_interval_buckets: {exc}") from exc
+    return ",".join(token.strip() for token in value.split(","))
+
+
 class InstanceGroup(JsonData):
     def __init__(self,
                  name: str,
@@ -345,6 +399,7 @@ class InstanceGroup(JsonData):
                  version: int = 1,
                  extra_info: str = "",
                  event_report_storage_candidates=None,
+                 revisit_interval_buckets: str = "",
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -356,6 +411,7 @@ class InstanceGroup(JsonData):
         self._version = version
         self._extra_info = extra_info
         self._event_report_storage_candidates = event_report_storage_candidates or []
+        self._revisit_interval_buckets = revisit_interval_buckets
         self.check()
 
     def check(self):
@@ -367,6 +423,11 @@ class InstanceGroup(JsonData):
                 json.loads(self._extra_info)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"extra_info must be valid JSON, got: '{self._extra_info}'") from exc
+        if self._revisit_interval_buckets:
+            try:
+                parse_bucket_boundaries(self._revisit_interval_buckets)
+            except ValueError as exc:
+                raise RuntimeError(f"revisit_interval_buckets invalid: {exc}") from exc
         self._instance_group_quota.check()
         self._cache_config.check()
 
@@ -381,6 +442,7 @@ class InstanceGroup(JsonData):
             "user_data": self._user_data,
             "version": self._version,
             "extra_info": self._extra_info,
+            "revisit_interval_buckets": self._revisit_interval_buckets,
         }
         if self._event_report_storage_candidates:
             data["event_report_storage_candidates"] = self._event_report_storage_candidates
@@ -406,8 +468,10 @@ class InstanceGroup(JsonData):
             version = int(json_data["version"])
         extra_info = json_data.get("extra_info", "")
         event_report_storage_candidates = json_data.get("event_report_storage_candidates", [])
+        revisit_interval_buckets = json_data.get("revisit_interval_buckets", "")
         return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count,
-                   cache_config, user_data, version, extra_info, event_report_storage_candidates)
+                   cache_config, user_data, version, extra_info, event_report_storage_candidates,
+                   revisit_interval_buckets)
 
 # create or update
 
@@ -495,6 +559,16 @@ def parse_instance_group_args(is_create: bool):
     )
 
     parser.add_argument(
+        "--instance_reclaim_budget_policy",
+        type=instance_reclaim_budget_policy_value,
+        default="USAGE_PROPORTIONAL" if is_create else argparse.SUPPRESS,
+        help=(
+            "cross-instance reclaim budget policy: USAGE_PROPORTIONAL or FIXED_PER_INSTANCE. "
+            "On update, omit to keep the server-side value"
+        )
+    )
+
+    parser.add_argument(
         "--data_storage_strategy",
         type=str,
         default="CPS_PREFER_3FS" if is_create else argparse.SUPPRESS,
@@ -561,6 +635,17 @@ def parse_instance_group_args(is_create: bool):
         type=split_strs,
         default=[] if is_create else argparse.SUPPRESS,
         help="event_report_storage_candidates, eg. event_report_default or event_report_g1,event_report_g2"
+    )
+
+    parser.add_argument(
+        "--revisit_interval_buckets",
+        type=revisit_interval_buckets_value,
+        default="" if is_create else argparse.SUPPRESS,
+        help=(
+            "revisit_interval_buckets, comma separated positive numbers in strictly "
+            "ascending order, eg. 1,5,30,60. Empty string clears it to server default. "
+            "On update, omit to keep the server-side value."
+        )
     )
 
     args = parser.parse_args()

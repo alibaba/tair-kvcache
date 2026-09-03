@@ -7,9 +7,12 @@ load("@python_platform//:platform.bzl", "python_platform")
 py_library(
     name = "vllm_connector",
     srcs = glob(["*.py"]),
+    visibility = ["//kv_cache_manager/py_connector:__subpackages__"],
     deps = ["//kv_cache_manager/py_connector/common:common",
             "//kv_cache_manager/py_connector/kernel:kernel",
-            "//kv_cache_manager/client/pybind:kvcm_py_client_lib"]
+            "//kv_cache_manager/client/pybind:kvcm_py_client_lib",
+            "@pip_cpu//pydantic",
+            "@pip_cpu//orjson"]
 )
 
 
@@ -39,6 +42,10 @@ py_wheel(
 #    },
     python_requires = ">=3.9",
     python_tag = python_abi(),
+    requires = [
+        "pydantic>=2.11.4",
+        "orjson>=3",
+    ],
     stamp = 1,
     version = "{STABLE_KVCM_VERSION}+{STABLE_BUILD_TIMESTAMP}.{STABLE_GIT_COMMIT}",
     deps = [

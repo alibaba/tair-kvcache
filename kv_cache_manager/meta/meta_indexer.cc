@@ -47,6 +47,14 @@ static constexpr size_t kPrefixStateWordBits = 64;
 static_assert(kLocalPrefixProbeKeyCount % kPrefixStateWordBits == 0);
 static_assert(kLocalPrefixParallelReadChunkSize % kPrefixStateWordBits == 0);
 
+void FillBatchKeys(const std::vector<int32_t> &global_indices, const KeyVector &all_keys, KeyVector &batch_keys) {
+    batch_keys.clear();
+    batch_keys.reserve(global_indices.size());
+    for (const int32_t global_index : global_indices) {
+        batch_keys.push_back(all_keys[global_index]);
+    }
+}
+
 struct PrefixLocationScratch {
     bool in_use = false;
     CompactLocationsPerKey locations;
@@ -88,21 +96,27 @@ private:
 
 class MetaIndexer::ScopedBatchLock {
 public:
-    // If `out_lock_wait_time_us` is non-null, accumulates the elapsed time
-    // spent acquiring all shard mutexes (in microseconds).
+    // Optional outputs accumulate time spent waiting for and holding all
+    // shard mutexes in this batch.
     ScopedBatchLock(MetaIndexer &indexer,
                     const std::vector<int32_t> &shard_indexs,
-                    int64_t *out_lock_wait_time_us = nullptr)
-        : indexer_(indexer), shard_indexs_(shard_indexs) {
+                    int64_t *out_lock_wait_time_us = nullptr,
+                    int64_t *out_lock_hold_time_us = nullptr)
+        : indexer_(indexer), shard_indexs_(shard_indexs), out_lock_hold_time_us_(out_lock_hold_time_us) {
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->lock();
         }
+        lock_acquired_time_us_ = TimestampUtil::GetCurrentTimeUs();
         if (out_lock_wait_time_us != nullptr) {
-            *out_lock_wait_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
+            *out_lock_wait_time_us += lock_acquired_time_us_ - begin;
         }
     }
     ~ScopedBatchLock() {
+        if (out_lock_hold_time_us_ != nullptr) {
+            *out_lock_hold_time_us_ +=
+                std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_);
+        }
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->unlock();
         }
@@ -114,6 +128,8 @@ public:
 private:
     MetaIndexer &indexer_;
     const std::vector<int32_t> &shard_indexs_;
+    int64_t *out_lock_hold_time_us_ = nullptr;
+    int64_t lock_acquired_time_us_ = 0;
 };
 
 MetaIndexer::~MetaIndexer() {
@@ -230,28 +246,45 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
 
-    static LocationIdsPerKey empty_location_ids;
-    std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, location_maps, properties);
+    std::vector<IndexBatch> batches = MakeBatches(keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t put_io_time_us = 0;
     int64_t lock_wait_time_us = 0;
+    int64_t lock_hold_time_us = 0;
     int64_t cache_backend_put_time_us = 0;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
+    BatchMetaData backend_batch;
+    for (const auto &batch : batches) {
+        FillBatchKeys(batch.global_indices, keys, backend_batch.batch_keys);
+        backend_batch.batch_locations.clear();
+        backend_batch.batch_properties.clear();
+        if (!location_maps.empty()) {
+            backend_batch.batch_locations.reserve(batch.global_indices.size());
+            for (const int32_t global_index : batch.global_indices) {
+                backend_batch.batch_locations.push_back(std::move(location_maps[global_index]));
+            }
+        }
+        if (!properties.empty()) {
+            backend_batch.batch_properties.reserve(batch.global_indices.size());
+            for (const int32_t global_index : batch.global_indices) {
+                backend_batch.batch_properties.push_back(std::move(properties[global_index]));
+            }
+        }
+        ScopedBatchLock lock(*this, batch.shard_indices, &lock_wait_time_us, &lock_hold_time_us);
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
-        auto error_codes = backend_manager_->Put(request_context, batch);
+        auto error_codes = backend_manager_->Put(request_context, backend_batch);
         put_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_put_io_time;
         int64_t v = 0;
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_put_time_us, v);
         cache_backend_put_time_us += v;
-        error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kPutMetaOperation, result);
+        error_count += ProcessErrorCodes(trace_id, error_codes, batch.global_indices, keys, kPutMetaOperation, result);
     }
     AdjustKeyCountMeta(keys.size() - error_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_hold_time_us, lock_hold_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
@@ -265,25 +298,27 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
-    static LocationIdsPerKey empty_location_ids;
-    static CacheLocationMapVector empty_locations;
-    static PropertyMapVector empty_properties;
-    std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
+    std::vector<IndexBatch> batches = MakeBatches(keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t lock_wait_time_us = 0;
+    int64_t lock_hold_time_us = 0;
     int64_t cache_backend_delete_time_us = 0;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
-        std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch.batch_keys);
+    KeyVector batch_keys;
+    for (const auto &batch : batches) {
+        FillBatchKeys(batch.global_indices, keys, batch_keys);
+        ScopedBatchLock lock(*this, batch.shard_indices, &lock_wait_time_us, &lock_hold_time_us);
+        std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch_keys);
         int64_t v = 0;
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
         cache_backend_delete_time_us += v;
-        error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kDeleteMetaOperation, result);
+        error_count +=
+            ProcessErrorCodes(trace_id, error_codes, batch.global_indices, keys, kDeleteMetaOperation, result);
     }
     AdjustKeyCountMeta(error_count - keys.size());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_hold_time_us, lock_hold_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
     ProcessErrorResult(trace_id, kDeleteMetaOperation, error_count, keys.size(), result);
@@ -410,7 +445,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
                                                           const BatchMetaData &delete_batch,
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
-                                                          Result &result) noexcept {
+                                                          Result &result,
+                                                          bool maintenance_no_touch) noexcept {
     if (delete_batch.batch_keys.empty()) {
         return {0, 0};
     }
@@ -421,6 +457,9 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     int32_t reclaimed_count = 0;
     if (delete_batch.batch_location_ids.empty()) {
         delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
+    } else if (maintenance_no_touch) {
+        delete_ecs = backend_manager_->DeleteLocationsForMaintenance(
+            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
     } else {
         delete_ecs = backend_manager_->Delete(
             request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
@@ -457,6 +496,8 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
         service_metrics_collector, meta_indexer, rmw_get_io_time_us, stats.get_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, lock_wait_time_us, stats.lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, lock_hold_time_us, stats.lock_hold_time_us);
 
     if (has_upsert) {
         KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -516,20 +557,18 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     auto ephemeral_request_context =
         std::make_shared<RequestContext>("read_modify_write_block", ephemeral_metrics_collector);
 
-    static LocationIdsPerKey empty_location_ids;
-    static CacheLocationMapVector empty_locations;
-    static PropertyMapVector empty_properties;
-    std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
+    std::vector<IndexBatch> batches = MakeBatches(keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     Result result(keys.size());
     int32_t error_count = 0;
     RmwStats stats;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
+    KeyVector batch_keys;
+    for (const auto &batch : batches) {
+        FillBatchKeys(batch.global_indices, keys, batch_keys);
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         // 1. Read each key's existing location id list (no value deserialization)
-        const auto &batch_keys = batch.batch_keys;
         LocationIdsPerKey batch_location_ids;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> get_ecs =
@@ -541,10 +580,10 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
                                batch_keys.size(),
                                get_ecs.size(),
                                batch_location_ids.size());
-            for (const int32_t global_idx : batch.batch_indexs) {
+            for (const int32_t global_idx : batch.global_indices) {
                 result.error_codes[global_idx] = EC_MISMATCH;
             }
-            error_count += static_cast<int32_t>(batch.batch_indexs.size());
+            error_count += static_cast<int32_t>(batch.global_indices.size());
             result.ec = EC_MISMATCH;
             continue;
         }
@@ -558,7 +597,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
 
             const LocationIdVector &existing_location_ids = batch_location_ids[i];
             const ErrorCode get_ec = get_ecs[i];
-            const int32_t global_idx = batch.batch_indexs[i];
+            const int32_t global_idx = batch.global_indices[i];
             PropertyMap upsert_property_map;
             CacheLocationMap out_new_locations;
             const auto [action, modifier_ec] = modifier(
@@ -614,14 +653,25 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                        modifier,
                                        adjust_reclaimed_key_count,
                                        false,
-                                       refresh_cache_from_persistent);
+                                       refresh_cache_from_persistent,
+                                       false);
+}
+
+MetaIndexer::LocationResult
+MetaIndexer::ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
+                                                    const KeyVector &keys,
+                                                    const LocationIdsPerKey &location_ids,
+                                                    const LocationModifierFunc &modifier,
+                                                    bool adjust_reclaimed_key_count) noexcept {
+    return ReadModifyWriteLocationImpl(
+        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, false, true);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
                                                                         const KeyVector &keys,
                                                                         const LocationIdsPerKey &location_ids,
                                                                         const LocationModifierFunc &modifier) noexcept {
-    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false);
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
@@ -630,7 +680,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      const LocationModifierFunc &modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
-                                                                     bool refresh_cache_from_persistent) noexcept {
+                                                                     bool refresh_cache_from_persistent,
+                                                                     bool maintenance_no_touch) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -653,9 +704,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         track_created_key_count ? "read_modify_write_target_locations" : "read_modify_write_location",
         ephemeral_metrics_collector);
 
-    static CacheLocationMapVector empty_locations;
-    static PropertyMapVector empty_properties;
-    std::vector<BatchMetaData> batches = MakeBatches(keys, location_ids, empty_locations, empty_properties);
+    std::vector<IndexBatch> batches = MakeBatches(keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     LocationResult location_result(location_ids);
@@ -668,11 +717,34 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
     // responses still fail closed without changing that established contract.
     std::vector<bool> key_level_failures(keys.size(), false);
     RmwStats stats;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
+    KeyVector batch_keys;
+    LocationIdsPerKey batch_location_ids;
+    for (const auto &batch : batches) {
+        FillBatchKeys(batch.global_indices, keys, batch_keys);
+        batch_location_ids.clear();
+        batch_location_ids.reserve(batch.global_indices.size());
+        for (const int32_t global_index : batch.global_indices) {
+            batch_location_ids.push_back(location_ids[global_index]);
+        }
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
-        const auto &batch_keys = batch.batch_keys;
+        if (maintenance_no_touch && !backend_manager_->Sync(batch_keys)) {
+            // A single async metadata backend may still have an accepted
+            // same-key mutation queued. Reading before that mutation reaches
+            // the persistent view could authorize a stale expected-value
+            // delete which is then queued behind, and removes, the newer
+            // mutation. Drain accepted writes while the shard fence prevents
+            // another same-key mutation from being admitted.
+            PREFIX_INDEXER_LOG(WARN, "maintenance pre-read Sync failed for keys[%lu]", batch_keys.size());
+            for (const int32_t global_idx : batch.global_indices) {
+                location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(),
+                                                                            EC_TIMEOUT);
+                rmw_result.error_codes[global_idx] = EC_TIMEOUT;
+                key_level_failures[global_idx] = true;
+            }
+            continue;
+        }
         LocationsPerKey batch_locations_per_key;
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
@@ -681,19 +753,25 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
-            refresh_results =
-                backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
             get_ecs_per_key = backend_manager_->GetLocationsWithKeyStatus(ephemeral_request_context.get(),
                                                                           batch_keys,
-                                                                          batch.batch_location_ids,
+                                                                          batch_location_ids,
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = backend_manager_->GetLocations(
-                ephemeral_request_context.get(), batch_keys, batch.batch_location_ids, batch_locations_per_key);
+            get_ecs_per_key = maintenance_no_touch
+                                  ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
+                                                                                 batch_keys,
+                                                                                 batch_location_ids,
+                                                                                 batch_locations_per_key)
+                                  : backend_manager_->GetLocations(ephemeral_request_context.get(),
+                                                                   batch_keys,
+                                                                   batch_location_ids,
+                                                                   batch_locations_per_key);
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -714,7 +792,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                get_ecs_per_key.size(),
                                batch_locations_per_key.size(),
                                batch_key_get_ecs.size());
-            for (const int32_t global_idx : batch.batch_indexs) {
+            for (const int32_t global_idx : batch.global_indices) {
                 location_result.per_location_error_codes[global_idx].assign(location_ids[global_idx].size(),
                                                                             EC_MISMATCH);
                 key_level_failures[global_idx] = true;
@@ -727,8 +805,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 if (refresh_results[i] == EC_OK) {
                     continue;
                 }
-                get_ecs_per_key[i].assign(batch.batch_location_ids[i].size(), refresh_results[i]);
-                batch_locations_per_key[i].assign(batch.batch_location_ids[i].size(), nullptr);
+                get_ecs_per_key[i].assign(batch_location_ids[i].size(), refresh_results[i]);
+                batch_locations_per_key[i].assign(batch_location_ids[i].size(), nullptr);
             }
         }
 
@@ -737,11 +815,11 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         BatchMetaData delete_batch;
         std::vector<int32_t> put_global_indexs;
         for (size_t i = 0; i < batch_keys.size(); ++i) {
-            const int32_t global_idx = batch.batch_indexs[i];
+            const int32_t global_idx = batch.global_indices[i];
             const KeyType key = batch_keys[i];
 
             std::vector<ErrorCode> &get_ecs = get_ecs_per_key[i];
-            const LocationIdVector &loc_ids = batch.batch_location_ids[i];
+            const LocationIdVector &loc_ids = batch_location_ids[i];
             CacheLocationVector &loc_values = batch_locations_per_key[i];
             if (get_ecs.size() != loc_ids.size() || loc_values.size() != loc_ids.size()) {
                 PREFIX_INDEXER_LOG(ERROR,
@@ -880,9 +958,34 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 }
             }
         }
-        const auto [delete_errs, delete_success_count] =
-            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
+        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(trace_id,
+                                                                          ephemeral_request_context.get(),
+                                                                          delete_batch,
+                                                                          keys,
+                                                                          stats,
+                                                                          rmw_result,
+                                                                          maintenance_no_touch);
         (void)delete_errs;
+        const bool maintenance_delete_synced = !maintenance_no_touch || delete_batch.batch_keys.empty() ||
+                                               !backend_manager_->RequiresMaintenancePostDeleteSync() ||
+                                               backend_manager_->Sync(delete_batch.batch_keys);
+        if (!maintenance_delete_synced) {
+            // Keep the per-key shard fence until the accepted maintenance
+            // delete reaches its async backend queue barrier. A timeout is an
+            // unknown persistence outcome, so surface a key-level hard result
+            // and let a later GC round reconcile the authoritative metadata
+            // again. Preserve the accepted per-location results and
+            // accounting: ordinary async RMW uses enqueue acceptance as its
+            // accounting boundary, and replacing those results with TIMEOUT
+            // would permanently leak usage when the delete has already been
+            // applied and is therefore absent from the next scan.
+            PREFIX_INDEXER_LOG(WARN,
+                               "maintenance post-delete Sync failed for keys[%lu]",
+                               delete_batch.batch_keys.size());
+            for (const int32_t global_idx : delete_batch.batch_indexs) {
+                key_level_failures[global_idx] = true;
+            }
+        }
         for (const auto &global_index : delete_batch.batch_indexs) {
             if (rmw_result.error_codes[global_index] != EC_OK) {
                 key_level_failures[global_index] = true;
@@ -956,39 +1059,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
 
-    // Preserve MakeBatches' observable ordering and capacity behavior: shards
-    // are visited in ascending order, indices within one shard retain request
-    // order, and a whole shard is appended before the soft limit is checked.
-    struct SingleLocationBatch {
-        std::vector<int32_t> shard_indices;
-        std::vector<int32_t> global_indices;
-    };
-    std::vector<std::vector<int32_t>> indices_by_shard(mutex_shards_.size());
-    for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
-        indices_by_shard[GetMutexShardIndex(keys[i])].push_back(i);
-    }
-    std::vector<SingleLocationBatch> batches;
-    batches.reserve(indices_by_shard.size());
-    SingleLocationBatch current_batch;
-    size_t current_batch_size = 0;
-    size_t nonempty_shards_remaining = static_cast<size_t>(std::count_if(
-        indices_by_shard.begin(), indices_by_shard.end(), [](const auto &indices) { return !indices.empty(); }));
-    for (size_t shard_index = 0; shard_index < indices_by_shard.size(); ++shard_index) {
-        const auto &indices = indices_by_shard[shard_index];
-        if (indices.empty()) {
-            continue;
-        }
-        current_batch.shard_indices.push_back(static_cast<int32_t>(shard_index));
-        current_batch.global_indices.reserve(current_batch.global_indices.size() + indices.size());
-        current_batch.global_indices.insert(current_batch.global_indices.end(), indices.begin(), indices.end());
-        current_batch_size += indices.size();
-        --nonempty_shards_remaining;
-        if (current_batch_size >= batch_key_size_ || nonempty_shards_remaining == 0) {
-            batches.push_back(std::move(current_batch));
-            current_batch = SingleLocationBatch{};
-            current_batch_size = 0;
-        }
-    }
+    std::vector<IndexBatch> batches = MakeBatches(keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
     // Prepare backend-owned lookup/release workspace once, before acquiring
@@ -1038,7 +1109,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         // Reuse request-shaped buffers across internal batches. Clear happens
         // before the next ScopedBatchLock, so releasing replacement locations
         // and growing these vectors never extends metadata lock hold time.
-        batch_keys.clear();
+        FillBatchKeys(batch.global_indices, keys, batch_keys);
         batch_location_ids.clear();
         batch_existing_locations.clear();
         batch_get_ecs.clear();
@@ -1050,7 +1121,6 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         upsert_is_new_key.clear();
         upsert_read_indices.clear();
         for (const int32_t global_index : batch.global_indices) {
-            batch_keys.push_back(keys[global_index]);
             batch_location_ids.push_back(location_ids[global_index]);
         }
         // Allocate all request-shaped scratch vectors before taking metadata
@@ -1061,7 +1131,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
         // releases the lock first, then drops replaced CacheLocations and
         // their URI strings outside the metadata critical section.
         DeferredLocationRelease deferred_location_release{backend_scratch.retired_locations};
-        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us);
+        ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         backend_manager_->GetSingleLocationViewsWithKeyStatusInto(nullptr,
@@ -1280,6 +1350,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
     }
     return result;
 }
+
 
 MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {
@@ -1921,11 +1992,8 @@ std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, co
     return storage_usage_data_.SubStorageUsageByType(type, value);
 }
 
-std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
-                                                    const LocationIdsPerKey &location_ids,
-                                                    CacheLocationMapVector &locations,
-                                                    PropertyMapVector &properties) const noexcept {
-    std::vector<BatchMetaData> result;
+std::vector<MetaIndexer::IndexBatch> MetaIndexer::MakeBatches(const KeyVector &keys) const noexcept {
+    std::vector<IndexBatch> result;
 
     std::map<int32_t, std::vector<int32_t>> shard_map;
     for (int32_t i = 0; i < static_cast<int32_t>(keys.size()); ++i) {
@@ -1936,7 +2004,7 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
         return result;
     }
 
-    BatchMetaData current;
+    IndexBatch current;
     size_t current_batch_size = 0;
     size_t shards_emitted = 0;
     const size_t total_shards = shard_map.size();
@@ -1945,30 +2013,15 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
         const int32_t shard_index = shard_kv.first;
         const auto &index_list = shard_kv.second;
 
-        current.batch_shard_indexs.emplace_back(shard_index);
-        for (const int32_t idx : index_list) {
-            current.batch_indexs.emplace_back(idx);
-            current.batch_keys.emplace_back(keys[idx]);
-            if (!properties.empty()) {
-                assert(idx < static_cast<int32_t>(properties.size()));
-                current.batch_properties.emplace_back(std::move(properties[idx]));
-            }
-            if (!locations.empty()) {
-                assert(idx < static_cast<int32_t>(locations.size()));
-                current.batch_locations.emplace_back(std::move(locations[idx]));
-            }
-            if (!location_ids.empty()) {
-                assert(idx < static_cast<int32_t>(location_ids.size()));
-                current.batch_location_ids.emplace_back(location_ids[idx]);
-            }
-        }
+        current.shard_indices.emplace_back(shard_index);
+        current.global_indices.insert(current.global_indices.end(), index_list.begin(), index_list.end());
         current_batch_size += index_list.size();
         ++shards_emitted;
 
         // Flush on soft-limit, or after the last shard so the tail batch is kept.
         if (current_batch_size >= batch_key_size_ || shards_emitted == total_shards) {
             result.emplace_back(std::move(current));
-            current = BatchMetaData{};
+            current = IndexBatch{};
             current_batch_size = 0;
         }
     }

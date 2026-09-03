@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,7 +16,10 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/loop_thread.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -55,10 +59,12 @@ public:
     struct Config {
         bool enabled{false};
         int64_t scan_interval_ms{1000};
-        int64_t round_pause_ms{24LL * 60 * 60 * 1000};
+        int64_t round_pause_ms{2LL * 60 * 60 * 1000};
         size_t scan_batch_size{256};
         int64_t orphan_writing_grace_period_ms{24LL * 60 * 60 * 1000};
         size_t max_inflight_delete_requests{2};
+        bool event_report_cleanup_enabled{true};
+        size_t event_report_action_batch_size{32};
     };
 
     CacheGarbageCollector() = delete;
@@ -83,13 +89,20 @@ public:
     void Stop() noexcept;
     [[nodiscard]] bool IsRunning() const noexcept;
     [[nodiscard]] bool IsEnabled() const noexcept { return config_.enabled; }
+    [[nodiscard]] bool IsEventReportCleanupEnabled() const noexcept {
+        return config_.enabled && config_.event_report_cleanup_enabled;
+    }
 
 private:
     using Clock = std::chrono::steady_clock;
+    static constexpr size_t kMaxScanFailuresPerInstancePerRound = 3;
 
     struct InstanceScanEntry {
         std::string instance_group;
         std::string instance_id;
+        std::string cursor{SCAN_BASE_CURSOR};
+        bool completed{false};
+        size_t scan_failure_count{0};
 
         bool operator<(const InstanceScanEntry &other) const {
             return std::tie(instance_group, instance_id) < std::tie(other.instance_group, other.instance_id);
@@ -113,26 +126,49 @@ private:
     struct InflightDelete {
         uint64_t round_id{0};
         std::string instance_id;
+        std::string action_name;
         size_t target_count{0};
         Clock::time_point submitted_at;
         std::vector<PendingLocationKey> pending_locations;
         std::future<PlanExecuteResult> future;
     };
 
+    enum class EventReportBackendRouteStatus {
+        kResolved,
+        kMissing,
+        kAmbiguous,
+        kUnavailable,
+    };
+
+    struct EventReportBackendRoute {
+        EventReportBackendRouteStatus status{EventReportBackendRouteStatus::kMissing};
+        std::string backend_unique_name;
+        std::shared_ptr<EventReportBackend> backend;
+    };
+
+    struct ScanDeleteActions {
+        CacheLocationDelRequest executor_request;
+        EventReportMetadataDelRequest event_report_request;
+    };
+
     void RunOneTick() noexcept;
+    EventReportBackendRoute LookupEventReportBackend(const std::string &instance_id,
+                                                      DataStorageType storage_type) const;
     void PollInflightDeletes() noexcept;
     void UpdateInflightDeleteMetrics() noexcept;
     void ReleasePendingLocations(const InflightDelete &inflight) noexcept;
     bool BeginRound();
     void CompleteRound() noexcept;
-    void AdvanceInstance() noexcept;
-    CacheLocationDelRequest
-    BuildDeleteRequest(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);
+    void AdvanceInstance(bool completed_current) noexcept;
+    ScanDeleteActions
+    BuildDeleteActions(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);
     bool
     IsOrphanWriting(const std::string &map_location_id, const CacheLocation &location, int64_t now_us) const noexcept;
     void ResetWorkerState() noexcept;
     void RegisterMetrics();
     void RecordCandidateCount(const std::string &reason, size_t count) noexcept;
+    void RecordCandidateDropped(const std::string &reason, const std::string &cause, size_t count) noexcept;
+    void RecordEventReportProbe(const std::string &result, const std::string &unknown_cause = {}) noexcept;
     void RecordOperationError(const std::string &stage) noexcept;
     void RecordDeleteResult(const std::string &status) noexcept;
 
@@ -152,7 +188,6 @@ private:
     // Worker-thread-only state.
     std::vector<InstanceScanEntry> instances_;
     size_t instance_index_{0};
-    std::string cursor_;
     uint64_t round_id_{0};
     bool round_active_{false};
     Clock::time_point round_started_at_;

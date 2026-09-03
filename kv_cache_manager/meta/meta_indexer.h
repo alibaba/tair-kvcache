@@ -110,6 +110,11 @@ public:
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
                                            bool refresh_cache_from_persistent = false) noexcept;
+    LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
+                                                          const KeyVector &keys,
+                                                          const LocationIdsPerKey &location_ids,
+                                                          const LocationModifierFunc &modifier,
+                                                          bool adjust_reclaimed_key_count = true) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -127,7 +132,6 @@ public:
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
-
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,
@@ -205,14 +209,16 @@ private:
                                                const LocationModifierFunc &modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
-                                               bool refresh_cache_from_persistent) noexcept;
+                                               bool refresh_cache_from_persistent,
+                                               bool maintenance_no_touch) noexcept;
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;
-    std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
-                                           const LocationIdsPerKey &location_ids,
-                                           CacheLocationMapVector &locations,
-                                           PropertyMapVector &properties) const noexcept;
+    struct IndexBatch {
+        std::vector<int32_t> shard_indices;
+        std::vector<int32_t> global_indices;
+    };
+    std::vector<IndexBatch> MakeBatches(const KeyVector &keys) const noexcept;
 
     ErrorCode RecoverMetaData() noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
@@ -237,6 +243,7 @@ private:
         int64_t index_deserialize_time_us = 0;
         bool has_index_deserialize = false;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t lock_hold_time_us = 0; // accumulated time holding all shard locks in a batch
         int64_t async_enqueue_timeout_key_count = 0;
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
@@ -260,7 +267,8 @@ private:
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
-                                                 Result &result) noexcept;
+                                                 Result &result,
+                                                 bool maintenance_no_touch = false) noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 

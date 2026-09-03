@@ -168,9 +168,15 @@ grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
 
 githooks中已经添加了C++等语言的格式化脚本，请确保开发环境安装了clang-format、autopep8、buildifier。（开发镜像均已预装）。
 
-## 提交要求
+## Proto 修改
+
+修改 `kv_cache_manager/protocol/protobuf` 下的 proto 定义时，请遵循 [Proto 文件修改指南](proto_modification_guide.md)，并同步完成其中列出的适配步骤（例如修改 AdminService 接口定义时需适配 `package/kvcm_ops` 运维 CLI）。
+
+## 提交与 PR 要求
 
 提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。
+
+发起和参与 PR 时应遵守 [Pull Request 协作指南](pull_request_guidelines.md)，主动控制评审负担并为其他参与者准备所需的信息。
 
 ## CI
 可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。

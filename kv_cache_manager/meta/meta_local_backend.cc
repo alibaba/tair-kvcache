@@ -223,8 +223,7 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(Cache::Handle *handle,
                 ssize_t new_usage = loc_ptr ? static_cast<ssize_t>(loc_ptr->EstimateMemUsage()) : 0;
                 charge_delta += new_usage - old_usage;
             } else {
-                ssize_t new_usage = loc_ptr ? static_cast<ssize_t>(loc_ptr->EstimateMemUsage()) : 0;
-                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + loc_id.size()) + new_usage;
+                charge_delta += static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(loc_id, loc_ptr));
                 existing_locations[loc_id] = loc_ptr;
             }
         }
@@ -278,8 +277,7 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(Cache::Handle *han
             }
             charge_delta = new_usage - old_usage;
         } else {
-            const ssize_t new_usage = location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
-            charge_delta = static_cast<ssize_t>(sizeof(void *) * 4 + location_id.size()) + new_usage;
+            charge_delta = static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(location_id, location));
             existing_locations.emplace(location_id, std::move(location));
         }
     }
@@ -370,8 +368,8 @@ ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vec
         for (const auto &loc_id : location_ids) {
             auto it = locs.find(loc_id);
             if (it != locs.end()) {
-                ssize_t loc_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
-                charge_delta -= static_cast<ssize_t>(sizeof(void *) * 4 + it->first.size()) + loc_usage;
+                charge_delta -=
+                    static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(it->first, it->second));
                 locs.erase(it);
             }
         }
@@ -809,6 +807,34 @@ ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
     return EC_OK;
 }
 
+ErrorCode MetaLocalBackend::GetForOneKeyForMaintenance(KeyType key,
+                                                       CacheLocationMap *out_location_map,
+                                                       std::vector<LocationId> *out_location_ids) {
+    ErrorCode result = EC_OK;
+    const bool found = cache_->ApplyToEntryNoTouch(
+        KeyToView(key),
+        [&](Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+            if (value == nullptr) {
+                result = EC_ERROR;
+                return 0;
+            }
+            const auto *item = static_cast<const MetaMemCacheItem *>(value);
+            std::shared_lock lock(item->GetMutex());
+            const auto &locations = item->GetLocations();
+            if (out_location_map) {
+                *out_location_map = locations;
+            }
+            if (out_location_ids) {
+                out_location_ids->reserve(locations.size());
+                for (const auto &[location_id, _] : locations) {
+                    out_location_ids->push_back(location_id);
+                }
+            }
+            return 0;
+        });
+    return found ? result : EC_NOENT;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::Get(RequestContext * /*request_context*/,
                                              const KeyTypeVec &keys,
                                              CacheLocationMapVector &out_locations,
@@ -1127,6 +1153,46 @@ void MetaLocalBackend::GetSingleLocationsWithKeyStatusIntoImpl(RequestContext * 
     }
 }
 
+std::vector<std::vector<ErrorCode>>
+MetaLocalBackend::GetLocationsForMaintenance(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             const LocationIdsPerKey &location_ids,
+                                             LocationsPerKey &out_locations) noexcept {
+    if (keys.size() != location_ids.size()) {
+        out_locations.clear();
+        return {};
+    }
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i].assign(location_ids[i].size(), EC_NOENT);
+        out_locations[i].resize(location_ids[i].size());
+        const bool found = cache_->ApplyToEntryNoTouch(
+            KeyToView(keys[i]),
+            [&](Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+                if (value == nullptr) {
+                    std::fill(results[i].begin(), results[i].end(), EC_ERROR);
+                    return 0;
+                }
+                const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                std::shared_lock lock(item->GetMutex());
+                const auto &locations = item->GetLocations();
+                for (size_t j = 0; j < location_ids[i].size(); ++j) {
+                    const auto it = locations.find(location_ids[i][j]);
+                    if (it != locations.end()) {
+                        results[i][j] = EC_OK;
+                        out_locations[i][j] = it->second;
+                    }
+                }
+                return 0;
+            });
+        if (!found) {
+            std::fill(results[i].begin(), results[i].end(), EC_NOENT);
+        }
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::GetLocationIds(RequestContext * /*request_context*/,
                                                         const KeyTypeVec &keys,
                                                         LocationIdsPerKey &out_location_ids) noexcept {
@@ -1134,6 +1200,69 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationIds(RequestContext * /*reque
     out_location_ids.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = GetForOneKey(keys[i], nullptr, nullptr, nullptr, &out_location_ids[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetLocationIdsForMaintenance(RequestContext * /*request_context*/,
+                                                                      const KeyTypeVec &keys,
+                                                                      LocationIdsPerKey &out_location_ids) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_location_ids.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKeyForMaintenance(keys[i], nullptr, &out_location_ids[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::DeleteLocationsForMaintenance(RequestContext * /*request_context*/,
+                                                                       const KeyTypeVec &keys,
+                                                                       const LocationIdsPerKey &location_ids) noexcept {
+    return DeleteLocationsForMaintenance(nullptr, keys, location_ids, std::vector<ErrorCode>(keys.size(), EC_OK));
+}
+
+std::vector<ErrorCode>
+MetaLocalBackend::DeleteLocationsForMaintenance(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const LocationIdsPerKey &location_ids,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    if (keys.size() != location_ids.size() || keys.size() != previous_error_codes.size()) {
+        return {};
+    }
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK && previous_error_codes[i] != EC_NOENT) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        if (location_ids[i].empty()) {
+            continue;
+        }
+        const bool found = cache_->ApplyToEntryNoTouch(
+            KeyToView(keys[i]),
+            [&](Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+                if (value == nullptr) {
+                    results[i] = EC_ERROR;
+                    return 0;
+                }
+                auto *item = static_cast<MetaMemCacheItem *>(value);
+                ssize_t charge_delta = 0;
+                std::unique_lock lock(item->GetMutex());
+                auto &locations = item->GetMutableLocations();
+                for (const auto &location_id : location_ids[i]) {
+                    const auto it = locations.find(location_id);
+                    if (it == locations.end()) {
+                        continue;
+                    }
+                    charge_delta -=
+                        static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(it->first, it->second));
+                    locations.erase(it);
+                }
+                return charge_delta;
+            });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
     }
     return results;
 }
@@ -1238,25 +1367,29 @@ ErrorCode MetaLocalBackend::ScanLocationsForMaintenance(RequestContext * /*reque
     const uint32_t num_shards = shard_mask_ + 1;
     int64_t collected = 0;
     for (uint32_t shard_id = static_cast<uint32_t>(start_shard); shard_id < num_shards; ++shard_id) {
+        std::vector<KeyType> shard_keys;
         cache_->ApplyToSingleShard(shard_id,
                                    [&](const std::string_view &key,
-                                       Cache::ObjectPtr value,
+                                       Cache::ObjectPtr /*value*/,
                                        size_t /*charge*/,
                                        const Cache::CacheItemHelper * /*helper*/) {
-                                       if (key.size() != sizeof(KeyType) || value == nullptr) {
+                                       if (key.size() != sizeof(KeyType)) {
                                            return;
                                        }
-                                       const auto *item = static_cast<const MetaMemCacheItem *>(value);
-                                       CacheLocationMap locations;
-                                       {
-                                           std::shared_lock lock(item->GetMutex());
-                                           locations = item->GetLocations();
-                                       }
-                                       out.keys.push_back(ViewToKey(key));
-                                       out.locations.emplace_back(std::move(locations));
-                                       out.location_results.push_back(EC_OK);
-                                       ++collected;
+                                       shard_keys.push_back(ViewToKey(key));
                                    });
+
+        // ApplyToSingleShard owns the LRU shard mutex. Copy each item only
+        // after that iteration lock has been released; ApplyToEntryNoTouch
+        // then pins the exact shard operation without promoting the entry.
+        for (const KeyType key : shard_keys) {
+            CacheLocationMap locations;
+            const ErrorCode ec = GetForOneKeyForMaintenance(key, &locations, nullptr);
+            out.keys.push_back(key);
+            out.locations.emplace_back(std::move(locations));
+            out.location_results.push_back(ec);
+            ++collected;
+        }
 
         if (collected >= limit) {
             const uint32_t next_shard = shard_id + 1;

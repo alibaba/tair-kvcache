@@ -2,6 +2,7 @@
 
 #include <google/protobuf/util/json_util.h>
 
+#include "fast_proto_json_codec.h"
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
@@ -29,6 +30,9 @@ bool ProtoMessageJsonUtil::ToJson(const ::google::protobuf::Message *message, st
     if (!message) {
         return false;
     }
+    if (FastProtoJsonCodec::TryToJson(*message, json)) {
+        return true;
+    }
     static ::google::protobuf::util::JsonPrintOptions option = CreateJsonPrintOption();
     auto status = google::protobuf::util::MessageToJsonString(*message, &json, option);
     return status.ok();
@@ -38,6 +42,11 @@ bool ProtoMessageJsonUtil::FromJson(std::string_view json, ::google::protobuf::M
     if (!message) {
         return false;
     }
+    if (FastProtoJsonCodec::TryFromJson(json, message)) {
+        return true;
+    }
+    // The fast parser can reject compatible but uncommon JSON shapes. The
+    // protobuf parser remains the compatibility oracle for those inputs.
     static ::google::protobuf::util::JsonParseOptions option = CreateJsonParseOption();
     const google::protobuf::StringPiece input(json.data(), static_cast<ptrdiff_t>(json.size()));
     auto status = google::protobuf::util::JsonStringToMessage(input, message, option);

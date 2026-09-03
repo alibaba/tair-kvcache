@@ -77,7 +77,13 @@ DataStorageType EventReportBackend::GetType() { return config_.type(); }
 bool EventReportBackend::Available() { return IsOpen() && IsAvailable(); }
 
 void EventReportBackend::SetAvailable(bool available) {
+    std::unique_lock<std::shared_mutex> maintenance_lock(maintenance_backend_mutex_);
     DataStorageBackend::SetAvailable(available);
+    if (available) {
+        // Re-enabled Reporters need a complete heartbeat + cleanup-grace
+        // window before recovery-absent cleanup may be authorized.
+        ResetMaintenanceRecoveryGrace();
+    }
     if (!available) {
         snapshot_state_cv_.notify_all();
     }
@@ -1270,6 +1276,245 @@ ErrorCode EventReportBackend::AcquireSnapshotCleanupLease(const ReporterSnapshot
     return EC_OK;
 }
 
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireDownLifecycleCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t expected_generation, LifecycleMutationLease &out_lease) const {
+    out_lease.reset();
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->generation != expected_generation) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    // Producers publish DownHost only after generation-checked unregister.
+    // Treat an unexpected same-generation active state fail-closed as busy:
+    // retain the candidate and never authorize deletion until down is observed.
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireAbsentReporterCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t &out_generation, LifecycleMutationLease &out_lease) {
+    out_generation = 0;
+    out_lease.reset();
+    const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    out_generation = lifecycle_fence->generation;
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+std::vector<EventReportBackend::MaintenanceLocationProbeResult>
+EventReportBackend::ProbeLocationsForMaintenance(const std::vector<MaintenanceLocationProbe> &probes) {
+    std::vector<MaintenanceLocationProbeResult> results(probes.size());
+    if (!AcceptingReports()) {
+        for (auto &result : results) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kBackendUnavailable;
+        }
+        return results;
+    }
+
+    const int64_t now_ms = NowMillis();
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    for (size_t i = 0; i < probes.size(); ++i) {
+        const auto &probe = probes[i];
+        auto &result = results[i];
+        std::string_view medium;
+        std::string_view reporter_host_view;
+        if (probe.instance_id.empty() || !ParseLocationIdView(probe.location_id, medium, reporter_host_view)) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kReporterIdentityMalformed;
+            continue;
+        }
+
+        ReporterSnapshotKey reporter_key{probe.instance_id, std::string(reporter_host_view)};
+        const auto instance_it = instance_nodes_.find(probe.instance_id);
+        NodeInfo *node = nullptr;
+        if (instance_it != instance_nodes_.end()) {
+            const auto node_it = instance_it->second.find(reporter_key.host_ip_port);
+            if (node_it != instance_it->second.end() && node_it->second) {
+                node = node_it->second.get();
+            }
+        }
+        if (node) {
+            if (!node->available.load(std::memory_order_relaxed)) {
+                result.decision = MaintenanceCleanupDecision::kKeep;
+                continue;
+            }
+
+            const auto state_it = snapshot_versions_.find(reporter_key);
+            if (state_it == snapshot_versions_.end() || state_it->second.committed.empty() ||
+                !state_it->second.strict_query_visibility) {
+                // Before the first successful complete snapshot, after a
+                // failed attempt, or while recovering, historical metadata is
+                // intentionally queryable. Its generation is not a deletion
+                // authorization.
+                result.unknown_reason = MaintenanceProbeUnknownReason::kSnapshotState;
+                continue;
+            }
+
+            bool contains_current = false;
+            bool malformed = false;
+            for (const auto &uri_text : probe.storage_uris) {
+                std::string_view version;
+                if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(uri_text, version)) {
+                    malformed = true;
+                    continue;
+                }
+                // A structurally valid URI without s_version is legacy
+                // metadata. It is stale only when no sibling spec carries the
+                // committed or in-flight generation.
+                contains_current = contains_current || version == state_it->second.committed ||
+                                   (!state_it->second.in_flight.empty() && version == state_it->second.in_flight);
+            }
+            if (contains_current) {
+                result.decision = MaintenanceCleanupDecision::kKeep;
+                continue;
+            }
+            if (malformed) {
+                result.unknown_reason = MaintenanceProbeUnknownReason::kLocationMalformed;
+                continue;
+            }
+
+            uint64_t generation = 0;
+            const auto generation_instance_it = node_generation_.find(probe.instance_id);
+            if (generation_instance_it != node_generation_.end()) {
+                const auto generation_it = generation_instance_it->second.find(reporter_key.host_ip_port);
+                if (generation_it != generation_instance_it->second.end()) {
+                    generation = generation_it->second;
+                }
+            }
+            result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+            result.token = MaintenanceCleanupToken{
+                .reason = MaintenanceCleanupReason::kStaleSnapshot,
+                .reporter_key = std::move(reporter_key),
+                .lifecycle_generation = generation,
+                .committed_version = state_it->second.committed,
+                .snapshot_attempt_epoch = state_it->second.attempt_epoch,
+            };
+            continue;
+        }
+
+        const auto generation_instance_it = node_generation_.find(probe.instance_id);
+        if (generation_instance_it != node_generation_.end()) {
+            const auto generation_it = generation_instance_it->second.find(reporter_key.host_ip_port);
+            if (generation_it != generation_instance_it->second.end()) {
+                result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+                result.token = MaintenanceCleanupToken{
+                    .reason = MaintenanceCleanupReason::kDownHost,
+                    .reporter_key = std::move(reporter_key),
+                    .lifecycle_generation = generation_it->second,
+                };
+                continue;
+            }
+        }
+
+        if (now_ms < maintenance_recovery_deadline_ms_.load(std::memory_order_acquire)) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kRecoveryGrace;
+            continue;
+        }
+        result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+        result.token = MaintenanceCleanupToken{
+            .reason = MaintenanceCleanupReason::kRecoveryAbsentHost,
+            .reporter_key = std::move(reporter_key),
+        };
+    }
+    return results;
+}
+
+void EventReportBackend::ResetMaintenanceRecoveryGrace() noexcept {
+    const int64_t now_ms = NowMillis();
+    const int64_t heartbeat_timeout_ms = std::max<int64_t>(0, heartbeat_timeout_ms_);
+    const int64_t cleanup_grace_ms = std::max<int64_t>(0, cleanup_grace_ms_);
+    const int64_t wait_ms = heartbeat_timeout_ms > std::numeric_limits<int64_t>::max() - cleanup_grace_ms
+                                ? std::numeric_limits<int64_t>::max()
+                                : heartbeat_timeout_ms + cleanup_grace_ms;
+    const int64_t deadline =
+        now_ms > std::numeric_limits<int64_t>::max() - wait_ms ? std::numeric_limits<int64_t>::max() : now_ms + wait_ms;
+    maintenance_recovery_deadline_ms_.store(deadline, std::memory_order_release);
+}
+
+int64_t EventReportBackend::GetMaintenanceRecoveryGraceRemainingMs() const noexcept {
+    const int64_t now_ms = NowMillis();
+    const int64_t deadline = maintenance_recovery_deadline_ms_.load(std::memory_order_acquire);
+    return deadline > now_ms ? deadline - now_ms : 0;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult
+EventReportBackend::AcquireMaintenanceBackendLease(MaintenanceBackendLease &out_lease) const {
+    out_lease.reset();
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(maintenance_backend_mutex_, std::try_to_lock);
+    if (!lease->owns_lock() || !AcceptingReports()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult
+EventReportBackend::AcquireMaintenanceCleanupLease(const MaintenanceCleanupToken &token,
+                                                   LifecycleMutationLease &out_lease) {
+    out_lease.reset();
+    if (!AcceptingReports()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    switch (token.reason) {
+    case MaintenanceCleanupReason::kStaleSnapshot: {
+        const auto lifecycle_fence = FindLifecycleFence(token.reporter_key);
+        if (!lifecycle_fence) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+        if (!lease->owns_lock() || !AcceptingReports()) {
+            return CleanupLeaseAcquireResult::kBusy;
+        }
+        if (!lifecycle_fence->registered || lifecycle_fence->generation != token.lifecycle_generation) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+        const auto state_it = snapshot_versions_.find(token.reporter_key);
+        if (state_it == snapshot_versions_.end() || !state_it->second.strict_query_visibility ||
+            state_it->second.committed != token.committed_version ||
+            state_it->second.attempt_epoch != token.snapshot_attempt_epoch) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        out_lease = std::move(lease);
+        return CleanupLeaseAcquireResult::kAcquired;
+    }
+    case MaintenanceCleanupReason::kDownHost:
+        return AcquireDownLifecycleCleanupLease(token.reporter_key, token.lifecycle_generation, out_lease);
+    case MaintenanceCleanupReason::kRecoveryAbsentHost: {
+        // A queued token may outlive a dynamic disable/re-enable, which starts
+        // a fresh recovery window. The Executor pins backend availability
+        // before this final check, so SetAvailable(true) cannot reset the
+        // deadline between this check and the metadata mutation.
+        if (NowMillis() < maintenance_recovery_deadline_ms_.load(std::memory_order_acquire)) {
+            return CleanupLeaseAcquireResult::kBusy;
+        }
+        uint64_t generation = 0;
+        const auto lease_result = AcquireAbsentReporterCleanupLease(token.reporter_key, generation, out_lease);
+        if (lease_result == CleanupLeaseAcquireResult::kAcquired && generation != token.lifecycle_generation) {
+            out_lease.reset();
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        return lease_result;
+    }
+    }
+    return CleanupLeaseAcquireResult::kStale;
+}
+
 bool EventReportBackend::CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version) {
     if (!SnapshotUriUtils::IsValidSnapshotVersionToken(version)) {
         return false;
@@ -1297,6 +1542,15 @@ void EventReportBackend::AbortSnapshotVersion(const ReporterSnapshotKey &reporte
         reporter_key.host_ip_port.empty()) {
         return;
     }
+    // Cleanup retains a shared lifecycle lease from final token validation
+    // through metadata deletion. Abort changes strict visibility and therefore
+    // must take the matching writer; otherwise an already-authorized cleanup
+    // could delete while the Reporter has moved into soft visibility.
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = snapshot_versions_.find(reporter_key);
     if (it != snapshot_versions_.end() && it->second.in_flight == version) {

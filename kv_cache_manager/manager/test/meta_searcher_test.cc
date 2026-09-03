@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <future>
 #include <limits>
@@ -208,6 +209,64 @@ private:
     std::optional<KeyType> get_locations_failed_key_;
 };
 
+class MaintenanceBarrierBackend : public MetaLocalBackend {
+public:
+    void QueueReplacement(KeyType key, CacheLocationConstPtr location) {
+        pending_key_ = key;
+        pending_location_ = std::move(location);
+    }
+
+    void ResetEvents() {
+        events_.clear();
+        sync_call_count_ = 0;
+    }
+
+    void FailSyncCall(size_t call_index) { fail_sync_call_ = call_index; }
+
+    const std::vector<std::string> &Events() const { return events_; }
+
+    bool Sync(const KeyTypeVec & /*keys*/) noexcept override {
+        events_.push_back("sync");
+        ++sync_call_count_;
+        if (!pending_location_) {
+            return sync_call_count_ != fail_sync_call_;
+        }
+        CacheLocationMapVector locations(1);
+        locations.front().emplace(pending_location_->id(), pending_location_);
+        PropertyMapVector properties(1);
+        const auto results = MetaLocalBackend::Upsert(nullptr, {pending_key_}, locations, properties);
+        pending_location_.reset();
+        return results.size() == 1 && results.front() == EC_OK && sync_call_count_ != fail_sync_call_;
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override {
+        events_.push_back("read");
+        return MetaLocalBackend::GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    }
+
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept override {
+        events_.push_back("delete_locations");
+        return MetaLocalBackend::DeleteLocationsForMaintenance(request_context, keys, location_ids);
+    }
+
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        events_.push_back("delete_key");
+        return MetaLocalBackend::Delete(request_context, keys);
+    }
+
+private:
+    KeyType pending_key_{0};
+    CacheLocationConstPtr pending_location_;
+    std::vector<std::string> events_;
+    size_t sync_call_count_{0};
+    size_t fail_sync_call_{0};
+};
+
 class RecordingGetLocationsBackend : public MetaLocalBackend {
 public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
@@ -375,6 +434,30 @@ public:
         meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
         meta_indexer_->backend_manager_->cache_backend_.reset();
         return backend_raw;
+    }
+
+    MaintenanceBarrierBackend *ReplaceWithMaintenanceBarrierBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<MaintenanceBarrierBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    MaintenanceBarrierBackend *ReplaceWithCachedMaintenanceBarrierBackend() {
+        auto *backend = ReplaceWithMaintenanceBarrierBackend();
+        auto cache_config = ConstructMetaStorageBackendConfig();
+        auto cache = std::make_unique<MetaLocalBackend>();
+        EXPECT_EQ(EC_OK, cache->Init("test", cache_config));
+        EXPECT_EQ(EC_OK, cache->Open());
+        meta_indexer_->backend_manager_->cache_backend_ = std::move(cache);
+        meta_indexer_->backend_manager_->recover_state_.store(
+            MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
+        return backend;
     }
 
     RecordingGetLocationsBackend *ReplaceWithRecordingGetLocationsBackend() {
@@ -1955,6 +2038,184 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     EXPECT_EQ(7u, validated_size);
 }
 
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsPendingWriteBeforeExpectedValueRead) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10027;
+    const std::string location_id = "kvs#event_report_l2#mem#barrier:8080";
+    auto make_location = [&location_id](const std::string &source) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(location_id);
+        location->set_status(CLS_SERVING);
+        location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        location->set_spec_size(1);
+        location->set_location_specs(
+            {LocationSpec("linear_0", "event_report://barrier:8080/mem?source=" + source + "&size=7")});
+        return location;
+    };
+
+    const auto old_location = make_location("old");
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, old_location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+
+    const auto new_location = make_location("new");
+    backend->QueueReplacement(key, new_location);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                    {key},
+                                                    {{location_id}},
+                                                    delete_results,
+                                                    {{old_location->ToJsonString()}},
+                                                    false,
+                                                    false,
+                                                    true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read"}), backend->Events());
+
+    LocationsPerKey current_locations;
+    const auto current_results = backend->MetaLocalBackend::GetLocationsForMaintenance(
+        request_context_.get(), {key}, {{location_id}}, current_locations);
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), current_results);
+    ASSERT_EQ(1u, current_locations.size());
+    ASSERT_EQ(1u, current_locations.front().size());
+    ASSERT_TRUE(current_locations.front().front());
+    EXPECT_EQ(new_location->ToJsonString(), current_locations.front().front()->ToJsonString());
+}
+
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsAcceptedDeleteBeforeShardFenceRelease) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10028;
+    const std::string location_id = "kvs#event_report_l2#mem#post-barrier:8080";
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(location_id);
+    location->set_status(CLS_SERVING);
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    location->set_spec_size(1);
+    location->set_location_specs(
+        {LocationSpec("linear_0", "event_report://post-barrier:8080/mem?source=current&size=7")});
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                    {key},
+                                                    {{location_id}},
+                                                    delete_results,
+                                                    {{location->ToJsonString()}},
+                                                    false,
+                                                    false,
+                                                    true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
+}
+
+TEST_F(MetaSearcherTest, TestCachedMaintenanceDeleteUsesHotMutationInsteadOfPostSync) {
+    auto *backend = ReplaceWithCachedMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10130;
+    const std::string location_id = "kvs#event_report_l2#mem#cached-barrier:8080";
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(location_id);
+    location->set_status(CLS_SERVING);
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    location->set_spec_size(1);
+    location->set_location_specs(
+        {LocationSpec("linear_0", "event_report://cached-barrier:8080/mem?source=current&size=7")});
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                    {key},
+                                                    {{location_id}},
+                                                    delete_results,
+                                                    {{location->ToJsonString()}},
+                                                    false,
+                                                    false,
+                                                    true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key"}), backend->Events());
+}
+
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSyncFails) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10029;
+    const std::string location_id = "kvs#event_report_l2#mem#post-sync-failure:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://post-sync-failure:8080/mem?size=17")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, merge_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
+    ASSERT_EQ(17u,
+              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().count(location_id));
+    const std::string expected_value = location_maps.front().at(location_id)->ToJsonString();
+
+    backend->ResetEvents();
+    backend->FailSyncCall(2);
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_ERROR,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                    {key},
+                                                    {{location_id}},
+                                                    delete_results,
+                                                    {{expected_value}},
+                                                    true,
+                                                    true,
+                                                    true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    // The aggregate error asks the caller to retry. Once the accepted delete
+    // is visible, that retry converges as NOENT and must not account twice.
+    backend->FailSyncCall(0);
+    backend->ResetEvents();
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                    {key},
+                                                    {{location_id}},
+                                                    delete_results,
+                                                    {{expected_value}},
+                                                    true,
+                                                    true,
+                                                    true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}), delete_results);
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocation) {
     const MetaSearcher::KeyVector keys = {10008};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.8:8080";
@@ -1985,7 +2246,7 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
     std::vector<std::vector<ErrorCode>> delete_results;
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}));
+                  request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -1996,10 +2257,10 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
     const std::string current_expected_value = location_maps[0].at(location_id)->ToJsonString();
     ASSERT_EQ(EC_BADARGS,
               meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}, {}}));
+                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}, {}}, true, true, true));
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}));
+                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -3217,10 +3478,8 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
 
     // batch: confirmed success / uncertain with id / failed without id / failed with a ghost id
     const KeyVector keys = {success_key, uncertain_key, no_id_key, ghost_key};
-    std::vector<MetaSearcher::AddLocationResult> add_results = {success_results[0],
-                                                                uncertain_results[0],
-                                                                {EC_ERROR, ""},
-                                                                {EC_ERROR, "ghost_location_id"}};
+    std::vector<MetaSearcher::AddLocationResult> add_results = {
+        success_results[0], uncertain_results[0], {EC_ERROR, ""}, {EC_ERROR, "ghost_location_id"}};
     MetaSearcher::AddLocationRollbackPlan plan;
     ASSERT_EQ(EC_OK, meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), keys, add_results, plan));
 
@@ -3234,7 +3493,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
     // uncertain metadata is deleted; confirmed-success metadata is left for the delete pipeline.
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_EQ(1u, location_maps[0].count(success_results[0].location_id));
     EXPECT_TRUE(location_maps[1].empty());
@@ -3247,8 +3508,7 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
     plan.direct_delete_indices = {0};
 
     EXPECT_EQ(EC_BADARGS,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
+              meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.pipeline_location_ids.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
@@ -3290,9 +3550,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisOnDeleteErro
 
     backend->SetGetLocationsFailedKey(uncertain_key);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
 
@@ -3322,9 +3582,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisWhenSyncFail
 
     backend->SetFailSync(true);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     // metadata was deleted in memory but the delete could not be synced: retain the URI.
     EXPECT_TRUE(plan.direct_delete_indices.empty());

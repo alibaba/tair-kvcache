@@ -133,6 +133,38 @@ reclaim_strategy->set_delay_before_delete_ms(0);  // 设置新字段
 ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());  // 验证新字段
 ```
 
+#### 4.1 检查 Protobuf JSON 快路径兼容性
+
+`ProtoMessageJsonUtil` 会对 KVCM 当前协议使用的类型直接做 protobuf Reflection 与 RapidJSON
+之间的转换。新增或修改字段时需要确认其类型是否在以下支持范围内：
+
+- `int32`、`uint32`、`int64`、`uint64`、`float`、`double`、`bool`、`string` 和普通 enum
+  （不含 `google.protobuf.NullValue`）；
+- 普通嵌套 message、repeated 和 oneof；
+- `map<string, string>`；
+- `google.protobuf.Int32Value` 和 `google.protobuf.Int64Value`。
+
+快路径承诺 protobuf JSON 的解析语义兼容，不承诺与 protobuf 3.8 的输出逐字节相同。特别是
+RapidJSON 会直接输出字符串中的 `<`、`>` 和部分合法 Unicode 字符，而 protobuf 3.8 会将它们写成
+HTML-safe 的 `\uXXXX` 形式；两种 JSON 解析后得到相同字符串，且该差异不会触发通用实现回退。
+因此快路径输出只能作为 JSON 或日志 JSON 消费，不能未经 HTML 层转义就直接嵌入可执行的
+`<script>` 内容。
+
+`FastProtoJsonCodecConformanceTest.TestAllRegisteredProtocolMessagesMatchProtobufJsonSemantics` 会检查所有
+当前协议消息。测试通过 Reflection 构造空消息及多组包含边界值、转义字符串、repeated、map、wrapper、
+oneof 和嵌套 message 的确定性样本，并以 protobuf 3.8 通用 JSON 实现作为 oracle，检查快路径输出的
+JSON 语义相同、两边输出均可由另一边解析回原消息。
+
+新增 `kv_cache_manager/protocol/protobuf/*.proto` 协议文件时，必须同时在该测试的 `kProtocolFiles`
+数组中加入新文件的 `FileDescriptor`（通常通过新文件中任一顶层 message 的 `descriptor()->file()`
+取得），并包含对应的生成 `.pb.h`。否则即使新文件使用了快路径尚未覆盖的字段类型或行为，该测试也
+无法发现。仅在已有协议文件中增删 message 或字段时，不需要手工登记 message，测试会遍历文件内全部
+顶层 message，并递归构造其嵌套类型。
+
+不在列表内的类型仍会回退到 protobuf 3.8 的通用 JSON 实现，功能不受影响，但 access log
+等热点路径无法获得加速。引入例如 `bytes`、其他 map 形态或其他 well-known type 时，应同时补充
+`FastProtoJsonCodec` 的实现与兼容性测试，或者在评审中明确接受相关 message 回退，并调整上述测试。
+
 ### 5. 构建和测试
 
 完成上述修改后，执行以下步骤验证修改是否正确：
@@ -152,6 +184,12 @@ bazel test //kv_cache_manager/xxxx:xxxx
 ### 7. （如果是修改MetaService） 更新客户端调用
 - RTP-LLM C++客户端: kv_cache_manager/client
 - vLLM等Python客户端：kv_cache_manager/py_connector
+
+### 8. （如果是修改AdminService）同步适配 kvcm_ops 运维 CLI
+
+- 工具位置：`package/kvcm_ops`
+- 若 InstanceGroup / Storage 等管理对象新增或变更字段，需同步更新对应的 Python 模型（如 `kvcm/instance_group/util.py`）的构造、校验与 JSON 序列化/反序列化，以及相关 create/update 命令参数。
+- 否则 kvcm_ops 的 update 流程（GET → 整体 PUT）会静默丢弃服务端已有字段，导致配置被意外清空。
 
 ## 注意事项
 
