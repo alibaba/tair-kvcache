@@ -968,8 +968,10 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                         const proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     SPAN_TRACER(request_context);
+    // This is a best-effort read of the node's local ReportEvent view. Followers may
+    // serve a stale view, while ReportEvent mutations remain leader-only.
     API_CALL_GUARD_WITH_DEBUG("GetHostCacheState",
-                              true,
+                              false,
                               BuildGetHostCacheStateRequestAccessLogSummary(request),
                               BuildGetHostCacheStateResponseAccessLogSummary(response),
                               RequestContext::ResponseJsonKind::kAccessLogSummary);
