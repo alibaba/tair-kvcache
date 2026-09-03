@@ -341,6 +341,59 @@ TEST_F(MetaDummyBackendTest, TestMaintenanceScanReturnsLocationsWithoutTouchingL
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestMaintenanceReadAndMutationDoNotTouchLru) {
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_maintenance_point_read", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc_1");
+    CacheLocationMapVector locations(1);
+    locations[0].emplace(location->id(), location);
+    PropertyMapVector properties(1);
+    properties[0]["p0"] = "v0";
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1}, locations, properties));
+
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    int64_t lru_before = 0;
+    ASSERT_TRUE(backend->table_.FindAndApply(
+        1, [&lru_before](const DummyItem &item) { lru_before = std::stoll(item.properties.at(PROPERTY_LRU_TIME)); }));
+
+    PropertyMapVector read_properties;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME, "p0"}, read_properties));
+    ASSERT_EQ("v0", read_properties[0].at("p0"));
+    ASSERT_EQ(std::to_string(lru_before), read_properties[0].at(PROPERTY_LRU_TIME));
+
+    CacheLocationMapVector read_locations;
+    const auto snapshot =
+        backend->GetForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, read_locations, read_properties);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), snapshot.location_error_codes);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), snapshot.property_error_codes);
+    ASSERT_EQ(1u, read_locations[0].count("loc_1"));
+
+    LocationsPerKey selected_locations;
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              backend->GetLocationsForMaintenance(nullptr, {1}, {{"loc_1"}}, selected_locations));
+
+    PropertyMapVector updates(1);
+    updates[0]["mark"] = "cold";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend->Upsert(nullptr,
+                              {1},
+                              CacheLocationMapVector(1),
+                              updates,
+                              MetaAccessIntent::kMaintenanceNoTouch));
+
+    int64_t lru_after = 0;
+    ASSERT_TRUE(backend->table_.FindAndApply(1, [&](const DummyItem &item) {
+        lru_after = std::stoll(item.properties.at(PROPERTY_LRU_TIME));
+        EXPECT_EQ("cold", item.properties.at("mark"));
+    }));
+    EXPECT_EQ(lru_before, lru_after);
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestRandomSample) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());

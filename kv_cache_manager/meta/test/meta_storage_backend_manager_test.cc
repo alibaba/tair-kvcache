@@ -1421,6 +1421,42 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverReadFallbackToPersistent) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceSnapshotKeepsProcessLocalLruUnknownOnCacheMiss) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_maintenance_process_local_lru";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_maintenance_process_local_lru", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    const KeyVector keys{22};
+    auto persistent_only = MakeBatch(keys);
+    SerializeLocationsIntoProperties(persistent_only);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr,
+                                           persistent_only.batch_keys,
+                                           persistent_only.batch_locations,
+                                           persistent_only.batch_properties));
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
+                             std::memory_order_release);
+
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    const auto result =
+        mgr.GetForMaintenance(nullptr, keys, {PROPERTY_LRU_TIME}, locations, properties);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), result.location_error_codes);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), result.property_error_codes);
+    ASSERT_EQ(1u, locations.size());
+    ASSERT_EQ(1u, locations[0].count("loc_22"));
+    ASSERT_EQ(1u, properties.size());
+    EXPECT_TRUE(properties[0].empty());
+
+    std::vector<bool> cache_exists;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, cache_exists));
+    ASSERT_EQ((std::vector<bool>{false}), cache_exists);
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
 // --- Recover phase: writes dual-write; Delete records tombstone --------------
 
 TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombstone) {

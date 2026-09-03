@@ -50,6 +50,12 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
     methods.mutable_mark().set_timeout_ms(12345);
     strategy.set_methods(methods);
     strategy.set_retention(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH);
+    MigrationAdmissionConfig admission;
+    admission.set_mode(MigrationAdmissionMode::SHADOW);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(3600));
+    admission.set_policies({policy});
+    strategy.set_admission(admission);
 
     MigrationStrategy parsed;
     ASSERT_TRUE(parsed.FromJsonString(strategy.ToJsonString()));
@@ -60,6 +66,110 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
     ASSERT_TRUE(parsed.methods().mark().enabled());
     ASSERT_EQ(12345, parsed.methods().mark().timeout_ms());
     ASSERT_EQ(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH, parsed.retention());
+    ASSERT_EQ(MigrationAdmissionMode::SHADOW, parsed.admission().mode());
+    ASSERT_EQ(1u, parsed.admission().policies().size());
+    ASSERT_EQ(3600, parsed.admission().policies()[0]->recent_access()->window_seconds());
+}
+
+TEST_F(MigrationStrategyTest, TestAdmissionDefaultsAndValidation) {
+    MigrationStrategy disabled;
+    disabled.set_source_storage_name("hot");
+    disabled.set_target_storage_name("cold");
+    disabled.set_trigger_threshold(0.7);
+    disabled.mutable_methods().mutable_mark().set_enabled(true);
+    std::string invalid_fields;
+    ASSERT_TRUE(disabled.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    ASSERT_EQ(MigrationAdmissionMode::DISABLED, disabled.admission().mode());
+    ASSERT_TRUE(disabled.admission().policies().empty());
+
+    // DISABLED may retain one valid dormant policy for staged rollout. It is
+    // validated and round-tripped, but is not evaluated until the mode changes.
+    MigrationAdmissionConfig dormant;
+    auto dormant_policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    dormant_policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(60));
+    dormant.set_policies({dormant_policy});
+    invalid_fields.clear();
+    ASSERT_TRUE(dormant.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    MigrationAdmissionConfig dormant_parsed;
+    ASSERT_TRUE(dormant_parsed.FromJsonString(dormant.ToJsonString()));
+    ASSERT_EQ(MigrationAdmissionMode::DISABLED, dormant_parsed.mode());
+    ASSERT_EQ(1u, dormant_parsed.policies().size());
+    ASSERT_EQ(60, dormant_parsed.policies()[0]->recent_access()->window_seconds());
+
+    MigrationAdmissionConfig enabled_without_policy;
+    enabled_without_policy.set_mode(MigrationAdmissionMode::ENFORCE);
+    invalid_fields.clear();
+    EXPECT_FALSE(enabled_without_policy.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("policies_count"));
+
+    MigrationAdmissionConfig invalid_window;
+    invalid_window.set_mode(MigrationAdmissionMode::SHADOW);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(0));
+    invalid_window.set_policies({policy});
+    invalid_fields.clear();
+    EXPECT_FALSE(invalid_window.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("window_seconds"));
+
+    MigrationAdmissionConfig valid;
+    valid.set_mode(MigrationAdmissionMode::ENFORCE);
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(60));
+    valid.set_policies({policy});
+    invalid_fields.clear();
+    EXPECT_TRUE(valid.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}
+
+TEST_F(MigrationStrategyTest, TestCacheConfigGatesEnforceByMetaBackendCapability) {
+    const auto make_cache_config =
+        [](MigrationAdmissionMode mode, const std::string &storage_type, const std::string &storage_uri = "") {
+            CacheConfig cache_config;
+            cache_config.set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL);
+            cache_config.set_reclaim_strategy(std::make_shared<CacheReclaimStrategy>());
+            cache_config.reclaim_strategy()->set_storage_unique_name("hot");
+
+            auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+            meta_indexer_config->GetMetaStorageBackendConfig()->SetStorageType(storage_type);
+            meta_indexer_config->GetMetaStorageBackendConfig()->SetStorageUri(storage_uri);
+            cache_config.set_meta_indexer_config(meta_indexer_config);
+
+            auto strategy = std::make_shared<MigrationStrategy>();
+            strategy->set_source_storage_name("hot");
+            strategy->set_target_storage_name("cold");
+            strategy->set_trigger_threshold(0.7);
+            strategy->mutable_methods().mutable_copy().set_enabled(true);
+            strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
+            strategy->mutable_admission().set_mode(mode);
+            auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+            policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(60));
+            strategy->mutable_admission().set_policies({policy});
+            cache_config.set_migration_strategies({strategy});
+            return cache_config;
+        };
+
+    std::string invalid_fields;
+    auto local = make_cache_config(MigrationAdmissionMode::ENFORCE, "local");
+    EXPECT_TRUE(local.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    invalid_fields.clear();
+    auto cached_local = make_cache_config(
+        MigrationAdmissionMode::ENFORCE, "cached", "redis://127.0.0.1:6379?persistent_type=redis&cache_type=local");
+    EXPECT_TRUE(cached_local.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    invalid_fields.clear();
+    auto redis = make_cache_config(MigrationAdmissionMode::ENFORCE, "redis");
+    EXPECT_FALSE(redis.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("unsupported_meta_backend"));
+
+    invalid_fields.clear();
+    auto cached_nonlocal = make_cache_config(
+        MigrationAdmissionMode::ENFORCE, "cached", "redis://127.0.0.1:6379?persistent_type=redis&cache_type=dummy");
+    EXPECT_FALSE(cached_nonlocal.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("unsupported_meta_backend"));
+
+    // SHADOW remains behavior-neutral and may observe unsupported features as UNKNOWN.
+    invalid_fields.clear();
+    auto shadow_redis = make_cache_config(MigrationAdmissionMode::SHADOW, "redis");
+    EXPECT_TRUE(shadow_redis.ValidateRequiredFields(invalid_fields)) << invalid_fields;
 }
 
 // 校验：各类非法配置都应被拒绝

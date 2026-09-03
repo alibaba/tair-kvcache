@@ -1,6 +1,7 @@
 #include "kv_cache_manager/config/migration_strategy.h"
 
 #include <cmath>
+#include <limits>
 #include <set>
 
 namespace kv_cache_manager {
@@ -13,7 +14,141 @@ bool IsValidMigrationRetention(MigrationRetention retention) {
            retention == MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
 }
 
+bool IsValidMigrationAdmissionMode(MigrationAdmissionMode mode) {
+    return mode == MigrationAdmissionMode::DISABLED || mode == MigrationAdmissionMode::SHADOW ||
+           mode == MigrationAdmissionMode::ENFORCE;
+}
+
 } // namespace
+
+RecentAccessAdmissionConfig::~RecentAccessAdmissionConfig() = default;
+
+bool RecentAccessAdmissionConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "window_seconds", window_seconds_);
+    return true;
+}
+
+void RecentAccessAdmissionConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "window_seconds", window_seconds_);
+}
+
+bool RecentAccessAdmissionConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    if (window_seconds_ > 0 && window_seconds_ <= std::numeric_limits<int64_t>::max() / (1000 * 1000)) {
+        return true;
+    }
+    invalid_fields += "{RecentAccessAdmissionConfig:{window_seconds}}";
+    return false;
+}
+
+MigrationAdmissionPolicyConfig::~MigrationAdmissionPolicyConfig() = default;
+
+MigrationAdmissionPolicyConfig::MigrationAdmissionPolicyConfig(
+    const MigrationAdmissionPolicyConfig &other) {
+    if (other.recent_access_ != nullptr) {
+        recent_access_ = std::make_shared<RecentAccessAdmissionConfig>(*other.recent_access_);
+    }
+}
+
+MigrationAdmissionPolicyConfig &MigrationAdmissionPolicyConfig::operator=(
+    const MigrationAdmissionPolicyConfig &other) {
+    if (this == &other) {
+        return *this;
+    }
+    recent_access_ = other.recent_access_ == nullptr
+                         ? nullptr
+                         : std::make_shared<RecentAccessAdmissionConfig>(*other.recent_access_);
+    return *this;
+}
+
+bool MigrationAdmissionPolicyConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "recent_access", recent_access_, std::shared_ptr<RecentAccessAdmissionConfig>());
+    return true;
+}
+
+void MigrationAdmissionPolicyConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    if (recent_access_ != nullptr) {
+        Put(writer, "recent_access", recent_access_);
+    }
+}
+
+bool MigrationAdmissionPolicyConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    if (recent_access_ == nullptr) {
+        invalid_fields += "{MigrationAdmissionPolicyConfig:{empty_policy}}";
+        return false;
+    }
+    return recent_access_->ValidateRequiredFields(invalid_fields);
+}
+
+MigrationAdmissionConfig::~MigrationAdmissionConfig() = default;
+
+MigrationAdmissionConfig::MigrationAdmissionConfig(const MigrationAdmissionConfig &other)
+    : mode_(other.mode_) {
+    policies_.reserve(other.policies_.size());
+    for (const auto &policy : other.policies_) {
+        policies_.push_back(policy == nullptr ? nullptr : std::make_shared<MigrationAdmissionPolicyConfig>(*policy));
+    }
+}
+
+MigrationAdmissionConfig &MigrationAdmissionConfig::operator=(const MigrationAdmissionConfig &other) {
+    if (this == &other) {
+        return *this;
+    }
+    mode_ = other.mode_;
+    policies_.clear();
+    policies_.reserve(other.policies_.size());
+    for (const auto &policy : other.policies_) {
+        policies_.push_back(policy == nullptr ? nullptr : std::make_shared<MigrationAdmissionPolicyConfig>(*policy));
+    }
+    return *this;
+}
+
+bool MigrationAdmissionConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "mode", mode_, MigrationAdmissionMode::DISABLED);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "policies", policies_, std::vector<std::shared_ptr<MigrationAdmissionPolicyConfig>>{});
+    return true;
+}
+
+void MigrationAdmissionConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "mode", mode_);
+    Put(writer, "policies", policies_);
+}
+
+bool MigrationAdmissionConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (!IsValidMigrationAdmissionMode(mode_)) {
+        valid = false;
+        local_invalid_fields += "{mode}";
+    }
+    // DISABLED may carry one validated dormant policy so operators can stage
+    // policy parameters before switching to SHADOW. The factory intentionally
+    // avoids constructing it until the mode is enabled, while JSON/proto keep
+    // round-tripping the configuration.
+    if (policies_.size() > 1 || (mode_ != MigrationAdmissionMode::DISABLED && policies_.size() != 1)) {
+        valid = false;
+        local_invalid_fields += "{policies_count}";
+    }
+    for (const auto &policy : policies_) {
+        if (policy == nullptr) {
+            valid = false;
+            local_invalid_fields += "{policies:null_entry}";
+            continue;
+        }
+        if (!policy->ValidateRequiredFields(local_invalid_fields)) {
+            valid = false;
+        }
+    }
+    if (!valid) {
+        invalid_fields += "{MigrationAdmissionConfig:" + local_invalid_fields + "}";
+    }
+    return valid;
+}
 
 MigrationCopyMethod::~MigrationCopyMethod() = default;
 
@@ -60,6 +195,7 @@ bool MigrationStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "trigger_threshold", trigger_threshold_);
     KVCM_JSON_GET_MACRO(rapid_value, "methods", methods_);
     KVCM_JSON_GET_MACRO(rapid_value, "retention", retention_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "admission", admission_, MigrationAdmissionConfig{});
     return true;
 }
 
@@ -69,6 +205,7 @@ void MigrationStrategy::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer>
     Put(writer, "trigger_threshold", trigger_threshold_);
     Put(writer, "methods", methods_);
     Put(writer, "retention", retention_);
+    Put(writer, "admission", admission_);
 }
 
 bool MigrationStrategy::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -108,6 +245,9 @@ bool MigrationStrategy::ValidateRequiredFields(std::string &invalid_fields) cons
     if (methods_.copy().enabled() && retention_ == MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED) {
         valid = false;
         local_invalid_fields += "{retention}";
+    }
+    if (!admission_.ValidateRequiredFields(local_invalid_fields)) {
+        valid = false;
     }
     if (!valid) {
         invalid_fields += "{MigrationStrategy: " + local_invalid_fields + "}";

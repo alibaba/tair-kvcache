@@ -677,6 +677,7 @@ private:
 
     bool BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
                                       const std::shared_ptr<const InstanceInfo> &instance_info,
+                                      bool full_candidate_pool,
                                       std::vector<std::int64_t> &out_batch) noexcept;
 
     std::vector<std::vector<std::string>> SnapshotPendingLocations(const std::string &instance_id,

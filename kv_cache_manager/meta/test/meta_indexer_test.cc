@@ -175,6 +175,33 @@ TEST_F(MetaIndexerTest, TestInit) {
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
 }
 
+TEST_F(MetaIndexerTest, TestMaintenanceReadinessEpochStartsAfterRecovery) {
+    const std::string configStr = R"({
+        "max_key_count" : 100, "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : {}
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    auto readiness = meta_indexer_->GetMaintenancePropertyReadiness(PROPERTY_LRU_TIME);
+    ASSERT_EQ(MaintenancePropertyCapability::kProcessLocalVolatile, readiness.capability);
+    ASSERT_GT(readiness.valid_since_steady_us, 0);
+
+    meta_indexer_->backend_manager_->recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
+                                                          std::memory_order_release);
+    meta_indexer_->ResetMaintenancePropertyReadinessEpoch();
+    const uint64_t recovering_generation = meta_indexer_->maintenance_readiness_generation_.load();
+    readiness = meta_indexer_->GetMaintenancePropertyReadiness(PROPERTY_LRU_TIME);
+    EXPECT_EQ(0, readiness.valid_since_steady_us);
+    EXPECT_EQ(recovering_generation, readiness.generation);
+
+    meta_indexer_->backend_manager_->recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning,
+                                                          std::memory_order_release);
+    readiness = meta_indexer_->GetMaintenancePropertyReadiness(PROPERTY_LRU_TIME);
+    EXPECT_GT(readiness.valid_since_steady_us, 0);
+    EXPECT_GT(readiness.generation, recovering_generation);
+}
+
 TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
     const KeyVector keys = {11, 22, 33};
 

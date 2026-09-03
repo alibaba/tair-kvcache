@@ -51,6 +51,11 @@ public:
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  MetaAccessIntent intent) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
                                            const KeyTypeVec &keys,
@@ -71,6 +76,10 @@ public:
                                                      const KeyTypeVec &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override;
     std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           LocationIdsPerKey &out_location_ids) noexcept override;
@@ -81,6 +90,15 @@ public:
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept override;
+    MaintenanceReadResult GetForMaintenance(RequestContext *request_context,
+                                            const KeyTypeVec &keys,
+                                            const std::vector<std::string> &field_names,
+                                            CacheLocationMapVector &out_locations,
+                                            PropertyMapVector &out_properties) noexcept override;
 
     // =====================================================================
     // Key-level APIs

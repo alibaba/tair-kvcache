@@ -770,6 +770,29 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestMaintenanceUpsertChargesCompleteLocationEntry) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_maintenance_upsert_charge", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "seed"}}}));
+    auto *backend = GetLocalBackend();
+    const size_t usage_before = backend->GetMemUsage();
+
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("maintenance_location");
+    location->set_status(CacheLocationStatus::CLS_SERVING);
+    CacheLocationMapVector locations(1);
+    locations[0].emplace(location->id(), location);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              backend->Upsert(nullptr, {1}, locations, PropertyMapVector(1), MetaAccessIntent::kMaintenanceNoTouch));
+
+    EXPECT_EQ(usage_before + MetaMemCacheItem::EstimateLocationEntryUsage(location->id(), location),
+              backend->GetMemUsage());
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());

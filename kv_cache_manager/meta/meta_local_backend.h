@@ -134,6 +134,11 @@ public:
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  MetaAccessIntent intent) noexcept override;
     std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
                                                  const KeyTypeVec &keys,
                                                  const LocationIdRefVector &location_ids,
@@ -173,6 +178,12 @@ public:
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  const std::vector<ErrorCode> &previous_error_codes,
+                                  MetaAccessIntent intent) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
@@ -244,6 +255,15 @@ public:
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept override;
+    MaintenanceReadResult GetForMaintenance(RequestContext *request_context,
+                                            const KeyTypeVec &keys,
+                                            const std::vector<std::string> &field_names,
+                                            CacheLocationMapVector &out_locations,
+                                            PropertyMapVector &out_properties) noexcept override;
     std::vector<ErrorCode> Exists(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   std::vector<bool> &out_is_exist_vec) noexcept override;
@@ -293,8 +313,10 @@ private:
     }
 
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
-    ErrorCode
-    CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode CreateAndInsert(std::string_view key_sv,
+                              const CacheLocationMap &locations,
+                              const PropertyMap &properties,
+                              MetaAccessIntent intent = MetaAccessIntent::kBusinessWrite);
     ErrorCode
     CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
@@ -318,7 +340,10 @@ private:
                                                  std::vector<ErrorCode> &out_results,
                                                  SingleLocationRmwScratch &scratch,
                                                  bool retain_handles) noexcept;
-    ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpsertForOneKey(KeyType key,
+                              const CacheLocationMap &locations,
+                              const PropertyMap &properties,
+                              MetaAccessIntent intent = MetaAccessIntent::kBusinessWrite);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);
     // Unified read helper. Fetches data from cache for a single key.
@@ -334,7 +359,9 @@ private:
                            PropertyMap *out_property_map,
                            std::vector<LocationId> *out_location_ids);
     ErrorCode GetForOneKeyForMaintenance(KeyType key,
+                                         const std::vector<std::string> *field_names,
                                          CacheLocationMap *out_location_map,
+                                         PropertyMap *out_property_map,
                                          std::vector<LocationId> *out_location_ids);
 
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;

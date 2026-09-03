@@ -1591,29 +1591,24 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t copy_max_concurrency =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
-    int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
-
-    // IsTieredMigrationEnabled 以“group 至少有一条 migration strategy”作为写路径消费 Mark 的
-    // group 级开关，因此无 strategy 时打标会成为“成功的 no-op”，这里直接拒绝。Admin 显式 target
-    // 不受 strategy route 约束；精确匹配到 enabled Mark route 只影响下方 timeout 的选择。
-    if (do_mark) {
-        const bool has_migration_strategy = !cache_config->migration_strategies().empty();
-        if (!has_migration_strategy) {
-            result.ec = EC_BADARGS;
-            result.message = "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
-            return result;
-        }
-
-        // Admin 保留显式指定任意已注册 target 的能力。精确匹配到启用 Mark 的 strategy 时复用其
-        // timeout；没有匹配 route 时仍允许迁移，并使用默认 timeout。
-        for (const auto &strategy : cache_config->migration_strategies()) {
-            if (strategy != nullptr && strategy->source_storage_name() == src_name &&
-                strategy->target_storage_name() == dst_name && strategy->methods().mark().enabled()) {
-                mark_timeout_ms = strategy->methods().mark().timeout_ms();
-                break;
+    std::shared_ptr<MigrationStrategy> matched_route;
+    for (const auto &strategy : cache_config->migration_strategies()) {
+        if (strategy != nullptr && strategy->source_storage_name() == src_name &&
+            strategy->target_storage_name() == dst_name) {
+            if (matched_route != nullptr) {
+                result.ec = EC_CONFIG_ERROR;
+                result.message = "duplicate migration route: " + src_name + " -> " + dst_name;
+                return result;
             }
+            matched_route = strategy;
         }
     }
+    if (matched_route == nullptr) {
+        result.ec = EC_BADARGS;
+        result.message = "migration route not configured: " + src_name + " -> " + dst_name;
+        return result;
+    }
+    const int64_t mark_timeout_ms = matched_route->methods().mark().timeout_ms();
 
     // 前置通过 → 委派编排。meta_indexer 已取得并校验，直接传入避免二次查找。
     const auto domain = migration_manager_->MigrateCache(request_context,
@@ -1628,10 +1623,13 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
                                                          explicit_block_keys,
                                                          sample_count,
                                                          copy_max_concurrency,
-                                                         mark_timeout_ms);
+                                                         mark_timeout_ms,
+                                                         matched_route->retention(),
+                                                         matched_route->admission());
     result.ec = domain.ec;
     result.accepted = domain.accepted;
     result.rejected = domain.rejected;
+    result.outcome_counts = domain.outcome_counts;
     result.message = domain.message;
     return result;
 }

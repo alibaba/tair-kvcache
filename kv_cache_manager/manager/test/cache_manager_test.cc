@@ -9458,6 +9458,7 @@ TEST_F(CacheManagerTest, TestMigrationTargetsRespectGroupQuota) {
     request.src_storage_name = "hot_01";
     request.dst_storage_name = "cold_01";
     request.src_specs = {LocationSpec("tp0", "dummy://hot_01/source?size=1")};
+    request.src_create_time = 1;
     const auto results = cache_manager_->migration_manager()->BatchSubmit("target-quota", {request});
     ASSERT_EQ(1u, results.size());
     EXPECT_EQ(EC_NOSPC, results[0]);
@@ -10094,7 +10095,7 @@ TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
     EXPECT_LE(marks[0].deadline_ms, after_deadline);
 }
 
-TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
+TEST_F(CacheManagerTest, TestAdminMarkRejectsUnmatchedTargetRoute) {
     EnableTieredMigrationStrategy("default", "hot_01", "cold_01", 3000);
     cache_manager_->StartMigrationManager();
     ASSERT_TRUE(RegisterDummyStorage("cold_02"));
@@ -10120,7 +10121,6 @@ TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
     ASSERT_EQ(EC_OK,
               meta_searcher->BatchUpdateLocationStatus(request_context_.get(), {1}, status_tasks, status_results));
 
-    const auto before = std::chrono::system_clock::now();
     const auto result = cache_manager_->MigrateCache(request_context_.get(),
                                                      "admin-mark-unmatched-target",
                                                      "admin_mark_unmatched_target",
@@ -10130,9 +10130,8 @@ TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
                                                      true,
                                                      {1},
                                                      0);
-    const auto after = std::chrono::system_clock::now();
-    ASSERT_EQ(EC_OK, result.ec);
-    ASSERT_EQ(1, result.accepted);
+    ASSERT_EQ(EC_BADARGS, result.ec);
+    ASSERT_EQ(0, result.accepted);
     ASSERT_EQ(0, result.rejected);
 
     std::vector<MigrationManager::MarkQueryResult> marks;
@@ -10140,16 +10139,7 @@ TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
         EC_OK,
         cache_manager_->migration_manager()->BatchGetTieredWriteTargets("admin_mark_unmatched_target", {1}, marks));
     ASSERT_EQ(1u, marks.size());
-    ASSERT_TRUE(marks[0].HasValidMark());
-    EXPECT_EQ("cold_02", marks[0].target);
-    const auto before_deadline =
-        std::chrono::duration_cast<std::chrono::milliseconds>(before.time_since_epoch()).count() +
-        MigrationMarkMethod::kDefaultTimeoutMs;
-    const auto after_deadline =
-        std::chrono::duration_cast<std::chrono::milliseconds>(after.time_since_epoch()).count() +
-        MigrationMarkMethod::kDefaultTimeoutMs;
-    EXPECT_GE(marks[0].deadline_ms, before_deadline);
-    EXPECT_LE(marks[0].deadline_ms, after_deadline);
+    ASSERT_FALSE(marks[0].HasValidMark());
 }
 
 TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {

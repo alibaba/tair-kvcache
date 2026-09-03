@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,6 +45,31 @@ ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
         out_location_ids.push_back(result.location_id);
     }
     return ec;
+}
+
+int64_t OutcomeCount(const proto::admin::MigrateCacheResponse &response,
+                     proto::admin::MigrationOutcomeStage stage,
+                     proto::admin::MigrationOutcomeClass outcome_class,
+                     proto::admin::MigrationOutcomeReason reason,
+                     bool terminal) {
+    int64_t count = 0;
+    for (const auto &outcome : response.outcome_counts()) {
+        if (outcome.stage() == stage && outcome.outcome_class() == outcome_class && outcome.reason() == reason &&
+            outcome.terminal() == terminal) {
+            count += outcome.count();
+        }
+    }
+    return count;
+}
+
+int64_t TerminalOutcomeCount(const proto::admin::MigrateCacheResponse &response) {
+    int64_t count = 0;
+    for (const auto &outcome : response.outcome_counts()) {
+        if (outcome.terminal()) {
+            count += outcome.count();
+        }
+    }
+    return count;
 }
 } // namespace
 
@@ -251,6 +277,24 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopy) {
     ASSERT_EQ(proto::admin::OK, resp.header().status().code());
     ASSERT_EQ(2, resp.accepted());
     ASSERT_EQ(1, resp.rejected());
+    ASSERT_EQ(3, TerminalOutcomeCount(resp));
+    ASSERT_EQ(2,
+              OutcomeCount(resp,
+                           proto::admin::MIGRATION_OUTCOME_STAGE_COPY,
+                           proto::admin::MIGRATION_OUTCOME_CLASS_ACCEPTED,
+                           proto::admin::MIGRATION_OUTCOME_REASON_COPY_SUBMITTED,
+                           true));
+    ASSERT_EQ(1,
+              OutcomeCount(resp,
+                           proto::admin::MIGRATION_OUTCOME_STAGE_SNAPSHOT,
+                           proto::admin::MIGRATION_OUTCOME_CLASS_REJECTED,
+                           proto::admin::MIGRATION_OUTCOME_REASON_SOURCE_NOT_FOUND,
+                           true));
+    ASSERT_EQ(32u,
+              metrics_registry_
+                  ->GetCounter("migration_copy_planned_bytes_total",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}, {"decision", "dispatched"}})
+                  .Get());
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 101));
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 102));
     ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 103));
@@ -336,6 +380,18 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     SeedServingSource(141);
     SeedServingSource(142);
 
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    ASSERT_NE(nullptr, indexer);
+    MetaSearcher meta_searcher(indexer);
+    RequestContext source_context("admin_reclaimer_source_snapshot");
+    std::vector<CacheLocationMap> source_maps;
+    BlockMask source_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&source_context, {142}, source_mask, source_maps));
+    ASSERT_EQ(1u, source_maps.size());
+    ASSERT_EQ(1u, source_maps[0].size());
+    const auto reclaimer_source = source_maps[0].begin()->second;
+    ASSERT_NE(nullptr, reclaimer_source);
+
     auto admin_req = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {141});
     proto::admin::MigrateCacheResponse admin_resp;
 
@@ -345,10 +401,11 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     reclaimer_req.instance_group_name = "default";
     reclaimer_req.instance_id = kInstance;
     reclaimer_req.block_key = 142;
-    reclaimer_req.src_location_id = "reclaimer_src_142";
+    reclaimer_req.src_location_id = reclaimer_source->id();
     reclaimer_req.src_storage_name = "hot_01";
     reclaimer_req.dst_storage_name = "cold_01";
-    reclaimer_req.src_specs = {LocationSpec("tp0", "dummy://hot_01/reclaimer_142?size=16")};
+    reclaimer_req.src_specs = reclaimer_source->location_specs();
+    reclaimer_req.src_create_time = reclaimer_source->create_time();
 
     std::vector<ErrorCode> reclaimer_results;
     std::atomic<int> ready{0};
@@ -428,6 +485,31 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMark) {
     ASSERT_EQ("cold_01", cache_manager_->migration_manager()->GetTieredWriteTarget(kInstance, 201));
 }
 
+TEST_F(AdminServiceImplTest, TestRepeatedMarkReturnsNoopOutcomeWithoutRenewing) {
+    SeedServingSource(204);
+
+    auto request_context = std::make_shared<RequestContext>("mark_noop_outcome");
+    auto request = MakeReq(proto::admin::MIGRATION_METHOD_MARK, {204});
+    proto::admin::MigrateCacheResponse first;
+    admin_->MigrateCache(request_context.get(), &request, &first);
+    ASSERT_EQ(proto::admin::OK, first.header().status().code());
+    ASSERT_EQ(1, first.accepted());
+    ASSERT_EQ(1, TerminalOutcomeCount(first));
+
+    proto::admin::MigrateCacheResponse second;
+    admin_->MigrateCache(request_context.get(), &request, &second);
+    ASSERT_EQ(proto::admin::OK, second.header().status().code());
+    ASSERT_EQ(0, second.accepted());
+    ASSERT_EQ(1, second.rejected()); // legacy projection keeps not-dispatched semantics
+    ASSERT_EQ(1, TerminalOutcomeCount(second));
+    ASSERT_EQ(1,
+              OutcomeCount(second,
+                           proto::admin::MIGRATION_OUTCOME_STAGE_MARK,
+                           proto::admin::MIGRATION_OUTCOME_CLASS_NOOP_ALREADY_SATISFIED,
+                           proto::admin::MIGRATION_OUTCOME_REASON_MARK_ALREADY_SAME_TARGET,
+                           true));
+}
+
 TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMarkCountsUniqueBlocks) {
     SeedServingSource(211);
     SeedServingSource(212);
@@ -478,8 +560,9 @@ TEST_F(AdminServiceImplTest, TestBothRejectedWhenNoMigrationStrategy) {
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 811));
 }
 
-// COPY-only 不创建 mark，无需 strategy；即使 group 无 strategy 也应正常工作（证明拒绝只作用于 do_mark）。
-TEST_F(AdminServiceImplTest, TestCopyAllowedWithoutMigrationStrategy) {
+// 所有下沉路径（包括 COPY-only）都必须精确命中 route，不允许以缺省
+// DISABLED 绕过路由配置和准入。
+TEST_F(AdminServiceImplTest, TestCopyRejectedWithoutMigrationStrategy) {
     SetDefaultMigrationStrategy(false);
     SeedServingSource(821);
 
@@ -488,9 +571,53 @@ TEST_F(AdminServiceImplTest, TestCopyAllowedWithoutMigrationStrategy) {
     proto::admin::MigrateCacheResponse resp;
     admin_->MigrateCache(rc.get(), &req, &resp);
 
-    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
-    ASSERT_EQ(1, resp.accepted());
-    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 821));
+    ASSERT_EQ(proto::admin::INVALID_ARGUMENT, resp.header().status().code());
+    ASSERT_EQ(0, resp.accepted());
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 821));
+}
+
+TEST_F(AdminServiceImplTest, TestAdminMethodComesFromRequestAfterRouteMatch) {
+    auto cache_config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    ASSERT_EQ(1u, cache_config->migration_strategies().size());
+    auto route = cache_config->migration_strategies().front();
+    ASSERT_NE(nullptr, route);
+    MigrationMethods reclaimer_methods;
+    reclaimer_methods.mutable_copy().set_enabled(false);
+    reclaimer_methods.mutable_mark().set_enabled(true);
+    route->set_methods(reclaimer_methods);
+
+    SeedServingSource(822);
+    auto request_context = std::make_shared<RequestContext>("admin_request_method");
+    auto request = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {822});
+    proto::admin::MigrateCacheResponse response;
+    admin_->MigrateCache(request_context.get(), &request, &response);
+
+    // Route methods control automatic Reclaimer dispatch.  Once Admin has
+    // matched an exact route, its explicit request method remains authoritative.
+    ASSERT_EQ(proto::admin::OK, response.header().status().code());
+    ASSERT_EQ(1, response.accepted());
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 822));
+}
+
+TEST_F(AdminServiceImplTest, TestAdminCopyUsesMatchedRouteRetention) {
+    auto cache_config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    ASSERT_EQ(1u, cache_config->migration_strategies().size());
+    auto route = cache_config->migration_strategies().front();
+    ASSERT_NE(nullptr, route);
+    route->set_retention(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH);
+
+    SeedServingSource(823);
+    auto request_context = std::make_shared<RequestContext>("admin_route_retention");
+    auto request = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {823});
+    proto::admin::MigrateCacheResponse response;
+    admin_->MigrateCache(request_context.get(), &request, &response);
+
+    ASSERT_EQ(proto::admin::OK, response.header().status().code());
+    ASSERT_EQ(1, response.accepted());
+    auto manager = cache_manager_->migration_manager();
+    std::lock_guard<std::mutex> lock(manager->task_mutex_);
+    ASSERT_EQ(MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH,
+              manager->active_tasks_by_instance_.at(kInstance).at(823).retention);
 }
 
 TEST_F(AdminServiceImplTest, TestExplicitBlockKeysBothPrefersCopy) {

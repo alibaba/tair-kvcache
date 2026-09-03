@@ -125,7 +125,8 @@ public:
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
-                               std::vector<AddLocationResult> &out_results);
+                               std::vector<AddLocationResult> &out_results,
+                               bool maintenance_no_touch = false);
     struct AddLocationRollbackPlan {
         // Confirmed-successful items (EC_OK + non-empty location id). The
         // caller submits these to the standard location delete pipeline.
@@ -321,12 +322,17 @@ public:
         // This closes the gap between a cleanup scan and its status CAS when
         // a stable location id is refreshed by a newer snapshot.
         std::string expected_location_value;
+        // Optional generation checked in the same metadata RMW as the status
+        // transition. Zero is a valid legacy generation, so absence must be
+        // represented separately instead of using zero as a sentinel.
+        std::optional<int64_t> expected_create_time;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results,
-                                     bool refresh_cache_from_persistent = false);
+                                     bool refresh_cache_from_persistent = false,
+                                     bool maintenance_no_touch = false);
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;

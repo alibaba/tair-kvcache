@@ -130,7 +130,7 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                 group_byte_size += byte_size;
                 const int64_t oldest_access_time = meta_indexer->GetOldestAccessTime();
                 int64_t max_lru_age_us = 0;
-                if (oldest_access_time < INT64_MAX) {
+                if (oldest_access_time > 0 && oldest_access_time < INT64_MAX) {
                     max_lru_age_us = TimestampUtil::GetCurrentTimeUs() - oldest_access_time;
                 }
                 auto write_stats = meta_indexer->GetAsyncWriteStats();

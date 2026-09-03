@@ -47,7 +47,9 @@ public:
     // ----- Write APIs -----
     // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
-    std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  BatchMetaData &batch,
+                                  MetaAccessIntent intent = MetaAccessIntent::kBusinessWrite) noexcept;
     std::vector<ErrorCode> UpsertSingleLocations(RequestContext *request_context,
                                                  const KeyVector &keys,
                                                  const LocationIdRefVector &location_ids,
@@ -139,6 +141,17 @@ public:
                                          const KeyVector &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyVector &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept;
+    MaintenanceReadResult GetForMaintenance(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const std::vector<std::string> &field_names,
+                                            CacheLocationMapVector &out_locations,
+                                            PropertyMapVector &out_properties) noexcept;
+    MaintenancePropertyCapability
+    GetMaintenancePropertyCapability(const std::string &property_name) const noexcept;
     std::vector<ErrorCode>
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 

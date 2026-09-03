@@ -182,10 +182,18 @@ std::vector<ErrorCode> MetaDummyBackend::Put(RequestContext * /*request_context*
     return results;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext *request_context,
                                                 const KeyTypeVec &keys,
                                                 const CacheLocationMapVector &locations,
                                                 const PropertyMapVector &properties) noexcept {
+    return Upsert(request_context, keys, locations, properties, MetaAccessIntent::kBusinessWrite);
+}
+
+std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties,
+                                                MetaAccessIntent intent) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -196,13 +204,17 @@ std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_conte
             for (const auto &[prop_name, prop_value] : properties[i]) {
                 existing.properties[prop_name] = prop_value;
             }
-            existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            if (intent != MetaAccessIntent::kMaintenanceNoTouch) {
+                existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            }
         });
         if (!found) {
             DummyItem item;
             item.locations = locations[i];
             item.properties = properties[i];
-            item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            if (intent != MetaAccessIntent::kMaintenanceNoTouch) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            }
             table_.Upsert(keys[i], std::move(item));
         }
     }
@@ -321,6 +333,29 @@ std::vector<std::vector<ErrorCode>> MetaDummyBackend::GetLocations(RequestContex
     return results;
 }
 
+std::vector<std::vector<ErrorCode>> MetaDummyBackend::GetLocationsForMaintenance(
+    RequestContext * /*request_context*/,
+    const KeyTypeVec &keys,
+    const LocationIdsPerKey &location_ids,
+    LocationsPerKey &out_locations) noexcept {
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.assign(keys.size(), CacheLocationVector{});
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i].assign(location_ids[i].size(), EC_NOENT);
+        out_locations[i].resize(location_ids[i].size());
+        table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            for (size_t j = 0; j < location_ids[i].size(); ++j) {
+                const auto location = item.locations.find(location_ids[i][j]);
+                if (location != item.locations.end()) {
+                    out_locations[i][j] = location->second;
+                    results[i][j] = EC_OK;
+                }
+            }
+        });
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaDummyBackend::GetLocationIds(RequestContext * /*request_context*/,
                                                         const KeyTypeVec &keys,
                                                         LocationIdsPerKey &out_location_ids) noexcept {
@@ -378,6 +413,56 @@ std::vector<ErrorCode> MetaDummyBackend::GetProperties(RequestContext * /*reques
         }
     }
     return results;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::GetPropertiesForMaintenance(
+    RequestContext * /*request_context*/,
+    const KeyTypeVec &keys,
+    const std::vector<std::string> &field_names,
+    PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_properties.assign(keys.size(), PropertyMap{});
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            for (const auto &field_name : field_names) {
+                if (const auto property = item.properties.find(field_name); property != item.properties.end()) {
+                    out_properties[i].emplace(property->first, property->second);
+                }
+            }
+        });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
+}
+
+MaintenanceReadResult MetaDummyBackend::GetForMaintenance(
+    RequestContext * /*request_context*/,
+    const KeyTypeVec &keys,
+    const std::vector<std::string> &field_names,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    MaintenanceReadResult result;
+    result.location_error_codes.assign(keys.size(), EC_OK);
+    result.property_error_codes.assign(keys.size(), EC_OK);
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    out_properties.assign(keys.size(), PropertyMap{});
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            out_locations[i] = item.locations;
+            for (const auto &field_name : field_names) {
+                if (const auto property = item.properties.find(field_name); property != item.properties.end()) {
+                    out_properties[i].emplace(property->first, property->second);
+                }
+            }
+        });
+        if (!found) {
+            result.location_error_codes[i] = EC_NOENT;
+            result.property_error_codes[i] = EC_NOENT;
+        }
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

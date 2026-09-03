@@ -80,8 +80,107 @@ kv_cache_manager::RequestContext::JsonFragment BuildProtoMessageDebugJson(const 
     } while (0)
 
 namespace {
+namespace proto = kv_cache_manager::proto;
+using kv_cache_manager::MigrationOutcomeClass;
+using kv_cache_manager::MigrationOutcomeReason;
+using kv_cache_manager::MigrationOutcomeStage;
+
 kv_cache_manager::proto::admin::ErrorCode ToAdminPbError(kv_cache_manager::ErrorCode ec) {
     return kv_cache_manager::ToPbError<kv_cache_manager::proto::admin::ErrorCode>(ec);
+}
+
+proto::admin::MigrationOutcomeStage ToPbMigrationOutcomeStage(MigrationOutcomeStage stage) {
+    switch (stage) {
+    case MigrationOutcomeStage::kSnapshot:
+        return proto::admin::MIGRATION_OUTCOME_STAGE_SNAPSHOT;
+    case MigrationOutcomeStage::kValue:
+        return proto::admin::MIGRATION_OUTCOME_STAGE_VALUE;
+    case MigrationOutcomeStage::kExecution:
+        return proto::admin::MIGRATION_OUTCOME_STAGE_EXECUTION;
+    case MigrationOutcomeStage::kCopy:
+        return proto::admin::MIGRATION_OUTCOME_STAGE_COPY;
+    case MigrationOutcomeStage::kMark:
+        return proto::admin::MIGRATION_OUTCOME_STAGE_MARK;
+    }
+    return proto::admin::MIGRATION_OUTCOME_STAGE_UNSPECIFIED;
+}
+
+proto::admin::MigrationOutcomeClass ToPbMigrationOutcomeClass(MigrationOutcomeClass outcome_class) {
+    switch (outcome_class) {
+    case MigrationOutcomeClass::kAccepted:
+        return proto::admin::MIGRATION_OUTCOME_CLASS_ACCEPTED;
+    case MigrationOutcomeClass::kRejected:
+        return proto::admin::MIGRATION_OUTCOME_CLASS_REJECTED;
+    case MigrationOutcomeClass::kNoopAlreadySatisfied:
+        return proto::admin::MIGRATION_OUTCOME_CLASS_NOOP_ALREADY_SATISFIED;
+    case MigrationOutcomeClass::kFailed:
+        return proto::admin::MIGRATION_OUTCOME_CLASS_FAILED;
+    }
+    return proto::admin::MIGRATION_OUTCOME_CLASS_UNSPECIFIED;
+}
+
+proto::admin::MigrationOutcomeReason ToPbMigrationOutcomeReason(MigrationOutcomeReason reason) {
+    switch (reason) {
+    case MigrationOutcomeReason::kUnspecified:
+        return proto::admin::MIGRATION_OUTCOME_REASON_UNSPECIFIED;
+    case MigrationOutcomeReason::kNotRecent:
+        return proto::admin::MIGRATION_OUTCOME_REASON_NOT_RECENT;
+    case MigrationOutcomeReason::kFeatureMissing:
+        return proto::admin::MIGRATION_OUTCOME_REASON_FEATURE_MISSING;
+    case MigrationOutcomeReason::kFeatureInvalid:
+        return proto::admin::MIGRATION_OUTCOME_REASON_FEATURE_INVALID;
+    case MigrationOutcomeReason::kFeatureUnsupported:
+        return proto::admin::MIGRATION_OUTCOME_REASON_FEATURE_UNSUPPORTED;
+    case MigrationOutcomeReason::kFeatureReadError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_FEATURE_READ_ERROR;
+    case MigrationOutcomeReason::kRouteNotReady:
+        return proto::admin::MIGRATION_OUTCOME_REASON_ROUTE_NOT_READY;
+    case MigrationOutcomeReason::kLocationReadError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_LOCATION_READ_ERROR;
+    case MigrationOutcomeReason::kSnapshotShapeError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_SNAPSHOT_SHAPE_ERROR;
+    case MigrationOutcomeReason::kSourceNotFound:
+        return proto::admin::MIGRATION_OUTCOME_REASON_SOURCE_NOT_FOUND;
+    case MigrationOutcomeReason::kTargetAlreadyCovered:
+        return proto::admin::MIGRATION_OUTCOME_REASON_TARGET_ALREADY_COVERED;
+    case MigrationOutcomeReason::kAlreadyMigrating:
+        return proto::admin::MIGRATION_OUTCOME_REASON_ALREADY_MIGRATING;
+    case MigrationOutcomeReason::kTargetRejected:
+        return proto::admin::MIGRATION_OUTCOME_REASON_TARGET_REJECTED;
+    case MigrationOutcomeReason::kSourceRecheckFailed:
+        return proto::admin::MIGRATION_OUTCOME_REASON_SOURCE_RECHECK_FAILED;
+    case MigrationOutcomeReason::kCopySubmitted:
+        return proto::admin::MIGRATION_OUTCOME_REASON_COPY_SUBMITTED;
+    case MigrationOutcomeReason::kCopySubmitFailed:
+        return proto::admin::MIGRATION_OUTCOME_REASON_COPY_SUBMIT_FAILED;
+    case MigrationOutcomeReason::kMarkInserted:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_INSERTED;
+    case MigrationOutcomeReason::kMarkAlreadySameTarget:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_ALREADY_SAME_TARGET;
+    case MigrationOutcomeReason::kMarkConflictDifferentTarget:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_CONFLICT_DIFFERENT_TARGET;
+    case MigrationOutcomeReason::kMarkMalformed:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_MALFORMED;
+    case MigrationOutcomeReason::kBlockNotFound:
+        return proto::admin::MIGRATION_OUTCOME_REASON_BLOCK_NOT_FOUND;
+    case MigrationOutcomeReason::kMarkReadError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_READ_ERROR;
+    case MigrationOutcomeReason::kMarkWriteError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_MARK_WRITE_ERROR;
+    case MigrationOutcomeReason::kPolicyContractError:
+        return proto::admin::MIGRATION_OUTCOME_REASON_POLICY_CONTRACT_ERROR;
+    case MigrationOutcomeReason::kBudgetExhausted:
+        return proto::admin::MIGRATION_OUTCOME_REASON_BUDGET_EXHAUSTED;
+    case MigrationOutcomeReason::kValueAccepted:
+        return proto::admin::MIGRATION_OUTCOME_REASON_VALUE_ACCEPTED;
+    case MigrationOutcomeReason::kNoExecutionMethod:
+        return proto::admin::MIGRATION_OUTCOME_REASON_NO_EXECUTION_METHOD;
+    case MigrationOutcomeReason::kCopySlotExhausted:
+        return proto::admin::MIGRATION_OUTCOME_REASON_COPY_SLOT_EXHAUSTED;
+    case MigrationOutcomeReason::kDispatchNotAvailable:
+        return proto::admin::MIGRATION_OUTCOME_REASON_DISPATCH_NOT_AVAILABLE;
+    }
+    return proto::admin::MIGRATION_OUTCOME_REASON_UNSPECIFIED;
 }
 
 bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::RegistryManager> &registry_manager,
@@ -607,6 +706,14 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
 
     response->set_accepted(result.accepted);
     response->set_rejected(result.rejected);
+    for (const auto &outcome : result.outcome_counts) {
+        auto *pb_outcome = response->add_outcome_counts();
+        pb_outcome->set_stage(ToPbMigrationOutcomeStage(outcome.stage));
+        pb_outcome->set_outcome_class(ToPbMigrationOutcomeClass(outcome.outcome_class));
+        pb_outcome->set_reason(ToPbMigrationOutcomeReason(outcome.reason));
+        pb_outcome->set_count(outcome.count);
+        pb_outcome->set_terminal(outcome.terminal);
+    }
     status->set_code(result.ec == EC_OK ? proto::admin::OK : ToAdminPbError(result.ec));
     status->set_message(result.message);
     request_context->set_status_code(status->code());

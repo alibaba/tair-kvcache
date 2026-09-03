@@ -21,6 +21,7 @@
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/migration_outcome.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
@@ -195,6 +196,7 @@ public:
         ErrorCode ec = EC_OK;
         int64_t accepted = 0;
         int64_t rejected = 0;
+        MigrationOutcomeCounts outcome_counts;
         std::string message;
     };
     // do_copy/do_mark 由 method 翻译而来；explicit_block_keys 非空则优先，否则按 sample_count 采样。

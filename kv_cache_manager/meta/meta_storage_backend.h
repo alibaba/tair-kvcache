@@ -81,6 +81,16 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
+    // Intent-aware counterpart used by shared RMW code. Backends without
+    // process-local access bookkeeping can safely reuse ordinary Upsert.
+    virtual std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector &locations,
+                                          const PropertyMapVector &properties,
+                                          MetaAccessIntent /*intent*/) noexcept {
+        return Upsert(request_context, keys, locations, properties);
+    }
+
     // Allocation-light one-location upsert used by pure-local targeted RMW.
     // The default adapter preserves backend semantics; local memory overrides
     // it to avoid constructing one temporary unordered_map per key.
@@ -377,6 +387,26 @@ public:
                                                  const KeyTypeVec &keys,
                                                  const std::vector<std::string> &field_names,
                                                  PropertyMapVector &out_properties) noexcept = 0;
+
+    virtual std::vector<ErrorCode>
+    GetPropertiesForMaintenance(RequestContext *request_context,
+                                const KeyTypeVec &keys,
+                                const std::vector<std::string> &field_names,
+                                PropertyMapVector &out_properties) noexcept {
+        return GetProperties(request_context, keys, field_names, out_properties);
+    }
+
+    virtual MaintenanceReadResult GetForMaintenance(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const std::vector<std::string> &field_names,
+                                                     CacheLocationMapVector &out_locations,
+                                                     PropertyMapVector &out_properties) noexcept {
+        MaintenanceReadResult result;
+        result.location_error_codes = GetLocations(request_context, keys, out_locations);
+        result.property_error_codes =
+            GetPropertiesForMaintenance(request_context, keys, field_names, out_properties);
+        return result;
+    }
 
     // 检查 key 是否存在。
     // @param request_context   请求上下文；可为 nullptr

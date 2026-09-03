@@ -4,6 +4,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -196,6 +197,90 @@ MetaIndexer::Result GetProperties_stub(void * /*obj*/,
 }
 } // namespace mark_query_result_stub
 
+namespace admission_dispatch_stub {
+MaintenancePropertyReadiness g_readiness;
+std::map<int64_t, CacheLocationMap> g_locations;
+std::map<int64_t, PropertyMap> g_properties;
+std::map<int64_t, ErrorCode> g_location_errors;
+std::map<int64_t, ErrorCode> g_property_errors;
+int g_snapshot_calls = 0;
+
+void Reset() {
+    g_readiness = {MaintenancePropertyCapability::kDurableAcrossRecovery, 0, 1};
+    g_locations.clear();
+    g_properties.clear();
+    g_location_errors.clear();
+    g_property_errors.clear();
+    g_snapshot_calls = 0;
+}
+
+MaintenancePropertyReadiness GetReadiness_stub(void * /*obj*/, const std::string & /*property_name*/) noexcept {
+    return g_readiness;
+}
+
+MetaIndexer::MaintenanceGetResult GetForMaintenance_stub(
+    void * /*obj*/,
+    RequestContext * /*request_context*/,
+    const KeyVector &keys,
+    const std::vector<std::string> & /*property_names*/,
+    CacheLocationMapVector &out_locations,
+    PropertyMapVector &out_properties) noexcept {
+    ++g_snapshot_calls;
+    out_locations.clear();
+    out_properties.clear();
+    out_locations.reserve(keys.size());
+    out_properties.reserve(keys.size());
+    MetaIndexer::MaintenanceGetResult result(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto location = g_locations.find(keys[i]);
+        out_locations.push_back(location == g_locations.end() ? CacheLocationMap{} : location->second);
+        const auto property = g_properties.find(keys[i]);
+        out_properties.push_back(property == g_properties.end() ? PropertyMap{} : property->second);
+        if (const auto error = g_location_errors.find(keys[i]); error != g_location_errors.end()) {
+            result.locations.error_codes[i] = error->second;
+        }
+        if (const auto error = g_property_errors.find(keys[i]); error != g_property_errors.end()) {
+            result.properties.error_codes[i] = error->second;
+        }
+    }
+    return result;
+}
+} // namespace admission_dispatch_stub
+
+MigrationAdmissionConfig RecentAccessAdmission(MigrationAdmissionMode mode, int64_t window_seconds) {
+    MigrationAdmissionConfig config;
+    config.set_mode(mode);
+    auto policy = std::make_shared<MigrationAdmissionPolicyConfig>();
+    policy->set_recent_access(std::make_shared<RecentAccessAdmissionConfig>(window_seconds));
+    config.set_policies({policy});
+    return config;
+}
+
+int64_t OutcomeCount(const MigrationManager::DispatchBatchResult &result,
+                     MigrationOutcomeStage stage,
+                     MigrationOutcomeClass outcome_class,
+                     MigrationOutcomeReason reason,
+                     bool terminal) {
+    int64_t count = 0;
+    for (const auto &outcome : result.outcome_counts) {
+        if (outcome.stage == stage && outcome.outcome_class == outcome_class && outcome.reason == reason &&
+            outcome.terminal == terminal) {
+            count += outcome.count;
+        }
+    }
+    return count;
+}
+
+int64_t TerminalOutcomeCount(const MigrationManager::DispatchBatchResult &result) {
+    int64_t count = 0;
+    for (const auto &outcome : result.outcome_counts) {
+        if (outcome.terminal) {
+            count += outcome.count;
+        }
+    }
+    return count;
+}
+
 namespace preparing_reservation_stub {
 MigrationManager *g_manager = nullptr;
 std::vector<std::pair<std::string, int64_t>> g_expected_reservations;
@@ -267,6 +352,23 @@ MetaIndexer::Result ReadModifyWriteBlockFail_stub(void * /*obj*/,
                                                   const BlockIdsOnlyModifierFunc & /*modifier*/) noexcept {
     MetaIndexer::Result result(EC_ERROR);
     result.error_codes.assign(keys.size(), EC_ERROR);
+    return result;
+}
+
+MetaIndexer::Result ReadModifyWriteBlockPartial_stub(void * /*obj*/,
+                                                     RequestContext * /*rc*/,
+                                                     const KeyVector &keys,
+                                                     const BlockIdsOnlyModifierFunc &modifier) noexcept {
+    MetaIndexer::Result result(keys.size() > 1 ? EC_PARTIAL_OK : EC_OK);
+    result.error_codes.assign(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        PropertyMap properties;
+        CacheLocationMap new_locations;
+        static_cast<void>(modifier({"source_location"}, EC_OK, i, properties, new_locations));
+    }
+    if (keys.size() > 1) {
+        result.error_codes[1] = EC_NOSPC;
+    }
     return result;
 }
 
@@ -479,6 +581,40 @@ public:
         return (it == maps[0].end()) ? nullptr : it->second;
     }
 
+    void SetLocationCreateTimeForTest(int64_t block_key, const std::string &location_id, int64_t create_time) {
+        auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+        ASSERT_NE(nullptr, indexer);
+        auto modifier = [create_time](const std::vector<ErrorCode> &get_ecs,
+                                      const LocationIdVector &location_ids,
+                                      size_t /*key_index*/,
+                                      CacheLocationVector &locations,
+                                      PropertyMap & /*upsert_properties*/) -> LocationModifierResult {
+            if (get_ecs.size() != 1 || location_ids.size() != 1 || locations.size() != 1 || get_ecs[0] != EC_OK ||
+                locations[0] == nullptr) {
+                return {MA_FAIL, {EC_MISMATCH}};
+            }
+            auto replacement = std::make_shared<CacheLocation>(*locations[0]);
+            replacement->set_create_time(create_time);
+            locations[0] = std::move(replacement);
+            return {MA_OK, {EC_OK}};
+        };
+        RequestContext rc("set_location_create_time_for_test");
+        const auto result =
+            indexer->ReadModifyWriteLocationsForMaintenance(&rc, {block_key}, {{location_id}}, modifier, false);
+        ASSERT_EQ(EC_OK, result.ec);
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), result.per_location_error_codes);
+    }
+
+    CacheLocationMap GetLocationMap(int64_t block_key) {
+        auto request_context = std::make_shared<RequestContext>("get_location_map");
+        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
+        CacheLocationMapVector maps;
+        BlockMask empty_mask;
+        EXPECT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, maps));
+        EXPECT_EQ(1u, maps.size());
+        return maps.empty() ? CacheLocationMap{} : maps.front();
+    }
+
     size_t LocationCount(int64_t block_key) {
         auto rc = std::make_shared<RequestContext>("loc_count");
         MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
@@ -585,7 +721,7 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsPreservesPartialResul
         {},
     };
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -612,7 +748,7 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsReportsAllReadFailure
     mark_query_result_stub::g_per_key_ecs = {EC_ERROR, EC_ERROR};
     mark_query_result_stub::g_properties = {{}, {}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -636,7 +772,7 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsDistinguishesBlockNot
     mark_query_result_stub::g_per_key_ecs = {EC_NOENT, EC_OK};
     mark_query_result_stub::g_properties = {{}, {}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -657,7 +793,7 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsRejectsMisalignedOutp
     mark_query_result_stub::g_per_key_ecs = {EC_OK, EC_OK};
     mark_query_result_stub::g_properties = {{{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "stale"}}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     MigrationManager::MarkQueryResult stale;
@@ -719,8 +855,14 @@ TEST_F(MigrationManagerTest, TestMalformedCleanupDoesNotClearValidRefresh) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     ASSERT_FALSE(mgr.ClearTieredWriteMarkIfMatch(kInstance, 200, "cold_01", 0));
     ASSERT_EQ("cold_01", GetRawTieredWriteTarget(200));
-    // 模拟查询已拿到 malformed target 后，另一线程把它刷新成同 target 的合法 Mark。
-    ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {200}, "cold_01", 10000));
+    const auto malformed_write = mgr.MarkForTieredWriteDetailed(kInstance, {200}, "cold_01", 10000);
+    ASSERT_EQ(EC_OK, malformed_write.ec);
+    ASSERT_EQ(1u, malformed_write.outcomes.size());
+    ASSERT_EQ(MigrationManager::MarkWriteStatus::kMalformedExistingMark, malformed_write.outcomes[0].status);
+
+    // 模拟查询已拿到 malformed target 后，另一条 metadata 链路把它
+    // 修复成同 target 的合法 Mark。条件 Mark 自身不会覆盖 malformed 现状。
+    SetRawMark(200, "cold_01", std::to_string(TimestampUtil::GetCurrentTimeMs() + 10000));
     ASSERT_FALSE(mgr.ClearTieredWriteMarkIfMatchInternal(kInstance, 200, "cold_01", 0));
 
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -804,8 +946,16 @@ TEST_F(MigrationManagerTest, TestClearMarkDoesNotClobberNewerMark) {
     const auto old_deadline = snap[0].deadline_ms;
     ASSERT_GT(old_deadline, 0);
 
-    // 覆盖：打 mark B: target=cold_02（模拟新一轮迁移打了不同目标的 mark）
-    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {1}, "cold_02"));
+    // 条件 Mark 不允许新 route 覆盖已有的不同 target。
+    const auto conflict = mgr.MarkForTieredWriteDetailed(kInstance, {1}, "cold_02");
+    ASSERT_EQ(ErrorCode::EC_OK, conflict.ec);
+    ASSERT_EQ(1u, conflict.outcomes.size());
+    ASSERT_EQ(MigrationManager::MarkWriteStatus::kConflictDifferentTarget, conflict.outcomes[0].status);
+    ASSERT_EQ("cold_01", mgr.GetTieredWriteTarget(kInstance, 1));
+
+    // 模拟另一条 metadata 链路已经将 Mark 更新为 B。
+    const auto new_deadline = TimestampUtil::GetCurrentTimeMs() + 10000;
+    SetRawMark(1, "cold_02", std::to_string(new_deadline));
     ASSERT_EQ("cold_02", mgr.GetTieredWriteTarget(kInstance, 1));
 
     // 用 mark A 的快照做 match-clear → 不应匹配（当前 mark 是 B）
@@ -930,20 +1080,30 @@ TEST_F(MigrationManagerTest, TestMarkExpiresByBackgroundCleanup) {
     mgr.Stop();
 }
 
-TEST_F(MigrationManagerTest, TestExpiredCleanupDoesNotClearRefreshedMark) {
+TEST_F(MigrationManagerTest, TestSameTargetMarkDoesNotRenewDeadline) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_refresh_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_refresh_cold/"));
     CreateSourceLocation(7, "hot_01", false, "g");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    mgr.Start();
-    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {7}, "cold_01", /*timeout_ms*/ 1));
-    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {7}, "cold_01", /*timeout_ms*/ 10000));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 7));
-    ASSERT_EQ("cold_01", mgr.GetTieredWriteTarget(kInstance, 7));
-    mgr.Stop();
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {7}, "cold_01", /*timeout_ms*/ 50));
+    std::vector<MigrationManager::MarkQueryResult> before;
+    ASSERT_EQ(EC_OK, mgr.BatchGetTieredWriteTargets(kInstance, {7}, before));
+    ASSERT_EQ(1u, before.size());
+    ASSERT_TRUE(before[0].HasValidMark());
+
+    const auto duplicate = mgr.MarkForTieredWriteDetailed(kInstance, {7}, "cold_01", /*timeout_ms*/ 10000);
+    ASSERT_EQ(EC_OK, duplicate.ec);
+    ASSERT_EQ(1u, duplicate.outcomes.size());
+    ASSERT_EQ(MigrationManager::MarkWriteStatus::kAlreadySameTarget, duplicate.outcomes[0].status);
+    std::vector<MigrationManager::MarkQueryResult> after;
+    ASSERT_EQ(EC_OK, mgr.BatchGetTieredWriteTargets(kInstance, {7}, after));
+    ASSERT_EQ(before[0].deadline_ms, after[0].deadline_ms);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    ASSERT_FALSE(mgr.IsMarkedForTieredWrite(kInstance, 7));
+    ASSERT_TRUE(GetRawTieredWriteTarget(7).empty());
 }
 
 // ============ Submit 参数校验 ============
@@ -1136,7 +1296,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceLost) {
 
     int64_t block_key = 250;
     std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     mgr.DebugEnableCopySubmissionsForTest();
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1148,6 +1308,15 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceLost) {
     ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
     std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
     ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_TRUE(mgr.HasActiveCopySourceLocation(kInstance, block_key, src_loc, source->create_time()));
+    ASSERT_FALSE(mgr.HasActiveCopySourceLocation(kInstance, block_key, src_loc, source->create_time() + 1));
+    ASSERT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("migration_source_lease_conflicts_total",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}, {"deleter", "scheduled_delete"}})
+                  .Get());
 
     // Copy 字节完成后、收尾前源 location 已被其他路径删掉，目标副本应作废。
     DeleteLocationMeta(block_key, src_loc);
@@ -1162,6 +1331,16 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceLost) {
     ASSERT_EQ(1u, stats.copy_submitted);
     ASSERT_EQ(0u, stats.copy_completed);
     ASSERT_EQ(1u, stats.copy_failed);
+    ASSERT_EQ(4u,
+              metrics_registry_
+                  ->GetCounter("migration_copy_source_lost_written_bytes_total",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}})
+                  .Get());
+    ASSERT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("migration_source_lease_duration_seconds_count",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}})
+                  .Get());
 }
 
 // Submit 时 PrepareCopyTask 应记录 src_create_time。当源 location 的 create_time 与记录不匹配时
@@ -1210,15 +1389,20 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeMismatch) {
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
-// create_time=0 边界：源和 ctx 都默认 0，0==0 应视为匹配并正常 promote。
+// create_time=0 边界：模拟升级前持久化的 legacy Location。零是一个明确的旧 generation，
+// 不应被当作缺失字段或通配符。
 TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ct0_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "ct0_cold/"));
 
     int64_t block_key = 270;
-    // create_time=0(默认,不设)
     std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    // BatchAddLocation 会为新 Location 自动赋时；显式改回 0 才能真实覆盖 legacy 数据。
+    SetLocationCreateTimeForTest(block_key, src_loc, 0);
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(0, source->create_time());
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
     MigrationManager::MigrationRequest req;
@@ -1238,6 +1422,67 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
     ASSERT_EQ(1u, mgr.GetStats().copy_completed);
     ASSERT_EQ(0u, mgr.GetStats().copy_failed);
     ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
+}
+
+TEST_F(MigrationManagerTest, TestBatchSubmitAcceptsLegacyZeroSourceGeneration) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_cold/"));
+
+    const int64_t block_key = 271;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    SetLocationCreateTimeForTest(block_key, src_loc, 0);
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(0, source->create_time());
+
+    MigrationManager::MigrationRequest request;
+    request.instance_id = kInstance;
+    request.block_key = block_key;
+    request.src_location_id = src_loc;
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    request.src_specs = source->location_specs();
+    request.src_create_time = source->create_time();
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("legacy_zero_generation", {request});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+
+    mgr.OnTaskSuccess(kInstance, block_key);
+    ASSERT_EQ(1u, mgr.GetStats().copy_completed);
+    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, src_loc) == CLS_NOT_FOUND; }));
+}
+
+TEST_F(MigrationManagerTest, TestBatchSubmitDoesNotTreatZeroSourceGenerationAsWildcard) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_mismatch_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_ct0_mismatch_cold/"));
+
+    const int64_t block_key = 272;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_GT(source->create_time(), 0);
+
+    MigrationManager::MigrationRequest request;
+    request.instance_id = kInstance;
+    request.block_key = block_key;
+    request.src_location_id = src_loc;
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+    request.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    request.src_specs = source->location_specs();
+    request.src_create_time = 0;
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const auto results = mgr.BatchSubmit("zero_generation_is_exact", {request});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_MISMATCH}), results);
+    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
 }
 
 TEST_F(MigrationManagerTest, TestSubmitThenFail) {
@@ -1855,7 +2100,8 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReserva
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
     Stub stub;
-    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlock), preparing_reservation_stub::ReadModifyWriteBlockFail_stub);
+    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlockForMaintenance),
+             preparing_reservation_stub::ReadModifyWriteBlockFail_stub);
 
     const auto results = mgr.BatchSubmit("batch_add_location_failure", {req});
     ASSERT_EQ(1u, results.size());
@@ -1872,31 +2118,27 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_partial_add_cold/"));
 
-    auto indexer = meta_manager_->GetMetaIndexer(kInstance);
-    ASSERT_NE(nullptr, indexer);
-    indexer->batch_key_size_ = 1;
-    indexer->max_key_count_ = 1;
-
-    std::vector<int64_t> block_keys{814, 815};
-    // batch_key_size is a soft limit: every key in one mutex shard remains
-    // in the same batch. Select two shards using this indexer's runtime hash
-    // seed so max_key_count=1 deterministically exercises one successful
-    // batch followed by one capacity failure.
-    while (indexer->GetMutexShardIndex(block_keys[0]) == indexer->GetMutexShardIndex(block_keys[1])) {
-        ++block_keys[1];
-    }
+    const std::vector<int64_t> block_keys{814, 815};
     auto make_request = [&](int64_t block_key) {
+        const auto src_location_id = CreateSourceLocation(block_key, "hot_01", true, "partial-add");
+        const auto src = GetLocation(block_key, src_location_id);
+        EXPECT_NE(nullptr, src);
         MigrationManager::MigrationRequest req;
         req.instance_group_name = "group_a";
         req.instance_id = kInstance;
         req.block_key = block_key;
-        req.src_location_id = "src_" + std::to_string(block_key);
+        req.src_location_id = src_location_id;
+        req.src_create_time = src == nullptr ? 0 : src->create_time();
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
-        req.src_specs = {
-            LocationSpec("TP0", "dummy://hot_01/src_" + std::to_string(block_key) + "?size=4")};
+        if (src != nullptr) {
+            req.src_specs = src->location_specs();
+        }
         return req;
     };
+
+    auto first = make_request(block_keys[0]);
+    auto second = make_request(block_keys[1]);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
     mgr.DebugEnableCopySubmissionsForTest();
@@ -1906,31 +2148,33 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     Stub stub;
     stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), preparing_reservation_stub::Delete_stub);
+    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlockForMaintenance),
+             preparing_reservation_stub::ReadModifyWriteBlockPartial_stub);
     stub.set(static_cast<preparing_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
              preparing_reservation_stub::CopySubmitPending_stub);
 
-    const auto results =
-        mgr.BatchSubmit("batch_add_location_partial", {make_request(block_keys[0]), make_request(block_keys[1])});
+    const auto results = mgr.BatchSubmit("batch_add_location_partial", {std::move(first), std::move(second)});
     ASSERT_EQ(2u, results.size());
-    ASSERT_TRUE((results[0] == EC_OK && results[1] == EC_NOSPC) ||
-                (results[1] == EC_OK && results[0] == EC_NOSPC));
+    ASSERT_EQ(EC_OK, results[0]);
+    ASSERT_EQ(EC_NOSPC, results[1]);
 
-    const std::size_t success_index = results[0] == EC_OK ? 0 : 1;
-    const std::size_t failed_index = 1 - success_index;
+    constexpr std::size_t success_index = 0;
+    constexpr std::size_t failed_index = 1;
     EXPECT_TRUE(mgr.HasMigrationTask(kInstance, block_keys[success_index]));
     EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_keys[failed_index]));
     EXPECT_EQ(1u, mgr.ActiveTaskCount());
     EXPECT_EQ(1u, preparing_reservation_stub::g_pending_copy_promises.size());
+    // Stub 只注入逐 key commit 结果，不落目标 metadata；两个 block 都保留原有源副本。
     EXPECT_EQ(1u, LocationCount(block_keys[success_index]));
-    EXPECT_EQ(0u, LocationCount(block_keys[failed_index]));
+    EXPECT_EQ(1u, LocationCount(block_keys[failed_index]));
     ASSERT_EQ(1u, preparing_reservation_stub::g_deleted_uris.size());
     EXPECT_NE(std::string::npos,
               preparing_reservation_stub::g_deleted_uris.front().ToUriString().find(
                   StringUtil::Uint64ToHex(block_keys[failed_index])));
 
-    // 统一口径：add 成功项已提交 executor（stub pending future），计入其 4 字节；
+    // 统一口径：add 成功项已提交 executor（stub pending future），计入其实际字节；
     // add 失败项（EC_NOSPC）已回滚且未提交，不计入。
-    EXPECT_EQ(4u,
+    EXPECT_EQ(std::string("partial-add").size(),
               metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
                                             {{"type", ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY)},
                                              {"unique_name", "cold_01"}})
@@ -2343,6 +2587,14 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "orphan_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "orphan_cold/"));
 
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    // 单 block,两个不同 size 的 spec → 落到两个 create_group。
+    const std::string src_location_id = CreateSourceLocation(700, "hot_01", true, "heterogeneous-source");
+    const auto src_location = GetLocation(700, src_location_id);
+    ASSERT_NE(nullptr, src_location);
+
     orphan_cleanup_stub::g_created_uris.clear();
     orphan_cleanup_stub::g_deleted_uris.clear();
     orphan_cleanup_stub::g_create_call_count = 0;
@@ -2350,14 +2602,11 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     stub.set(ADDR(DataStorageManager, Create), orphan_cleanup_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), orphan_cleanup_stub::Delete_stub);
 
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    mgr.DebugEnableCopySubmissionsForTest();
-
-    // 单 block,两个不同 size 的 spec → 落到两个 create_group。
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
     req.block_key = 700;
-    req.src_location_id = "src_700";
+    req.src_location_id = src_location_id;
+    req.src_create_time = src_location->create_time();
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
     req.src_specs = {
@@ -2401,6 +2650,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitShortCreateResultRollsBackWholeGroup
         request.instance_id = kInstance;
         request.block_key = block_key;
         request.src_location_id = src_location_id;
+        request.src_create_time = src_location->create_time();
         request.src_storage_name = "hot_01";
         request.dst_storage_name = "cold_01";
         request.src_specs = src_location->location_specs();
@@ -2445,6 +2695,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitLongCreateResultDeletesEveryReturned
         request.instance_id = kInstance;
         request.block_key = block_key;
         request.src_location_id = src_location_id;
+        request.src_create_time = src_location->create_time();
         request.src_storage_name = "hot_01";
         request.dst_storage_name = "cold_01";
         request.src_specs = src_location->location_specs();
@@ -2697,8 +2948,14 @@ CacheLocationConstPtr MakeLocationWithSpecs(const std::string &id,
 
 } // namespace
 
-TEST_F(MigrationManagerTest, TestDispatchSkipsMarkWhenDedupQueryFails) {
+TEST_F(MigrationManagerTest, TestDispatchDoesNotDependOnTouchingMarkPrequery) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "dispatch_mark_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "dispatch_mark_cold"));
+    CreateSourceLocation(1, "hot_01", true, "payload");
+
+    // V1 的 Mark 正确性由最终条件 RMW 保证，Dispatch 不再做会 touch
+    // metadata 的预查询。即使旧 GetProperties 路径失败，也不应阻断 Mark。
     mark_query_result_stub::Reset();
     mark_query_result_stub::g_aggregate_ec = EC_ERROR;
     mark_query_result_stub::g_per_key_ecs = {EC_ERROR};
@@ -2706,21 +2963,279 @@ TEST_F(MigrationManagerTest, TestDispatchSkipsMarkWhenDedupQueryFails) {
     Stub stub;
     stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
-    CacheLocationMap loc_map;
-    auto src_loc = MakeLocation("loc_src", "hot_01", CLS_SERVING);
-    loc_map[src_loc->id()] = src_loc;
     MigrationManager::DispatchBatchParams params;
     params.do_mark = true;
-    params.dedup_marks = true;
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     mgr.DebugEnableCopySubmissionsForTest();
-    const auto result =
-        mgr.DispatchMigrationBatch("mark_query_error", kInstance, "hot_01", "cold_01", {1}, {loc_map}, params);
+    const auto result = mgr.DispatchMigrationBatch(
+        "mark_query_error", kInstance, "hot_01", "cold_01", {1}, params);
 
+    ASSERT_EQ(1, result.mark_submitted);
+    ASSERT_EQ(1u, mgr.GetStats().marks_added);
+}
+
+TEST_F(MigrationManagerTest, TestShadowFeatureFailureKeepsLegacyDispatchBehavior) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "shadow_feature_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "shadow_feature_cold"));
+    for (const int64_t block_key : {11, 12}) {
+        CreateSourceLocation(block_key, "hot_01", false, "payload");
+    }
+
+    admission_dispatch_stub::Reset();
+    for (const int64_t block_key : {11, 12}) {
+        admission_dispatch_stub::g_locations[block_key] = GetLocationMap(block_key);
+        admission_dispatch_stub::g_property_errors[block_key] = EC_ERROR;
+    }
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetMaintenancePropertyReadiness), admission_dispatch_stub::GetReadiness_stub);
+    stub.set(ADDR(MetaIndexer, GetForMaintenance), admission_dispatch_stub::GetForMaintenance_stub);
+
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.admission = RecentAccessAdmission(MigrationAdmissionMode::SHADOW, 10);
+    MigrationManager manager(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    manager.DebugEnableCopySubmissionsForTest();
+
+    const auto result =
+        manager.DispatchMigrationBatch("shadow_feature_error", kInstance, "hot_01", "cold_01", {11, 12}, params);
+
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(2, result.mark_submitted);
+    ASSERT_EQ(0, result.rejected);
+    ASSERT_EQ(0, result.failed);
+    ASSERT_EQ(2, TerminalOutcomeCount(result));
+    ASSERT_EQ(2,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kValue,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kFeatureReadError,
+                           false));
+    ASSERT_EQ(2,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kMark,
+                           MigrationOutcomeClass::kAccepted,
+                           MigrationOutcomeReason::kMarkInserted,
+                           true));
+    const MetricsTags route_tags{{"trigger", "admin"},
+                                 {"src", "hot_01"},
+                                 {"dst", "cold_01"},
+                                 {"mode", "shadow"}};
+    ASSERT_EQ(2u, metrics_registry_->GetCounter("migration_admission_candidates_total", route_tags).Get());
+    ASSERT_EQ(2u,
+              metrics_registry_
+                  ->GetCounter("migration_admission_rejected_total",
+                               {{"trigger", "admin"},
+                                {"src", "hot_01"},
+                                {"dst", "cold_01"},
+                                {"mode", "shadow"},
+                                {"reason", "feature_read_error"}})
+                  .Get());
+    ASSERT_EQ(2u,
+              metrics_registry_
+                  ->GetCounter("migration_admission_feature_status_total",
+                               {{"src", "hot_01"},
+                                {"dst", "cold_01"},
+                                {"feature", "last_access_time"},
+                                {"status", "read_error"}})
+                  .Get());
+    ASSERT_EQ(14u,
+              metrics_registry_
+                  ->GetCounter("migration_mark_eligible_source_bytes_total",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}, {"decision", "eligible"}})
+                  .Get());
+}
+
+TEST_F(MigrationManagerTest, TestEnforceFiltersValueUnknownAndNotRecentBeforeMark) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "enforce_value_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "enforce_value_cold"));
+    for (const int64_t block_key : {21, 22, 23}) {
+        CreateSourceLocation(block_key, "hot_01", false, "payload");
+    }
+
+    admission_dispatch_stub::Reset();
+    for (const int64_t block_key : {21, 22, 23}) {
+        admission_dispatch_stub::g_locations[block_key] = GetLocationMap(block_key);
+    }
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    admission_dispatch_stub::g_properties[21][PROPERTY_LRU_TIME] = std::to_string(now_us - 1000 * 1000);
+    admission_dispatch_stub::g_properties[22][PROPERTY_LRU_TIME] = std::to_string(now_us - 30 * 1000 * 1000);
+    // block 23 simulates a dual-backend hot miss: location is available from
+    // persistent metadata, while process-local LRU explicitly stays missing.
+    admission_dispatch_stub::g_property_errors[23] = EC_NOENT;
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetMaintenancePropertyReadiness), admission_dispatch_stub::GetReadiness_stub);
+    stub.set(ADDR(MetaIndexer, GetForMaintenance), admission_dispatch_stub::GetForMaintenance_stub);
+
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.admission = RecentAccessAdmission(MigrationAdmissionMode::ENFORCE, 10);
+    MigrationManager manager(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    manager.DebugEnableCopySubmissionsForTest();
+
+    const auto result =
+        manager.DispatchMigrationBatch("enforce_value", kInstance, "hot_01", "cold_01", {21, 22, 23}, params);
+
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.mark_submitted);
+    ASSERT_EQ(2, result.rejected);
+    ASSERT_EQ(3, TerminalOutcomeCount(result));
+    ASSERT_EQ(1,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kValue,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kNotRecent,
+                           true));
+    ASSERT_EQ(1,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kValue,
+                           MigrationOutcomeClass::kRejected,
+                           MigrationOutcomeReason::kFeatureMissing,
+                           true));
+    ASSERT_TRUE(manager.IsMarkedForTieredWrite(kInstance, 21));
+    ASSERT_FALSE(manager.IsMarkedForTieredWrite(kInstance, 22));
+    ASSERT_FALSE(manager.IsMarkedForTieredWrite(kInstance, 23));
+    ASSERT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("migration_admission_accepted_total",
+                               {{"trigger", "admin"},
+                                {"src", "hot_01"},
+                                {"dst", "cold_01"},
+                                {"mode", "enforce"}})
+                  .Get());
+    ASSERT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("migration_candidate_pool_total",
+                               {{"src", "hot_01"}, {"dst", "cold_01"}, {"stage", "value_qualified"}})
+                  .Get());
+    ASSERT_EQ(2u,
+              metrics_registry_
+                  ->GetCounter("migration_admission_access_age_seconds_count",
+                               {{"trigger", "admin"}, {"src", "hot_01"}, {"dst", "cold_01"}})
+                  .Get());
+}
+
+TEST_F(MigrationManagerTest, TestEnforceFeatureReadFailureReturnsInfrastructureError) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "enforce_read_error_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "enforce_read_error_cold"));
+    CreateSourceLocation(24, "hot_01", false, "payload");
+
+    admission_dispatch_stub::Reset();
+    admission_dispatch_stub::g_locations[24] = GetLocationMap(24);
+    admission_dispatch_stub::g_property_errors[24] = EC_ERROR;
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetMaintenancePropertyReadiness), admission_dispatch_stub::GetReadiness_stub);
+    stub.set(ADDR(MetaIndexer, GetForMaintenance), admission_dispatch_stub::GetForMaintenance_stub);
+
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.admission = RecentAccessAdmission(MigrationAdmissionMode::ENFORCE, 10);
+    MigrationManager manager(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    manager.DebugEnableCopySubmissionsForTest();
+
+    const auto result =
+        manager.DispatchMigrationBatch("enforce_feature_read_error", kInstance, "hot_01", "cold_01", {24}, params);
+
+    ASSERT_EQ(EC_ERROR, result.ec);
     ASSERT_EQ(0, result.mark_submitted);
-    ASSERT_EQ(0u, mgr.GetStats().marks_added);
-    ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+    ASSERT_EQ(0, result.rejected);
+    ASSERT_EQ(1, result.failed);
+    ASSERT_EQ(1, TerminalOutcomeCount(result));
+    ASSERT_EQ(1,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kSnapshot,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kFeatureReadError,
+                           true));
+    ASSERT_FALSE(manager.IsMarkedForTieredWrite(kInstance, 24));
+}
+
+TEST_F(MigrationManagerTest, TestEnforceNotReadyStopsBeforeSnapshotAndMark) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "not_ready_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "not_ready_cold"));
+    CreateSourceLocation(31, "hot_01", false, "payload");
+
+    admission_dispatch_stub::Reset();
+    admission_dispatch_stub::g_readiness = {MaintenancePropertyCapability::kProcessLocalVolatile,
+                                            TimestampUtil::GetSteadyTimeUs(),
+                                            9};
+    admission_dispatch_stub::g_locations[31] = GetLocationMap(31);
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetMaintenancePropertyReadiness), admission_dispatch_stub::GetReadiness_stub);
+    stub.set(ADDR(MetaIndexer, GetForMaintenance), admission_dispatch_stub::GetForMaintenance_stub);
+
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.admission = RecentAccessAdmission(MigrationAdmissionMode::ENFORCE, 3600);
+    MigrationManager manager(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    manager.DebugEnableCopySubmissionsForTest();
+
+    const auto result =
+        manager.DispatchMigrationBatch("enforce_not_ready", kInstance, "hot_01", "cold_01", {31}, params);
+
+    ASSERT_NE(EC_OK, result.ec);
+    ASSERT_EQ(1, result.failed);
+    ASSERT_EQ(1, TerminalOutcomeCount(result));
+    ASSERT_EQ(1,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kSnapshot,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kRouteNotReady,
+                           true));
+    ASSERT_EQ(0, admission_dispatch_stub::g_snapshot_calls);
+    ASSERT_FALSE(manager.IsMarkedForTieredWrite(kInstance, 31));
+    ASSERT_EQ(0.0,
+              metrics_registry_
+                  ->GetGauge("migration_admission_readiness",
+                             {{"instance", kInstance},
+                              {"src", "hot_01"},
+                              {"dst", "cold_01"},
+                              {"feature", "last_access_time"}})
+                  .Get());
+    ASSERT_EQ(1u,
+              metrics_registry_
+                  ->GetCounter("migration_admission_readiness_not_ready_total",
+                               {{"instance", kInstance},
+                                {"src", "hot_01"},
+                                {"dst", "cold_01"},
+                                {"feature", "last_access_time"},
+                                {"reason", "warmup"}})
+                  .Get());
+}
+
+TEST_F(MigrationManagerTest, TestMalformedShadowPolicyIsBehaviorNeutralAtRuntime) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "shadow_contract_hot"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "shadow_contract_cold"));
+    CreateSourceLocation(41, "hot_01", false, "payload");
+
+    admission_dispatch_stub::Reset();
+    admission_dispatch_stub::g_locations[41] = GetLocationMap(41);
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetForMaintenance), admission_dispatch_stub::GetForMaintenance_stub);
+
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.admission.set_mode(MigrationAdmissionMode::SHADOW); // intentionally missing leaf policy
+    MigrationManager manager(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    manager.DebugEnableCopySubmissionsForTest();
+
+    const auto result = manager.DispatchMigrationBatch(
+        "shadow_policy_contract", kInstance, "hot_01", "cold_01", {41}, params);
+
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.mark_submitted);
+    ASSERT_EQ(1, TerminalOutcomeCount(result));
+    ASSERT_EQ(1,
+              OutcomeCount(result,
+                           MigrationOutcomeStage::kValue,
+                           MigrationOutcomeClass::kFailed,
+                           MigrationOutcomeReason::kPolicyContractError,
+                           false));
 }
 
 TEST_F(MigrationManagerTest, TestCheckCopyAdmission) {
@@ -2801,6 +3316,7 @@ TEST_F(MigrationManagerTest, TestCheckCopyAdmissionAllowsPartialTarget) {
         ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, adm.status);
         ASSERT_NE(nullptr, adm.src_location);
         ASSERT_EQ("loc_src_l1", adm.src_location->id());
+        ASSERT_EQ(2u, adm.missing_specs.size());
     }
 
     {
@@ -2813,6 +3329,20 @@ TEST_F(MigrationManagerTest, TestCheckCopyAdmissionAllowsPartialTarget) {
         const auto adm = mgr.CheckCopyAdmission(kInstance, /*block_key*/ 7, loc_map, src, dst);
         ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kTargetServingExists, adm.status);
         ASSERT_EQ(nullptr, adm.src_location);
+        ASSERT_TRUE(adm.missing_specs.empty());
+    }
+
+    {
+        CacheLocationMap loc_map;
+        auto src_loc = MakeLocationWithSpecs("loc_src", src, CLS_SERVING, {"tp0", "tp1"});
+        auto dst_loc = MakeLocationWithSpecs("loc_dst", dst, CLS_SERVING, {"tp0"});
+        loc_map[src_loc->id()] = src_loc;
+        loc_map[dst_loc->id()] = dst_loc;
+
+        const auto adm = mgr.CheckCopyAdmission(kInstance, /*block_key*/ 8, loc_map, src, dst);
+        ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, adm.status);
+        ASSERT_EQ(1u, adm.missing_specs.size());
+        ASSERT_EQ("tp1", adm.missing_specs.front().name());
     }
 }
 
