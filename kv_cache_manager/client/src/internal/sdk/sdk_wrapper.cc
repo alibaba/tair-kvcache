@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <unordered_map>
 
-#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
@@ -146,8 +145,7 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
     return ER_OK;
 }
 
-ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
-                                const BlockBuffers &local_buffers) {
+ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ec;
@@ -161,16 +159,15 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris,
     // Build task vector for parallel dispatch
     std::vector<std::function<ClientErrorCode()>> tasks;
     tasks.reserve(groups.size());
-    // wrapper 等待上限 = 入口 + 静态预算；同一份预算已在 Init 时注入各后端
-    // （SdkBackendConfig::timeout_config），后端从自身任务起点自律。
-    const int64_t deadline_ms = SteadyClockMs() + wrapper_config_->timeout_config().get_timeout_ms();
-    const auto deadline = std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms));
-
     for (const auto &group : groups) {
         // Capture group by value to prevent use-after-free on timeout
         tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
     }
-    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), deadline);
+
+    // 静态预算：同一份已在 Init 时注入各后端（SdkBackendConfig::timeout_config），
+    // 后端从自身任务起点起算 deadline 并自律。
+    int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
+    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
@@ -193,9 +190,6 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     std::vector<std::shared_ptr<std::vector<DataStorageUri>>> group_results;
     tasks.reserve(groups.size());
     group_results.reserve(groups.size());
-    // 与 Get 同理：等待上限 = 入口 + 静态预算；预算已在 Init 时注入后端。
-    const int64_t deadline_ms = SteadyClockMs() + wrapper_config_->timeout_config().put_timeout_ms();
-    const auto deadline = std::chrono::steady_clock::time_point(std::chrono::milliseconds(deadline_ms));
 
     for (const auto &group : groups) {
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
@@ -206,7 +200,9 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         });
     }
 
-    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), deadline);
+    // 与 Get 同理：静态预算已在 Init 时注入后端。
+    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
     if (ec != ER_OK) {
         KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
         return ec;
@@ -275,18 +271,20 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                                   std::chrono::steady_clock::time_point deadline) const {
+                                                   int timeout_ms) const {
     if (tasks.empty()) {
         return ER_OK;
     }
 
+    // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s parallel failed, task thread pool is full", getOpTypeString(op_type).c_str());
+        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
+                      getOpTypeString(op_type).c_str());
         return ER_THREADPOOL_ERROR;
     }
 
-    const std::string op_str = getOpTypeString(op_type);
-    const auto start = std::chrono::steady_clock::now();
+    // Submit all tasks with shared stop flag
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     // stop：错误/超时路径置位后，排队中尚未被拾起的任务直接短路，不再发起新的 I/O。
     // 时间准入（now >= deadline）只覆盖"已到 deadline"的情形；普通错误往往发生在
@@ -297,7 +295,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
-        auto wrapped = [stop, deadline, task = std::move(task)]() -> ClientErrorCode {
+        auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
             if (stop->load()) {
                 return ER_SDK_TIMEOUT;
             }
@@ -310,7 +308,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             }
             return task();
         };
-        futures.push_back(wait_task_thread_pool_->async(std::move(wrapped)));
+        futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
     // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
@@ -326,12 +324,16 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
 
     for (size_t i = 0; i < futures.size(); ++i) {
         if (futures[i].wait_until(deadline) != std::future_status::ready) {
-            auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-            KVCM_LOG_WARN("run %s parallel timeout: elapsed_ms=%lld, return immediately "
-                          "(in-flight I/O may still write caller buffer)",
-                          op_str.c_str(),
-                          static_cast<long long>(elapsed_ms));
+            auto overdue_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                    .count();
+            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu), overdue_ms: %lld, "
+                          "return immediately (in-flight I/O is not cancelled and may still write caller buffer)",
+                          getOpTypeString(op_type).c_str(),
+                          timeout_ms,
+                          i + 1,
+                          futures.size(),
+                          static_cast<long long>(overdue_ms));
             drain(i + 1);
             return ER_SDK_TIMEOUT;
         }
@@ -339,7 +341,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         auto ec = futures[i].get();
         if (ec != ER_OK) {
             KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
-                          op_str.c_str(),
+                          getOpTypeString(op_type).c_str(),
                           static_cast<int>(ec));
             drain(i + 1);
             return ec;

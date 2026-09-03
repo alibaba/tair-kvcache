@@ -1,6 +1,5 @@
 #pragma once
 
-#include <chrono>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -57,7 +56,7 @@ private:
     std::string getOpTypeString(OpType op_type) const;
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
                                            std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                           std::chrono::steady_clock::time_point deadline) const;
+                                           int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);

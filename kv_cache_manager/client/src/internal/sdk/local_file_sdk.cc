@@ -159,13 +159,9 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev),
-                                false,
-                                "get cudaDevAttrHostRegisterSupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev), false, "get cudaDevAttrHostRegisterSupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev),
-                                false,
-                                "get musaDevAttrHostRegisterSupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev), false, "get musaDevAttrHostRegisterSupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -183,13 +179,9 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev),
-                                false,
-                                "get cudaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev), false, "get cudaDevAttrHostRegisterReadOnlySupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev),
-                                false,
-                                "get musaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -209,14 +201,10 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev),
-                                false,
-                                "get cudaDevAttrPageableMemoryAccess failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev), false, "get cudaDevAttrPageableMemoryAccess failed");
 #elif defined(USING_MUSA)
         // MUSA equivalent - adjust if needed
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev),
-                                false,
-                                "get musaDevAttrPageableMemoryAccess failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev), false, "get musaDevAttrPageableMemoryAccess failed");
 #endif
         if (value != 1) {
             return false;
@@ -271,7 +259,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-
+    
     // Check if GPUs support direct pageable memory access
     // If true, we can skip cudaHostRegister for mmap'd memory
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
@@ -287,7 +275,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-
+    
     // Check if GPUs support direct pageable memory access
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
     KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
@@ -297,8 +285,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
 SdkType LocalFileSdk::Type() { return SdkType::LOCAL_FILE; }
 
-ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris,
-                                  const BlockBuffers &local_buffers) {
+ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
@@ -338,9 +325,9 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
     }
     // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
     const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
-    // 保序契约：actual_remote_uris[i] 必须对应 remote_uris[i]。
-    // 先按总大小 resize，再按 BlockGroup::indices 回填原位；禁止 clear() 后 append
-    // （那会依赖 unordered_map 的迭代序，交错多 path 输入必然错位）。
+    // 预分配并按原始下标回填，保证同序契约：actual_remote_uris[i] 对应 remote_uris[i]。
+    // SplitByPath 按 path 分组后迭代顺序是不确定的（unordered_map），不能按分组
+    // 顺序 append 结果，否则交错输入（同 backend 多 path）会乱序。
     actual_remote_uris->resize(remote_uris.size());
     auto group_map = SplitByPath(remote_uris, local_buffers);
     size_t done_blocks = 0;
@@ -352,30 +339,29 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
             return ER_SDK_TIMEOUT;
         }
         std::string file_path = group.first;
+        const BlockGroup &block_group = group.second;
         std::vector<DataStorageUri> group_actual_uris;
         if (!std::filesystem::exists(file_path)) {
-            auto ec = Alloc(group.second.remote_uris, group_actual_uris);
+            auto ec = Alloc(block_group.remote_uris, group_actual_uris);
             if (ec != ER_OK) {
                 KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
                 return ER_SDKALLOC_ERROR;
             }
-            if (group_actual_uris.size() != group.second.indices.size()) {
+            if (group_actual_uris.size() != block_group.indices.size()) {
                 KVCM_LOG_ERROR("Put failed, alloc returned %zu uris but group has %zu blocks, path: %s",
                                group_actual_uris.size(),
-                               group.second.indices.size(),
+                               block_group.indices.size(),
                                file_path.c_str());
                 return ER_SDKALLOC_ERROR;
             }
         } else {
-            // 文件已存在：实际位置就是原 uri，但仍须按 indices 回填（保序契约）。
-            group_actual_uris = group.second.remote_uris;
+            group_actual_uris = block_group.remote_uris;
         }
-        // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标（下标是 block 的唯一身份）。
-        // 禁止 append 到 actual_remote_uris 末尾 —— 多 path 交错输入会错位。
-        for (size_t k = 0; k < group.second.indices.size(); ++k) {
-            (*actual_remote_uris)[group.second.indices[k]] = group_actual_uris[k];
+        // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标。
+        for (size_t k = 0; k < block_group.indices.size(); ++k) {
+            (*actual_remote_uris)[block_group.indices[k]] = group_actual_uris[k];
         }
-        auto ec = DoPut(group.second.remote_uris, group.second.local_buffers, deadline_ms);
+        auto ec = DoPut(block_group.remote_uris, block_group.local_buffers, deadline_ms);
         if (ec == ER_SDK_TIMEOUT) {
             // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通写错误）。
             return ER_SDK_TIMEOUT;
@@ -384,7 +370,7 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
             KVCM_LOG_ERROR("Put failed, DoPut failed, errorcode: %d", ec);
             return ER_SDKWRITE_ERROR;
         }
-        done_blocks += group.second.remote_uris.size();
+        done_blocks += block_group.remote_uris.size();
     }
     return ER_OK;
 }
@@ -464,8 +450,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     // If GPU supports direct pageable memory access, skip cudaHostRegister
     // This allows direct DMA transfer between GPU and mmap'd memory without pinning
     if (!support_pageable_memory_access_) {
-        auto register_ec =
-            helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
+        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
@@ -477,8 +462,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
 #elif defined(USING_MUSA)
     GpuStreamDrainGuard gpu_drain(musa_stream_, &gpu_copy_enqueued);
     if (!support_pageable_memory_access_) {
-        auto register_ec =
-            helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
+        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
