@@ -57,10 +57,15 @@ DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_counter);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_query_counter);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_query_rt_us_sum);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_context_rt_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_finalize_time_us_sum);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_parse_time_us_sum);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_callback_time_us_sum);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, response_serialize_time_us_sum);
 DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, handler_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_receive_wait_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, io_event_loop_lag_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, response_build_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, socket_write_time_us_sum);
 
 // manager metrics
 #define DEFINE_METRICS_NAME_FOR_MANAGER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, manager, name)
@@ -141,11 +146,16 @@ void ServiceMetricsCollector::RecordHttpRequestLatency(const HttpRequestLatency 
         ++http_service_query_counter_metrics_;
         http_service_query_rt_us_sum_metrics_ += latency.service_query_rt_us;
         http_request_context_rt_us_sum_metrics_ += latency.request_context_rt_us;
+        http_service_finalize_time_us_sum_metrics_ += latency.service_finalize_time_us;
     }
     http_request_parse_time_us_sum_metrics_ += latency.request_parse_time_us;
     http_service_callback_time_us_sum_metrics_ += latency.service_callback_time_us;
     http_response_serialize_time_us_sum_metrics_ += latency.response_serialize_time_us;
     http_handler_time_us_sum_metrics_ += latency.handler_time_us;
+    http_request_receive_wait_time_us_sum_metrics_ += latency.request_receive_wait_time_us;
+    http_io_event_loop_lag_us_sum_metrics_ += latency.io_event_loop_lag_us;
+    http_response_build_time_us_sum_metrics_ += latency.response_build_time_us;
+    http_socket_write_time_us_sum_metrics_ += latency.socket_write_time_us;
 }
 
 bool ServiceMetricsCollector::Init() {
@@ -167,10 +177,15 @@ bool ServiceMetricsCollector::Init() {
         REGISTER_COUNTER_METRICS_FOR_HTTP(service_query_counter);
         REGISTER_COUNTER_METRICS_FOR_HTTP(service_query_rt_us_sum);
         REGISTER_COUNTER_METRICS_FOR_HTTP(request_context_rt_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(service_finalize_time_us_sum);
         REGISTER_COUNTER_METRICS_FOR_HTTP(request_parse_time_us_sum);
         REGISTER_COUNTER_METRICS_FOR_HTTP(service_callback_time_us_sum);
         REGISTER_COUNTER_METRICS_FOR_HTTP(response_serialize_time_us_sum);
         REGISTER_COUNTER_METRICS_FOR_HTTP(handler_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(request_receive_wait_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(io_event_loop_lag_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(response_build_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(socket_write_time_us_sum);
     }
 
     // manager metrics

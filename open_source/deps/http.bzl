@@ -116,6 +116,7 @@ def http_deps():
     # yalantinglibs
     http_archive(
         name = "yalantinglibs",
+        patches = ["//patches/yalantinglibs:0001-add-http-io-metrics.patch"],
         urls = ["https://github.com/alibaba/yalantinglibs/archive/refs/tags/0.5.5.tar.gz"],
         strip_prefix = "yalantinglibs-0.5.5",
         sha256 = "7962579c1414d1ade4fd22316476723d54112c919514bf1e6015a1870e5e68f7",

@@ -1,0 +1,174 @@
+diff --git include/ylt/standalone/cinatra/coro_http_request.hpp include/ylt/standalone/cinatra/coro_http_request.hpp
+--- include/ylt/standalone/cinatra/coro_http_request.hpp
++++ include/ylt/standalone/cinatra/coro_http_request.hpp
+@@ -4,0 +5,2 @@
++#include <cstdint>
++#include <functional>
+@@ -96,0 +99,9 @@
++struct http_io_metrics {
++  std::uint64_t request_receive_wait_time_us = 0;
++  std::uint64_t io_event_loop_lag_us = 0;
++  std::uint64_t response_build_time_us = 0;
++  std::uint64_t socket_write_time_us = 0;
++};
++using http_io_metrics_callback =
++    std::function<void(const http_io_metrics &)>;
++
+@@ -141,0 +153,21 @@
++  void set_http_io_metrics(std::uint64_t request_receive_wait_time_us,
++                           std::uint64_t io_event_loop_lag_us) {
++    io_metrics_.request_receive_wait_time_us = request_receive_wait_time_us;
++    io_metrics_.io_event_loop_lag_us = io_event_loop_lag_us;
++  }
++
++  void set_http_io_metrics_callback(http_io_metrics_callback callback) {
++    io_metrics_callback_ = std::move(callback);
++  }
++
++  bool has_http_io_metrics_callback() const {
++    return static_cast<bool>(io_metrics_callback_);
++  }
++
++  void complete_http_io_metrics(std::uint64_t response_build_time_us,
++                                std::uint64_t socket_write_time_us) {
++    io_metrics_.response_build_time_us = response_build_time_us;
++    io_metrics_.socket_write_time_us = socket_write_time_us;
++    io_metrics_callback_(io_metrics_);
++  }
++
+@@ -297,0 +330,2 @@
++    io_metrics_ = {};
++    io_metrics_callback_ = {};
+@@ -310,0 +345,2 @@
++  http_io_metrics io_metrics_;
++  http_io_metrics_callback io_metrics_callback_;
+diff --git include/ylt/standalone/cinatra/coro_http_connection.hpp include/ylt/standalone/cinatra/coro_http_connection.hpp
+--- include/ylt/standalone/cinatra/coro_http_connection.hpp
++++ include/ylt/standalone/cinatra/coro_http_connection.hpp
+@@ -31,0 +32,16 @@
++namespace detail {
++inline thread_local std::uint64_t io_context_max_lag_us = 0;
++
++inline void observe_io_context_lag(std::uint64_t lag_us) {
++  if (lag_us > io_context_max_lag_us) {
++    io_context_max_lag_us = lag_us;
++  }
++}
++
++inline std::uint64_t get_io_context_lag() {
++  return io_context_max_lag_us;
++}
++
++inline void reset_io_context_lag() { io_context_max_lag_us = 0; }
++}  // namespace detail
++
+@@ -45 +61,2 @@
+-                       coro_http_router &router)
++                       coro_http_router &router,
++                       bool enable_http_io_metrics = false)
+@@ -48,0 +66 @@
++        enable_http_io_metrics_(enable_http_io_metrics),
+@@ -108,0 +127,4 @@
++      std::chrono::steady_clock::time_point request_receive_begin;
++      if (enable_http_io_metrics_) {
++        request_receive_begin = std::chrono::steady_clock::now();
++      }
+@@ -222,0 +245,9 @@
++      if (enable_http_io_metrics_) {
++        const auto receive_wait_us =
++            std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now() - request_receive_begin)
++                .count();
++        request_.set_http_io_metrics(
++            static_cast<std::uint64_t>(receive_wait_us),
++            detail::get_io_context_lag());
++      }
+@@ -316,0 +348,4 @@
++      if (request_.has_http_io_metrics_callback()) {
++        detail::reset_io_context_lag();
++      }
++
+@@ -421,0 +457,6 @@
++    const bool collect_io_metrics = request_.has_http_io_metrics_callback();
++    std::chrono::steady_clock::time_point response_build_begin;
++    std::chrono::steady_clock::time_point socket_write_begin;
++    if (collect_io_metrics) {
++      response_build_begin = std::chrono::steady_clock::now();
++    }
+@@ -425,0 +467,3 @@
++      if (collect_io_metrics) {
++        socket_write_begin = std::chrono::steady_clock::now();
++      }
+@@ -431,0 +476,3 @@
++      if (collect_io_metrics) {
++        socket_write_begin = std::chrono::steady_clock::now();
++      }
+@@ -433,0 +481,10 @@
++    if (collect_io_metrics) {
++      const auto socket_write_end = std::chrono::steady_clock::now();
++      request_.complete_http_io_metrics(
++          static_cast<std::uint64_t>(
++              std::chrono::duration_cast<std::chrono::microseconds>(
++                  socket_write_begin - response_build_begin).count()),
++          static_cast<std::uint64_t>(
++              std::chrono::duration_cast<std::chrono::microseconds>(
++                  socket_write_end - socket_write_begin).count()));
++    }
+@@ -976,0 +1034 @@
++  bool enable_http_io_metrics_ = false;
+diff --git include/ylt/standalone/cinatra/coro_http_server.hpp include/ylt/standalone/cinatra/coro_http_server.hpp
+--- include/ylt/standalone/cinatra/coro_http_server.hpp
++++ include/ylt/standalone/cinatra/coro_http_server.hpp
+@@ -2,0 +3 @@
++#include <chrono>
+@@ -3,0 +5 @@
++#include <vector>
+@@ -66,0 +69,2 @@
++  void enable_http_io_metrics() { enable_http_io_metrics_ = true; }
++
+@@ -95,0 +100,3 @@
++      if (enable_http_io_metrics_) {
++        start_io_context_lag_timers();
++      }
+@@ -692 +699,2 @@
+-        socket.get_executor(), std::move(socket), router_);
++        socket.get_executor(), std::move(socket), router_,
++        enable_http_io_metrics_);
+@@ -1031,0 +1040,34 @@
++  void start_io_context_lag_timers() {
++    if (pool_ == nullptr) {
++      return;
++    }
++    io_context_lag_timers_.reserve(pool_->pool_size());
++    for (std::size_t i = 0; i < pool_->pool_size(); ++i) {
++      auto timer = std::make_shared<asio::steady_timer>(
++          pool_->get_executor()->get_asio_executor());
++      io_context_lag_timers_.push_back(timer);
++      arm_io_context_lag_timer(std::move(timer));
++    }
++  }
++
++  void arm_io_context_lag_timer(
++      std::shared_ptr<asio::steady_timer> timer) {
++    static constexpr auto kSampleInterval = std::chrono::milliseconds(10);
++    const auto expected = std::chrono::steady_clock::now() + kSampleInterval;
++    timer->expires_at(expected);
++    timer->async_wait([this, timer = std::move(timer), expected](auto ec) {
++      if (ec || stop_timer_) {
++        return;
++      }
++      const auto now = std::chrono::steady_clock::now();
++      if (now > expected) {
++        const auto lag_us =
++            std::chrono::duration_cast<std::chrono::microseconds>(
++                now - expected).count();
++        detail::observe_io_context_lag(
++            static_cast<std::uint64_t>(lag_us));
++      }
++      arm_io_context_lag_timer(std::move(timer));
++    });
++  }
++
+@@ -1054,0 +1097,2 @@
++  bool enable_http_io_metrics_ = false;
++  std::vector<std::shared_ptr<asio::steady_timer>> io_context_lag_timers_;

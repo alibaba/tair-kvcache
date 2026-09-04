@@ -214,6 +214,7 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
     meta_service_impl_->ReportEvent(request_context, request, response);
     http_metrics_sample->latency.service_query_rt_us = request_context->service_query_rt_us();
     http_metrics_sample->latency.request_context_rt_us = request_context->service_request_context_rt_us();
+    http_metrics_sample->latency.service_finalize_time_us = request_context->service_finalize_time_us();
     http_metrics_sample->latency.has_service_latency = request_context->has_service_latency();
 }
 

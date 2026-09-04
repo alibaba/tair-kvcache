@@ -258,13 +258,16 @@ TEST_F(LocalMetricsReporterTest, ServiceCallGuardCopiesRequestOutcomeToEventRepo
     request_context.set_status_code(10);
     request_context.GetMetricsCollectorsVehicle().AddMetricsCollector(snapshot_collector);
     {
-        ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get());
+        ServiceCallGuard guard(cache_manager_.get(), &request_context, reporter_.get(), [] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     EXPECT_TRUE(request_context.has_service_latency());
     EXPECT_GT(request_context.service_query_rt_us(), 0);
     EXPECT_GE(request_context.service_request_context_rt_us(), request_context.service_query_rt_us());
+    EXPECT_GE(request_context.service_finalize_time_us(), 1000);
     EXPECT_EQ(1, service_collector->get_service_query_counter_metrics());
     EXPECT_GT(snapshot_collector->get_service_query_rt_us_metrics(), 0.);
     EXPECT_DOUBLE_EQ(1., snapshot_collector->get_service_error_code_metrics());

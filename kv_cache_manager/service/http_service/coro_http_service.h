@@ -62,6 +62,7 @@ private:
     std::unordered_map<std::string, HandlerType> get_handlers_{};
     std::unordered_map<std::string, HandlerType> post_handlers_{};
     std::unique_ptr<coro_http::coro_http_server> server_{};
+    bool enable_http_io_metrics_{false};
 };
 
 template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
@@ -104,6 +105,7 @@ CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
                                                                                     HttpRequestMetricsSample *)>
         callback,
     bool (*request_parser)(char *, size_t, PbRequestMessage *)) {
+    enable_http_io_metrics_ = true;
     return [this, callback, request_parser](coro_http::coro_http_request &req,
                                             coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
         const auto handler_begin_us = TimestampUtil::GetSteadyTimeUs();
@@ -162,7 +164,15 @@ CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
         metrics_sample.latency.service_callback_time_us = service_callback_end_us - request_parse_end_us;
         metrics_sample.latency.response_serialize_time_us = response_serialize_end_us - service_callback_end_us;
         metrics_sample.latency.handler_time_us = handler_end_us - handler_begin_us;
-        metrics_sample.collector->RecordHttpRequestLatency(metrics_sample.latency);
+        req.set_http_io_metrics_callback(
+            [collector = std::move(metrics_sample.collector),
+             latency = metrics_sample.latency](const coro_http::http_io_metrics &io_metrics) mutable {
+                latency.request_receive_wait_time_us = io_metrics.request_receive_wait_time_us;
+                latency.io_event_loop_lag_us = io_metrics.io_event_loop_lag_us;
+                latency.response_build_time_us = io_metrics.response_build_time_us;
+                latency.socket_write_time_us = io_metrics.socket_write_time_us;
+                collector->RecordHttpRequestLatency(latency);
+            });
         co_return;
     };
 }

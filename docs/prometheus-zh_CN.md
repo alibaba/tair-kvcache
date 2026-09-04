@@ -134,6 +134,11 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `http.handler_time_us_sum` | counter | ReportEvent arena handler 累计耗时，包含 Arena 清理（微秒） |
 | `http.service_query_rt_us_sum` | counter | ReportEvent HTTP 请求 ServiceCallGuard query 累计耗时（微秒） |
 | `http.request_context_rt_us_sum` | counter | ServiceCallGuard 上报和 access log 前捕获的 RequestContext 累计耗时（微秒） |
+| `http.service_finalize_time_us_sum` | counter | ServiceCallGuard response debug、指标上报和 access log 累计耗时（微秒） |
+| `http.request_receive_wait_time_us_sum` | counter | cinatra 等待并组装完整 HTTP 请求的累计耗时（微秒） |
+| `http.io_event_loop_lag_us_sum` | counter | 请求进入 handler 前，同一 I/O 线程自上次已打点请求以来观测到的最大 event-loop timer 延迟累计值（微秒） |
+| `http.response_build_time_us_sum` | counter | cinatra 构建 HTTP response header/buffer 的累计耗时（微秒） |
+| `http.socket_write_time_us_sum` | counter | cinatra `async_write` 将完整响应写入 socket 的累计等待时间（微秒） |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
@@ -172,13 +177,22 @@ rate(kvcm_http_request_parse_time_us_sum[1m])
 
 rate(kvcm_http_service_query_rt_us_sum[1m])
   / rate(kvcm_http_service_query_counter[1m])
+
+rate(kvcm_http_socket_write_time_us_sum[1m])
+  / rate(kvcm_http_request_counter[1m])
 ```
 
 `request_parse`、`service_callback`、`response_serialize` 划分了已打点的
-handler；`handler_time` 还包含 Arena 清理。进入 handler 时 request body
-已经接收完成，而 cinatra 会在 handler 返回后执行 socket write，因此这些
-counter 不覆盖 body 接收/事件循环等待和响应网络回写。排障时可用客户端 RT
-与 `handler_time` 的差值界定这一外围区间。
+handler；`handler_time` 还包含 Arena 清理。`service_finalize` 是
+`service_callback` 内部的收尾子阶段，不应与后者相加。`request_receive_wait` 从连接协程
+开始等待 HTTP header 计时，到 body 组装完成为止，因此 keep-alive 空闲时间也
+会包含在内；它不是纯网络传输耗时。`io_event_loop_lag` 使用每个 I/O 线程的
+10ms 周期 timer，并把两次已打点请求之间观测到的最大超时延迟归到下一次请求，用于
+识别同步 handler 导致的 event-loop head-of-line blocking，而不是精确的逐请求
+排队时间；它可能与 `request_receive_wait` 重叠，也不应作为耗时阶段相加。
+`response_build` 和 `socket_write` 位于 handler 返回之后；后者止于
+服务端 `async_write` 完成，不包含客户端读取响应。客户端 send/read/JSON 解析
+仍需由压测端单独采集。
 
 上述 GetHostCacheState 分段指标是嵌套关系：`meta_indexer.get_io_time_us` 位于
 `meta_searcher.indexer_get_time_us` 内，后者与 projection/reduce 又位于

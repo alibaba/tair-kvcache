@@ -138,6 +138,11 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `http.handler_time_us_sum` | counter | Cumulative ReportEvent arena-handler time, including arena cleanup (us) |
 | `http.service_query_rt_us_sum` | counter | Cumulative ServiceCallGuard query time for ReportEvent HTTP requests (us) |
 | `http.request_context_rt_us_sum` | counter | Cumulative request-context time captured before ServiceCallGuard reporting and access logging (us) |
+| `http.service_finalize_time_us_sum` | counter | Cumulative ServiceCallGuard response-debug, metrics-reporting, and access-log time (us) |
+| `http.request_receive_wait_time_us_sum` | counter | Cumulative time cinatra waits for and assembles complete HTTP requests (us) |
+| `http.io_event_loop_lag_us_sum` | counter | Cumulative maximum I/O-loop timer lag observed since the previous instrumented request on the same I/O thread (us) |
+| `http.response_build_time_us_sum` | counter | Cumulative cinatra HTTP response header/buffer construction time (us) |
+| `http.socket_write_time_us_sum` | counter | Cumulative time spent awaiting cinatra's full-response socket `async_write` (us) |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
@@ -177,14 +182,26 @@ rate(kvcm_http_request_parse_time_us_sum[1m])
 
 rate(kvcm_http_service_query_rt_us_sum[1m])
   / rate(kvcm_http_service_query_counter[1m])
+
+rate(kvcm_http_socket_write_time_us_sum[1m])
+  / rate(kvcm_http_request_counter[1m])
 ```
 
 `request_parse`, `service_callback`, and `response_serialize` partition the
 instrumented handler; `handler_time` additionally includes arena cleanup.
-The request body is already available when the handler starts, and the
-cinatra socket write happens after it returns. Therefore these counters do
-not measure body receive/event-loop wait or response socket-write time; use
-the gap between client latency and `handler_time` to bound that outer region.
+`service_finalize` is a nested finalization phase inside `service_callback` and
+must not be added to it.
+`request_receive_wait` starts when the connection coroutine begins waiting
+for the HTTP header and ends when the body is assembled, so it also contains
+keep-alive idle time and is not pure network-transfer time. `io_event_loop_lag`
+uses a 10-ms timer per I/O thread and attributes the maximum timer delay seen
+between two instrumented requests to the next one. It diagnoses event-loop
+head-of-line blocking from synchronous handlers rather than an exact
+per-request queue duration; it can overlap `request_receive_wait` and is not
+an additive latency stage. `response_build` and `socket_write` occur after
+the handler returns; socket write ends when the server-side `async_write`
+completes and excludes client response reading. Client send/read/JSON parsing
+still requires client-side instrumentation.
 
 The GetHostCacheState phase metrics above are nested:
 `meta_indexer.get_io_time_us` is inside `meta_searcher.indexer_get_time_us`, and

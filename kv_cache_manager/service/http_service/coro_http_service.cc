@@ -38,6 +38,9 @@ void CoroHttpService::RegisterPostHandler(const std::string &api, HandlerType ha
 
 bool CoroHttpService::Start(int32_t port, size_t thread_num) {
     server_ = std::make_unique<coro_http::coro_http_server>(thread_num, static_cast<unsigned short>(port), "0.0.0.0");
+    if (enable_http_io_metrics_) {
+        server_->enable_http_io_metrics();
+    }
 
     // 注册所有 GET/POST handler
     for (const auto &[path, handler] : get_handlers_) {

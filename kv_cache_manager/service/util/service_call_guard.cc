@@ -131,7 +131,7 @@ ServiceCallGuard::~ServiceCallGuard() {
     const auto extra_collectors = request_context_->GetMetricsCollectorsVehicle().GetMetricsCollectors();
     const auto request_rt_us =
         static_cast<std::uint64_t>(TimestampUtil::GetSteadyTimeUs() - request_context_->request_begin_steady_time_us());
-    request_context_->set_service_latency(query_rt_us, request_rt_us);
+    const auto finalize_begin_us = TimestampUtil::GetSteadyTimeUs();
     // MetricsReporter treats any non-zero error_code sample as a failed
     // request, so this gauge is deliberately a 0/1 failure flag rather than
     // the wire enum value (where a successful request is non-zero).
@@ -162,6 +162,8 @@ ServiceCallGuard::~ServiceCallGuard() {
         }
     }
     PrintAccessLog(request_context_);
+    const auto finalize_time_us = static_cast<std::uint64_t>(TimestampUtil::GetSteadyTimeUs() - finalize_begin_us);
+    request_context_->set_service_latency(query_rt_us, request_rt_us, finalize_time_us);
 }
 
 void ServiceCallGuard::PrintAccessLog(RequestContext *request_context) {

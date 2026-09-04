@@ -1,6 +1,19 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "CoroHttpIoMetricsTest",
+    srcs = ["coro_http_io_metrics_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fcoroutines",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "@yalantinglibs//:ylt",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",

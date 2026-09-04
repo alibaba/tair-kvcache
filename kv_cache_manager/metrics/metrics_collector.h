@@ -256,10 +256,15 @@ struct HttpRequestLatency {
     bool has_service_latency{false};
     std::uint64_t service_query_rt_us{0};
     std::uint64_t request_context_rt_us{0};
+    std::uint64_t service_finalize_time_us{0};
     std::uint64_t request_parse_time_us{0};
     std::uint64_t service_callback_time_us{0};
     std::uint64_t response_serialize_time_us{0};
     std::uint64_t handler_time_us{0};
+    std::uint64_t request_receive_wait_time_us{0};
+    std::uint64_t io_event_loop_lag_us{0};
+    std::uint64_t response_build_time_us{0};
+    std::uint64_t socket_write_time_us{0};
 };
 
 class ServiceMetricsCollector final : public MetricsCollector {
@@ -277,10 +282,15 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(http, service_query_counter)
     KVCM_COUNTER_METRICS(http, service_query_rt_us_sum)
     KVCM_COUNTER_METRICS(http, request_context_rt_us_sum)
+    KVCM_COUNTER_METRICS(http, service_finalize_time_us_sum)
     KVCM_COUNTER_METRICS(http, request_parse_time_us_sum)
     KVCM_COUNTER_METRICS(http, service_callback_time_us_sum)
     KVCM_COUNTER_METRICS(http, response_serialize_time_us_sum)
     KVCM_COUNTER_METRICS(http, handler_time_us_sum)
+    KVCM_COUNTER_METRICS(http, request_receive_wait_time_us_sum)
+    KVCM_COUNTER_METRICS(http, io_event_loop_lag_us_sum)
+    KVCM_COUNTER_METRICS(http, response_build_time_us_sum)
+    KVCM_COUNTER_METRICS(http, socket_write_time_us_sum)
 
     // manager metrics
     KVCM_GAUGE_METRICS(manager, request_key_count)
