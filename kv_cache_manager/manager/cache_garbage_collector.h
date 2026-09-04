@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -165,6 +166,8 @@ private:
     void ReleasePendingLocations(const InflightDelete &inflight) noexcept;
     bool BeginRound();
     void CompleteRound() noexcept;
+    static std::pair<size_t, std::string>
+    BuildSubmittedLocationSummary(const std::map<std::string, size_t> &reason_counts);
     void LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept;
     void AdvanceInstance(bool completed_current) noexcept;
     ScanDeleteActions

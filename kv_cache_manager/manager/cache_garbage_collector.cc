@@ -748,31 +748,33 @@ void CacheGarbageCollector::CompleteRound() noexcept {
     next_round_at_ = now + std::chrono::milliseconds(config_.round_pause_ms);
 }
 
-void CacheGarbageCollector::LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept {
-    const auto reason_count = [&entry](const char *reason) {
-        const auto it = entry.submitted_location_counts.find(reason);
-        return it == entry.submitted_location_counts.end() ? size_t{0} : it->second;
-    };
+std::pair<size_t, std::string>
+CacheGarbageCollector::BuildSubmittedLocationSummary(const std::map<std::string, size_t> &reason_counts) {
     size_t submitted_location_count = 0;
-    for (const auto &[reason, count] : entry.submitted_location_counts) {
-        (void)reason;
+    std::string reason_summary;
+    for (const auto &[reason, count] : reason_counts) {
+        if (!reason_summary.empty()) {
+            reason_summary += ',';
+        }
+        reason_summary += reason + '=' + std::to_string(count);
         submitted_location_count += count;
     }
+    return {submitted_location_count, reason_summary};
+}
+
+void CacheGarbageCollector::LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept {
+    const auto [submitted_location_count, reason_summary] =
+        BuildSubmittedLocationSummary(entry.submitted_location_counts);
     KVCM_LOG_INFO(
         "cache gc instance scan completed, round[%lu] group[%s] instance[%s] scanned_keys[%zu] scan_batches[%zu] "
-        "submitted_locations[%zu] reasons[orphan_writing=%zu,storage_missing=%zu,event_report_stale_snapshot=%zu,"
-        "event_report_down_host=%zu,event_report_recovery_absent_host=%zu] inflight_throttled_ticks[%zu]",
+        "submitted_locations[%zu] reasons[%s] inflight_throttled_ticks[%zu]",
         round_id_,
         entry.instance_group.c_str(),
         entry.instance_id.c_str(),
         entry.scanned_key_count,
         entry.scan_batch_count,
         submitted_location_count,
-        reason_count(kOrphanWritingReason),
-        reason_count(kStorageMissingReason),
-        reason_count(kEventReportStaleSnapshotReason),
-        reason_count(kEventReportDownHostReason),
-        reason_count(kEventReportRecoveryAbsentHostReason),
+        reason_summary.c_str(),
         entry.inflight_throttled_tick_count);
 }
 

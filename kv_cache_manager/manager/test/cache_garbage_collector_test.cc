@@ -1329,6 +1329,16 @@ TEST_F(CacheGarbageCollectorTest, TickTracksPerInstanceScanAndSubmittedReasonSum
     pending_delete_promise->set_value({EC_OK, ""});
 }
 
+TEST_F(CacheGarbageCollectorTest, SubmittedLocationSummaryIncludesEveryReason) {
+    const auto [submitted_location_count, reason_summary] = CacheGarbageCollector::BuildSubmittedLocationSummary({
+        {"orphan_writing", 90},
+        {"future_reason", 10},
+    });
+
+    EXPECT_EQ(100u, submitted_location_count);
+    EXPECT_EQ("future_reason=10,orphan_writing=90", reason_summary);
+}
+
 TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {
     scan_responses["instance_a"] = {
         {EC_ERROR, {}},
