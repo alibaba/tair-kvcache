@@ -12,6 +12,7 @@ using namespace std::chrono_literals;
 
 namespace kv_cache_manager {
 
+#ifdef CINATRA_HAS_HTTP_IO_METRICS
 TEST(CoroHttpIoMetricsTest, ReportsReceiveLoopLagResponseBuildAndSocketWrite) {
     coro_http::coro_http_server server(1, 0);
     server.enable_http_io_metrics();
@@ -60,5 +61,6 @@ TEST(CoroHttpIoMetricsTest, ReportsReceiveLoopLagResponseBuildAndSocketWrite) {
 
     server.stop();
 }
+#endif
 
 } // namespace kv_cache_manager

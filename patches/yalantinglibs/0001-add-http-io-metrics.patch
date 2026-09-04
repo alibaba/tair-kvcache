@@ -4,7 +4,10 @@ diff --git include/ylt/standalone/cinatra/coro_http_request.hpp include/ylt/stan
 @@ -4,0 +5,2 @@
 +#include <cstdint>
 +#include <functional>
-@@ -96,0 +99,9 @@
+@@ -17,0 +20,2 @@
++#define CINATRA_HAS_HTTP_IO_METRICS 1
++
+@@ -96,0 +101,9 @@
 +struct http_io_metrics {
 +  std::uint64_t request_receive_wait_time_us = 0;
 +  std::uint64_t io_event_loop_lag_us = 0;
@@ -14,7 +17,7 @@ diff --git include/ylt/standalone/cinatra/coro_http_request.hpp include/ylt/stan
 +using http_io_metrics_callback =
 +    std::function<void(const http_io_metrics &)>;
 +
-@@ -141,0 +153,21 @@
+@@ -141,0 +155,21 @@
 +  void set_http_io_metrics(std::uint64_t request_receive_wait_time_us,
 +                           std::uint64_t io_event_loop_lag_us) {
 +    io_metrics_.request_receive_wait_time_us = request_receive_wait_time_us;
@@ -36,10 +39,10 @@ diff --git include/ylt/standalone/cinatra/coro_http_request.hpp include/ylt/stan
 +    io_metrics_callback_(io_metrics_);
 +  }
 +
-@@ -297,0 +330,2 @@
+@@ -297,0 +332,2 @@
 +    io_metrics_ = {};
 +    io_metrics_callback_ = {};
-@@ -310,0 +345,2 @@
+@@ -310,0 +347,2 @@
 +  http_io_metrics io_metrics_;
 +  http_io_metrics_callback io_metrics_callback_;
 diff --git include/ylt/standalone/cinatra/coro_http_connection.hpp include/ylt/standalone/cinatra/coro_http_connection.hpp
