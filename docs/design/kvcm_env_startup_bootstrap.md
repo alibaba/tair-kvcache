@@ -17,7 +17,49 @@ KVCM 启动后，可以根据环境变量自动创建或更新 Storage 和 Insta
 
 如果三个 Storage 变量都没有配置，KVCM 正常启动，但不会访问 Admin API，也不会创建、更新或删除任何资源。
 
-## 2. 启动和主从行为
+## 2. 环境变量配置
+
+平台注入以下环境变量：
+
+```json
+{
+  "KVCM_PACE_STORAGE": "{\"unique_name\":\"tairmempool_s_test\",\"domain\":\"empty\",\"timeout\":30,\"service_discovery_url\":\"spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348\"}",
+  "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
+  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&timeout_ms=1000&retry_count=3&cluster_name=group_test&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=1024000&async_max_size=1024000&async_enqueue_timeout_ms=10&async_wait_us=1000000&capacity=65536\"}"
+}
+```
+
+以上环境变量等价于执行以下命令：
+
+```bash
+python3 -m kvcm_ops add_storage -u tairmempool_s_test pace \
+  --domain empty \
+  --timeout 30 \
+  --service_discovery_url 'spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348'
+
+python3 -m kvcm_ops add_storage -u vineyard_s_test event_report_l2
+
+python3 -m kvcm_ops create_instance_group \
+  -n group_test \
+  -s tairmempool_s_test \
+  --user_data 'group_test' \
+  --max_instance_count 512 \
+  --quota_capacity 7476679068870 \
+  --quota_configs ST_TAIRMEMPOOL,7476679068870 \
+  --reclaim_policy POLICY_LRU \
+  --reclaim_used_percentage 0.8 \
+  --data_storage_strategy CPS_PREFER_TAIR_MEMPOOL \
+  --max_key_count 1000000000 \
+  --mutex_shard_num 131072 \
+  --batch_key_size 1024 \
+  --meta_storage_backend_config 'cached,redis://default:<password>@redis.example.com:6379?db=4&timeout_ms=1000&retry_count=3&cluster_name=group_test&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=1024000&async_max_size=1024000&async_enqueue_timeout_ms=10&async_wait_us=1000000&capacity=65536' \
+  --search_cache_capacity 10240 \
+  --search_cache_shard_bits 6 \
+  --extra_info '{"metadata_backend_mode":3}' \
+  --event_report_storage_candidates vineyard_s_test
+```
+
+## 3. 启动和主从行为
 
 bootstrap 在 KVCM Admin 服务健康后执行，典型调用关系为：
 
@@ -40,90 +82,7 @@ start_server.sh
 
 因此，多次启动、Leader 切换或环境变量未变化时，bootstrap 都是幂等的，不会重复创建相同资源。
 
-## 3. 最简配置
-
-下面是只启用 L1.5 Storage 的最简配置：
-
-```bash
-export KVCM_L1P5_STORAGE='{"unique_name":"example_l1p5"}'
-export KVCM_INSTANCE_GROUP='{"name":"example_group","meta_storage_backend_config":"cached,redis://redis.example.com:6379?cluster_name=example_cluster"}'
-```
-
-启动后会得到：
-
-- Storage：`example_l1p5`
-- Instance Group：`example_group`
-- Group 的主 Storage：`example_l1p5`
-- Group quota：默认 `1000000000` bytes（1 GB）
-
-其余未配置字段使用本文后面的默认值。
-
-## 4. 最全配置
-
-下面展示三个 Storage 和全部可配置字段。示例地址和密码仅用于说明格式：
-
-```bash
-export KVCM_L1P5_STORAGE='{
-  "unique_name": "example_l1p5",
-  "heartbeat_timeout_ms": 30000,
-  "cleanup_grace_ms": 300000,
-  "liveness_check_interval_ms": 5000,
-  "snapshot_min_interval_ms": 30000
-}'
-
-export KVCM_L2P_STORAGE='{
-  "unique_name": "example_l2",
-  "heartbeat_timeout_ms": 30000,
-  "cleanup_grace_ms": 300000,
-  "liveness_check_interval_ms": 5000,
-  "snapshot_min_interval_ms": 30000
-}'
-
-export KVCM_PACE_STORAGE='{
-  "unique_name": "example_pace",
-  "domain": "http://pace.example.com",
-  "timeout": 30,
-  "service_discovery_url": "http://discovery.example.com",
-  "media_type": 2
-}'
-
-export KVCM_INSTANCE_GROUP='{
-  "name": "example_group",
-  "user_data": "example_group",
-  "quota_capacity": 1000000000,
-  "max_instance_count": 512,
-  "reclaim_policy": "POLICY_LRU",
-  "reclaim_used_percentage": 0.8,
-  "max_key_count": 1000000000,
-  "mutex_shard_num": 131072,
-  "batch_key_size": 1024,
-  "search_cache_capacity": 10240,
-  "search_cache_shard_bits": 6,
-  "metadata_backend_mode": 4,
-  "meta_storage_backend_config": "cached,redis://user:password@redis.example.com:6379?cluster_name=example_cluster&timeout_ms=1000"
-}'
-```
-
-这组配置同时创建 L1.5、L2 和 PACE Storage。由于 PACE 的优先级最高，Group 会使用 `example_pace` 作为主 Storage；L1.5 和 L2 则作为 EventReport Storage。
-
-## 5. 主 Storage 选择规则
-
-主 Storage 优先级固定为：
-
-```text
-PACE > L1.5 > L2
-```
-
-| 配置情况 | 主 Storage | EventReport Storage |
-|---|---|---|
-| 配置了 PACE | PACE | 已配置的 L1.5、L2 |
-| 未配置 PACE，但配置了 L1.5 | L1.5 | 已配置的 L1.5、L2 |
-| 只配置 L2 | L2 | L2 |
-| 三个都未配置 | 不执行初始化 | 不执行初始化 |
-
-bootstrap 会根据主 Storage 自动生成 Group 的 `storage_candidates`、quota 类型、reclaim Storage 和 data strategy。EventReport candidates 固定按 L1.5、L2 排序。
-
-## 6. 配置变化后的行为
+## 4. 配置变化后的行为
 
 线上修改环境变量后，KVCM 会重启。新进程启动时，bootstrap 会读取 Registry 中的已有配置并进行对比。
 
@@ -171,15 +130,22 @@ MetaIndexer 相关字段包括：
 
 第一次只配置：
 
-```bash
-export KVCM_L1P5_STORAGE='{"unique_name":"example_l1p5"}'
+`KVCM_L1P5_STORAGE`
+
+```json
+{
+  "unique_name": "example_l1p5"
+}
 ```
 
-第二次改为：
+第二次在平台中删除 `KVCM_L1P5_STORAGE`，并新增：
 
-```bash
-unset KVCM_L1P5_STORAGE
-export KVCM_L2P_STORAGE='{"unique_name":"example_l2"}'
+`KVCM_L2P_STORAGE`
+
+```json
+{
+  "unique_name": "example_l2"
+}
 ```
 
 重启后 KVCM 会：
@@ -189,7 +155,7 @@ export KVCM_L2P_STORAGE='{"unique_name":"example_l2"}'
 3. 保留旧的 `example_l1p5`，但 Group 不再引用它。
 4. 不执行第二次重启，因为 MetaIndexer 配置没有变化。
 
-## 7. 字段说明和默认值
+## 5. 字段说明和默认值
 
 ### L1.5 / L2 Storage
 
@@ -233,7 +199,7 @@ export KVCM_L2P_STORAGE='{"unique_name":"example_l2"}'
 
 `meta_storage_backend_config` 使用 `type,uri` 格式，type 支持 `redis` 和 `cached`，Redis URI 必须包含 `cluster_name`。URI query 会原样传递给 Meta Backend，Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
 
-## 8. 配置错误和重试
+## 6. 配置错误和重试
 
 以下情况会被视为配置错误：
 
