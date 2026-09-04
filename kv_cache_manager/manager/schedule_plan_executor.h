@@ -65,6 +65,10 @@ struct CacheLocationDelRequest {
     // GC physical deletion revalidates against the persistent source of truth
     // and refreshes candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
+    // URIs that the submitter has already confirmed absent. Physical deletion
+    // skips these idempotently while still deleting any remaining specs in the
+    // same Location.
+    std::set<std::string> confirmed_missing_uris;
 };
 
 struct EventReportMetadataDeleteTarget {
