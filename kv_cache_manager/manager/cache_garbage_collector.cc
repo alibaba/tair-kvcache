@@ -137,6 +137,7 @@ const char *MaintenanceUnknownReasonName(EventReportBackend::MaintenanceProbeUnk
 struct DeleteCandidate {
     std::string expected_location_value;
     CandidateReason reason{CandidateReason::kOrphanWriting};
+    std::set<std::string> confirmed_missing_uris;
     std::shared_ptr<EventReportBackend> event_report_backend;
     std::string event_report_backend_unique_name;
     std::optional<EventReportBackend::MaintenanceCleanupToken> event_report_cleanup_token;
@@ -145,7 +146,7 @@ struct DeleteCandidate {
 struct ServingProbe {
     CandidateKey key;
     CacheLocationConstPtr location;
-    bool storage_missing{false};
+    std::set<std::string> confirmed_missing_uris;
 };
 
 struct StorageProbeBatch {
@@ -346,6 +347,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         }
         PollInflightDeletes();
         if (inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
+            if (round_active_ && instance_index_ < instances_.size()) {
+                ++instances_[instance_index_].inflight_throttled_tick_count;
+            }
             return;
         }
         if (stop_requested_.load(std::memory_order_acquire)) {
@@ -411,6 +415,8 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         }
 
         entry.scan_failure_count = 0;
+        entry.scanned_key_count += batch.keys.size();
+        ++entry.scan_batch_count;
         METRICS_(cache_gc, scan_key_count) += batch.keys.size();
         entry.cursor = batch.next_cursor;
         if (stop_requested_.load(std::memory_order_acquire)) {
@@ -418,7 +424,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         }
         ScanDeleteActions actions = BuildDeleteActions(entry.instance_id, batch, TimestampUtil::GetCurrentTimeUs());
         const std::string instance_id = entry.instance_id;
-        AdvanceInstance(entry.cursor == SCAN_BASE_CURSOR);
+        const bool scan_completed = entry.cursor == SCAN_BASE_CURSOR;
 
         if (stop_requested_.load(std::memory_order_acquire)) {
             return;
@@ -426,7 +432,8 @@ void CacheGarbageCollector::RunOneTick() noexcept {
 
         auto submit_and_track = [&](auto &request,
                                     std::vector<PendingLocationKey> request_targets,
-                                    const char *action_name) {
+                                    const char *action_name,
+                                    const std::map<std::string, size_t> &reason_counts) {
             if (request_targets.empty() || inflight_deletes_.size() >= config_.max_inflight_delete_requests) {
                 return false;
             }
@@ -505,6 +512,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                 return false;
             }
             METRICS_(cache_gc, delete_target_count) += request_targets.size();
+            for (const auto &[reason, count] : reason_counts) {
+                entry.submitted_location_counts[reason] += count;
+            }
             return true;
         };
 
@@ -514,7 +524,8 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                 physical_targets.push_back({instance_id, actions.executor_request.block_keys[i], location_id});
             }
         }
-        submit_and_track(actions.executor_request, std::move(physical_targets), "physical_delete");
+        submit_and_track(
+            actions.executor_request, std::move(physical_targets), "physical_delete", actions.executor_reason_counts);
 
         std::vector<PendingLocationKey> event_report_targets;
         for (size_t i = 0; i < actions.event_report_request.block_keys.size(); ++i) {
@@ -532,9 +543,16 @@ void CacheGarbageCollector::RunOneTick() noexcept {
                 }
             }
         } else {
-            submit_and_track(actions.event_report_request, std::move(event_report_targets), "event_report_metadata");
+            submit_and_track(actions.event_report_request,
+                             std::move(event_report_targets),
+                             "event_report_metadata",
+                             actions.event_report_reason_counts);
         }
         UpdateInflightDeleteMetrics();
+        if (scan_completed) {
+            LogInstanceScanSummary(entry);
+        }
+        AdvanceInstance(scan_completed);
     } catch (const std::exception &e) {
         RecordOperationError("tick_exception");
         KVCM_LOG_ERROR("cache gc tick threw exception: %s", e.what());
@@ -611,13 +629,7 @@ void CacheGarbageCollector::PollInflightDeletes() noexcept {
             }
             const PlanExecuteResult result = it->future.get();
             RecordDeleteResult(std::to_string(static_cast<int>(result.status)));
-            if (result.status == EC_OK) {
-                KVCM_LOG_DEBUG("cache gc action completed, round[%lu] instance[%s] action[%s] targets[%zu]",
-                               round_id,
-                               instance_id.c_str(),
-                               action_name.c_str(),
-                               target_count);
-            } else {
+            if (result.status != EC_OK) {
                 KVCM_LOG_WARN(
                     "cache gc action completed with status[%d], round[%lu] instance[%s] action[%s] targets[%zu] "
                     "error[%s]",
@@ -736,6 +748,34 @@ void CacheGarbageCollector::CompleteRound() noexcept {
     next_round_at_ = now + std::chrono::milliseconds(config_.round_pause_ms);
 }
 
+void CacheGarbageCollector::LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept {
+    const auto reason_count = [&entry](const char *reason) {
+        const auto it = entry.submitted_location_counts.find(reason);
+        return it == entry.submitted_location_counts.end() ? size_t{0} : it->second;
+    };
+    size_t submitted_location_count = 0;
+    for (const auto &[reason, count] : entry.submitted_location_counts) {
+        (void)reason;
+        submitted_location_count += count;
+    }
+    KVCM_LOG_INFO(
+        "cache gc instance scan completed, round[%lu] group[%s] instance[%s] scanned_keys[%zu] scan_batches[%zu] "
+        "submitted_locations[%zu] reasons[orphan_writing=%zu,storage_missing=%zu,event_report_stale_snapshot=%zu,"
+        "event_report_down_host=%zu,event_report_recovery_absent_host=%zu] inflight_throttled_ticks[%zu]",
+        round_id_,
+        entry.instance_group.c_str(),
+        entry.instance_id.c_str(),
+        entry.scanned_key_count,
+        entry.scan_batch_count,
+        submitted_location_count,
+        reason_count(kOrphanWritingReason),
+        reason_count(kStorageMissingReason),
+        reason_count(kEventReportStaleSnapshotReason),
+        reason_count(kEventReportDownHostReason),
+        reason_count(kEventReportRecoveryAbsentHostReason),
+        entry.inflight_throttled_tick_count);
+}
+
 void CacheGarbageCollector::AdvanceInstance(bool completed_current) noexcept {
     if (instances_.empty() || instance_index_ >= instances_.size()) {
         CompleteRound();
@@ -798,7 +838,10 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                     continue;
                 }
                 candidates.emplace(candidate_key,
-                                   DeleteCandidate{location->ToJsonString(), CandidateReason::kOrphanWriting});
+                                   DeleteCandidate{
+                                       .expected_location_value = location->ToJsonString(),
+                                       .reason = CandidateReason::kOrphanWriting,
+                                   });
                 continue;
             }
 
@@ -871,7 +914,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             }
 
             const size_t serving_probe_index = serving_probes.size();
-            serving_probes.push_back({candidate_key, location, false});
+            serving_probes.push_back({candidate_key, location});
             for (auto &[storage_name, uri] : parsed_uris) {
                 auto &probe_batch = storage_probe_batches[{storage_name, storage_type}];
                 probe_batch.uris.emplace_back(std::move(uri));
@@ -930,7 +973,8 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                 }
                 for (size_t i = 0; i < might_exist.size(); ++i) {
                     if (!might_exist[i]) {
-                        serving_probes[probe_batch.serving_probe_indexes[offset + i]].storage_missing = true;
+                        serving_probes[probe_batch.serving_probe_indexes[offset + i]].confirmed_missing_uris.insert(
+                            uris[i].ToUriString());
                     }
                 }
             }
@@ -1018,9 +1062,13 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
     }
 
     for (auto &probe : serving_probes) {
-        if (probe.storage_missing) {
+        if (!probe.confirmed_missing_uris.empty()) {
             candidates.emplace(std::move(probe.key),
-                               DeleteCandidate{probe.location->ToJsonString(), CandidateReason::kStorageMissing});
+                               DeleteCandidate{
+                                   .expected_location_value = probe.location->ToJsonString(),
+                                   .reason = CandidateReason::kStorageMissing,
+                                   .confirmed_missing_uris = std::move(probe.confirmed_missing_uris),
+                               });
         }
     }
 
@@ -1082,10 +1130,14 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                 .cleanup_token = candidate.event_report_cleanup_token.value(),
             });
             event_report_selected_keys.insert(block_key);
+            ++actions.event_report_reason_counts[CandidateReasonName(candidate.reason)];
         } else {
             auto &block_targets = executor_targets[block_key];
             block_targets.location_ids.push_back(location_id);
             block_targets.expected_location_values.push_back(candidate.expected_location_value);
+            actions.executor_request.confirmed_missing_uris.insert(candidate.confirmed_missing_uris.begin(),
+                                                                   candidate.confirmed_missing_uris.end());
+            ++actions.executor_reason_counts[CandidateReasonName(candidate.reason)];
         }
         ++selected;
     }

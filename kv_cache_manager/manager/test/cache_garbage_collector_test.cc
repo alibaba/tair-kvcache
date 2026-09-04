@@ -1046,8 +1046,8 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
         MakeStoredLocation("second_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_b_uri});
 
     const auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {first_locations, second_locations});
-    const CacheLocationDelRequest request =
-        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
+    const auto actions = gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
+    const CacheLocationDelRequest &request = actions.executor_request;
 
     EXPECT_EQ((KeyVector{10, 20}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"old_writing", "serving_missing"}, {"second_missing"}}),
@@ -1056,6 +1056,9 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
                                                       first_locations.at("serving_missing")->ToJsonString()},
                                                      {second_locations.at("second_missing")->ToJsonString()}}),
               request.expected_location_values);
+    EXPECT_EQ((std::set<std::string>{missing_a_uri, missing_b_uri}), request.confirmed_missing_uris);
+    EXPECT_EQ(1u, actions.executor_reason_counts.at("orphan_writing"));
+    EXPECT_EQ(2u, actions.executor_reason_counts.at("storage_missing"));
 
     ASSERT_EQ(2, might_exist_calls.size());
     const auto storage_a_call =
@@ -1292,6 +1295,38 @@ TEST_F(CacheGarbageCollectorTest, TickScansOneBatchAndSubmitsConditionalAsyncDel
     EXPECT_TRUE(submitted_requests.front().authoritative_read);
     EXPECT_EQ(1, gc->inflight_deletes_.size());
     EXPECT_EQ(1, gc->pending_locations_.size());
+}
+
+TEST_F(CacheGarbageCollectorTest, TickTracksPerInstanceScanAndSubmittedReasonSummary) {
+    auto config = DefaultConfig();
+    config.scan_batch_size = 10;
+    config.max_inflight_delete_requests = 1;
+    submit_mode = SubmitMode::kPending;
+    const std::string missing_uri = "dummy://storage_a/missing?size=1";
+    might_exist_by_uri[missing_uri] = false;
+
+    CacheLocationMap locations;
+    locations["old_writing"] = MakeLocation("old_writing", CLS_WRITING, OldCreateTimeUs(config, 1));
+    locations["serving_missing"] =
+        MakeStoredLocation("serving_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri});
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch("next_cursor", {100}, {locations})}};
+
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, gc->instances_.size());
+    const auto &entry = gc->instances_.front();
+    EXPECT_EQ(1u, entry.scanned_key_count);
+    EXPECT_EQ(1u, entry.scan_batch_count);
+    EXPECT_EQ(1u, entry.submitted_location_counts.at("orphan_writing"));
+    EXPECT_EQ(1u, entry.submitted_location_counts.at("storage_missing"));
+    EXPECT_EQ(0u, entry.inflight_throttled_tick_count);
+
+    gc->RunOneTick();
+    EXPECT_EQ(1u, gc->instances_.front().inflight_throttled_tick_count);
+    ASSERT_TRUE(pending_delete_promise);
+    pending_delete_promise->set_value({EC_OK, ""});
 }
 
 TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {

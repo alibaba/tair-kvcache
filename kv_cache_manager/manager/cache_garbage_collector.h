@@ -103,6 +103,10 @@ private:
         std::string cursor{SCAN_BASE_CURSOR};
         bool completed{false};
         size_t scan_failure_count{0};
+        size_t scanned_key_count{0};
+        size_t scan_batch_count{0};
+        size_t inflight_throttled_tick_count{0};
+        std::map<std::string, size_t> submitted_location_counts;
 
         bool operator<(const InstanceScanEntry &other) const {
             return std::tie(instance_group, instance_id) < std::tie(other.instance_group, other.instance_id);
@@ -149,6 +153,8 @@ private:
     struct ScanDeleteActions {
         CacheLocationDelRequest executor_request;
         EventReportMetadataDelRequest event_report_request;
+        std::map<std::string, size_t> executor_reason_counts;
+        std::map<std::string, size_t> event_report_reason_counts;
     };
 
     void RunOneTick() noexcept;
@@ -159,6 +165,7 @@ private:
     void ReleasePendingLocations(const InflightDelete &inflight) noexcept;
     bool BeginRound();
     void CompleteRound() noexcept;
+    void LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept;
     void AdvanceInstance(bool completed_current) noexcept;
     ScanDeleteActions
     BuildDeleteActions(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);
