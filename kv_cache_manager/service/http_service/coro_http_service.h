@@ -10,13 +10,17 @@
 
 #include "google/protobuf/arena.h"
 #include "google/protobuf/message.h"
+#include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
 namespace kv_cache_manager {
 
-class MetricsCollector;
-class MetricsRegistry;
+struct HttpRequestMetricsSample {
+    std::shared_ptr<ServiceMetricsCollector> collector;
+    HttpRequestLatency latency;
+};
 
 class CoroHttpService {
 public:
@@ -46,10 +50,13 @@ protected:
         std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
             ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback);
     template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
-    HandlerType GetArenaHandler(
-        std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-            ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback,
-        bool (*request_parser)(char *, size_t, PbRequestMessage *) = nullptr);
+    HandlerType GetArenaHandler(std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
+                                    ServiceType *,
+                                    coro_http::coro_http_connection *,
+                                    PbRequestMessage *,
+                                    PbResponseMessage *,
+                                    HttpRequestMetricsSample *)> callback,
+                                bool (*request_parser)(char *, size_t, PbRequestMessage *) = nullptr);
 
 private:
     std::unordered_map<std::string, HandlerType> get_handlers_{};
@@ -90,11 +97,16 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(
 
 template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
 CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
-    std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(
-        ServiceType *, coro_http::coro_http_connection *, PbRequestMessage *, PbResponseMessage *)> callback,
+    std::function<std::enable_if_t<std::is_base_of_v<CoroHttpService, ServiceType>>(ServiceType *,
+                                                                                    coro_http::coro_http_connection *,
+                                                                                    PbRequestMessage *,
+                                                                                    PbResponseMessage *,
+                                                                                    HttpRequestMetricsSample *)>
+        callback,
     bool (*request_parser)(char *, size_t, PbRequestMessage *)) {
     return [this, callback, request_parser](coro_http::coro_http_request &req,
                                             coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+        const auto handler_begin_us = TimestampUtil::GetSteadyTimeUs();
         // Large ReportEvent requests contain tens of thousands of nested
         // protobuf messages. Keeping them on a request-scoped arena avoids a
         // separate malloc/free for every EventItem/spec and releases all
@@ -124,22 +136,33 @@ CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
             request_parser
                 ? request_parser(body.empty() ? nullptr : const_cast<char *>(body.data()), body.size(), pb_req)
                 : ProtoMessageJsonUtil::FromJson(body, pb_req);
+        const auto request_parse_end_us = TimestampUtil::GetSteadyTimeUs();
         if (!parsed) {
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::bad_request, json_res);
             co_return;
         }
 
-        callback(static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+        HttpRequestMetricsSample metrics_sample;
+        callback(static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res, &metrics_sample);
+        const auto service_callback_end_us = TimestampUtil::GetSteadyTimeUs();
 
         json_res.reserve(512);
         if (!ProtoMessageJsonUtil::ToJson(pb_res, json_res)) {
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
-            co_return;
+        } else {
+            res.add_header("Content-Type", "application/json");
+            res.set_status_and_content(coro_http::status_type::ok, json_res);
         }
-        res.add_header("Content-Type", "application/json");
-        res.set_status_and_content(coro_http::status_type::ok, json_res);
+        const auto response_serialize_end_us = TimestampUtil::GetSteadyTimeUs();
+        arena.Reset();
+        const auto handler_end_us = TimestampUtil::GetSteadyTimeUs();
+        metrics_sample.latency.request_parse_time_us = request_parse_end_us - handler_begin_us;
+        metrics_sample.latency.service_callback_time_us = service_callback_end_us - request_parse_end_us;
+        metrics_sample.latency.response_serialize_time_us = response_serialize_end_us - service_callback_end_us;
+        metrics_sample.latency.handler_time_us = handler_end_us - handler_begin_us;
+        metrics_sample.collector->RecordHttpRequestLatency(metrics_sample.latency);
         co_return;
     };
 }

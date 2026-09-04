@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -52,6 +53,11 @@ namespace kv_cache_manager {
 #define REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry, group, name, tags)                                            \
     do {                                                                                                               \
         METRICS_(group, name) = (metrics_registry)->GetGauge(METRICS_NAME_(group, name), tags);                        \
+    } while (0)
+
+#define REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry, group, name, tags)                                      \
+    do {                                                                                                               \
+        METRICS_(group, name) = (metrics_registry)->GetStealGauge(METRICS_NAME_(group, name), tags);                   \
     } while (0)
 
 #define REPORT_DYNAMIC_GAUGE_(metrics_registry, name, tags, value)                                                     \
@@ -120,6 +126,11 @@ using MetricsValueVariant = std::variant<CounterValue, GaugeValue>;
 struct MetricsValue {
     MetricsValueVariant value;
     std::atomic<bool> touched{false};
+    // Pull-based exporters consume this shadow value once. It is separate
+    // from Gauge::Steal() so Prometheus and synchronous reporters cannot
+    // invalidate each other's sample.
+    std::atomic<bool> steal_on_prometheus_expose{false};
+    GaugeValue prometheus_gauge_value{std::numeric_limits<double>::quiet_NaN()};
 
     template <typename T, typename U>
     MetricsValue(std::in_place_type_t<T> tag, U init) noexcept : value(tag, init) {}
@@ -186,10 +197,14 @@ public:
 
     [[nodiscard]] double Get() const;
     [[nodiscard]] double Steal();
+    void EnableStealOnPrometheusExpose() noexcept;
 
     Gauge &operator=(double v);
     Gauge &operator+=(double v);
     Gauge &operator-=(double v);
+
+private:
+    void PublishPrometheusValue() noexcept;
 };
 
 class MetricsData {
@@ -243,6 +258,7 @@ public:
 
     Counter GetCounter(const std::string &name, const MetricsTags &tags = {});
     Gauge GetGauge(const std::string &name, const MetricsTags &tags = {});
+    Gauge GetStealGauge(const std::string &name, const MetricsTags &tags = {});
 
     // remove a specific metric by name + tags; returns true if erased
     bool Remove(const std::string &name, const MetricsTags &tags);

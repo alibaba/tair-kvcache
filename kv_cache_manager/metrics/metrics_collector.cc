@@ -42,7 +42,7 @@ MetricsCollectors::mc_vec_t MetricsCollectors::GetMetricsCollectors() const noex
 #define REGISTER_COUNTER_METRICS_FOR_SERVICE(name)                                                                     \
     REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, service, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_SERVICE(name)                                                                       \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, service, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, service, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_SERVICE(query_counter);
 DEFINE_METRICS_NAME_FOR_SERVICE(query_rt_us);
@@ -50,12 +50,24 @@ DEFINE_METRICS_NAME_FOR_SERVICE(error_code);
 DEFINE_METRICS_NAME_FOR_SERVICE(error_counter);
 DEFINE_METRICS_NAME_FOR_SERVICE(request_queue_size);
 
+// HTTP adapter metrics
+#define REGISTER_COUNTER_METRICS_FOR_HTTP(name)                                                                        \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, http, name, metrics_tags_)
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_counter);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_query_counter);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_query_rt_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_context_rt_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, request_parse_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, service_callback_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, response_serialize_time_us_sum);
+DEFINE_METRICS_NAME_(ServiceMetricsCollector, http, handler_time_us_sum);
+
 // manager metrics
 #define DEFINE_METRICS_NAME_FOR_MANAGER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, manager, name)
 #define REGISTER_COUNTER_METRICS_FOR_MANAGER(name)                                                                     \
     REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, manager, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_MANAGER(name)                                                                       \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_MANAGER(request_key_count);
 DEFINE_METRICS_NAME_FOR_MANAGER(prefix_match_len);
@@ -75,7 +87,7 @@ DEFINE_METRICS_NAME_FOR_MANAGER(batch_update_location_time_us);
 // meta searcher metrics
 #define DEFINE_METRICS_NAME_FOR_META_SEARCHER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, meta_searcher, name)
 #define REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(name)                                                                 \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_searcher, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, meta_searcher, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_get_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(host_projection_time_us);
@@ -89,7 +101,7 @@ DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_query_times);
 // meta indexer metrics
 #define DEFINE_METRICS_NAME_FOR_META_INDEXER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, meta_indexer, name)
 #define REGISTER_GAUGE_METRICS_FOR_META_INDEXER(name)                                                                  \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_indexer, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, meta_indexer, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_INDEXER(query_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(get_not_exist_key_count);
@@ -123,6 +135,19 @@ ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry
                                                  MetricsTags metrics_tags) noexcept
     : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
 
+void ServiceMetricsCollector::RecordHttpRequestLatency(const HttpRequestLatency &latency) noexcept {
+    ++http_request_counter_metrics_;
+    if (latency.has_service_latency) {
+        ++http_service_query_counter_metrics_;
+        http_service_query_rt_us_sum_metrics_ += latency.service_query_rt_us;
+        http_request_context_rt_us_sum_metrics_ += latency.request_context_rt_us;
+    }
+    http_request_parse_time_us_sum_metrics_ += latency.request_parse_time_us;
+    http_service_callback_time_us_sum_metrics_ += latency.service_callback_time_us;
+    http_response_serialize_time_us_sum_metrics_ += latency.response_serialize_time_us;
+    http_handler_time_us_sum_metrics_ += latency.handler_time_us;
+}
+
 bool ServiceMetricsCollector::Init() {
     if (metrics_registry_ == nullptr) {
         return false;
@@ -133,7 +158,20 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_SERVICE(query_rt_us);
     REGISTER_GAUGE_METRICS_FOR_SERVICE(error_code);
     REGISTER_COUNTER_METRICS_FOR_SERVICE(error_counter);
-    REGISTER_GAUGE_METRICS_FOR_SERVICE(request_queue_size);
+    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, service, request_queue_size, metrics_tags_);
+
+    // Only ReportEvent uses the instrumented arena HTTP handler.
+    const auto api_name_it = metrics_tags_.find("api_name");
+    if (api_name_it != metrics_tags_.end() && api_name_it->second == "ReportEvent") {
+        REGISTER_COUNTER_METRICS_FOR_HTTP(request_counter);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(service_query_counter);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(service_query_rt_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(request_context_rt_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(request_parse_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(service_callback_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(response_serialize_time_us_sum);
+        REGISTER_COUNTER_METRICS_FOR_HTTP(handler_time_us_sum);
+    }
 
     // manager metrics
     REGISTER_GAUGE_METRICS_FOR_MANAGER(request_key_count);
@@ -197,11 +235,11 @@ bool ServiceMetricsCollector::Init() {
 #define REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(name)                                                        \
     REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, service, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(name)                                                          \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, service, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, service, name, metrics_tags_)
 #define DEFINE_METRICS_NAME_FOR_EVENT_REPORT_MANAGER(name)                                                             \
     DEFINE_METRICS_NAME_(EventReportMetricsCollector, manager, name)
 #define REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_MANAGER(name)                                                          \
-    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(query_counter);
 DEFINE_METRICS_NAME_FOR_EVENT_REPORT_SERVICE(query_rt_us);
@@ -241,6 +279,8 @@ bool EventReportMetricsCollector::Init() {
     REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, data_storage, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(name)                                                                  \
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, data_storage, name, metrics_tags_)
+#define REGISTER_STEAL_GAUGE_METRICS_FOR_DATA_STORAGE(name)                                                            \
+    REGISTER_METRICS_W_TAGS_STEAL_GAUGE_(metrics_registry_, data_storage, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_counter);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE(create_keys_qps);
@@ -263,11 +303,11 @@ bool DataStorageMetricsCollector::Init() {
     }
 
     REGISTER_COUNTER_METRICS_FOR_DATA_STORAGE(create_counter);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(create_keys_qps);
+    REGISTER_STEAL_GAUGE_METRICS_FOR_DATA_STORAGE(create_keys_qps);
     REGISTER_COUNTER_METRICS_FOR_DATA_STORAGE(create_keys_counter);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(create_time_us);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_keys_qps);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(copy_time_us);
+    REGISTER_STEAL_GAUGE_METRICS_FOR_DATA_STORAGE(create_time_us);
+    REGISTER_STEAL_GAUGE_METRICS_FOR_DATA_STORAGE(copy_keys_qps);
+    REGISTER_STEAL_GAUGE_METRICS_FOR_DATA_STORAGE(copy_time_us);
     REGISTER_COUNTER_METRICS_FOR_DATA_STORAGE(write_bytes_dispatched_total);
 
     return true;

@@ -143,12 +143,30 @@ double Gauge::Steal() {
     return old_v;
 }
 
+void Gauge::PublishPrometheusValue() noexcept {
+    if (value_->steal_on_prometheus_expose.load(std::memory_order_relaxed)) {
+        value_->prometheus_gauge_value.store(std::get<GaugeValue>(value_->value).load(std::memory_order_relaxed),
+                                             std::memory_order_release);
+    }
+}
+
+void Gauge::EnableStealOnPrometheusExpose() noexcept {
+    if (value_ == nullptr) {
+        return;
+    }
+    value_->steal_on_prometheus_expose.store(true, std::memory_order_relaxed);
+    if (value_->touched.load(std::memory_order_relaxed)) {
+        PublishPrometheusValue();
+    }
+}
+
 Gauge &Gauge::operator=(const double v) {
     if (value_ == nullptr) {
         return *this;
     }
     std::get<GaugeValue>(value_->value).store(v);
     MarkTouched();
+    PublishPrometheusValue();
     return *this;
 }
 
@@ -162,6 +180,7 @@ Gauge &Gauge::operator+=(const double v) {
         new_v = old_v + v;
     } while (!std::get<GaugeValue>(value_->value).compare_exchange_weak(old_v, new_v));
     MarkTouched();
+    PublishPrometheusValue();
     return *this;
 }
 
@@ -175,6 +194,7 @@ Gauge &Gauge::operator-=(const double v) {
         new_v = old_v - v;
     } while (!std::get<GaugeValue>(value_->value).compare_exchange_weak(old_v, new_v));
     MarkTouched();
+    PublishPrometheusValue();
     return *this;
 }
 
@@ -367,6 +387,12 @@ Gauge MetricsRegistry::GetGauge(const std::string &name, const MetricsTags &tags
     const auto metrics_data = GetOrCreateMetricsData(name);
     assert(metrics_data);
     return metrics_data->GetOrCreateGauge(tags);
+}
+
+Gauge MetricsRegistry::GetStealGauge(const std::string &name, const MetricsTags &tags) {
+    auto gauge = GetGauge(name, tags);
+    gauge.EnableStealOnPrometheusExpose();
+    return gauge;
 }
 
 void MetricsRegistry::RegisterHistogramFamily(const std::string &family_name) {

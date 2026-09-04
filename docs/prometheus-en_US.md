@@ -70,6 +70,9 @@ meta_indexer.total_key_count  ->  kvcm_meta_indexer_total_key_count
 
 `CounterValue` metrics are emitted as `# TYPE ... counter`.
 `GaugeValue` metrics are emitted as `# TYPE ... gauge`.
+Request-scoped gauges are emitted only once after each new sample; a later
+scrape omits them until another request updates them. State gauges such as
+`service.request_queue_size` remain visible on every scrape.
 
 `MetricsTags` (key-value pairs) are emitted as Prometheus labels:
 
@@ -127,6 +130,14 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `service.error_counter` | counter | Total error count |
 | `service.query_rt_us` | gauge | Last query response time (us) |
 | `service.request_queue_size` | gauge | Request queue size |
+| `http.request_counter` | counter | Parsed ReportEvent HTTP requests observed by the instrumented handler |
+| `http.service_query_counter` | counter | ReportEvent HTTP requests with a completed ServiceCallGuard sample |
+| `http.request_parse_time_us_sum` | counter | Cumulative JSON-to-protobuf parsing time for ReportEvent HTTP requests (us) |
+| `http.service_callback_time_us_sum` | counter | Cumulative ReportEvent HTTP callback time, including request-context setup and teardown (us) |
+| `http.response_serialize_time_us_sum` | counter | Cumulative protobuf-to-JSON response serialization time (us) |
+| `http.handler_time_us_sum` | counter | Cumulative ReportEvent arena-handler time, including arena cleanup (us) |
+| `http.service_query_rt_us_sum` | counter | Cumulative ServiceCallGuard query time for ReportEvent HTTP requests (us) |
+| `http.request_context_rt_us_sum` | counter | Cumulative request-context time captured before ServiceCallGuard reporting and access logging (us) |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
@@ -154,6 +165,26 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
+
+The `http.*` metrics are currently emitted only for `/api/reportEvent` and
+carry the same `api_name`, `instance_group`, `instance_id`, and optional
+`type` labels as its service collector. Calculate request-weighted stage
+averages from counter deltas, for example:
+
+```promql
+rate(kvcm_http_request_parse_time_us_sum[1m])
+  / rate(kvcm_http_request_counter[1m])
+
+rate(kvcm_http_service_query_rt_us_sum[1m])
+  / rate(kvcm_http_service_query_counter[1m])
+```
+
+`request_parse`, `service_callback`, and `response_serialize` partition the
+instrumented handler; `handler_time` additionally includes arena cleanup.
+The request body is already available when the handler starts, and the
+cinatra socket write happens after it returns. Therefore these counters do
+not measure body receive/event-loop wait or response socket-write time; use
+the gap between client latency and `handler_time` to bound that outer region.
 
 The GetHostCacheState phase metrics above are nested:
 `meta_indexer.get_io_time_us` is inside `meta_searcher.indexer_get_time_us`, and

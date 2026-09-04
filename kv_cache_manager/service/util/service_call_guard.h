@@ -26,10 +26,8 @@ private:
     RequestContext *request_context_;
     MetricsReporter *metrics_reporter_;
     std::function<void()> response_debug_setter_;
-    // Records per-request begin timestamp; writes (now - begin) to
-    // service.query_rt_us when the scope ends.  Explicitly reset in
-    // ~ServiceCallGuard() before ReportPerQuery, so declaration order
-    // does not matter.
+    // Records the query latency in the latest-value Gauge and returns the same
+    // request-local sample before reporting.
     ChronoScopeGuard query_scope_;
 };
 

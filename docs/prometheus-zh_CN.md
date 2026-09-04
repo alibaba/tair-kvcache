@@ -68,6 +68,8 @@ meta_indexer.total_key_count  ->  kvcm_meta_indexer_total_key_count
 
 `CounterValue` 类型的指标以 `# TYPE ... counter` 输出。
 `GaugeValue` 类型的指标以 `# TYPE ... gauge` 输出。
+逐请求 Gauge 在产生新样本后只输出一次；后续抓取会暂时省略，直到新请求再次
+更新。`service.request_queue_size` 等状态 Gauge 则会在每次抓取时持续输出。
 
 `MetricsTags`（键值对）以 Prometheus 标签形式输出：
 
@@ -124,6 +126,14 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.error_counter` | counter | 总错误次数 |
 | `service.query_rt_us` | gauge | 最近一次查询响应时间（微秒） |
 | `service.request_queue_size` | gauge | 请求队列大小 |
+| `http.request_counter` | counter | instrumented handler 已观测到并成功解析的 ReportEvent HTTP 请求数 |
+| `http.service_query_counter` | counter | 已产生完整 ServiceCallGuard 样本的 ReportEvent HTTP 请求数 |
+| `http.request_parse_time_us_sum` | counter | ReportEvent HTTP 请求 JSON→protobuf 解析累计耗时（微秒） |
+| `http.service_callback_time_us_sum` | counter | ReportEvent HTTP callback 累计耗时，包含 RequestContext 初始化和收尾（微秒） |
+| `http.response_serialize_time_us_sum` | counter | ReportEvent HTTP 响应 protobuf→JSON 序列化累计耗时（微秒） |
+| `http.handler_time_us_sum` | counter | ReportEvent arena handler 累计耗时，包含 Arena 清理（微秒） |
+| `http.service_query_rt_us_sum` | counter | ReportEvent HTTP 请求 ServiceCallGuard query 累计耗时（微秒） |
+| `http.request_context_rt_us_sum` | counter | ServiceCallGuard 上报和 access log 前捕获的 RequestContext 累计耗时（微秒） |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
@@ -151,6 +161,24 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。
+
+`http.*` 指标目前仅覆盖 `/api/reportEvent`，标签与其 service collector
+一致，包括 `api_name`、`instance_group`、`instance_id`，以及可选的
+`type`。应根据 counter 增量计算请求加权的阶段平均耗时，例如：
+
+```promql
+rate(kvcm_http_request_parse_time_us_sum[1m])
+  / rate(kvcm_http_request_counter[1m])
+
+rate(kvcm_http_service_query_rt_us_sum[1m])
+  / rate(kvcm_http_service_query_counter[1m])
+```
+
+`request_parse`、`service_callback`、`response_serialize` 划分了已打点的
+handler；`handler_time` 还包含 Arena 清理。进入 handler 时 request body
+已经接收完成，而 cinatra 会在 handler 返回后执行 socket write，因此这些
+counter 不覆盖 body 接收/事件循环等待和响应网络回写。排障时可用客户端 RT
+与 `handler_time` 的差值界定这一外围区间。
 
 上述 GetHostCacheState 分段指标是嵌套关系：`meta_indexer.get_io_time_us` 位于
 `meta_searcher.indexer_get_time_us` 内，后者与 projection/reduce 又位于

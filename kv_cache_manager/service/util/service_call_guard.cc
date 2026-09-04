@@ -40,7 +40,7 @@ public:
         // TODO  show request and response in debug mode
         // TODO Data Masking in request and response maybe
         int64_t cost_us =
-            kv_cache_manager::TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us();
+            kv_cache_manager::TimestampUtil::GetSteadyTimeUs() - request_context_->request_begin_steady_time_us();
 
         writer.StartObject();
         writer.Key("request_begin_time");
@@ -124,14 +124,14 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
 ServiceCallGuard::~ServiceCallGuard() {
     assert(cache_manager_);
     assert(request_context_);
-    // Member destructors run after this function body, so we explicitly end the
-    // scope here to flush query_rt_us into the Gauge; otherwise the subsequent
-    // ReportPerQuery would read the stale value from the previous request.
-    query_scope_ = ChronoScopeGuard{};
+    // Finish before reporting so the latest-value Gauge and the request-local
+    // timing sample describe the same query.
+    const auto query_rt_us = query_scope_.Finish();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context_->metrics_collector());
     const auto extra_collectors = request_context_->GetMetricsCollectorsVehicle().GetMetricsCollectors();
-    const double request_rt_us =
-        static_cast<double>(TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us());
+    const auto request_rt_us =
+        static_cast<std::uint64_t>(TimestampUtil::GetSteadyTimeUs() - request_context_->request_begin_steady_time_us());
+    request_context_->set_service_latency(query_rt_us, request_rt_us);
     // MetricsReporter treats any non-zero error_code sample as a failed
     // request, so this gauge is deliberately a 0/1 failure flag rather than
     // the wire enum value (where a successful request is non-zero).

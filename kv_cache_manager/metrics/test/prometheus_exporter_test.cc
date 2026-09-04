@@ -73,12 +73,42 @@ TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsReuseServiceTagsAndValu
     SET_METRICS_(&collector, service, query_rt_us, 321.);
 
     const std::string output = PrometheusExporter::Expose(*registry_);
-    const std::string labels =
-        "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
-        "instance_id=\"instance_a\",type=\"event_report_l2\"}";
+    const std::string labels = "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
+                               "instance_id=\"instance_a\",type=\"event_report_l2\"}";
     EXPECT_NE(output.find("kvcm_service_query_counter" + labels + " 1"), std::string::npos) << output;
     EXPECT_NE(output.find("kvcm_service_query_rt_us" + labels + " 321"), std::string::npos) << output;
     EXPECT_EQ(output.find("kvcm_event_report_request_counter"), std::string::npos) << output;
+}
+
+TEST_F(PrometheusExporterTest, RequestGaugeIsConsumedWhileStateGaugePersists) {
+    ServiceMetricsCollector request_collector(registry_);
+    ASSERT_TRUE(request_collector.Init());
+    SET_METRICS_(&request_collector, service, query_rt_us, 321.);
+    SET_METRICS_(&request_collector, service, request_queue_size, 7.);
+
+    const std::string first = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(first.find("kvcm_service_query_rt_us 321"), std::string::npos) << first;
+    EXPECT_NE(first.find("kvcm_service_request_queue_size 7"), std::string::npos) << first;
+
+    const std::string second = PrometheusExporter::Expose(*registry_);
+    EXPECT_EQ(second.find("kvcm_service_query_rt_us"), std::string::npos) << second;
+    EXPECT_NE(second.find("kvcm_service_request_queue_size 7"), std::string::npos) << second;
+
+    SET_METRICS_(&request_collector, service, query_rt_us, 654.);
+    const std::string third = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(third.find("kvcm_service_query_rt_us 654"), std::string::npos) << third;
+}
+
+TEST_F(PrometheusExporterTest, PrometheusConsumptionDoesNotRaceGaugeSteal) {
+    Gauge gauge = registry_->GetStealGauge("service.query_rt_us");
+    gauge = 123.;
+
+    EXPECT_DOUBLE_EQ(123., gauge.Steal());
+    const std::string first = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(first.find("kvcm_service_query_rt_us 123"), std::string::npos) << first;
+
+    const std::string second = PrometheusExporter::Expose(*registry_);
+    EXPECT_EQ(second.find("kvcm_service_query_rt_us"), std::string::npos) << second;
 }
 
 TEST_F(PrometheusExporterTest, MultipleTagSets) {
