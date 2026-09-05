@@ -152,10 +152,12 @@ void ServiceMetricsCollector::RecordHttpRequestLatency(const HttpRequestLatency 
     http_service_callback_time_us_sum_metrics_ += latency.service_callback_time_us;
     http_response_serialize_time_us_sum_metrics_ += latency.response_serialize_time_us;
     http_handler_time_us_sum_metrics_ += latency.handler_time_us;
-    http_request_receive_wait_time_us_sum_metrics_ += latency.request_receive_wait_time_us;
-    http_io_event_loop_lag_us_sum_metrics_ += latency.io_event_loop_lag_us;
-    http_response_build_time_us_sum_metrics_ += latency.response_build_time_us;
-    http_socket_write_time_us_sum_metrics_ += latency.socket_write_time_us;
+    if (latency.has_http_io_metrics) {
+        http_request_receive_wait_time_us_sum_metrics_ += latency.request_receive_wait_time_us;
+        http_io_event_loop_lag_us_sum_metrics_ += latency.io_event_loop_lag_us;
+        http_response_build_time_us_sum_metrics_ += latency.response_build_time_us;
+        http_socket_write_time_us_sum_metrics_ += latency.socket_write_time_us;
+    }
 }
 
 bool ServiceMetricsCollector::Init() {

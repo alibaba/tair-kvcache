@@ -168,6 +168,7 @@ CoroHttpService::HandlerType CoroHttpService::GetArenaHandler(
         req.set_http_io_metrics_callback(
             [collector = std::move(metrics_sample.collector),
              latency = metrics_sample.latency](const coro_http::http_io_metrics &io_metrics) mutable {
+                latency.has_http_io_metrics = true;
                 latency.request_receive_wait_time_us = io_metrics.request_receive_wait_time_us;
                 latency.io_event_loop_lag_us = io_metrics.io_event_loop_lag_us;
                 latency.response_build_time_us = io_metrics.response_build_time_us;

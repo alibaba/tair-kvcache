@@ -55,6 +55,20 @@ ErrorCode BeginSnapshotForRegisteredReporter(EventReportBackend &backend,
     return backend.BeginSnapshot(reporter_key, out_candidate_version, out_retry_after_ms);
 }
 
+MetricsTags LockMetricTags(const std::string &lock_name, const std::string &operation) {
+    return {{"lock_name", lock_name},
+            {"operation", operation},
+            {"type", "event_report_l1p5"},
+            {"unique_name", "event_report_test_group"}};
+}
+
+Counter GetLockMetric(const std::shared_ptr<MetricsRegistry> &registry,
+                      const std::string &metric_name,
+                      const std::string &lock_name,
+                      const std::string &operation) {
+    return registry->GetCounter(metric_name, LockMetricTags(lock_name, operation));
+}
+
 // (1) GetType / Available / Create-Delete EC_UNIMPLEMENTED / GetStorageUsageRatio=1.0
 TEST_F(EventReportBackendTest, BasicAccessors) {
     EventReportBackend backend(metrics_registry_);
@@ -151,6 +165,93 @@ TEST_F(EventReportBackendTest, CloseInterruptsLongLivenessWait) {
     ASSERT_EQ(EC_OK, backend.Close());
     const auto close_elapsed = std::chrono::steady_clock::now() - close_begin;
     EXPECT_LT(close_elapsed, 2s);
+}
+
+TEST_F(EventReportBackendTest, RequestedLockPathsRecordWaitHoldAndAcquireCount) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 60000), "trace"));
+    const ReporterSnapshotKey reporter_key{"test_inst", "10.0.0.1:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    auto acquire = [&](const std::string &lock_name, const std::string &operation) {
+        return GetLockMetric(metrics_registry_, "event.lock_acquire_counter", lock_name, operation);
+    };
+    const auto begin_before = acquire("nodes_mutex", "begin").Get();
+    const auto end_before = acquire("nodes_mutex", "end").Get();
+    const auto snapshot_get_before = acquire("nodes_mutex", "snapshot_get").Get();
+    const auto ensure_node_before = acquire("nodes_mutex", "ensure_node").Get();
+    const auto lifecycle_before = acquire("lifecycle_fences_mutex", "access").Get();
+
+    ASSERT_EQ(EC_OK, backend.EnsureNodeRegistered(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    EXPECT_TRUE(backend.GetSnapshotVersion(reporter_key).empty());
+    std::string committed_version;
+    uint64_t lifecycle_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed_version, &lifecycle_generation));
+    backend.EndDeltaMutation(reporter_key, lifecycle_generation, committed_version);
+    EventReportBackend::LifecycleMutationLease lifecycle_lease;
+    ASSERT_EQ(EC_OK, backend.AcquireLifecycleMutationLease(reporter_key, lifecycle_generation, lifecycle_lease));
+    lifecycle_lease.reset();
+
+    EXPECT_EQ(begin_before + 1, acquire("nodes_mutex", "begin").Get());
+    EXPECT_EQ(end_before + 1, acquire("nodes_mutex", "end").Get());
+    EXPECT_EQ(snapshot_get_before + 1, acquire("nodes_mutex", "snapshot_get").Get());
+    EXPECT_EQ(ensure_node_before + 1, acquire("nodes_mutex", "ensure_node").Get());
+    EXPECT_EQ(lifecycle_before + 1, acquire("lifecycle_fences_mutex", "access").Get());
+
+    for (const auto &[lock_name, operation] :
+         std::vector<std::pair<std::string, std::string>>{{"nodes_mutex", "begin"},
+                                                          {"nodes_mutex", "end"},
+                                                          {"nodes_mutex", "snapshot_get"},
+                                                          {"nodes_mutex", "ensure_node"},
+                                                          {"lifecycle_fences_mutex", "access"}}) {
+        const auto wait = GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", lock_name, operation);
+        const auto hold = GetLockMetric(metrics_registry_, "event.lock_hold_time_us_sum", lock_name, operation);
+        ASSERT_NE(nullptr, wait.GetRaw());
+        ASSERT_NE(nullptr, hold.GetRaw());
+        EXPECT_TRUE(wait.GetRaw()->touched.load(std::memory_order_relaxed));
+        EXPECT_TRUE(hold.GetRaw()->touched.load(std::memory_order_relaxed));
+    }
+}
+
+TEST_F(EventReportBackendTest, ContendedGlobalLocksAccumulateWaitTime) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 60000), "trace"));
+    const ReporterSnapshotKey reporter_key{"test_inst", "10.0.0.1:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    const uint64_t lifecycle_generation =
+        backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
+
+    auto nodes_wait = GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", "nodes_mutex", "snapshot_get");
+    const auto nodes_wait_before = nodes_wait.Get();
+    std::unique_lock<std::shared_mutex> nodes_guard(backend.nodes_mutex_);
+    std::promise<void> nodes_started;
+    auto nodes_started_future = nodes_started.get_future();
+    auto snapshot_future = std::async(std::launch::async, [&] {
+        nodes_started.set_value();
+        return backend.GetSnapshotVersion(reporter_key);
+    });
+    nodes_started_future.wait();
+    std::this_thread::sleep_for(50ms);
+    nodes_guard.unlock();
+    EXPECT_TRUE(snapshot_future.get().empty());
+    EXPECT_GE(nodes_wait.Get() - nodes_wait_before, 20000u);
+
+    auto lifecycle_wait =
+        GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", "lifecycle_fences_mutex", "access");
+    const auto lifecycle_wait_before = lifecycle_wait.Get();
+    std::unique_lock<std::mutex> lifecycle_guard(backend.lifecycle_fences_mutex_);
+    std::promise<void> lifecycle_started;
+    auto lifecycle_started_future = lifecycle_started.get_future();
+    auto lease_future = std::async(std::launch::async, [&] {
+        lifecycle_started.set_value();
+        EventReportBackend::LifecycleMutationLease lease;
+        return backend.AcquireLifecycleMutationLease(reporter_key, lifecycle_generation, lease);
+    });
+    lifecycle_started_future.wait();
+    std::this_thread::sleep_for(50ms);
+    lifecycle_guard.unlock();
+    EXPECT_EQ(EC_OK, lease_future.get());
+    EXPECT_GE(lifecycle_wait.Get() - lifecycle_wait_before, 20000u);
 }
 
 // (2) RegisterNode / UnregisterNode

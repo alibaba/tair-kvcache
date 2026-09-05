@@ -143,6 +143,9 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `http.io_event_loop_lag_us_sum` | counter | Cumulative maximum I/O-loop timer lag observed since the previous instrumented request on the same I/O thread (us) |
 | `http.response_build_time_us_sum` | counter | Cumulative cinatra HTTP response header/buffer construction time (us) |
 | `http.socket_write_time_us_sum` | counter | Cumulative time spent awaiting cinatra's full-response socket `async_write` (us) |
+| `event.lock_wait_time_us_sum` | counter | Cumulative EventReport global-lock wait time (us), split by `lock_name`, `operation`, `type`, and `unique_name` |
+| `event.lock_hold_time_us_sum` | counter | Cumulative EventReport global-lock hold time (us), with the same labels |
+| `event.lock_acquire_counter` | counter | Successful EventReport global-lock acquisitions, with the same labels |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
@@ -202,6 +205,18 @@ an additive latency stage. `response_build` and `socket_write` occur after
 the handler returns; socket write ends when the server-side `async_write`
 completes and excludes client response reading. Client send/read/JSON parsing
 still requires client-side instrumentation.
+
+The four cinatra I/O counters are written only when the current build provides the
+`CINATRA_HAS_HTTP_IO_METRICS` hook. If `http.request_counter` advances while all four
+series are absent, the binary does not support those exact boundaries; unsupported
+measurements are no longer exported as misleading zeroes. An application handler or
+aspect cannot accurately reconstruct stages before and after the handler, so exact
+server-side values require an upgraded/modified cinatra; client-side timings remain
+end-to-end approximations.
+
+For EventReport lock metrics, `lock_name="nodes_mutex"` supports the `begin`, `end`,
+`snapshot_get`, and `ensure_node` operations. `lock_name="lifecycle_fences_mutex"`
+uses `operation="access"`.
 
 The GetHostCacheState phase metrics above are nested:
 `meta_indexer.get_io_time_us` is inside `meta_searcher.indexer_get_time_us`, and

@@ -254,6 +254,7 @@ public:                                                                         
 
 struct HttpRequestLatency {
     bool has_service_latency{false};
+    bool has_http_io_metrics{false};
     std::uint64_t service_query_rt_us{0};
     std::uint64_t request_context_rt_us{0};
     std::uint64_t service_finalize_time_us{0};

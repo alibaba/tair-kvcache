@@ -18,6 +18,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -44,6 +45,54 @@ std::string GenerateSnapshotVersionToken() {
 
 } // namespace
 
+template <typename LockType>
+class EventReportBackend::TimedLock {
+public:
+    template <typename Mutex>
+    TimedLock(Mutex &mutex, const LockMetrics &metrics)
+        : metrics_(metrics), wait_begin_us_(TimestampUtil::GetSteadyTimeUs()), lock_(mutex) {
+        RecordAcquired();
+    }
+
+    ~TimedLock() {
+        if (lock_.owns_lock()) {
+            Release();
+        }
+    }
+
+    TimedLock(const TimedLock &) = delete;
+    TimedLock &operator=(const TimedLock &) = delete;
+
+    void lock() {
+        wait_begin_us_ = TimestampUtil::GetSteadyTimeUs();
+        lock_.lock();
+        RecordAcquired();
+    }
+
+    void unlock() { Release(); }
+
+private:
+    void RecordAcquired() {
+        hold_begin_us_ = TimestampUtil::GetSteadyTimeUs();
+        wait_time_us_ = static_cast<std::uint64_t>(hold_begin_us_ - wait_begin_us_);
+    }
+
+    void Release() {
+        const auto hold_time_us = static_cast<std::uint64_t>(TimestampUtil::GetSteadyTimeUs() - hold_begin_us_);
+        lock_.unlock();
+        metrics_.wait_time_us_sum += wait_time_us_;
+        metrics_.hold_time_us_sum += hold_time_us;
+        ++metrics_.acquire_counter;
+        hold_begin_us_ = 0;
+    }
+
+    LockMetrics metrics_;
+    std::int64_t wait_begin_us_;
+    LockType lock_;
+    std::int64_t hold_begin_us_ = 0;
+    std::uint64_t wait_time_us_ = 0;
+};
+
 EventReportBackend::EventReportBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
     : DataStorageBackend(std::move(metrics_registry)) {}
 
@@ -53,9 +102,29 @@ EventReportBackend::~EventReportBackend() {
     }
 }
 
+void EventReportBackend::InitLockMetrics(const StorageConfig &config) {
+    if (!metrics_registry_) {
+        return;
+    }
+    auto init_metrics = [&](LockMetrics &metrics, const std::string &lock_name, const std::string &operation) {
+        const MetricsTags tags{{"lock_name", lock_name},
+                               {"operation", operation},
+                               {"type", ToString(config.type())},
+                               {"unique_name", config.global_unique_name()}};
+        metrics.wait_time_us_sum = metrics_registry_->GetCounter("event.lock_wait_time_us_sum", tags);
+        metrics.hold_time_us_sum = metrics_registry_->GetCounter("event.lock_hold_time_us_sum", tags);
+        metrics.acquire_counter = metrics_registry_->GetCounter("event.lock_acquire_counter", tags);
+    };
+    init_metrics(nodes_mutex_begin_metrics_, "nodes_mutex", "begin");
+    init_metrics(nodes_mutex_end_metrics_, "nodes_mutex", "end");
+    init_metrics(nodes_mutex_snapshot_get_metrics_, "nodes_mutex", "snapshot_get");
+    init_metrics(nodes_mutex_ensure_node_metrics_, "nodes_mutex", "ensure_node");
+    init_metrics(lifecycle_fences_mutex_metrics_, "lifecycle_fences_mutex", "access");
+}
+
 std::shared_ptr<EventReportBackend::LifecycleFence>
 EventReportBackend::GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporter_key) {
-    std::lock_guard<std::mutex> lock(lifecycle_fences_mutex_);
+    TimedLock<std::unique_lock<std::mutex>> lock(lifecycle_fences_mutex_, lifecycle_fences_mutex_metrics_);
     auto &fence = lifecycle_fences_[reporter_key];
     if (!fence) {
         fence = std::make_shared<LifecycleFence>();
@@ -65,7 +134,7 @@ EventReportBackend::GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporte
 
 std::shared_ptr<EventReportBackend::LifecycleFence>
 EventReportBackend::FindLifecycleFence(const ReporterSnapshotKey &reporter_key) const {
-    std::lock_guard<std::mutex> lock(lifecycle_fences_mutex_);
+    TimedLock<std::unique_lock<std::mutex>> lock(lifecycle_fences_mutex_, lifecycle_fences_mutex_metrics_);
     const auto it = lifecycle_fences_.find(reporter_key);
     return it == lifecycle_fences_.end() ? nullptr : it->second;
 }
@@ -113,6 +182,7 @@ ErrorCode EventReportBackend::DoOpen(const StorageConfig &config, const std::str
         return EC_ERROR;
     }
     spec_ = *spec;
+    InitLockMetrics(config);
     heartbeat_timeout_ms_ = spec_.heartbeat_timeout_ms();
     cleanup_grace_ms_ = spec_.cleanup_grace_ms();
     liveness_check_interval_ms_ = spec_.liveness_check_interval_ms();
@@ -174,7 +244,7 @@ ErrorCode EventReportBackend::Close() {
     }
     std::vector<std::shared_ptr<LifecycleFence>> fence_refs;
     {
-        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
+        TimedLock<std::unique_lock<std::mutex>> fences_guard(lifecycle_fences_mutex_, lifecycle_fences_mutex_metrics_);
         fence_refs.reserve(lifecycle_fences_.size());
         for (const auto &entry : lifecycle_fences_) {
             if (entry.second) {
@@ -202,7 +272,7 @@ ErrorCode EventReportBackend::Close() {
         snapshot_token_owners_.clear();
     }
     {
-        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
+        TimedLock<std::unique_lock<std::mutex>> fences_guard(lifecycle_fences_mutex_, lifecycle_fences_mutex_metrics_);
         lifecycle_fences_.clear();
     }
     fence_locks.clear();
@@ -320,7 +390,7 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
     // lock before it is merged (lock-based double check; the map itself must
     // never be read without nodes_mutex_).
     {
-        std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+        TimedLock<std::shared_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_ensure_node_metrics_);
         auto instance_it = instance_nodes_.find(instance_id);
         if (instance_it != instance_nodes_.end()) {
             auto node_it = instance_it->second.find(host_ip_port);
@@ -342,7 +412,7 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
     // lease, and new deltas still need to reach the bounded snapshot gate
     // instead of blocking here indefinitely.
     {
-        std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+        TimedLock<std::unique_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_ensure_node_metrics_);
         if (!AcceptingReports()) {
             return EC_INSTANCE_NOT_EXIST;
         }
@@ -362,7 +432,7 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    TimedLock<std::unique_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_ensure_node_metrics_);
     auto &host_map = instance_nodes_[instance_id];
     if (auto it = host_map.find(host_ip_port); it != host_map.end()) {
         // Another request may have created the node between the fast-path
@@ -953,7 +1023,7 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
     if (reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return EC_BADARGS;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    TimedLock<std::unique_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_begin_metrics_);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
@@ -1015,7 +1085,7 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
 void EventReportBackend::EndDeltaMutation(const ReporterSnapshotKey &reporter_key,
                                           uint64_t lifecycle_generation,
                                           const std::string &expected_snapshot_version) {
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    TimedLock<std::unique_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_end_metrics_);
     auto it = snapshot_versions_.find(reporter_key);
     if (it != snapshot_versions_.end() && !expected_snapshot_version.empty() &&
         it->second.committed != expected_snapshot_version) {
@@ -1312,7 +1382,7 @@ void EventReportBackend::AbortSnapshotVersion(const ReporterSnapshotKey &reporte
 }
 
 std::string EventReportBackend::GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const {
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    TimedLock<std::shared_lock<std::shared_mutex>> lock(nodes_mutex_, nodes_mutex_snapshot_get_metrics_);
     auto it = snapshot_versions_.find(reporter_key);
     return it == snapshot_versions_.end() ? std::string{} : it->second.committed;
 }

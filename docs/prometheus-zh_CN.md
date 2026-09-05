@@ -139,6 +139,9 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `http.io_event_loop_lag_us_sum` | counter | 请求进入 handler 前，同一 I/O 线程自上次已打点请求以来观测到的最大 event-loop timer 延迟累计值（微秒） |
 | `http.response_build_time_us_sum` | counter | cinatra 构建 HTTP response header/buffer 的累计耗时（微秒） |
 | `http.socket_write_time_us_sum` | counter | cinatra `async_write` 将完整响应写入 socket 的累计等待时间（微秒） |
+| `event.lock_wait_time_us_sum` | counter | EventReport 指定全局锁等待累计耗时（微秒），按 `lock_name`、`operation`、`type`、`unique_name` 区分 |
+| `event.lock_hold_time_us_sum` | counter | EventReport 指定全局锁持有累计耗时（微秒），标签同上 |
+| `event.lock_acquire_counter` | counter | EventReport 指定全局锁实际成功加锁次数，标签同上 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
@@ -193,6 +196,14 @@ handler；`handler_time` 还包含 Arena 清理。`service_finalize` 是
 `response_build` 和 `socket_write` 位于 handler 返回之后；后者止于
 服务端 `async_write` 完成，不包含客户端读取响应。客户端 send/read/JSON 解析
 仍需由压测端单独采集。
+
+四项 cinatra I/O counter 仅在当前构建提供 `CINATRA_HAS_HTTP_IO_METRICS` hook 时写入。若
+`http.request_counter` 持续增加而四项 series 均不存在，表示当前二进制不支持这些精确边界；它们不会再以
+误导性的 0 导出。应用层 handler 或 aspect 无法准确补出 handler 之前和之后的阶段，需升级/修改 cinatra
+或在客户端采集近似的端到端分段。
+
+EventReport 锁指标的 `lock_name="nodes_mutex"` 支持 `operation="begin"`、`"end"`、
+`"snapshot_get"`、`"ensure_node"`；`lock_name="lifecycle_fences_mutex"` 使用 `operation="access"`。
 
 上述 GetHostCacheState 分段指标是嵌套关系：`meta_indexer.get_io_time_us` 位于
 `meta_searcher.indexer_get_time_us` 内，后者与 projection/reduce 又位于

@@ -321,6 +321,25 @@ TEST_F(PrometheusExporterTest, CounterIncrementedThenResetAppears) {
     EXPECT_NE(output.find("kvcm_service_query_counter 0"), std::string::npos) << "Actual output:\n" << output;
 }
 
+TEST_F(PrometheusExporterTest, HttpIoSeriesAreAbsentWithoutFrameworkSample) {
+    ServiceMetricsCollector collector(registry_, MetricsTags{{"api_name", "ReportEvent"}});
+    ASSERT_TRUE(collector.Init());
+
+    HttpRequestLatency latency;
+    latency.request_parse_time_us = 7;
+    latency.handler_time_us = 11;
+    collector.RecordHttpRequestLatency(latency);
+
+    const std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_http_request_counter{api_name=\"ReportEvent\"} 1"), std::string::npos) << output;
+    EXPECT_NE(output.find("kvcm_http_request_parse_time_us_sum{api_name=\"ReportEvent\"} 7"), std::string::npos)
+        << output;
+    EXPECT_EQ(output.find("kvcm_http_request_receive_wait_time_us_sum"), std::string::npos) << output;
+    EXPECT_EQ(output.find("kvcm_http_io_event_loop_lag_us_sum"), std::string::npos) << output;
+    EXPECT_EQ(output.find("kvcm_http_response_build_time_us_sum"), std::string::npos) << output;
+    EXPECT_EQ(output.find("kvcm_http_socket_write_time_us_sum"), std::string::npos) << output;
+}
+
 // Histogram output tests
 
 TEST_F(PrometheusExporterTest, HistogramBasicOutput) {

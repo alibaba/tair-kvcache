@@ -258,6 +258,7 @@ TEST_F(MetricsCollectorTest, ServiceMetricsTest) {
 
     HttpRequestLatency latency;
     latency.has_service_latency = true;
+    latency.has_http_io_metrics = true;
     latency.service_query_rt_us = 100;
     latency.request_context_rt_us = 130;
     latency.service_finalize_time_us = 25;
@@ -300,10 +301,10 @@ TEST_F(MetricsCollectorTest, ServiceMetricsTest) {
     EXPECT_EQ(GET(p, http, request_context_rt_us_sum), 130);
     EXPECT_EQ(GET(p, http, service_finalize_time_us_sum), 25);
     EXPECT_EQ(GET(p, http, handler_time_us_sum), 222);
-    EXPECT_EQ(GET(p, http, request_receive_wait_time_us_sum), 204);
-    EXPECT_EQ(GET(p, http, io_event_loop_lag_us_sum), 20);
-    EXPECT_EQ(GET(p, http, response_build_time_us_sum), 14);
-    EXPECT_EQ(GET(p, http, socket_write_time_us_sum), 16);
+    EXPECT_EQ(GET(p, http, request_receive_wait_time_us_sum), 200);
+    EXPECT_EQ(GET(p, http, io_event_loop_lag_us_sum), 15);
+    EXPECT_EQ(GET(p, http, response_build_time_us_sum), 8);
+    EXPECT_EQ(GET(p, http, socket_write_time_us_sum), 9);
 
     // Test time measurement
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, ServiceQuery);

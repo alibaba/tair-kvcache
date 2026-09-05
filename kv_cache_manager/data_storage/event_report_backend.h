@@ -168,6 +168,16 @@ private:
     bool AcceptingReports() const { return !retired_.load(std::memory_order_acquire) && (!IsOpen() || IsAvailable()); }
     bool Retired() const { return retired_.load(std::memory_order_acquire); }
 
+    struct LockMetrics {
+        Counter wait_time_us_sum;
+        Counter hold_time_us_sum;
+        Counter acquire_counter;
+    };
+    template <typename LockType>
+    class TimedLock;
+
+    void InitLockMetrics(const StorageConfig &config);
+
     struct LifecycleFence {
         mutable std::shared_mutex mutex;
         uint64_t generation = 0;
@@ -211,6 +221,12 @@ private:
     }
 
     EventReportStorageSpec spec_;
+
+    LockMetrics nodes_mutex_begin_metrics_;
+    LockMetrics nodes_mutex_end_metrics_;
+    LockMetrics nodes_mutex_snapshot_get_metrics_;
+    LockMetrics nodes_mutex_ensure_node_metrics_;
+    LockMetrics lifecycle_fences_mutex_metrics_;
 
     mutable std::shared_mutex nodes_mutex_;
     // Final metadata writes may already hold a MetaIndexer lock, while host
