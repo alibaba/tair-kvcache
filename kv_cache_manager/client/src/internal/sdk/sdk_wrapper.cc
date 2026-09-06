@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <charconv>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
@@ -31,10 +32,32 @@ SdkWrapper::~SdkWrapper() {
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
                                  const SharedMemoryRegistration *shared_memory_registration) {
+    return InitInternal(client_config, init_params, false, 0, shared_memory_registration);
+}
+
+ClientErrorCode SdkWrapper::InitForKvMeta(const std::unique_ptr<ClientConfig> &client_config,
+                                          const InitParams &init_params,
+                                          std::uint64_t max_object_bytes,
+                                          const SharedMemoryRegistration *shared_memory_registration) {
+    if (max_object_bytes == 0 || max_object_bytes > std::numeric_limits<std::size_t>::max()) {
+        KVCM_LOG_WARN("KVMeta max object bytes is invalid: %llu",
+                      static_cast<unsigned long long>(max_object_bytes));
+        return ER_INVALID_PARAMS;
+    }
+    return InitInternal(client_config, init_params, true, max_object_bytes, shared_memory_registration);
+}
+
+ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &client_config,
+                                         const InitParams &init_params,
+                                         bool variable_object_size_enabled,
+                                         std::uint64_t max_object_bytes,
+                                         const SharedMemoryRegistration *shared_memory_registration) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
     }
+    variable_object_size_enabled_ = variable_object_size_enabled;
+    max_variable_object_bytes_ = max_object_bytes;
     wrapper_config_ = client_config->sdk_wrapper_config();
     if (!wrapper_config_) {
         KVCM_LOG_WARN("sdk wrapper config is null");
@@ -103,6 +126,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
+        sdk_backend_config->set_variable_object_size_policy(variable_object_size_enabled, max_object_bytes);
         // 注入静态超时预算：后端用它从自身任务起点起算 deadline 并自律（内部取消）。
         // 不读取该字段的后端（tair_mempool 等）行为不受影响。
         sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
@@ -226,6 +250,140 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     return ER_OK;
 }
 
+ClientErrorCode SdkWrapper::GetKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
+                                             const std::vector<std::uint64_t> &value_sizes,
+                                             const BlockBuffers &local_buffers) {
+    auto ec = ValidateKvMetaObjects(remote_uris, value_sizes, local_buffers);
+    if (ec != ER_OK) {
+        return ec;
+    }
+
+    // Fixed-size backends may interpret every element in one SDK call as a
+    // block in the same allocation (for example path + blkid * block_size).
+    // KVMeta objects are allocated independently and can have different
+    // sizes, so never rebatch them through the regular fixed-size data path.
+    // Resolve every SDK before submitting work to avoid partial I/O when one
+    // URI is invalid or points at an unavailable backend.
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.reserve(remote_uris.size());
+    for (std::size_t i = 0; i < remote_uris.size(); ++i) {
+        auto sdk = GetSdk(remote_uris[i]);
+        if (!sdk) {
+            KVCM_LOG_WARN("get KVMeta object failed, no sdk found for hostname: %s",
+                          remote_uris[i].GetHostName().c_str());
+            return ER_GETSDK_ERROR;
+        }
+        std::vector<DataStorageUri> object_uri{remote_uris[i]};
+        BlockBuffers object_buffer{local_buffers[i]};
+        tasks.push_back([sdk, object_uri = std::move(object_uri), object_buffer = std::move(object_buffer)]() {
+            return sdk->Get(object_uri, object_buffer);
+        });
+    }
+
+    // Callers own the exact-size buffers. On timeout/error, wait for an
+    // already-running backend operation to stop before returning so it can no
+    // longer access those buffers. This stronger drain is KVMeta-only.
+    return RunWithTimeoutParallel(
+        OpType::GET, std::move(tasks), wrapper_config_->timeout_config().get_timeout_ms(), true);
+}
+
+ClientErrorCode SdkWrapper::PutKvMetaObjects(
+    const std::vector<DataStorageUri> &remote_uris,
+    const std::vector<std::uint64_t> &value_sizes,
+    const BlockBuffers &local_buffers,
+    std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+    if (!actual_remote_uris) {
+        return ER_INVALID_PARAMS;
+    }
+    actual_remote_uris->clear();
+    auto ec = ValidateKvMetaObjects(remote_uris, value_sizes, local_buffers);
+    if (ec != ER_OK) {
+        return ec;
+    }
+
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    std::vector<std::shared_ptr<std::vector<DataStorageUri>>> object_results;
+    tasks.reserve(remote_uris.size());
+    object_results.reserve(remote_uris.size());
+    for (std::size_t i = 0; i < remote_uris.size(); ++i) {
+        auto sdk = GetSdk(remote_uris[i]);
+        if (!sdk) {
+            KVCM_LOG_WARN("put KVMeta object failed, no sdk found for hostname: %s",
+                          remote_uris[i].GetHostName().c_str());
+            return ER_GETSDK_ERROR;
+        }
+        std::vector<DataStorageUri> object_uri{remote_uris[i]};
+        BlockBuffers object_buffer{local_buffers[i]};
+        auto object_result = std::make_shared<std::vector<DataStorageUri>>();
+        object_results.push_back(object_result);
+        tasks.push_back([sdk,
+                         object_uri = std::move(object_uri),
+                         object_buffer = std::move(object_buffer),
+                         object_result]() {
+            return sdk->Put(object_uri, object_buffer, object_result);
+        });
+    }
+
+    ec = RunWithTimeoutParallel(
+        OpType::PUT, std::move(tasks), wrapper_config_->timeout_config().put_timeout_ms(), true);
+    if (ec != ER_OK) {
+        return ec;
+    }
+
+    std::vector<DataStorageUri> aggregated_uris;
+    aggregated_uris.reserve(object_results.size());
+    for (const auto &object_result : object_results) {
+        if (object_result->size() != 1) {
+            KVCM_LOG_WARN("KVMeta sdk returned mismatched actual_uris size: %zu vs 1", object_result->size());
+            return ER_SDKWRITE_ERROR;
+        }
+        aggregated_uris.push_back((*object_result)[0]);
+    }
+    *actual_remote_uris = std::move(aggregated_uris);
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
+                                                  const std::vector<std::uint64_t> &value_sizes,
+                                                  const BlockBuffers &local_buffers) const {
+    if (!variable_object_size_enabled_ || max_variable_object_bytes_ == 0 || remote_uris.empty() ||
+        remote_uris.size() != value_sizes.size() || remote_uris.size() != local_buffers.size()) {
+        return ER_INVALID_PARAMS;
+    }
+    for (std::size_t i = 0; i < remote_uris.size(); ++i) {
+        const auto expected_size = value_sizes[i];
+        const auto &uri = remote_uris[i];
+        const auto &buffer = local_buffers[i];
+        if (expected_size == 0 || expected_size > max_variable_object_bytes_ || !uri.Valid() ||
+            uri.GetHostName().empty() || !uri.HasParam("size") || buffer.iovs.empty()) {
+            return ER_INVALID_PARAMS;
+        }
+
+        const std::string uri_size_text = uri.GetParam("size");
+        std::uint64_t uri_size = 0;
+        const auto parse_result =
+            std::from_chars(uri_size_text.data(), uri_size_text.data() + uri_size_text.size(), uri_size);
+        if (uri_size_text.empty() || parse_result.ec != std::errc{} ||
+            parse_result.ptr != uri_size_text.data() + uri_size_text.size() || uri_size != expected_size) {
+            return ER_INVALID_PARAMS;
+        }
+
+        std::uint64_t buffer_size = 0;
+        for (const auto &iov : buffer.iovs) {
+            if (iov.ignore || iov.size == 0 || buffer_size > expected_size ||
+                iov.size > expected_size - buffer_size || iov.base == nullptr ||
+                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU)) {
+                return ER_INVALID_LOCAL_BUFFERS;
+            }
+            buffer_size += iov.size;
+        }
+        if (buffer_size != expected_size) {
+            return ER_INVALID_LOCAL_BUFFERS;
+        }
+    }
+    return ER_OK;
+}
+
 ClientErrorCode SdkWrapper::Valid(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers local_buffers) {
     if (remote_uris.empty() || local_buffers.empty() || remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_WARN(
@@ -271,7 +429,8 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
 
 ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                                                    std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                                   int timeout_ms) const {
+                                                   int timeout_ms,
+                                                   bool wait_for_inflight) const {
     if (tasks.empty()) {
         return ER_OK;
     }
@@ -311,14 +470,18 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
-    // 超时路径调用它时 deadline 已过，wait_until 立即返回，保持"超时立即返回"语义；
-    // 普通错误路径则真正等待在飞 peer（此时 deadline 未到，SDK 仍在契约窗口内写
-    // caller buffer，不等就返回会让 caller 在 hard backend 仍在读写时复用/释放 buffer）。
+    // Regular calls keep the existing bounded drain: stop queued work and wait
+    // for peers only until the deadline. KVMeta uses a stronger drain because
+    // its caller-owned exact-size buffers can be released immediately after
+    // return; in-flight backend access must therefore finish first.
     auto drain = [&](size_t from) {
         stop->store(true);
         for (size_t j = from; j < futures.size(); ++j) {
-            futures[j].wait_until(deadline);
+            if (wait_for_inflight) {
+                futures[j].wait();
+            } else {
+                futures[j].wait_until(deadline);
+            }
         }
     };
 
@@ -334,7 +497,11 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                           i + 1,
                           futures.size(),
                           static_cast<long long>(overdue_ms));
-            drain(i + 1);
+            // The regular fixed-size path preserves its existing immediate
+            // timeout behavior. KVMeta drains the timed-out task as well,
+            // because its caller-owned variable-size buffer may be released
+            // as soon as this method returns.
+            drain(wait_for_inflight ? i : i + 1);
             return ER_SDK_TIMEOUT;
         }
 

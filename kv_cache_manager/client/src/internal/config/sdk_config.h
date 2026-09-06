@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <unordered_map>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -65,12 +66,24 @@ public:
     const SdkTimeoutConfig &timeout_config() const { return timeout_config_; }
     void set_timeout_config(const SdkTimeoutConfig &value) { timeout_config_ = value; }
 
+    // Runtime-only policy used by the isolated KVMeta object data plane. The
+    // regular TransferClient never enables it and therefore retains exact
+    // location-spec size validation.
+    bool variable_object_size_enabled() const { return variable_object_size_enabled_; }
+    std::uint64_t max_variable_object_bytes() const { return max_variable_object_bytes_; }
+    void set_variable_object_size_policy(bool enabled, std::uint64_t max_object_bytes) {
+        variable_object_size_enabled_ = enabled;
+        max_variable_object_bytes_ = max_object_bytes;
+    }
+
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
     SdkTimeoutConfig timeout_config_;
+    bool variable_object_size_enabled_{false};
+    std::uint64_t max_variable_object_bytes_{0};
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {

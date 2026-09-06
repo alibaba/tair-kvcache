@@ -683,6 +683,42 @@ TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
 }
 
+// KVMeta buffers are caller-owned and may be destroyed as soon as the API
+// returns. Its opt-in safe drain must therefore wait for an in-flight peer on
+// an error, while TestNoUnboundedWaitOnTimeout above keeps the regular path's
+// existing bounded-return contract unchanged.
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTask) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(2, 8, "KvMetaSafeDrainTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> slow_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([&]() {
+        while (!slow_started.load()) {
+            std::this_thread::yield();
+        }
+        return ER_SDKREAD_ERROR;
+    });
+    tasks.push_back([&]() {
+        slow_started.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        slow_finished.store(true);
+        return ER_OK;
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto ec = sdk_wrapper.RunWithTimeoutParallel(
+        SdkWrapper::OpType::GET, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_EQ(ER_SDKREAD_ERROR, ec);
+    EXPECT_TRUE(slow_finished.load());
+    EXPECT_GE(elapsed_ms, 100);
+}
+
 // 验证静态预算注入：wrapper 在 Init 阶段把自身 timeout_config 注入
 // SdkBackendConfig，后端（fake 观测面）读到的是同一份预算 —— 这是后端
 // "从自身任务起点起算 deadline 并自律"的数据来源。

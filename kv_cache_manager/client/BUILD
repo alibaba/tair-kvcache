@@ -22,6 +22,8 @@ cc_library(
     deps = [
         ":client_impl",
         ":kv_meta_client_impl",
+        ":kv_meta_object_client_impl",
+        ":kv_meta_transfer_client_impl",
     ],
     alwayslink = True,
 )
@@ -41,6 +43,8 @@ cc_library(
     name = "client_api",
     hdrs = [
         "include/kv_meta_client.h",
+        "include/kv_meta_object_client.h",
+        "include/kv_meta_transfer_client.h",
         "include/manager_client.h",
         "include/meta_client.h",
         "include/rtp_llm_client.h",
@@ -62,6 +66,33 @@ cc_library(
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "kv_meta_transfer_client_impl",
+    srcs = ["src/kv_meta_transfer_client_impl.cc"],
+    hdrs = ["src/kv_meta_transfer_client_impl.h"],
+    deps = [
+        ":client_api",
+        "//kv_cache_manager/client/src/internal/config",
+        "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "kv_meta_object_client_impl",
+    srcs = ["src/kv_meta_object_client_impl.cc"],
+    hdrs = ["src/kv_meta_object_client_impl.h"],
+    deps = [
+        ":client_api",
+        ":kv_meta_client_impl",
+        ":kv_meta_transfer_client_impl",
+        "//kv_cache_manager/common:logger",
     ],
     alwayslink = True,
 )

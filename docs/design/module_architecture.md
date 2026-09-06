@@ -50,7 +50,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
-| **client** | `client/` | C++/Python 客户端 SDK，是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条 KVCache 链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。另提供独立的 `KvMetaClient`，只访问可选 KVMeta gRPC 服务并返回变长对象 allocation；它不放宽或复用固定 block `TransferClient`。面向外部，不被服务端核心调用。 |
+| **client** | `client/` | C++/Python 客户端 SDK，是推理引擎与 KVCM 之间的桥梁。对外提供 `ManagerClient`/`RTPLLMClient` 门面，内部由两条 KVCache 链路组成（见下）：**元数据面** `MetaClient`（经 gRPC 桩 `internal/stub` 调用 KVCM 服务）与**数据面** `TransferClient`（经 `internal/sdk` 在推理引擎显存/内存与存储后端之间搬运 KVCache 数据）。另提供隔离的 KVMeta 对象链路：`KvMetaClient` 访问可选 KVMeta gRPC 服务，`KvMetaTransferClient` 逐对象搬运变长 value，`KvMetaObjectClient` 编排二者；它们不放宽或复用固定 block `TransferClient`。面向外部，不被服务端核心调用。 |
 | **py_connector** | `py_connector/` | 推理框架集成（Python）。将 client 接入 vLLM/SGLang/TRT-LLM，含 CUDA kernel 辅助，负责在引擎的推理流程中按正确顺序调用元数据面与数据面接口。此外自带一个纯 Python 的 HTTP 元数据面客户端 `KvCacheManagerClient`（`common/manager_client.py`），可通过统一服务发现 URL 获取 Manager 入口，并作为 C++ `MetaClient` 之外的另一条元数据面通路。位于 Python 侧栈顶。 |
 
 > **三个面的界定**：本文档区分三个面——**元数据面**指 MetaService 的接口（`GetCacheLocation`/`StartWriteCache`/`FinishWriteCache`/`GetCacheMeta`/`RemoveCache`/`RegisterInstance` 等）及 client 侧调用这些接口的逻辑，是推理引擎读写 KVCache 的热路径；**数据面**指 KVCache 数据在引擎显存/内存与存储后端之间的实际搬运（`TransferClient`，不经过 KVCM）；**管控面**仅指 AdminService 的接口（Storage 增删改、Instance Group 管理、账号、配置快照、运维监控、Leader 运维等），供运维/管理工具使用，不在推理引擎的读写热路径上。
@@ -61,13 +61,15 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 |---|---|---|---|
 | 元数据面 | `MetaClient` → `internal/stub:grpc_stub` | `protocol`、`config`、`service/util:manager_message_proto_util` | MetaService：`GetCacheLocation` / `StartWriteCache` / `FinishWriteCache` / `GetCacheMeta` / `RemoveCache` 等 |
 | 数据面（数据搬运） | `TransferClient` → `internal/sdk` | `data_storage`（URI/common_define）、`common` | 不经过 KVCM，直接读写存储后端 |
+| KVMeta 对象侧路 | `KvMetaObjectClient` → `KvMetaClient` + `KvMetaTransferClient` | `protocol`、`internal/stub`、`internal/sdk`、`data_storage` | 元数据经独立 KVMetaService；数据直接读写存储后端 |
 
 **元数据面到 KVCM 有两条等价通路**，最终都落到服务端同一套 `*ServiceImpl`（`grpc_service`/`http_service` 只是传输适配层）：
 
 1. **C++ `MetaClient`（gRPC）**：走 `internal/stub:grpc_stub`，供 C++ 侧与经 pybind 的引擎使用。
 2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖 MetaService 的全部 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`）。`manager_uri` 可直接使用 HTTP(S) 地址，也可使用通用服务发现 URL；启用 Leader 发现后，客户端以动态发现的 Manager 端点调用 `/api/getClusterInfo`，再根据 `leader_endpoint.meta_http_port` 直连 Leader，并处理 `SERVER_NOT_LEADER` 重试。普通 API 请求使用可配置的 `request_timeout_seconds`（默认 1 秒），Leader 查询保留独立的 5 秒超时。不同连接器按需选用其一。
 
-数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
+普通 KVCache 数据面统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。KVMeta 仅在显式
+创建 `KvMetaObjectClient`/`KvMetaTransferClient` 时启用独立的变长策略。
 
 client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点）只创建 `MetaClient` 做元数据匹配与写地址申请；**WORKER**（推理节点）只创建 `TransferClient` 做数据搬运；**HYBRID** 两者都有。WORKER 的存储配置由 `MetaClient::GetStorageConfig()` 从 KVCM 下发获得，保证与服务端一致。
 
@@ -312,9 +314,11 @@ flowchart LR
 配置非零 `kvcm.kv_meta.rpc_port` 后，`KvMetaClient` 经独立 gRPC server 调用 `KvMetaServiceImpl`，再进入
 `KvMetaManager`。KVMeta 将业务 string key 映射为一级哈希 key，并把完整 key 编码进 location id，以
 exact-key 方式复用 `MetaIndexer`；数据 allocation 直接使用注册表中的 `DataStorageManager`。同一请求内每个
-缺失 key 按自己的 value size 发起 singleton `Create`，因此不会修改 KVCache 的固定 block 分配和
-`TransferClient` 数据面。普通 Reclaimer、Migration 与 Cache GC 仅跳过完整 KVMeta schema marker 的内部
-instance。完整状态机、配额与失败语义见 [KVMeta 通用对象存储](kv_meta_object_storage.md)。
+缺失 key 按自己的 value size 发起 singleton `Create`。client 侧 `KvMetaObjectClient` 组合元数据事务与
+`KvMetaTransferClient`；后者对每个对象发起 singleton SDK IO 并共享一次 batch 超时。服务端和 client 的两层
+隔离都不会修改 KVCache 的固定 block 分配及 `TransferClient` 策略。普通 Reclaimer、Migration 与 Cache GC
+仅跳过完整 KVMeta schema marker 的内部 instance。完整状态机、配额与失败语义见
+[KVMeta 通用对象存储](kv_meta_object_storage.md)。
 
 ---
 

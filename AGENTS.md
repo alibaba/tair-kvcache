@@ -33,7 +33,7 @@ flowchart TD
     %% 对外分支与 optimizer
     py_connector["py_connector"] --> client["client SDK"]
     client -.-> config
-    client -. KvMetaClient / 独立 gRPC .-> service
+    client -. KvMetaObjectClient / 独立 KVMeta 侧路 .-> service
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
 ```
 

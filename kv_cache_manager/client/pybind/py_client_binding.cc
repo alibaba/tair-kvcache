@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "kv_cache_manager/client/include/kv_meta_object_client.h"
 #include "kv_cache_manager/client/include/transfer_client.h"
 
 namespace py = pybind11;
@@ -37,6 +38,28 @@ struct PyInitParams {
         params.self_location_spec_name = self_location_spec_name;
         params.storage_configs = storage_configs;
         return params;
+    }
+};
+
+struct PyKvMetaObjectClientConfig {
+    kvcm::KvMetaClientConfig metadata;
+    std::string instance_group;
+    std::string user_data;
+    std::string transfer_client_config;
+    PyInitParams transfer_init_params;
+    std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
+    std::int32_t write_timeout_seconds{30};
+
+    kvcm::KvMetaObjectClientConfig ToCpp() const {
+        kvcm::KvMetaObjectClientConfig config;
+        config.metadata = metadata;
+        config.instance_group = instance_group;
+        config.user_data = user_data;
+        config.transfer_client_config = transfer_client_config;
+        config.transfer_init_params = transfer_init_params.ToCpp();
+        config.max_object_bytes = max_object_bytes;
+        config.write_timeout_seconds = write_timeout_seconds;
+        return config;
     }
 };
 } // namespace
@@ -146,6 +169,22 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_readwrite("self_location_spec_name", &PyInitParams::self_location_spec_name)
         .def_readwrite("storage_configs", &PyInitParams::storage_configs);
 
+    py::class_<kvcm::KvMetaClientConfig, py::smart_holder>(module, "KvMetaClientConfig")
+        .def(py::init<>())
+        .def_readwrite("addresses", &kvcm::KvMetaClientConfig::addresses)
+        .def_readwrite("instance_id", &kvcm::KvMetaClientConfig::instance_id)
+        .def_readwrite("call_timeout_ms", &kvcm::KvMetaClientConfig::call_timeout_ms);
+
+    py::class_<PyKvMetaObjectClientConfig, py::smart_holder>(module, "KvMetaObjectClientConfig")
+        .def(py::init<>())
+        .def_readwrite("metadata", &PyKvMetaObjectClientConfig::metadata)
+        .def_readwrite("instance_group", &PyKvMetaObjectClientConfig::instance_group)
+        .def_readwrite("user_data", &PyKvMetaObjectClientConfig::user_data)
+        .def_readwrite("transfer_client_config", &PyKvMetaObjectClientConfig::transfer_client_config)
+        .def_readwrite("transfer_init_params", &PyKvMetaObjectClientConfig::transfer_init_params)
+        .def_readwrite("max_object_bytes", &PyKvMetaObjectClientConfig::max_object_bytes)
+        .def_readwrite("write_timeout_seconds", &PyKvMetaObjectClientConfig::write_timeout_seconds);
+
     py::class_<kvcm::ForwardContext, py::smart_holder>(module, "ForwardContext")
         .def(py::init<>())
         .def_readwrite("metas", &kvcm::ForwardContext::metas)
@@ -202,6 +241,56 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("uri_str_vec"),
              py::arg("block_buffers"),
              py::arg("trace_info") = nullptr,
+             py::call_guard<py::gil_scoped_release>());
+
+    py::class_<kvcm::KvMetaObjectClient, py::smart_holder>(module, "KvMetaObjectClient", py::dynamic_attr())
+        .def_static(
+            "Create",
+            [](const std::string &trace_id, const PyKvMetaObjectClientConfig &py_config) -> py::tuple {
+                auto config = py_config.ToCpp();
+                auto captured_span = py_config.transfer_init_params.regist_span;
+                py::object captured_owner = captured_span == nullptr ? py::none() : captured_span->owner;
+                std::pair<kvcm::ClientErrorCode, std::unique_ptr<kvcm::KvMetaObjectClient>> result;
+                {
+                    py::gil_scoped_release release;
+                    if (captured_span != nullptr && captured_span->fd != -1) {
+                        kvcm::SharedMemoryRegistration registration;
+                        registration.base = captured_span->span.base;
+                        registration.size = captured_span->span.size;
+                        registration.fd = captured_span->fd;
+                        result = kvcm::KvMetaObjectClient::Create(trace_id, config, registration);
+                    } else {
+                        result = kvcm::KvMetaObjectClient::Create(trace_id, config);
+                    }
+                }
+                if (result.second == nullptr) {
+                    return py::make_tuple(result.first, py::none());
+                }
+                auto py_client = py::cast(std::move(result.second));
+                py_client.attr("_regist_span") = py::cast(captured_span);
+                py_client.attr("_regist_span_owner") = captured_owner;
+                return py::make_tuple(result.first, py_client);
+            },
+            py::arg("trace_id"),
+            py::arg("config"))
+        .def("LoadObjects",
+             &kvcm::KvMetaObjectClient::LoadObjects,
+             py::arg("trace_id"),
+             py::arg("keys"),
+             py::arg("expected_value_sizes"),
+             py::arg("object_buffers"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("SaveObjects",
+             &kvcm::KvMetaObjectClient::SaveObjects,
+             py::arg("trace_id"),
+             py::arg("keys"),
+             py::arg("value_sizes"),
+             py::arg("object_buffers"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("Remove",
+             &kvcm::KvMetaObjectClient::Remove,
+             py::arg("trace_id"),
+             py::arg("keys"),
              py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager

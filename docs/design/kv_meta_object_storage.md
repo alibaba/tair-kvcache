@@ -3,8 +3,9 @@
 ## 目标和边界
 
 EPD 分离场景中，KV cache 继续使用现有 `MetaService + CacheManager` 定长 block 链路；embedding 等
-opaque value 使用新增的 KVMeta exact-key 链路。V1 只管理元数据、存储 allocation URI 和写事务，数据搬运
-仍由调用方/connector 完成。
+opaque value 使用新增的 KVMeta exact-key 链路。服务端管理元数据、allocation URI 和写事务；client 侧新增
+独立的 exact-size 数据面，并由 `KvMetaObjectClient` 将两者组合成完整对象读写。该数据面不放宽现有
+`TransferClient` 的定长校验。
 
 这条链路遵守以下隔离条件：
 
@@ -118,7 +119,15 @@ metadata reservation、commit 和 delete 均经过 `Sync` 持久化屏障；删�
 4. 每项按自己的 `value_size` 完成数据面写入；
 5. 无论成功或失败都调用 `PutFinish`。成功 mask 按紧凑 `locations` 对齐，而不是按原始 keys 对齐。
 
-RTP C++ 侧可链接现有 RPM 中的 `kv_cache_manager_client.so` 并包含 `kv_meta_client.h`。`KvMetaClient` 支持
+RTP C++ 侧可链接包含本功能的 RPM 中的 `kv_cache_manager_client.so` 并包含
+`kv_meta_object_client.h`。`KvMetaObjectClient` 在创建时调用 `RegisterInstance` 获取服务端权威 storage
+配置，并组合 `KvMetaClient` 与 `KvMetaTransferClient`；`SaveObjects` 完成 PutStart、仅写 miss、校验实际
+URI 和 PutFinish，任一步失败都会以失败 mask 回滚已开始的 session。`LoadObjects` 在任何数据 IO 前验证全部
+key 命中、value size、URI 和 buffer。每个变长对象以 singleton SDK 调用搬运，但同一批次仍共享 wrapper
+级总超时预算；deadline 后排队任务不会再发起 IO，已经运行的任务则在返回前安全 drain，避免调用方释放
+buffer 后 backend 继续访问。这样不会触发固定 block backend 对同批对象等长、同 allocation 的历史假设。
+
+底层 `KvMetaClient` 支持
 多 KVMeta 地址：读请求和同配置注册遇到 transport 错误会尝试下一地址；所有请求收到明确的 not-leader 或
 not-ready 响应时都会故障转移并记住成功 endpoint。所有数据变更 RPC 的 transport 错误都无法证明服务端
 是否已经执行，因此客户端不会自动重试；特别是重放 `Remove`/`Trim` 可能误删第一次调用后创建的新一代对象。
@@ -127,12 +136,11 @@ allocation 由 session timeout 或下一任 leader 的恢复流程清理。`PutS
 尚处于 active 状态，调用方要等原 write timeout 过去再发起新写；C++ 接口以
 `ER_INVALID_GRPCSTATUS` 返回这类 transport 结果。
 
-V1 的 `KvMetaClient` **只负责元数据和 allocation**。现有 `TransferClient` 按普通 instance 注册的固定
-`location_spec_infos` 初始化并校验 buffer size；KVMeta 的 marker spec 固定为 1，不能用它安全搬运任意长度
-embedding，也不能为了接入而放宽这条主链路校验。RTP connector 需要使用返回 URI 和
-`KvMetaValueLocation.value_size` 走独立的动态长度 IO adapter（或后续新增独立的 `KvMetaTransferClient`）。
-RTP 仓库接入 RPM 时，其 third-party Bazel 头文件列表还需要显式导出 `kv_meta_client.h`；这属于下一阶段
-connector 集成，不在本次 KVCM 服务端改动中。
+`KvMetaClient` 本身仍只负责元数据和 allocation；需要自行编排事务的调用方也可直接组合它与
+`KvMetaTransferClient`。现有 `TransferClient` 继续按普通 instance 的固定 `location_spec_infos` 校验 buffer
+size；KVMeta 的 marker spec 固定为 1，不能用它搬运任意长度 embedding。变长策略只由
+`KvMetaTransferClient::Create` 的显式初始化开启，并受 `max_object_bytes` 上限约束。C++ 和 Python pybind
+均导出推荐的 `KvMetaObjectClient`。
 
 Python 调用方可依赖 Bazel target
 `//kv_cache_manager/protocol/protobuf:kv_meta_service_py_proto` 使用生成的 gRPC stub。

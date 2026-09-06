@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "3rdparty/mooncake/client_c.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
@@ -33,6 +35,7 @@ protected:
                           std::vector<DataStorageUri> &alloc_uris) override;
 
 private:
+    std::uint64_t MaxAllowedObjectBytes() const;
     std::pair<size_t, bool>
     extractSlices(const MooncakeRemoteItem &item, const BlockBuffer &buffer, std::vector<Slice_t> &slices) const;
 
