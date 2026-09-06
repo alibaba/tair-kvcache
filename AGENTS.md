@@ -13,7 +13,7 @@
 ```mermaid
 flowchart TD
     main["main.cpp"] --> service["service（接入层/装配入口）"]
-    service --> manager["manager（CacheManager）"]
+    service --> manager["manager（CacheManager / KvMetaManager）"]
     manager --> meta["meta（索引/CacheLocation）"]
     meta --> config["config（注册表/选主）"]
     config --> data_storage["data_storage（存储后端）"]
@@ -33,6 +33,7 @@ flowchart TD
     %% 对外分支与 optimizer
     py_connector["py_connector"] --> client["client SDK"]
     client -.-> config
+    client -. KvMetaClient / 独立 gRPC .-> service
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
 ```
 

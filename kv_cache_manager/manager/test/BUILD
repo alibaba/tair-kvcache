@@ -11,6 +11,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
+        "//kv_cache_manager/manager:kv_meta_instance",
         "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
     ],
@@ -27,6 +28,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_garbage_collector",
+        "//kv_cache_manager/manager:kv_meta_instance",
         "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
     ],
@@ -150,6 +152,20 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
         "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "KvMetaManagerTest",
+    srcs = ["kv_meta_manager_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_instance",
+        "//kv_cache_manager/manager:kv_meta_manager",
+        "//kv_cache_manager/manager:startup_config_loader",
     ],
 )
 

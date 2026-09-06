@@ -44,6 +44,35 @@ cc_test(
 )
 
 cc_test(
+    name = "KvMetaServiceImplTest",
+    srcs = [
+        "kv_meta_service_impl_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_manager",
+        "//kv_cache_manager/manager:startup_config_loader",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service:kv_meta_service_impl",
+    ],
+)
+
+cc_test(
+    name = "KvMetaServiceGRpcTest",
+    srcs = [
+        "kv_meta_service_grpc_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service/grpc_service",
+    ],
+)
+
+cc_test(
     name = "AdminServiceRemoveInstanceGroupTest",
     srcs = [
         "admin_service_remove_instance_group_test.cc",

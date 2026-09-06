@@ -21,6 +21,7 @@ cc_library(
     name = "client",
     deps = [
         ":client_impl",
+        ":kv_meta_client_impl",
     ],
     alwayslink = True,
 )
@@ -39,6 +40,7 @@ cc_library(
 cc_library(
     name = "client_api",
     hdrs = [
+        "include/kv_meta_client.h",
         "include/manager_client.h",
         "include/meta_client.h",
         "include/rtp_llm_client.h",
@@ -47,6 +49,19 @@ cc_library(
     strip_include_prefix = "include",
     deps = [
         ":common",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "kv_meta_client_impl",
+    srcs = ["src/kv_meta_client_impl.cc"],
+    hdrs = ["src/kv_meta_client_impl.h"],
+    deps = [
+        ":client_api",
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
     ],
     alwayslink = True,
 )

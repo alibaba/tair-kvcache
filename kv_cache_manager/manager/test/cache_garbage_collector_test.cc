@@ -23,6 +23,7 @@
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -401,6 +402,37 @@ public:
         instances_by_group[group_name].first = EC_OK;
         instances_by_group[group_name].second.push_back(instance);
         group_by_instance[instance_id] = group_name;
+    }
+
+    void AddKvMetaInstance(const std::string &group_name, const std::string &encoded_id) {
+        auto group_it = std::find_if(instance_groups.begin(), instance_groups.end(), [&](const auto &group) {
+            return group && group->name() == group_name;
+        });
+        if (group_it == instance_groups.end()) {
+            auto group = std::make_shared<InstanceGroup>();
+            group->set_name(group_name);
+            instance_groups.push_back(group);
+            group_configs[group_name] = group;
+        }
+        ModelDeployment deployment;
+        deployment.set_model_name(std::string(kKvMetaModelName));
+        deployment.set_dtype(std::string(kKvMetaDtype));
+        deployment.set_tp_size(1);
+        deployment.set_dp_size(1);
+        deployment.set_pp_size(1);
+        deployment.set_extra(std::string(kKvMetaDeploymentExtra));
+        auto instance = std::make_shared<InstanceInfo>("quota",
+                                                       group_name,
+                                                       std::string(kKvMetaInternalInstancePrefix) + encoded_id,
+                                                       1,
+                                                       std::vector<LocationSpecInfo>{LocationSpecInfo(
+                                                           std::string(kKvMetaValueSpecName), 1)},
+                                                       deployment,
+                                                       std::vector<LocationSpecGroup>{},
+                                                       1);
+        instances_by_group[group_name].first = EC_OK;
+        instances_by_group[group_name].second.push_back(instance);
+        group_by_instance[instance->instance_id()] = group_name;
     }
 
     CacheGarbageCollector::Config DefaultConfig() const {
@@ -1292,6 +1324,20 @@ TEST_F(CacheGarbageCollectorTest, TickScansOneBatchAndSubmitsConditionalAsyncDel
     EXPECT_TRUE(submitted_requests.front().authoritative_read);
     EXPECT_EQ(1, gc->inflight_deletes_.size());
     EXPECT_EQ(1, gc->pending_locations_.size());
+}
+
+TEST_F(CacheGarbageCollectorTest, KvMetaInstancesDoNotConsumeTheKvCacheScanBudget) {
+    AddKvMetaInstance("group_a", "656d62");
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
+
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    gc->RunOneTick();
+
+    ASSERT_EQ(1, scan_calls.size());
+    EXPECT_EQ("instance_a", scan_calls.front().first);
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
 }
 
 TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {

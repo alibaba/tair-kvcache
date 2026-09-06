@@ -38,6 +38,31 @@ cc_library(
 )
 
 cc_library(
+    name = "kv_meta_manager",
+    srcs = ["kv_meta_manager.cc"],
+    hdrs = ["kv_meta_manager.h"],
+    deps = [
+        ":cache_manager",
+        ":data_storage_selector",
+        ":kv_meta_instance",
+        ":meta_searcher",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:meta_indexer_manager",
+        "//kv_cache_manager/meta:types",
+    ],
+)
+
+cc_library(
+    name = "kv_meta_instance",
+    hdrs = ["kv_meta_instance.h"],
+    deps = ["//kv_cache_manager/config"],
+)
+
+cc_library(
     name = "cache_garbage_collector",
     srcs = [
         "cache_garbage_collector.cc",
@@ -48,6 +73,7 @@ cc_library(
         "event_report_cleanup_util.h",
     ],
     deps = [
+        ":kv_meta_instance",
         ":meta_searcher",
         ":migration_manager",
         ":schedule_plan_executor",
@@ -94,6 +120,7 @@ cc_library(
     srcs = ["cache_reclaimer.cc"],
     hdrs = ["cache_reclaimer.h"],
     deps = [
+        ":kv_meta_instance",
         "//kv_cache_manager/config",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",

@@ -13,8 +13,15 @@ enum ErrorCode {
     INTERNAL_ERROR = 3;
     SERVICE_NOT_READY = 4;
     INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6;
     REACH_MAX_ENTITY_CAPACITY = 7;
     INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9;
+    RESOURCE_EXHAUSTED = 10;
+    NOT_FOUND = 11;
+    WRITE_IN_PROGRESS = 12;
+    SESSION_NOT_FOUND = 13;
+    SIZE_MISMATCH = 14;
 
     IO_ERROR = 20;
     UNKNOWN_ERROR = 100;
@@ -61,6 +68,9 @@ message ValueLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    // 业务 value 的有效字节数。URI 中的 size 是存储分配大小，两者当前相等；
+    // 保留独立字段，便于后续按存储粒度对齐分配而不改变反序列化长度。
+    uint64 value_size = 4;
 }
 
 message InstanceInfo {
@@ -182,7 +192,10 @@ message GetRequest {
 
 message GetResponse {
     CommonResponseHeader header = 1;
-    repeated ValueLocation locations = 2; // 多个key的列表
+    // 与 GetRequest.keys 严格一一对应；未命中的位置放空 ValueLocation。
+    repeated ValueLocation locations = 2;
+    // 与 GetRequest.keys 严格一一对应，true 表示对应 key 命中可读 value。
+    KeyMask hit_mask = 3;
 }
 
 // 在每次写入value前, 需要调用这个接口获得ValueLocation信息
@@ -191,16 +204,20 @@ message PutStartRequest {
     string instance_id = 2;
     repeated string keys = 3;
     int32 write_timeout_seconds = 4; // seconds, 要在指定timeout内调用PutFinish，否则服务端会将本次 Request 相关的 Meta 全释放掉
+    // 与 keys 严格一一对应，每个 value 的有效字节数。不同 key 可以不同。
+    repeated uint64 value_sizes = 5;
 }
 
 message PutStartResponse {
     CommonResponseHeader header = 1;
     string write_session_id = 2;
-    KeyMask key_mask = 3; // 存在相同key已经在写，一般情况下会mask掉这个key不让写
+    // 与请求 keys 一一对应。true 表示已存在或正在写，本次不应写入。
+    KeyMask key_mask = 3;
+    // 仅包含 key_mask=false 的 key，顺序与请求中的相对顺序一致。
     repeated ValueLocation locations = 4;
 }
 
-// 写入为简单起见, 先设计为原子性接口, 全成功或全失败
+// 写入采用整批失败语义：任一 value 失败则全部回滚；不承诺跨 key 的线性化同时可见。
 // 结束对指定 keys 的写入(要保证所有 keys 对应 value 都已完成写入),
 // 若客户端未调用该接口或写入长时间未完成,
 // 服务端会视为写入失败并将本次Request所有meta清除. 客户端调用完这个接口后,
@@ -210,6 +227,10 @@ message PutFinishRequest {
     string instance_id = 2;
     string write_session_id = 3;
     repeated ValueLocation locations = 4; // 有可能location是在客户端分配的，需要传回来
+    // 与 PutStartResponse.locations 一一对应；true 表示对应 value 已写成功。
+    // 服务端分配的 location 以 write session 中保存的值为准，locations 仅用于兼容
+    // 将来可能出现的客户端分配模式。
+    KeyMask success_keys = 5;
 }
 
 // 删除指定keys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况

@@ -43,6 +43,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -2612,9 +2613,20 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
 
     // Retrieve the list before branching, as in the legacy path. The budget
     // policy only changes planning and execution after this point.
-    const auto [ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), ins_gr);
+    auto [ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), ins_gr);
     if (ec != ErrorCode::EC_OK) {
         LOG_WITH_GR(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec));
+        return result;
+    }
+    // KVMeta objects intentionally remain CLS_NEW and are managed by the
+    // isolated generic-object path. Do not spend the KV-cache reclaim or
+    // migration budget sampling those exact-key namespaces.
+    instance_infos.erase(
+        std::remove_if(instance_infos.begin(), instance_infos.end(), [](const auto &instance) {
+            return instance && IsKvMetaInstance(*instance);
+        }),
+        instance_infos.end());
+    if (instance_infos.empty()) {
         return result;
     }
 
