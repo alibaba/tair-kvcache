@@ -22,11 +22,20 @@ public:
     void set_wrong_uri_scheme(bool value) { wrong_uri_scheme_.store(value); }
     void set_omit_last_start_location(bool value) { omit_last_start_location_.store(value); }
     void set_extra_start_mask_value(bool value) { extra_start_mask_value_.store(value); }
+    void set_register_transport_error(bool value) { register_transport_error_.store(value); }
+    void set_get_transport_error(bool value) { get_transport_error_.store(value); }
+    void set_put_start_transport_error(bool value) { put_start_transport_error_.store(value); }
+    void set_put_finish_transport_error(bool value) { put_finish_transport_error_.store(value); }
+    void set_remove_transport_error(bool value) { remove_transport_error_.store(value); }
+    void set_trim_transport_error(bool value) { trim_transport_error_.store(value); }
 
     grpc::Status RegisterInstance(grpc::ServerContext *,
                                   const proto::kv_meta::RegisterInstanceRequest *request,
                                   proto::kv_meta::RegisterInstanceResponse *response) override {
         ++register_calls;
+        if (register_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         if (!SetReadyStatus(response)) {
             return grpc::Status::OK;
         }
@@ -52,6 +61,10 @@ public:
     grpc::Status Get(grpc::ServerContext *,
                      const proto::kv_meta::GetRequest *request,
                      proto::kv_meta::GetResponse *response) override {
+        ++get_calls;
+        if (get_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         if (!SetReadyStatus(response)) {
             return grpc::Status::OK;
         }
@@ -70,6 +83,9 @@ public:
                           const proto::kv_meta::PutStartRequest *request,
                           proto::kv_meta::PutStartResponse *response) override {
         ++put_start_calls;
+        if (put_start_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         if (!SetReadyStatus(response)) {
             return grpc::Status::OK;
         }
@@ -115,6 +131,9 @@ public:
                            const proto::kv_meta::PutFinishRequest *request,
                            proto::kv_meta::CommonResponse *response) override {
         ++put_finish_calls;
+        if (put_finish_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         if (!SetReadyStatus(response)) {
             return grpc::Status::OK;
         }
@@ -127,6 +146,10 @@ public:
     grpc::Status Remove(grpc::ServerContext *,
                         const proto::kv_meta::RemoveRequest *,
                         proto::kv_meta::CommonResponse *response) override {
+        ++remove_calls;
+        if (remove_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         SetReadyStatus(response);
         return grpc::Status::OK;
     }
@@ -134,6 +157,10 @@ public:
     grpc::Status Trim(grpc::ServerContext *,
                       const proto::kv_meta::TrimRequest *,
                       proto::kv_meta::CommonResponse *response) override {
+        ++trim_calls;
+        if (trim_transport_error_.load()) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
+        }
         SetReadyStatus(response);
         return grpc::Status::OK;
     }
@@ -149,8 +176,11 @@ public:
     }
 
     std::atomic<int> register_calls{0};
+    std::atomic<int> get_calls{0};
     std::atomic<int> put_start_calls{0};
     std::atomic<int> put_finish_calls{0};
+    std::atomic<int> remove_calls{0};
+    std::atomic<int> trim_calls{0};
     std::string last_instance_id;
 
 private:
@@ -176,6 +206,12 @@ private:
     std::atomic<bool> wrong_uri_scheme_{false};
     std::atomic<bool> omit_last_start_location_{false};
     std::atomic<bool> extra_start_mask_value_{false};
+    std::atomic<bool> register_transport_error_{false};
+    std::atomic<bool> get_transport_error_{false};
+    std::atomic<bool> put_start_transport_error_{false};
+    std::atomic<bool> put_finish_transport_error_{false};
+    std::atomic<bool> remove_transport_error_{false};
+    std::atomic<bool> trim_transport_error_{false};
     mutable std::mutex mutex_;
     std::vector<std::uint64_t> last_start_sizes;
     std::vector<bool> last_finish_successes;
@@ -268,6 +304,120 @@ TEST(KvMetaClientTest, FailsOverAndAbortsAMismatchedAllocation) {
     EXPECT_EQ(1, leader.put_start_calls.load());
     EXPECT_EQ(1, leader.put_finish_calls.load());
     EXPECT_EQ((std::vector<bool>{false}), leader.FinishSuccesses());
+}
+
+TEST(KvMetaClientTest, ReadFailsOverAfterTransportError) {
+    FakeKvMetaService unavailable;
+    unavailable.set_get_transport_error(true);
+    FakeKvMetaService leader;
+    RunningServer unavailable_server(&unavailable);
+    RunningServer leader_server(&leader);
+    ASSERT_TRUE(unavailable_server.valid());
+    ASSERT_TRUE(leader_server.valid());
+
+    auto client = KvMetaClient::Create(
+        {{unavailable_server.address(), leader_server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    auto [get_ec, get] = client->Get("trace-get", {"a"});
+    ASSERT_EQ(ER_OK, get_ec);
+    ASSERT_EQ(1, get.locations.size());
+    EXPECT_EQ(17, get.locations[0].value_size);
+    EXPECT_EQ(1, unavailable.get_calls.load());
+    EXPECT_EQ(1, leader.get_calls.load());
+}
+
+TEST(KvMetaClientTest, IdempotentRegistrationFailsOverAfterTransportError) {
+    FakeKvMetaService unavailable;
+    unavailable.set_register_transport_error(true);
+    FakeKvMetaService leader;
+    RunningServer unavailable_server(&unavailable);
+    RunningServer leader_server(&leader);
+    ASSERT_TRUE(unavailable_server.valid());
+    ASSERT_TRUE(leader_server.valid());
+
+    auto client = KvMetaClient::Create(
+        {{unavailable_server.address(), leader_server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    auto [register_ec, storage_config] =
+        client->RegisterInstance("trace-register", "objects", "emb");
+    EXPECT_EQ(ER_OK, register_ec);
+    EXPECT_EQ("{}", storage_config);
+    EXPECT_EQ(1, unavailable.register_calls.load());
+    EXPECT_EQ(1, leader.register_calls.load());
+}
+
+TEST(KvMetaClientTest, AmbiguousWriteTransportErrorsAreNotRetried) {
+    FakeKvMetaService ambiguous;
+    ambiguous.set_put_start_transport_error(true);
+    ambiguous.set_put_finish_transport_error(true);
+    ambiguous.set_remove_transport_error(true);
+    ambiguous.set_trim_transport_error(true);
+    FakeKvMetaService fallback;
+    RunningServer ambiguous_server(&ambiguous);
+    RunningServer fallback_server(&fallback);
+    ASSERT_TRUE(ambiguous_server.valid());
+    ASSERT_TRUE(fallback_server.valid());
+
+    auto client = KvMetaClient::Create(
+        {{ambiguous_server.address(), fallback_server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS,
+              client->StartWrite("trace-start", {"a"}, {17}, 30).first);
+    EXPECT_EQ(1, ambiguous.put_start_calls.load());
+    EXPECT_EQ(0, fallback.put_start_calls.load());
+
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS,
+              client->FinishWrite("trace-finish", "possibly-committed-session", {true}));
+    EXPECT_EQ(1, ambiguous.put_finish_calls.load());
+    EXPECT_EQ(0, fallback.put_finish_calls.load());
+
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->Remove("trace-remove", {"a"}));
+    EXPECT_EQ(1, ambiguous.remove_calls.load());
+    EXPECT_EQ(0, fallback.remove_calls.load());
+
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->TrimAll("trace-trim"));
+    EXPECT_EQ(1, ambiguous.trim_calls.load());
+    EXPECT_EQ(0, fallback.trim_calls.load());
+}
+
+TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {
+    FakeKvMetaService standby(true);
+    FakeKvMetaService leader;
+    RunningServer standby_server(&standby);
+    RunningServer leader_server(&leader);
+    ASSERT_TRUE(standby_server.valid());
+    ASSERT_TRUE(leader_server.valid());
+
+    const KvMetaClientConfig config{
+        {standby_server.address(), leader_server.address()}, "emb-instance", 1000};
+    auto start_client = KvMetaClient::Create(config);
+    ASSERT_TRUE(start_client);
+    auto [start_ec, start] = start_client->StartWrite("trace-start", {"a"}, {17}, 30);
+    ASSERT_EQ(ER_OK, start_ec);
+    EXPECT_EQ(1, standby.put_start_calls.load());
+    EXPECT_EQ(1, leader.put_start_calls.load());
+    EXPECT_EQ(ER_OK,
+              start_client->FinishWrite("trace-cleanup", start.write_session_id, {false}));
+
+    auto finish_client = KvMetaClient::Create(config);
+    ASSERT_TRUE(finish_client);
+    EXPECT_EQ(ER_OK,
+              finish_client->FinishWrite("trace-finish", "standby-redirect-session", {true}));
+    EXPECT_EQ(1, standby.put_finish_calls.load());
+    EXPECT_EQ(2, leader.put_finish_calls.load());
+
+    auto remove_client = KvMetaClient::Create(config);
+    ASSERT_TRUE(remove_client);
+    EXPECT_EQ(ER_OK, remove_client->Remove("trace-remove", {"a"}));
+    EXPECT_EQ(1, standby.remove_calls.load());
+    EXPECT_EQ(1, leader.remove_calls.load());
+
+    auto trim_client = KvMetaClient::Create(config);
+    ASSERT_TRUE(trim_client);
+    EXPECT_EQ(ER_OK, trim_client->TrimAll("trace-trim"));
+    EXPECT_EQ(1, standby.trim_calls.load());
+    EXPECT_EQ(1, leader.trim_calls.load());
 }
 
 TEST(KvMetaClientTest, MalformedCompactLocationsAbortUsingTheRequestAlignedMask) {

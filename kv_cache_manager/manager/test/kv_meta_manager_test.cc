@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -214,6 +215,8 @@ TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
     EXPECT_TRUE(before_resume[0].found);
     EXPECT_TRUE(before_resume[1].found);
 
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
     ASSERT_TRUE(manager_->ResumeMaintenance());
     ASSERT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
     EXPECT_EQ(0, indexer->GetStorageUsage());
@@ -260,6 +263,84 @@ TEST_F(KvMetaManagerTest, ExistingAndInflightKeysAreMasked) {
     ASSERT_EQ(EC_OK, third_ec);
     EXPECT_EQ((std::vector<bool>{true}), third.key_mask);
     EXPECT_TRUE(third.locations.empty());
+}
+
+TEST_F(KvMetaManagerTest, RemoveDoesNotInvalidateAnActiveWriteSession) {
+    auto [committed_start_ec, committed_start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"committed-remove-guard"}, {13}, 30);
+    ASSERT_EQ(EC_OK, committed_start_ec);
+    ASSERT_EQ(EC_OK,
+              manager_->FinishWrite(
+                  &request_context_, kInstanceId, committed_start.write_session_id, {true}));
+
+    auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"active-remove"}, {21}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+
+    EXPECT_EQ(EC_EXIST,
+              manager_->Remove(
+                  &request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
+
+    // Batch validation finishes before DeleteItems, so the committed key is
+    // preserved when a later key in the same request is still active.
+    auto [before_finish_ec, before_finish] =
+        manager_->Get(&request_context_, kInstanceId, {"committed-remove-guard", "active-remove"});
+    ASSERT_EQ(EC_OK, before_finish_ec);
+    ASSERT_EQ(2, before_finish.size());
+    EXPECT_TRUE(before_finish[0].found);
+    EXPECT_FALSE(before_finish[1].found);
+
+    ASSERT_EQ(EC_OK,
+              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+
+    auto [get_ec, values] =
+        manager_->Get(&request_context_, kInstanceId, {"active-remove"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values[0].found);
+    EXPECT_EQ(EC_OK,
+              manager_->Remove(
+                  &request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
+}
+
+TEST_F(KvMetaManagerTest, ExpiredSessionIsCleanedBeforeTheKeyCanBeWrittenAgain) {
+    constexpr const char *kKey = "expires-and-retries";
+    auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+
+    ErrorCode retry_ec = EC_UNKNOWN;
+    KvMetaManager::StartWriteResult retry;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        auto attempt = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 30);
+        retry_ec = attempt.first;
+        retry = std::move(attempt.second);
+        if (retry_ec == EC_OK && !retry.write_session_id.empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_FALSE(retry.write_session_id.empty());
+    EXPECT_EQ(EC_NOENT,
+              manager_->FinishWrite(
+                  &request_context_, kInstanceId, start.write_session_id, {true}));
+    ASSERT_EQ(EC_OK,
+              manager_->FinishWrite(
+                  &request_context_, kInstanceId, retry.write_session_id, {false}));
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values[0].found);
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
+        KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    EXPECT_EQ(0, indexer->GetStorageUsage());
 }
 
 TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
@@ -372,6 +453,33 @@ TEST_F(KvMetaManagerTest, DemotionDefersUnboundedSessionCleanupToRecovery) {
     ASSERT_EQ(EC_OK,
               manager_->FinishWrite(
                   &request_context_, kInstanceId, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, CancellationClosesSessionAdmissionBeforeWorkerJoin) {
+    auto [first_ec, first] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"before-cancel"}, {19}, 30);
+    ASSERT_EQ(EC_OK, first_ec);
+
+    manager_->CancelMaintenance();
+    auto [cancelled_ec, cancelled] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
+    EXPECT_EQ(EC_SERVICE_NOT_LEADER, cancelled_ec);
+    EXPECT_TRUE(cancelled.locations.empty());
+    EXPECT_FALSE(manager_->ResumeMaintenance());
+
+    // An already admitted Finish may still drain cleanly. No new session can
+    // be published after cancellation, and DoCleanup performs the final join.
+    EXPECT_EQ(EC_OK,
+              manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {false}));
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [retry_ec, retry] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_EQ(EC_OK,
+              manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, ActiveSessionCountIsBoundedBeforeAllocation) {

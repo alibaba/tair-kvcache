@@ -184,23 +184,27 @@ void Server::OnNoLongerLeader() {
         kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel);
         kv_meta_impl_->DisableLeaderOnlyRequests();
         kv_meta_manager_->CancelMaintenance();
-        // Stop the independent expiry worker before CacheManager teardown can
-        // race it. Pending sessions are cleared in memory without per-session
-        // backend I/O; the next leader's recovery reclaims active records.
-        kv_meta_manager_->DoCleanup();
-        CancelAndJoinKvMetaRecovery();
     }
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
-    if (kv_meta_manager_) {
-        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
-    }
 
     cache_manager_->JoinCacheGarbageCollector();
     // Stop migration after leader-only requests drain and after GC has stopped consulting
     // active Copy reservations.
     cache_manager_->StopMigrationManager();
+
+    if (kv_meta_manager_) {
+        // CancelMaintenance already closed session admission and made an
+        // unbounded Trim return at its next bounded checkpoint. Preserve the
+        // original main-service drain/GC/migration ordering above before any
+        // KVMeta join can wait on a backend operation.
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        // Pending sessions are then cleared in memory without per-session
+        // backend I/O; the next leader's recovery reclaims active records.
+        kv_meta_manager_->DoCleanup();
+        CancelAndJoinKvMetaRecovery();
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -581,15 +585,11 @@ void Server::Stop() {
     if (kv_meta_manager_) {
         kv_meta_impl_->DisableLeaderOnlyRequests();
         kv_meta_manager_->CancelMaintenance();
-        kv_meta_manager_->DoCleanup();
-        CancelAndJoinKvMetaRecovery();
     }
-    if (kv_meta_rpc_server_) {
-        kv_meta_rpc_server_->Shutdown();
-    }
-    if (kv_meta_manager_) {
-        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
-    }
+
+    // Preserve the original main-service shutdown order. KVMeta admission is
+    // already closed above, but a slow generic-object backend operation must
+    // not delay shutdown of the existing RPC/HTTP endpoints.
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
@@ -613,6 +613,15 @@ void Server::Stop() {
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
     KVCM_LOG_INFO("admin http server stopped.");
+
+    if (kv_meta_rpc_server_) {
+        kv_meta_rpc_server_->Shutdown();
+    }
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        kv_meta_manager_->DoCleanup();
+        CancelAndJoinKvMetaRecovery();
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 

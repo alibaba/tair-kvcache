@@ -34,11 +34,16 @@ public:
     ClientErrorCode TrimAll(const std::string &trace_id, bool metadata_only) override;
 
 private:
+    enum class TransportRetryPolicy {
+        kSafe,
+        kUnsafe,
+    };
+
     friend class KvMetaClient;
     ClientErrorCode Init(const KvMetaClientConfig &config);
 
     template <typename Response, typename Rpc>
-    ClientErrorCode Call(Response *response, Rpc &&rpc);
+    ClientErrorCode Call(Response *response, TransportRetryPolicy transport_retry_policy, Rpc &&rpc);
 
     KvMetaClientConfig config_;
     std::vector<std::unique_ptr<proto::kv_meta::MetaService::Stub>> stubs_;

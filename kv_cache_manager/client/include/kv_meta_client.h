@@ -58,8 +58,10 @@ struct KvMetaInstanceInfo {
 
 struct KvMetaClientConfig {
     // Addresses must point to the isolated kvcm.kv_meta.rpc_port, not to the
-    // existing MetaService port. Calls try the preferred endpoint first and
-    // fail over on transport, not-leader, or not-ready responses.
+    // existing MetaService port. Calls try the preferred endpoint first.
+    // Reads and idempotent registration fail over on transport errors; all
+    // calls fail over when a server explicitly responds not-leader or
+    // not-ready. Data mutations never retry an ambiguous transport result.
     std::vector<std::string> addresses;
     std::string instance_id;
     std::uint32_t call_timeout_ms{3000};
@@ -84,6 +86,9 @@ public:
     virtual std::pair<ClientErrorCode, KvMetaGetResult>
     Get(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
 
+    // ER_INVALID_GRPCSTATUS means the server may already have reserved an
+    // active session. Do not blindly retry; query the keys and, for misses,
+    // wait for write_timeout_seconds before attempting another StartWrite.
     virtual std::pair<ClientErrorCode, KvMetaStartWriteResult>
     StartWrite(const std::string &trace_id,
                const std::vector<std::string> &keys,
@@ -92,10 +97,14 @@ public:
 
     // success_keys is aligned with StartWriteResult.locations, not with the
     // original request. A single false value aborts the complete session.
+    // ER_INVALID_GRPCSTATUS has an unknown commit outcome; resolve it with Get.
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const std::vector<bool> &success_keys) = 0;
 
+    // Remove and TrimAll also return ER_INVALID_GRPCSTATUS for an unknown
+    // mutation outcome. Their retries must be chosen by the caller so a new
+    // generation created after the first attempt is not deleted implicitly.
     virtual ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
     virtual ClientErrorCode TrimAll(const std::string &trace_id, bool metadata_only = false) = 0;
 };

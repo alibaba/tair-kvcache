@@ -370,6 +370,13 @@ void KvMetaServiceImpl::Remove(RequestContext *request_context,
     }
     const std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     const ErrorCode ec = kv_meta_manager_->Remove(request_context, request->instance_id(), keys);
+    if (ec == EC_EXIST) {
+        SetDirectError(request_context,
+                       status,
+                       proto::kv_meta::WRITE_IN_PROGRESS,
+                       ErrorMessage("Remove", ec, request_context));
+        return;
+    }
     SetResult(request_context, status, ec, "Remove");
 }
 

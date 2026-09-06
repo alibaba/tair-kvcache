@@ -173,5 +173,37 @@ TEST_F(KvMetaServiceImplTest, UnsupportedFieldsAreRejectedWithoutManagerMutation
     EXPECT_EQ(proto::kv_meta::UNSUPPORTED, trim_response.header().status().code());
 }
 
+TEST_F(KvMetaServiceImplTest, RemoveReportsAnActiveWriterWithoutConsumingItsSession) {
+    proto::kv_meta::PutStartRequest start_request;
+    start_request.set_trace_id("active-remove-start");
+    start_request.set_instance_id(kInstanceId);
+    start_request.add_keys("active-remove");
+    start_request.add_value_sizes(17);
+    start_request.set_write_timeout_seconds(30);
+    proto::kv_meta::PutStartResponse start_response;
+    RequestContext start_context(start_request.trace_id());
+    service_->PutStart(&start_context, &start_request, &start_response);
+    ASSERT_EQ(proto::kv_meta::OK, start_response.header().status().code());
+
+    proto::kv_meta::RemoveRequest remove_request;
+    remove_request.set_trace_id("active-remove-request");
+    remove_request.set_instance_id(kInstanceId);
+    remove_request.add_keys("active-remove");
+    proto::kv_meta::CommonResponse remove_response;
+    RequestContext remove_context(remove_request.trace_id());
+    service_->Remove(&remove_context, &remove_request, &remove_response);
+    EXPECT_EQ(proto::kv_meta::WRITE_IN_PROGRESS, remove_response.header().status().code());
+
+    proto::kv_meta::PutFinishRequest finish_request;
+    finish_request.set_trace_id("active-remove-finish");
+    finish_request.set_instance_id(kInstanceId);
+    finish_request.set_write_session_id(start_response.write_session_id());
+    finish_request.mutable_success_keys()->add_values(false);
+    proto::kv_meta::CommonResponse finish_response;
+    RequestContext finish_context(finish_request.trace_id());
+    service_->PutFinish(&finish_context, &finish_request, &finish_response);
+    EXPECT_EQ(proto::kv_meta::OK, finish_response.header().status().code());
+}
+
 } // namespace
 } // namespace kv_cache_manager

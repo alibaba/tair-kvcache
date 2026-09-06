@@ -78,7 +78,8 @@ PutStart
   -> 删除本代 allocation
 
 降主
-  -> 关闭 KVMeta 请求门并停止 session expiry worker
+  -> 关闭 KVMeta 请求门，非阻塞请求停止 session expiry worker
+  -> 先按原顺序排空主服务请求、停止主 GC/Migration
   -> 仅清空进程内 session，不在主服务 cleanup 上逐个执行存储 IO
   -> 下一任 leader 的独立 KVMeta recovery 清理残留 active metadata/allocation
 ```
@@ -88,13 +89,19 @@ PutStart
 调用方可以用正确 mask 重试。V1 的 commit/rollback 使用逐 key 条件更新与失败补偿，不承诺多 key 在并发 `Get`
 观察下具备线性化的同一瞬间可见性。
 
+`Remove` 不会抢占 active write session。批次中任一 key 仍在写时返回 `WRITE_IN_PROGRESS`，整批不产生删除
+副作用；该 session 只能由对应的 `PutFinish`、session timeout 或 leader 恢复流程收敛。这样独立的修复/删除
+请求不会使 writer 仍持有的 URI 提前失效。
+
 通用对象在 metadata 中保持 `CLS_NEW`，避免进入按定长 block 设计的 reclaimer/migration。正
 `create_time` 是 active marker，负值是 KVMeta 私有 committed marker。Get 只返回 committed 对象。启动恢复
 只删除 schema marker 正确且仍为 active 的对象，并使用完整序列化值做条件删除；无法确认归属时宁可保留数据，
 不会冒险删除可能已被新一代 metadata 引用的 URI。
 
-降主不逐个同步回滚任意数量的 session，避免 embedding 规模反向阻塞主 KVCM 生命周期。active 对象始终不可读，
-其 metadata 和 allocation 会在新 leader 放开 KVMeta 服务之前完成清理，因此这一延迟不改变可见性语义。
+降主先用非阻塞信号关闭新 session 准入、取消 Trim 并唤醒 expiry worker，然后按原有顺序排空主服务请求并停止
+主 GC/Migration；只有在这些主链路步骤完成后才 join KVMeta worker。降主不逐个同步回滚任意数量的 session，
+避免 embedding 规模反向阻塞主 KVCM 生命周期。active 对象始终不可读，其 metadata 和 allocation 会在新
+leader 放开 KVMeta 服务之前完成清理，因此这一延迟不改变可见性语义。
 
 metadata reservation、commit 和 delete 均经过 `Sync` 持久化屏障；删除只有在 metadata delete 已持久化后才
 释放物理 allocation。恢复按有界 batch 清理 stale active 写入，并在一个无删除、无错误的稳定扫描完成后，按
@@ -112,7 +119,13 @@ metadata reservation、commit 和 delete 均经过 `Sync` 持久化屏障；删�
 5. 无论成功或失败都调用 `PutFinish`。成功 mask 按紧凑 `locations` 对齐，而不是按原始 keys 对齐。
 
 RTP C++ 侧可链接现有 RPM 中的 `kv_cache_manager_client.so` 并包含 `kv_meta_client.h`。`KvMetaClient` 支持
-多 KVMeta 地址，遇到 transport、not-leader 或 not-ready 会尝试下一地址并记住成功 endpoint。
+多 KVMeta 地址：读请求和同配置注册遇到 transport 错误会尝试下一地址；所有请求收到明确的 not-leader 或
+not-ready 响应时都会故障转移并记住成功 endpoint。所有数据变更 RPC 的 transport 错误都无法证明服务端
+是否已经执行，因此客户端不会自动重试；特别是重放 `Remove`/`Trim` 可能误删第一次调用后创建的新一代对象。
+调用方应把结果视为不确定，并按具体 mutation 查询或审计；key 级结果可通过 `Get` 确认。未提交的 active
+allocation 由 session timeout 或下一任 leader 的恢复流程清理。`PutStart` 后 `Get` 仍 miss 可能表示 session
+尚处于 active 状态，调用方要等原 write timeout 过去再发起新写；C++ 接口以
+`ER_INVALID_GRPCSTATUS` 返回这类 transport 结果。
 
 V1 的 `KvMetaClient` **只负责元数据和 allocation**。现有 `TransferClient` 按普通 instance 注册的固定
 `location_spec_infos` 初始化并校验 buffer size；KVMeta 的 marker spec 固定为 1，不能用它安全搬运任意长度
@@ -132,4 +145,6 @@ active session 上限后，
 数据。`TS_REMOVE_ALL_META` 只删 metadata、保留物理数据，仅用于明确的数据所有权/修复场景；时间范围 Trim
 尚不支持。`Remove`/`TS_REMOVE_ALL_CACHE` 会调用所选 storage backend 的 Delete，但最终物理回收能力遵循
 该 backend 的现有实现；例如当前开源 NFS backend 的 Delete 是幂等 no-op，本次不会为了 KVMeta 改动这一
-主链路共用行为。
+主链路共用行为。metadata 删除会先持久化，再释放物理 allocation，以保证任何时刻都不会把仍可读的 URI
+提前删除。若后端随后返回物理删除失败，接口会报错，但该 URI 已不再被 metadata 引用；随机 generation URI
+保证后续同 key 写入不会复用它，运维仍需依赖后端的 orphan 清理能力回收这类空间。

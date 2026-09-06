@@ -195,7 +195,9 @@ ClientErrorCode KvMetaClientImpl::Init(const KvMetaClientConfig &config) {
 }
 
 template <typename Response, typename Rpc>
-ClientErrorCode KvMetaClientImpl::Call(Response *response, Rpc &&rpc) {
+ClientErrorCode KvMetaClientImpl::Call(Response *response,
+                                       TransportRetryPolicy transport_retry_policy,
+                                       Rpc &&rpc) {
     if (!response || stubs_.empty()) {
         return ER_INVALID_STUB;
     }
@@ -217,6 +219,15 @@ ClientErrorCode KvMetaClientImpl::Call(Response *response, Rpc &&rpc) {
             KVCM_LOG_WARN("KVMeta RPC endpoint[%zu] failed with gRPC code[%d]",
                           index,
                           static_cast<int>(grpc_status.error_code()));
+            // A transport failure does not tell us whether the server applied
+            // the request before the response was lost. Retrying PutStart can
+            // leak the first allocation/session and retrying PutFinish can
+            // turn a successful commit into SESSION_NOT_FOUND. Replaying a
+            // Remove/Trim can also delete a new generation created after the
+            // first attempt. Only reads and idempotent registration fail over.
+            if (transport_retry_policy == TransportRetryPolicy::kUnsafe) {
+                return last_error;
+            }
             continue;
         }
         if (!response->has_header() || !response->header().has_status()) {
@@ -248,9 +259,10 @@ KvMetaClientImpl::RegisterInstance(const std::string &trace_id,
     request.set_instance_id(config_.instance_id);
     request.set_user_data(user_data);
     proto::kv_meta::RegisterInstanceResponse response;
-    const ClientErrorCode ec = Call(&response, [&request](auto &stub, auto *context, auto *output) {
-        return stub.RegisterInstance(context, request, output);
-    });
+    const ClientErrorCode ec =
+        Call(&response, TransportRetryPolicy::kSafe, [&request](auto &stub, auto *context, auto *output) {
+            return stub.RegisterInstance(context, request, output);
+        });
     if (ec != ER_OK) {
         return {ec, {}};
     }
@@ -265,9 +277,10 @@ KvMetaClientImpl::GetInstanceInfo(const std::string &trace_id) {
     proto::kv_meta::GetInstanceInfoRequest request;
     SetCommonRequestFields(request, trace_id, config_.instance_id);
     proto::kv_meta::GetInstanceInfoResponse response;
-    const ClientErrorCode ec = Call(&response, [&request](auto &stub, auto *context, auto *output) {
-        return stub.GetInstanceInfo(context, request, output);
-    });
+    const ClientErrorCode ec =
+        Call(&response, TransportRetryPolicy::kSafe, [&request](auto &stub, auto *context, auto *output) {
+            return stub.GetInstanceInfo(context, request, output);
+        });
     if (ec != ER_OK) {
         return {ec, {}};
     }
@@ -292,9 +305,10 @@ KvMetaClientImpl::Get(const std::string &trace_id, const std::vector<std::string
         request.add_keys(key);
     }
     proto::kv_meta::GetResponse response;
-    const ClientErrorCode ec = Call(&response, [&request](auto &stub, auto *context, auto *output) {
-        return stub.Get(context, request, output);
-    });
+    const ClientErrorCode ec =
+        Call(&response, TransportRetryPolicy::kSafe, [&request](auto &stub, auto *context, auto *output) {
+            return stub.Get(context, request, output);
+        });
     if (ec != ER_OK) {
         return {ec, {}};
     }
@@ -345,9 +359,10 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         request.add_value_sizes(value_sizes[i]);
     }
     proto::kv_meta::PutStartResponse response;
-    const ClientErrorCode ec = Call(&response, [&request](auto &stub, auto *context, auto *output) {
-        return stub.PutStart(context, request, output);
-    });
+    const ClientErrorCode ec =
+        Call(&response, TransportRetryPolicy::kUnsafe, [&request](auto &stub, auto *context, auto *output) {
+            return stub.PutStart(context, request, output);
+        });
     if (ec != ER_OK) {
         return {ec, {}};
     }
@@ -427,9 +442,11 @@ ClientErrorCode KvMetaClientImpl::FinishWrite(const std::string &trace_id,
         request.mutable_success_keys()->add_values(success);
     }
     proto::kv_meta::CommonResponse response;
-    return Call(&response, [&request](auto &stub, auto *context, auto *output) {
-        return stub.PutFinish(context, request, output);
-    });
+    return Call(&response,
+                TransportRetryPolicy::kUnsafe,
+                [&request](auto &stub, auto *context, auto *output) {
+                    return stub.PutFinish(context, request, output);
+                });
 }
 
 ClientErrorCode KvMetaClientImpl::Remove(const std::string &trace_id, const std::vector<std::string> &keys) {
@@ -442,7 +459,7 @@ ClientErrorCode KvMetaClientImpl::Remove(const std::string &trace_id, const std:
         request.add_keys(key);
     }
     proto::kv_meta::CommonResponse response;
-    return Call(&response, [&request](auto &stub, auto *context, auto *output) {
+    return Call(&response, TransportRetryPolicy::kUnsafe, [&request](auto &stub, auto *context, auto *output) {
         return stub.Remove(context, request, output);
     });
 }
@@ -452,7 +469,7 @@ ClientErrorCode KvMetaClientImpl::TrimAll(const std::string &trace_id, bool meta
     SetCommonRequestFields(request, trace_id, config_.instance_id);
     request.set_strategy(metadata_only ? proto::kv_meta::TS_REMOVE_ALL_META : proto::kv_meta::TS_REMOVE_ALL_CACHE);
     proto::kv_meta::CommonResponse response;
-    return Call(&response, [&request](auto &stub, auto *context, auto *output) {
+    return Call(&response, TransportRetryPolicy::kUnsafe, [&request](auto &stub, auto *context, auto *output) {
         return stub.Trim(context, request, output);
     });
 }

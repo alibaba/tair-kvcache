@@ -78,9 +78,9 @@ public:
     // active metadata is reclaimed by the next leader's isolated recovery;
     // demotion never walks an unbounded session set on the main cleanup path.
     void DoCleanup();
-    // Trim can span an arbitrary number of objects. Server demotion cancels
-    // it before waiting for KVMeta RPCs, so this optional side path cannot
-    // indefinitely delay cleanup of the existing KV-cache service.
+    // Non-blockingly cancels Trim, closes new session admission, and wakes the
+    // expiry worker. Server demotion can therefore finish the existing
+    // KV-cache drain/GC/migration sequence before joining KVMeta workers.
     void CancelMaintenance() noexcept;
     // Called only after a successful leader recovery. It also restarts the
     // write-session expiry worker stopped by DoCleanup.

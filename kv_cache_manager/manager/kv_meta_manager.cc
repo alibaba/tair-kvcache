@@ -238,7 +238,7 @@ public:
         std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         std::lock_guard<std::mutex> lock(mutex_);
         if (thread_.joinable()) {
-            return true;
+            return !stopping_;
         }
         stopping_ = false;
         try {
@@ -285,6 +285,18 @@ public:
             return PutResult::kStopped;
         }
         return sessions_.size() < max_sessions_ ? PutResult::kOk : PutResult::kFull;
+    }
+
+    // Close admission and wake the expiry loop without joining it. Server
+    // demotion uses this first so the existing KV-cache drain/GC/migration
+    // sequence never waits behind KVMeta backend I/O. StopAndDiscard performs
+    // the eventual join before CacheManager teardown.
+    void RequestStop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
     }
 
     TakeResult Take(const std::string &session_id,
@@ -372,7 +384,8 @@ private:
     }
 
     void Expire(Session session) {
-        if (!owner_ || session.items.empty()) {
+        if (!owner_ || session.items.empty() ||
+            owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
             return;
         }
         RequestContext request_context("kv_meta_write_session_expired");
@@ -455,6 +468,9 @@ void KvMetaManager::DoCleanup() {
 
 void KvMetaManager::CancelMaintenance() noexcept {
     maintenance_cancelled_.store(true, std::memory_order_release);
+    if (write_session_manager_) {
+        write_session_manager_->RequestStop();
+    }
 }
 
 bool KvMetaManager::ResumeMaintenance() {
@@ -944,6 +960,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     if (!initialized_.load(std::memory_order_acquire)) {
         return {EC_ERROR, std::move(response)};
     }
+    if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+        return {EC_SERVICE_NOT_LEADER, std::move(response)};
+    }
     if (const ErrorCode ec = ValidateKeys(request_context, keys); ec != EC_OK) {
         return {ec, std::move(response)};
     }
@@ -1069,6 +1088,14 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     std::vector<SessionItem> candidates;
     candidates.reserve(missing_indices.size());
     for (const std::size_t request_index : missing_indices) {
+        if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+            const ErrorCode cleanup_ec = DeleteAllocatedLocations(request_context, candidates);
+            if (cleanup_ec != EC_OK) {
+                KVCM_LOG_WARN("KVMeta cancellation could not release all uncommitted allocations, ec[%d]",
+                              cleanup_ec);
+            }
+            return {EC_SERVICE_NOT_LEADER, StartWriteResult{}};
+        }
         const std::uint64_t instance_path_hash =
             Hash64(internal_instance_id.data(), internal_instance_id.size(), kInstancePathHashSeed);
         const std::string object_key =
@@ -1554,6 +1581,13 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
                                                        size);
             ec != EC_OK) {
             return ec;
+        }
+        // Do not let an independent Remove invalidate a writer's allocation
+        // while its session can still commit or roll back that same URI.
+        // Session timeout/PutFinish owns cleanup of active generations.
+        if (!IsCommittedObject(*exact[i].location)) {
+            AddError(request_context, "KVMeta cannot remove a value while its write session is active");
+            return EC_EXIST;
         }
         items.push_back(SessionItem{i,
                                     keys[i],
