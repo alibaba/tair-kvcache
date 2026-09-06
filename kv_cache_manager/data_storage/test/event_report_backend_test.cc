@@ -176,9 +176,9 @@ TEST_F(EventReportBackendTest, RequestedLockPathsRecordWaitHoldAndAcquireCount) 
     auto acquire = [&](const std::string &lock_name, const std::string &operation) {
         return GetLockMetric(metrics_registry_, "event.lock_acquire_counter", lock_name, operation);
     };
-    const auto begin_before = acquire("nodes_mutex", "begin").Get();
-    const auto end_before = acquire("nodes_mutex", "end").Get();
-    const auto snapshot_get_before = acquire("nodes_mutex", "snapshot_get").Get();
+    const auto begin_before = acquire("reporter_state_mutex", "begin").Get();
+    const auto end_before = acquire("reporter_state_mutex", "end").Get();
+    const auto snapshot_get_before = acquire("reporter_state_mutex", "snapshot_get").Get();
     const auto ensure_node_before = acquire("nodes_mutex", "ensure_node").Get();
     const auto lifecycle_before = acquire("lifecycle_fences_mutex", "access").Get();
 
@@ -192,16 +192,16 @@ TEST_F(EventReportBackendTest, RequestedLockPathsRecordWaitHoldAndAcquireCount) 
     ASSERT_EQ(EC_OK, backend.AcquireLifecycleMutationLease(reporter_key, lifecycle_generation, lifecycle_lease));
     lifecycle_lease.reset();
 
-    EXPECT_EQ(begin_before + 1, acquire("nodes_mutex", "begin").Get());
-    EXPECT_EQ(end_before + 1, acquire("nodes_mutex", "end").Get());
-    EXPECT_EQ(snapshot_get_before + 1, acquire("nodes_mutex", "snapshot_get").Get());
+    EXPECT_EQ(begin_before + 1, acquire("reporter_state_mutex", "begin").Get());
+    EXPECT_EQ(end_before + 1, acquire("reporter_state_mutex", "end").Get());
+    EXPECT_EQ(snapshot_get_before + 1, acquire("reporter_state_mutex", "snapshot_get").Get());
     EXPECT_EQ(ensure_node_before + 1, acquire("nodes_mutex", "ensure_node").Get());
-    EXPECT_EQ(lifecycle_before + 1, acquire("lifecycle_fences_mutex", "access").Get());
+    EXPECT_EQ(lifecycle_before + 4, acquire("lifecycle_fences_mutex", "access").Get());
 
     for (const auto &[lock_name, operation] :
-         std::vector<std::pair<std::string, std::string>>{{"nodes_mutex", "begin"},
-                                                          {"nodes_mutex", "end"},
-                                                          {"nodes_mutex", "snapshot_get"},
+         std::vector<std::pair<std::string, std::string>>{{"reporter_state_mutex", "begin"},
+                                                          {"reporter_state_mutex", "end"},
+                                                          {"reporter_state_mutex", "snapshot_get"},
                                                           {"nodes_mutex", "ensure_node"},
                                                           {"lifecycle_fences_mutex", "access"}}) {
         const auto wait = GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", lock_name, operation);
@@ -213,33 +213,79 @@ TEST_F(EventReportBackendTest, RequestedLockPathsRecordWaitHoldAndAcquireCount) 
     }
 }
 
-TEST_F(EventReportBackendTest, ContendedGlobalLocksAccumulateWaitTime) {
+TEST_F(EventReportBackendTest, DeltaAndVersionPathsDoNotWaitForGlobalNodeTableLock) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 60000), "trace"));
+    const ReporterSnapshotKey reporter_key{"test_inst", "10.0.0.1:8080"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+
+    std::string initial_version;
+    uint64_t lifecycle_generation = 0;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, initial_version, &lifecycle_generation));
+    backend.EndDeltaMutation(reporter_key, lifecycle_generation, initial_version);
+
+    std::unique_lock<std::shared_mutex> nodes_guard(backend.nodes_mutex_);
+    auto wait_without_node_lock = [&](auto &future) {
+        const auto status = future.wait_for(200ms);
+        if (status != std::future_status::ready) {
+            nodes_guard.unlock();
+            future.wait();
+        }
+        return status;
+    };
+
+    auto snapshot_future = std::async(std::launch::async, [&] { return backend.GetSnapshotVersion(reporter_key); });
+    ASSERT_EQ(std::future_status::ready, wait_without_node_lock(snapshot_future));
+    EXPECT_EQ(initial_version, snapshot_future.get());
+
+    auto begin_future = std::async(std::launch::async, [&] {
+        std::string version;
+        uint64_t generation = 0;
+        const ErrorCode ec = backend.BeginDeltaMutation(reporter_key, version, &generation);
+        return std::make_tuple(ec, std::move(version), generation);
+    });
+    ASSERT_EQ(std::future_status::ready, wait_without_node_lock(begin_future));
+    auto [begin_ec, version, generation] = begin_future.get();
+    ASSERT_EQ(EC_OK, begin_ec);
+    EXPECT_EQ(initial_version, version);
+    EXPECT_EQ(lifecycle_generation, generation);
+
+    auto end_future =
+        std::async(std::launch::async, [&] { backend.EndDeltaMutation(reporter_key, generation, version); });
+    ASSERT_EQ(std::future_status::ready, wait_without_node_lock(end_future));
+    end_future.get();
+    nodes_guard.unlock();
+}
+
+TEST_F(EventReportBackendTest, ContendedReporterStateAndLifecycleMapLocksAccumulateWaitTime) {
     EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 60000), "trace"));
     const ReporterSnapshotKey reporter_key{"test_inst", "10.0.0.1:8080"};
     ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
     const uint64_t lifecycle_generation =
         backend.GetNodeGeneration(reporter_key.instance_id, reporter_key.host_ip_port);
+    const auto lifecycle_fence = backend.FindLifecycleFence(reporter_key);
+    ASSERT_NE(nullptr, lifecycle_fence);
 
-    auto nodes_wait = GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", "nodes_mutex", "snapshot_get");
-    const auto nodes_wait_before = nodes_wait.Get();
-    std::unique_lock<std::shared_mutex> nodes_guard(backend.nodes_mutex_);
-    std::promise<void> nodes_started;
-    auto nodes_started_future = nodes_started.get_future();
+    auto reporter_state_wait =
+        GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", "reporter_state_mutex", "snapshot_get");
+    const auto reporter_state_wait_before = reporter_state_wait.Get();
+    std::unique_lock<std::mutex> reporter_state_guard(lifecycle_fence->state_mutex);
+    std::promise<void> reporter_state_started;
     auto snapshot_future = std::async(std::launch::async, [&] {
-        nodes_started.set_value();
+        reporter_state_started.set_value();
         return backend.GetSnapshotVersion(reporter_key);
     });
-    nodes_started_future.wait();
+    reporter_state_started.get_future().wait();
     std::this_thread::sleep_for(50ms);
-    nodes_guard.unlock();
+    reporter_state_guard.unlock();
     EXPECT_TRUE(snapshot_future.get().empty());
-    EXPECT_GE(nodes_wait.Get() - nodes_wait_before, 20000u);
+    EXPECT_GE(reporter_state_wait.Get() - reporter_state_wait_before, 20000u);
 
     auto lifecycle_wait =
         GetLockMetric(metrics_registry_, "event.lock_wait_time_us_sum", "lifecycle_fences_mutex", "access");
     const auto lifecycle_wait_before = lifecycle_wait.Get();
-    std::unique_lock<std::mutex> lifecycle_guard(backend.lifecycle_fences_mutex_);
+    std::unique_lock<std::shared_mutex> lifecycle_guard(backend.lifecycle_fences_mutex_);
     std::promise<void> lifecycle_started;
     auto lifecycle_started_future = lifecycle_started.get_future();
     auto lease_future = std::async(std::launch::async, [&] {
@@ -1827,7 +1873,6 @@ TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
     uint64_t retry_after_ms = 0;
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginSnapshot(scope, rejected_token, retry_after_ms));
     EXPECT_TRUE(rejected_token.empty());
-    EXPECT_EQ(0u, backend.snapshot_versions_.count(scope));
 
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     std::string token;
@@ -1839,7 +1884,6 @@ TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginSnapshot(scope, rejected_token, retry_after_ms));
     EXPECT_TRUE(rejected_token.empty());
-    EXPECT_EQ(0u, backend.snapshot_versions_.count(scope));
     std::string committed;
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
 }
@@ -1890,11 +1934,17 @@ TEST(EventReportBackendSnapshotTest, StaleDeltaEndCannotDrainReregisteredLifecyc
     EventReportBackend backend(nullptr);
     const ReporterSnapshotKey reporter_key{"delta-incarnation", "10.0.0.73:8080"};
     ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
+    const auto lifecycle_fence = backend.FindLifecycleFence(reporter_key);
+    ASSERT_NE(nullptr, lifecycle_fence);
+    const auto active_delta_mutations = [&] {
+        std::lock_guard<std::mutex> lock(lifecycle_fence->state_mutex);
+        return lifecycle_fence->snapshot_state.active_delta_mutations;
+    };
 
     std::string old_token;
     uint64_t old_generation = 0;
     ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, old_token, &old_generation));
-    ASSERT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+    ASSERT_EQ(1u, active_delta_mutations());
 
     ASSERT_EQ(EC_OK, backend.UnregisterNode(reporter_key.instance_id, reporter_key.host_ip_port));
     ASSERT_EQ(EC_OK, backend.RegisterNode(reporter_key.instance_id, reporter_key.host_ip_port, {"mem"}));
@@ -1903,13 +1953,13 @@ TEST(EventReportBackendSnapshotTest, StaleDeltaEndCannotDrainReregisteredLifecyc
     ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, new_token, &new_generation));
     ASSERT_NE(old_token, new_token);
     ASSERT_NE(old_generation, new_generation);
-    ASSERT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+    ASSERT_EQ(1u, active_delta_mutations());
 
     backend.EndDeltaMutation(reporter_key, old_generation, old_token);
-    EXPECT_EQ(1u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+    EXPECT_EQ(1u, active_delta_mutations());
 
     backend.EndDeltaMutation(reporter_key, new_generation, new_token);
-    EXPECT_EQ(0u, backend.snapshot_versions_[reporter_key].active_delta_mutations);
+    EXPECT_EQ(0u, active_delta_mutations());
 }
 
 TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {

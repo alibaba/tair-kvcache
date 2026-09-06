@@ -176,18 +176,46 @@ private:
     template <typename LockType>
     class TimedLock;
 
+    struct SnapshotVersionState {
+        // Process-local reporter state, not a distributed lock. KVCM restart
+        // clears this state; the first valid delta or snapshot rebuilds it.
+        std::string committed;
+        std::string in_flight;
+        // Monotonically advances for every admitted snapshot attempt,
+        // including attempts that later abort. Async cleanup captures this
+        // value so an older task cannot reclaim writes from a later attempt.
+        uint64_t attempt_epoch = 0;
+        uint64_t active_delta_mutations = 0;
+        int64_t last_commit_ms = 0;
+        // A successful complete snapshot proves that committed is an
+        // authoritative query fence. An admitted snapshot failure switches
+        // back to soft visibility because in-place candidate writes may have
+        // replaced committed metadata. Process-local recovery also starts
+        // soft until the next successful snapshot.
+        bool strict_query_visibility = false;
+    };
+
     void InitLockMetrics(const StorageConfig &config);
 
     struct LifecycleFence {
         mutable std::shared_mutex mutex;
+        mutable std::mutex state_mutex;
+        std::condition_variable_any snapshot_state_cv;
         uint64_t generation = 0;
         bool registered = false;
+        SnapshotVersionState snapshot_state;
     };
     std::shared_ptr<LifecycleFence> GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporter_key);
     std::shared_ptr<LifecycleFence> FindLifecycleFence(const ReporterSnapshotKey &reporter_key) const;
-    ErrorCode UnregisterNodeLocked(const std::string &instance_id, const std::string &host_ip_port);
+    std::vector<std::shared_ptr<LifecycleFence>> GetLifecycleFences() const;
+    std::string ReserveSnapshotVersionToken(const ReporterSnapshotKey &reporter_key);
+    void ReleaseSnapshotVersionToken(const ReporterSnapshotKey &reporter_key, const std::string &token);
+    ErrorCode UnregisterNodeLocked(const std::string &instance_id,
+                                   const std::string &host_ip_port,
+                                   LifecycleFence &lifecycle_fence);
     struct NodeInfo {
         std::string instance_id;
+        std::shared_ptr<LifecycleFence> lifecycle_fence;
         std::atomic<int64_t> last_heartbeat_ms{0};
         std::atomic<bool> available{true};
         std::atomic<int64_t> unavailable_since_ms{0};
@@ -222,18 +250,18 @@ private:
 
     EventReportStorageSpec spec_;
 
-    LockMetrics nodes_mutex_begin_metrics_;
-    LockMetrics nodes_mutex_end_metrics_;
-    LockMetrics nodes_mutex_snapshot_get_metrics_;
+    LockMetrics reporter_state_begin_metrics_;
+    LockMetrics reporter_state_end_metrics_;
+    LockMetrics reporter_state_snapshot_get_metrics_;
     LockMetrics nodes_mutex_ensure_node_metrics_;
     LockMetrics lifecycle_fences_mutex_metrics_;
 
     mutable std::shared_mutex nodes_mutex_;
     // Final metadata writes may already hold a MetaIndexer lock, while host
     // cleanup deliberately holds a lifecycle lease before taking metadata
-    // locks. A per-reporter fence prevents that inversion from becoming a
-    // deadlock without making unrelated reporters fail one another's writes.
-    mutable std::mutex lifecycle_fences_mutex_;
+    // locks. Each stable per-reporter fence also owns snapshot/delta state, so
+    // unrelated reporters never contend on the node-table lock for admission.
+    mutable std::shared_mutex lifecycle_fences_mutex_;
     std::unordered_map<ReporterSnapshotKey, std::shared_ptr<LifecycleFence>, ReporterSnapshotKeyHash> lifecycle_fences_;
     // instance_id -> (host_ip_port -> NodeInfo)
     std::unordered_map<std::string, std::unordered_map<std::string, std::unique_ptr<NodeInfo>>> instance_nodes_;
@@ -243,30 +271,10 @@ private:
     // report after process restart can lazily rebuild the node.
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
-    struct SnapshotVersionState {
-        // Process-local reporter state, not a distributed lock. KVCM restart
-        // clears this state; the first valid delta or snapshot rebuilds it.
-        std::string committed;
-        std::string in_flight;
-        // Monotonically advances for every admitted snapshot attempt,
-        // including attempts that later abort. Async cleanup captures this
-        // value so an older task cannot reclaim writes from a later attempt.
-        uint64_t attempt_epoch = 0;
-        uint64_t active_delta_mutations = 0;
-        int64_t last_commit_ms = 0;
-        // A successful complete snapshot proves that committed is an
-        // authoritative query fence. An admitted snapshot failure switches
-        // back to soft visibility because in-place candidate writes may have
-        // replaced committed metadata. Process-local recovery also starts
-        // soft until the next successful snapshot.
-        bool strict_query_visibility = false;
-    };
-    std::unordered_map<ReporterSnapshotKey, SnapshotVersionState, ReporterSnapshotKeyHash> snapshot_versions_;
-    // Resolves an opaque committed token back to the reporter whose liveness
-    // must also be checked by the context-free MightExist interface.
-    // Guarded by nodes_mutex_ together with snapshot_versions_.
+    // Resolves every reserved (committed or in-flight) token back to its
+    // reporter. MightExist additionally validates that the token is committed.
+    mutable std::shared_mutex snapshot_token_owners_mutex_;
     std::unordered_map<std::string, ReporterSnapshotKey> snapshot_token_owners_;
-    std::condition_variable_any snapshot_state_cv_;
     int64_t snapshot_min_interval_ms_ = EventReportStorageSpec::kDefaultSnapshotMinIntervalMs;
     int64_t snapshot_delta_drain_timeout_ms_ = EventReportStorageSpec::kDefaultSnapshotDeltaDrainTimeoutMs;
 
