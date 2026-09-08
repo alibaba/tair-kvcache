@@ -1268,6 +1268,53 @@ MetaLocalBackend::DeleteLocationsForMaintenance(RequestContext * /*request_conte
     return results;
 }
 
+std::vector<ErrorCode> MetaLocalBackend::GetPropertiesForMaintenance(RequestContext * /*request_context*/,
+                                                                     const KeyTypeVec &keys,
+                                                                     const std::vector<std::string> &field_names,
+                                                                     PropertyMapVector &out_properties) noexcept {
+    out_properties.assign(keys.size(), PropertyMap{});
+    std::vector<ErrorCode> results(keys.size(), EC_NOENT);
+    if (!cache_) {
+        std::fill(results.begin(), results.end(), EC_ERROR);
+        return results;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        cache_->ApplyToEntryNoTouch(
+            KeyToView(keys[i]), [&](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                if (value == nullptr) {
+                    results[i] = EC_ERROR;
+                    return 0;
+                }
+                const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                std::shared_lock lock(item->GetMutex());
+                for (const auto &field : field_names) {
+                    if (field == PROPERTY_LRU_TIME) {
+                        out_properties[i][field] = std::to_string(item->GetLastAccessTime());
+                    } else if (const auto it = item->GetProperties().find(field); it != item->GetProperties().end()) {
+                        out_properties[i][field] = it->second;
+                    }
+                }
+                results[i] = EC_OK;
+                return 0;
+            });
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetLocationMapsForMaintenance(RequestContext * /*request_context*/,
+                                                                       const KeyTypeVec &keys,
+                                                                       CacheLocationMapVector &out_locations) noexcept {
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    std::vector<ErrorCode> results(keys.size(), EC_ERROR);
+    if (!cache_) {
+        return results;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKeyForMaintenance(keys[i], &out_locations[i], nullptr);
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::GetProperties(RequestContext * /*request_context*/,
                                                        const KeyTypeVec &keys,
                                                        const std::vector<std::string> &field_names,
@@ -1508,6 +1555,18 @@ ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_c
         remaining -= static_cast<int64_t>(collected);
     }
     return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::SampleReclaimKeysForMaintenance(RequestContext *request_context,
+                                                            int64_t count,
+                                                            KeyTypeVec &out_keys) noexcept {
+    ReclaimCandidateVector candidates;
+    const auto ec = SampleReclaimCandidates(request_context, count, candidates);
+    out_keys.clear();
+    for (const auto &candidate : candidates) {
+        out_keys.push_back(candidate.key);
+    }
+    return ec;
 }
 
 std::vector<ErrorCode>

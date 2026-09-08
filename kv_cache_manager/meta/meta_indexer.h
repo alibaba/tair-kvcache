@@ -159,6 +159,13 @@ public:
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
                                 LocationsPerKey &out_locations) noexcept;
+    Result GetPropertiesForMaintenance(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const std::vector<std::string> &property_names,
+                                       PropertyMapVector &out_properties) noexcept;
+    Result GetLocationMapsForMaintenance(RequestContext *request_context,
+                                         const KeyVector &keys,
+                                         CacheLocationMapVector &out_locations) noexcept;
     Result GetProperties(RequestContext *request_context,
                          const KeyVector &keys,
                          const std::vector<std::string> &property_names,
@@ -178,6 +185,8 @@ public:
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates) const noexcept;
+    ErrorCode
+    SampleReclaimKeysForMaintenance(RequestContext *request_context, int64_t count, KeyVector &out_keys) const noexcept;
 
     // Reuses the same bounded executor for CPU-only query projection/reduction.
     // Directly constructed test/indexer instances without an executor retain

@@ -2,13 +2,13 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | 已实现，独立版本全量单测通过 |
+| 状态 | 已实现，单测与共用回收链路端到端回归通过 |
 | 更新时间 | 2026-09-08 |
 | 代码基线 | `origin/main`，`a6e5d176` |
 | 涉及模块 | `manager`、`metrics` |
 | 关联能力 | 按用量比例分配预算、异步 credit、水位提前停止 |
 
-本文档只讨论如何避免有逐出预算的小 Instance 长期得不到执行机会。它不改变容量预算的分配算法，也不包含跨 Instance 的 Group LRU。整体行为见 [跨 Instance 预算分配设计](cache_reclaimer_instance_fairness.md)，删除安全约束见 [异步删除设计](cache_reclaimer_async_delete.md)。本次改动可独立构建和验证，不依赖新逐出策略。
+本文档只讨论如何避免有逐出预算的小 Instance 长期得不到执行机会。它不改变容量预算的分配算法，也不负责跨 Instance LRU；后者见 [Group LRU 设计](cache_reclaimer_group_lru.md)。整体行为见 [跨 Instance 预算分配设计](cache_reclaimer_instance_fairness.md)，删除安全约束见 [异步删除设计](cache_reclaimer_async_delete.md)。两部分已在本分支实现并统一验证。
 
 ## 1. 背景
 
@@ -142,7 +142,7 @@ std::map<std::string, FairRotationState> fair_rotation_by_group_;
 
 因此选择容量比例模式的 Group 升级后执行顺序会变化，但不需要迁移 Registry 数据。切换到 `FIXED_PER_INSTANCE` 可以回退到旧固定预算路径，**并不等于恢复本改造前“用量比例预算 + 每轮从大到小”的完全相同行为**。
 
-默认值保持 `USAGE_PROPORTIONAL`，现有枚举编号、协议和持久化格式均不变；Group LRU 及其配置扩展另行提交。
+本分支同时提供 `instance_reclaim_budget_policy=GROUP_LRU` 的独立候选选择路径，不消费本容量策略的执行队列。该路径成为新的缺省模式，显式配置 `USAGE_PROPORTIONAL` 的 Group 继续使用容量比例轮转；默认值变更和旧配置升级规则见 [Group LRU 设计](cache_reclaimer_group_lru.md)。
 
 ### 5.2 状态清理
 
@@ -177,7 +177,7 @@ DEBUG 日志记录 Group、本轮原始最大权重项、实际起始 ID、已�
 
 ## 8. 验证计划
 
-已补充 12 个轮转专项单测，并扩展已有触发范围变化和配置切换用例。拆分后的独立版本已在隔离 Linux 环境中通过全部 137 个 `CacheReclaimerTest` 用例，指标上报模块独立构建通过，验证时关闭 Mooncake 构建；涉及的 C++ 文件通过仓库配置下的 clang-format 13.0.1 检查。验证覆盖以下范围，异步与迁移安全约束同时沿用已有回归用例：
+已补充 12 个轮转专项单测，并扩展已有触发范围变化和配置切换用例，随 159 个 CacheReclaimer 全量单测通过。扩展回归与共用回收链路端到端测试已通过，结果见 [Group LRU 功能验证记录](cache_reclaimer_group_lru.md#102-本次功能验证结果2026-09-08)。验证覆盖以下范围，异步与迁移安全约束同时沿用已有回归用例：
 
 1. **稳定复现并修复饥饿**：三个正预算 Instance，usage stub 在多轮保持不变，每轮第一个 accepted 请求足以恢复水位；验证执行顺序依次覆盖 A、B、C，而不是反复 A。
 2. **无压力轮次不丢位置**：A 后停止，中间多轮 credit 使水位不再触发，恢复压力后从 B 开始。
@@ -204,5 +204,5 @@ DEBUG 日志记录 Group、本轮原始最大权重项、实际起始 ID、已�
 - `CacheReclaimer::PrepareFairExecutionOrder` / `TryReclaimOnGroupFair`：计划同步、按队列取项、尝试后推进；不修改整数分配实现。
 - `CacheReclaimer::PruneFairRotationStates` / `ReclaimCron` / `Stop`：Group 状态回收和线程归属。
 - `CacheReclaimer` 与 `kmonitor_metrics_reporter.cc`：轮转指标注册、采集和上报。
-- `cache_reclaimer_test.cc`：跨轮顺序、预算更新、失败让位、成员同步和生命周期回归代码。
-- 当前预算分配文档已同步执行顺序和提前停止行为；不包含 Group LRU 及其配置、协议或元数据读取改动。
+- `cache_reclaimer_test.cc`：跨轮顺序、预算更新、失败让位、成员同步和生命周期回归代码，已通过。
+- 当前预算分配文档已同步执行顺序和提前停止行为；Group LRU 通过独立路径实现，两种策略可按配置切换。

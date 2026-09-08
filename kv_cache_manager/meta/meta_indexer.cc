@@ -114,8 +114,7 @@ public:
     }
     ~ScopedBatchLock() {
         if (out_lock_hold_time_us_ != nullptr) {
-            *out_lock_hold_time_us_ +=
-                std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_);
+            *out_lock_hold_time_us_ += std::max<int64_t>(0, TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_);
         }
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->unlock();
@@ -763,15 +762,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = maintenance_no_touch
-                                  ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
-                                                                                 batch_keys,
-                                                                                 batch_location_ids,
-                                                                                 batch_locations_per_key)
-                                  : backend_manager_->GetLocations(ephemeral_request_context.get(),
-                                                                   batch_keys,
-                                                                   batch_location_ids,
-                                                                   batch_locations_per_key);
+            get_ecs_per_key =
+                maintenance_no_touch
+                    ? backend_manager_->GetLocationsForMaintenance(
+                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
+                    : backend_manager_->GetLocations(
+                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -1855,6 +1851,37 @@ bool MetaIndexer::ParallelForQuery(std::size_t count, const QueryExecutor::Range
     return false;
 }
 
+MetaIndexer::Result MetaIndexer::GetPropertiesForMaintenance(RequestContext *request_context,
+                                                             const KeyVector &keys,
+                                                             const std::vector<std::string> &property_names,
+                                                             PropertyMapVector &out_properties) noexcept {
+    auto codes = backend_manager_->GetPropertiesForMaintenance(request_context, keys, property_names, out_properties);
+    Result result(keys.size());
+    if (keys.empty()) {
+        result.ec = EC_OK;
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    const auto errors = ProcessErrorCodes(trace_id, codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, errors, keys.size(), result);
+    return result;
+}
+
+MetaIndexer::Result MetaIndexer::GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                               const KeyVector &keys,
+                                                               CacheLocationMapVector &out_locations) noexcept {
+    auto codes = backend_manager_->GetLocationMapsForMaintenance(request_context, keys, out_locations);
+    Result result(keys.size());
+    if (keys.empty()) {
+        result.ec = EC_OK;
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    const auto errors = ProcessErrorCodes(trace_id, codes, {}, keys, kGetMetaOperation, result);
+    ProcessErrorResult(trace_id, kGetMetaOperation, errors, keys.size(), result);
+    return result;
+}
+
 MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,
                                                const KeyVector &keys,
                                                const std::vector<std::string> &property_names,
@@ -1936,6 +1963,12 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
                        out_keys.size());
     }
     return ec;
+}
+
+ErrorCode MetaIndexer::SampleReclaimKeysForMaintenance(RequestContext *request_context,
+                                                       int64_t count,
+                                                       KeyVector &out_keys) const noexcept {
+    return backend_manager_->SampleReclaimKeysForMaintenance(request_context, count, out_keys);
 }
 
 ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,

@@ -67,6 +67,9 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
+    CacheReclaimerGroupLruConfig group_lru_config;
+    group_lru_config.max_sampling_size = config_.GetCacheReclaimerGroupLruMaxSamplingSize();
+    group_lru_config.max_delete_requests_per_round = config_.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound();
     CacheGarbageCollector::Config cache_gc_config;
     cache_gc_config.enabled = config_.IsCacheGcEnabled();
     cache_gc_config.scan_interval_ms = config_.GetCacheGcScanIntervalMs();
@@ -88,7 +91,8 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetMetaQueryWorkerCount(),
                               config_.GetMetaQueryParallelThreshold(),
                               config_.GetMetaQueryChunkSize(),
-                              cache_gc_config)) {
+                              cache_gc_config,
+                              group_lru_config)) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;
     }
