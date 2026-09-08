@@ -1,8 +1,9 @@
 import orjson
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import List, Any, Union, Dict
+from typing import Any, Dict, List, Set, Tuple, Union
 
 import zmq
 
@@ -13,7 +14,8 @@ from kv_cache_manager.py_connector.common.logger import logger
 class SendBlockStartEvent:
     request_id: str
     write_session_id: str
-    locations: list = field(default_factory=list)
+    # Manager CacheLocation dicts, one per block to save.
+    locations: List[Dict[str, Any]] = field(default_factory=list)
     type: str = "SendBlockStartEvent"
 
 
@@ -48,7 +50,7 @@ class CoordinateMessage:
     create_time: float = field(default_factory=time.time)
 
 
-msg_type_mapping = {
+msg_type_mapping: Dict[str, type] = {
     "SendBlockStartEvent": SendBlockStartEvent,
     "SendBlockFinishedEvent": SendBlockFinishedEvent,
     "LoadBlockFinishedEvent": LoadBlockFinishedEvent,
@@ -81,36 +83,41 @@ class RunningId:
 
 @dataclass()
 class LoadContext:
-    finished_rank: set = field(default_factory=set)
+    finished_rank: Set[int] = field(default_factory=set)
 
-    def add_new_rank(self, tp_rank):
+    def add_new_rank(self, tp_rank: int) -> None:
         if tp_rank in self.finished_rank:
             return
         self.finished_rank.add(tp_rank)
 
-    def get_size(self):
+    def get_size(self) -> int:
         return len(self.finished_rank)
 
 
 @dataclass
 class SaveContext:
-    locations: list
-    result_per_rank: Dict[int, List[Any]] = field(default_factory=dict)
+    # Manager CacheLocation dicts, one per block to save.
+    locations: List[Dict[str, Any]]
+    result_per_rank: Dict[int, List[bool]] = field(default_factory=dict)
     success_mask: List[bool] = field(default_factory=list)
 
-    def add_new_rank(self, tp_rank, is_successes):
+    def add_new_rank(self, tp_rank: int, is_successes: List[bool]) -> None:
         if tp_rank in self.result_per_rank:
             return
         self.result_per_rank[tp_rank] = is_successes
 
-    def get_size(self):
+    def get_size(self) -> int:
         return len(self.result_per_rank)
 
 
 class TpCoordinatorServer:
     def __init__(
-        self, host_ip: str, base_port: int, tp_world_size: int, on_finished_callback
-    ):
+        self,
+        host_ip: str,
+        base_port: int,
+        tp_world_size: int,
+        on_finished_callback: Callable[[str, SaveContext], None],
+    ) -> None:
         self._host_ip = host_ip
         self._base_port = base_port
         self._tp_world_size = tp_world_size
@@ -128,7 +135,7 @@ class TpCoordinatorServer:
         self._finished_saving_lock = threading.Lock()
         self._on_finished_callback = on_finished_callback
 
-    def coordinator_routine(self):
+    def coordinator_routine(self) -> None:
         context = zmq.Context()
         socket = context.socket(zmq.PULL)
         port = self._base_port
@@ -142,7 +149,7 @@ class TpCoordinatorServer:
 
         def complete_save_if_ready(
             save_id: RunningId, write_session_id: str, request_id: str
-        ):
+        ) -> None:
             save_context = running_save.get(save_id)
             if save_context is None:
                 return
@@ -214,7 +221,7 @@ class TpCoordinatorServer:
             else:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
 
-    def get_finished_tasks(self):
+    def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
         finished_saving = []
         finished_loading = []
         if len(self._finished_loading) > 0:
@@ -229,7 +236,7 @@ class TpCoordinatorServer:
             self._finished_saving_lock.release()
         return finished_saving, finished_loading
 
-    def get_failed_loading_block_idxs(self):
+    def get_failed_loading_block_idxs(self) -> Set[int]:
         if len(self._failed_loading_block_idxs) == 0:
             return set()
         self._finished_loading_lock.acquire()
@@ -240,7 +247,7 @@ class TpCoordinatorServer:
 
 
 class TpCoordinatorClient:
-    def __init__(self, host_ip, port):
+    def __init__(self, host_ip: str, port: int) -> None:
         self._host_ip = host_ip
         self._port = port
         self._lock = threading.Lock()
@@ -251,6 +258,6 @@ class TpCoordinatorClient:
         socket.connect("tcp://%s:%d" % (self._host_ip, self._port))
         self._socket = socket
 
-    def send(self, param: bytes):
+    def send(self, param: bytes) -> None:
         with self._lock:
             self._socket.send(param)

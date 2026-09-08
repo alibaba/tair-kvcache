@@ -13,7 +13,6 @@ URL 形式（由工厂解析后注入）::
 import threading
 from typing import List, Optional, Sequence
 
-from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.service_discovery import (
     ServiceDiscovery,
     ServiceEndpoint,
@@ -65,7 +64,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
         host_list: Optional[str] = None,
         *,
         endpoints: Optional[Sequence[ServiceEndpoint]] = None,
-    ):
+    ) -> None:
         if endpoints is not None:
             parsed: List[ServiceEndpoint] = list(endpoints)
         elif host_list is not None:

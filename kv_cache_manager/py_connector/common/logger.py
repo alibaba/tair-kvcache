@@ -16,7 +16,7 @@ _DEFAULT_LEVEL = logging.WARNING
 _ENV_VAR = "KVCM_LOG_LEVEL"
 
 
-def set_log_level(level_str: str):
+def set_log_level(level_str: str) -> None:
     """Set KVCM logger level from a string like 'DEBUG', 'INFO', 'WARNING'.
 
     Falls back to WARNING if the level string is invalid or empty.
@@ -24,14 +24,17 @@ def set_log_level(level_str: str):
     if not level_str:
         logger.setLevel(_DEFAULT_LEVEL)
         return
-    level = logging.getLevelName(level_str.upper())
+    # The str -> int overload is deprecated, but getLevelNamesMapping()
+    # would raise the wheel's python_requires (>= 3.9); the fallback below
+    # already handles the non-int answers.
+    level = logging.getLevelName(level_str.upper())  # ty: ignore[deprecated]
     if not isinstance(level, int):
         logger.warning("Invalid log level '%s', falling back to WARNING", level_str)
         level = _DEFAULT_LEVEL
     logger.setLevel(level)
 
 
-def configure_log_level(param_level: str = ""):
+def configure_log_level(param_level: str = "") -> None:
     """Apply log level with priority: env var > param > default(WARNING).
 
     Args:

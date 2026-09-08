@@ -1,7 +1,7 @@
 import random
 import threading
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import requests
 
@@ -48,16 +48,16 @@ class KvCacheManagerClient:
 
     def __init__(
         self,
-        base_url,
+        base_url: str,
         *,
-        instance_id="",
-        auto_discover_leader=False,
-        leader_retry_count=1,
-        leader_retry_base_interval_seconds=0.005,
-        discovery_refresh_interval_seconds=30,
-        min_discover_interval_seconds=1,
-        request_timeout_seconds=1.0,
-    ):
+        instance_id: str = "",
+        auto_discover_leader: bool = False,
+        leader_retry_count: int = 1,
+        leader_retry_base_interval_seconds: float = 0.005,
+        discovery_refresh_interval_seconds: float = 30,
+        min_discover_interval_seconds: float = 1,
+        request_timeout_seconds: float = 1.0,
+    ) -> None:
         """
         Args:
             base_url: Manager HTTP(S) address or a service-discovery URL. When
@@ -157,26 +157,26 @@ class KvCacheManagerClient:
                 raise
 
     @staticmethod
-    def _is_http_url(url):
+    def _is_http_url(url: str) -> bool:
         return url.startswith(("http://", "https://"))
 
     @staticmethod
-    def _endpoint_url(endpoint: ServiceEndpoint):
+    def _endpoint_url(endpoint: ServiceEndpoint) -> str:
         """Build a Manager URL from the host:port-only HTTP endpoint contract."""
         return f"http://{endpoint.host}"
 
-    def _close_service_discovery(self):
+    def _close_service_discovery(self) -> None:
         discovery = self._service_discovery
         self._service_discovery = None
         if discovery is not None:
             discovery.close()
 
     @staticmethod
-    def _get_status_code(response_data):
+    def _get_status_code(response_data: Mapping[str, Any]) -> Any:
         """Extract status code from a standard API response."""
         return response_data.get("header", {}).get("status", {}).get("code")
 
-    def _refresh_manager_route(self, force_service_refresh=False):
+    def _refresh_manager_route(self, force_service_refresh: bool = False) -> bool:
         """Refresh the Manager route through service and optional leader discovery."""
         snapshot = self.base_url
         with self._route_lock:
@@ -199,7 +199,7 @@ class KvCacheManagerClient:
             finally:
                 self._last_route_refresh_time = time.monotonic()
 
-    def _do_discover_leader(self, url):
+    def _do_discover_leader(self, url: str) -> bool:
         """Resolve and switch to the leader. Must be called under _route_lock."""
         try:
             resp = requests.post(
@@ -255,7 +255,7 @@ class KvCacheManagerClient:
             self.base_url = new_url
         return True
 
-    def _resolve_discovery_url(self, force_refresh=False):
+    def _resolve_discovery_url(self, force_refresh: bool = False) -> str:
         """Resolve a fresh leader-discovery seed, falling back to the initial one."""
         if self._service_discovery is not None:
             try:
@@ -278,7 +278,7 @@ class KvCacheManagerClient:
                 )
         return self._discovery_url
 
-    def _route_refresh_loop(self):
+    def _route_refresh_loop(self) -> None:
         """Background daemon for periodic leader and event-driven route refresh."""
         try:
             while not self._closed.is_set():
@@ -307,7 +307,12 @@ class KvCacheManagerClient:
         finally:
             self._close_deferred_service_discovery()
 
-    def _make_request(self, method, endpoint, data=None):
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[Mapping[str, Any]] = None,
+    ) -> requests.Response:
         """Helper method to make HTTP requests to the service"""
         url = self.base_url + endpoint
 
@@ -331,8 +336,12 @@ class KvCacheManagerClient:
         return response
 
     def _check_response(
-        self, endpoint, response, response_data, check_business_status=True
-    ):
+        self,
+        endpoint: str,
+        response: requests.Response,
+        response_data: Any,
+        check_business_status: bool = True,
+    ) -> None:
         """Validate transport/envelope and optionally the Manager status."""
         if response.status_code != 200:
             raise KvCacheManagerHTTPError(
@@ -360,7 +369,12 @@ class KvCacheManagerClient:
                 f"Request to {endpoint} failed with error: {status.get('message', '')}"
             )
 
-    def _make_api_request(self, endpoint, data=None, check_response=True):
+    def _make_api_request(
+        self,
+        endpoint: str,
+        data: Optional[Mapping[str, Any]] = None,
+        check_response: bool = True,
+    ) -> Dict[str, Any]:
         """Helper method to make POST requests to API endpoints and optionally validate response"""
         retries_left = self._leader_retry_count if self._auto_discover_leader else 0
 
@@ -424,64 +438,88 @@ class KvCacheManagerClient:
 
             return response_data
 
-    def register_instance(self, data, check_response=True):
+    def register_instance(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Register an instance with the service"""
         return self._make_api_request("/api/registerInstance", data, check_response)
 
-    def get_instance_info(self, data, check_response=True):
+    def get_instance_info(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get information about a registered instance"""
         return self._make_api_request("/api/getInstanceInfo", data, check_response)
 
-    def get_cache_meta(self, data, check_response=True):
+    def get_cache_meta(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get cache metadata for specified block keys"""
         return self._make_api_request("/api/getCacheMeta", data, check_response)
 
-    def get_cache_location(self, data, check_response=True):
+    def get_cache_location(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get cache location for specified block keys"""
         return self._make_api_request("/api/getCacheLocation", data, check_response)
 
-    def get_cache_location_len(self, data, check_response=True):
+    def get_cache_location_len(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get the number of cache locations matching the specified block keys"""
         return self._make_api_request("/api/getCacheLocationLen", data, check_response)
 
-    def get_cache_locations_by_backend(self, data, check_response=True):
+    def get_cache_locations_by_backend(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get cache locations selected independently for each storage backend."""
         return self._make_api_request(
             "/api/getCacheLocationsByBackend", data, check_response
         )
 
-    def start_write_cache(self, data, check_response=True):
+    def start_write_cache(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Start writing cache data"""
         return self._make_api_request("/api/startWriteCache", data, check_response)
 
-    def finish_write_cache(self, data, check_response=True):
+    def finish_write_cache(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Finish writing cache data"""
         return self._make_api_request("/api/finishWriteCache", data, check_response)
 
-    def remove_cache(self, data, check_response=True):
+    def remove_cache(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Remove cache data for specified block keys"""
         return self._make_api_request("/api/removeCache", data, check_response)
 
-    def report_event(self, data, check_response=True):
+    def report_event(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Report node, cache block, host-down, or heartbeat events."""
         return self._make_api_request("/api/reportEvent", data, check_response)
 
-    def trim_cache(self, data, check_response=True):
+    def trim_cache(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Trim cache data based on specified strategy"""
         return self._make_api_request("/api/trimCache", data, check_response)
 
-    def get_cluster_info(self, data, check_response=True):
+    def get_cluster_info(
+        self, data: Mapping[str, Any], check_response: bool = True
+    ) -> Dict[str, Any]:
         """Get cluster info including leader endpoint (leader discovery API)"""
         return self._make_api_request("/api/getClusterInfo", data, check_response)
 
-    def _close_session_once(self):
+    def _close_session_once(self) -> None:
         with self._resource_lock:
             if self._session_close_claimed:
                 return
             self._session_close_claimed = True
         self.session.close()
 
-    def _rollback_construction(self):
+    def _rollback_construction(self) -> None:
         try:
             self.close()
         except BaseException:
@@ -490,7 +528,9 @@ class KvCacheManagerClient:
                 exc_info=True,
             )
 
-    def _request_service_discovery_close(self, refresh_thread):
+    def _request_service_discovery_close(
+        self, refresh_thread: Optional[threading.Thread]
+    ) -> None:
         discovery = None
         with self._resource_lock:
             if (
@@ -511,7 +551,7 @@ class KvCacheManagerClient:
         if discovery is not None:
             discovery.close()
 
-    def _close_deferred_service_discovery(self):
+    def _close_deferred_service_discovery(self) -> None:
         discovery = None
         with self._resource_lock:
             self._refresh_worker_cleanup_reached = True
@@ -533,7 +573,7 @@ class KvCacheManagerClient:
                     exc_info=True,
                 )
 
-    def close(self):
+    def close(self) -> None:
         """Close the HTTP session, discovery client, and background refresh thread."""
         self._closed.set()
         self._refresh_event.set()
