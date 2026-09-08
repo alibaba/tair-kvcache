@@ -119,11 +119,19 @@ class RunningId:
 @dataclass()
 class LoadContext:
     finished_rank: Set[int] = field(default_factory=set)
+    # Union of the per-rank failed vLLM block ids. A rank whose loads all
+    # succeed reports an empty list, so keeping only the last-arriving
+    # event's list silently dropped the other ranks' failures whenever a
+    # success event arrived last -- at tp >= 2 a partially failed load was
+    # then never reported to vLLM, which went on to compute on unwritten
+    # KV blocks.
+    failed_block_idxs: List[int] = field(default_factory=list)
 
-    def add_new_rank(self, tp_rank: int) -> None:
+    def add_new_rank(self, tp_rank: int, failed_block_idxs: List[int]) -> None:
         if tp_rank in self.finished_rank:
             return
         self.finished_rank.add(tp_rank)
+        self.failed_block_idxs.extend(failed_block_idxs)
 
     def get_size(self) -> int:
         return len(self.finished_rank)
@@ -306,21 +314,26 @@ class TpCoordinatorServer:
                             content.tp_rank,
                             self._tp_world_size,
                         )
-                running_load[load_id].add_new_rank(content.tp_rank)
+                load_ctx = running_load[load_id]
+                # Union the per-rank failures (upstream cbfdb265): keeping only
+                # the last event's list dropped a failed rank's blocks whenever
+                # a success arrived last -- at 32 ranks that is ~31/32 of
+                # asymmetric failures silently reported as clean.
+                load_ctx.add_new_rank(content.tp_rank, content.failed_block_idxs)
                 if _TRACE:
                     logger.info(
                         "[coordinator] load %s ranks %d/%d (new %d, epoch %s)",
                         load_id,
-                        running_load[load_id].get_size(),
+                        load_ctx.get_size(),
                         self._tp_world_size,
                         content.tp_rank,
                         content.epoch,
                     )
-                if running_load[load_id].get_size() == self._tp_world_size:
+                if load_ctx.get_size() == self._tp_world_size:
                     running_load.pop(load_id)
 
                     self._finished_loading_lock.acquire()
-                    self._failed_loading_block_idxs.extend(content.failed_block_idxs)
+                    self._failed_loading_block_idxs.extend(load_ctx.failed_block_idxs)
                     self._finished_loading.append(content.request_id)
                     self._finished_loading_lock.release()
                     with self._loading_history_lock:

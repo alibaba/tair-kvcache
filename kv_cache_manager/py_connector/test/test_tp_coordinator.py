@@ -14,6 +14,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateEventUnion,
     CoordinateMessage,
     CoordinateMsgSerializer,
+    LoadBlockFinishedEvent,
     SendBlockFinishedEvent,
     SendBlockStartEvent,
     StorageConfigsEvent,
@@ -506,6 +507,67 @@ class TestTpCoordinatorEventRegistry(unittest.TestCase):
         for event in get_args(CoordinateEventUnion):
             declared = event.__dataclass_fields__["type"].default
             self.assertIn(declared, msg_type_mapping)
+
+
+class TestLoadFailureAggregation(unittest.TestCase):
+    """The load-finish aggregation must UNION the per-rank failed block ids.
+
+    Rank asymmetry is the production case: one rank's storage reads fail
+    (e.g. evicted files) while the other rank's succeed, and a block is only
+    usable when every rank loaded it. Before the fix the coordinator kept
+    only the last-arriving event's list, so a success event arriving last
+    erased the other rank's failures and vLLM was never told about the
+    invalid blocks."""
+
+    def setUp(self):
+        self.port = _find_free_port()
+        self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, lambda *a: None)
+        _wait_for_server(self.port)
+        self.client = TpCoordinatorClient("127.0.0.1", self.port)
+
+    def _send(self, tp_rank, failed):
+        msg = CoordinateMessage(
+            time.time(),
+            LoadBlockFinishedEvent(
+                request_id="req-load",
+                tp_rank=tp_rank,
+                epoch=7,
+                failed_block_idxs=failed,
+            ),
+        )
+        self.client.send(CoordinateMsgSerializer.dumps(msg))
+
+    def _poll_failed(self, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            failed = self.server.get_failed_loading_block_idxs()
+            if failed:
+                return failed
+            time.sleep(0.01)
+        return set()
+
+    def test_failures_survive_later_success_event(self):
+        # rank 0 fails blocks 3 and 5, then rank 1's all-success event
+        # completes the set -- the failures must still be reported.
+        self._send(0, [3, 5])
+        self._send(1, [])
+        self.assertEqual(self._poll_failed(), {3, 5})
+
+    def test_failures_from_both_ranks_are_unioned(self):
+        self._send(0, [2])
+        self._send(1, [4])
+        self.assertEqual(self._poll_failed(), {2, 4})
+
+    def test_failures_reported_when_success_arrives_first(self):
+        # Arrival order must not matter.
+        self._send(1, [])
+        self._send(0, [9])
+        self.assertEqual(self._poll_failed(), {9})
+
+    def tearDown(self):
+        self.server._coordinator_running = False
+        self.client._socket.close()
+        self.client._zmq_context.term()
 
 
 if __name__ == "__main__":
