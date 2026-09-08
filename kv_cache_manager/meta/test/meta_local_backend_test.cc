@@ -771,6 +771,87 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouchingKeys) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_no_touch", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc");
+    location->set_status(CLS_SERVING);
+    const KeyVector keys{1, 2, 3};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr,
+                                         keys,
+                                         CacheLocationMapVector(3, {{"loc", location}}),
+                                         PropertyMapVector(3, {{PROPERTY_HIT_COUNT, "7"}})));
+    PropertyMapVector before, after;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, keys, {PROPERTY_LRU_TIME}, before));
+    KeyVector legacy_before;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 3, legacy_before));
+    const auto usage = GetLocalBackend()->GetMemUsage();
+    std::vector<KeyType> sampled;
+    for (int i = 0; i < 6; ++i) {
+        KeyVector batch;
+        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 1, batch));
+        ASSERT_EQ(1, batch.size());
+        sampled.push_back(batch[0]);
+        PropertyMapVector props;
+        CacheLocationMapVector locations;
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  meta_storage_backend_->GetPropertiesForMaintenance(
+                      nullptr, batch, {PROPERTY_LRU_TIME, PROPERTY_HIT_COUNT}, props));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, batch, locations));
+        EXPECT_EQ("7", props[0].at(PROPERTY_HIT_COUNT));
+        ASSERT_EQ(1, locations[0].size());
+    }
+    EXPECT_EQ((KeyVector{1, 2, 3, 1, 2, 3}), sampled);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, keys, {PROPERTY_LRU_TIME}, after));
+    EXPECT_EQ(before, after);
+    KeyVector legacy_after;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 3, legacy_after));
+    EXPECT_EQ(legacy_before, legacy_after);
+    EXPECT_EQ(usage, GetLocalBackend()->GetMemUsage());
+    CacheLocationMapVector missing_locations;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+              meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, {1, 99}, missing_locations));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1, 99}, {PROPERTY_LRU_TIME}, after));
+    ASSERT_EQ(2, after.size());
+    EXPECT_TRUE(after[1].empty());
+}
+
+TEST_F(MetaLocalBackendTest, TestGroupLruSamplingCursorSurvivesRemovalAndPromotion) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_cursor", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2, 3},
+                               {{{PROPERTY_URI, "1"}}, {{PROPERTY_URI, "2"}}, {{PROPERTY_URI, "3"}}}));
+    KeyVector sampled;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 1, sampled));
+    ASSERT_EQ((KeyVector{1}), sampled);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {2}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 1, sampled));
+    EXPECT_EQ((KeyVector{3}), sampled);
+    // A business read promotes the node at the cursor; maintenance must not retain a stale link.
+    PropertyMapVector props;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->GetProperties(nullptr, {1}, {PROPERTY_URI}, props));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 100, sampled));
+    EXPECT_EQ((KeyVector{3, 1}), sampled);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), meta_storage_backend_->Delete(nullptr, {1, 3}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 100, sampled));
+    EXPECT_TRUE(sampled.empty());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {4}, {{{PROPERTY_URI, "4"}}}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 100, sampled));
+    EXPECT_EQ((KeyVector{4}), sampled);
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());

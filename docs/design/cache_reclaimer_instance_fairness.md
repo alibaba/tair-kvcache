@@ -2,14 +2,14 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | 预算分配已合入；跨轮轮转已实现，独立版本全量单测通过 |
+| 状态 | 预算分配已合入；跨轮轮转已实现，核心单测通过，扩展回归中 |
 | 更新时间 | 2026-09-08 |
 | 涉及模块 | `manager`、`meta`、`config`、`metrics`、`service`、`protocol`、`kvcm_ops` |
 | 关联能力 | Instance Group 水位回收、异步删除、分层存储迁移 |
 
 本文档描述 CacheReclaimer 当前的跨 Instance 预算分配行为。异步删除的 pending、credit、Future 和反压语义见 [CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)，模块职责与分层迁移顺序见 [模块架构与关联关系](module_architecture.md)。
 
-执行顺序的新增改进见 [跨轮轮转设计](cache_reclaimer_cross_round_rotation.md)。本次只修改容量比例路径的调度顺序，不增加 Group LRU 模式或改变默认值。
+执行顺序的新增改进见 [跨轮轮转设计](cache_reclaimer_cross_round_rotation.md)。[Group LRU 设计](cache_reclaimer_group_lru.md) 描述本分支新增的独立路径及默认值变更；两项改造正在统一验证，下文只展开容量比例路径。
 
 ## 1. 背景与目标
 
@@ -30,10 +30,11 @@ CacheReclaimer 以 Instance Group 为水位和配额边界。Group 总 bytes、�
 
 | 值 | Admin API | 行为 |
 |---|---|---|
-| `0` | `USAGE_PROPORTIONAL` | 默认。按当前超水位维度上的 per-instance 用量分配 Group 预算，跨轮轮转执行 |
+| `0` | `USAGE_PROPORTIONAL` | 按当前超水位维度上的 per-instance 用量分配 Group 预算，跨轮轮转执行 |
 | `1` | `FIXED_PER_INSTANCE` | 兼容模式。按注册表顺序遍历，每个 Instance 使用固定配置预算 |
+| `2` | `GROUP_LRU` | 新默认。跨 Instance 候选按访问时间统一排序，详见独立设计文档 |
 
-内部持久化 JSON 使用整数，Admin protobuf/JSON 和 `kvcm_ops` 使用枚举名。旧配置缺少该字段时仍按 `USAGE_PROPORTIONAL` 处理；配置加载拒绝未知枚举值。运行期若遇到未知值，仍沿用既有告警并回退到用量比例策略的行为。
+内部持久化 JSON 使用整数，Admin protobuf/JSON 和 `kvcm_ops` 使用枚举名。缺字段时按 `GROUP_LRU` 处理；显式 `0`、`1` 保留原模式。配置加载拒绝未知枚举值，运行期遇到未知值也不偷偷切换逐出策略，而是记录错误并跳过回收；具体发布兼容规则见 Group LRU 文档。
 
 预算使用以下进程级参数：
 
@@ -175,7 +176,7 @@ DEBUG 日志记录权重维度、Group 理论预算、各计划项的原始/最�
 
 ## 10. 发布与回退
 
-选择 `USAGE_PROPORTIONAL` 或缺少策略字段的 Group 使用本设计的预算和轮转逻辑。发布后重点观察计划量、实际采样/提交 Instance 数、计划截断和无进展退避，结合轮转指标及 DEBUG 中的起始 / 下一 ID，确认等待项持续获得机会，credit 提前停止符合预期。
+选择 `USAGE_PROPORTIONAL` 的 Group 使用本设计的预算和轮转逻辑；缺少策略字段的配置进入 `GROUP_LRU`。发布后重点观察计划量、实际采样/提交 Instance 数、计划截断和无进展退避，结合轮转指标及 DEBUG 中的起始 / 下一 ID，确认等待项持续获得机会，credit 提前停止符合预期。
 
 需要回退预算行为时，将策略改为 `FIXED_PER_INSTANCE`；下一轮开始按固定 per-instance 预算和原注册表顺序执行。切换不会取消、重置或重复提交已经在途的删除请求，异步 credit 和 pending Location 继续按原生命周期收敛。此回退不等于恢复“比例预算 + 每轮最大 Instance 优先”；本次没有单独关闭轮转的配置。
 
@@ -188,9 +189,9 @@ DEBUG 日志记录权重维度、Group 理论预算、各计划项的原始/最�
 - 采样与 batch 联动、`S_cfg < B_cfg` 归一化、极小份额取整和裁剪比例保护；
 - 异步 credit 满足水位后的提前停止、继续执行、触发范围变化和提交失败；
 - 有界采样波次的成功、失败、超时、暂停和 worker 饱和；
-- 两种预算策略、缺省值、配置 / Proto 转换和运行期切换；
+- 两种原有预算策略、新 Group LRU 模式、缺省值、配置 / Proto 转换和运行期切换；
 - Reclaim pending Location 与同轮 Migration 快照的互斥。
 
 `kvcm_ops` 单测覆盖枚举参数解析、JSON round-trip、缺省值和 create/update payload。通用 Reclaimer 冒烟测试用于验证整体回收链路，但不作为跨 Instance 公平分配的专项覆盖依据。
 
-本次新增 12 个跨轮轮转专项用例，覆盖无压力轮次保留位置、动态预算 / 成员、失败让位、暂停和策略切换等行为；独立构建和测试结果记录在 [跨轮轮转设计](cache_reclaimer_cross_round_rotation.md)。
+本次新增跨轮轮转、无压力轮次保留位置、动态预算 / 成员、失败让位、暂停和策略切换等测试，已随 159 个 CacheReclaimer 全量单测通过。Group LRU 与本改进统一完成扩展回归和端到端功能验证，结果见 [Group LRU 验证记录](cache_reclaimer_group_lru.md#102-本次功能验证结果2026-09-08)。

@@ -94,6 +94,14 @@ public:
                        std::int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept override;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept override;
+
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           int64_t limit,

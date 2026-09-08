@@ -247,6 +247,8 @@ sequenceDiagram
 
 `CacheReclaimer` 依据 Quota 与存储水位选出待逐出的 key，并把 Location 删除作为端到端异步任务提交给 `SchedulePlanExecutor`。Executor worker 完成元数据 Get/CAS/Sync；Sync 成功后通过定时队列等待删除 delay（等待不占 worker），随后删除 `data_storage` 数据并 CAD `meta` 索引。Reclaimer 在任务终态前按 Instance Group 与 BaseStorageType 维护 pending Location、删除 bytes credit 和硬配额，用于去重、避免过度逐出及提供有界反压；回收动作通过 `event` 上报。完整生命周期和异常语义见 [CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)。
 
+跨 Instance 逐出由 `instance_reclaim_budget_policy` 选择：`GROUP_LRU` 通过 `meta` 的 no-touch 采样 / 属性 / Location 读取收集候选，先做资格过滤，再按 Group 访问时间顺序做删除准入；`USAGE_PROPORTIONAL` 按用量分配预算并跨轮轮转；`FIXED_PER_INSTANCE` 保留原预算和顺序。三者共用 Location 保护规则及上述 Executor 异步生命周期，不改变 Instance 隔离或模块依赖方向。具体配置和采样边界见 [Group LRU 设计](cache_reclaimer_group_lru.md)。
+
 ### 4.6 分层存储迁移（异步 Prepare 与回收协同）
 
 分层迁移由 `CacheReclaimer` 根据 migration strategy 的 source storage 类型水位触发。Reclaimer cron 线程只完成 LRU 候选采样、同轮回收准入和异步 Job 构造，不在 cron 线程执行可能较慢的 Backend Create、最新 Location 查询或 Copy：

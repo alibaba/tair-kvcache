@@ -77,6 +77,13 @@ public:
                                                          int32_t &out_reclaimed_count) noexcept;
 
     // ----- Read APIs -----
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyVector &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept;
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept;
     std::vector<ErrorCode> Get(RequestContext *request_context,
                                const KeyVector &keys,
                                CacheLocationMapVector &out_locations,
@@ -159,6 +166,8 @@ public:
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates) noexcept;
+    ErrorCode
+    SampleReclaimKeysForMaintenance(RequestContext *request_context, int64_t count, KeyTypeVec &out_keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;

@@ -129,6 +129,28 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_item_capped_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_rotation_resume_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_rotation_advance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_plan_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_partial_plan_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_plan_failure_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_eligible_instance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_started_instance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_collected_instance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_candidate_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_selected_block_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_invalid_time_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_delete_request_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_request_limit_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_watermark_stop_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_scope_change_stop_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_backpressure_stop_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_deadline_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_collect_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_sort_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_submit_duration_us);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -553,7 +575,8 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<EventManager> event_manager,
                                std::shared_ptr<WriteLocationManager> write_location_manager,
                                CacheReclaimerAsyncDeleteConfig async_delete_config,
-                               std::shared_ptr<MigrationManager> migration_manager)
+                               std::shared_ptr<MigrationManager> migration_manager,
+                               CacheReclaimerGroupLruConfig group_lru_config)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
@@ -562,6 +585,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , event_manager_(std::move(event_manager))
     , write_location_manager_(std::move(write_location_manager))
     , migration_manager_(std::move(migration_manager))
+    , group_lru_config_(group_lru_config)
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
@@ -595,6 +619,10 @@ CacheReclaimer::~CacheReclaimer() {
 }
 
 ErrorCode CacheReclaimer::Start() noexcept {
+    if (group_lru_config_.max_sampling_size == 0 || group_lru_config_.max_delete_requests_per_round == 0) {
+        KVCM_LOG_ERROR("Group LRU resource limits must be positive");
+        return ErrorCode::EC_BADARGS;
+    }
     if (registry_manager_ == nullptr) {
         KVCM_LOG_ERROR("registry manager is nullptr");
         return ErrorCode::EC_ERROR;
@@ -647,6 +675,28 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_resume_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_advance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_plan_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_partial_plan_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_plan_failure_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligible_instance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_started_instance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_collected_instance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_candidate_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_selected_block_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_invalid_time_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_delete_request_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_request_limit_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_watermark_stop_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_scope_change_stop_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_backpressure_stop_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_deadline_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_collect_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_sort_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_submit_duration_us);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -709,6 +759,7 @@ void CacheReclaimer::Stop() noexcept {
     }
 
     fair_rotation_by_group_.clear();
+    group_lru_rotation_by_group_.clear();
 
     KVCM_LOG_DEBUG("cache reclaimer stop OK");
 }
@@ -1217,24 +1268,15 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
             const std::size_t available_workers = workers_.size() - in_flight;
             const std::size_t remaining_task_count = (sampling_sz_todo - 1) / sampling_sz_per_task + 1;
             const std::size_t wave_task_count = std::min(remaining_task_count, available_workers);
-            std::vector<std::future<KeySamplingResult>> futures;
+            std::vector<std::future<SamplingResult>> futures;
             futures.reserve(wave_task_count);
             for (std::size_t i = 0; i != wave_task_count; ++i) {
                 const std::size_t sampling_sz = std::min(sampling_sz_per_task, sampling_sz_todo);
-                auto promise = std::make_shared<std::promise<KeySamplingResult>>();
-                futures.emplace_back(promise->get_future());
-                in_flight_sampling_tasks_.fetch_add(1);
-                SubmitTask([this, sample, sampling_sz, promise]() {
-                    ReclaimCandidateVector candidates;
-                    const auto ec = sample(sampling_sz, candidates);
-                    in_flight_sampling_tasks_.fetch_sub(1);
-                    if (ec != ErrorCode::EC_OK) {
-                        promise->set_value({ec, nullptr});
-                    } else {
-                        promise->set_value(
-                            {ErrorCode::EC_OK, std::make_shared<ReclaimCandidateVector>(std::move(candidates))});
-                    }
-                });
+                futures.emplace_back(SubmitSamplingTask([sample, sampling_sz]() {
+                    SamplingResult result;
+                    result.ec = sample(sampling_sz, result.candidates);
+                    return result;
+                }));
                 sampling_sz_todo -= sampling_sz;
             }
 
@@ -1260,8 +1302,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
                     break;
                 }
                 sampled_candidates.insert(sampled_candidates.end(),
-                                          std::make_move_iterator(key_sampling_result.candidates->begin()),
-                                          std::make_move_iterator(key_sampling_result.candidates->end()));
+                                          std::make_move_iterator(key_sampling_result.candidates.begin()),
+                                          std::make_move_iterator(key_sampling_result.candidates.end()));
             }
             if (!wave_succeeded) {
                 cancelled->store(true, std::memory_order_relaxed);
@@ -1445,6 +1487,30 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  CountsByStorageType &out_location_counts_by_type,
                                  std::uint64_t &out_predicted_deleted_keys,
                                  AgeStats &out_create_age_stats) noexcept {
+    return FilterLocIDImpl(request_context,
+                           instance_info,
+                           batch,
+                           water_level_exceed,
+                           out_loc_ids,
+                           out_bytes_by_type,
+                           out_location_counts_by_type,
+                           out_predicted_deleted_keys,
+                           out_create_age_stats,
+                           false,
+                           false);
+}
+
+bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
+                                     const std::shared_ptr<const InstanceInfo> &instance_info,
+                                     const std::vector<std::int64_t> &batch,
+                                     const WaterLevelExceed &water_level_exceed,
+                                     std::vector<std::vector<std::string>> &out_loc_ids,
+                                     BytesByStorageType &out_bytes_by_type,
+                                     CountsByStorageType &out_location_counts_by_type,
+                                     std::uint64_t &out_predicted_deleted_keys,
+                                     AgeStats &out_create_age_stats,
+                                     bool eligibility_only,
+                                     bool maintenance_read) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1454,8 +1520,8 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
 
-    if (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
-        pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit) {
+    if (!eligibility_only && (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
+                              pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit)) {
         RecordPendingLimitReject(ins_gr, "process");
         LOG_WITH_ID(WARN,
                     "process pending delete limit reached, handlers: [%" PRIu64 "/%" PRIu64 "], bytes: [%" PRIu64
@@ -1469,20 +1535,34 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         return true;
     }
 
-    const auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(ins_id);
-    if (meta_searcher == nullptr) {
-        LOG_WITH_ID(WARN, "meta searcher is nullptr");
-        return false;
-    }
-
     // get the location map of each block in the batch
     std::vector<CacheLocationMap> loc_maps;
-    const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
-    assert(std::holds_alternative<BlockMaskVector>(blk_mask));
-    if (const auto ec = meta_searcher->BatchGetLocation(request_context, batch, blk_mask, loc_maps);
-        ec != ErrorCode::EC_OK) {
-        LOG_WITH_ID(WARN, "get cache location maps failed, error code: [%d]", static_cast<std::int32_t>(ec));
-        return false;
+    if (maintenance_read) {
+        const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
+        if (!indexer) {
+            return false;
+        }
+        const auto result = indexer->GetLocationMapsForMaintenance(request_context, batch, loc_maps);
+        if (result.error_codes.size() != batch.size() ||
+            std::any_of(result.error_codes.begin(), result.error_codes.end(), [](const auto ec) {
+                return ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT;
+            })) {
+            LOG_WITH_ID(WARN, "maintenance location read failed");
+            return false;
+        }
+    } else {
+        const auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(ins_id);
+        if (meta_searcher == nullptr) {
+            LOG_WITH_ID(WARN, "meta searcher is nullptr");
+            return false;
+        }
+        const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
+        assert(std::holds_alternative<BlockMaskVector>(blk_mask));
+        if (const auto ec = meta_searcher->BatchGetLocation(request_context, batch, blk_mask, loc_maps);
+            ec != ErrorCode::EC_OK) {
+            LOG_WITH_ID(WARN, "get cache location maps failed, error code: [%d]", static_cast<std::int32_t>(ec));
+            return false;
+        }
     }
 
     if (loc_maps.size() != batch.size()) {
@@ -1661,6 +1741,13 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     continue;
                 }
 
+                // Discovery must not reserve a budget for unselected candidates.
+                // Admission below re-runs the same eligibility rules on fresh maps.
+                if (eligibility_only) {
+                    loc_id_vec.emplace_back(loc.id());
+                    continue;
+                }
+
                 const auto quota_it = pending_quota_by_group_type_.find({ins_gr, base_type});
                 const PendingQuota current_quota =
                     quota_it == pending_quota_by_group_type_.end() ? PendingQuota{} : quota_it->second;
@@ -1712,7 +1799,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 }
             }
         }
-        if (!loc_id_vec.empty() && loc_id_vec.size() == valid_location_count) {
+        if (!eligibility_only && !loc_id_vec.empty() && loc_id_vec.size() == valid_location_count) {
             out_predicted_deleted_keys = SaturatingAdd(out_predicted_deleted_keys, 1);
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
@@ -2572,7 +2659,7 @@ std::vector<std::size_t> CacheReclaimer::PrepareFairExecutionOrder(const std::st
 
 void CacheReclaimer::PruneFairRotationStates(
     const std::vector<std::shared_ptr<const InstanceGroup>> &instance_groups) noexcept {
-    if (fair_rotation_by_group_.empty()) {
+    if (fair_rotation_by_group_.empty() && group_lru_rotation_by_group_.empty()) {
         return;
     }
     std::unordered_set<std::string> active_groups;
@@ -2585,6 +2672,13 @@ void CacheReclaimer::PruneFairRotationStates(
     for (auto it = fair_rotation_by_group_.begin(); it != fair_rotation_by_group_.end();) {
         if (active_groups.find(it->first) == active_groups.end()) {
             it = fair_rotation_by_group_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = group_lru_rotation_by_group_.begin(); it != group_lru_rotation_by_group_.end();) {
+        if (active_groups.find(it->first) == active_groups.end()) {
+            it = group_lru_rotation_by_group_.erase(it);
         } else {
             ++it;
         }
@@ -2629,14 +2723,16 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
     const auto budget_policy = reclaim_strategy->instance_reclaim_budget_policy();
     if (budget_policy == InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
         fair_rotation_by_group_.erase(ins_gr);
+        group_lru_rotation_by_group_.erase(ins_gr);
         result = TryReclaimOnGroupLegacy(request_context, instance_group, reclaim_strategy, instance_infos);
-    } else {
-        if (budget_policy != InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL) {
-            LOG_WITH_GR(WARN,
-                        "unknown instance reclaim budget policy: [%d], falling back to usage-proportional",
-                        static_cast<std::int32_t>(budget_policy));
-        }
+    } else if (budget_policy == InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL) {
+        group_lru_rotation_by_group_.erase(ins_gr);
         result = TryReclaimOnGroupFair(request_context, instance_group, reclaim_strategy, instance_infos);
+    } else if (budget_policy == InstanceReclaimBudgetPolicy::GROUP_LRU) {
+        fair_rotation_by_group_.erase(ins_gr);
+        result = TryReclaimOnGroupLru(request_context, instance_group, reclaim_strategy, instance_infos);
+    } else {
+        LOG_WITH_GR(ERROR, "invalid instance reclaim mode [%d], skip reclaim", static_cast<int>(budget_policy));
     }
 
     // Reclaim admission precedes migration preparation in the same cron round. An accepted

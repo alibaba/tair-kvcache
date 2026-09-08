@@ -49,6 +49,35 @@ void MetaDummyBackendTest::ConstructMetaStorageBackendConfig() {
     meta_storage_backend_config_->SetStorageUri("file://" + local_path);
 }
 
+TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("maintenance_no_touch", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc");
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        meta_storage_backend_->Put(
+            nullptr, {1}, CacheLocationMapVector{{{"loc", location}}}, PropertyMapVector{{{PROPERTY_HIT_COUNT, "3"}}}));
+    PropertyMapVector before, after;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, before));
+    for (int repeat = 0; repeat < 5; ++repeat) {
+        KeyVector sampled;
+        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 1, sampled));
+        EXPECT_EQ((KeyVector{1}), sampled);
+        CacheLocationMapVector locations;
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+                  meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
+        ASSERT_EQ(2, locations.size());
+        EXPECT_EQ(1, locations[0].count("loc"));
+        EXPECT_TRUE(locations[1].empty());
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, after));
+        EXPECT_EQ(before, after);
+    }
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestSimple) {
     ASSERT_EQ(META_DUMMY_BACKEND_TYPE_STR, meta_storage_backend_->GetStorageType());
 

@@ -82,6 +82,24 @@ public:
     }
 };
 
+class MaintenanceReadFailureBackend : public MetaLocalBackend {
+public:
+    bool malformed{false};
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *,
+                                                       const KeyVector &keys,
+                                                       const std::vector<std::string> &,
+                                                       PropertyMapVector &out) noexcept override {
+        out.assign(malformed ? 0 : keys.size(), PropertyMap{});
+        return std::vector<ErrorCode>(keys.size(), malformed ? EC_OK : EC_ERROR);
+    }
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *,
+                                                         const KeyVector &keys,
+                                                         CacheLocationMapVector &out) noexcept override {
+        out.assign(malformed ? 0 : keys.size(), CacheLocationMap{});
+        return std::vector<ErrorCode>(keys.size(), malformed ? EC_OK : EC_ERROR);
+    }
+};
+
 class RecoverContractCacheBackend : public MetaLocalBackend {
 public:
     explicit RecoverContractCacheBackend(std::vector<ErrorCode> put_results = {})
@@ -1081,6 +1099,86 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
     ASSERT_LE(sampled.size(), 1u);
 
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestGroupLruMaintenanceViewDuringAndAfterRecovery) {
+    MetaStorageBackendManager mgr;
+    mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    config->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, mgr.persistent_backend_->Init("persistent", config));
+    ASSERT_EQ(EC_OK, mgr.cache_backend_->Init("cache", config));
+    ASSERT_EQ(EC_OK, mgr.persistent_backend_->Open());
+    ASSERT_EQ(EC_OK, mgr.cache_backend_->Open());
+    auto persisted = MakeBatch({1, 2});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              mgr.persistent_backend_->Put(
+                  nullptr, persisted.batch_keys, persisted.batch_locations, persisted.batch_properties));
+    auto hot = MakeBatch({2});
+    hot.batch_properties[0]["p0"] = "newer-cache-value";
+    hot.batch_locations[0] = {{"hot", MakeLocation("hot", "hot-uri")}};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->Put(nullptr, hot.batch_keys, hot.batch_locations, hot.batch_properties));
+    mgr.recover_state_ = MetaStorageBackendManager::RecoverState::kRecover;
+    PropertyMapVector properties, before, after;
+    CacheLocationMapVector locations;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->GetPropertiesForMaintenance(nullptr, {2}, {PROPERTY_LRU_TIME}, before));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
+              mgr.GetPropertiesForMaintenance(nullptr, {1, 2, 3}, {"p0"}, properties));
+    EXPECT_EQ("p0_1", properties[0].at("p0"));
+    EXPECT_EQ("newer-cache-value", properties[1].at("p0"));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
+              mgr.GetLocationMapsForMaintenance(nullptr, {1, 2, 3}, locations));
+    EXPECT_EQ(1, locations[0].count("loc_1"));
+    EXPECT_EQ(1, locations[1].count("hot"));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}),
+              mgr.cache_backend_->GetLocationMapsForMaintenance(nullptr, {1}, locations));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.cache_backend_->GetPropertiesForMaintenance(nullptr, {2}, {PROPERTY_LRU_TIME}, after));
+    EXPECT_EQ(before, after);
+    KeyVector sampled;
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeysForMaintenance(nullptr, 10, sampled));
+    EXPECT_EQ((KeyVector{1, 2}), sampled);
+    mgr.recover_state_ = MetaStorageBackendManager::RecoverState::kRunning;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}),
+              mgr.GetPropertiesForMaintenance(nullptr, {1, 2}, {"p0"}, properties));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}), mgr.GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeysForMaintenance(nullptr, 10, sampled));
+    EXPECT_EQ((KeyVector{2}), sampled);
+    ASSERT_EQ(EC_OK, mgr.cache_backend_->Close());
+    ASSERT_EQ(EC_OK, mgr.persistent_backend_->Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestGroupLruMaintenanceRejectsMalformedAndFailedReads) {
+    for (const bool malformed : {false, true}) {
+        MetaStorageBackendManager mgr;
+        auto failure = std::make_unique<MaintenanceReadFailureBackend>();
+        failure->malformed = malformed;
+        mgr.persistent_backend_ = std::move(failure);
+        auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+        ASSERT_EQ(EC_OK, mgr.persistent_backend_->Init("failure", config));
+        ASSERT_EQ(EC_OK, mgr.persistent_backend_->Open());
+        PropertyMapVector properties;
+        CacheLocationMapVector locations;
+        EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+                  mgr.GetPropertiesForMaintenance(nullptr, {1, 2}, {PROPERTY_LRU_TIME}, properties));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+                  mgr.GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
+        EXPECT_EQ(2, properties.size());
+        EXPECT_EQ(2, locations.size());
+        mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+        ASSERT_EQ(EC_OK, mgr.cache_backend_->Init("empty-cache", config));
+        ASSERT_EQ(EC_OK, mgr.cache_backend_->Open());
+        mgr.recover_state_ = MetaStorageBackendManager::RecoverState::kRecover;
+        EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+                  mgr.GetPropertiesForMaintenance(nullptr, {1, 2}, {PROPERTY_LRU_TIME}, properties));
+        EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+                  mgr.GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
+        ASSERT_EQ(EC_OK, mgr.cache_backend_->Close());
+        ASSERT_EQ(EC_OK, mgr.persistent_backend_->Close());
+    }
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersistentFallback) {
