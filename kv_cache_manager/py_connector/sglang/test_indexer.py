@@ -13,6 +13,7 @@ import signal
 import time
 import os
 import atexit
+from typing import Any
 from types import SimpleNamespace
 
 import torch
@@ -74,7 +75,7 @@ kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 proc = None
 
 
-def _stop_manager():
+def _stop_manager(*args: Any) -> None:
     global proc
     if proc and proc.poll() is None:
         proc.terminate()

@@ -7,6 +7,7 @@ import signal
 import time
 import os
 import atexit
+from typing import Any
 import requests
 import torch
 import torch.multiprocessing as mp
@@ -61,7 +62,7 @@ manager_log_dir = os.environ.get("KVCM_LOG_DIR", "/root/KVCacheManager/logs")
 proc = None
 
 
-def _stop_manager():
+def _stop_manager(*args: Any) -> None:
     """Stop the KV Cache Manager process."""
     global proc
     if proc and proc.poll() is None:
