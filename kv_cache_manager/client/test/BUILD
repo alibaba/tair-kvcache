@@ -16,6 +16,35 @@ cc_test(
 )
 
 cc_test(
+    name = "KvMetaClientTest",
+    srcs = ["kv_meta_client_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/client:kv_meta_client_impl",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+    ],
+)
+
+cc_test(
+    name = "KvMetaObjectClientTest",
+    srcs = ["kv_meta_object_client_test.cc"],
+    deps = [
+        "//kv_cache_manager/client:kv_meta_object_client_impl",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "KvMetaTransferClientTest",
+    srcs = ["kv_meta_transfer_client_test.cc"],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "TransferClientTest",
     srcs = [
         "transfer_client_test.cc",
