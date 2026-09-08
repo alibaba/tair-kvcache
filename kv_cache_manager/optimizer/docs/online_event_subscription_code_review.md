@@ -307,7 +307,7 @@ ttl_seconds            -> 24 hours
 KVCM instance_id       -> Optimizer instance_id
 KVCM block_size        -> Optimizer block_size
 location_spec_infos    -> 全量原样转换
-location_spec_groups   -> 全量保留 group name 和 spec names
+location_spec_groups   -> 一个时原样保留；为空时合成名为 full、包含全部 specs 的 group；多个时跳过
 linear_step            -> 0
 OptimizerStateInfo     -> 接入层不填写，由 OnlineOptimizerManager 判断
 ```
@@ -328,7 +328,8 @@ OnlineOptimizerManager::RegisterInstance
 当前行为：
 
 - 自动注册明确按 full-attention、full-only 处理。
-- ServiceImpl 不判断哪个 spec group 是 full，将 KVCM 返回的所有 group 交给 Manager。
+- ServiceImpl 不根据 group 名称判断哪个 group 是 full；唯一 group 原样交给 Manager，空 group 列表按普通
+  full-attention 配置合成一个包含全部 specs 的 `full` group。
 - Manager 的直接注册接口对无显式状态的 full-only Instance 只在唯一 group 时采用该 group；多 group 返回
   `EC_BADARGS`。
 - KVCM 自动接入暂不推断 linear state；多 group 的语义不明确时标记为 unsupported 并跳过。
@@ -342,7 +343,7 @@ OnlineOptimizerManager::RegisterInstance
 
 - [x] 自动 Group 默认开启 `enable_prefix_hash=true`。
 - [x] 自动 Group 默认开启 `enable_theoretical_max_cache=true`。
-- [x] 不根据 group 名称猜测 full group，也不使用全部 specs fallback。
+- [x] 不根据 group 名称猜测 full group；空 group 列表时使用全部 specs 合成 full-only group。
 - [ ] 支持多 group 时，由协议显式提供 `full_location_spec_group_name`。
 - [ ] GLM-5.2 是否可以按 `linear_step=0` 的 full-only 模型处理。
 - [ ] 已存在但配置不一致的 Group / Instance 如何迁移。
