@@ -58,7 +58,13 @@ try:
         BUILD_TIME,
     )
 except ImportError:
-    FULL_VERSION, GIT_COMMIT, BUILD_TIME = "dev", "source", "source"
+    # The literals clash with the generated module's when a built
+    # worktree makes the import above resolvable.
+    FULL_VERSION, GIT_COMMIT, BUILD_TIME = (
+        "dev",  # ty: ignore[invalid-assignment]
+        "source",  # ty: ignore[invalid-assignment]
+        "source",
+    )
 
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler
