@@ -4,24 +4,17 @@ logging.basicConfig(level=logging.DEBUG)
 
 import os
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from tempfile import TemporaryDirectory
 import json
 
 import click
-import torch
 
-from tensorrt_llm import LLM, SamplingParams, logger
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
-    KvCacheConnectorScheduler,
-    KvCacheConnectorWorker,
-    SchedulerOutput,
-)
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
-from kv_cache_manager.py_connector.trtllm.connector import (
+# The two connector classes are re-exported for TensorRT-LLM:
+# KvCacheConnectorConfig loads this module by name and resolves them from
+# its namespace.
+from kv_cache_manager.py_connector.trtllm.connector import (  # noqa: F401
     KVCM_CONFIG_PATH_KEY,
     KVCMKvCacheConnectorLeader,
     KVCMKvCacheConnectorWorker,
@@ -87,7 +80,8 @@ def main(model: str):
     sampling_params = SamplingParams(max_tokens=32)
 
     output = llm.generate([test_text], sampling_params)
-    text0 = output[0].outputs[0].text
+    # RequestOutput is subscriptable at runtime; its type stubs are not.
+    text0 = output[0].outputs[0].text  # ty: ignore[not-subscriptable]
 
     logger.info(f"First output: {text0}")
     logger.info("Loading new LLM instance...")
@@ -103,7 +97,8 @@ def main(model: str):
     )
 
     output = llm.generate([test_text], sampling_params)
-    text1 = output[0].outputs[0].text
+    # See above.
+    text1 = output[0].outputs[0].text  # ty: ignore[not-subscriptable]
 
     logger.info(f"Second output (using connector cache): {text1}")
 
