@@ -282,15 +282,12 @@ public:
                                 std::vector<KeyType> &out_keys) noexcept override;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
-                                      ReclaimCandidateVector &out_candidates) noexcept override;
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) noexcept override;
     std::vector<ErrorCode>
     GetLastAccessTimesForMaintenance(RequestContext *request_context,
                                      const KeyTypeVec &keys,
                                      std::vector<int64_t> &out_last_access_times) noexcept override;
-
-    ErrorCode SampleReclaimKeysForMaintenance(RequestContext *request_context,
-                                              int64_t count,
-                                              KeyTypeVec &out_keys) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;

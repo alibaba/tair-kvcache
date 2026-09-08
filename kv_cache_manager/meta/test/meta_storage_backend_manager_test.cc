@@ -13,6 +13,7 @@
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -353,9 +354,12 @@ public:
                                      const ErrorCode lookup_result = EC_OK)
         : key_(key), lookup_timestamp_(lookup_timestamp), lookup_result_(lookup_result) {}
 
-    ErrorCode
-    SampleReclaimCandidates(RequestContext *, int64_t count, ReclaimCandidateVector &out_candidates) noexcept override {
+    ErrorCode SampleReclaimCandidates(RequestContext *,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success) noexcept override {
         ++calls_;
+        read_modes.push_back(require_read_success);
         out_candidates.clear();
         if (count > 0) {
             out_candidates.push_back({key_, key_ * 10});
@@ -364,6 +368,7 @@ public:
     }
 
     int calls() const { return calls_; }
+    std::vector<bool> read_modes;
     int timestamp_lookup_calls() const { return timestamp_lookup_calls_; }
 
     std::vector<ErrorCode> GetLastAccessTimesForMaintenance(
@@ -540,6 +545,25 @@ TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTim
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(1, cache_ptr->calls());
     EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestGroupLruStrictReadModeReachesSelectedBackend) {
+    MetaStorageBackendManager mgr;
+    auto persistent = std::make_unique<RecordingReclaimBackend>(11);
+    auto cache = std::make_unique<RecordingReclaimBackend>(22, 999);
+    auto *persistent_ptr = persistent.get();
+    auto *cache_ptr = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates, true));
+    mgr.cache_backend_ = std::move(cache);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates, true));
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates, true));
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
+    EXPECT_EQ((std::vector<bool>{true, true}), persistent_ptr->read_modes);
+    EXPECT_EQ((std::vector<bool>{true, false}), cache_ptr->read_modes);
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesFallsBackForRecoveryCacheMiss) {
@@ -1139,13 +1163,13 @@ TEST_F(MetaStorageBackendManagerTest, TestGroupLruMaintenanceViewDuringAndAfterR
               mgr.cache_backend_->GetPropertiesForMaintenance(nullptr, {2}, {PROPERTY_LRU_TIME}, after));
     EXPECT_EQ(before, after);
     KeyVector sampled;
-    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeysForMaintenance(nullptr, 10, sampled));
+    ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(&mgr, 10, sampled));
     EXPECT_EQ((KeyVector{1, 2}), sampled);
     mgr.recover_state_ = MetaStorageBackendManager::RecoverState::kRunning;
     EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}),
               mgr.GetPropertiesForMaintenance(nullptr, {1, 2}, {"p0"}, properties));
     EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_OK}), mgr.GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
-    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeysForMaintenance(nullptr, 10, sampled));
+    ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(&mgr, 10, sampled));
     EXPECT_EQ((KeyVector{2}), sampled);
     ASSERT_EQ(EC_OK, mgr.cache_backend_->Close());
     ASSERT_EQ(EC_OK, mgr.persistent_backend_->Close());

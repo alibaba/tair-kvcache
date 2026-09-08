@@ -543,8 +543,6 @@ private:
     struct SamplingResult {
         ErrorCode ec{ErrorCode::EC_ERROR};
         ReclaimCandidateVector candidates;
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
     };
 
     std::map<std::string, FairRotationState> group_lru_rotation_by_group_;

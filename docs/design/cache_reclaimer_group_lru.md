@@ -184,11 +184,13 @@ B_group = min(B_theory, max(1, floor(uint128(S_effective) * B_cfg / S)))
 
 ### 5.4 并发、截止时间与局部失败
 
-复用现有采样 worker pool，不创建新线程池。Group 按 Instance 轮流派发至多一个采样子任务，再派发下一批，优先让各 Instance 获得第一批采样机会；每个 wave 的任务数不能超过当前可用 worker。
+复用现有采样 worker pool，不创建新线程池。Group 按 Instance 轮流派发采样子任务，优先让各 Instance 获得第一批采样机会。收集器不等待整批任务全部结束：哪个任务完成，就回收哪个任务的名额并继续派发；慢 Instance 不能挡住健康 Instance 的后续分片。
+
+将本轮开始时可用 worker 数除以计划 Instance 数，向下取整且至少为 1，作为每个 Instance 的在途分片上限；所有任务仍受进程级 in-flight 上限约束。这样慢 Instance 不能反复占用健康 Instance 释放的 worker，单 Instance 场景仍可并行使用可用 worker。这个限制只分配采样并发，不分配删除份额；本轮不动态借用其他 Instance 的并发份额。
 
 新旧有界路径共用采样任务提交能力，由 Group 收集器统一管理新模式的任务和结果，不能并发调用多个各自认为可以占满整个 pool 的采样循环。同一 Instance 的分片结果按实际完成状态合并，不能跨 Instance 混淆。
 
-本轮候选收集共享一个绝对 deadline，时长沿用 `future_timeout_ms` 的当轮快照。派发和等待都使用剩余时间，不能为每个 wave 或 Instance 重新获得完整 timeout。截止时间限制的是等待与继续派发，不承诺取消不支持取消的底层 I/O；超时任务继续占用已有 in-flight 计数直到真实退出。
+本轮候选收集共享一个绝对 deadline，时长沿用 `future_timeout_ms` 的当轮快照。派发和等待都使用剩余时间，不能为后续分片或 Instance 重新获得完整 timeout。截止时间限制的是等待与继续派发，不承诺取消不支持取消的底层 I/O；超时任务继续占用已有 in-flight 计数直到真实退出。
 
 某个 Instance 完成采样后，由 cron 分批完成 Location 资格过滤，再将该 Instance 的候选加入 Group 列表；不必等所有 Instance 采样结束才开始过滤。每批过滤前后也检查收集 deadline，未完成资格过滤的 Instance 不进入成功结果。deadline 到达后可以对已经完整收集的候选排序并进入准入阶段，但不能继续补采样；最终准入读取仍受现有后端 I/O 约束、请求数量上限和运行状态检查保护。这不是对整轮墙钟耗时的硬性承诺。
 
@@ -203,6 +205,14 @@ B_group = min(B_theory, max(1, floor(uint128(S_effective) * B_cfg / S)))
 不完整计划应以成功完成收集的 Instance 的采样预算之和，替换第 5.3 节的 `S_effective` 重新收缩 `B_group`，不能把失败 Instance 对应的理论批量也压到剩余成功候选上。这只是在异常时降低总量，不为各成功 Instance 再分配固定逐出份额；完整计划仍允许全部 victim 来自一个 Instance。
 
 正常无故障且资源足够时，本轮为所有有效 Instance 收集候选；局部失败时只能保证成功候选范围内的 LRU。失败率持续较高、deadline 频繁截断时，应视为策略覆盖不足并告警，而不是把热点数据提前删除解释为理想 Group LRU。
+
+### 5.5 Local 后端的分片覆盖
+
+no-touch 采样只推进分片内部的采样游标，不移动物理 LRU 尾部。若每次只按尾部时间选择最冷的几个分片，一个不可回收的旧尾部可能让同一批分片反复入选，其他分片一直没有采样机会。
+
+新路径每次选取 `K = min(sample_times, 非空分片数, 本次采样数)` 个分片：其中 `ceil(K / 2)` 个名额按分片 ID 跨调用轮转，剩余名额从尚未选中的分片里按尾部时间选最冷者。`K=1` 时该名额也轮转，不会一直固定在最冷分片。轮转部分先采样，分片内部仍沿独立游标继续读取。
+
+轮转复用公共候选采样接口中每个 Local backend 独立的 64 位原子计数，支持并发采样；非空分片集合稳定时会持续覆盖各分片。三种逐出策略共用该采样基础，不修改业务访问时间或物理 LRU 顺序。冷分片优先仍保留，但采样不是全量扫描，最终只对实际取得且可删除的候选按访问时间排序。
 
 ## 6. 候选表示、过滤与排序
 
@@ -223,7 +233,9 @@ struct GroupLruCandidate {
 
 排序统一使用 `PROPERTY_LRU_TIME` 的微秒时间戳升序，时间相同时按 `instance_id`、block key 排序，保证可复现。V1 已确认：成功读取但属性缺失 / 解析失败的单个 key 沿用历史 LRU 的时间 0 退化规则；新模式将非正时间也归一化为 0，并记录异常时间计数。这不是证明异常 key 一定最冷，而是避免它们因时间不可用长期无法回收的兼容性取舍；优先排序范围从原来的 Instance 内扩大到了整个 Group。批量读取错误必须走局部失败，不能当成所有 key 的时间都是 0。LRU 时间可能在采样后更新，V1 不增加阻塞前台访问的全局快照锁，因此只承诺采样时刻的近似次序。
 
-采样、读取属性和读取 Location 都保持 no-touch：不能刷新业务 LRU，也不能因维护性读取改变 backend 的候选冷热顺序。新路径通过 `SampleReclaimKeysForMaintenance`、`GetPropertiesForMaintenance`、`GetLocationMapsForMaintenance` 贯穿 MetaIndexer、BackendManager 与后端；local 采用不晋升 LRU 的读取，cached 在恢复期间优先保留热缓存值，仅对缺 key 回查持久层且不回填，恢复完成后只使用完整缓存。普通容量 / 固定路径保留原入口。独立测试覆盖重复维护读取后业务时间和 LRU 链表不变。
+候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，已消失的 key 跳过，成功读取但时间缺失 / 非法仍按 0 处理。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
+
+Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 
 local 采样使用 shard 内独立游标推进下一段候选，不移动 LRU 节点；否则多个采样子任务可能反复拿到同一批最旧 key。节点因业务访问、删除或淘汰移出链表时同步维护游标，游标只影响后续采样覆盖，不把已采到的 key 标记为变热。
 
@@ -342,7 +354,7 @@ B_request = min(B_cfg, kSizeLimit - 1)
 9. **集中逐出**：同一 Instance 连续占据 Top B，能够按单请求上限提交多个请求，不被旧 per-instance 比例预算截断。
 10. **异步安全**：候选计划不建立 credit；accepted 才记账；过期 / 失败 Future、pending 去重、反压及 key 保留规则保持。
 11. **有界资源**：Group 乘法溢出、`N > S_plan` 时多轮覆盖全部有效 Instance 而非永久停回收、采样和 batch 为 0、联合裁剪取整、单请求 / 单轮请求上限、共享 deadline、超时 worker 不提前减 in-flight、局部失败不提交半个 Instance 的结果。
-12. **覆盖退化**：一个 Instance 故障不导致其他健康 Instance 永久无进展；多轮 deadline 截断时未开始项优先获得下一轮机会， incomplete 计数和成功覆盖对应的 batch 收缩准确，暂停 / Stop 后不发起新删除。
+12. **覆盖退化**：一个 Instance 故障不导致其他健康 Instance 永久无进展，包含健康 Instance 需要多次补充采样分片的场景；分片旧尾部长期保留时，其余分片仍获得采样机会；多轮 deadline 截断时未开始项优先获得下一轮机会， incomplete 计数和成功覆盖对应的 batch 收缩准确，暂停 / Stop 后不发起新删除。
 13. **配置兼容**：新建和旧 Registry 缺字段时默认 Group LRU，显式旧值 0 / 1 保持原模式；覆盖协议字段缺省与显式 0 的区别、旧客户端省略零值、新枚举 round-trip、非法 LFU / TTL 组合、CLI 更新无关字段不丢策略，以及下一轮切换和在途状态不变。
 14. **单 Instance 回归**：合法完整候选下与原 LRU 选择基本一致。新路径过滤前移、确定性 tie-break 和显式 I/O 失败处理造成的差异单独断言，不承诺输出逐项完全相同。
 15. **迁移回归**：本轮 accepted Location 出现在 Migration pending 排除快照中；仅达到迁移水位时仍能迁移。
@@ -352,32 +364,6 @@ B_request = min(B_cfg, kSizeLimit - 1)
 性能验证覆盖 Instance 数 1 / 3 / 100 / 512、LRU 高度集中与交错、采样总量裁剪、慢 metadata 后端，比较原容量策略的回收吞吐、首次提交延迟、采样 I/O、请求数和峰值内存。构建验证使用隔离测试环境；不需要的 Mooncake 依赖保持禁用。
 
 非正 LRU 时间的归一化仅用于新模式，不能通过公共函数重构改变旧模式对历史异常值的处理而不提供单独回归说明。
-
-### 10.2 本次功能验证结果（2026-09-08）
-
-在隔离 Linux 容器完成构建和测试，全程使用 `--define=ENABLE_MOONCAKE=false`，未构建 Mooncake。本次涉及的 30 个 C++ 文件使用仓库根目录 `.clang-format` 和 clang-format 13.0.1 格式化，并通过 `--dry-run --Werror` 检查。
-
-16 个测试目标全部通过：
-
-| 验证范围 | 实际结果 |
-|---|---|
-| `CacheReclaimerTest` 全量 | 159 个用例通过，含 Group LRU、容量轮转、异步 credit、反压及迁移保护 |
-| `InstanceGroupTest`、`ServerConfigTest` | 配置缺省、显式枚举、protobuf 存在性、非法组合和新参数校验通过 |
-| Local / Dummy / BackendManager / LruCache | no-touch、采样游标、恢复期缓存优先读取与既有后端回归通过 |
-| AdminService / Proto JSON / FastProto JSON | 管理接口转换和协议 JSON 一致性回归通过 |
-| `kvcm_ops` 策略与相邻配置回归 | 15 + 24 个用例通过 |
-| `reclaiming_test` | 11 个用例通过，包含新模式冷数据优先选择、延迟删除保护、配置恢复和无进展退避 |
-| `location_pruning_test`、`multi_location_test` | 6 + 3 个用例通过 |
-| `admin_service:recover_test` | 1 个 Registry 恢复回归通过 |
-
-34 个 Group LRU / 跨轮轮转专项单测另以打乱顺序的方式重复 20 轮，全部通过（`--gtest_filter=*GroupLru*:*FairRotation* --gtest_repeat=20 --gtest_shuffle --gtest_random_seed=1137`）。
-
-新增的两个 Group LRU 端到端用例均重复运行 3 次并通过：
-
-- 冷小 Instance 有 4 个 block，热大 Instance 有 12 个；触发回收后只删除冷 Instance 的 2 个 block，热 Instance 的 12 个全部保留，credit 满足水位后停止。
-- 创建、GET→无关字段 UPDATE、重启恢复后，显式 `0/1/2` 保持原语义；模拟旧 Registry 缺字段记录后恢复为 `GROUP_LRU`。测试使用独立的持久化 Registry 文件，保留旧记录其余字段的原始编码。
-
-以上是功能验证，不是吞吐结论。1 / 3 / 100 / 512 Instance 的容量比例策略对照压测、长期冷热混合流量，以及真实 Redis / PACE 后端的压力验证仍待开展；当前不据此宣称 65536 / 128 已是最佳参数，也不承诺旧 Instance 在固定时间内清空。
 
 ## 11. 已确认取舍与后续优化
 

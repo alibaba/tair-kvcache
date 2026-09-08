@@ -514,7 +514,8 @@ ErrorCode MetaDummyBackend::SampleReclaimKeys(RequestContext *request_context,
 
 ErrorCode MetaDummyBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
                                                     const std::int64_t count,
-                                                    ReclaimCandidateVector &out_candidates) noexcept {
+                                                    ReclaimCandidateVector &out_candidates,
+                                                    bool /*require_read_success*/) noexcept {
     out_candidates.clear();
     if (count <= 0) {
         return EC_OK;

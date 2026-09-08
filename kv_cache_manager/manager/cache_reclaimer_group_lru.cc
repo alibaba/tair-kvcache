@@ -5,7 +5,6 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
-#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
@@ -238,6 +237,8 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(future_timeout_ms_.load());
     // As in the existing sampler, zero disables per-Instance task splitting.
     const auto per_task = sampling_size_per_task_.load();
+    const auto available_at_start = workers_.size() - std::min(workers_.size(), in_flight_sampling_tasks_.load());
+    const auto per_instance_tasks = std::max(std::size_t{1}, available_at_start / plan.items.size());
     struct State {
         std::size_t remaining{0};
         std::size_t outstanding{0};
@@ -258,16 +259,15 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         ready.push_back(i);
     }
     auto &queue = group_lru_rotation_by_group_[plan.items.front().instance_info->instance_group_name()].instance_ids;
-    while (!ready.empty() && IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < deadline) {
-        const auto in_flight = in_flight_sampling_tasks_.load();
-        if (in_flight >= workers_.size()) {
-            break;
-        }
-        const auto available = workers_.size() - in_flight;
-        std::vector<Task> wave;
-        wave.reserve(available);
-        while (wave.size() < available && !ready.empty() && IsRunning() && !IsPaused() &&
-               std::chrono::steady_clock::now() < deadline) {
+    std::vector<Task> tasks;
+    tasks.reserve(workers_.size());
+    while ((!ready.empty() || !tasks.empty()) && IsRunning() && !IsPaused() &&
+           std::chrono::steady_clock::now() < deadline) {
+        // A completed task releases a slot independently of other Instances.
+        // Bound each Instance to its share of initially available workers, so
+        // a slow backend cannot consume the workers released by healthy peers.
+        while (tasks.size() < workers_.size() && in_flight_sampling_tasks_.load() < workers_.size() && !ready.empty() &&
+               IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < deadline) {
             const auto index = ready.front();
             ready.pop_front();
             auto &state = states[index];
@@ -292,122 +292,94 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
             const auto count = per_task == 0 ? state.remaining : std::min(per_task, state.remaining);
             state.remaining -= count;
             ++state.outstanding;
-            if (state.remaining > 0) {
+            if (state.remaining > 0 && state.outstanding < per_instance_tasks) {
                 ready.push_back(index);
             }
             // A request-local collector must not be shared by parallel workers.
             auto task_context = std::make_shared<RequestContext>(request_context->trace_id());
             auto cancelled = state.cancelled;
-            wave.push_back({index, SubmitSamplingTask([this, indexer, task_context, cancelled, count, deadline]() {
-                                SamplingResult result;
-                                const auto active = [&]() {
-                                    return !cancelled->load(std::memory_order_relaxed) && IsRunning() && !IsPaused() &&
-                                           std::chrono::steady_clock::now() < deadline;
-                                };
-                                if (!active()) {
-                                    return result;
-                                }
-                                result.ec =
-                                    indexer->SampleReclaimKeysForMaintenance(task_context.get(), count, result.keys);
-                                if (result.ec != ErrorCode::EC_OK) {
-                                    return result;
-                                }
-                                if (result.keys.size() > count || !active()) {
-                                    return SamplingResult{};
-                                }
-                                if (result.keys.empty()) {
-                                    return result;
-                                }
-                                const auto properties = indexer->GetPropertiesForMaintenance(
-                                    task_context.get(), result.keys, {PROPERTY_LRU_TIME}, result.maps);
-                                if (properties.error_codes.size() != result.keys.size() ||
-                                    result.maps.size() != result.keys.size()) {
-                                    return SamplingResult{};
-                                }
-                                std::size_t kept = 0;
-                                for (std::size_t i = 0; i < result.keys.size(); ++i) {
-                                    const auto ec = properties.error_codes[i];
-                                    if (ec == ErrorCode::EC_NOENT) {
-                                        continue;
-                                    }
-                                    if (ec != ErrorCode::EC_OK) {
-                                        return SamplingResult{};
-                                    }
-                                    if (kept != i) {
-                                        result.keys[kept] = result.keys[i];
-                                        result.maps[kept] = std::move(result.maps[i]);
-                                    }
-                                    ++kept;
-                                }
-                                result.keys.resize(kept);
-                                result.maps.resize(kept);
-                                return active() ? std::move(result) : SamplingResult{};
-                            })});
+            tasks.push_back({index, SubmitSamplingTask([this, indexer, task_context, cancelled, count, deadline]() {
+                                 SamplingResult result;
+                                 const auto active = [&]() {
+                                     return !cancelled->load(std::memory_order_relaxed) && IsRunning() && !IsPaused() &&
+                                            std::chrono::steady_clock::now() < deadline;
+                                 };
+                                 if (!active()) {
+                                     return result;
+                                 }
+                                 result.ec = indexer->SampleReclaimCandidates(
+                                     task_context.get(), count, result.candidates, true);
+                                 if (result.ec != ErrorCode::EC_OK) {
+                                     return result;
+                                 }
+                                 if (result.candidates.size() > count || !active()) {
+                                     return SamplingResult{};
+                                 }
+                                 return result;
+                             })});
         }
-        std::size_t waiting = wave.size();
-        while (waiting > 0 && IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < deadline) {
-            bool received = false;
-            for (auto &task : wave) {
-                if (!task.future.valid() ||
-                    task.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-                    continue;
-                }
-                auto sampled = task.future.get();
-                received = true;
-                --waiting;
-                auto &state = states[task.instance_index];
-                --state.outstanding;
-                if (sampled.ec != ErrorCode::EC_OK) {
-                    state.failed = true;
-                    state.cancelled->store(true, std::memory_order_relaxed);
-                }
-                if (state.failed) {
-                    state.times.clear();
-                    continue;
-                }
-                METRICS_(cache_reclaimer, group_lru_sampled_key_count) += sampled.keys.size();
-                for (std::size_t i = 0; i < sampled.keys.size(); ++i) {
-                    std::int64_t time = 0;
-                    const auto prop = sampled.maps[i].find(PROPERTY_LRU_TIME);
-                    if (prop == sampled.maps[i].end() || !StringUtil::StrToInt64(prop->second.c_str(), time) ||
-                        time <= 0) {
-                        time = 0;
-                        METRICS_(cache_reclaimer, group_lru_invalid_time_count) += 1;
-                    }
-                    auto [it, inserted] = state.times.emplace(sampled.keys[i], time);
-                    if (!inserted) {
-                        it->second = std::max(it->second, time);
-                    }
-                }
-                if (state.remaining == 0 && state.outstanding == 0) {
-                    state.collected = FilterGroupLruCandidates(
-                        request_context, scope, plan, task.instance_index, state.times, deadline, out_candidates);
-                    state.failed = !state.collected;
-                    state.times.clear();
-                    if (state.collected) {
-                        out_successful_sampling_size += plan.items[task.instance_index].sampling_size;
-                    }
-                }
-            }
-            if (!received) {
-                // Poll all ready results before waiting, so one slow Instance
-                // cannot prevent healthy results from being filtered in time.
-                for (auto &task : wave) {
-                    if (task.future.valid()) {
-                        const auto remaining = deadline - std::chrono::steady_clock::now();
-                        if (remaining > std::chrono::steady_clock::duration::zero()) {
-                            task.future.wait_for(
-                                std::min(remaining,
-                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                             std::chrono::milliseconds(1))));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        if (waiting > 0) {
+        if (tasks.empty()) {
+            // No task owned by this collector can release capacity: the pool
+            // is saturated by earlier rounds, or there is no remaining work.
             break;
+        }
+        bool received = false;
+        for (auto &task : tasks) {
+            if (!task.future.valid() ||
+                task.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                continue;
+            }
+            auto sampled = task.future.get();
+            received = true;
+            auto &state = states[task.instance_index];
+            const bool was_at_limit = state.outstanding == per_instance_tasks;
+            --state.outstanding;
+            if (sampled.ec != ErrorCode::EC_OK) {
+                state.failed = true;
+                state.cancelled->store(true, std::memory_order_relaxed);
+            }
+            if (state.failed) {
+                state.times.clear();
+                continue;
+            }
+            METRICS_(cache_reclaimer, group_lru_sampled_key_count) += sampled.candidates.size();
+            for (const auto &candidate : sampled.candidates) {
+                std::int64_t time = candidate.last_access_time_us;
+                if (time <= 0) {
+                    time = 0;
+                    METRICS_(cache_reclaimer, group_lru_invalid_time_count) += 1;
+                }
+                auto [it, inserted] = state.times.emplace(candidate.key, time);
+                if (!inserted) {
+                    it->second = std::max(it->second, time);
+                }
+            }
+            if (state.remaining > 0) {
+                // Below the limit this Instance is already in ready. Only
+                // crossing the limit queues it again, avoiding duplicates.
+                if (was_at_limit) {
+                    ready.push_back(task.instance_index);
+                }
+            } else if (state.outstanding == 0) {
+                state.collected = FilterGroupLruCandidates(
+                    request_context, scope, plan, task.instance_index, state.times, deadline, out_candidates);
+                state.failed = !state.collected;
+                state.times.clear();
+                if (state.collected) {
+                    out_successful_sampling_size += plan.items[task.instance_index].sampling_size;
+                }
+            }
+        }
+        tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](const auto &task) { return !task.future.valid(); }),
+                    tasks.end());
+        if (!received && !tasks.empty()) {
+            // Only a short wait before polling/refilling, never a whole-wave barrier.
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining > std::chrono::steady_clock::duration::zero()) {
+                tasks.front().future.wait_for(std::min(
+                    remaining,
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(1))));
+            }
         }
     }
     std::size_t started = 0, collected = 0, failed = 0;

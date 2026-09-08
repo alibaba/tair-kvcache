@@ -109,7 +109,8 @@ kvcm.meta_query.parallel_threshold=256
 # 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
 kvcm.meta_query.chunk_size=128
 
-# CacheReclaimer 单个有效 Instance 每轮最多采样的 key 数，默认 100。
+# CacheReclaimer 基础采样量，默认 100。GROUP_LRU 按有效 Instance 数计算 Group 预算后重新分配，
+# 该模式下此值不是单个 Instance 的硬上限；各模式的预算规则见下文。
 kvcm.cache_reclaimer.key_sampling_size_total=100
 
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
