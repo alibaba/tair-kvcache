@@ -138,10 +138,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
 
         model_config = vllm_config.model_config
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
-        if getattr(model_config, "use_mla", False):
-            raise NotImplementedError(
-                "MLA models are not supported by TairKvCacheConnector"
-            )
+        # MLA models transfer a token-granular latent cache (one vector per
+        # token instead of K+V); parse_groups gates the unsupported MLA
+        # variants (compression, packed fp8, quantized KV).
+        self._use_mla = bool(getattr(model_config, "use_mla", False))
 
         self._vllm_block_size = vllm_config.cache_config.block_size
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -177,7 +177,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         deployment = {
             "model_name": model_config.served_model_name,
             "dtype": str(self._kv_dtype)[6:],  # strip "torch."
-            "use_mla": False,
+            "use_mla": self._use_mla,
             "tp_size": self._tp_size,
             "dp_size": vllm_config.parallel_config.data_parallel_size,
             "pp_size": vllm_config.parallel_config.pipeline_parallel_size,

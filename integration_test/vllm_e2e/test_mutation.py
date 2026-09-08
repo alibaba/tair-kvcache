@@ -16,14 +16,14 @@ and this test fails.
 
 import unittest
 
-from e2e_lib import run_e2e
+from e2e_lib import run_e2e, scenario_tp_size
 
 
 class TestMutation(unittest.TestCase):
     def test_mutated_connector_is_caught(self):
         run_e2e(
             scenario="mutation",
-            tp_size=1,
+            tp_size=scenario_tp_size(),
             num_prompts=1,
             preferred_block_size=0,
             connector_name="MutatedConnector",
