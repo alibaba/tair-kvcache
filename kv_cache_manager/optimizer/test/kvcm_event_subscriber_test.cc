@@ -483,4 +483,11 @@ TEST_F(KvcmEventSubscriberTest, ReconnectDelayUsesCappedExponentialBackoffWithJi
     }
 }
 
+TEST_F(KvcmEventSubscriberTest, FormatsLeaderEndpointForIpv4AndIpv6) {
+    EXPECT_EQ("127.0.0.1:6381", KvcmEventSubscriber::FormatEndpoint("127.0.0.1", 6381));
+    EXPECT_EQ("kvcm.example:6381", KvcmEventSubscriber::FormatEndpoint("kvcm.example", 6381));
+    EXPECT_EQ("[2001:db8::1]:6381", KvcmEventSubscriber::FormatEndpoint("2001:db8::1", 6381));
+    EXPECT_EQ("[2001:db8::1]:6381", KvcmEventSubscriber::FormatEndpoint("[2001:db8::1]", 6381));
+}
+
 } // namespace kv_cache_manager

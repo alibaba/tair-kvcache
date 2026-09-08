@@ -65,6 +65,7 @@ private:
     void RequestConfigurationRefresh();
     bool WaitForSupervisor(std::chrono::milliseconds duration);
     bool WaitForReconnect(EndpointWorker *worker, std::chrono::milliseconds duration);
+    static std::string FormatEndpoint(const std::string &host, int port);
     static std::chrono::milliseconds ComputeReconnectDelay(uint32_t failed_attempts);
 
     KvcmEventSubscriptionConfig config_;

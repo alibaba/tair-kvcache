@@ -9,6 +9,7 @@
 namespace kv_cache_manager {
 
 struct InstanceSummary;
+struct IntervalMetricInfo;
 struct MrcMetricInfo;
 class OptimizerServiceMetricsCollector;
 
@@ -26,7 +27,9 @@ public:
     void ReportPerQuery(OptimizerServiceMetricsCollector *collector,
                         const MetricsTags &service_tags,
                         const MetricsTags &query_tags);
-    void ReportInterval(const std::vector<InstanceSummary> &summaries, const std::vector<MrcMetricInfo> &mrc_metrics);
+    void ReportInterval(const std::vector<InstanceSummary> &summaries,
+                        const std::vector<IntervalMetricInfo> &interval_metrics,
+                        const std::vector<MrcMetricInfo> &mrc_metrics);
 
 private:
     bool InitMetrics();

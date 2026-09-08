@@ -126,7 +126,7 @@ void OptimizerMetricsReporter::ReportInterval() {
     }
 
     if (kmonitor_reporter_) {
-        kmonitor_reporter_->ReportInterval(summaries, mrc_metrics);
+        kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics);
     }
 }
 
