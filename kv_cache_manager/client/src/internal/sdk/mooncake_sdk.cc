@@ -1,5 +1,6 @@
 #include "mooncake_sdk.h"
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 #include <sstream>
@@ -124,6 +125,19 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
 
 SdkType MooncakeSdk::Type() { return SdkType::MOONCAKE; }
 
+std::uint64_t MooncakeSdk::MaxAllowedObjectBytes() const {
+    if (sdk_backend_config_->variable_object_size_enabled()) {
+        return sdk_backend_config_->max_variable_object_bytes();
+    }
+    std::uint64_t max_allowed_size = 0;
+    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
+        if (byte_size_per_block > 0) {
+            max_allowed_size = std::max(max_allowed_size, static_cast<std::uint64_t>(byte_size_per_block));
+        }
+    }
+    return max_allowed_size;
+}
+
 ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
                                  const BlockBuffers &local_buffer) {
     if (remote_uris.size() != local_buffer.size()) {
@@ -136,10 +150,7 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
     // 那是 wrapper 层日志的职责）。
     const auto call_start = std::chrono::steady_clock::now();
     // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
-    int64_t max_allowed_size = 0;
-    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
-        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
-    }
+    const std::uint64_t max_allowed_size = MaxAllowedObjectBytes();
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         std::vector<Slice_t> slices;
@@ -155,10 +166,10 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
         }
         if (read_len > max_allowed_size) {
             KVCM_LOG_WARN(
-                "mooncake get but iovs exceed max allowed size, key: [%s], read_len: [%zu], max_allowed: [%ld]",
+                "mooncake get but iovs exceed max allowed size, key: [%s], read_len: [%zu], max_allowed: [%llu]",
                 item.key.c_str(),
                 read_len,
-                max_allowed_size);
+                static_cast<unsigned long long>(max_allowed_size));
             return ER_INVALID_PARAMS;
         }
         // ============================================================
@@ -215,10 +226,7 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
     // 本 SDK 调用内的墙钟起点：超时归因日志的 elapsed_ms 用（不含线程池排队时间）。
     const auto call_start = std::chrono::steady_clock::now();
     // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
-    int64_t max_allowed_size = 0;
-    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
-        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
-    }
+    const std::uint64_t max_allowed_size = MaxAllowedObjectBytes();
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         auto [write_len, success] = extractSlices(item, local_buffers[i], slices);
@@ -233,10 +241,10 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         }
         if (write_len > max_allowed_size) {
             KVCM_LOG_WARN(
-                "mooncake put but iovs exceed max allowed size, key: [%s], write_len: [%zu], max_allowed: [%ld]",
+                "mooncake put but iovs exceed max allowed size, key: [%s], write_len: [%zu], max_allowed: [%llu]",
                 item.key.c_str(),
                 write_len,
-                max_allowed_size);
+                static_cast<unsigned long long>(max_allowed_size));
             return ER_INVALID_PARAMS;
         }
         // ============================================================

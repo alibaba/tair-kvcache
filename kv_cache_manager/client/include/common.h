@@ -8,7 +8,7 @@
 
 namespace kv_cache_manager {
 
-enum [[nodiscard]] ClientErrorCode : int32_t{
+enum [[nodiscard]] ClientErrorCode : int32_t {
     // client & sdkwrapper
     ER_OK = 0,
     ER_INVALID_STUB = 1,
@@ -38,6 +38,14 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_SERVICE_DUPLICATE_ENTITY = 54,
     ER_SERVICE_INSTANCE_NOT_EXIST = 55,
     ER_SERVICE_NOT_LEADER = 56,
+    ER_SERVICE_NOT_READY = 57,
+    ER_SERVICE_REACH_MAX_ENTITY_CAPACITY = 58,
+    ER_SERVICE_RESOURCE_EXHAUSTED = 59,
+    ER_SERVICE_NOT_FOUND = 60,
+    ER_SERVICE_WRITE_IN_PROGRESS = 61,
+    ER_SERVICE_SESSION_NOT_FOUND = 62,
+    ER_SERVICE_SIZE_MISMATCH = 63,
+    ER_SERVICE_IO_ERROR = 64,
 
     // sdk
     ER_SDK_TIMEOUT = 100,
