@@ -156,7 +156,7 @@ class TestLoadFailure(unittest.TestCase):
             # while any mismatch belongs to a deleted (recomputed) block.
             wait_for_captures(env.capture_dir, "loaded", expected=keep,
                               timeout=180)
-            report = compare_captures(env.capture_dir, tp_size=1)
+            report = compare_captures(env.capture_dir)
             hashes = full_block_hashes(toks, mbs)
             kept_keys = {("tp0", h) for h in hashes[:keep]}
             deleted_keys = {("tp0", h) for h in hashes[keep:]}

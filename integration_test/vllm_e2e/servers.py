@@ -6,8 +6,9 @@ from lib_utils import (
     MODEL_PATH, assert_report_ok, block_token_hash, compare_captures,
     count_captures, find_manager_binary, find_python, find_repo_root,
     free_port, full_block_hashes, get_manager_block_size, is_hybrid_model,
-    make_base_prompts, send_completions, shared_token_prefix_len,
-    tokenize, wait_for_captures, wait_for_prefix_cached, wait_http,
+    is_mla_model, make_base_prompts, scenario_tp_size, send_completions,
+    shared_token_prefix_len, tokenize, wait_for_captures,
+    wait_for_prefix_cached, wait_http,
 )
 
 
@@ -209,12 +210,16 @@ class VllmServer:
         # Serving knobs, override-able via vllm_args (a scenario can widen
         # max-model-len or raise gpu-memory-utilization without editing the
         # harness); keys are vLLM CLI flags without the leading "--".
+        # KVCM_E2E_VLLM_ARGS (JSON dict, same key format) is the operator
+        # escape hatch -- e.g. serving a model whose weights need
+        # quantization to fit the local GPUs.
         vllm_args = {
             "max-model-len": "4096",
             "gpu-memory-utilization": "0.85",
             "enforce-eager": None,
             "max-num-seqs": "16",
             **getattr(self, "vllm_args", {}),
+            **json.loads(os.environ.get("KVCM_E2E_VLLM_ARGS", "{}")),
         }
         cmd = [
             find_python(), "-m", "vllm.entrypoints.openai.api_server",
@@ -250,7 +255,12 @@ class VllmServer:
         # Force FlashAttention for the full-attention layers: it produces the
         # [2, num_blocks, block_size, num_kv_heads, head_size] layout the
         # connector expects, and avoids the flashinfer backend entirely.
-        env.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+        # MLA models are exempt: FLASH_ATTN has no MLA implementation, so let
+        # vLLM auto-select an MLA backend (TRITON_MLA on Ampere; every MLA
+        # backend registers the same 3-D (num_blocks, block, head_size) latent
+        # cache, which the connector detects from the tensor shape).
+        if not is_mla_model(MODEL_PATH):
+            env.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
         # Use the PyTorch-native sampler; the flashinfer sampler JIT-compiles
         # with ninja, which is not available in the test environment.
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -290,7 +300,7 @@ class ScenarioEnv:
     this; run_e2e keeps its own two-phase flow on top of the same pieces.
     """
 
-    def __init__(self, scenario: str, tp_size: int = 1,
+    def __init__(self, scenario: str, tp_size: Optional[int] = None,
                  preferred_block_size: int = 0,
                  enable_prefix_caching: Optional[bool] = None,
                  connector_name: str = "VerifyingConnector",
@@ -299,7 +309,9 @@ class ScenarioEnv:
                  key_count_per_file: int = 8,
                  kv_load_failure_policy: Optional[str] = None):
         self.scenario = scenario
-        self.tp_size = tp_size
+        # None = per-scenario default, overridable via KVCM_E2E_TP (models
+        # too large for one GPU run every scenario with tp=2).
+        self.tp_size = tp_size if tp_size is not None else scenario_tp_size()
         self.hybrid = is_hybrid_model(MODEL_PATH)
         self.preferred_block_size = 0 if self.hybrid else preferred_block_size
         self.enable_prefix_caching = (self.hybrid if enable_prefix_caching is None
@@ -449,7 +461,7 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         wait_for_captures(capture_dir, "loaded",
                           expected=tp_size * sum(expected_load_blocks), timeout=180)
 
-        report = compare_captures(capture_dir, tp_size)
+        report = compare_captures(capture_dir)
         min_matched = tp_size * sum(expected_load_blocks)
         if expect_verification_failure:
             try:
