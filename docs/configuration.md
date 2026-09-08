@@ -267,6 +267,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
             "meta_indexer_config": {
                 "max_key_count": 1000000, # 单个meta indexer的key数量上限，同样影响reclaimer的逐出水位计算
                 "mutex_shard_num": 16,
+                "mutex_enabled": true, # 默认开启 MetaIndexer 分片锁；压测可设为 false
                 "batch_key_size": 16,
                 "meta_storage_backend_config": { # 控制meta indexer的storage backend，可选local本地文件或者redis
                     # Redis示例：
@@ -288,6 +289,15 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+`cache_config.meta_indexer_config.mutex_enabled` 为可选布尔值，默认 `true`，在 MetaIndexer 初始化时读取。
+压测可设为 `false` 跳过 MetaIndexer 分片锁，此时 lock wait/hold 指标为零；分片与批次划分、后端内部锁仍保留。
+关闭后不再保证同 key 并发读改写的原子性，可能出现更新丢失和计数偏差，仅用于受控压测。修改配置需重建
+MetaIndexer（例如重启服务）才会生效。
+
+Admin HTTP/gRPC 的 Create/Update Instance Group 同样支持该字段，Get/List 会返回配置值（见
+[Admin API](api/admin_service.md#create-instance-group)）。`kvcm_ops` 创建或更新 Instance Group 时可传
+`--mutex_enabled false` 关闭、`--mutex_enabled true` 恢复；更新时不传则保留原值，新建时不传则默认加锁。
 
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage

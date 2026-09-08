@@ -17,6 +17,46 @@ class ProtoMessageJsonUtilTest : public TESTBASE {
 public:
 };
 
+TEST_F(ProtoMessageJsonUtilTest, TestMetaIndexerMutexEnabledRoundTrip) {
+    struct TestCase {
+        const char *json;
+        bool present;
+        bool enabled;
+    };
+    const TestCase cases[] = {
+        {R"({"meta_indexer_config":{}})", false, true},
+        {R"({"meta_indexer_config":{"mutex_enabled":null}})", false, true},
+        {R"({"meta_indexer_config":{"mutex_enabled":true}})", true, true},
+        {R"({"meta_indexer_config":{"mutex_enabled":false}})", true, false},
+    };
+    for (const auto &test_case : cases) {
+        SCOPED_TRACE(test_case.json);
+        proto::admin::CacheConfig request;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(test_case.json, &request));
+        ASSERT_EQ(test_case.present, request.meta_indexer_config().has_mutex_enabled());
+
+        // The explicit false wrapper must also survive the gRPC wire format.
+        proto::admin::CacheConfig decoded;
+        ASSERT_TRUE(decoded.ParseFromString(request.SerializeAsString()));
+        ASSERT_EQ(test_case.present, decoded.meta_indexer_config().has_mutex_enabled());
+        CacheConfig config;
+        ProtoConvert::CacheConfigFromProto(&decoded, config);
+        ASSERT_EQ(test_case.enabled, config.meta_indexer_config()->GetMutexEnabled());
+
+        proto::admin::CacheConfig response;
+        ProtoConvert::CacheConfigToProto(config, &response);
+        ASSERT_TRUE(response.meta_indexer_config().has_mutex_enabled());
+        ASSERT_EQ(test_case.enabled, response.meta_indexer_config().mutex_enabled().value());
+        std::string json;
+        ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&response, json));
+        ASSERT_NE(std::string::npos,
+                  json.find(test_case.enabled ? "\"mutex_enabled\":true" : "\"mutex_enabled\":false"));
+        proto::admin::CacheConfig round_trip;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(json, &round_trip));
+        ASSERT_TRUE(google::protobuf::util::MessageDifferencer::Equals(response, round_trip));
+    }
+}
+
 TEST_F(ProtoMessageJsonUtilTest, TestToJsonSimple) {
     { // Empty msg
         SimpleMessage msg;

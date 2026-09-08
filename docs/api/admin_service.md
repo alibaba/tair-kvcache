@@ -112,6 +112,13 @@ curl -g -vvv -X POST http://localhost:6492/api/listStorage \
 ```
 
 ## Create Instance Group
+
+`cache_config.meta_indexer_config.mutex_enabled` 是可选布尔值，缺省为 `true`；显式设置 `false`
+仅用于受控压测，关闭后不再保证同 key 并发读改写的原子性。HTTP JSON 直接传布尔值，gRPC 使用
+`google.protobuf.BoolValue` 区分未填写和 `false`。Create/Update 均支持，Get/List 会返回实际配置值。
+该值在 MetaIndexer 初始化时读取；更新已有 Instance Group 不会切换已运行实例的锁，需要重建
+MetaIndexer（例如重启服务）才能生效。Update 使用完整配置对象，建议从 Get 的结果修改后提交。
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
   -H "Content-Type: application/json" \
@@ -148,6 +155,7 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
             "meta_indexer_config": {
                 "max_key_count": 10000000,
                 "mutex_shard_num": 1024,
+                "mutex_enabled": true,
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "local_path": "/tmp/meta"
@@ -199,6 +207,7 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
             "meta_indexer_config": {
                 "max_key_count": 10000,
                 "mutex_shard_num": 1024,
+                "mutex_enabled": true,
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "storage_uri": ""
@@ -255,6 +264,7 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
             "meta_indexer_config": {
                 "max_key_count": 10000000,
                 "mutex_shard_num": 1024,
+                "mutex_enabled": true,
                 "meta_storage_backend_config": {
                     "storage_type": "redis",
                     "storage_uri": "redis://xxxx:xxxx@r-xxxx.redis.zhangbei.rds.aliyuncs.com:6379"

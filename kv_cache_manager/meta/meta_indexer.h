@@ -276,6 +276,7 @@ private:
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;
     size_t mutex_shard_mask_ = MetaIndexerConfig::kDefaultMutexShardNum - 1;
+    bool mutex_enabled_ = MetaIndexerConfig::kDefaultMutexEnabled;
     uint64_t mutex_shard_hash_seed_ = 0;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;

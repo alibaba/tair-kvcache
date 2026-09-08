@@ -249,9 +249,11 @@ class MetaIndexerConfig(JsonData):
                  mutex_shard_num: int = 512,
                  batch_key_size: int = 128,
                  meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig(),
-                 meta_cache_policy_config: MetaCachePolicyConfig = MetaCachePolicyConfig()):
+                 meta_cache_policy_config: MetaCachePolicyConfig = MetaCachePolicyConfig(),
+                 mutex_enabled: bool = True):
         self._max_key_count = max_key_count
         self._mutex_shard_num = mutex_shard_num
+        self._mutex_enabled = mutex_enabled
         self._batch_key_size = batch_key_size
         self._meta_storage_backend_config = meta_storage_backend_config
         self._meta_cache_policy_config = meta_cache_policy_config
@@ -261,6 +263,7 @@ class MetaIndexerConfig(JsonData):
         return {
             "max_key_count": self._max_key_count,
             "mutex_shard_num": self._mutex_shard_num,
+            "mutex_enabled": self._mutex_enabled,
             "batch_key_size": self._batch_key_size,
             "meta_storage_backend_config": self._meta_storage_backend_config.to_json_data(),
             "meta_cache_policy_config": self._meta_cache_policy_config.to_json_data()
@@ -283,12 +286,14 @@ class MetaIndexerConfig(JsonData):
                 json_data["meta_storage_backend_config"])
         if JsonData.expect_exist("meta_cache_policy_config", json_data, dict):
             meta_cache_policy_config = MetaCachePolicyConfig.from_json_data(json_data["meta_cache_policy_config"])
+        JsonData.maybe_exist("mutex_enabled", json_data, bool)
         return cls(
             max_key_count,
             mutex_shard_num,
             batch_key_size,
             meta_storage_backend_config,
-            meta_cache_policy_config)
+            meta_cache_policy_config,
+            mutex_enabled=json_data.get("mutex_enabled", True))
 
 
 class CacheConfig(JsonData):
@@ -453,6 +458,12 @@ class InstanceGroup(JsonData):
 # create or update
 
 
+def mutex_enabled_value(value: str) -> bool:
+    if value not in ("true", "false"):
+        raise argparse.ArgumentTypeError("mutex_enabled must be true or false")
+    return value == "true"
+
+
 def parse_instance_group_args(is_create: bool):
     common_parser = create_common_parser()
     method = "create_instance_group" if is_create else "update_instance_group"
@@ -557,6 +568,13 @@ def parse_instance_group_args(is_create: bool):
         type=int,
         default=512 if is_create else argparse.SUPPRESS,
         help="meta_indexer_config.mutex_shard_num"
+    )
+
+    parser.add_argument(
+        "--mutex_enabled",
+        type=mutex_enabled_value,
+        default=True if is_create else argparse.SUPPRESS,
+        help="MetaIndexer shard locks: true or false (benchmark only); applied at indexer initialization"
     )
 
     parser.add_argument(

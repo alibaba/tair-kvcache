@@ -95,6 +95,7 @@ TEST_F(StartupConfigLoaderTest, TestStartupConfigJsonize) {
 
     ASSERT_EQ(meta1.GetMaxKeyCount(), meta2.GetMaxKeyCount());
     ASSERT_EQ(meta1.GetMutexShardNum(), meta2.GetMutexShardNum());
+    ASSERT_FALSE(meta2.GetMutexEnabled());
     ASSERT_EQ(meta1.GetBatchKeySize(), meta2.GetBatchKeySize());
 
     // Compare StorageConfig
@@ -204,6 +205,7 @@ InstanceGroup StartupConfigLoaderTest::MakeInstanceGroup() {
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(1000000);
     meta_indexer_config->SetMutexShardNum(16);
+    meta_indexer_config->SetMutexEnabled(false);
     meta_indexer_config->SetBatchKeySize(16);
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
     meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);

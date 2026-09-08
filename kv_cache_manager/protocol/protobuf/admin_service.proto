@@ -296,6 +296,8 @@ message MetaIndexerConfig {
     // scalar fields in older proto3 versions (v3.12.0, before which
     // the "optional" keyword is not available)
     google.protobuf.Int64Value persist_metadata_interval_time_ms = 6;
+    // Absent means true; explicit false disables MetaIndexer shard locks for benchmarking.
+    google.protobuf.BoolValue mutex_enabled = 7;
 }
 
 message SystemStorageConfig {

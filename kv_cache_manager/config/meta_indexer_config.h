@@ -14,6 +14,7 @@ class MetaIndexerConfig : public Jsonizable {
 public:
     static constexpr size_t kDefaultMaxKeyCount = std::numeric_limits<size_t>::max();
     static constexpr size_t kDefaultMutexShardNum = 1024;
+    static constexpr bool kDefaultMutexEnabled = true;
     static constexpr size_t kDefaultBatchKeySize = 128;
     static constexpr size_t kDefaultPersistMetaDataIntervalTimeMs = 1000;
 
@@ -41,6 +42,7 @@ public:
     ~MetaIndexerConfig() override;
     size_t GetMaxKeyCount() const { return max_key_count_; }
     size_t GetMutexShardNum() const { return mutex_shard_num_; }
+    bool GetMutexEnabled() const { return mutex_enabled_; }
     size_t GetBatchKeySize() const { return batch_key_size_; }
     size_t GetPersistMetaDataIntervalTimeMs() const { return persist_metadata_interval_time_ms_; }
 
@@ -51,6 +53,7 @@ public:
     const std::shared_ptr<MetaCachePolicyConfig> &GetMetaCachePolicyConfig() const { return meta_cache_policy_config_; }
     void SetMaxKeyCount(size_t max_key_count) { max_key_count_ = max_key_count; }
     void SetMutexShardNum(size_t mutex_shard_num) { mutex_shard_num_ = mutex_shard_num; }
+    void SetMutexEnabled(bool mutex_enabled) { mutex_enabled_ = mutex_enabled; }
     void SetBatchKeySize(size_t batch_key_size) { batch_key_size_ = batch_key_size; }
     void SetPersistMetaDataIntervalTimeMs(size_t persist_metadata_interval_time_ms) {
         persist_metadata_interval_time_ms_ = persist_metadata_interval_time_ms;
@@ -66,6 +69,7 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "max_key_count", max_key_count_, kDefaultMaxKeyCount);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mutex_shard_num", mutex_shard_num_, kDefaultMutexShardNum);
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mutex_enabled", mutex_enabled_, kDefaultMutexEnabled);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
                                     "persist_metadata_interval_time_ms",
                                     persist_metadata_interval_time_ms_,
@@ -83,6 +87,7 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "max_key_count", max_key_count_);
         Put(writer, "mutex_shard_num", mutex_shard_num_);
+        Put(writer, "mutex_enabled", mutex_enabled_);
         Put(writer, "batch_key_size", batch_key_size_);
         Put(writer, "persist_metadata_interval_time_ms", persist_metadata_interval_time_ms_);
         Put(writer, "meta_storage_backend_config", meta_storage_backend_config_);
@@ -112,6 +117,7 @@ public:
 private:
     size_t max_key_count_;
     size_t mutex_shard_num_;
+    bool mutex_enabled_ = kDefaultMutexEnabled;
     size_t batch_key_size_;
     size_t persist_metadata_interval_time_ms_;
     std::shared_ptr<MetaStorageBackendConfig> meta_storage_backend_config_;

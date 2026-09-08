@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
@@ -115,6 +116,10 @@ public:
     ErrorCode InitIndexer(const std::string &configStr);
 };
 
+class MetaIndexerMutexTest : public MetaIndexerTest, public ::testing::WithParamInterface<bool> {};
+
+INSTANTIATE_TEST_SUITE_P(MutexEnabled, MetaIndexerMutexTest, ::testing::Bool());
+
 void MetaIndexerTest::SetUp() {
     meta_indexer_ = std::make_shared<MetaIndexer>();
     request_context_ = std::make_shared<RequestContext>("test_trace_id");
@@ -138,6 +143,7 @@ TEST_F(MetaIndexerTest, TestInit) {
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
+    ASSERT_TRUE(meta_indexer_->mutex_enabled_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     // test failed
@@ -438,7 +444,7 @@ TEST_F(MetaIndexerTest, TestCompactPrefixGetIoMetricExcludesPipelinedVisitorTime
     EXPECT_GE(elapsed_us - static_cast<int64_t>(backend_wall_us), 30000);
 }
 
-TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
+TEST_P(MetaIndexerMutexTest, TestRmwLockAndMetricsAcrossBatches) {
     const std::string config_str = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
@@ -446,7 +452,10 @@ TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
         "meta_storage_backend_config" : { "storage_type" : "local" },
         "meta_cache_policy_config" : { "capacity" : 0 }
     })";
-    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+    MetaIndexerConfig config;
+    ASSERT_TRUE(config.FromJsonString(config_str));
+    config.SetMutexEnabled(GetParam());
+    ASSERT_EQ(EC_OK, InitIndexer(config.ToJsonString()));
 
     KeyVector keys = {0};
     for (KeyType key = 1; key < 100; ++key) {
@@ -457,6 +466,19 @@ TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
     }
     ASSERT_EQ(2u, keys.size());
 
+    const auto can_lock_shard = [this](KeyType key) {
+        bool acquired = false;
+        // Probe from another thread: trying a mutex already owned by this
+        // thread would be undefined behavior when locking is enabled.
+        std::thread probe([&] {
+            std::unique_lock<std::mutex> lock(*meta_indexer_->mutex_shards_[meta_indexer_->GetMutexShardIndex(key)],
+                                              std::try_to_lock);
+            acquired = lock.owns_lock();
+        });
+        probe.join();
+        return acquired;
+    };
+
     auto metrics_registry = std::make_shared<MetricsRegistry>();
     auto metrics_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry);
     ASSERT_TRUE(metrics_collector->Init());
@@ -465,15 +487,24 @@ TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
     const auto result = meta_indexer_->ReadModifyWriteBlock(
         &metrics_context,
         keys,
-        [&modifier_calls](const LocationIdVector &, ErrorCode, size_t, PropertyMap &, CacheLocationMap &) {
+        [&](const LocationIdVector &, ErrorCode, size_t key_index, PropertyMap &, CacheLocationMap &) {
             ++modifier_calls;
+            EXPECT_EQ(!GetParam(), can_lock_shard(keys[key_index]));
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             return ModifierResult{MA_SKIP, EC_OK};
         });
 
     EXPECT_EQ(EC_OK, result.ec);
     EXPECT_EQ(2u, modifier_calls);
-    EXPECT_GE(metrics_collector->get_meta_indexer_lock_hold_time_us_metrics(), 3000.);
+    if (GetParam()) {
+        EXPECT_GE(metrics_collector->get_meta_indexer_lock_hold_time_us_metrics(), 3000.);
+    } else {
+        EXPECT_EQ(0., metrics_collector->get_meta_indexer_lock_wait_time_us_metrics());
+        EXPECT_EQ(0., metrics_collector->get_meta_indexer_lock_hold_time_us_metrics());
+    }
+    for (const KeyType key : keys) {
+        EXPECT_TRUE(can_lock_shard(key));
+    }
 }
 
 TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesRejectsMalformedShape) {
@@ -840,7 +871,7 @@ TEST_F(MetaIndexerTest, TestMakeBatchesPreservesOrderWithinEachShard) {
     ASSERT_EQ(expected_indexs, covered_indexs);
 }
 
-TEST_F(MetaIndexerTest, TestLocalSimple) {
+TEST_P(MetaIndexerMutexTest, TestLocalSimple) {
     std::string configStr = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,        
@@ -850,7 +881,10 @@ TEST_F(MetaIndexerTest, TestLocalSimple) {
         },
         "meta_cache_policy_config" : { "capacity" : 0 }
     })";
-    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+    MetaIndexerConfig config;
+    ASSERT_TRUE(config.FromJsonString(configStr));
+    config.SetMutexEnabled(GetParam());
+    ASSERT_EQ(EC_OK, InitIndexer(config.ToJsonString()));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));

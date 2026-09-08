@@ -43,6 +43,8 @@ def main():
         current._cache_config._meta_indexer_config._max_key_count = args.max_key_count
     if hasattr(args, "mutex_shard_num"):
         current._cache_config._meta_indexer_config._mutex_shard_num = args.mutex_shard_num
+    if hasattr(args, "mutex_enabled"):
+        current._cache_config._meta_indexer_config._mutex_enabled = args.mutex_enabled
     if hasattr(args, "batch_key_size"):
         current._cache_config._meta_indexer_config._batch_key_size = args.batch_key_size
     if hasattr(args, "meta_storage_backend_config"):

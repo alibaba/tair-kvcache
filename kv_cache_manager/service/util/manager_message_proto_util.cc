@@ -227,6 +227,7 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         auto *meta_indexer_config = proto_cache_config->mutable_meta_indexer_config();
         meta_indexer_config->set_max_key_count(origin_meta_indexer_config->GetMaxKeyCount());
         meta_indexer_config->set_mutex_shard_num(origin_meta_indexer_config->GetMutexShardNum());
+        meta_indexer_config->mutable_mutex_enabled()->set_value(origin_meta_indexer_config->GetMutexEnabled());
         meta_indexer_config->set_batch_key_size(origin_meta_indexer_config->GetBatchKeySize());
         meta_indexer_config->mutable_persist_metadata_interval_time_ms()->set_value(
             origin_meta_indexer_config->GetPersistMetaDataIntervalTimeMs());
@@ -310,6 +311,9 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
     meta_indexer_config->SetMaxKeyCount(proto_cache_config->meta_indexer_config().max_key_count());
     meta_indexer_config->SetMutexShardNum(proto_cache_config->meta_indexer_config().mutex_shard_num());
+    if (proto_cache_config->meta_indexer_config().has_mutex_enabled()) {
+        meta_indexer_config->SetMutexEnabled(proto_cache_config->meta_indexer_config().mutex_enabled().value());
+    }
     meta_indexer_config->SetBatchKeySize(proto_cache_config->meta_indexer_config().batch_key_size());
     if (proto_cache_config->meta_indexer_config().has_persist_metadata_interval_time_ms()) {
         meta_indexer_config->SetPersistMetaDataIntervalTimeMs(

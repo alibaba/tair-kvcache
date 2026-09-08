@@ -35,3 +35,9 @@ py_test(
     srcs = ["test/instance_group_revisit_buckets_test.py"],
     deps = [":kvcm_ops_lib"],
 )
+
+py_test(
+    name = "instance_group_mutex_test",
+    srcs = ["test/instance_group_mutex_test.py"],
+    deps = [":kvcm_ops_lib"],
+)

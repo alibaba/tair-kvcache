@@ -267,14 +267,15 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         list_resp = self._client.list_instance_group({"trace_id": self._trace_id})
         self.assertEqual(list_resp["header"]["status"]["code"], "OK")
         self.assertIn("instance_group", list_resp)
-        self.assertTrue(
-            any(instance_group["name"] == ig["name"] for instance_group in list_resp["instance_group"]),
-            "not found instance group after created.")
+        listed_groups = {group["name"]: group for group in list_resp["instance_group"]}
+        self.assertIn(ig["name"], listed_groups)
+        self.assertIs(listed_groups[ig["name"]]["cache_config"]["meta_indexer_config"]["mutex_enabled"], True)
 
         # Update some field
         ig_updated = ig.copy()
         ig_updated["user_data"] = "updated_data"
         ig_updated["version"] = ig["version"] + 1
+        ig_updated["cache_config"]["meta_indexer_config"]["mutex_enabled"] = False
         update_req = {"trace_id": self._trace_id, "instance_group": ig_updated, "current_version": ig["version"]}
         update_resp = self._client.update_instance_group(update_req)
         self.assertEqual(update_resp["header"]["status"]["code"], "OK")
@@ -283,12 +284,26 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         get_resp = self._client.get_instance_group(get_req)
         self.assertEqual(get_resp["header"]["status"]["code"], "OK")
         self.assertEqual(get_resp["instance_group"]["user_data"], "updated_data")
+        self.assertIs(get_resp["instance_group"]["cache_config"]["meta_indexer_config"]["mutex_enabled"], False)
 
         list_resp = self._client.list_instance_group({"trace_id": self._trace_id})
         self.assertEqual(list_resp["header"]["status"]["code"], "OK")
         listed_groups = {instance_group["name"]: instance_group for instance_group in list_resp["instance_group"]}
         self.assertIn(ig["name"], listed_groups)
         self.assertEqual(listed_groups[ig["name"]]["user_data"], "updated_data")
+        self.assertIs(listed_groups[ig["name"]]["cache_config"]["meta_indexer_config"]["mutex_enabled"], False)
+
+        # Re-enable using the full object returned by GET, as the CLI does.
+        restored_group = get_resp["instance_group"]
+        current_version = int(restored_group["version"])
+        restored_group["version"] = current_version + 1
+        restored_group["cache_config"]["meta_indexer_config"]["mutex_enabled"] = True
+        update_resp = self._client.update_instance_group({
+            "trace_id": self._trace_id, "instance_group": restored_group, "current_version": current_version})
+        self.assertEqual(update_resp["header"]["status"]["code"], "OK")
+        get_resp = self._client.get_instance_group(get_req)
+        self.assertEqual(get_resp["header"]["status"]["code"], "OK")
+        self.assertIs(get_resp["instance_group"]["cache_config"]["meta_indexer_config"]["mutex_enabled"], True)
 
         remove_req = {"trace_id": self._trace_id, "name": ig["name"]}
         remove_resp = self._client.remove_instance_group(remove_req)

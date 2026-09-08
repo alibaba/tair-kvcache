@@ -69,6 +69,17 @@ class RecoverFaultToleranceTest(TestBase, unittest.TestCase):
         logging.info(f"connecting: admin={admin_url}, meta={meta_url}")
         return AdminServiceHttpClient(admin_url), MetaServiceHttpClient(meta_url)
 
+    def test_recover_mutex_enabled(self):
+        self._add_storage()
+        self._create_instance_group(mutex_enabled=False)
+        self._register_instance("unlocked_instance")
+        self._write_and_read_block("unlocked_instance", block_key=0)
+        self._restart_server()
+        response = self._admin_client.get_instance_group({
+            "trace_id": self._trace_id, "name": self._instance_group_name})
+        self.assertIs(response["instance_group"]["cache_config"]["meta_indexer_config"]["mutex_enabled"], False)
+        self._write_and_read_block("unlocked_instance", block_key=1)
+
     def test_recover_with_corrupted_registry(self):
         """Server tolerates corrupted registry data and recovers when fixed."""
 
@@ -142,7 +153,7 @@ class RecoverFaultToleranceTest(TestBase, unittest.TestCase):
         }
         self._admin_client.add_storage(req, check_response=False)
 
-    def _create_instance_group(self):
+    def _create_instance_group(self, mutex_enabled=True):
         req = {
             "trace_id": self._trace_id,
             "instance_group": {
@@ -166,6 +177,7 @@ class RecoverFaultToleranceTest(TestBase, unittest.TestCase):
                     "meta_indexer_config": {
                         "max_key_count": 64,
                         "mutex_shard_num": 16,
+                        "mutex_enabled": mutex_enabled,
                         "meta_storage_backend_config": {
                             "storage_type": "dummy",
                             "storage_uri": f"file://{self.get_workdir()}/meta_{self._instance_group_name}",

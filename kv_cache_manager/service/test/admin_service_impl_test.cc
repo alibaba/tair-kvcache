@@ -200,6 +200,49 @@ public:
     const std::string kInstance = "test_instance";
 };
 
+TEST_F(AdminServiceImplTest, TestMutexEnabledAppliesToNewIndexer) {
+    RequestContext rc("mutex_enabled");
+    proto::admin::GetInstanceGroupRequest get_request;
+    get_request.set_name("default");
+    proto::admin::GetInstanceGroupResponse get_response;
+    admin_->GetInstanceGroup(&rc, &get_request, &get_response);
+    ASSERT_EQ(proto::admin::OK, get_response.header().status().code());
+    ASSERT_TRUE(get_response.instance_group().cache_config().meta_indexer_config().mutex_enabled().value());
+
+    proto::admin::UpdateInstanceGroupRequest update_request;
+    auto *group = update_request.mutable_instance_group();
+    group->CopyFrom(get_response.instance_group());
+    update_request.set_current_version(group->version());
+    group->set_version(group->version() + 1);
+    group->mutable_cache_config()->mutable_reclaim_strategy()->set_storage_unique_name("hot_01");
+    group->mutable_cache_config()->mutable_meta_indexer_config()->mutable_mutex_enabled()->set_value(false);
+    proto::admin::CommonResponse update_response;
+    admin_->UpdateInstanceGroup(&rc, &update_request, &update_response);
+    ASSERT_EQ(proto::admin::OK, update_response.header().status().code()) << update_response.DebugString();
+
+    // Configuration updates do not reinitialize an already running indexer.
+    auto existing_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
+    ASSERT_NE(nullptr, existing_indexer);
+    ASSERT_TRUE(existing_indexer->mutex_enabled_);
+
+    proto::admin::RegisterInstanceRequest register_request;
+    register_request.set_instance_group("default");
+    register_request.set_instance_id("unlocked_instance");
+    register_request.set_block_size(64);
+    register_request.mutable_model_deployment()->set_model_name("m");
+    register_request.mutable_model_deployment()->set_dtype("FP16");
+    register_request.mutable_model_deployment()->set_tp_size(1);
+    auto *spec = register_request.add_location_spec_infos();
+    spec->set_name("tp0");
+    spec->set_size(512);
+    proto::admin::CommonResponse register_response;
+    admin_->RegisterInstance(&rc, &register_request, &register_response);
+    ASSERT_EQ(proto::admin::OK, register_response.header().status().code()) << register_response.DebugString();
+    auto new_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(register_request.instance_id());
+    ASSERT_NE(nullptr, new_indexer);
+    ASSERT_FALSE(new_indexer->mutex_enabled_);
+}
+
 TEST_F(AdminServiceImplTest, TestInvalidArgs) {
     auto rc = std::make_shared<RequestContext>("t");
 

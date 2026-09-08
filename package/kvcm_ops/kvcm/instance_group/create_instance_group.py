@@ -49,6 +49,7 @@ curl -g -vvv -X POST http://localhost:56040/api/createInstanceGroup \
             "meta_indexer_config": {
                 "max_key_count": 10000,
                 "mutex_shard_num": 1024,
+                "mutex_enabled": true,
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "storage_uri": ""
@@ -77,6 +78,7 @@ def create_instance_group(args) -> InstanceGroup:
                                                      cache_shard_bits=args.search_cache_shard_bits)
     meta_indexer_config = MetaIndexerConfig(max_key_count=args.max_key_count,
                                             mutex_shard_num=args.mutex_shard_num,
+                                            mutex_enabled=args.mutex_enabled,
                                             batch_key_size=args.batch_key_size,
                                             meta_storage_backend_config=args.meta_storage_backend_config,
                                             meta_cache_policy_config=meta_cache_policy_config)

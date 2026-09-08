@@ -103,22 +103,28 @@ public:
                     int64_t *out_lock_wait_time_us = nullptr,
                     int64_t *out_lock_hold_time_us = nullptr)
         : indexer_(indexer), shard_indexs_(shard_indexs), out_lock_hold_time_us_(out_lock_hold_time_us) {
+        if (!indexer_.mutex_enabled_) {
+            return;
+        }
         const int64_t begin = TimestampUtil::GetCurrentTimeUs();
-        // for (const int32_t shardIdx : shard_indexs_) {
-        //     indexer_.mutex_shards_[shardIdx]->lock();
-        // }
+        for (const int32_t shardIdx : shard_indexs_) {
+            indexer_.mutex_shards_[shardIdx]->lock();
+        }
         lock_acquired_time_us_ = TimestampUtil::GetCurrentTimeUs();
         if (out_lock_wait_time_us != nullptr) {
             *out_lock_wait_time_us += lock_acquired_time_us_ - begin;
         }
     }
     ~ScopedBatchLock() {
+        if (!indexer_.mutex_enabled_) {
+            return;
+        }
         if (out_lock_hold_time_us_ != nullptr) {
             *out_lock_hold_time_us_ += TimestampUtil::GetCurrentTimeUs() - lock_acquired_time_us_;
         }
-        // for (const int32_t shardIdx : shard_indexs_) {
-        //     indexer_.mutex_shards_[shardIdx]->unlock();
-        // }
+        for (const int32_t shardIdx : shard_indexs_) {
+            indexer_.mutex_shards_[shardIdx]->unlock();
+        }
     }
 
     ScopedBatchLock(const ScopedBatchLock &) = delete;
@@ -145,6 +151,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
     max_key_count_ = config->GetMaxKeyCount();
     const size_t mutex_shard_num = config->GetMutexShardNum();
+    mutex_enabled_ = config->GetMutexEnabled();
     batch_key_size_ = config->GetBatchKeySize();
     persist_metadata_interval_time_ms_ = config->GetPersistMetaDataIntervalTimeMs();
     if (mutex_shard_num > max_key_count_ || (mutex_shard_num & (mutex_shard_num - 1)) || mutex_shard_num <= 0) {
@@ -192,17 +199,19 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
         return ec;
     }
-    KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
-                  "], max key count[%lu], "
-                  "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
-                  instance_id_.c_str(),
-                  mutex_shard_num,
-                  mutex_shard_hash_seed_,
-                  max_key_count_,
-                  batch_key_size_,
-                  key_count_.load(),
-                  persist_metadata_interval_time_ms_,
-                  storage_usage_data_.ToJsonString().c_str());
+    KVCM_LOG_INFO(
+        "instance[%s] meta indexer init success, mutex enabled[%d], mutex shard num[%lu], mutex hash seed[%" PRIu64
+        "], max key count[%lu], "
+        "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
+        instance_id_.c_str(),
+        mutex_enabled_,
+        mutex_shard_num,
+        mutex_shard_hash_seed_,
+        max_key_count_,
+        batch_key_size_,
+        key_count_.load(),
+        persist_metadata_interval_time_ms_,
+        storage_usage_data_.ToJsonString().c_str());
     return EC_OK;
 }
 
