@@ -5,7 +5,6 @@ import time
 import unittest
 import socket as socket_module
 
-import zmq
 
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMessage,

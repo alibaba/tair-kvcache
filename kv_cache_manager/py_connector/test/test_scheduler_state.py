@@ -17,12 +17,12 @@ Covers, against fake vLLM SchedulerOutput / Request objects:
 import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any, Dict
 from unittest.mock import MagicMock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector,
     make_connector_scheduler,
-    GroupMeta,
 )
 from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
@@ -30,7 +30,6 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     StateGroupMeta,
     parse_groups,
 )
-from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
 from kv_cache_manager.py_connector.vllm.metadata import (
     SaveRequest,
     LoadRequest,
@@ -339,7 +338,7 @@ class TestStateCompleteMask(unittest.TestCase):
 
     def _req(self, tables):
         return RequestLedger(
-            vllm_request=FakeRequest("r0", []),
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
             block_ids_per_group=tables,
             has_saved_block_num=0,
         )
@@ -550,8 +549,10 @@ class TestParseGroups(unittest.TestCase):
 
         return SimpleNamespace(
             layer_names=layers,
-            kv_cache_spec=FullAttentionSpec(
-                block_size, page_size_bytes, page_size_padded=page_size_padded
+            kv_cache_spec=FullAttentionSpec(  # ty: ignore[missing-argument]
+                block_size,
+                page_size_bytes,  # ty: ignore[too-many-positional-arguments]
+                page_size_padded=page_size_padded,
             ),
         )
 
@@ -559,7 +560,11 @@ class TestParseGroups(unittest.TestCase):
         from vllm.v1.kv_cache_interface import MambaSpec
 
         return SimpleNamespace(
-            layer_names=layers, kv_cache_spec=MambaSpec(block_size, page_size_bytes)
+            layer_names=layers,
+            kv_cache_spec=MambaSpec(  # ty: ignore[missing-argument]
+                block_size,
+                page_size_bytes,  # ty: ignore[invalid-argument-type]
+            ),
         )
 
     def test_full_attention_single_group(self):
@@ -712,7 +717,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     def test_num_allocated_blocks_ignores_skipped_group(self):
         conn = self._skipped_group0_connector()
         ledger = RequestLedger(
-            vllm_request=FakeRequest("r0", list(range(64))),
+            vllm_request=FakeRequest("r0", list(range(64))),  # ty: ignore[invalid-argument-type]
             # Drafter table (group 0) lags with 1 block; attention has 4.
             block_ids_per_group=[[100], [200, 201, 202, 203]],
             has_saved_block_num=0,
@@ -737,7 +742,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         ]
         conn._num_groups = 2
         ledger = RequestLedger(
-            vllm_request=FakeRequest("r0", []),
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
             block_ids_per_group=[[9], [1, 2, 3], [4, 5]],
             has_saved_block_num=0,
         )
@@ -746,7 +751,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
     def test_num_allocated_blocks_empty(self):
         conn = self._skipped_group0_connector()
         ledger = RequestLedger(
-            vllm_request=FakeRequest("r0", []),
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
             block_ids_per_group=[],
             has_saved_block_num=0,
         )
@@ -756,7 +761,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         # Exactly one vLLM block table: the transferred group is 0 and the
         # failure report maps manager blocks into its table.
         conn = make_connector(manager_block_size=self.MBS)
-        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
@@ -785,7 +792,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         ]
         conn._num_groups = 1
-        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
@@ -808,7 +817,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         # vLLM block tables, attention-only, still breaks the single-table
         # recovery unpack -- must not be reported.
         conn = make_connector(manager_block_size=self.MBS, num_groups=2)
-        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
@@ -830,7 +841,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn = make_connector(
             manager_block_size=self.MBS, num_groups=1, num_state_groups=1
         )
-        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
@@ -862,7 +875,9 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         ]
         conn._num_groups = 1
-        conn._extra_config = SimpleNamespace(block_per_load_task=8)
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
         conn._data_transfer = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
@@ -944,7 +959,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
         )
 
     def _preempted_step(self, conn, req, use_legacy):
-        kwargs = dict(
+        kwargs: Dict[str, Any] = dict(
             cached_req_ids=["r0"], num_scheduled={"r0": 0}, new_block_ids=[[[200, 201]]]
         )
         if use_legacy:
@@ -972,7 +987,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
                 conn = make_scheduler_connector(mbs=self.MBS)
                 req, _ = self._new_request(conn, "r0", 40, 3)
                 before = [list(t) for t in conn._tracked["r0"].block_ids_per_group]
-                kwargs = dict(
+                kwargs: Dict[str, Any] = dict(
                     cached_req_ids=["r0"], num_scheduled={"r0": 0}, new_block_ids=[None]
                 )
                 if use_legacy:

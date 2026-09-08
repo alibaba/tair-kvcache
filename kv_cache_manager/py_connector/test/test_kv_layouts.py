@@ -19,6 +19,7 @@ Runs without torch: a minimal FakeTensor models the strided-view semantics
 
 import sys
 import types
+from typing import Any
 import unittest
 
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
@@ -26,7 +27,6 @@ from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 from kv_cache_manager.py_connector.vllm.v1_connector import (
     attn_kv_views,
     ensure_hybrid_supported,
-    GroupMeta,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 
@@ -158,7 +158,8 @@ class TestAttnKvViews(unittest.TestCase):
 
 def _make_group_conn():
     conn = make_connector(manager_block_size=16)
-    conn._self_spec_names = ["tp0_g0"]
+    # list instead of the production dict: group_idx == position here.
+    conn._self_spec_names = ["tp0_g0"]  # ty: ignore[invalid-assignment]
     conn._device = "cpu"
     return conn
 
@@ -281,7 +282,7 @@ class TestHybridGate(unittest.TestCase):
     MOD = "vllm.v1.core.sched.scheduler"
 
     def _with_scheduler(self, cls):
-        mod = types.ModuleType(self.MOD)
+        mod: Any = types.ModuleType(self.MOD)
         mod.Scheduler = cls
         old = sys.modules.get(self.MOD)
         sys.modules[self.MOD] = mod

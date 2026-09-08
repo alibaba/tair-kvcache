@@ -3,26 +3,29 @@
 import json
 import sys
 import types
+from typing import Any
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
 
 # ── Mock unavailable modules before importing connector ──────────────
-_mock_metrics = types.ModuleType("sglang.srt.metrics")
-_mock_collector = types.ModuleType("sglang.srt.metrics.collector")
+_mock_metrics: Any = types.ModuleType("sglang.srt.metrics")
+_mock_collector: Any = types.ModuleType("sglang.srt.metrics.collector")
 _mock_collector.StorageMetrics = MagicMock
 _mock_metrics.collector = _mock_collector
 sys.modules.setdefault("sglang.srt.metrics", _mock_metrics)
 sys.modules.setdefault("sglang.srt.metrics.collector", _mock_collector)
 
-_mock_pybind = types.ModuleType("kv_cache_manager.client.pybind")
+_mock_pybind: Any = types.ModuleType("kv_cache_manager.client.pybind")
 _mock_kvcm = MagicMock()
 _mock_kvcm.ClientErrorCode.ER_OK = 0
 _mock_pybind.kvcm_py_client = _mock_kvcm
 sys.modules["kv_cache_manager.client.pybind"] = _mock_pybind
 
-_mock_version = types.ModuleType("kv_cache_manager.py_connector.common._version_info")
+_mock_version: Any = types.ModuleType(
+    "kv_cache_manager.py_connector.common._version_info"
+)
 _mock_version.FULL_VERSION = "0.0.0-test"
 _mock_version.GIT_COMMIT = "test"
 _mock_version.BUILD_TIME = "test"

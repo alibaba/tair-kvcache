@@ -7,6 +7,7 @@ reference implementation, token by token.
 """
 
 import unittest
+from typing import Any, Dict
 
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -17,7 +18,7 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
 
 
 def _make_group(group_bs, kernel_bs=0, is_attention=True):
-    common = dict(
+    common: Dict[str, Any] = dict(
         group_idx=0,
         spec_name="tp0_g0",
         layer_names=["layer0"],
@@ -28,7 +29,8 @@ def _make_group(group_bs, kernel_bs=0, is_attention=True):
     if is_attention:
         return AttentionTransferGroup(
             kv_layout=KVLayout.PACKED_4D,
-            kvcache_ptr_tensor_gpu=None,
+            # No real device pointers in the pure translation tests.
+            kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
             num_kv_ptrs=1,
             per_token_dim=8,
             kernel_block_size=kernel_bs,

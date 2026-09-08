@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -34,7 +35,7 @@ def set_log_level(level_str: str) -> None:
     logger.setLevel(level)
 
 
-def configure_log_level(param_level: str = "") -> None:
+def configure_log_level(param_level: Optional[str] = "") -> None:
     """Apply log level with priority: env var > param > default(WARNING).
 
     Args:

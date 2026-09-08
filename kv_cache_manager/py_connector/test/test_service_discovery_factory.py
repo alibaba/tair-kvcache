@@ -4,6 +4,7 @@
 import sys
 import unittest
 from types import ModuleType
+from typing import Any
 
 try:
     from unittest.mock import patch
@@ -47,8 +48,8 @@ class _FakeSpectrumServiceDiscovery:
         return None
 
 
-def _fake_spectrum_module():
-    module = ModuleType(_SPECTRUM_MODULE)
+def _fake_spectrum_module() -> Any:
+    module: Any = ModuleType(_SPECTRUM_MODULE)
     module.SpectrumServiceDiscovery = _FakeSpectrumServiceDiscovery
     return module
 
@@ -64,13 +65,15 @@ class TestParseUrl(unittest.TestCase):
         self.assertIsNone(_parse_url("static://"))
 
     def test_static_no_query(self):
-        scheme, body, params = _parse_url("static://10.0.0.1:8080,10.0.0.2:9090")
+        scheme, body, params = _parse_url(  # ty: ignore[not-iterable]
+            "static://10.0.0.1:8080,10.0.0.2:9090"
+        )
         self.assertEqual(scheme, "static")
         self.assertEqual(body, "10.0.0.1:8080,10.0.0.2:9090")
         self.assertEqual(params, {})
 
     def test_spectrum_with_query(self):
-        scheme, body, params = _parse_url(
+        scheme, body, params = _parse_url(  # ty: ignore[not-iterable]
             "spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000"
         )
         self.assertEqual(scheme, "spectrum")
@@ -81,7 +84,9 @@ class TestParseUrl(unittest.TestCase):
         )
 
     def test_vipserver_with_single_param(self):
-        scheme, body, params = _parse_url("vipserver://my.domain.vipserver?timeout=10")
+        scheme, body, params = _parse_url(  # ty: ignore[not-iterable]
+            "vipserver://my.domain.vipserver?timeout=10"
+        )
         self.assertEqual(scheme, "vipserver")
         self.assertEqual(body, "my.domain.vipserver")
         self.assertEqual(params, {"timeout": "10"})
@@ -118,7 +123,9 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         self.assertIsNone(create_service_discovery("vipserver://pace.meta.vipserver"))
 
     def test_static_url_success(self):
-        discovery = create_service_discovery("static://10.0.0.1:8080,10.0.0.2:9090")
+        discovery: Any = create_service_discovery(
+            "static://10.0.0.1:8080,10.0.0.2:9090"
+        )
         self.assertIsNotNone(discovery)
         self.assertEqual(discovery.get_type(), "Static")
         endpoints = discovery.get_all_endpoints()
@@ -134,8 +141,10 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         self.assertIsNone(create_service_discovery("static://10.0.0.1:abc"))
 
     def test_spectrum_url_passes_config_to_discovery(self):
-        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
-            discovery = create_service_discovery(
+        with patch.dict(  # ty: ignore[unresolved-attribute]
+            sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}
+        ):
+            discovery: Any = create_service_discovery(
                 "spectrum://v-ad2d143d?cache_time=10&retry_time=2&timeout=3000"
             )
 
@@ -152,8 +161,10 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         self.assertIsNone(create_service_discovery("spectrum://"))
 
     def test_spectrum_url_passes_custom_port(self):
-        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
-            discovery = create_service_discovery(
+        with patch.dict(  # ty: ignore[unresolved-attribute]
+            sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}
+        ):
+            discovery: Any = create_service_discovery(
                 "spectrum://v-port?cache_time=10&retry_time=2&timeout=3000&port=12348"
             )
 
@@ -162,8 +173,10 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         discovery.close()
 
     def test_spectrum_body_is_forwarded_to_implementation(self):
-        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
-            discovery = create_service_discovery(
+        with patch.dict(  # ty: ignore[unresolved-attribute]
+            sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}
+        ):
+            discovery: Any = create_service_discovery(
                 "spectrum://virtual-service:opaque-suffix?cache_time=10"
             )
 
@@ -176,8 +189,10 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         discovery.close()
 
     def test_spectrum_url_uses_default_port_override(self):
-        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
-            discovery = create_service_discovery(
+        with patch.dict(  # ty: ignore[unresolved-attribute]
+            sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}
+        ):
+            discovery: Any = create_service_discovery(
                 "spectrum://v-no-port?cache_time=10&retry_time=2&timeout=3000"
             )
 

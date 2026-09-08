@@ -13,7 +13,7 @@ import importlib.util
 import json
 import sys
 import types
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 #: Modules this run replaced with stand-ins (empty when the real deps are
@@ -22,7 +22,10 @@ from unittest.mock import MagicMock
 STUBBED: set = set()
 
 
-def _module(name: str) -> types.ModuleType:
+def _module(name: str) -> Any:
+    """Return (or register) the stub module; Any because the whole point of
+    this helper is dynamic attribute injection that no static type
+    describes."""
     mod = sys.modules.get(name)
     if mod is None:
         mod = types.ModuleType(name)
@@ -195,7 +198,6 @@ _install_stubs()
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
     AttentionGroupMeta,
-    GroupMeta,
     StateGroupMeta,
 )
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler  # noqa: E402
@@ -239,16 +241,21 @@ def make_connector(
     truncation)."""
     conn = ConnectorWorker.__new__(ConnectorWorker)
     conn._manager_block_size = manager_block_size
-    conn._vllm_block_size = vllm_block_size or manager_block_size
+    # Extra harness attributes the worker itself never declares.
+    conn._vllm_block_size = (  # ty: ignore[unresolved-attribute]
+        vllm_block_size or manager_block_size
+    )
     conn._tp_size = tp_size
     conn._tp_rank = 0
     conn._self_spec_names = {}
     conn._device = "cpu"
     conn._group_metas = _make_group_metas(
-        num_groups, num_state_groups, conn._vllm_block_size
+        num_groups,
+        num_state_groups,
+        conn._vllm_block_size,  # ty: ignore[unresolved-attribute]
     )
     conn._num_groups = len(conn._group_metas)
-    conn._state_group_idxs = [
+    conn._state_group_idxs = [  # ty: ignore[unresolved-attribute]
         m.group_idx for m in conn._group_metas if isinstance(m, StateGroupMeta)
     ]
     return conn
@@ -261,15 +268,16 @@ class FakeLocationQueries:
     hook's clamped result (store_result) is what the allocation consumes;
     the offset recorded at get time travels with it."""
 
-    def __init__(self, locations=None):
+    def __init__(self, locations: Optional[list] = None) -> None:
         self.locations = locations
         self.in_flight = locations is None
-        self._stored = None
+        self._stored: Any = None
         self.last_computed_blocks = 0
 
-    def get_locations_for_query(self, request, computed_blocks):
+    def get_locations_for_query(self, request: Any, computed_blocks: int) -> Any:
         self.last_computed_blocks = computed_blocks
-        return None if self.in_flight else list(self.locations)
+        # list(self.locations) is only reached when not in flight.
+        return None if self.in_flight else list(self.locations)  # ty: ignore[invalid-argument-type]
 
     def store_result(self, req_id, locations):
         self._stored = list(locations)
@@ -323,5 +331,7 @@ def make_connector_scheduler(
     core._http_executor = MagicMock()
     core._manager_client = MagicMock()
     core._coordinator_client = MagicMock()
-    core._location_query_manager = FakeLocationQueries(locations)
+    core._location_query_manager = (  # ty: ignore[invalid-assignment]
+        FakeLocationQueries(locations)
+    )
     return core

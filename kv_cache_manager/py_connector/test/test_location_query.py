@@ -63,7 +63,10 @@ class LocationQueryFanoutTest(unittest.TestCase):
 
     def _manager(self, async_mode=True):
         return LocationQueryManager(
-            self.client, self.executor, "inst", async_get_cache_location=async_mode
+            self.client,  # ty: ignore[invalid-argument-type]  (test double)
+            self.executor,
+            "inst",
+            async_get_cache_location=async_mode,
         )
 
     def _await_answer(self, lqm, offset):
@@ -205,7 +208,7 @@ class LocationQueryFanoutTest(unittest.TestCase):
         def boom(request):
             raise RuntimeError("manager down")
 
-        self.client.get_cache_location = boom
+        self.client.get_cache_location = boom  # ty: ignore[invalid-assignment]
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
         deadline = time.time() + 10  # failure pops the slot asynchronously
         while time.time() < deadline:
@@ -215,7 +218,9 @@ class LocationQueryFanoutTest(unittest.TestCase):
             time.sleep(0.01)
         # The next ask re-issues instead of waiting forever on a dead slot.
         restore = GatedClient.get_cache_location
-        self.client.get_cache_location = lambda request: restore(self.client, request)
+        self.client.get_cache_location = (  # ty: ignore[invalid-assignment]
+            lambda request: restore(self.client, request)
+        )
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # re-issue
         self._gate(0).set()
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])

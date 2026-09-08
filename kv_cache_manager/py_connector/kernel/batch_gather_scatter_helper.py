@@ -30,7 +30,7 @@ on AttentionTransferGroup.kv_layout; the GPU test in test/kernel checks
 both modes element-wise against naive torch indexing.
 """
 
-from typing import Any, List
+from typing import Any, List, Union
 
 import torch
 import triton
@@ -165,7 +165,9 @@ def batch_gather_kv_caches(
     kv_caches_ptrs_tensor: torch.Tensor,
     # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
     dst_tensor: torch.Tensor,
-    block_token_indices: List[List[int]],  # token slots per block
+    # Row-major [total_blocks, num_tokens_per_block] slots; nested per
+    # block or already flat -- torch.tensor flattens both identically.
+    block_token_indices: Union[List[List[int]], List[int]],
     dst_block_indices: List[int],  # List of dst block indices
     num_tokens_per_block: int,
     dim_size_per_token_per_layer: int,
@@ -310,7 +312,9 @@ def batch_scatter_kv_caches(
     kv_caches_ptrs_tensor: torch.Tensor,
     # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
     src_tensor: torch.Tensor,  # 注意：src_tensor在PCIE连接的host DRAM上 (pinned memory)
-    block_token_indices: List[List[int]],  # token slots per block
+    # Row-major [total_blocks, num_tokens_per_block] slots; nested per
+    # block or already flat -- torch.tensor flattens both identically.
+    block_token_indices: Union[List[List[int]], List[int]],
     src_block_indices: List[int],  # List of src block indices
     num_tokens_per_block: int,
     dim_size_per_token_per_layer: int,

@@ -147,16 +147,14 @@ class MultiResult:
     callback once every task has reported. Each result is a list[bool] aligned
     with the manager blocks the task handled (in submission order)."""
 
-    def __init__(
-        self, size: int, callback: Callable[[List[Optional[bool]]], None]
-    ) -> None:
+    def __init__(self, size: int, callback: Callable[[List[Any]], None]) -> None:
         self._size = size
-        self._results: List[Optional[Sequence[Optional[bool]]]] = [None] * size
+        self._results: List[Optional[Sequence[Any]]] = [None] * size
         self._lock = threading.Lock()
         self._finished_num = 0
         self._callback = callback
 
-    def submit_result(self, idx: int, result: Sequence[Optional[bool]]) -> None:
+    def submit_result(self, idx: int, result: Sequence[Any]) -> None:
         with self._lock:
             assert self._results[idx] is None
             self._results[idx] = result

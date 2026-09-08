@@ -3,7 +3,7 @@
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import requests
 
@@ -467,8 +467,10 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=True)
         try:
             self.assertIsNotNone(client._refresh_thread)
-            self.assertTrue(client._refresh_thread.is_alive())
-            self.assertTrue(client._refresh_thread.daemon)
+            self.assertTrue(
+                client._refresh_thread.is_alive()  # ty: ignore[unresolved-attribute]
+            )
+            self.assertTrue(client._refresh_thread.daemon)  # ty: ignore[unresolved-attribute]
         finally:
             client.close()
 
@@ -541,7 +543,9 @@ class TestServerNotLeaderRetry(unittest.TestCase):
         )
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             result = client.register_instance({"trace_id": "test"})
             self.assertEqual(result["result"], "success")
             # First call returns NOT_LEADER, second succeeds
@@ -572,7 +576,9 @@ class TestServerNotLeaderRetry(unittest.TestCase):
             return _make_mock_response(_not_leader_response())
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             with self.assertRaises(AssertionError) as ctx:
                 client.register_instance({"trace_id": "test"})
             self.assertIn("Current node is not the leader", str(ctx.exception))
@@ -591,7 +597,9 @@ class TestServerNotLeaderRetry(unittest.TestCase):
             return _make_mock_response(_not_leader_response())
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             with self.assertRaises(AssertionError) as ctx:
                 client.register_instance({"trace_id": "test"})
             self.assertIn("Current node is not the leader", str(ctx.exception))
@@ -639,7 +647,9 @@ class TestConnectionErrorHandling(unittest.TestCase):
             raise requests.ConnectionError("Connection refused")
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             client._refresh_event.clear()
 
             with self.assertRaises(requests.ConnectionError):
@@ -662,7 +672,9 @@ class TestConnectionErrorHandling(unittest.TestCase):
             raise requests.ConnectionError("Connection refused")
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             with self.assertRaises(requests.ConnectionError):
                 client.register_instance({"trace_id": "test"})
             # _refresh_event should NOT be set
@@ -686,7 +698,9 @@ class TestConnectionErrorHandling(unittest.TestCase):
                     min_discover_interval_seconds=0,
                 )
                 discovery = client._service_discovery
-                discovery.refresh = MagicMock(wraps=discovery.refresh)
+                discovery.refresh = MagicMock(  # ty: ignore[invalid-assignment]
+                    wraps=discovery.refresh  # ty: ignore[unresolved-attribute]
+                )
                 client.session.post = MagicMock(side_effect=error)
                 route_refreshed = threading.Event()
                 original_refresh = client._refresh_manager_route
@@ -697,7 +711,9 @@ class TestConnectionErrorHandling(unittest.TestCase):
                     finally:
                         route_refreshed.set()
 
-                client._refresh_manager_route = refresh_and_signal
+                client._refresh_manager_route = (  # ty: ignore[invalid-assignment]
+                    refresh_and_signal
+                )
                 try:
                     with self.assertRaises(type(error)):
                         client.register_instance({"trace_id": "test"})
@@ -707,7 +723,7 @@ class TestConnectionErrorHandling(unittest.TestCase):
                         "route refresh did not finish after the transport failure",
                     )
                     self.assertEqual(client.base_url, "http://10.0.0.2:8080")
-                    discovery.refresh.assert_called_once_with()
+                    discovery.refresh.assert_called_once_with()  # ty: ignore[unresolved-attribute]
                     mock_discovery_post.assert_not_called()
                 finally:
                     client.close()
@@ -792,9 +808,9 @@ class TestCloseLifecycle(unittest.TestCase):
         )
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=True)
 
-        self.assertTrue(client._refresh_thread.is_alive())
+        self.assertTrue(client._refresh_thread.is_alive())  # ty: ignore[unresolved-attribute]
         client.close()
-        self.assertFalse(client._refresh_thread.is_alive())
+        self.assertFalse(client._refresh_thread.is_alive())  # ty: ignore[unresolved-attribute]
         self.assertTrue(client._closed.is_set())
 
     def test_close_without_discovery(self):
@@ -880,7 +896,6 @@ class TestThreadSafety(unittest.TestCase):
     def test_concurrent_discover_dedup(self, mock_post):
         """Concurrent Manager route refresh calls should dedup via lock."""
         actual_discover_count = [0]
-        original_post = mock_post
 
         def slow_post(*args, **kwargs):
             actual_discover_count[0] += 1
@@ -945,7 +960,9 @@ class TestGetClusterInfoPublicApi(unittest.TestCase):
             return _make_mock_response(expected)
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             result = client.get_cluster_info({"trace_id": "test"})
             self.assertEqual(result["leader_node_id"], "node-0")
             self.assertIn("leader_endpoint", result)
@@ -1069,7 +1086,9 @@ class TestNormalApiStillWorks(unittest.TestCase):
             return _make_mock_response(ok_resp)
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             result = client.register_instance({"trace_id": "t1"})
             self.assertEqual(result["header"]["status"]["code"], "OK")
         finally:
@@ -1087,7 +1106,9 @@ class TestNormalApiStillWorks(unittest.TestCase):
             return _make_mock_response(ok_resp)
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             result = client.get_cache_location({"trace_id": "t1"})
             self.assertEqual(result["header"]["status"]["code"], "OK")
         finally:
@@ -1111,7 +1132,9 @@ class TestNormalApiStillWorks(unittest.TestCase):
             return _make_mock_response(error_resp)
 
         try:
-            client.session.post = mock_session_post
+            client.session.post = (  # ty: ignore[invalid-assignment]
+                mock_session_post
+            )
             result = client.register_instance({"trace_id": "t1"}, check_response=False)
             self.assertEqual(result["header"]["status"]["code"], "INTERNAL_ERROR")
         finally:

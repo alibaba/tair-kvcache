@@ -202,7 +202,8 @@ class TestNullStateBlocks(unittest.TestCase):
             per_block_bytes=1024,
             layer_num=1,
             kv_layout=KVLayout.PACKED_4D,
-            kvcache_ptr_tensor_gpu=None,
+            # No real device pointers in the pure plumbing tests.
+            kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
             num_kv_ptrs=1,
             per_token_dim=8,
             kernel_block_size=528,
@@ -464,7 +465,12 @@ class TestStagingPool(unittest.TestCase):
         from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
 
         with patch("torch.empty") as empty:
-            _StagingPool(SimpleNamespace(type="cuda"), per_block_bytes=16, max_blocks=8)
+            # duck-typed device stand-in
+            _StagingPool(
+                SimpleNamespace(type="cuda"),  # ty: ignore[invalid-argument-type]
+                per_block_bytes=16,
+                max_blocks=8,
+            )
         self.assertEqual(
             empty.call_count, 1, "pool must own exactly one backing allocation"
         )
