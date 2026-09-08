@@ -608,6 +608,10 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_item_capped_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, fair_sampling_size_normalized_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_sampling_size_normalized_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_rotation_resume_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_rotation_resume_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_rotation_advance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_rotation_advance_count));
 
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_duration_us));
@@ -830,6 +834,59 @@ public:
     int ListInstanceGroupCallCount() {
         std::lock_guard<std::mutex> lock(list_ins_group_mut);
         return list_ins_group_call_counter;
+    }
+
+    std::shared_ptr<InstanceGroup> SetUpFairRotationScenario() {
+        cache_reclaimer_->job_state_flag_ = true;
+        spe_submit_auto_complete = false;
+        instance_infos.clear();
+        for (const auto &[id, usage] :
+             std::vector<std::pair<std::string, std::uint64_t>>{{"large", 600}, {"medium", 300}, {"small", 100}}) {
+            auto instance = InstanceInfoFactory();
+            instance->set_instance_id(id);
+            instance_infos.push_back(instance);
+            AddMetaIndexerForInstance(id, usage);
+        }
+
+        auto group = InstanceGroupFactory();
+        group->quota_.set_capacity(1200);
+        group->quota_.quota_config_.clear();
+        group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+        instance_groups = {group};
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+        // One task per Instance, with duplicate sampled keys collapsing to a single victim.
+        // Its 50-byte credit covers the 40-byte gap; official usage stays fixed between rounds.
+        cache_reclaimer_->sampling_size_per_task_.store(1000);
+        batch_get_loc_out_maps = {CacheLocationMap{
+            {"fifty_bytes",
+             MakeCacheLocation("fifty_bytes",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store/key?size=50")},
+        }};
+        return group;
+    }
+
+    static CacheReclaimer::FairReclaimPlan MakeFairRotationPlan(const std::vector<std::string> &ids) {
+        CacheReclaimer::FairReclaimPlan plan;
+        for (const auto &id : ids) {
+            CacheReclaimer::FairReclaimPlanItem item;
+            item.instance_id = id;
+            item.batch_size = 1;
+            item.sampling_size = 10;
+            plan.items.push_back(std::move(item));
+        }
+        return plan;
+    }
+
+    std::vector<std::string> FairRotationOrder(const std::string &group) const {
+        const auto it = cache_reclaimer_->fair_rotation_by_group_.find(group);
+        if (it == cache_reclaimer_->fair_rotation_by_group_.end()) {
+            return {};
+        }
+        const auto &ids = it->second.instance_ids;
+        return {ids.begin(), ids.end()};
     }
 
     Stub stub_;
@@ -4125,6 +4182,279 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
 }
 
+TEST_F(CacheReclaimerTest, TestFairRotationKeepsWaitingOrderAcrossPlanChanges) {
+    const std::string group = "rotation_group";
+    auto plan = MakeFairRotationPlan({"a", "b", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{0, 1, 2}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    cache_reclaimer_->fair_rotation_by_group_[group].instance_ids = {"b", "c", "a"};
+
+    // A new largest Instance joins last; fresh ranking does not overtake waiting IDs.
+    plan = MakeFairRotationPlan({"new_largest", "a", "b", "c"});
+    plan.items[2].batch_size = 7;
+    const auto order = cache_reclaimer_->PrepareFairExecutionOrder(group, plan);
+    EXPECT_EQ((std::vector<std::size_t>{2, 3, 1, 0}), order);
+    EXPECT_EQ((std::vector<std::string>{"b", "c", "a", "new_largest"}), FairRotationOrder(group));
+    ASSERT_FALSE(order.empty());
+    EXPECT_EQ(7, plan.items[order.front()].batch_size);
+
+    // Absence covers deletion, missing Indexer and zero final budget alike.
+    plan = MakeFairRotationPlan({"new_largest", "a", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{2, 1, 0}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    EXPECT_EQ((std::vector<std::string>{"c", "a", "new_largest"}), FairRotationOrder(group));
+
+    plan = MakeFairRotationPlan({"b", "new_largest", "a", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{3, 2, 1, 0}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    const auto waiting_order = FairRotationOrder(group);
+    EXPECT_EQ((std::vector<std::string>{"c", "a", "new_largest", "b"}), waiting_order);
+    EXPECT_TRUE(cache_reclaimer_->PrepareFairExecutionOrder(group, MakeFairRotationPlan({})).empty());
+    EXPECT_EQ(waiting_order, FairRotationOrder(group));
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationIsolatesGroupsAndPrunesDeletedGroups) {
+    const auto group = InstanceGroupFactory();
+    const auto plan = MakeFairRotationPlan({"a", "b"});
+    EXPECT_EQ((std::vector<std::size_t>{0, 1}), cache_reclaimer_->PrepareFairExecutionOrder(group->name(), plan));
+    EXPECT_EQ((std::vector<std::size_t>{0, 1}), cache_reclaimer_->PrepareFairExecutionOrder("deleted_group", plan));
+    cache_reclaimer_->fair_rotation_by_group_[group->name()].instance_ids = {"b", "a"};
+    EXPECT_EQ((std::vector<std::string>{"a", "b"}), FairRotationOrder("deleted_group"));
+
+    cache_reclaimer_->PruneFairRotationStates({group, nullptr});
+    EXPECT_EQ(1, cache_reclaimer_->fair_rotation_by_group_.size());
+    EXPECT_EQ((std::vector<std::string>{"b", "a"}), FairRotationOrder(group->name()));
+    EXPECT_TRUE(FairRotationOrder("deleted_group").empty());
+    cache_reclaimer_->PruneFairRotationStates({});
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationServesSmallInstanceAcrossCreditLimitedRounds) {
+    const auto group = SetUpFairRotationScenario();
+    const std::vector<std::string> expected_order = {"large", "medium", "small", "large", "medium", "small"};
+    for (std::size_t round = 0; round < expected_order.size(); ++round) {
+        const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+        EXPECT_TRUE(result.water_level_exceeded);
+        EXPECT_TRUE(result.made_progress);
+        const auto requests = SubmittedDelRequestsSnapshot();
+        ASSERT_EQ(round + 1, requests.size());
+        EXPECT_EQ(expected_order[round], requests.back().instance_id);
+        EXPECT_EQ(50,
+                  cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                      group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+        EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+
+        const auto waiting_order = FairRotationOrder(group->name());
+        for (int idle_round = 0; idle_round < 2; ++idle_round) {
+            const auto idle = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+            EXPECT_FALSE(idle.water_level_exceeded);
+            EXPECT_FALSE(idle.made_progress);
+            EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+            EXPECT_EQ(round + 1, SampleReclaimRequestsSnapshot().size());
+        }
+        // Clearing in-flight credit exposes the same pressure without changing usage ranks.
+        CompleteSubmittedDelete(round, {ErrorCode::EC_OK, ""});
+        cache_reclaimer_->HandleDelRes();
+    }
+    EXPECT_EQ(6, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+    EXPECT_EQ(4, cache_reclaimer_->get_cache_reclaimer_fair_rotation_resume_count_metrics());
+    EXPECT_EQ(6, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationUsesFreshBudgetWithoutResettingWaitingOrder) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+
+    // The waiting medium Instance now has a different budget, not last round's 90 samples.
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 200);
+    meta_indexers_by_instance.at("medium")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 700);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    auto samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, samples.size());
+    EXPECT_EQ(std::make_pair(std::string{"medium"}, std::int64_t{100}), samples.back());
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+
+    // Swapping the large ranks again cannot move the still-waiting small Instance back.
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 700);
+    meta_indexers_by_instance.at("medium")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 200);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(3, samples.size());
+    EXPECT_EQ(std::make_pair(std::string{"small"}, std::int64_t{30}), samples.back());
+    ASSERT_EQ(3, SubmittedDelRequestCount());
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationContinuesMultipleItemsAndResumesAtNextItem) {
+    const auto group = SetUpFairRotationScenario();
+    group->quota_.set_capacity(1150); // 80-byte gap requires two 50-byte requests.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("large", requests[0].instance_id);
+    EXPECT_EQ("medium", requests[1].instance_id);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(4, requests.size());
+    EXPECT_EQ("small", requests[2].instance_id);
+    EXPECT_EQ("large", requests[3].instance_id);
+    EXPECT_EQ((std::vector<std::string>{"medium", "small", "large"}), FairRotationOrder(group->name()));
+    EXPECT_EQ(4, SampleReclaimRequestsSnapshot().size());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationSamplingFailureYieldsToWaitingInstances) {
+    const auto group = SetUpFairRotationScenario();
+    sample_reclaim_results = {ErrorCode::EC_ERROR, ErrorCode::EC_OK};
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, samples.size());
+    EXPECT_EQ("large", samples[0].first);
+    EXPECT_EQ("medium", samples[1].first);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().front().instance_id);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationRejectedRequestYieldsWithoutAddingCredit) {
+    const auto group = SetUpFairRotationScenario();
+    spe_submit_accepted_by_instance["large"] = false;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto attempts = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, attempts.size());
+    EXPECT_EQ("large", attempts[0].instance_id);
+    EXPECT_EQ("medium", attempts[1].instance_id);
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(50,
+              cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                  group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationEmptyVictimsAreBoundedAndDoNotCountAsProgress) {
+    const auto group = SetUpFairRotationScenario();
+    batch_get_loc_out_maps = {CacheLocationMap{}};
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(3, SampleReclaimRequestsSnapshot().size());
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+    EXPECT_EQ((std::vector<std::string>{"large", "medium", "small"}), FairRotationOrder(group->name()));
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationRetainsPositionWhenPlanningCannotProceed) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    const auto waiting_order = FairRotationOrder(group->name());
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 0));
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 0));
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+    list_ins_info_result = ErrorCode::EC_ERROR;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    EXPECT_EQ(1, SampleReclaimRequestsSnapshot().size());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+
+    list_ins_info_result = ErrorCode::EC_OK;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationDropsZeroBudgetAndAppendsReeligibleInstance) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 699);
+    meta_indexers_by_instance.at("small")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::string>{"large", "medium"}), FairRotationOrder(group->name()));
+    ASSERT_EQ(2, SampleReclaimRequestsSnapshot().size());
+    EXPECT_EQ("medium", SampleReclaimRequestsSnapshot().back().first);
+
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 600);
+    meta_indexers_by_instance.at("small")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::string>{"medium", "small", "large"}), FairRotationOrder(group->name()));
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationPausePreservesPositionAndStopClearsOnlyQueue) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto waiting_order = FairRotationOrder(group->name());
+    const auto credited_bytes = cache_reclaimer_->credited_delete_bytes_by_group_;
+    const auto pending_count = cache_reclaimer_->pending_locations_.size();
+    cache_reclaimer_->Pause();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    cache_reclaimer_->Resume();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().back().instance_id);
+    cache_reclaimer_->Stop();
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationPolicySwitchResetsQueueWithoutResettingCredit) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto credited_bytes = cache_reclaimer_->credited_delete_bytes_by_group_;
+    const auto predicted_keys = cache_reclaimer_->predicted_deleted_keys_by_group_;
+    const auto pending_count = cache_reclaimer_->pending_locations_.size();
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(predicted_keys, cache_reclaimer_->predicted_deleted_keys_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
 TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {
     cache_reclaimer_->job_state_flag_ = true;
     spe_submit_auto_complete = false;
@@ -4277,6 +4607,13 @@ TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenTriggerScopeChanges) {
     EXPECT_FALSE(current_water_level->CheckStorageTypeWaterLevelExceed());
     EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
     EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+    EXPECT_EQ((std::vector<std::string>{"b", "a"}), FairRotationOrder(group->name()));
+
+    // The next plan uses Group bytes instead of type bytes, without resetting the waiter.
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("b", requests.back().instance_id);
 }
 
 TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenStorageTypeBecomesExceeded) {
@@ -4628,6 +4965,7 @@ TEST_F(CacheReclaimerTest, TestBudgetPolicySwitchAppliesNextRoundAndPreservesInF
     }
     EXPECT_EQ(100, fair_sampling["large"]);
     EXPECT_EQ(40, fair_sampling["small"]);
+    EXPECT_EQ((std::vector<std::string>{"large", "small"}), FairRotationOrder(group->name()));
 
     const std::uint64_t delete_handler_count = cache_reclaimer_->pending_delete_handler_count_;
     const std::size_t pending_location_count = cache_reclaimer_->pending_locations_.size();
@@ -4647,6 +4985,7 @@ TEST_F(CacheReclaimerTest, TestBudgetPolicySwitchAppliesNextRoundAndPreservesInF
     EXPECT_EQ(pending_location_count, cache_reclaimer_->pending_locations_.size());
     EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
     EXPECT_EQ(predicted_keys, cache_reclaimer_->predicted_deleted_keys_by_group_);
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
 }
 
 TEST_F(CacheReclaimerTest, TestFixedPerInstanceBudgetPolicyUsesLegacyOrderAndBudget) {

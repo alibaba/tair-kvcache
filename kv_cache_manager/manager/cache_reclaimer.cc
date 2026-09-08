@@ -127,6 +127,8 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_plan_truncated_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_plan_truncated_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_item_capped_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_rotation_resume_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(fair_rotation_advance_count);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -643,6 +645,8 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_plan_truncated_instance_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_item_capped_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_resume_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_advance_count);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
@@ -703,6 +707,8 @@ void CacheReclaimer::Stop() noexcept {
     if (reclaimer_.joinable()) {
         reclaimer_.join();
     }
+
+    fair_rotation_by_group_.clear();
 
     KVCM_LOG_DEBUG("cache reclaimer stop OK");
 }
@@ -1095,6 +1101,9 @@ void CacheReclaimer::ReclaimCron() noexcept {
             sleep_interval_ms = sleep_interval_ms_.load();
             continue;
         }
+
+        // Only a successful full Registry snapshot can retire a Group's rotation state.
+        PruneFairRotationStates(instance_groups);
 
         bool made_progress = false;
         bool needs_no_progress_backoff = false;
@@ -2520,6 +2529,68 @@ bool CacheReclaimer::BuildFairReclaimPlan(const RequestContext *request_context,
     return true;
 }
 
+std::vector<std::size_t> CacheReclaimer::PrepareFairExecutionOrder(const std::string &instance_group,
+                                                                   const FairReclaimPlan &plan) noexcept {
+    if (plan.items.empty()) {
+        return {};
+    }
+
+    std::unordered_map<std::string, std::size_t> remaining_indices;
+    remaining_indices.reserve(plan.items.size());
+    for (std::size_t i = 0; i != plan.items.size(); ++i) {
+        remaining_indices.emplace(plan.items[i].instance_id, i);
+    }
+
+    auto &rotation = fair_rotation_by_group_[instance_group];
+    std::deque<std::string> next_ids;
+    std::vector<std::size_t> execution_order;
+    execution_order.reserve(plan.items.size());
+
+    // Keep waiting IDs in their previous order, even when usage rankings change.
+    // Missing/zero-budget IDs are absent from the new plan and are discarded here.
+    for (auto &instance_id : rotation.instance_ids) {
+        const auto it = remaining_indices.find(instance_id);
+        if (it == remaining_indices.end()) {
+            continue;
+        }
+        execution_order.push_back(it->second);
+        next_ids.push_back(std::move(instance_id));
+        remaining_indices.erase(it);
+    }
+
+    // First use follows the plan's usage order; new eligible IDs join behind waiters.
+    for (std::size_t i = 0; i != plan.items.size(); ++i) {
+        const auto &instance_id = plan.items[i].instance_id;
+        if (remaining_indices.erase(instance_id) != 0) {
+            execution_order.push_back(i);
+            next_ids.push_back(instance_id);
+        }
+    }
+    rotation.instance_ids = std::move(next_ids);
+    return execution_order;
+}
+
+void CacheReclaimer::PruneFairRotationStates(
+    const std::vector<std::shared_ptr<const InstanceGroup>> &instance_groups) noexcept {
+    if (fair_rotation_by_group_.empty()) {
+        return;
+    }
+    std::unordered_set<std::string> active_groups;
+    active_groups.reserve(instance_groups.size());
+    for (const auto &instance_group : instance_groups) {
+        if (instance_group != nullptr) {
+            active_groups.insert(instance_group->name());
+        }
+    }
+    for (auto it = fair_rotation_by_group_.begin(); it != fair_rotation_by_group_.end();) {
+        if (active_groups.find(it->first) == active_groups.end()) {
+            it = fair_rotation_by_group_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 CacheReclaimer::ReclaimResult
 CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
                                   const std::shared_ptr<const InstanceGroup> &instance_group) noexcept {
@@ -2557,6 +2628,7 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
 
     const auto budget_policy = reclaim_strategy->instance_reclaim_budget_policy();
     if (budget_policy == InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
+        fair_rotation_by_group_.erase(ins_gr);
         result = TryReclaimOnGroupLegacy(request_context, instance_group, reclaim_strategy, instance_infos);
     } else {
         if (budget_policy != InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL) {
@@ -2684,6 +2756,12 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
         return result;
     }
 
+    const auto execution_order = PrepareFairExecutionOrder(ins_gr, plan);
+    if (execution_order.empty()) {
+        return result;
+    }
+    auto &rotation = fair_rotation_by_group_.at(ins_gr);
+
     std::uint64_t planned_batch_count = 0;
     std::uint64_t planned_sample_count = 0;
     const std::uint64_t capped_item_count = static_cast<std::uint64_t>(plan.capped_item_count);
@@ -2753,7 +2831,8 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
     std::size_t sampled_instance_count = 0;
     std::size_t submitted_instance_count = 0;
     std::shared_ptr<WaterLevelExceed> water_level_before_next_item;
-    for (std::size_t i = 0; i != plan.items.size(); ++i) {
+    for (std::size_t i = 0; i != execution_order.size(); ++i) {
+        const auto &item = plan.items[execution_order[i]];
         auto water_level_exceed =
             water_level_before_next_item != nullptr ? std::move(water_level_before_next_item) : read_water_level();
         if (water_level_exceed == nullptr) {
@@ -2761,18 +2840,27 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
             break;
         }
         if (!IsTriggerReclaiming(water_level_exceed) || !plan_scope_still_active(*water_level_exceed)) {
-            const std::size_t remaining = plan.items.size() - i;
+            const std::size_t remaining = execution_order.size() - i;
             METRICS_(cache_reclaimer, fair_plan_truncated_count) += 1;
             METRICS_(cache_reclaimer, fair_plan_truncated_instance_count) += remaining;
             LOG_WITH_GR(DEBUG,
                         "fair plan stopped before instance [%s], water level satisfied or trigger scope "
                         "changed, remaining items [%zu]",
-                        plan.items[i].instance_id.c_str(),
+                        item.instance_id.c_str(),
                         remaining);
             break;
         }
 
-        const auto &item = plan.items[i];
+        if (i == 0) {
+            LOG_WITH_GR(DEBUG,
+                        "fair rotation starts at instance [%s], largest weight instance [%s], planned items [%zu]",
+                        item.instance_id.c_str(),
+                        plan.items.front().instance_id.c_str(),
+                        execution_order.size());
+            if (execution_order.front() != 0) {
+                METRICS_(cache_reclaimer, fair_rotation_resume_count) += 1;
+            }
+        }
         ++sampled_instance_count;
         const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
         switch (reclaim_strategy->reclaim_policy()) {
@@ -2795,13 +2883,21 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
                                                       item.batch_size);
         METRICS_(cache_reclaimer, reclaim_job_duration_us) =
             static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
+
+        // An attempt consumes the scheduling turn, not a guaranteed deletion.
+        // Failures and empty candidates must also let the next Instance run.
+        auto attempted_id = std::move(rotation.instance_ids.front());
+        rotation.instance_ids.pop_front();
+        rotation.instance_ids.push_back(std::move(attempted_id));
+        METRICS_(cache_reclaimer, fair_rotation_advance_count) += 1;
+
         result.made_progress = result.made_progress || submitted;
         if (!submitted) {
             continue;
         }
 
         ++submitted_instance_count;
-        if (i + 1 == plan.items.size()) {
+        if (i + 1 == execution_order.size()) {
             continue;
         }
         water_level_before_next_item = read_water_level();
@@ -2811,7 +2907,7 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
         }
         if (!IsTriggerReclaiming(water_level_before_next_item) ||
             !plan_scope_still_active(*water_level_before_next_item)) {
-            const std::size_t remaining = plan.items.size() - i - 1;
+            const std::size_t remaining = execution_order.size() - i - 1;
             METRICS_(cache_reclaimer, fair_plan_truncated_count) += 1;
             METRICS_(cache_reclaimer, fair_plan_truncated_instance_count) += remaining;
             LOG_WITH_GR(DEBUG,
@@ -2826,6 +2922,11 @@ CacheReclaimer::TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &req
 
     METRICS_(cache_reclaimer, fair_sampled_instance_count) = static_cast<double>(sampled_instance_count);
     METRICS_(cache_reclaimer, fair_submitted_instance_count) = static_cast<double>(submitted_instance_count);
+    LOG_WITH_GR(DEBUG,
+                "fair rotation finished, attempted/submitted instances [%zu/%zu], next instance [%s]",
+                sampled_instance_count,
+                submitted_instance_count,
+                rotation.instance_ids.front().c_str());
     return result;
 }
 

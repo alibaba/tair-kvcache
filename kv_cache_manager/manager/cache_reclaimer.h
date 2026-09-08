@@ -503,6 +503,14 @@ private:
         std::vector<FairReclaimPlanItem> items;
     };
 
+    struct FairRotationState {
+        // IDs only: budgets and InstanceInfo are always taken from the current plan.
+        std::deque<std::string> instance_ids;
+    };
+
+    // Owned by the cron thread; Stop() may clear it after joining that thread.
+    std::map<std::string, FairRotationState> fair_rotation_by_group_;
+
     /**
      * @brief Calculate the group's WaterLevelExceed data
      *
@@ -635,6 +643,11 @@ private:
 
     [[nodiscard]] static const char *FairWeightDimensionName(FairWeightDimension dimension) noexcept;
 
+    [[nodiscard]] std::vector<std::size_t> PrepareFairExecutionOrder(const std::string &instance_group,
+                                                                     const FairReclaimPlan &plan) noexcept;
+
+    void PruneFairRotationStates(const std::vector<std::shared_ptr<const InstanceGroup>> &instance_groups) noexcept;
+
     void HandleDelRes() noexcept;
 
     /**
@@ -748,6 +761,8 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_plan_truncated_instance_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_item_capped_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_resume_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_advance_count)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us)

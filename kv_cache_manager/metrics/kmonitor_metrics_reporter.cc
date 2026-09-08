@@ -146,6 +146,8 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, fair_plan_truncated_instance_count);
     DECLARE_METRICS(cache_reclaimer, fair_item_capped_count);
     DECLARE_METRICS(cache_reclaimer, fair_sampling_size_normalized_count);
+    DECLARE_METRICS(cache_reclaimer, fair_rotation_resume_count);
+    DECLARE_METRICS(cache_reclaimer, fair_rotation_advance_count);
 
     DECLARE_METRICS(cache_reclaimer, reclaim_cron_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_quota_duration_us);
@@ -434,6 +436,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_plan_truncated_instance_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_item_capped_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_sampling_size_normalized_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, fair_rotation_resume_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, fair_rotation_advance_count);
 
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_quota_duration_us);
@@ -758,6 +762,8 @@ void KmonitorMetricsReporter::ReportInterval() {
         std::uint64_t fair_plan_truncated_instance_count_v;
         std::uint64_t fair_item_capped_count_v;
         std::uint64_t fair_sampling_size_normalized_count_v;
+        std::uint64_t fair_rotation_resume_count_v;
+        std::uint64_t fair_rotation_advance_count_v;
 
         double reclaim_cron_duration_us_v;
         double reclaim_quota_duration_us_v;
@@ -809,6 +815,8 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, fair_plan_truncated_instance_count, fair_plan_truncated_instance_count_v);
         GET_METRICS_(cr, cache_reclaimer, fair_item_capped_count, fair_item_capped_count_v);
         GET_METRICS_(cr, cache_reclaimer, fair_sampling_size_normalized_count, fair_sampling_size_normalized_count_v);
+        GET_METRICS_(cr, cache_reclaimer, fair_rotation_resume_count, fair_rotation_resume_count_v);
+        GET_METRICS_(cr, cache_reclaimer, fair_rotation_advance_count, fair_rotation_advance_count_v);
 
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
@@ -867,6 +875,9 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer,
                        fair_sampling_size_normalized_count,
                        static_cast<double>(fair_sampling_size_normalized_count_v));
+        REPORT_METRICS(cache_reclaimer, fair_rotation_resume_count, static_cast<double>(fair_rotation_resume_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, fair_rotation_advance_count, static_cast<double>(fair_rotation_advance_count_v));
 
         REPORT_METRICS(cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
