@@ -370,8 +370,14 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
                 write_session_id = result["write_session_id"]
                 block_mask = result["block_mask"]
             except Exception as e:
-                logger.error(f"get_cache_location {e=}, {get_request=}")
-                len_locations = 0
+                # Best-effort: skip saving this request (mirrors the error
+                # handling of get_num_new_matched_tokens) instead of crashing
+                # the scheduler loop.
+                logger.error(
+                    f"start_write_cache failed for request {req.request_id}, "
+                    f"skip saving: {e=}"
+                )
+                continue
 
             save_indices = self._parse_block_mask(block_mask, len(block_keys))
             assert len(store_locations) == len(save_indices)
