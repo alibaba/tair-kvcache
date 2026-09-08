@@ -33,11 +33,15 @@ only -- correctness never depends on it.
 
 import threading
 import time
+from concurrent.futures import Executor
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.logger import logger
+
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
 
 QUERY_TYPE = "QT_PREFIX_MATCH"
 
@@ -58,7 +62,8 @@ class _Query:
 
     key: QueryCacheKey
     version: int = 0
-    locations: list = None  # None until the manager answered
+    # None until the manager answered.
+    locations: Optional[List[dict]] = None
     ask_time: float = 0.0  # monotonic clock, at query issue
 
 
@@ -75,11 +80,11 @@ class LocationQueryManager:
     def __init__(
         self,
         manager_client: KvCacheManagerClient,
-        http_executor,
+        http_executor: Executor,
         instance_id: str,
         async_get_cache_location: bool,
         max_answer_age_s: float = 1.0,
-    ):
+    ) -> None:
         self._manager_client = manager_client
         self._http_executor = http_executor
         self._instance_id = instance_id
@@ -91,19 +96,23 @@ class LocationQueryManager:
         # Hits refused for age and re-fetched.
         self.stale_supersede_count = 0
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         pass
 
     @staticmethod
-    def _key(request, computed_blocks: int) -> QueryCacheKey:
+    def _key(request: "Request", computed_blocks: int) -> QueryCacheKey:
         return QueryCacheKey(
             req_id=request.request_id,
             query_type=QUERY_TYPE,
-            token_length=len(request.prompt_token_ids),
+            # vLLM types prompt_token_ids as Optional; a live Request
+            # always carries its prompt.
+            token_length=len(request.prompt_token_ids),  # ty: ignore[invalid-argument-type]
             computed_blocks=computed_blocks,
         )
 
-    def _fetch_from_manager(self, request, computed_blocks: int):
+    def _fetch_from_manager(
+        self, request: "Request", computed_blocks: int
+    ) -> List[dict]:
         """Run the actual GetCacheLocation call (http thread or inline)."""
         get_request = {
             "trace_id": request.request_id,
@@ -117,8 +126,8 @@ class LocationQueryManager:
         logger.debug("get_kvcache_location result: %s", result)
         return result["locations"]
 
-    def _query_async(self, request, key: QueryCacheKey, q: _Query) -> None:
-        def run():
+    def _query_async(self, request: "Request", key: QueryCacheKey, q: _Query) -> None:
+        def run() -> None:
             try:
                 locations = self._fetch_from_manager(request, key.computed_blocks)
             except Exception as e:
@@ -149,7 +158,9 @@ class LocationQueryManager:
 
         self._http_executor.submit(run)
 
-    def get_locations_for_query(self, request, computed_blocks: int) -> Optional[list]:
+    def get_locations_for_query(
+        self, request: "Request", computed_blocks: int
+    ) -> Optional[List[dict]]:
         """Ask (or re-ask) for the request's external match at this offset.
 
         Returns the locations when a fresh answer is already cached for
@@ -208,7 +219,7 @@ class LocationQueryManager:
                 q.locations = locations
         return locations
 
-    def store_result(self, req_id: str, locations: list) -> None:
+    def store_result(self, req_id: str, locations: List[dict]) -> None:
         """Overwrite the cached answer (the match hook clamps it to a
         vLLM-safe prefix before the allocation consumes it). The slot is
         necessarily the query the hook just got its answer from: the hook
@@ -218,7 +229,7 @@ class LocationQueryManager:
             if q is not None:
                 q.locations = locations
 
-    def consume_locations(self, req_id: str) -> Optional[Tuple[list, int]]:
+    def consume_locations(self, req_id: str) -> Optional[Tuple[List[dict], int]]:
         """Pop the request's answered query: (locations, computed_blocks),
         or None when nothing is cached (no query was issued / still in
         flight / already consumed)."""

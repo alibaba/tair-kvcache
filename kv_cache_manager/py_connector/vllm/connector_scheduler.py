@@ -17,17 +17,19 @@ speak the vllm_common vocabulary.
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMsgSerializer,
     CoordinateMessage,
     SendBlockStartEvent,
     TpCoordinatorClient,
 )
+from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.location_query_manager import (
     LocationQueryManager,
 )
@@ -87,14 +89,14 @@ class ConnectorScheduler:
 
     def __init__(
         self,
-        extra_config,
+        extra_config: TairKvCacheConnectorExtraConfig,
         group_metas: List[GroupMeta],
         manager_block_size: int,
         vllm_block_size: int,
         tp_size: int,
-        manager_client,
+        manager_client: KvCacheManagerClient,
         coordinator_client: TpCoordinatorClient,
-    ):
+    ) -> None:
         self._extra_config = extra_config
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
@@ -130,7 +132,7 @@ class ConnectorScheduler:
         self._load_failed: set = set()
         self._load_attempted: set = set()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         self._location_query_manager.shutdown()
         self._http_executor.shutdown(wait=False)
 
@@ -148,7 +150,7 @@ class ConnectorScheduler:
         raise KeyError(f"no such transferred group: {group_idx}")
 
     def _state_complete_mask(
-        self, ledger: RequestLedger, manager_block_idxes
+        self, ledger: RequestLedger, manager_block_idxes: Sequence[int]
     ) -> List[bool]:
         """Per manager block: does *every* state group hold a real state?
 
@@ -351,7 +353,7 @@ class ConnectorScheduler:
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
-    ):
+    ) -> None:
         """First (or re-) allocation: record the ledger and ship the load.
 
         The block tables arrive here whole, once per allocation; increments
@@ -404,7 +406,7 @@ class ConnectorScheduler:
             )
         )
 
-    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         """Consume the worker's step output: mark requests whose external
         load failed, at request granularity.
 
@@ -561,7 +563,9 @@ class ConnectorScheduler:
                 self._http_executor.submit(
                     self.start_save_kvcache_async,
                     ledger.vllm_request.request_id,
-                    ledger.vllm_request.all_token_ids[
+                    # vLLM types all_token_ids as list[ConstantList | int];
+                    # at runtime it only ever holds ints.
+                    ledger.vllm_request.all_token_ids[  # ty: ignore[invalid-argument-type]
                         : target_save_num * self._manager_block_size
                     ],
                     target_save_num,
@@ -628,8 +632,12 @@ class ConnectorScheduler:
         self._location_query_manager.invalidate(req_id)
 
     def start_save_kvcache_async(
-        self, req_id, token_ids, target_save_num, state_complete_mask
-    ):
+        self,
+        req_id: str,
+        token_ids: List[int],
+        target_save_num: int,
+        state_complete_mask: List[bool],
+    ) -> None:
         """Ask the manager for write locations for a request's first
         ``target_save_num`` manager blocks.
 
@@ -735,7 +743,7 @@ class ConnectorScheduler:
                 SaveRequest(req_id, locations, need_block_idx, write_session_id)
             )
 
-    def handle_canceled_save_req(self):
+    def handle_canceled_save_req(self) -> None:
         with self._canceled_save_request_ids_lock:
             canceled = self._canceled_save_request_ids
             self._canceled_save_request_ids = []
@@ -753,7 +761,7 @@ class ConnectorScheduler:
             ):
                 self._retire_request(req_id)
 
-    def get_finished_count(self):
+    def get_finished_count(self) -> int:
         # Only rank0 reports finished requests.
         return 1
 

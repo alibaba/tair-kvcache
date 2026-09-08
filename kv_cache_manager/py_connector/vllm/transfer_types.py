@@ -103,7 +103,8 @@ class TransferPlan:
     hole means is the task's disposition logic (see data_transfer)."""
 
     group: TransferGroup
-    uris: List
+    # None where a block carries no data for this group's spec.
+    uris: List[Optional[str]]
     # Attention groups: flat token slots per manager block (gather/scatter).
     token_indices: Optional[List[List[int]]] = None
     # State groups: source/target state block id per manager block.

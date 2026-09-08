@@ -165,7 +165,7 @@ def batch_gather_kv_caches(
     kv_caches_ptrs_tensor: torch.Tensor,
     # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
     dst_tensor: torch.Tensor,
-    block_token_indices: List[int],  # List of token positions to gather
+    block_token_indices: List[List[int]],  # token slots per block
     dst_block_indices: List[int],  # List of dst block indices
     num_tokens_per_block: int,
     dim_size_per_token_per_layer: int,
@@ -310,7 +310,7 @@ def batch_scatter_kv_caches(
     kv_caches_ptrs_tensor: torch.Tensor,
     # Shape [block_num, num_layers * kv_num, num_tokens_per_block, dim_size_per_token_per_layer]
     src_tensor: torch.Tensor,  # 注意：src_tensor在PCIE连接的host DRAM上 (pinned memory)
-    block_token_indices: List[int],  # List of token positions to scatter to
+    block_token_indices: List[List[int]],  # token slots per block
     src_block_indices: List[int],  # List of src block indices
     num_tokens_per_block: int,
     dim_size_per_token_per_layer: int,

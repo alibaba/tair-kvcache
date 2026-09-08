@@ -8,8 +8,8 @@ and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -19,6 +19,9 @@ from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     KVLayout,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 # Spec group names advertised at registration and used per key in
 # start_write_cache. See build_spec_groups for the semantics.
@@ -107,7 +110,9 @@ class StateGroupMeta(GroupMeta):
     page_size_bytes: int = 0
 
 
-def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
+def parse_groups(
+    kv_cache_config: "KVCacheConfig", manager_block_size: int
+) -> List[GroupMeta]:
     """Derive the transferable GroupMeta list from vLLM's KVCacheConfig
     (https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/kv_cache_interface.py#L952:
     kv_cache_groups holds one KVCacheGroupSpec per block table, each with its
@@ -266,7 +271,7 @@ def _hybrid_external_load_supported() -> Optional[bool]:
     return "External KV connector is not verified yet" not in src
 
 
-def ensure_hybrid_supported(force: bool = False):
+def ensure_hybrid_supported(force: bool = False) -> None:
     """Fail fast with a clear message when a hybrid (mamba) model is served on
     a vLLM whose scheduler rejects external KV loads (vllm <= 0.22.x).
 

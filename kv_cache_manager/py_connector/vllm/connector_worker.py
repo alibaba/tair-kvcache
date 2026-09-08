@@ -11,28 +11,28 @@ shell.
 import copy
 import json
 import typing
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from kv_cache_manager.client.pybind import kvcm_py_client
+# kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
+from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     SaveContext,
     TpCoordinatorClient,
     TpCoordinatorServer,
 )
+from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     MultiResult,
     DataTransferManager,
     _get_device_module,
 )
-from kv_cache_manager.py_connector.vllm.metadata import (
-    FinishRequest,
-    TairKvCacheConnectorMetadata,
-)
+from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
@@ -50,7 +50,10 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
-    from vllm.attention import AttentionMetadata
+
+    # vllm.attention no longer exists in vLLM >= 0.26; kept for the older
+    # eras this connector supports.
+    from vllm.attention import AttentionMetadata  # ty: ignore[unresolved-import]
 
 
 class ConnectorWorker:
@@ -58,15 +61,15 @@ class ConnectorWorker:
 
     def __init__(
         self,
-        extra_config,
+        extra_config: TairKvCacheConnectorExtraConfig,
         group_metas: List[GroupMeta],
         manager_block_size: int,
         tp_size: int,
         host_ip: str,
-        manager_client,
+        manager_client: KvCacheManagerClient,
         coordinator_client: TpCoordinatorClient,
-        register_response: dict,
-    ):
+        register_response: Dict[str, Any],
+    ) -> None:
         self._extra_config = extra_config
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
@@ -82,7 +85,9 @@ class ConnectorWorker:
         self._finish_pending: set = set()
 
         self._tp_rank = get_tensor_model_parallel_rank()
-        self._device_mod = None
+        # torch device module (torch.cuda / torch.musa / ...), set in
+        # register_kv_caches; Any because the module surface is dynamic.
+        self._device_mod: Any = None
         port = extra_config.coordinator_base_port
         if self._tp_rank == 0:
             self._coordinator_server = TpCoordinatorServer(
@@ -142,8 +147,8 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # Storage config plumbing
     # ------------------------------------------------------------------ #
-    def parse_hf3fs_configs(self, storage_configs):
-        hf3fs_configs = []
+    def parse_hf3fs_configs(self, storage_configs: str) -> List[Dict[str, Any]]:
+        hf3fs_configs: List[Dict[str, Any]] = []
         storage_configs_json = json.loads(storage_configs)
         for storage_config in storage_configs_json:
             if storage_config["type"] == "vcns_hf3fs":
@@ -166,7 +171,7 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # KV cache registration
     # ------------------------------------------------------------------ #
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(self, kv_caches: Dict[str, Any]) -> None:
         self._kv_caches = kv_caches
         first_attn = next(
             kv_caches[name]
@@ -183,7 +188,11 @@ class ConnectorWorker:
             if isinstance(meta, AttentionGroupMeta):
                 groups.append(self._build_attention_group(meta, kv_caches))
             else:
-                groups.append(self._build_state_group(meta, kv_caches))
+                # parse_groups only produces attention/state GroupMetas;
+                # ty cannot infer that the complement is StateGroupMeta.
+                groups.append(
+                    self._build_state_group(meta, kv_caches)  # ty: ignore[invalid-argument-type]
+                )
 
         self._kvcache_info = KVCacheInfo(
             tp_rank=self._tp_rank,
@@ -209,7 +218,7 @@ class ConnectorWorker:
         )
 
     def _build_attention_group(
-        self, meta: AttentionGroupMeta, kv_caches
+        self, meta: AttentionGroupMeta, kv_caches: Dict[str, Any]
     ) -> AttentionTransferGroup:
         spec = self._self_spec_names[meta.group_idx]
         tensors = [kv_caches[name] for name in meta.layer_names]
@@ -266,7 +275,9 @@ class ConnectorWorker:
             block_stride=block_stride,
         )
 
-    def _build_state_group(self, meta: StateGroupMeta, kv_caches) -> StateTransferGroup:
+    def _build_state_group(
+        self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
+    ) -> StateTransferGroup:
         # Mamba/state group: each layer is a list[Tensor] sharing one storage;
         # rebuild a (num_blocks, page_size_bytes) byte view for opaque copy.
         spec = self._self_spec_names[meta.group_idx]
@@ -305,7 +316,10 @@ class ConnectorWorker:
     # Block index translation
     # ------------------------------------------------------------------ #
     def _attn_token_indices(
-        self, group: AttentionTransferGroup, manager_block_idxes, block_table
+        self,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        block_table: List[int],
     ) -> List[List[int]]:
         """Map manager blocks to flat token slots of one attention group.
 
@@ -335,7 +349,10 @@ class ConnectorWorker:
         return out
 
     def _state_block_ids(
-        self, group: StateTransferGroup, manager_block_idxes, block_table
+        self,
+        group: StateTransferGroup,
+        manager_block_idxes: Sequence[int],
+        block_table: List[int],
     ) -> List[int]:
         """Map manager blocks to block ids of a state (mamba) group.
 
@@ -363,7 +380,16 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # Load / save
     # ------------------------------------------------------------------ #
-    def _iter_task_chunks(self, plans: List[TransferPlan], per_task: int):
+    def _iter_task_chunks(
+        self, plans: List[TransferPlan], per_task: int
+    ) -> Iterator[
+        Tuple[
+            TransferGroup,
+            List[Optional[str]],
+            Optional[List[List[int]]],
+            Optional[List[int]],
+        ]
+    ]:
         """Slice each plan's blocks into per-task chunks.
 
         Pure generator: the task index is the consumer's concern (enumerate
@@ -382,7 +408,10 @@ class ConnectorWorker:
                 )
 
     def _plan_group_transfers(
-        self, locations, manager_block_idxes, block_ids_per_group
+        self,
+        locations: List[Dict[str, Any]],
+        manager_block_idxes: Sequence[int],
+        block_ids_per_group: List[List[int]],
     ) -> Optional[List[TransferPlan]]:
         """Build the per-group TransferPlans for a set of manager blocks.
 
@@ -424,18 +453,22 @@ class ConnectorWorker:
                     )
                 )
             else:
+                # KVCacheInfo groups are only attention or state groups;
+                # ty cannot infer that the complement is StateTransferGroup.
                 plans.append(
                     TransferPlan(
                         group=group,
                         uris=uris,
                         block_ids=self._state_block_ids(
-                            group, manager_block_idxes, block_table
+                            group,  # ty: ignore[invalid-argument-type]
+                            manager_block_idxes,
+                            block_table,
                         ),
                     )
                 )
         return plans
 
-    def _check_block_table_covers(self, block_ids_per_group) -> None:
+    def _check_block_table_covers(self, block_ids_per_group: List[List[int]]) -> None:
         """``block_ids_per_group`` is indexed by the raw vLLM group index --
         a guarantee vLLM provides today
         (https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/core/sched/output.py,
@@ -455,7 +488,7 @@ class ConnectorWorker:
         self,
         forward_context: "ForwardContext",
         meta: TairKvCacheConnectorMetadata,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         for load_req in meta.to_load_requests:
             if not load_req.need_load_locations:
@@ -546,11 +579,11 @@ class ConnectorWorker:
         layer_name: str,
         kv_layer: torch.Tensor,
         attn_metadata: "AttentionMetadata",
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         pass
 
-    def wait_for_save(self, meta: TairKvCacheConnectorMetadata):
+    def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
         if not meta.to_save_requests:
             return
         ready_event = self._device_mod.Event()
@@ -592,7 +625,9 @@ class ConnectorWorker:
                     self._pending_saves.get(save_req.req_id, 0) + 1
                 )
 
-    def on_save_finished(self, write_session_id: str, save_context: SaveContext):
+    def on_save_finished(
+        self, write_session_id: str, save_context: SaveContext
+    ) -> None:
         for block_idx in range(len(save_context.locations)):
             fully_saved = all(
                 save_context.result_per_rank[rank][block_idx]
