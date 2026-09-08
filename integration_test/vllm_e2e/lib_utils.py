@@ -65,6 +65,29 @@ def is_hybrid_model(model_path: str) -> bool:
     )
 
 
+def scenario_tp_size(default: int = 1) -> int:
+    """TP size for a scenario: KVCM_E2E_TP overrides the per-scenario default.
+
+    Models too large for a single GPU (e.g. GLM-4.7-Flash on 24 GB cards, even
+    fp8-quantized) run every scenario at tp=2 via this knob instead of editing
+    each scenario file."""
+    return int(os.environ.get("KVCM_E2E_TP", "") or default)
+
+
+def is_mla_model(model_path: str) -> bool:
+    """Detect an MLA model from its config (kv_lora_rank is the defining
+    knob -- vLLM's own is_deepseek_mla check keys on it for every MLA
+    family). Used to stop the harness from forcing the FLASH_ATTN backend,
+    which has no MLA implementation and would abort engine init."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+    except Exception:
+        return False
+    text_cfg = cfg.get("text_config", cfg)
+    return "kv_lora_rank" in text_cfg
+
+
 # --------------------------------------------------------------------------- #
 # Paths / binaries
 # --------------------------------------------------------------------------- #
@@ -274,8 +297,10 @@ def wait_for_captures(capture_dir: str, kind: str, expected: int,
         f"timed out waiting for {kind} captures: got {n}, want {expected}")
 
 
-def compare_captures(capture_dir: str, tp_size: int) -> dict:
+def compare_captures(capture_dir: str) -> dict:
     """Compare loaded captures against reference captures.
+
+    Capture file names carry the tp rank, so no tp_size is needed.
 
     Every block that was *loaded* from KVCM must correspond to a *reference*
     capture (same tp rank + token content) with matching KV data. The direction

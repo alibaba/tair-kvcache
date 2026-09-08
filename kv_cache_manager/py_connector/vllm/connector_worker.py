@@ -231,7 +231,7 @@ class ConnectorWorker:
         # (num_blocks, kernel_block_size, heads, content_dim); everything
         # below is layout-independent. Split-K/V layouts (vllm <= 0.25.x)
         # yield two views (= two transfer pointers) per layer, the packed
-        # layout (vllm >= 0.26.0) yields one.
+        # layout (vllm >= 0.26.0) and the MLA latent cache yield one.
         ref_views, kv_layout = attn_kv_views(ref)
         view = ref_views[0]
         kernel_block_size = view.shape[1]

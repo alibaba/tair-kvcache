@@ -102,7 +102,7 @@ class TestMultiTurn(unittest.TestCase):
             # And the loaded decode-block KV must verify.
             wait_for_captures(env.capture_dir, "loaded",
                               expected=shared_blocks, timeout=180)
-            report = compare_captures(env.capture_dir, tp_size=1)
+            report = compare_captures(env.capture_dir)
             assert_report_ok(report, min_matched=shared_blocks)
         finally:
             env.stop()
