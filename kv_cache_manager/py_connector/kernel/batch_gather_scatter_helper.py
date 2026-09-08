@@ -30,14 +30,14 @@ on AttentionTransferGroup.kv_layout; the GPU test in test/kernel checks
 both modes element-wise against naive torch indexing.
 """
 
-from typing import List, Optional, Union
+from typing import Any, List
 
 import torch
 import triton
 import triton.language as tl
 
 
-def pytorch_dtype_to_triton_dtype(torch_dtype):
+def pytorch_dtype_to_triton_dtype(torch_dtype: torch.dtype) -> Any:
     """
     Converts a PyTorch dtype to a Triton language dtype.
     """
@@ -66,10 +66,10 @@ def pytorch_dtype_to_triton_dtype(torch_dtype):
 
 @triton.jit
 def kv_cache_batch_gather_kernel(
-    kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers * kv_count]
-    dst_ptr,  # 输出缓冲区 (pinned host memory)
-    block_token_indices_ptr,  # [total_blocks, num_tokens_per_block]
-    dst_block_indices_ptr,  # [total_blocks]
+    kv_cache_ptrs_ptr: torch.Tensor,  # 指针数组基址 [num_layers * kv_count]
+    dst_ptr: torch.Tensor,  # 输出缓冲区 (pinned host memory)
+    block_token_indices_ptr: torch.Tensor,  # [total_blocks, num_tokens_per_block]
+    dst_block_indices_ptr: torch.Tensor,  # [total_blocks]
     total_blocks: int,  # 需要处理的总block数
     NUM_TOKENS_PER_BLOCK: tl.constexpr,
     NUM_DIMS_PER_TOKEN: tl.constexpr,
@@ -79,7 +79,7 @@ def kv_cache_batch_gather_kernel(
     kv_stride: tl.constexpr = 0,  # stride between K and V (for V pointers)
     block_stride: tl.constexpr = 0,  # stride between blocks (0 = use flat indexing)
     local_block_size: tl.constexpr = 0,  # actual block size in tensor (0 = use NUM_TOKENS_PER_BLOCK)
-):
+) -> None:
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
 
     # Determine if using strided layout
@@ -173,7 +173,7 @@ def batch_gather_kv_caches(
     kv_stride: int = 0,  # stride between K and V (for V pointers)
     block_stride: int = 0,  # stride between blocks (0 = use flat indexing)
     local_block_size: int = 0,  # actual block size in tensor (0 = use num_tokens_per_block)
-):
+) -> None:
     # 配置参数
     total_blocks = len(dst_block_indices)
     total_kv_caches_ptr = kv_caches_ptrs_tensor.size(0)
@@ -210,10 +210,10 @@ def batch_gather_kv_caches(
 
 @triton.jit
 def kv_cache_batch_scatter_kernel(
-    kv_cache_ptrs_ptr,  # 指针数组基址 [num_layers * kv_count]
-    src_ptr,  # 源缓冲区 (pinned host memory)
-    block_token_indices_ptr,  # [total_blocks, num_tokens_per_block]
-    src_block_indices_ptr,  # [total_blocks]
+    kv_cache_ptrs_ptr: torch.Tensor,  # 指针数组基址 [num_layers * kv_count]
+    src_ptr: torch.Tensor,  # 源缓冲区 (pinned host memory)
+    block_token_indices_ptr: torch.Tensor,  # [total_blocks, num_tokens_per_block]
+    src_block_indices_ptr: torch.Tensor,  # [total_blocks]
     total_blocks: int,  # 需要处理的总block数
     NUM_TOKENS_PER_BLOCK: tl.constexpr,
     NUM_DIMS_PER_TOKEN: tl.constexpr,
@@ -223,7 +223,7 @@ def kv_cache_batch_scatter_kernel(
     kv_stride: tl.constexpr = 0,  # stride between K and V (for V pointers)
     block_stride: tl.constexpr = 0,  # stride between blocks (0 = use flat indexing)
     local_block_size: tl.constexpr = 0,  # actual block size in tensor (0 = use NUM_TOKENS_PER_BLOCK)
-):
+) -> None:
     NUM_DIMS_PER_BLOCK = NUM_TOKENS_PER_BLOCK * NUM_DIMS_PER_TOKEN
 
     # Determine if using strided layout
@@ -318,7 +318,7 @@ def batch_scatter_kv_caches(
     kv_stride: int = 0,  # stride between K and V (for V pointers)
     block_stride: int = 0,  # stride between blocks (0 = use flat indexing)
     local_block_size: int = 0,  # actual block size in tensor (0 = use num_tokens_per_block)
-):
+) -> None:
     # 配置参数
     total_blocks = len(src_block_indices)
     total_kv_caches_ptr = kv_caches_ptrs_tensor.size(0)

@@ -9,3 +9,10 @@
 [environment]
 extra-paths = ["../.."]
 python = "../../.venv"
+
+# Triton kernels: ty cannot model the @triton.jit DSL -- constexpr
+# parameters, their defaults, and launch options such as num_warps all
+# surface as argument-type noise. Suppress only those rule classes here.
+[[overrides]]
+include = ["kernel/**"]
+rules = { invalid-argument-type = "ignore", invalid-parameter-default = "ignore", unknown-argument = "ignore" }

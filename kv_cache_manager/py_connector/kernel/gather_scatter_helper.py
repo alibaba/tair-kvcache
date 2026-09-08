@@ -1,24 +1,24 @@
-from typing import List, Optional, Union
+from typing import List, Tuple
+
 import threading
 
 import torch
 import triton
 import triton.language as tl
-from triton.language import static_print
 
 
 @triton.jit
 def kv_cache_scatter_kernel(
     # Pointers to KV cache tensors (flattened into one array)
-    kv_cache_ptrs_ptr,  # pointer to array of pointers (size num_layers)
-    source_ptr,  # pointer to source tensor (num_layers, 2, num_tokens, hidden_size)
-    token_indices_ptr,  # pointer to token indices
-    num_tokens_in_block,  # length of token_indices
-    hidden_size,  # hidden dimension size
-    total_token_in_kvcache,  # sequence length in KV cache
-    num_layers,  # number of layers
+    kv_cache_ptrs_ptr: torch.Tensor,  # pointer to array of pointers (size num_layers)
+    source_ptr: torch.Tensor,  # pointer to source tensor (num_layers, 2, num_tokens, hidden_size)
+    token_indices_ptr: torch.Tensor,  # pointer to token indices
+    num_tokens_in_block: int,  # length of token_indices
+    hidden_size: int,  # hidden dimension size
+    total_token_in_kvcache: int,  # sequence length in KV cache
+    num_layers: int,  # number of layers
     BLOCK_SIZE: tl.constexpr,
-):
+) -> None:
     # Get the current program's layer index and token position
     layer_idx = tl.program_id(0)
     token_pos = tl.program_id(1)
@@ -65,15 +65,15 @@ def kv_cache_scatter_kernel(
 @triton.jit
 def kv_cache_gather_kernel(
     # Pointers to KV cache tensors (flattened into one array)
-    kv_cache_ptrs_ptr,  # pointer to array of pointers (size num_layers)
-    dst_ptr,  # pointer to dst tensor (num_layers, 2, num_tokens, hidden_size)
-    token_indices_ptr,  # pointer to token indices
-    num_tokens_in_block,  # length of token_indices
-    hidden_size,  # hidden dimension size
-    total_token_in_kvcache,  # sequence length in KV cache
-    num_layers,  # number of layers
+    kv_cache_ptrs_ptr: torch.Tensor,  # pointer to array of pointers (size num_layers)
+    dst_ptr: torch.Tensor,  # pointer to dst tensor (num_layers, 2, num_tokens, hidden_size)
+    token_indices_ptr: torch.Tensor,  # pointer to token indices
+    num_tokens_in_block: int,  # length of token_indices
+    hidden_size: int,  # hidden dimension size
+    total_token_in_kvcache: int,  # sequence length in KV cache
+    num_layers: int,  # number of layers
     BLOCK_SIZE: tl.constexpr,
-):
+) -> None:
     # Get the current program's layer index and token position
     layer_idx = tl.program_id(0)
     token_pos = tl.program_id(1)
@@ -121,7 +121,7 @@ def scatter_kv_caches(
     total_token_in_kvcache: int,  # total token in kv cache
     src_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
     token_indices: List[int],  # List of token positions to update
-):
+) -> None:
     assert len(kv_caches_ptrs) == src_tensor.shape[0], "Number of layers mismatch"
     num_layers = len(kv_caches_ptrs)
     num_tokens_in_block = len(token_indices)
@@ -156,7 +156,7 @@ def gather_kv_caches(
     total_token_in_kvcache: int,  # total token in kv cache
     dst_tensor: torch.Tensor,  # Shape [num_layers, 2, num_tokens_in_block, hidden_size]
     token_indices: List[int],  # List of token positions to update
-):
+) -> None:
     assert kv_caches_ptrs.shape[0] == dst_tensor.shape[0], "Number of layers mismatch"
     num_layers = kv_caches_ptrs.shape[0]
     num_tokens_in_block = len(token_indices)
@@ -185,7 +185,9 @@ def gather_kv_caches(
 
 
 class CopyBufferAllocator:
-    def __init__(self, device, dtype, shape: List[int], max_count: int):
+    def __init__(
+        self, device: torch.device, dtype: torch.dtype, shape: List[int], max_count: int
+    ) -> None:
         if max_count <= 0:
             raise ValueError("max_count must be positive")
 
@@ -239,13 +241,13 @@ class CopyBufferAllocator:
             del self._free_idx_list[-count:]
             return result
 
-    def get_buffer_by_idx(self, indices: List[int]):
+    def get_buffer_by_idx(self, indices: List[int]) -> List[torch.Tensor]:
         result = []
         for idx in indices:
             result.append(self._free_buffer_list[idx])
         return result
 
-    def free_buffer(self, buffers: List[int]):
+    def free_buffer(self, buffers: List[int]) -> None:
 
         if not buffers:
             return  # 空列表，直接返回
@@ -269,12 +271,12 @@ class CopyBufferAllocator:
 
 
 def generate_test_data(
-    num_layers=64,
-    total_token_in_kvcache=1024,
-    num_tokens_in_block=128,
-    hidden_size=4096,
-    device="cuda",
-):
+    num_layers: int = 64,
+    total_token_in_kvcache: int = 1024,
+    num_tokens_in_block: int = 128,
+    hidden_size: int = 4096,
+    device: str = "cuda",
+) -> Tuple[List[torch.Tensor], torch.Tensor, List[int]]:
     # 生成KV caches (不连续的tensor列表)
     kv_caches = []
     for _ in range(num_layers):
@@ -297,13 +299,13 @@ def generate_test_data(
 
 def reference_impl(
     kv_caches: List[torch.Tensor], source_tensor: torch.Tensor, token_indices: List[int]
-):
+) -> None:
     """参考实现，用于验证正确性"""
     for layer_idx in range(len(kv_caches)):
         kv_caches[layer_idx][:, token_indices, :] = source_tensor[layer_idx]
 
 
-def main():
+def main() -> None:
     """测试算子实现的正确性"""
     torch.manual_seed(42)
     num_layers = 4  # 测试时减少层数以加快速度
