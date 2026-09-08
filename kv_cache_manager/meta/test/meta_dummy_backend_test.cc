@@ -63,7 +63,7 @@ TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime)
               meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, before));
     for (int repeat = 0; repeat < 5; ++repeat) {
         KeyVector sampled;
-        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeysForMaintenance(nullptr, 1, sampled));
+        ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, sampled));
         EXPECT_EQ((KeyVector{1}), sampled);
         CacheLocationMapVector locations;
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),

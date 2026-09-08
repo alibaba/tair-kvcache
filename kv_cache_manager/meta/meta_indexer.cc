@@ -1965,12 +1965,6 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
     return ec;
 }
 
-ErrorCode MetaIndexer::SampleReclaimKeysForMaintenance(RequestContext *request_context,
-                                                       int64_t count,
-                                                       KeyVector &out_keys) const noexcept {
-    return backend_manager_->SampleReclaimKeysForMaintenance(request_context, count, out_keys);
-}
-
 ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
                                          const int64_t count,
                                          KeyVector &out_keys) const noexcept {
@@ -1988,12 +1982,14 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
 
 ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
                                                const int64_t count,
-                                               ReclaimCandidateVector &out_candidates) const noexcept {
+                                               ReclaimCandidateVector &out_candidates,
+                                               bool require_read_success) const noexcept {
     out_candidates.clear();
     if (count > 0) {
         out_candidates.reserve(static_cast<size_t>(count));
     }
-    const ErrorCode ec = backend_manager_->SampleReclaimCandidates(request_context, count, out_candidates);
+    const ErrorCode ec =
+        backend_manager_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim candidates failed, count[%lu] candidate size[%lu]",
                        instance_id_.c_str(),

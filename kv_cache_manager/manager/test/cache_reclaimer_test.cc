@@ -383,7 +383,8 @@ std::vector<std::pair<std::string, std::int64_t>> sample_reclaim_requests;
 ErrorCode MetaIndexer_SampleReclaimCandidates_stub(void *obj,
                                                    RequestContext *rc,
                                                    const std::int64_t c,
-                                                   ReclaimCandidateVector &out_candidates) noexcept {
+                                                   ReclaimCandidateVector &out_candidates,
+                                                   bool /*require_read_success*/) noexcept {
     ++sample_reclaim_call_counter;
     ErrorCode result = sample_reclaim_result;
     std::chrono::milliseconds delay = mi_sample_reclaim_delay;
@@ -496,7 +497,14 @@ std::mutex group_lru_test_mutex;
 std::map<std::string, GroupLruTestBackend> group_lru_test_backends;
 std::function<void()> group_lru_location_read_hook;
 
-ErrorCode GroupLruSample_stub(void *obj, RequestContext *, std::int64_t count, KeyVector &keys) noexcept {
+ErrorCode GroupLruSample_stub(void *obj,
+                              RequestContext *request_context,
+                              std::int64_t count,
+                              ReclaimCandidateVector &candidates,
+                              bool require_read_success) noexcept {
+    if (!require_read_success) {
+        return MetaIndexer_SampleReclaimCandidates_stub(obj, request_context, count, candidates, false);
+    }
     std::chrono::milliseconds delay{0};
     ErrorCode ec = ErrorCode::EC_OK;
     {
@@ -508,39 +516,35 @@ ErrorCode GroupLruSample_stub(void *obj, RequestContext *, std::int64_t count, K
         if (backend.sampling_calls == backend.fail_sampling_call) {
             ec = ErrorCode::EC_ERROR;
         }
-        keys.clear();
+        candidates.clear();
+        if (ec == ErrorCode::EC_OK && backend.property_error != ErrorCode::EC_NOENT) {
+            ec = backend.property_error;
+        }
         for (std::size_t i = 0; i < std::min(static_cast<std::size_t>(count), backend.keys.size()); ++i) {
-            keys.push_back(backend.keys[backend.cursor++ % backend.keys.size()]);
+            const auto key = backend.keys[backend.cursor++ % backend.keys.size()];
+            if (ec != ErrorCode::EC_OK || backend.property_error == ErrorCode::EC_NOENT) {
+                continue;
+            }
+            std::string value;
+            if (const auto it = backend.times.find(key); it != backend.times.end()) {
+                value = it->second;
+            }
+            auto &versions = backend.time_versions[key];
+            if (!versions.empty()) {
+                value = versions.front();
+                if (versions.size() > 1) {
+                    versions.pop_front();
+                }
+            }
+            int64_t time = 0;
+            if (!StringUtil::StrToInt64(value.c_str(), time)) {
+                time = 0;
+            }
+            candidates.push_back({key, time});
         }
     }
     std::this_thread::sleep_for(delay);
     return ec;
-}
-
-MetaIndexer::Result GroupLruProperties_stub(void *obj,
-                                            RequestContext *,
-                                            const KeyVector &keys,
-                                            const std::vector<std::string> &,
-                                            PropertyMapVector &maps) noexcept {
-    std::lock_guard<std::mutex> lock(group_lru_test_mutex);
-    auto &backend = group_lru_test_backends.at(instance_id_by_meta_indexer.at(obj));
-    maps.assign(keys.size(), PropertyMap{});
-    MetaIndexer::Result result(keys.size());
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-        result.error_codes[i] = backend.property_error;
-        if (const auto it = backend.times.find(keys[i]); it != backend.times.end()) {
-            maps[i][PROPERTY_LRU_TIME] = it->second;
-        }
-        auto &versions = backend.time_versions[keys[i]];
-        if (!versions.empty()) {
-            maps[i][PROPERTY_LRU_TIME] = versions.front();
-            if (versions.size() > 1) {
-                versions.pop_front();
-            }
-        }
-    }
-    result.ec = backend.property_error;
-    return result;
 }
 
 MetaIndexer::Result
@@ -829,8 +833,6 @@ public:
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
-        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeysForMaintenance));
-        stub_.reset(ADDR(MetaIndexer, GetPropertiesForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
@@ -974,8 +976,7 @@ public:
     }
 
     std::shared_ptr<InstanceGroup> SetUpGroupLruScenario(const std::vector<std::string> &ids = {"a", "b"}) {
-        stub_.set(ADDR(MetaIndexer, SampleReclaimKeysForMaintenance), GroupLruSample_stub);
-        stub_.set(ADDR(MetaIndexer, GetPropertiesForMaintenance), GroupLruProperties_stub);
+        stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), GroupLruSample_stub);
         stub_.set(ADDR(MetaIndexer, GetLocationMapsForMaintenance), GroupLruLocations_stub);
         cache_reclaimer_->job_state_flag_ = true;
         cache_reclaimer_->sampling_size_per_task_.store(2);
@@ -4597,6 +4598,30 @@ TEST_F(CacheReclaimerTest, TestGroupLruDeadlineRetainsCompleteInstancesAndRealIn
     EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_deadline_count_metrics());
     EXPECT_GE(cache_reclaimer_->in_flight_sampling_tasks_.load(), 1);
     EXPECT_LE(cache_reclaimer_->in_flight_sampling_tasks_.load(), cache_reclaimer_->workers_.size());
+    EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSlowInstanceDoesNotBlockHealthySamplingFragments) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 1;
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 32));
+    cache_reclaimer_->future_timeout_ms_ = 200;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(500);
+    const auto slow_task_limit = cache_reclaimer_->workers_.size() / 2;
+
+    // B needs more fragments than fit in one wave, while A's first fragment
+    // outlives the deadline. Free workers must keep processing B, not wait for
+    // A or get filled with more of A's blocked fragments.
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    {
+        std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+        EXPECT_EQ(slow_task_limit, group_lru_test_backends.at("a").sampling_calls);
+        EXPECT_EQ(32, group_lru_test_backends.at("b").sampling_calls);
+    }
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_collected_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_partial_plan_count_metrics());
+    EXPECT_EQ(slow_task_limit, cache_reclaimer_->in_flight_sampling_tasks_.load());
     EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
 }
 

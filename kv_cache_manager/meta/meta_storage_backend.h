@@ -475,15 +475,13 @@ public:
     // but a timestamp is unavailable or malformed, the candidate is returned
     // with last_access_time_us == 0 to preserve the reclaimer's historical
     // best-effort degradation.
+    // require_read_success distinguishes failed backend reads from missing or
+    // malformed timestamp values. In strict mode read failures fail the sample
+    // and disappeared keys are skipped; invalid values still degrade to zero.
     virtual ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                               int64_t count,
-                                              ReclaimCandidateVector &out_candidates) noexcept = 0;
-    // Independent sampling progress without treating sampled keys as accesses.
-    // Random/persistent samplers can retain their existing implementation.
-    virtual ErrorCode
-    SampleReclaimKeysForMaintenance(RequestContext *request_context, int64_t count, KeyTypeVec &out_keys) noexcept {
-        return SampleReclaimKeys(request_context, count, out_keys);
-    }
+                                              ReclaimCandidateVector &out_candidates,
+                                              bool require_read_success = false) noexcept = 0;
 
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）

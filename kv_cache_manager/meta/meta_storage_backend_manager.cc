@@ -1933,18 +1933,6 @@ ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_contex
     return persistent_backend_->RandomSample(request_context, count, out_keys);
 }
 
-ErrorCode MetaStorageBackendManager::SampleReclaimKeysForMaintenance(RequestContext *request_context,
-                                                                     int64_t count,
-                                                                     KeyTypeVec &out_keys) noexcept {
-    out_keys.clear();
-    // The hot view is complete only in kRunning. During recovery sample the
-    // persistent source; timestamp reads can still use newer cached values.
-    auto *backend = cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning
-                        ? static_cast<MetaStorageBackend *>(cache_backend_.get())
-                        : persistent_backend_.get();
-    return backend ? backend->SampleReclaimKeysForMaintenance(request_context, count, out_keys) : EC_ERROR;
-}
-
 ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_context,
                                                        const int64_t count,
                                                        KeyTypeVec &out_keys) noexcept {
@@ -1962,24 +1950,27 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
 
 ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,
                                                              const int64_t count,
-                                                             ReclaimCandidateVector &out_candidates) noexcept {
+                                                             ReclaimCandidateVector &out_candidates,
+                                                             bool require_read_success) noexcept {
     out_candidates.clear();
     if (count <= 0) {
         return EC_OK;
     }
     if (!cache_backend_) {
-        return persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+        return persistent_backend_->SampleReclaimCandidates(
+            request_context, count, out_candidates, require_read_success);
     }
 
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
     }
 
     // The persistent layer is the only complete key source while recovery is
     // still backfilling the hot cache. Its timestamps can be stale, however,
     // so overlay every cache hit with the current in-memory timestamp using a
     // no-touch exact-key lookup. Cache misses retain the persistent timestamp.
-    ErrorCode ec = persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+    ErrorCode ec =
+        persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
     if (ec != EC_OK) {
         out_candidates.clear();
         return ec;

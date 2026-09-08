@@ -358,6 +358,10 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegradesA
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 
+TEST_F(MetaRedisBackendTest, TestGroupLruStrictCandidateReadsPreserveLegacyFallback) {
+    AssertReclaimCandidateReadModes<MetaRedisBackend>();
+}
+
 TEST_F(MetaRedisBackendTest, TestRedisError) {
     EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri empty_storage_uri;

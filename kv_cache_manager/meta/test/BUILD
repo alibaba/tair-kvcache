@@ -76,6 +76,7 @@ cc_library(
     ],
     copts = ["-fno-access-control"],
     deps = [
+        "//kv_cache_manager/meta:common",
         "//kv_cache_manager/meta:meta_cache_base_backend",
         "//kv_cache_manager/meta:meta_redis_backend",
         "//kv_cache_manager/meta:meta_storage_backend",
@@ -168,6 +169,7 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
+        ":meta_storage_backend_testlib",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:common",
