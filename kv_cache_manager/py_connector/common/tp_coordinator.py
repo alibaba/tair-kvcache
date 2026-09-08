@@ -36,7 +36,9 @@ class LoadBlockFinishedEvent:
     type: str = "LoadBlockFinishedEvent"
 
 
-CoordinateEventUnion = Union[SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent]
+CoordinateEventUnion = Union[
+    SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent
+]
 
 
 @dataclass
@@ -67,7 +69,7 @@ class CoordinateMsgSerializer:
         return CoordinateMessage(
             send_time=msg_dict["send_time"],
             create_time=msg_dict["create_time"],
-            content=content
+            content=content,
         )
 
 
@@ -106,13 +108,17 @@ class SaveContext:
 
 
 class TpCoordinatorServer:
-    def __init__(self, host_ip: str, base_port: int, tp_world_size: int, on_finished_callback):
+    def __init__(
+        self, host_ip: str, base_port: int, tp_world_size: int, on_finished_callback
+    ):
         self._host_ip = host_ip
         self._base_port = base_port
         self._tp_world_size = tp_world_size
 
         self._coordinator_running = True
-        self._coordinator_thread = threading.Thread(target=self.coordinator_routine, daemon=True)
+        self._coordinator_thread = threading.Thread(
+            target=self.coordinator_routine, daemon=True
+        )
         self._coordinator_thread.start()
 
         self._finished_loading = []
@@ -134,7 +140,9 @@ class TpCoordinatorServer:
         # Buffer for SendBlockFinishedEvent that arrives before SendBlockStartEvent
         pending_save_finishes: Dict[RunningId, List[SendBlockFinishedEvent]] = {}
 
-        def complete_save_if_ready(save_id: RunningId, write_session_id: str, request_id: str):
+        def complete_save_if_ready(
+            save_id: RunningId, write_session_id: str, request_id: str
+        ):
             save_context = running_save.get(save_id)
             if save_context is None:
                 return
@@ -151,7 +159,9 @@ class TpCoordinatorServer:
             try:
                 msg = CoordinateMsgSerializer.loads(raw_msg)
             except Exception as e:
-                logger.warning("[coordinator] received msg load failed: %s, error: %s", raw_msg, e)
+                logger.warning(
+                    "[coordinator] received msg load failed: %s, error: %s", raw_msg, e
+                )
                 continue
 
             if isinstance(msg.content, SendBlockStartEvent):
@@ -163,9 +173,13 @@ class TpCoordinatorServer:
                 # Merge any buffered finish events that arrived before this start
                 if save_id in pending_save_finishes:
                     for finish_event in pending_save_finishes.pop(save_id):
-                        running_save[save_id].add_new_rank(finish_event.tp_rank, finish_event.is_success_list)
+                        running_save[save_id].add_new_rank(
+                            finish_event.tp_rank, finish_event.is_success_list
+                        )
 
-                complete_save_if_ready(save_id, content.write_session_id, content.request_id)
+                complete_save_if_ready(
+                    save_id, content.write_session_id, content.request_id
+                )
 
             elif isinstance(msg.content, SendBlockFinishedEvent):
                 content: SendBlockFinishedEvent = msg.content
@@ -177,8 +191,12 @@ class TpCoordinatorServer:
                         pending_save_finishes[save_id] = []
                     pending_save_finishes[save_id].append(content)
                 else:
-                    running_save[save_id].add_new_rank(content.tp_rank, content.is_success_list)
-                    complete_save_if_ready(save_id, content.write_session_id, content.request_id)
+                    running_save[save_id].add_new_rank(
+                        content.tp_rank, content.is_success_list
+                    )
+                    complete_save_if_ready(
+                        save_id, content.write_session_id, content.request_id
+                    )
             elif isinstance(msg.content, LoadBlockFinishedEvent):
                 content: LoadBlockFinishedEvent = msg.content
                 load_id = RunningId(str(content.epoch), content.request_id)

@@ -4,6 +4,7 @@
 import sys
 import unittest
 from types import ModuleType
+
 try:
     from unittest.mock import patch
 except ImportError:
@@ -139,8 +140,8 @@ class TestCreateServiceDiscovery(unittest.TestCase):
             )
 
         self.assertIsNotNone(discovery)
-        self.assertEqual(discovery.get_type(), 'Spectrum')
-        self.assertEqual(discovery.virtual_service_id, 'v-ad2d143d')
+        self.assertEqual(discovery.get_type(), "Spectrum")
+        self.assertEqual(discovery.virtual_service_id, "v-ad2d143d")
         self.assertEqual(discovery.cache_ttl, 10)
         self.assertEqual(discovery.retry_count, 2)
         self.assertEqual(discovery.refresh_timeout, 3)  # 3000 ms → 3 s
@@ -185,5 +186,5 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         discovery.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

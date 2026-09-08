@@ -58,8 +58,8 @@ class _Query:
 
     key: QueryCacheKey
     version: int = 0
-    locations: list = None          # None until the manager answered
-    ask_time: float = 0.0           # monotonic clock, at query issue
+    locations: list = None  # None until the manager answered
+    ask_time: float = 0.0  # monotonic clock, at query issue
 
 
 class LocationQueryManager:
@@ -72,9 +72,14 @@ class LocationQueryManager:
     and the query re-issued.
     """
 
-    def __init__(self, manager_client: KvCacheManagerClient, http_executor,
-                 instance_id: str, async_get_cache_location: bool,
-                 max_answer_age_s: float = 1.0):
+    def __init__(
+        self,
+        manager_client: KvCacheManagerClient,
+        http_executor,
+        instance_id: str,
+        async_get_cache_location: bool,
+        max_answer_age_s: float = 1.0,
+    ):
         self._manager_client = manager_client
         self._http_executor = http_executor
         self._instance_id = instance_id
@@ -95,7 +100,8 @@ class LocationQueryManager:
             req_id=request.request_id,
             query_type=QUERY_TYPE,
             token_length=len(request.prompt_token_ids),
-            computed_blocks=computed_blocks)
+            computed_blocks=computed_blocks,
+        )
 
     def _fetch_from_manager(self, request, computed_blocks: int):
         """Run the actual GetCacheLocation call (http thread or inline)."""
@@ -116,8 +122,11 @@ class LocationQueryManager:
             try:
                 locations = self._fetch_from_manager(request, key.computed_blocks)
             except Exception as e:
-                logger.warning("get_cache_location error, request_id: %s, error: %s",
-                               request.request_id, e)
+                logger.warning(
+                    "get_cache_location error, request_id: %s, error: %s",
+                    request.request_id,
+                    e,
+                )
                 with self._lock:
                     # Drop the slot: the next match hook re-issues the query.
                     if self._queries.get(request.request_id) is q:
@@ -131,9 +140,12 @@ class LocationQueryManager:
                     # answer of a dead ask must never write into the new
                     # slot (late answers only win against older asks, never
                     # against newer ones).
-                    logger.debug("get_cache_location answer dropped: request %s "
-                                 "query v%d was superseded",
-                                 request.request_id, q.version)
+                    logger.debug(
+                        "get_cache_location answer dropped: request %s "
+                        "query v%d was superseded",
+                        request.request_id,
+                        q.version,
+                    )
 
         self._http_executor.submit(run)
 
@@ -162,14 +174,20 @@ class LocationQueryManager:
                     return q.locations
                 # Expired: a miss. Old answers are never served.
                 self.stale_supersede_count += 1
-                logger.info("req:%s location answer expired after %.3fs "
-                            "(max %.3fs); re-querying", req_id, age,
-                            self._max_answer_age_s)
+                logger.info(
+                    "req:%s location answer expired after %.3fs "
+                    "(max %.3fs); re-querying",
+                    req_id,
+                    age,
+                    self._max_answer_age_s,
+                )
             # First ask, a different offset, or an expired answer: the
             # newest ask supersedes.
-            q = _Query(key=key,
-                       version=q.version + 1 if q is not None else 0,
-                       ask_time=time.monotonic())
+            q = _Query(
+                key=key,
+                version=q.version + 1 if q is not None else 0,
+                ask_time=time.monotonic(),
+            )
             self._queries[req_id] = q
 
         if self._async_get_cache_location:
@@ -178,8 +196,9 @@ class LocationQueryManager:
         try:
             locations = self._fetch_from_manager(request, computed_blocks)
         except Exception as e:
-            logger.warning("get_cache_location error, request_id: %s, error: %s",
-                           req_id, e)
+            logger.warning(
+                "get_cache_location error, request_id: %s, error: %s", req_id, e
+            )
             with self._lock:
                 if self._queries.get(req_id) is q:
                     self._queries.pop(req_id, None)

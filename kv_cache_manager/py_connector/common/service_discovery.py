@@ -18,6 +18,7 @@ from typing import List, Optional
 @dataclass
 class ServiceEndpoint:
     """统一的服务端点信息。"""
+
     ip: str
     port: int
     host: str  # f"{ip}:{port}"

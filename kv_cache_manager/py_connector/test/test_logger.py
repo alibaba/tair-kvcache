@@ -13,6 +13,7 @@ class TestSetLogLevel(unittest.TestCase):
     def setUp(self):
         # Re-import logger module for each test to get fresh state
         import kv_cache_manager.py_connector.common.logger as logger_mod
+
         self.logger_mod = logger_mod
 
     def test_set_debug_level(self):
@@ -53,12 +54,14 @@ class TestEnvironmentVariable(unittest.TestCase):
     def test_env_var_debug(self):
         with patch.dict(os.environ, {"KVCM_LOG_LEVEL": "DEBUG"}):
             import kv_cache_manager.py_connector.common.logger as logger_mod
+
             importlib.reload(logger_mod)
             self.assertEqual(logger_mod.logger.level, logging.DEBUG)
 
     def test_env_var_info(self):
         with patch.dict(os.environ, {"KVCM_LOG_LEVEL": "INFO"}):
             import kv_cache_manager.py_connector.common.logger as logger_mod
+
             importlib.reload(logger_mod)
             self.assertEqual(logger_mod.logger.level, logging.INFO)
 
@@ -67,18 +70,21 @@ class TestEnvironmentVariable(unittest.TestCase):
         env.pop("KVCM_LOG_LEVEL", None)
         with patch.dict(os.environ, env, clear=True):
             import kv_cache_manager.py_connector.common.logger as logger_mod
+
             importlib.reload(logger_mod)
             self.assertEqual(logger_mod.logger.level, logging.WARNING)
 
     def test_env_var_invalid_falls_back_to_warning(self):
         with patch.dict(os.environ, {"KVCM_LOG_LEVEL": "GARBAGE"}):
             import kv_cache_manager.py_connector.common.logger as logger_mod
+
             importlib.reload(logger_mod)
             self.assertEqual(logger_mod.logger.level, logging.WARNING)
 
     def tearDown(self):
         # Restore default level after env var tests
         import kv_cache_manager.py_connector.common.logger as logger_mod
+
         importlib.reload(logger_mod)
 
 
@@ -87,6 +93,7 @@ class TestConfigureLogLevel(unittest.TestCase):
 
     def setUp(self):
         import kv_cache_manager.py_connector.common.logger as logger_mod
+
         self.logger_mod = logger_mod
 
     def test_env_var_takes_priority_over_param(self):
@@ -117,6 +124,7 @@ class TestConfigureLogLevel(unittest.TestCase):
 
     def tearDown(self):
         import kv_cache_manager.py_connector.common.logger as logger_mod
+
         importlib.reload(logger_mod)
 
 

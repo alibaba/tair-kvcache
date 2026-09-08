@@ -61,7 +61,9 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         self.to_finish_requests.append(finish_request)
 
     def __repr__(self):
-        return (f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
-                f"load={len(self.to_load_requests)}, "
-                f"save={len(self.to_save_requests)}, "
-                f"finish={len(self.to_finish_requests)})")
+        return (
+            f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
+            f"load={len(self.to_load_requests)}, "
+            f"save={len(self.to_save_requests)}, "
+            f"finish={len(self.to_finish_requests)})"
+        )

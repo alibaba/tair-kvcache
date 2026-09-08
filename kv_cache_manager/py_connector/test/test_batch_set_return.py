@@ -1,4 +1,5 @@
 """Unit tests for _batch_set return value: 1:1 positional mapping with input keys."""
+
 import json
 import sys
 import types
@@ -25,7 +26,9 @@ _mock_version = types.ModuleType("kv_cache_manager.py_connector.common._version_
 _mock_version.FULL_VERSION = "0.0.0-test"
 _mock_version.GIT_COMMIT = "test"
 _mock_version.BUILD_TIME = "test"
-sys.modules.setdefault("kv_cache_manager.py_connector.common._version_info", _mock_version)
+sys.modules.setdefault(
+    "kv_cache_manager.py_connector.common._version_info", _mock_version
+)
 
 from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: E402
 
@@ -35,10 +38,17 @@ def _make_obj(cls):
     return cls.__new__(cls)
 
 
-def _build_connector(*, tp_rank=0, tp_world_size=1, kv_factor=2,
-                     instance_id="test", location_spec_name="tp_0",
-                     location_spec_size=4096, write_timeout_seconds=30,
-                     is_mla_model=False):
+def _build_connector(
+    *,
+    tp_rank=0,
+    tp_world_size=1,
+    kv_factor=2,
+    instance_id="test",
+    location_spec_name="tp_0",
+    location_spec_size=4096,
+    write_timeout_seconds=30,
+    is_mla_model=False,
+):
     """Build a HiCacheKVCM with attributes set manually (bypass __init__)."""
     obj = _make_obj(HiCacheKVCM)
     obj.tp_rank = tp_rank
@@ -107,16 +117,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
 
         # offset=2 means indices [2,3,4] need saving (relative: [2,3,4])
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-2",
             "block_mask": {"offset": 2},  # first 2 (prefix=0, so key 0,1) cached
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         result = c._batch_set(keys, torch.zeros(5), trace_id="t2")
 
@@ -130,16 +138,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
         keys = ["k0", "k1", "k2", "k3", "k4"]
 
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-3",
             "block_mask": {"offset": 2},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=False)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=False)
 
         result = c._batch_set(keys, torch.zeros(5), trace_id="t3")
 
@@ -153,16 +159,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
         keys = ["k0", "k1", "k2"]
 
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-4",
             "block_mask": {"offset": 0},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         result = c._batch_set(keys, torch.zeros(3), trace_id="t4")
 
@@ -175,16 +179,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
         keys = ["k0", "k1", "k2"]
 
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-5",
             "block_mask": {"offset": 0},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=False)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=False)
 
         result = c._batch_set(keys, torch.zeros(3), trace_id="t5")
 
@@ -200,22 +202,21 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # block_mask offset=5 means save from index 5 onward
         # relative save_indices = [5-3, 6-3] = [2, 3]
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(2)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(2)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-6",
             "block_mask": {"offset": 5},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1", "p2"]
 
-        result = c._batch_set(keys, torch.zeros(4), trace_id="t6",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(4), trace_id="t6", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # key 0,1 (k3,k4) → True (no write needed)
@@ -231,20 +232,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # indices [0,1,2,3,4] → masks [False, True, False, True, False]
         # save_indices (need write): [0, 2, 4]
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-7",
-            "block_mask": {
-                "bool_masks": {
-                    "values": [False, True, False, True, False]
-                }
-            },
+            "block_mask": {"bool_masks": {"values": [False, True, False, True, False]}},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         result = c._batch_set(keys, torch.zeros(5), trace_id="t7")
 
@@ -262,20 +257,14 @@ class TestBatchSetReturnValue(unittest.TestCase):
         keys = ["k0", "k1", "k2", "k3", "k4"]
 
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-8",
-            "block_mask": {
-                "bool_masks": {
-                    "values": [False, True, False, True, False]
-                }
-            },
+            "block_mask": {"bool_masks": {"values": [False, True, False, True, False]}},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=False)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=False)
 
         result = c._batch_set(keys, torch.zeros(5), trace_id="t8")
 
@@ -298,22 +287,21 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # prefix_write_count=2, save_indices=[0,1,2]
         # locations: 5 entries (2 prefix + 3 new)
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(5)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(5)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-9",
             "block_mask": {"offset": 1},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1", "p2"]
 
-        result = c._batch_set(keys, torch.zeros(3), trace_id="t9",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(3), trace_id="t9", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # All new blocks written successfully
@@ -331,22 +319,21 @@ class TestBatchSetReturnValue(unittest.TestCase):
         keys = ["k3", "k4", "k5"]
 
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(5)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(5)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-10",
             "block_mask": {"offset": 1},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=False)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=False)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1", "p2"]
 
-        result = c._batch_set(keys, torch.zeros(3), trace_id="t10",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(3), trace_id="t10", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # New blocks write failed
@@ -368,26 +355,21 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # prefix_write_count=1, save_indices=[0,2] (k2 and k4)
         # locations: 3 entries (1 prefix + 2 new)
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(3)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(3)
         ]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-11",
-            "block_mask": {
-                "bool_masks": {
-                    "values": [True, False, False, True, False]
-                }
-            },
+            "block_mask": {"bool_masks": {"values": [True, False, False, True, False]}},
         }
-        c = self._setup_connector(start_write_result=result_from_manager,
-                                  save_ok=True)
+        c = self._setup_connector(start_write_result=result_from_manager, save_ok=True)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1"]
 
-        result = c._batch_set(keys, torch.zeros(3), trace_id="t11",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(3), trace_id="t11", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # k2: write succeeded, k3: cached, k4: write succeeded
@@ -408,25 +390,20 @@ class TestBatchSetReturnValue(unittest.TestCase):
         #   p0:True p1:False(prefix,skip) k2:True(cached) k3:True(cached)
         # prefix_write_count=1, save_indices=[] (all new cached)
         # locations: 1 entry (for p1 only)
-        locations = [
-            {"location_specs": [{"name": "tp_0", "uri": "uri_0"}]}
-        ]
+        locations = [{"location_specs": [{"name": "tp_0", "uri": "uri_0"}]}]
         result_from_manager = {
             "locations": locations,
             "write_session_id": "ws-12",
-            "block_mask": {
-                "bool_masks": {
-                    "values": [True, False, True, True]
-                }
-            },
+            "block_mask": {"bool_masks": {"values": [True, False, True, True]}},
         }
         c = self._setup_connector(start_write_result=result_from_manager)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1"]
 
-        result = c._batch_set(keys, torch.zeros(2), trace_id="t12",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(2), trace_id="t12", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # All new blocks are cached → True
@@ -446,11 +423,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
         result_from_manager = {
             "locations": [],
             "write_session_id": "ws-13",
-            "block_mask": {
-                "bool_masks": {
-                    "values": [True]
-                }
-            },
+            "block_mask": {"bool_masks": {"values": [True]}},
         }
         c = self._setup_connector(start_write_result=result_from_manager)
 
@@ -467,11 +440,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
         result_from_manager = {
             "locations": [],
             "write_session_id": "ws-14",
-            "block_mask": {
-                "bool_masks": {
-                    "values": []
-                }
-            },
+            "block_mask": {"bool_masks": {"values": []}},
         }
         c = self._setup_connector(start_write_result=result_from_manager)
 
@@ -488,8 +457,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
 
         # All 5 keys need writing (offset=0), 5 locations
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(5)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(5)
         ]
         result_from_manager = {
             "locations": locations,
@@ -503,7 +471,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # This simulates a rank that has fewer local blocks available.
         # local_block_count = 6 // 2 = 3, so only save_indices [0,1,2] are valid.
         c.mem_pool_host.get_page_buffer_meta.return_value = (
-            list(range(6)),           # 6 ptrs → 3 blocks
+            list(range(6)),  # 6 ptrs → 3 blocks
             [c.location_spec_size] * 6,
         )
 
@@ -535,8 +503,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
 
         # All 4 keys need writing (offset=0)
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(4)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(4)
         ]
         result_from_manager = {
             "locations": locations,
@@ -579,8 +546,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # prefix_write_count=1, save_indices=[0,1,2,3]
         # locations: 5 entries (1 prefix + 4 new)
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(5)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(5)
         ]
         result_from_manager = {
             "locations": locations,
@@ -606,8 +572,9 @@ class TestBatchSetReturnValue(unittest.TestCase):
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1"]
 
-        result = c._batch_set(keys, torch.zeros(4), trace_id="t17",
-                              extra_info=extra_info)
+        result = c._batch_set(
+            keys, torch.zeros(4), trace_id="t17", extra_info=extra_info
+        )
 
         self.assertEqual(len(result), len(keys))
         # k2(idx0): local data + success → True
@@ -651,11 +618,13 @@ class TestSkipTransfer(unittest.TestCase):
     @staticmethod
     def _broadcast_side_effect(result, len_prefix, len_new, input_hash):
         """Return a side_effect that fills the recv list with rank 0's data."""
+
         def _side_effect(tensor_list, src, group):
             tensor_list[0] = result
             tensor_list[1] = len_prefix
             tensor_list[2] = len_new
             tensor_list[3] = input_hash
+
         return _side_effect
 
     @staticmethod
@@ -677,7 +646,8 @@ class TestSkipTransfer(unittest.TestCase):
         rank0_len_prefix, rank0_len_new = 0, 3
         rank0_hash = self._rank0_hash(
             ["rank0_k0", "rank0_k1", "rank0_k2"],
-            rank0_len_prefix, rank0_len_new,
+            rank0_len_prefix,
+            rank0_len_new,
         )
         rank0_result = {
             "locations": [],
@@ -686,7 +656,10 @@ class TestSkipTransfer(unittest.TestCase):
         }
 
         bcast = self._broadcast_side_effect(
-            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+            rank0_result,
+            rank0_len_prefix,
+            rank0_len_new,
+            rank0_hash,
         )
         with patch("torch.distributed.broadcast_object_list", side_effect=bcast):
             result = c._batch_set(local_keys, torch.zeros(3), trace_id="t19")
@@ -705,11 +678,11 @@ class TestSkipTransfer(unittest.TestCase):
         rank0_len_prefix, rank0_len_new = 0, 4
         rank0_hash = self._rank0_hash(
             ["rank0_k0", "rank0_k1", "rank0_k2", "rank0_k3"],
-            rank0_len_prefix, rank0_len_new,
+            rank0_len_prefix,
+            rank0_len_new,
         )
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(2)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(2)
         ]
         rank0_result = {
             "locations": locations,
@@ -718,12 +691,17 @@ class TestSkipTransfer(unittest.TestCase):
         }
 
         bcast = self._broadcast_side_effect(
-            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+            rank0_result,
+            rank0_len_prefix,
+            rank0_len_new,
+            rank0_hash,
         )
 
         # all_reduce is a no-op (keeps all-zero flags)
-        with patch("torch.distributed.broadcast_object_list", side_effect=bcast), \
-             patch("torch.distributed.all_reduce"):
+        with (
+            patch("torch.distributed.broadcast_object_list", side_effect=bcast),
+            patch("torch.distributed.all_reduce"),
+        ):
             result = c._batch_set(local_keys, torch.zeros(4), trace_id="t20")
 
         self.assertEqual(len(result), 4)
@@ -742,12 +720,12 @@ class TestSkipTransfer(unittest.TestCase):
         rank0_len_prefix, rank0_len_new = 3, 3
         rank0_hash = self._rank0_hash(
             ["rank0_p0", "rank0_p1", "rank0_p2", "rank0_k3", "rank0_k4", "rank0_k5"],
-            rank0_len_prefix, rank0_len_new,
+            rank0_len_prefix,
+            rank0_len_new,
         )
         # offset=1 < len_prefix=3 → prefix best-effort path, all 5 blocks in locations
         locations = [
-            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
-            for i in range(5)
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]} for i in range(5)
         ]
         rank0_result = {
             "locations": locations,
@@ -756,13 +734,19 @@ class TestSkipTransfer(unittest.TestCase):
         }
 
         bcast = self._broadcast_side_effect(
-            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+            rank0_result,
+            rank0_len_prefix,
+            rank0_len_new,
+            rank0_hash,
         )
 
-        with patch("torch.distributed.broadcast_object_list", side_effect=bcast), \
-             patch("torch.distributed.all_reduce"):
-            result = c._batch_set(local_keys, torch.zeros(3), trace_id="t21",
-                                  extra_info=local_extra)
+        with (
+            patch("torch.distributed.broadcast_object_list", side_effect=bcast),
+            patch("torch.distributed.all_reduce"),
+        ):
+            result = c._batch_set(
+                local_keys, torch.zeros(3), trace_id="t21", extra_info=local_extra
+            )
 
         self.assertEqual(len(result), 3)
         self.assertEqual(result, [False, False, False])
@@ -775,32 +759,39 @@ class TestParseHf3fsConfigs(unittest.TestCase):
         c.write_iov_block_size = 1048576
         c.iov_size = 4294967296
 
-        storage_configs = json.dumps([
-            {
-                "type": "vcns_hf3fs",
-                "is_available": True,
-                "global_unique_name": "vcns_3fs",
-                "storage_spec": {
-                    "cluster_name": "vcns_3fs",
+        storage_configs = json.dumps(
+            [
+                {
+                    "type": "vcns_hf3fs",
+                    "is_available": True,
+                    "global_unique_name": "vcns_3fs",
+                    "storage_spec": {
+                        "cluster_name": "vcns_3fs",
+                        "mountpoint": "/data/",
+                        "root_dir": "instance-root/",
+                        "key_count_per_file": 8,
+                        "remote_host": "127.0.0.1",
+                        "remote_port": 9081,
+                        "meta_storage_uri": "redis://example",
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(
+            c.parse_hf3fs_configs(storage_configs),
+            [
+                {
+                    "type": "vcns_hf3fs",
                     "mountpoint": "/data/",
                     "root_dir": "instance-root/",
-                    "key_count_per_file": 8,
-                    "remote_host": "127.0.0.1",
-                    "remote_port": 9081,
-                    "meta_storage_uri": "redis://example",
-                },
-            }
-        ])
-
-        self.assertEqual(c.parse_hf3fs_configs(storage_configs), [{
-            "type": "vcns_hf3fs",
-            "mountpoint": "/data/",
-            "root_dir": "instance-root/",
-            "read_iov_block_size": 0,
-            "read_iov_size": 4294967296,
-            "write_iov_block_size": 1048576,
-            "write_iov_size": 4294967296,
-        }])
+                    "read_iov_block_size": 0,
+                    "read_iov_size": 4294967296,
+                    "write_iov_block_size": 1048576,
+                    "write_iov_size": 4294967296,
+                }
+            ],
+        )
 
     def test_unavailable_vcns_hf3fs_is_ignored(self):
         c = _build_connector()
@@ -808,17 +799,19 @@ class TestParseHf3fsConfigs(unittest.TestCase):
         c.write_iov_block_size = 0
         c.iov_size = 1024
 
-        storage_configs = json.dumps([
-            {
-                "type": "vcns_hf3fs",
-                "is_available": False,
-                "global_unique_name": "vcns_3fs",
-                "storage_spec": {
-                    "mountpoint": "/data/",
-                    "root_dir": "instance-root/",
-                },
-            }
-        ])
+        storage_configs = json.dumps(
+            [
+                {
+                    "type": "vcns_hf3fs",
+                    "is_available": False,
+                    "global_unique_name": "vcns_3fs",
+                    "storage_spec": {
+                        "mountpoint": "/data/",
+                        "root_dir": "instance-root/",
+                    },
+                }
+            ]
+        )
 
         self.assertEqual(c.parse_hf3fs_configs(storage_configs), [])
 
@@ -833,8 +826,11 @@ class TestMLASkipTPSync(unittest.TestCase):
     def _make_mla_rank0(self):
         """MLA connector at rank 0 in a 2-rank setup."""
         c = _build_connector(
-            tp_rank=0, tp_world_size=2, kv_factor=1,
-            location_spec_name="tp_0_full", is_mla_model=True,
+            tp_rank=0,
+            tp_world_size=2,
+            kv_factor=1,
+            location_spec_name="tp_0_full",
+            is_mla_model=True,
         )
         c.storage_tp_group = MagicMock()
         return c
@@ -862,8 +858,10 @@ class TestMLASkipTPSync(unittest.TestCase):
         c = self._make_mla_rank0()
         self._setup_write(c)
 
-        with patch("torch.distributed.broadcast_object_list") as mock_bcast, \
-             patch("torch.distributed.all_reduce") as mock_allreduce:
+        with (
+            patch("torch.distributed.broadcast_object_list") as mock_bcast,
+            patch("torch.distributed.all_reduce") as mock_allreduce,
+        ):
             result = c._batch_set(["k0", "k1", "k2"], torch.zeros(3), trace_id="mla1")
 
         self.assertEqual(result, [True, True, True])
@@ -876,8 +874,10 @@ class TestMLASkipTPSync(unittest.TestCase):
         c = self._make_mla_rank0()
         self._setup_write(c, save_ok=False)
 
-        with patch("torch.distributed.broadcast_object_list") as mock_bcast, \
-             patch("torch.distributed.all_reduce") as mock_allreduce:
+        with (
+            patch("torch.distributed.broadcast_object_list") as mock_bcast,
+            patch("torch.distributed.all_reduce") as mock_allreduce,
+        ):
             result = c._batch_set(["k0", "k1", "k2"], torch.zeros(3), trace_id="mla2")
 
         self.assertEqual(result, [False, False, False])
@@ -902,8 +902,10 @@ class TestMLASkipTPSync(unittest.TestCase):
         c = self._make_mla_rank0()
         self._setup_write(c, num_keys=4)
 
-        with patch("torch.distributed.broadcast_object_list"), \
-             patch("torch.distributed.all_reduce"):
+        with (
+            patch("torch.distributed.broadcast_object_list"),
+            patch("torch.distributed.all_reduce"),
+        ):
             c._batch_set(["k0", "k1", "k2", "k3"], torch.zeros(4), trace_id="mla4")
 
         # SaveKvCaches should be called with 4 URIs (1 per page, not 8)

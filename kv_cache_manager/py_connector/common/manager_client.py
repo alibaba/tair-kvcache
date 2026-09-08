@@ -27,9 +27,7 @@ class KvCacheManagerProtocolError(requests.RequestException, AssertionError):
 
 class KvCacheManagerClient:
     @classmethod
-    def from_connector_config(
-        cls, config: Mapping[str, Any]
-    ) -> "KvCacheManagerClient":
+    def from_connector_config(cls, config: Mapping[str, Any]) -> "KvCacheManagerClient":
         """Create a client from the shared connector configuration surface."""
         return cls(
             config["manager_uri"],
@@ -48,11 +46,18 @@ class KvCacheManagerClient:
             request_timeout_seconds=config.get("request_timeout_seconds", 1.0),
         )
 
-    def __init__(self, base_url, *, instance_id="", auto_discover_leader=False, leader_retry_count=1,
-                 leader_retry_base_interval_seconds=0.005,
-                 discovery_refresh_interval_seconds=30,
-                 min_discover_interval_seconds=1,
-                 request_timeout_seconds=1.0):
+    def __init__(
+        self,
+        base_url,
+        *,
+        instance_id="",
+        auto_discover_leader=False,
+        leader_retry_count=1,
+        leader_retry_base_interval_seconds=0.005,
+        discovery_refresh_interval_seconds=30,
+        min_discover_interval_seconds=1,
+        request_timeout_seconds=1.0,
+    ):
         """
         Args:
             base_url: Manager HTTP(S) address or a service-discovery URL. When
@@ -67,7 +72,10 @@ class KvCacheManagerClient:
             raise ValueError("request_timeout_seconds must be positive")
 
         self.session = requests.Session()
-        self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        self.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
         self._resource_lock = threading.Lock()
         self._session_close_claimed = False
         self._service_discovery_close_claimed = False
@@ -106,7 +114,7 @@ class KvCacheManagerClient:
             self._rollback_construction()
             raise
 
-        self.base_url = resolved_url.rstrip('/')
+        self.base_url = resolved_url.rstrip("/")
 
         # Manager route settings
         self._instance_id = instance_id
@@ -126,16 +134,21 @@ class KvCacheManagerClient:
             try:
                 self._refresh_manager_route()
             except Exception as e:
-                logger.warning("Initial leader discovery failed, keeping original base_url %s: %s",
-                               self.base_url, e)
+                logger.warning(
+                    "Initial leader discovery failed, keeping original base_url %s: %s",
+                    self.base_url,
+                    e,
+                )
 
         # One route-refresh thread serves both modes. Leader discovery wakes
         # periodically; service-discovery-only mode waits for transport failures.
         if self._auto_discover_leader or self._service_discovery is not None:
             try:
                 self._refresh_thread = threading.Thread(
-                    target=self._route_refresh_loop, daemon=True,
-                    name="kvcm-route-refresh")
+                    target=self._route_refresh_loop,
+                    daemon=True,
+                    name="kvcm-route-refresh",
+                )
                 self._refresh_thread.start()
             except BaseException:
                 # The caller cannot close an object whose constructor failed.
@@ -145,7 +158,7 @@ class KvCacheManagerClient:
 
     @staticmethod
     def _is_http_url(url):
-        return url.startswith(('http://', 'https://'))
+        return url.startswith(("http://", "https://"))
 
     @staticmethod
     def _endpoint_url(endpoint: ServiceEndpoint):
@@ -161,7 +174,7 @@ class KvCacheManagerClient:
     @staticmethod
     def _get_status_code(response_data):
         """Extract status code from a standard API response."""
-        return response_data.get('header', {}).get('status', {}).get('code')
+        return response_data.get("header", {}).get("status", {}).get("code")
 
     def _refresh_manager_route(self, force_service_refresh=False):
         """Refresh the Manager route through service and optional leader discovery."""
@@ -190,7 +203,7 @@ class KvCacheManagerClient:
         """Resolve and switch to the leader. Must be called under _route_lock."""
         try:
             resp = requests.post(
-                url + '/api/getClusterInfo',
+                url + "/api/getClusterInfo",
                 json={
                     "trace_id": f"leader_discovery_{time.monotonic()}",
                     "instance_id": self._instance_id,
@@ -203,28 +216,42 @@ class KvCacheManagerClient:
             return False
 
         if resp.status_code != 200:
-            logger.warning("Leader discovery to %s returned status %d", url, resp.status_code)
+            logger.warning(
+                "Leader discovery to %s returned status %d", url, resp.status_code
+            )
             return False
 
         try:
             data = resp.json()
         except Exception as e:
-            logger.warning("Leader discovery response from %s is not valid JSON: %s", url, e)
+            logger.warning(
+                "Leader discovery response from %s is not valid JSON: %s", url, e
+            )
             return False
 
-        if self._get_status_code(data) != 'OK':
-            msg = data.get('header', {}).get('status', {}).get('message', 'unknown')
+        if self._get_status_code(data) != "OK":
+            msg = data.get("header", {}).get("status", {}).get("message", "unknown")
             logger.warning("Leader discovery from %s returned error: %s", url, msg)
             return False
 
-        leader_ep = data.get('leader_endpoint')
-        if not leader_ep or not leader_ep.get('host') or not leader_ep.get('meta_http_port'):
-            logger.warning("Leader discovery from %s: leader_endpoint missing or incomplete", url)
+        leader_ep = data.get("leader_endpoint")
+        if (
+            not leader_ep
+            or not leader_ep.get("host")
+            or not leader_ep.get("meta_http_port")
+        ):
+            logger.warning(
+                "Leader discovery from %s: leader_endpoint missing or incomplete", url
+            )
             return False
 
         new_url = f"http://{leader_ep['host']}:{leader_ep['meta_http_port']}"
         if new_url != self.base_url:
-            logger.info("Leader discovered: switching base_url from %s to %s", self.base_url, new_url)
+            logger.info(
+                "Leader discovered: switching base_url from %s to %s",
+                self.base_url,
+                new_url,
+            )
             self.base_url = new_url
         return True
 
@@ -284,14 +311,14 @@ class KvCacheManagerClient:
         """Helper method to make HTTP requests to the service"""
         url = self.base_url + endpoint
 
-        if method == 'POST':
+        if method == "POST":
             response = self.session.post(
                 url,
                 json=data,
                 headers=self.headers,
                 timeout=self._request_timeout_seconds,
             )
-        elif method == 'GET':
+        elif method == "GET":
             response = self.session.get(
                 url,
                 params=data,
@@ -303,8 +330,9 @@ class KvCacheManagerClient:
 
         return response
 
-    def _check_response(self, endpoint, response, response_data,
-                        check_business_status=True):
+    def _check_response(
+        self, endpoint, response, response_data, check_business_status=True
+    ):
         """Validate transport/envelope and optionally the Manager status."""
         if response.status_code != 200:
             raise KvCacheManagerHTTPError(
@@ -316,21 +344,21 @@ class KvCacheManagerClient:
             raise KvCacheManagerProtocolError(
                 f"Response from {endpoint} is not a JSON object"
             )
-        header = response_data.get('header')
+        header = response_data.get("header")
         if not isinstance(header, dict):
             raise KvCacheManagerProtocolError(
                 f"Response from {endpoint} missing a valid 'header' field"
             )
-        status = header.get('status')
-        if not isinstance(status, dict) or not status.get('code'):
+        status = header.get("status")
+        if not isinstance(status, dict) or not status.get("code"):
             raise KvCacheManagerProtocolError(
                 f"Response from {endpoint} missing a valid 'header.status' field"
             )
 
-        if check_business_status and status['code'] != "OK":
+        if check_business_status and status["code"] != "OK":
             raise AssertionError(
-                f"Request to {endpoint} failed with error: "
-                f"{status.get('message', '')}")
+                f"Request to {endpoint} failed with error: {status.get('message', '')}"
+            )
 
     def _make_api_request(self, endpoint, data=None, check_response=True):
         """Helper method to make POST requests to API endpoints and optionally validate response"""
@@ -338,7 +366,7 @@ class KvCacheManagerClient:
 
         while True:
             try:
-                response = self._make_request('POST', endpoint, data)
+                response = self._make_request("POST", endpoint, data)
             except (requests.ConnectionError, requests.Timeout):
                 # Never retry the current request after a transport failure: without
                 # a response, the client cannot know whether Manager applied it, and
@@ -365,20 +393,31 @@ class KvCacheManagerClient:
             )
 
             # SERVER_NOT_LEADER handling: rediscover leader and retry with backoff
-            if self._auto_discover_leader and self._get_status_code(response_data) == 'SERVER_NOT_LEADER':
+            if (
+                self._auto_discover_leader
+                and self._get_status_code(response_data) == "SERVER_NOT_LEADER"
+            ):
                 if retries_left > 0:
                     retries_left -= 1
                     attempt = self._leader_retry_count - retries_left  # 1-based
-                    sleep_time = self._leader_retry_base_interval * attempt + random.uniform(
-                        0, self._leader_retry_base_interval)
-                    logger.warning("Request to %s returned SERVER_NOT_LEADER, "
-                                   "retrying after %.3fs (retries left: %d)",
-                                   endpoint, sleep_time, retries_left)
+                    sleep_time = (
+                        self._leader_retry_base_interval * attempt
+                        + random.uniform(0, self._leader_retry_base_interval)
+                    )
+                    logger.warning(
+                        "Request to %s returned SERVER_NOT_LEADER, "
+                        "retrying after %.3fs (retries left: %d)",
+                        endpoint,
+                        sleep_time,
+                        retries_left,
+                    )
                     time.sleep(sleep_time)
                     if self._refresh_manager_route():
                         continue
                 if retries_left <= 0:
-                    logger.error("All leader discovery retries exhausted for %s", endpoint)
+                    logger.error(
+                        "All leader discovery retries exhausted for %s", endpoint
+                    )
 
             if check_response:
                 self._check_response(endpoint, response, response_data)
@@ -387,51 +426,53 @@ class KvCacheManagerClient:
 
     def register_instance(self, data, check_response=True):
         """Register an instance with the service"""
-        return self._make_api_request('/api/registerInstance', data, check_response)
+        return self._make_api_request("/api/registerInstance", data, check_response)
 
     def get_instance_info(self, data, check_response=True):
         """Get information about a registered instance"""
-        return self._make_api_request('/api/getInstanceInfo', data, check_response)
+        return self._make_api_request("/api/getInstanceInfo", data, check_response)
 
     def get_cache_meta(self, data, check_response=True):
         """Get cache metadata for specified block keys"""
-        return self._make_api_request('/api/getCacheMeta', data, check_response)
+        return self._make_api_request("/api/getCacheMeta", data, check_response)
 
     def get_cache_location(self, data, check_response=True):
         """Get cache location for specified block keys"""
-        return self._make_api_request('/api/getCacheLocation', data, check_response)
+        return self._make_api_request("/api/getCacheLocation", data, check_response)
 
     def get_cache_location_len(self, data, check_response=True):
         """Get the number of cache locations matching the specified block keys"""
-        return self._make_api_request('/api/getCacheLocationLen', data, check_response)
+        return self._make_api_request("/api/getCacheLocationLen", data, check_response)
 
     def get_cache_locations_by_backend(self, data, check_response=True):
         """Get cache locations selected independently for each storage backend."""
-        return self._make_api_request('/api/getCacheLocationsByBackend', data, check_response)
+        return self._make_api_request(
+            "/api/getCacheLocationsByBackend", data, check_response
+        )
 
     def start_write_cache(self, data, check_response=True):
         """Start writing cache data"""
-        return self._make_api_request('/api/startWriteCache', data, check_response)
+        return self._make_api_request("/api/startWriteCache", data, check_response)
 
     def finish_write_cache(self, data, check_response=True):
         """Finish writing cache data"""
-        return self._make_api_request('/api/finishWriteCache', data, check_response)
+        return self._make_api_request("/api/finishWriteCache", data, check_response)
 
     def remove_cache(self, data, check_response=True):
         """Remove cache data for specified block keys"""
-        return self._make_api_request('/api/removeCache', data, check_response)
+        return self._make_api_request("/api/removeCache", data, check_response)
 
     def report_event(self, data, check_response=True):
         """Report node, cache block, host-down, or heartbeat events."""
-        return self._make_api_request('/api/reportEvent', data, check_response)
+        return self._make_api_request("/api/reportEvent", data, check_response)
 
     def trim_cache(self, data, check_response=True):
         """Trim cache data based on specified strategy"""
-        return self._make_api_request('/api/trimCache', data, check_response)
+        return self._make_api_request("/api/trimCache", data, check_response)
 
     def get_cluster_info(self, data, check_response=True):
         """Get cluster info including leader endpoint (leader discovery API)"""
-        return self._make_api_request('/api/getClusterInfo', data, check_response)
+        return self._make_api_request("/api/getClusterInfo", data, check_response)
 
     def _close_session_once(self):
         with self._resource_lock:

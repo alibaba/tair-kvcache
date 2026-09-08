@@ -63,8 +63,8 @@ class LocationQueryFanoutTest(unittest.TestCase):
 
     def _manager(self, async_mode=True):
         return LocationQueryManager(
-            self.client, self.executor, "inst",
-            async_get_cache_location=async_mode)
+            self.client, self.executor, "inst", async_get_cache_location=async_mode
+        )
 
     def _await_answer(self, lqm, offset):
         """Pump the hook until the slot answers; assert the client was hit."""
@@ -95,13 +95,15 @@ class LocationQueryFanoutTest(unittest.TestCase):
         for _ in range(5):  # scheduler re-asks while the query is on the wire
             self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
         time.sleep(0.2)
-        self.assertEqual(self.client.calls, 1,
-                         "re-asks while in flight must not issue new queries")
+        self.assertEqual(
+            self.client.calls, 1, "re-asks while in flight must not issue new queries"
+        )
 
         self._gate(0).set()
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
-        self.assertEqual(self.client.calls, 1,
-                         "cached answer must be served without a new query")
+        self.assertEqual(
+            self.client.calls, 1, "cached answer must be served without a new query"
+        )
 
     # ------------------------------------------------------------------ #
     # Supersession: a different offset is a different query
@@ -124,14 +126,17 @@ class LocationQueryFanoutTest(unittest.TestCase):
         # older offset's in-flight query -- and once superseded, the older
         # offset is no longer addressable: asking it again supersedes back.
         lqm = self._manager()
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # RPC #1
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # RPC #2
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # RPC #1
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))  # RPC #2
         self.assertEqual(self.client.calls, 2)
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # same key: dedup
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))  # same key: dedup
         self.assertEqual(self.client.calls, 2)
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # older offset
-        self.assertEqual(self.client.calls, 3,                        # supersedes back
-                         "asking the superseded offset must re-issue, not serve")
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # older offset
+        self.assertEqual(
+            self.client.calls,
+            3,  # supersedes back
+            "asking the superseded offset must re-issue, not serve",
+        )
 
     def test_superseded_answer_is_not_served_at_its_offset(self):
         # offset 0 answered, then superseded by offset 8: even when offset 8
@@ -141,10 +146,10 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # submit
         self._gate(0).set()
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # supersede
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))  # supersede
         self._gate(1).set()
         self.assertEqual(self._await_answer(lqm, 8), ["loc0", "loc1"])
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # fresh RPC
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # fresh RPC
         self._gate(2)  # wait until the fresh query reaches the client
         self.assertEqual(self.client.calls, 3)
 
@@ -155,9 +160,9 @@ class LocationQueryFanoutTest(unittest.TestCase):
         # Old ask answered first: its answer must be dropped, the new slot
         # stays in flight until its own answer lands.
         lqm = self._manager()
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # RPC #1
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # RPC #2
-        self._gate(0).set()                                    # old answers
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # RPC #1
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))  # RPC #2
+        self._gate(0).set()  # old answers
         deadline = time.time() + 5
         while time.time() < deadline and self.client.calls < 2:
             time.sleep(0.01)
@@ -172,14 +177,17 @@ class LocationQueryFanoutTest(unittest.TestCase):
         # overwrite the new slot's answer.
         lqm = self._manager()
         self.client.answers = [["old_answers"], ["new_answers"]]
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))   # RPC #1
-        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))   # RPC #2
-        self._gate(1).set()                                    # new answers
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # RPC #1
+        self.assertIsNone(lqm.get_locations_for_query(self.req, 8))  # RPC #2
+        self._gate(1).set()  # new answers
         self.assertEqual(self._await_answer(lqm, 8), ["new_answers"])
-        self._gate(0).set()                                    # old answers late
+        self._gate(0).set()  # old answers late
         time.sleep(0.2)
-        self.assertEqual(lqm.get_locations_for_query(self.req, 8), ["new_answers"],
-                         "the superseded ask must not overwrite the new slot")
+        self.assertEqual(
+            lqm.get_locations_for_query(self.req, 8),
+            ["new_answers"],
+            "the superseded ask must not overwrite the new slot",
+        )
 
     # ------------------------------------------------------------------ #
     # Failure and sync mode
@@ -207,8 +215,7 @@ class LocationQueryFanoutTest(unittest.TestCase):
             time.sleep(0.01)
         # The next ask re-issues instead of waiting forever on a dead slot.
         restore = GatedClient.get_cache_location
-        self.client.get_cache_location = \
-            lambda request: restore(self.client, request)
+        self.client.get_cache_location = lambda request: restore(self.client, request)
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # re-issue
         self._gate(0).set()
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
@@ -242,8 +249,7 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self.assertEqual(self._await_answer(lqm, 0), ["loc0", "loc1"])
         # Well inside the horizon: re-asks keep serving the cached answer.
         for _ in range(3):
-            self.assertEqual(lqm.get_locations_for_query(self.req, 0),
-                             ["loc0", "loc1"])
+            self.assertEqual(lqm.get_locations_for_query(self.req, 0), ["loc0", "loc1"])
         self.assertEqual(self.client.calls, 1)
         self.assertEqual(lqm.stale_supersede_count, 0)
 
@@ -264,10 +270,10 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self._gate(0).set()
         self._await_answer(lqm, 0)
         self._expire(lqm)
-        lqm.store_result("r1", ["loc0"])     # the hook's clamp, post-answer
+        lqm.store_result("r1", ["loc0"])  # the hook's clamp, post-answer
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))  # expired: miss
         self._gate(1).set()
-        self._await_answer(lqm, 0)           # re-answered fresh
+        self._await_answer(lqm, 0)  # re-answered fresh
         self.assertEqual(lqm.consume_locations("r1"), (["loc0", "loc1"], 0))
 
     # ------------------------------------------------------------------ #
@@ -288,7 +294,7 @@ class LocationQueryFanoutTest(unittest.TestCase):
         # resurrect a slot for a request vLLM already moved past.
         lqm = self._manager()
         self.assertIsNone(lqm.get_locations_for_query(self.req, 0))
-        self.assertIsNone(lqm.consume_locations("r1"))   # pops the in-flight slot
+        self.assertIsNone(lqm.consume_locations("r1"))  # pops the in-flight slot
         self._gate(0).set()
         time.sleep(0.2)
         with lqm._lock:
@@ -307,8 +313,9 @@ class LocationQueryFanoutTest(unittest.TestCase):
         self._gate(0).set()
         time.sleep(0.2)
         with lqm._lock:
-            self.assertNotIn("r1", lqm._queries,
-                             "a late answer must not resurrect the slot")
+            self.assertNotIn(
+                "r1", lqm._queries, "a late answer must not resurrect the slot"
+            )
 
 
 if __name__ == "__main__":

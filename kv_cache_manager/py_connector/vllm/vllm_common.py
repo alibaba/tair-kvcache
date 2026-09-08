@@ -63,12 +63,18 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     attn_specs = sorted(
         spec_name(rank, meta.group_idx)
         for rank in range(tp_size)
-        for meta in group_metas if isinstance(meta, AttentionGroupMeta))
+        for meta in group_metas
+        if isinstance(meta, AttentionGroupMeta)
+    )
     all_specs = sorted(
         spec_name(rank, meta.group_idx)
-        for rank in range(tp_size) for meta in group_metas)
-    return [{"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
-            {"name": ALL_SPEC_GROUP, "spec_names": all_specs}]
+        for rank in range(tp_size)
+        for meta in group_metas
+    )
+    return [
+        {"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
+        {"name": ALL_SPEC_GROUP, "spec_names": all_specs},
+    ]
 
 
 @dataclass(frozen=True)
@@ -109,17 +115,21 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
     metas = []
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
         if getattr(group, "is_eagle_group", False):
-            logger.warning("skip eagle group %d (%d layers)", idx, len(group.layer_names))
+            logger.warning(
+                "skip eagle group %d (%d layers)", idx, len(group.layer_names)
+            )
             continue
         spec = group.kv_cache_spec
         if isinstance(spec, MambaSpec):
-            metas.append(StateGroupMeta(
-                group_idx=idx,
-                layer_names=list(group.layer_names),
-                block_size=spec.block_size,
-                per_block_bytes=spec.page_size_bytes * len(group.layer_names),
-                page_size_bytes=spec.page_size_bytes,
-            ))
+            metas.append(
+                StateGroupMeta(
+                    group_idx=idx,
+                    layer_names=list(group.layer_names),
+                    block_size=spec.block_size,
+                    per_block_bytes=spec.page_size_bytes * len(group.layer_names),
+                    page_size_bytes=spec.page_size_bytes,
+                )
+            )
         elif isinstance(spec, FullAttentionSpec):
             # FullAttentionSpec doubles as the merged spec of hybrid
             # SWA/chunked-attention models (vLLM merges window layers into
@@ -132,7 +142,8 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
                         f"group {idx}: FullAttentionSpec has {window_field}="
                         f"{getattr(spec, window_field)}; sliding-window / "
                         f"chunked attention KV is not full-prefix and is "
-                        f"not yet supported by TairKvCacheConnector")
+                        f"not yet supported by TairKvCacheConnector"
+                    )
             # Attention KV is token-granular; scale from the spec's page size
             # to the manager block size. Use the *compact* page size:
             # spec.page_size_bytes returns page_size_padded when set, which
@@ -147,23 +158,28 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
                         f"group {idx}: page_size_padded="
                         f"{spec.page_size_padded} but this vLLM exposes no "
                         f"real_page_size_bytes to recover the compact page "
-                        f"size; padded attention layouts are unsupported here")
+                        f"size; padded attention layouts are unsupported here"
+                    )
                 compact_page_bytes = spec.page_size_bytes
             per_token_bytes = compact_page_bytes // spec.block_size
-            metas.append(AttentionGroupMeta(
-                group_idx=idx,
-                layer_names=list(group.layer_names),
-                block_size=spec.block_size,
-                per_block_bytes=per_token_bytes * manager_block_size * len(group.layer_names),
-            ))
+            metas.append(
+                AttentionGroupMeta(
+                    group_idx=idx,
+                    layer_names=list(group.layer_names),
+                    block_size=spec.block_size,
+                    per_block_bytes=per_token_bytes
+                    * manager_block_size
+                    * len(group.layer_names),
+                )
+            )
         else:
             raise NotImplementedError(
-                f"Unsupported kv cache spec {type(spec).__name__} in group {idx}")
+                f"Unsupported kv cache spec {type(spec).__name__} in group {idx}"
+            )
     if not metas:
         # Every group was skipped (all-EAGLE config or an empty group list):
         # nothing to transfer, refuse explicitly instead of asserting.
-        raise NotImplementedError(
-            "no usable kv cache groups (all groups skipped?)")
+        raise NotImplementedError("no usable kv cache groups (all groups skipped?)")
     if not any(isinstance(m, AttentionGroupMeta) for m in metas):
         # Pure-mamba / attention-free models have no attention KV to
         # transfer; the register_kv_caches path would fail obscurely later
@@ -171,7 +187,8 @@ def parse_groups(kv_cache_config, manager_block_size: int) -> List[GroupMeta]:
         raise NotImplementedError(
             "pure-mamba / attention-free models are not supported: "
             "TairKvCacheConnector transfers full-attention or hybrid "
-            "(attention + mamba) KV caches only")
+            "(attention + mamba) KV caches only"
+        )
     return metas
 
 
@@ -205,7 +222,8 @@ def attn_kv_views(ref: torch.Tensor) -> tuple:
         if kv_first and n_first:
             raise NotImplementedError(
                 f"ambiguous kv layout {tuple(ref.shape)}: cannot tell the K/V "
-                f"dim from a num_blocks dim of size 2")
+                f"dim from a num_blocks dim of size 2"
+            )
         if kv_first:
             return [ref[0], ref[1]], KVLayout.SPLIT_KV_5D_KV_FIRST
         if n_first:
@@ -213,7 +231,8 @@ def attn_kv_views(ref: torch.Tensor) -> tuple:
     raise NotImplementedError(
         f"unrecognized kv cache layout {tuple(ref.shape)}; expected the packed "
         f"4-D (vllm >= 0.26.0) or one of the split K/V 5-D layouts "
-        f"(vllm <= 0.25.x)")
+        f"(vllm <= 0.25.x)"
+    )
 
 
 def _hybrid_external_load_supported() -> Optional[bool]:
@@ -233,12 +252,14 @@ def _hybrid_external_load_supported() -> Optional[bool]:
     """
     try:
         from vllm.v1.core.sched.scheduler import Scheduler
+
         method = Scheduler._mamba_block_aligned_split
     except (ImportError, AttributeError):
         # No such method: the blocking assert was removed/refactored away.
         return True
     try:
         import inspect
+
         src = inspect.getsource(method)
     except Exception:
         return None  # method exists but cannot be inspected
@@ -262,7 +283,8 @@ def ensure_hybrid_supported(force: bool = False):
                 "force_hybrid_support=true: skipping the hybrid external-load "
                 "capability probe; if this vLLM's scheduler still asserts "
                 "'External KV connector is not verified yet' the first "
-                "external match will crash it")
+                "external match will crash it"
+            )
             return
         raise NotImplementedError(
             "TairKvCacheConnector: cannot verify that this vLLM supports "
@@ -270,12 +292,14 @@ def ensure_hybrid_supported(force: bool = False):
             "Scheduler._mamba_block_aligned_split exists but its source is "
             "unavailable, so the vllm <= 0.22.x blocking assert cannot be "
             "ruled out. If you know this vLLM is >= 0.23.0, set "
-            "kv_connector_extra_config {\"force_hybrid_support\": true} to "
-            "bypass this check.")
+            'kv_connector_extra_config {"force_hybrid_support": true} to '
+            "bypass this check."
+        )
     raise NotImplementedError(
         "TairKvCacheConnector: this vLLM version cannot combine hybrid "
         "(mamba) models with an external KV connector -- its scheduler "
         "asserts num_external_computed_tokens == 0 in "
         "_mamba_block_aligned_split ('External KV connector is not "
         "verified yet'). Upgrade to vLLM >= 0.23.0 for hybrid model "
-        "support; full-attention models are unaffected.")
+        "support; full-attention models are unaffected."
+    )

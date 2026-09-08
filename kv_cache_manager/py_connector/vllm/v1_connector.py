@@ -48,7 +48,10 @@ from kv_cache_manager.py_connector.common.logger import logger, configure_log_le
 try:
     # Stamped into the wheel at build time; absent in a source checkout.
     from kv_cache_manager.py_connector.common._version_info import (
-        FULL_VERSION, GIT_COMMIT, BUILD_TIME)
+        FULL_VERSION,
+        GIT_COMMIT,
+        BUILD_TIME,
+    )
 except ImportError:
     FULL_VERSION, GIT_COMMIT, BUILD_TIME = "dev", "source", "source"
 
@@ -57,8 +60,14 @@ from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorSche
 from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    GroupMeta, StateGroupMeta, attn_kv_views, build_spec_groups,
-    ensure_hybrid_supported, parse_groups, spec_name)
+    GroupMeta,
+    StateGroupMeta,
+    attn_kv_views,
+    build_spec_groups,
+    ensure_hybrid_supported,
+    parse_groups,
+    spec_name,
+)
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -70,45 +79,64 @@ if typing.TYPE_CHECKING:
 # Compatibility re-exports: tests and the e2e harness import these from
 # v1_connector (their original home before the role split).
 __all__ = [
-    "TairKvCacheConnector", "attn_kv_views", "ensure_hybrid_supported",
-    "GroupMeta", "spec_name", "build_spec_groups", "parse_groups",
+    "TairKvCacheConnector",
+    "attn_kv_views",
+    "ensure_hybrid_supported",
+    "GroupMeta",
+    "spec_name",
+    "build_spec_groups",
+    "parse_groups",
 ]
 
 
 class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
-
     # ------------------------------------------------------------------ #
     # Init / registration (role-agnostic)
     # ------------------------------------------------------------------ #
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole,
-                 kv_cache_config: Optional["KVCacheConfig"] = None):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
+    ):
         super().__init__(vllm_config, role, kv_cache_config)
-        assert kv_cache_config is not None, \
+        assert kv_cache_config is not None, (
             "TairKvCacheConnector requires vLLM to pass kv_cache_config (vllm >= 0.11.1)"
+        )
 
-        logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)",
-                       FULL_VERSION, GIT_COMMIT, BUILD_TIME)
+        logger.warning(
+            "KVCM vllm connector version: %s (commit: %s, build: %s)",
+            FULL_VERSION,
+            GIT_COMMIT,
+            BUILD_TIME,
+        )
 
         extra_config = TairKvCacheConnectorExtraConfig(
-            **vllm_config.kv_transfer_config.kv_connector_extra_config)
+            **vllm_config.kv_transfer_config.kv_connector_extra_config
+        )
         configure_log_level(extra_config.log_level)
 
         model_config = vllm_config.model_config
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
         if getattr(model_config, "use_mla", False):
-            raise NotImplementedError("MLA models are not supported by TairKvCacheConnector")
+            raise NotImplementedError(
+                "MLA models are not supported by TairKvCacheConnector"
+            )
 
         self._vllm_block_size = vllm_config.cache_config.block_size
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
         self._kv_dtype = get_kv_cache_torch_dtype(
-            vllm_config.cache_config.cache_dtype, model_config.dtype)
+            vllm_config.cache_config.cache_dtype, model_config.dtype
+        )
 
         # Manager block size: attention KV is token-granular and can be re-blocked,
         # but mamba state exists once per scheduler block, so hybrid models must
         # keep manager block == scheduler block.
         manager_block_size = self._vllm_block_size
         self._has_state_groups = any(
-            isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups)
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in kv_cache_config.kv_cache_groups
+        )
         if self._has_state_groups:
             ensure_hybrid_supported(force=extra_config.force_hybrid_support)
         if extra_config.preferred_block_size != 0:
@@ -116,8 +144,10 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 if extra_config.preferred_block_size != self._vllm_block_size:
                     logger.warning(
                         "preferred_block_size=%d ignored for hybrid model: mamba state is "
-                        "per scheduler block (%d)", extra_config.preferred_block_size,
-                        self._vllm_block_size)
+                        "per scheduler block (%d)",
+                        extra_config.preferred_block_size,
+                        self._vllm_block_size,
+                    )
             else:
                 manager_block_size = extra_config.preferred_block_size
         self._manager_block_size = manager_block_size
@@ -135,7 +165,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info("deployment: %s, groups: %s", deployment, self._group_metas)
 
         self._manager_client = KvCacheManagerClient.from_connector_config(
-            extra_config.model_dump())
+            extra_config.model_dump()
+        )
         host_ip = get_ip()
 
         register_request = {
@@ -146,7 +177,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "block_size": manager_block_size,
             "location_spec_infos": [
                 {"name": spec_name(rank, meta.group_idx), "size": meta.per_block_bytes}
-                for rank in range(self._tp_size) for meta in self._group_metas
+                for rank in range(self._tp_size)
+                for meta in self._group_metas
             ],
         }
         spec_groups = build_spec_groups(self._group_metas, self._tp_size)
@@ -162,20 +194,33 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker: Optional[ConnectorWorker] = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = ConnectorScheduler(
-                extra_config, self._group_metas, manager_block_size,
-                self._vllm_block_size, self._tp_size, self._manager_client,
-                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port))
+                extra_config,
+                self._group_metas,
+                manager_block_size,
+                self._vllm_block_size,
+                self._tp_size,
+                self._manager_client,
+                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+            )
             logger.warning(
                 "TairKvCacheConnector scheduler inited, extra_config: %r, "
                 "manager block size: %d, vllm block size: %d, groups: %d",
-                extra_config.model_dump(), manager_block_size,
-                self._vllm_block_size, len(self._group_metas))
+                extra_config.model_dump(),
+                manager_block_size,
+                self._vllm_block_size,
+                len(self._group_metas),
+            )
         else:
             self.connector_worker = ConnectorWorker(
-                extra_config, self._group_metas, manager_block_size,
-                self._tp_size, host_ip, self._manager_client,
+                extra_config,
+                self._group_metas,
+                manager_block_size,
+                self._tp_size,
+                host_ip,
+                self._manager_client,
                 TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
-                register_response)
+                register_response,
+            )
 
     def shutdown(self):
         if self.connector_scheduler is not None:
@@ -186,28 +231,31 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------ #
     # Scheduler hooks (called on the scheduler-role instance)
     # ------------------------------------------------------------------ #
-    def get_num_new_matched_tokens(self, request: "Request",
-                                   num_computed_tokens: int):
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens)
+            request, num_computed_tokens
+        )
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
-                                 num_external_tokens: int):
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens)
+            request, blocks, num_external_tokens
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
 
-    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
-    def request_finished_all_groups(self, request: "Request",
-                                    block_ids) -> tuple:
+    def request_finished_all_groups(self, request: "Request", block_ids) -> tuple:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
@@ -240,16 +288,20 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         self.connector_worker.start_load_kv(
-            forward_context, self._get_connector_metadata(), **kwargs)
+            forward_context, self._get_connector_metadata(), **kwargs
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         assert self.connector_worker is not None
         self.connector_worker.wait_for_layer_load(layer_name)
 
-    def save_kv_layer(self, layer_name: str, kv_layer,
-                      attn_metadata: "AttentionMetadata", **kwargs) -> None:
+    def save_kv_layer(
+        self, layer_name: str, kv_layer, attn_metadata: "AttentionMetadata", **kwargs
+    ) -> None:
         assert self.connector_worker is not None
-        self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+        self.connector_worker.save_kv_layer(
+            layer_name, kv_layer, attn_metadata, **kwargs
+        )
 
     def wait_for_save(self):
         assert self.connector_worker is not None
@@ -258,7 +310,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(
-            finished_req_ids, self._get_connector_metadata())
+            finished_req_ids, self._get_connector_metadata()
+        )
 
     def get_block_ids_with_load_errors(self) -> set:
         assert self.connector_worker is not None

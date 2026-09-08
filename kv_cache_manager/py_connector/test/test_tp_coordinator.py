@@ -20,7 +20,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 def _find_free_port():
     """Find a free TCP port."""
     with socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(("", 0))
         return s.getsockname()[1]
 
 
@@ -29,7 +29,7 @@ def _wait_for_server(port, timeout=5.0):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            with socket_module.create_connection(('127.0.0.1', port), timeout=0.1):
+            with socket_module.create_connection(("127.0.0.1", port), timeout=0.1):
                 time.sleep(0.05)  # Extra time for coordinator to enter recv loop
                 return True
         except (ConnectionRefusedError, socket_module.timeout):
@@ -157,7 +157,9 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
         )
         self.client.send(CoordinateMsgSerializer.dumps(start_msg))
 
-        self.assertTrue(self.callback_event.wait(timeout=5), "Callback not triggered after start")
+        self.assertTrue(
+            self.callback_event.wait(timeout=5), "Callback not triggered after start"
+        )
         self.assertEqual(len(self.callback_results), 1)
         session_id, save_context = self.callback_results[0]
         self.assertEqual(session_id, "session-1")

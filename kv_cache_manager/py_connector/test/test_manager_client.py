@@ -221,11 +221,13 @@ class TestRequestTimeout(unittest.TestCase):
                     )
 
     def test_connector_config_forwards_request_timeout(self):
-        client = KvCacheManagerClient.from_connector_config({
-            "manager_uri": "http://10.0.0.1:8080",
-            "instance_id": "connector-instance",
-            "request_timeout_seconds": 3.5,
-        })
+        client = KvCacheManagerClient.from_connector_config(
+            {
+                "manager_uri": "http://10.0.0.1:8080",
+                "instance_id": "connector-instance",
+                "request_timeout_seconds": 3.5,
+            }
+        )
         try:
             self.assertEqual(client._instance_id, "connector-instance")
             self.assertEqual(client._request_timeout_seconds, 3.5)
@@ -233,9 +235,11 @@ class TestRequestTimeout(unittest.TestCase):
             client.close()
 
     def test_connector_config_uses_request_timeout_default(self):
-        client = KvCacheManagerClient.from_connector_config({
-            "manager_uri": "http://10.0.0.1:8080",
-        })
+        client = KvCacheManagerClient.from_connector_config(
+            {
+                "manager_uri": "http://10.0.0.1:8080",
+            }
+        )
         try:
             self.assertEqual(client._request_timeout_seconds, 1.0)
         finally:
@@ -304,14 +308,16 @@ class TestResponseClassification(unittest.TestCase):
 
     def test_manager_business_error_keeps_assertion_contract(self):
         self.client.session.post = MagicMock(
-            return_value=_make_mock_response({
-                "header": {
-                    "status": {
-                        "code": "INVALID_ARGUMENT",
-                        "message": "bad request",
+            return_value=_make_mock_response(
+                {
+                    "header": {
+                        "status": {
+                            "code": "INVALID_ARGUMENT",
+                            "message": "bad request",
+                        }
                     }
                 }
-            })
+            )
         )
 
         with self.assertRaises(AssertionError) as caught:
@@ -338,7 +344,9 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_init_discovers_leader_and_switches(self, mock_post):
         """Init should discover leader via getClusterInfo and switch base_url."""
-        mock_post.return_value = _make_mock_response(_cluster_info_response("10.0.0.99", 9090))
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
 
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=True)
         try:
@@ -353,7 +361,9 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_init_discovery_includes_instance_id(self, mock_post):
         """Discovery request should include instance_id in the request body."""
-        mock_post.return_value = _make_mock_response(_cluster_info_response("10.0.0.99", 9090))
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
 
         client = KvCacheManagerClient(
             "http://10.0.0.1:8080",
@@ -423,7 +433,11 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
         """leader_endpoint with missing host should keep original base_url."""
         resp_data = {
             "header": {"status": {"code": "OK", "message": ""}},
-            "leader_endpoint": {"node_id": "node-0", "host": "", "meta_http_port": 8080},
+            "leader_endpoint": {
+                "node_id": "node-0",
+                "host": "",
+                "meta_http_port": 8080,
+            },
         }
         mock_post.return_value = _make_mock_response(resp_data)
 
@@ -435,7 +449,9 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
 
     def test_init_auto_discover_disabled(self):
         """auto_discover_leader=False should not start discovery or background thread."""
-        client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=False)
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080", auto_discover_leader=False
+        )
         try:
             self.assertEqual(client.base_url, "http://10.0.0.1:8080")
             self.assertIsNone(client._refresh_thread)
@@ -464,7 +480,9 @@ class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):
     def test_discover_uses_discovery_url_not_base_url(self, mock_post):
         """After switching to leader, re-discovery should still query the seed url."""
         # Init: discover leader, switch base_url to 10.0.0.99:9090
-        mock_post.return_value = _make_mock_response(_cluster_info_response("10.0.0.99", 9090))
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=True)
         self.assertEqual(client.base_url, "http://10.0.0.99:9090")
         self.assertEqual(client._discovery_url, "http://10.0.0.1:8080")
@@ -781,7 +799,9 @@ class TestCloseLifecycle(unittest.TestCase):
 
     def test_close_without_discovery(self):
         """close() should work fine when auto_discover_leader=False."""
-        client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=False)
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080", auto_discover_leader=False
+        )
         client.close()  # Should not raise
         self.assertTrue(client._closed.is_set())
 
@@ -966,9 +986,7 @@ class TestMetaServiceApiWrappers(unittest.TestCase):
         self, mock_make_api_request
     ):
         """Backend-aware lookup should use getCacheLocationsByBackend."""
-        mock_make_api_request.return_value = _ok_response_json(
-            {"key_locations": []}
-        )
+        mock_make_api_request.return_value = _ok_response_json({"key_locations": []})
         client = KvCacheManagerClient("http://10.0.0.1:8080")
         self.addCleanup(client.close)
         request = {
@@ -1059,7 +1077,9 @@ class TestNormalApiStillWorks(unittest.TestCase):
 
     def test_api_works_without_discovery(self):
         """API calls should work with auto_discover_leader=False."""
-        client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=False)
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080", auto_discover_leader=False
+        )
 
         ok_resp = _ok_response_json({"locations": []})
 
@@ -1082,7 +1102,9 @@ class TestNormalApiStillWorks(unittest.TestCase):
         client = KvCacheManagerClient("http://10.0.0.1:8080", auto_discover_leader=True)
 
         error_resp = {
-            "header": {"status": {"code": "INTERNAL_ERROR", "message": "something broke"}}
+            "header": {
+                "status": {"code": "INTERNAL_ERROR", "message": "something broke"}
+            }
         }
 
         def mock_session_post(url, **kwargs):

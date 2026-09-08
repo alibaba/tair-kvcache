@@ -3,7 +3,9 @@
 Requires a running KV Cache Manager process and CUDA device.
 Mirrors test_linear.py structure but replaces Mamba with Indexer.
 """
+
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 
 import subprocess
@@ -90,11 +92,15 @@ def _stop_manager():
 def _start_manager():
     global proc
     subprocess.run("rm -rf /root/KVCacheManager/logs/*", shell=True, check=False)
-    proc = subprocess.Popen([
-        f"{kvcm_home}/bin/kv_cache_manager_bin",
-        "-c", f"{kvcm_home}/etc/default_server_config.conf",
-        "-l", f"{kvcm_home}/etc/default_logger_config.conf"
-    ])
+    proc = subprocess.Popen(
+        [
+            f"{kvcm_home}/bin/kv_cache_manager_bin",
+            "-c",
+            f"{kvcm_home}/etc/default_server_config.conf",
+            "-l",
+            f"{kvcm_home}/etc/default_logger_config.conf",
+        ]
+    )
     signal.signal(signal.SIGINT, _stop_manager)
     signal.signal(signal.SIGTERM, _stop_manager)
     atexit.register(_stop_manager)
@@ -106,6 +112,7 @@ def _start_manager():
 # Mock Indexer Pool
 # ============================================================
 
+
 class MockIndexerPoolHost:
     """Lightweight mock of NSAIndexerPoolHost for testing.
 
@@ -114,8 +121,15 @@ class MockIndexerPoolHost:
     so the connector can do zero-copy I/O.
     """
 
-    def __init__(self, page_num, page_size_val, layer_num_val,
-                 index_head_dim, quant_block_size, dtype):
+    def __init__(
+        self,
+        page_num,
+        page_size_val,
+        layer_num_val,
+        index_head_dim,
+        quant_block_size,
+        dtype,
+    ):
         self.page_num = page_num
         self.page_size = page_size_val
         self.layer_num = layer_num_val
@@ -126,8 +140,7 @@ class MockIndexerPoolHost:
         self.layout = "page_first_direct"
 
         self.indexer_size_per_token = (
-            index_head_dim
-            + index_head_dim // quant_block_size * 4
+            index_head_dim + index_head_dim // quant_block_size * 4
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * page_size_val * dtype.itemsize
@@ -143,9 +156,7 @@ class MockIndexerPoolHost:
 
     def get_size_per_token(self):
         return (
-            self.indexer_size_per_token
-            * self.layer_num
-            * self.indexer_dtype.itemsize
+            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
     def get_page_buffer_meta(self, indices):
@@ -157,9 +168,7 @@ class MockIndexerPoolHost:
         indices = indices.tolist()
         ptr_list = []
         page_stride_bytes = (
-            self.layer_num
-            * self.indexer_page_stride_size
-            * self.indexer_dtype.itemsize
+            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
         )
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
         for i in range(0, len(indices), self.page_size):
@@ -171,6 +180,7 @@ class MockIndexerPoolHost:
 # ============================================================
 # Setup helpers
 # ============================================================
+
 
 def _create_pools():
     device_pool = MHATokenToKVPool(
@@ -252,7 +262,7 @@ def _create_indexer_backend(kv_pool_host, indexer_pool, instance_id, num_blocks=
     block_hash = None
     kv_host_indices = []
     for i in range(0, num_blocks * page_size, page_size):
-        block_hash = get_hash_str(token_ids[i:i + page_size], block_hash)
+        block_hash = get_hash_str(token_ids[i : i + page_size], block_hash)
         block_hashes.append(block_hash)
         kv_host_indices.extend(range(i, i + page_size))
 
@@ -281,11 +291,11 @@ def _fill_indexer_buffer(indexer_pool, num_blocks):
 # Tests
 # ============================================================
 
+
 def test_indexer_hybrid(kv_pool_host, indexer_pool):
     """Basic hybrid: set_v2 (Indexer) + set_v1 (KV), then exists_v2, get_v2 with data verification."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_hybrid_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_hybrid_0")
     )
     num_blocks = len(block_hashes)
 
@@ -335,18 +345,17 @@ def test_indexer_hybrid(kv_pool_host, indexer_pool):
     )
 
     for i in range(num_blocks):
-        assert torch.equal(
-            indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]
-        ), f"Indexer data mismatch at page {i}"
+        assert torch.equal(indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]), (
+            f"Indexer data mismatch at page {i}"
+        )
 
     logger.info("test_indexer_hybrid passed!")
 
 
 def test_indexer_write_kv_only(kv_pool_host, indexer_pool):
     """Write KV only -> batch_exists_v2 shows KV hit but Indexer boundary=0."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_kv_only_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_kv_only_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -381,9 +390,8 @@ def test_indexer_write_kv_only(kv_pool_host, indexer_pool):
 
 def test_indexer_write_indexer_only(kv_pool_host, indexer_pool):
     """Write Indexer only (no KV) -> kv_hit_pages should be 0."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_only_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_only_0")
     )
     num_blocks = len(block_hashes)
     _fill_indexer_buffer(indexer_pool, num_blocks)
@@ -407,9 +415,8 @@ def test_indexer_write_indexer_only(kv_pool_host, indexer_pool):
 
 def test_indexer_kv_first_then_indexer(kv_pool_host, indexer_pool):
     """Write KV first, then Indexer. Both should succeed and verify data."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_cross_order_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_cross_order_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -464,18 +471,17 @@ def test_indexer_kv_first_then_indexer(kv_pool_host, indexer_pool):
     assert all(get_v2_result[PoolName.INDEXER])
 
     for i in range(num_blocks):
-        assert torch.equal(
-            indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]
-        ), f"Indexer data mismatch at page {i}"
+        assert torch.equal(indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]), (
+            f"Indexer data mismatch at page {i}"
+        )
 
     logger.info("test_indexer_kv_first_then_indexer passed!")
 
 
 def test_indexer_full_round_trip(kv_pool_host, indexer_pool):
     """Complete write-clear-read-verify cycle for both KV and Indexer."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_full_rt_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_full_rt_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -519,8 +525,12 @@ def test_indexer_full_round_trip(kv_pool_host, indexer_pool):
         actual = torch.mean(tensor_i).item()
         expected = bf16_i.item()
         if actual != expected:
-            print(f"[KV-VERIFY] i={i} page_id={page_id} token_id={token_id} actual={actual} expected={expected} tensor_shape={tensor_i.shape} sample={tensor_i.flatten()[:5]}")
-            assert False, f"KV data mismatch at i={i}: actual={actual} expected={expected}"
+            print(
+                f"[KV-VERIFY] i={i} page_id={page_id} token_id={token_id} actual={actual} expected={expected} tensor_shape={tensor_i.shape} sample={tensor_i.flatten()[:5]}"
+            )
+            assert False, (
+                f"KV data mismatch at i={i}: actual={actual} expected={expected}"
+            )
 
     # Verify Indexer
     for i in range(num_blocks):
@@ -534,24 +544,21 @@ def test_indexer_full_round_trip(kv_pool_host, indexer_pool):
 def test_indexer_all_pages_policy(kv_pool_host, indexer_pool):
     """Test ALL_PAGES boundary: only write Indexer for last N blocks,
     ALL_PAGES should truncate at first missing page."""
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_allpages_0"
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(kv_pool_host, indexer_pool, "indexer_allpages_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
     _fill_indexer_buffer(indexer_pool, num_blocks)
 
     # Write all KV blocks
-    set_v1 = storage_backend.batch_set_v1(
-        block_hashes, torch.tensor(kv_host_indices)
-    )
+    set_v1 = storage_backend.batch_set_v1(block_hashes, torch.tensor(kv_host_indices))
     assert all(set_v1)
 
     # Write Indexer only for last 3 blocks
     trailing_n = 3
     trailing_keys = block_hashes[-trailing_n:]
-    trailing_indexer_indices = indexer_host_indices[-trailing_n * page_size:]
+    trailing_indexer_indices = indexer_host_indices[-trailing_n * page_size :]
     trailing_transfer = PoolTransfer(
         name=PoolName.INDEXER,
         host_indices=torch.tensor(trailing_indexer_indices),
@@ -609,9 +616,10 @@ def test_indexer_partial_write_buffer_indexing(kv_pool_host, indexer_pool):
     num_blocks = 6
     first_n = 3
 
-    (storage_backend,
-     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
-        kv_pool_host, indexer_pool, "indexer_partial_idx_0", num_blocks=num_blocks
+    (storage_backend, block_hashes, kv_host_indices, indexer_host_indices) = (
+        _create_indexer_backend(
+            kv_pool_host, indexer_pool, "indexer_partial_idx_0", num_blocks=num_blocks
+        )
     )
 
     _fill_indexer_buffer(indexer_pool, num_blocks)
@@ -619,7 +627,7 @@ def test_indexer_partial_write_buffer_indexing(kv_pool_host, indexer_pool):
     # Step 1: Write Indexer for first 3 blocks — all new, save_indices = [0,1,2]
     first_transfer = PoolTransfer(
         name=PoolName.INDEXER,
-        host_indices=torch.tensor(indexer_host_indices[:first_n * page_size]),
+        host_indices=torch.tensor(indexer_host_indices[: first_n * page_size]),
         keys=block_hashes[:first_n],
         hit_policy=PoolHitPolicy.ALL_PAGES,
     )
@@ -654,11 +662,8 @@ def test_indexer_partial_write_buffer_indexing(kv_pool_host, indexer_pool):
     # Step 4: Verify each page has its own correct data (not swapped).
     # With the old bug, pages 3-5 would contain data from pages 0-2.
     for i in range(num_blocks):
-        assert torch.equal(
-            indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]
-        ), (
-            f"Indexer mismatch at page {i}: "
-            f"expected fill value {(i + 1) % 256}"
+        assert torch.equal(indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]), (
+            f"Indexer mismatch at page {i}: expected fill value {(i + 1) % 256}"
         )
 
     logger.info("test_indexer_partial_write_buffer_indexing passed!")

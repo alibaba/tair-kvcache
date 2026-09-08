@@ -23,13 +23,28 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.tp_coordinator import (
-    CoordinateMsgSerializer, CoordinateMessage, SendBlockStartEvent, TpCoordinatorClient)
-from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQueryManager
+    CoordinateMsgSerializer,
+    CoordinateMessage,
+    SendBlockStartEvent,
+    TpCoordinatorClient,
+)
+from kv_cache_manager.py_connector.vllm.location_query_manager import (
+    LocationQueryManager,
+)
 from kv_cache_manager.py_connector.vllm.metadata import (
-    FinishRequest, LoadRequest, SaveRequest, TairKvCacheConnectorMetadata)
+    FinishRequest,
+    LoadRequest,
+    SaveRequest,
+    TairKvCacheConnectorMetadata,
+)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
-    ATTN_ONLY_SPEC_GROUP, ALL_SPEC_GROUP, GroupMeta, StateGroupMeta,
-    build_spec_groups, spec_name)
+    ATTN_ONLY_SPEC_GROUP,
+    ALL_SPEC_GROUP,
+    GroupMeta,
+    StateGroupMeta,
+    build_spec_groups,
+    spec_name,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -46,6 +61,7 @@ class RequestLedger:
     read from it on demand (all_token_ids) and only its length is tracked
     here. ``has_saved_block_num`` anchors the incremental saves: blocks are
     saved once as the computed prefix crosses manager-block boundaries."""
+
     vllm_request: "Request"
     # Per kv_cache_group block table, in each group's own block_size units.
     block_ids_per_group: List[List[int]]
@@ -69,14 +85,22 @@ class RequestLedger:
 class ConnectorScheduler:
     """State and hooks for the scheduler-role connector instance."""
 
-    def __init__(self, extra_config, group_metas: List[GroupMeta],
-                 manager_block_size: int, vllm_block_size: int, tp_size: int,
-                 manager_client, coordinator_client: TpCoordinatorClient):
+    def __init__(
+        self,
+        extra_config,
+        group_metas: List[GroupMeta],
+        manager_block_size: int,
+        vllm_block_size: int,
+        tp_size: int,
+        manager_client,
+        coordinator_client: TpCoordinatorClient,
+    ):
         self._extra_config = extra_config
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
-        self._state_group_idxs = [m.group_idx for m in group_metas
-                                  if isinstance(m, StateGroupMeta)]
+        self._state_group_idxs = [
+            m.group_idx for m in group_metas if isinstance(m, StateGroupMeta)
+        ]
         self._manager_block_size = manager_block_size
         self._vllm_block_size = vllm_block_size
         self._tp_size = tp_size
@@ -84,11 +108,16 @@ class ConnectorScheduler:
         self._coordinator_client = coordinator_client
 
         self._epoch = 0
-        self._http_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kvcm_http_")
+        self._http_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="kvcm_http_"
+        )
         self._location_query_manager = LocationQueryManager(
-            manager_client, self._http_executor, extra_config.instance_id,
+            manager_client,
+            self._http_executor,
+            extra_config.instance_id,
             extra_config.async_get_cache_location,
-            extra_config.location_query_max_age_seconds)
+            extra_config.location_query_max_age_seconds,
+        )
 
         self._tracked: Dict[str, RequestLedger] = {}
         self._waiting_to_load_requests: List[LoadRequest] = []
@@ -118,7 +147,9 @@ class ConnectorScheduler:
                 return meta.block_size
         raise KeyError(f"no such transferred group: {group_idx}")
 
-    def _state_complete_mask(self, ledger: RequestLedger, manager_block_idxes) -> List[bool]:
+    def _state_complete_mask(
+        self, ledger: RequestLedger, manager_block_idxes
+    ) -> List[bool]:
         """Per manager block: does *every* state group hold a real state?
 
         vLLM's block table is the ground truth: in "align" mode a manager block
@@ -150,8 +181,10 @@ class ConnectorScheduler:
         min would permanently understate how many blocks are saveable."""
         if not ledger.block_ids_per_group:
             return 0
-        return min(len(ledger.block_ids_per_group[meta.group_idx])
-                   for meta in self._group_metas)
+        return min(
+            len(ledger.block_ids_per_group[meta.group_idx])
+            for meta in self._group_metas
+        )
 
     # ------------------------------------------------------------------ #
     # External matching
@@ -165,9 +198,11 @@ class ConnectorScheduler:
         which is what makes the sparsity visible here.
         """
         names = {spec.get("name") for spec in location.get("location_specs", [])}
-        return all(spec_name(rank, group_idx) in names
-                   for rank in range(self._tp_size)
-                   for group_idx in self._state_group_idxs)
+        return all(
+            spec_name(rank, group_idx) in names
+            for rank in range(self._tp_size)
+            for group_idx in self._state_group_idxs
+        )
 
     def _external_match_burned(self, req_id: str) -> bool:
         """Has this request lost its option of an external match?
@@ -203,8 +238,9 @@ class ConnectorScheduler:
             return False
         return len(ledger.block_ids_per_group) > 1
 
-    def get_num_new_matched_tokens(self, request: "Request",
-                                   num_computed_tokens: int) -> Tuple[Optional[int], bool]:
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> Tuple[Optional[int], bool]:
         """Answer vLLM's per-request question: beyond the ``num_computed_tokens``
         it already has, how many more tokens can the external KV supply?
 
@@ -227,8 +263,10 @@ class ConnectorScheduler:
             # recompute. For this request the external match is burned --
             # see _external_match_burned for which signal burned it. Whatever
             # is left, vLLM recomputes locally.
-            logger.warning("req:%s re-queried after an external load attempt, "
-                           "skip external match", req_id)
+            logger.warning(
+                "req:%s re-queried after an external load attempt, skip external match",
+                req_id,
+            )
             # Hit accounting: this re-ask answers "no external match";
             # the local hit stands, the remote hit is spent.
             ledger = self._tracked.get(req_id)
@@ -239,13 +277,14 @@ class ConnectorScheduler:
 
         computed_blocks = num_computed_tokens // self._manager_block_size
         need_load_locations = self._location_query_manager.get_locations_for_query(
-            request, computed_blocks)
+            request, computed_blocks
+        )
         if need_load_locations is None:
             return None, False
 
         need_load_locations = self._safe_external_prefix(
-            req_id, need_load_locations,
-            num_computed_tokens, request.num_tokens)
+            req_id, need_load_locations, num_computed_tokens, request.num_tokens
+        )
         # Cache the clamped answer: the allocation consumes exactly this.
         self._location_query_manager.store_result(req_id, need_load_locations)
         new_matched_count = len(need_load_locations) * self._manager_block_size
@@ -264,8 +303,13 @@ class ConnectorScheduler:
         logger.info("req:%s matched %d external tokens", req_id, new_matched_count)
         return new_matched_count, new_matched_count > 0
 
-    def _safe_external_prefix(self, req_id: str, locations: List[dict],
-                              num_computed_tokens: int, num_tokens: int) -> List[dict]:
+    def _safe_external_prefix(
+        self,
+        req_id: str,
+        locations: List[dict],
+        num_computed_tokens: int,
+        num_tokens: int,
+    ) -> List[dict]:
         """Clamp an external match to the longest prefix vLLM can resume from.
 
         Two constraints, both only ever trimming the tail, so the answer is
@@ -284,7 +328,10 @@ class ConnectorScheduler:
         """
         # Cap: how many leading blocks may be matched at all.
         limit = len(locations)
-        while limit and num_computed_tokens + limit * self._manager_block_size >= num_tokens:
+        while (
+            limit
+            and num_computed_tokens + limit * self._manager_block_size >= num_tokens
+        ):
             limit -= 1
         # Within that allowance the match may only end on a block carrying
         # the recurrent state: scan for the last one.
@@ -293,13 +340,18 @@ class ConnectorScheduler:
             if self._location_covers_states(location):
                 keep = i + 1
         if keep < len(locations):
-            logger.info("req:%s truncated external match from %d to %d blocks "
-                        "(full-hit cap / no recurrent state at the end)",
-                        req_id, len(locations), keep)
+            logger.info(
+                "req:%s truncated external match from %d to %d blocks "
+                "(full-hit cap / no recurrent state at the end)",
+                req_id,
+                len(locations),
+                keep,
+            )
         return locations[:keep]
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks",
-                                 num_external_tokens: int):
+    def update_state_after_alloc(
+        self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
+    ):
         """First (or re-) allocation: record the ledger and ship the load.
 
         The block tables arrive here whole, once per allocation; increments
@@ -333,7 +385,8 @@ class ConnectorScheduler:
                 f"req {req_id}: allocated for {num_external_tokens} external "
                 f"tokens but no cached location query exists; the match hook "
                 f"did not answer, or its answer was consumed/invalidated "
-                f"before this allocation")
+                f"before this allocation"
+            )
         locations, computed_blocks = consumed
         # Blocks were allocated for an external hit: the request is now
         # spending its external load (burns hybrid re-queries).
@@ -342,12 +395,14 @@ class ConnectorScheduler:
             return
         total_remote_blocks = computed_blocks + len(locations)
         ledger.has_saved_block_num = total_remote_blocks
-        self._waiting_to_load_requests.append(LoadRequest(
-            req_id=req_id,
-            manager_block_idxes=list(range(computed_blocks, total_remote_blocks)),
-            need_load_locations=locations,
-            all_block_ids=[list(b) for b in ledger.block_ids_per_group],
-        ))
+        self._waiting_to_load_requests.append(
+            LoadRequest(
+                req_id=req_id,
+                manager_block_idxes=list(range(computed_blocks, total_remote_blocks)),
+                need_load_locations=locations,
+                all_block_ids=[list(b) for b in ledger.block_ids_per_group],
+            )
+        )
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """Consume the worker's step output: mark requests whose external
@@ -362,16 +417,24 @@ class ConnectorScheduler:
         if not invalid:
             return
         for req_id, ledger in self._tracked.items():
-            if any(b in invalid
-                   for group_ids in ledger.block_ids_per_group for b in group_ids):
+            if any(
+                b in invalid
+                for group_ids in ledger.block_ids_per_group
+                for b in group_ids
+            ):
                 self._load_failed.add(req_id)
-                logger.warning("req:%s external load failed (invalid blocks "
-                               "reached its block table)", req_id)
+                logger.warning(
+                    "req:%s external load failed (invalid blocks "
+                    "reached its block table)",
+                    req_id,
+                )
 
     # ------------------------------------------------------------------ #
     # Per-step metadata assembly and saving orchestration
     # ------------------------------------------------------------------ #
-    def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> TairKvCacheConnectorMetadata:
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> TairKvCacheConnectorMetadata:
         """Assemble one engine step's envelope (see TairKvCacheConnectorMetadata).
 
         Two sources feed the envelope: vLLM's scheduling output for this step
@@ -411,7 +474,8 @@ class ConnectorScheduler:
                 logger.warning(
                     "scheduled new req %s has no ledger (hook-order "
                     "contract broken?); its block table is not recorded",
-                    vllm_req.req_id)
+                    vllm_req.req_id,
+                )
                 continue
             ledger.block_ids_per_group = [list(b) for b in vllm_req.block_ids]
 
@@ -426,8 +490,11 @@ class ConnectorScheduler:
                 logger.warning(
                     "scheduled cached req %s has no ledger (resumed=%s, "
                     "scheduled_tokens=%d); its block increments are not "
-                    "recorded", req_id, resumed,
-                    scheduler_output.num_scheduled_tokens[req_id])
+                    "recorded",
+                    req_id,
+                    resumed,
+                    scheduler_output.num_scheduled_tokens[req_id],
+                )
                 continue
 
             if hasattr(cached_reqs, "resumed_req_ids"):
@@ -445,8 +512,9 @@ class ConnectorScheduler:
             if resumed:
                 ledger.block_ids_per_group = [list(b) for b in new_block_ids]
             else:
-                for group_ids, new_ids in zip(ledger.block_ids_per_group,
-                                              new_block_ids):
+                for group_ids, new_ids in zip(
+                    ledger.block_ids_per_group, new_block_ids
+                ):
                     group_ids.extend(new_ids)
 
     def _dispatch_incremental_saves(self) -> None:
@@ -469,26 +537,36 @@ class ConnectorScheduler:
             # the whole session. The allocated cap still bounds the other
             # way: under chunked prefill all_token_ids runs ahead of the
             # computed KV.
-            target_save_num = min(
-                len(ledger.vllm_request.all_token_ids),
-                self._num_allocated_blocks(ledger) * self._vllm_block_size) \
+            target_save_num = (
+                min(
+                    len(ledger.vllm_request.all_token_ids),
+                    self._num_allocated_blocks(ledger) * self._vllm_block_size,
+                )
                 // self._manager_block_size
+            )
             if target_save_num > ledger.has_saved_block_num:
-                logger.info("req:%s incremental save: %d -> %d blocks "
-                            "(tokens=%d, allocated=%d)",
-                            ledger.vllm_request.request_id,
-                            ledger.has_saved_block_num, target_save_num,
-                            len(ledger.vllm_request.all_token_ids),
-                            self._num_allocated_blocks(ledger))
+                logger.info(
+                    "req:%s incremental save: %d -> %d blocks "
+                    "(tokens=%d, allocated=%d)",
+                    ledger.vllm_request.request_id,
+                    ledger.has_saved_block_num,
+                    target_save_num,
+                    len(ledger.vllm_request.all_token_ids),
+                    self._num_allocated_blocks(ledger),
+                )
                 ledger.scheduled_saving_count += 1
                 # Per-block state completeness must be read here, in the
                 # scheduler loop: it comes from vLLM's block table, which the
                 # http_executor thread would race against later steps.
                 self._http_executor.submit(
-                    self.start_save_kvcache_async, ledger.vllm_request.request_id,
-                    ledger.vllm_request.all_token_ids[:target_save_num * self._manager_block_size],
+                    self.start_save_kvcache_async,
+                    ledger.vllm_request.request_id,
+                    ledger.vllm_request.all_token_ids[
+                        : target_save_num * self._manager_block_size
+                    ],
                     target_save_num,
-                    self._state_complete_mask(ledger, range(target_save_num)))
+                    self._state_complete_mask(ledger, range(target_save_num)),
+                )
             ledger.has_saved_block_num = target_save_num
 
     def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
@@ -515,7 +593,9 @@ class ConnectorScheduler:
         for save_req in new_save_reqs:
             ledger = self._tracked.get(save_req.req_id)
             if ledger is None:
-                logger.warning("request %s is not tracked, skip saving", save_req.req_id)
+                logger.warning(
+                    "request %s is not tracked, skip saving", save_req.req_id
+                )
                 continue
             # Snapshot the ledger for the worker: the gather translates
             # manager blocks into physical slots through these tables, and
@@ -523,8 +603,10 @@ class ConnectorScheduler:
             save_req.all_block_ids = [list(b) for b in ledger.block_ids_per_group]
             meta.add_save_request(save_req)
             ledger.sent_saving_count += 1
-            if (ledger.need_report_after_saving_finished and
-                    ledger.scheduled_saving_count == ledger.sent_saving_count):
+            if (
+                ledger.need_report_after_saving_finished
+                and ledger.scheduled_saving_count == ledger.sent_saving_count
+            ):
                 self._retire_request(save_req.req_id)
 
         self.handle_canceled_save_req()
@@ -545,8 +627,9 @@ class ConnectorScheduler:
         self._load_attempted.discard(req_id)
         self._location_query_manager.invalidate(req_id)
 
-    def start_save_kvcache_async(self, req_id, token_ids, target_save_num,
-                                 state_complete_mask):
+    def start_save_kvcache_async(
+        self, req_id, token_ids, target_save_num, state_complete_mask
+    ):
         """Ask the manager for write locations for a request's first
         ``target_save_num`` manager blocks.
 
@@ -565,14 +648,20 @@ class ConnectorScheduler:
         }
         if self._state_group_idxs:
             assert len(state_complete_mask) == target_save_num, (
-                f"state mask {len(state_complete_mask)} != {target_save_num} blocks")
+                f"state mask {len(state_complete_mask)} != {target_save_num} blocks"
+            )
             request["location_spec_group_names"] = [
                 ALL_SPEC_GROUP if complete else ATTN_ONLY_SPEC_GROUP
-                for complete in state_complete_mask]
+                for complete in state_complete_mask
+            ]
             if not all(state_complete_mask):
-                logger.info("req:%s saving %d/%d blocks without a recurrent "
-                            "state (attention specs only)", req_id,
-                            state_complete_mask.count(False), target_save_num)
+                logger.info(
+                    "req:%s saving %d/%d blocks without a recurrent "
+                    "state (attention specs only)",
+                    req_id,
+                    state_complete_mask.count(False),
+                    target_save_num,
+                )
         try:
             response = self._manager_client.start_write_cache(request)
         except Exception as e:
@@ -586,40 +675,65 @@ class ConnectorScheduler:
         mask = response.get("block_mask") or {}
         if "bool_masks" in mask:
             values = mask["bool_masks"].get("values", [])
-            mask_summary = (f"bool_masks offset={mask['bool_masks'].get('offset')} "
-                            f"total={len(values)} "
-                            f"existing={sum(1 for v in values if v)}")
+            mask_summary = (
+                f"bool_masks offset={mask['bool_masks'].get('offset')} "
+                f"total={len(values)} "
+                f"existing={sum(1 for v in values if v)}"
+            )
         else:
             mask_summary = f"offset={mask.get('offset')}"
-        logger.info("req:%s save session %s: block_mask %s locations=%d",
-                    req_id, write_session_id[:8], mask_summary, len(locations))
-        logger.debug("req:%s save session %s: block_mask=%s locations=%d",
-                     req_id, write_session_id[:8],
-                     response.get("block_mask"), len(locations))
+        logger.info(
+            "req:%s save session %s: block_mask %s locations=%d",
+            req_id,
+            write_session_id[:8],
+            mask_summary,
+            len(locations),
+        )
+        logger.debug(
+            "req:%s save session %s: block_mask=%s locations=%d",
+            req_id,
+            write_session_id[:8],
+            response.get("block_mask"),
+            len(locations),
+        )
 
         if not locations:
             try:
-                self._manager_client.finish_write_cache({
-                    "trace_id": "finish_%s" % write_session_id[:8],
-                    "instance_id": self._extra_config.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {"bool_masks": {"offset": 0}},
-                })
+                self._manager_client.finish_write_cache(
+                    {
+                        "trace_id": "finish_%s" % write_session_id[:8],
+                        "instance_id": self._extra_config.instance_id,
+                        "write_session_id": write_session_id,
+                        "success_blocks": {"bool_masks": {"offset": 0}},
+                    }
+                )
             except Exception as e:
-                logger.warning("finish_write_cache failed, session: %s, error: %s",
-                               write_session_id, e)
+                logger.warning(
+                    "finish_write_cache failed, session: %s, error: %s",
+                    write_session_id,
+                    e,
+                )
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
             return
 
-        need_block_idx = self.parse_block_mask_to_save_indices(response, target_save_num)
-        message = CoordinateMessage(time.time(), SendBlockStartEvent(
-            request_id=req_id, write_session_id=write_session_id, locations=locations))
+        need_block_idx = self.parse_block_mask_to_save_indices(
+            response, target_save_num
+        )
+        message = CoordinateMessage(
+            time.time(),
+            SendBlockStartEvent(
+                request_id=req_id,
+                write_session_id=write_session_id,
+                locations=locations,
+            ),
+        )
         self._coordinator_client.send(CoordinateMsgSerializer.dumps(message))
 
         with self._waiting_to_save_requests_lock:
-            self._waiting_to_save_requests.append(SaveRequest(
-                req_id, locations, need_block_idx, write_session_id))
+            self._waiting_to_save_requests.append(
+                SaveRequest(req_id, locations, need_block_idx, write_session_id)
+            )
 
     def handle_canceled_save_req(self):
         with self._canceled_save_request_ids_lock:
@@ -633,15 +747,19 @@ class ConnectorScheduler:
                 logger.warning("canceled save for unknown request %s, skip", req_id)
                 continue
             ledger.sent_saving_count += 1
-            if (ledger.need_report_after_saving_finished and
-                    ledger.scheduled_saving_count == ledger.sent_saving_count):
+            if (
+                ledger.need_report_after_saving_finished
+                and ledger.scheduled_saving_count == ledger.sent_saving_count
+            ):
                 self._retire_request(req_id)
 
     def get_finished_count(self):
         # Only rank0 reports finished requests.
         return 1
 
-    def parse_block_mask_to_save_indices(self, response: dict, target_save_num: int) -> List[int]:
+    def parse_block_mask_to_save_indices(
+        self, response: dict, target_save_num: int
+    ) -> List[int]:
         block_mask = response.get("block_mask", {})
         if "offset" in block_mask:
             return list(range(block_mask["offset"], target_save_num))
@@ -652,12 +770,13 @@ class ConnectorScheduler:
     # Request finish
     # ------------------------------------------------------------------ #
     def request_finished_all_groups(
-            self, request: "Request",
-            block_ids: Tuple[List[int], ...]) -> Tuple[bool, Optional[dict]]:
+        self, request: "Request", block_ids: Tuple[List[int], ...]
+    ) -> Tuple[bool, Optional[dict]]:
         return self._finish_request(request)
 
-    def request_finished(self, request: "Request",
-                         block_ids: List[int]) -> Tuple[bool, Optional[dict]]:
+    def request_finished(
+        self, request: "Request", block_ids: List[int]
+    ) -> Tuple[bool, Optional[dict]]:
         return self._finish_request(request)
 
     def _finish_request(self, request: "Request") -> Tuple[bool, Optional[dict]]:
