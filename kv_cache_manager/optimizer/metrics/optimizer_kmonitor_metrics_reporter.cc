@@ -52,6 +52,10 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(query, max_hit_rate);
     DECLARE_METRICS(query, capacity_efficiency);
 
+    DECLARE_METRICS(interval, query_hit_rate);
+    DECLARE_METRICS(interval, query_max_hit_rate);
+    DECLARE_METRICS(interval, query_capacity_efficiency);
+
     DECLARE_METRICS(trace, query_total);
     DECLARE_METRICS(trace, query_blocks_total);
     DECLARE_METRICS(trace, query_max_hit_rate);
@@ -212,6 +216,10 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(query, max_hit_rate);
     REGISTER_GAUGE_METRIC(query, capacity_efficiency);
 
+    REGISTER_GAUGE_METRIC(interval, query_hit_rate);
+    REGISTER_GAUGE_METRIC(interval, query_max_hit_rate);
+    REGISTER_GAUGE_METRIC(interval, query_capacity_efficiency);
+
     REGISTER_GAUGE_METRIC(trace, query_total);
     REGISTER_GAUGE_METRIC(trace, query_blocks_total);
     REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
@@ -288,6 +296,7 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 }
 
 void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<InstanceSummary> &summaries,
+                                                      const std::vector<IntervalMetricInfo> &interval_metrics,
                                                       const std::vector<MrcMetricInfo> &mrc_metrics) {
     if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
         return;
@@ -330,6 +339,25 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             bucket_base_tags["age_bucket"] = bucket_label;
             const auto bucket_tags = kmon_ctx_->GetKmonitorTags(bucket_base_tags);
             kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&bucket_tags, bucket.ratio);
+        }
+    }
+
+    for (const auto &metric : interval_metrics) {
+        MetricsTags base_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
+        if (metric.has_theoretical_max_hit_rate) {
+            kmon_ctx_->interval_query_max_hit_rate_metrics->Report(&tags, metric.max_hit_rate);
+        }
+
+        for (const auto &capacity : metric.per_capacity_hit_rates) {
+            MetricsTags capacity_base_tags = base_tags;
+            capacity_base_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+            const auto capacity_tags = kmon_ctx_->GetKmonitorTags(capacity_base_tags);
+            kmon_ctx_->interval_query_hit_rate_metrics->Report(&capacity_tags, capacity.hit_rate);
+            if (metric.has_theoretical_max_hit_rate && metric.max_hit_rate > 0) {
+                kmon_ctx_->interval_query_capacity_efficiency_metrics->Report(&capacity_tags,
+                                                                              capacity.hit_rate / metric.max_hit_rate);
+            }
         }
     }
 

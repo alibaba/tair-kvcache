@@ -23,6 +23,7 @@ namespace {
 
 constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
 constexpr int64_t kKvcmAutoGroupTtlSeconds = 24 * 60 * 60;
+constexpr const char *kKvcmSynthesizedFullSpecGroupName = "full";
 
 void SetPbResponseHeader(proto::optimizer::CommonResponseHeader *header, ErrorCode ec) {
     auto *status = header->mutable_status();
@@ -393,10 +394,19 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         }
 
         std::vector<LocationSpecGroup> spec_groups;
-        spec_groups.reserve(source.location_spec_groups_size());
-        for (const auto &source_group : source.location_spec_groups()) {
-            std::vector<std::string> spec_names(source_group.spec_names().begin(), source_group.spec_names().end());
-            spec_groups.emplace_back(source_group.name(), spec_names);
+        if (source.location_spec_groups().empty()) {
+            std::vector<std::string> spec_names;
+            spec_names.reserve(spec_infos.size());
+            for (const auto &spec : spec_infos) {
+                spec_names.push_back(spec.name());
+            }
+            spec_groups.emplace_back(kKvcmSynthesizedFullSpecGroupName, spec_names);
+        } else {
+            spec_groups.reserve(source.location_spec_groups_size());
+            for (const auto &source_group : source.location_spec_groups()) {
+                std::vector<std::string> spec_names(source_group.spec_names().begin(), source_group.spec_names().end());
+                spec_groups.emplace_back(source_group.name(), spec_names);
+            }
         }
 
         OptimizerInstanceInfo instance(source.instance_group_name(),

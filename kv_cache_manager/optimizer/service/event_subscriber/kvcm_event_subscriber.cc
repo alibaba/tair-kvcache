@@ -151,12 +151,21 @@ bool KvcmEventSubscriber::DiscoverLeader(std::string &leader_endpoint) {
             KVCM_LOG_WARN("KvcmEventSubscriber: invalid leader endpoint returned by seed[%s]", endpoint.host.c_str());
             continue;
         }
-        leader_endpoint = leader.host() + ":" + std::to_string(leader.meta_rpc_port());
+        leader_endpoint = FormatEndpoint(leader.host(), leader.meta_rpc_port());
         return true;
     }
 
     KVCM_LOG_WARN("KvcmEventSubscriber: failed to discover KVCM leader from all healthy seeds");
     return false;
+}
+
+std::string KvcmEventSubscriber::FormatEndpoint(const std::string &host, int port) {
+    const bool is_ipv6_literal = host.find(':') != std::string::npos;
+    const bool is_bracketed = host.size() >= 2 && host.front() == '[' && host.back() == ']';
+    if (is_ipv6_literal && !is_bracketed) {
+        return "[" + host + "]:" + std::to_string(port);
+    }
+    return host + ":" + std::to_string(port);
 }
 
 bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) {

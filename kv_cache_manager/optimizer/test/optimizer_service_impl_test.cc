@@ -541,6 +541,37 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationCreatesEnabledGroupAndIns
     EXPECT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
 }
 
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSynthesizesFullGroupWhenAbsent) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("kvcm-group");
+    instance->set_instance_id("kvcm-instance");
+    instance->set_block_size(4);
+    auto *tp1 = instance->add_location_spec_infos();
+    tp1->set_name("tp1");
+    tp1->set_size(32);
+    auto *tp0 = instance->add_location_spec_infos();
+    tp0->set_name("tp0");
+    tp0->set_size(16);
+
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids));
+    EXPECT_TRUE(unsupported_instance_ids.empty());
+
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+        ASSERT_EQ(1u, state.instance_info->location_spec_groups().size());
+        const auto &full_group = state.instance_info->location_spec_groups().front();
+        EXPECT_EQ("full", full_group.name());
+        EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}), full_group.spec_names());
+        EXPECT_EQ("full", state.instance_info->optimizer_state_info().full_location_spec_group_name());
+        EXPECT_EQ(48, state.size_full);
+    }));
+}
+
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationUsesCapacityOverride) {
     proto::optimizer::KvcmConfigurationResponse configuration;
     auto *group = configuration.add_instance_groups();
