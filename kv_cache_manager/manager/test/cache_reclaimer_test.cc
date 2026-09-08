@@ -38,6 +38,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -235,6 +236,25 @@ std::shared_ptr<InstanceInfo> InstanceInfoFactory() {
     instance_info->set_location_spec_infos({spec_info});
     instance_info->set_model_deployment(model_deployment);
     return instance_info;
+}
+
+std::shared_ptr<InstanceInfo> KvMetaInstanceInfoFactory() {
+    ModelDeployment deployment;
+    deployment.set_model_name(std::string(kKvMetaModelName));
+    deployment.set_dtype(std::string(kKvMetaDtype));
+    deployment.set_tp_size(1);
+    deployment.set_dp_size(1);
+    deployment.set_pp_size(1);
+    deployment.set_extra(std::string(kKvMetaDeploymentExtra));
+    return std::make_shared<InstanceInfo>(
+        "default_quota_group",
+        "default_test_group",
+        std::string(kKvMetaInternalInstancePrefix) + "656d62",
+        1,
+        std::vector<LocationSpecInfo>{LocationSpecInfo(std::string(kKvMetaValueSpecName), 1)},
+        deployment,
+        std::vector<LocationSpecGroup>{},
+        1);
 }
 
 std::pair<ErrorCode, ins_info_ptr_vec>
@@ -4117,6 +4137,24 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_TRUE(result.made_progress);
     EXPECT_EQ(1, SubmittedDelRequestCount());
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, KvMetaInstancesDoNotConsumeReclaimOrMigrationBudget) {
+    cache_reclaimer_->job_state_flag_ = true;
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 90);
+    instance_infos = {KvMetaInstanceInfoFactory()};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->quota_.quota_config_.front().set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_FALSE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(0, sample_reclaim_call_counter);
+    EXPECT_EQ(0, batch_get_loc_call_counter);
+    EXPECT_TRUE(captured_copy_reqs.empty());
 }
 
 TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {

@@ -1,10 +1,11 @@
 #include <cstddef>
-#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <unistd.h>
+#include <vector>
 
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -64,6 +65,22 @@ public:
     }
 
 private:
+    int CreateAnonymousSharedMemoryFile() const {
+        const std::string filename = root_path_ + "shared-memory-XXXXXX";
+        std::vector<char> path(filename.begin(), filename.end());
+        path.push_back('\0');
+
+        const int fd = mkstemp(path.data());
+        if (fd < 0) {
+            return -1;
+        }
+        if (unlink(path.data()) != 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
     void InitFile() {
         std::filesystem::create_directories(root_path_ + "tmp/test");
         std::string file_path = root_path_ + "tmp/test/key1";
@@ -103,19 +120,19 @@ TEST_F(TransferClientTest, TestCreate) {
 }
 
 TEST_F(TransferClientTest, TestCreateWithSharedMemory) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     auto client = TransferClient::Create(client_config_, init_params_, registration);
     ASSERT_NE(client, nullptr);
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
     client.reset();
 }
 
@@ -126,9 +143,9 @@ TEST_F(TransferClientTest, TestCreateWithDisabledSharedMemory) {
 }
 
 TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
@@ -136,7 +153,7 @@ TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {
     registration.fd = -1;
     EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
 
-    registration.fd = fileno(file);
+    registration.fd = fd;
     registration.base = nullptr;
     EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
 
@@ -148,7 +165,7 @@ TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {
     registration.base = reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max());
     EXPECT_EQ(TransferClient::Create(client_config_, init_params_, registration), nullptr);
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 TEST_F(TransferClientTest, TestCreateWithEmptySelfLocationSpecName) {

@@ -36,6 +36,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+        ASSERT_EQ(0, config.GetKvMetaRpcPort());
     }
     // config_file not exist
     {
@@ -90,6 +91,31 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(4, config.GetServiceIoThreadNum());
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
+    }
+}
+
+TEST_F(ServerConfigTest, TestKvMetaRpcPortIsOptInAndIsolated) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.rpc_port", "6500"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ(6500, config.GetKvMetaRpcPort());
+
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ(0, config.GetKvMetaRpcPort());
+
+    for (const auto &environ : std::vector<std::unordered_map<std::string, std::string>>{
+             {{"kvcm.kv_meta.rpc_port", "-1"}},
+             {{"kvcm.kv_meta.rpc_port", "65536"}},
+             {{"kvcm.kv_meta.rpc_port", "6381"}, {"kvcm.service.rpc_port", "6381"}},
+             {{"kvcm.kv_meta.rpc_port", "6382"}, {"kvcm.service.http_port", "6382"}},
+             {{"kvcm.kv_meta.rpc_port", "9382"},
+              {"kvcm.service.http_port", "6382"},
+              {"kvcm.service.enable_debug_service", "true"}},
+         }) {
+        ServerConfig invalid;
+        ASSERT_TRUE(invalid.Parse("", environ));
+        EXPECT_FALSE(invalid.Check());
     }
 }
 

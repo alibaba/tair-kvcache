@@ -19,6 +19,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
@@ -699,6 +700,12 @@ bool CacheGarbageCollector::BeginRound() {
             return false;
         }
         for (const auto &instance : instances) {
+            // Generic objects have their own exact-key recovery and cleanup
+            // lifecycle. Excluding them here prevents a large embedding
+            // namespace from consuming the existing KV-cache GC scan budget.
+            if (instance && IsKvMetaInstance(*instance)) {
+                continue;
+            }
             if (!instance || instance->instance_id().empty()) {
                 RecordOperationError("registry_snapshot");
                 KVCM_LOG_WARN("cache gc encountered invalid instance in group[%s]", group->name().c_str());

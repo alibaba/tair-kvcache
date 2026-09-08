@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -247,6 +248,12 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
+    variable_object_size_enabled_ = sdk_backend_config->variable_object_size_enabled();
+    max_variable_object_bytes_ = sdk_backend_config->max_variable_object_bytes();
+    if (variable_object_size_enabled_ && max_variable_object_bytes_ == 0) {
+        KVCM_LOG_WARN("Init local file sdk failed, max variable object bytes is zero");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
     timeout_config_ = sdk_backend_config->timeout_config();
 #if defined(USING_CUDA)
     CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking),
@@ -284,6 +291,17 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 }
 
 SdkType LocalFileSdk::Type() { return SdkType::LOCAL_FILE; }
+
+bool LocalFileSdk::IsAllowedObjectSize(std::size_t size) const {
+    if (variable_object_size_enabled_) {
+        return size > 0 && size <= max_variable_object_bytes_;
+    }
+    return std::any_of(spec_byte_sizes_per_block_.begin(),
+                       spec_byte_sizes_per_block_.end(),
+                       [size](const auto &entry) {
+                           return entry.second > 0 && size == static_cast<std::size_t>(entry.second);
+                       });
+}
 
 ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     if (remote_uris.size() != local_buffers.size()) {
@@ -495,14 +513,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         auto item = LocalFileItem::FromUri(remote_uri);
 
         // 防御性校验：URI 的 size 必须在允许的 spec 范围内
-        bool size_valid = false;
-        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
-            if (item.size == byte_size_per_block) {
-                size_valid = true;
-                break;
-            }
-        }
-        if (!size_valid) {
+        if (!IsAllowedObjectSize(item.size)) {
             KVCM_LOG_ERROR("Get failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
@@ -588,14 +599,7 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         auto item = LocalFileItem::FromUri(remote_uri);
 
         // 防御性校验：URI 的 size 必须在允许的 spec 范围内
-        bool size_valid = false;
-        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
-            if (item.size == byte_size_per_block) {
-                size_valid = true;
-                break;
-            }
-        }
-        if (!size_valid) {
+        if (!IsAllowedObjectSize(item.size)) {
             KVCM_LOG_ERROR("Put failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());

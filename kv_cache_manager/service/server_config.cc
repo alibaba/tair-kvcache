@@ -103,6 +103,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_admin_http_port_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.kv_meta.rpc_port",
+     [](const std::string &value, ServerConfig *config) {
+         config->kv_meta_rpc_port_ = std::stoi(value);
+         return true;
+     }},
     {"kvcm.service.enable_debug_service",
      [](const std::string &value, ServerConfig *config) {
          config->enable_debug_service_ = value == "true";
@@ -303,6 +308,7 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    kv_meta_rpc_port_ = 0;
     metrics_reporter_type_ = "local";
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
@@ -435,6 +441,30 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 bool ServerConfig::Check() {
     // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
     // falls back to local backend. No validation needed for empty value.
+
+    if (kv_meta_rpc_port_ < 0 || kv_meta_rpc_port_ > 65535) {
+        fprintf(stderr, "kvcm.kv_meta.rpc_port must be 0 (disabled) or in [1, 65535]\n");
+        return false;
+    }
+    if (kv_meta_rpc_port_ != 0) {
+        const std::vector<std::pair<const char *, int32_t>> occupied_ports = {
+            {"kvcm.service.rpc_port", service_rpc_port_},
+            {"kvcm.service.http_port", service_http_port_},
+            {"kvcm.service.admin_rpc_port", service_admin_rpc_port_},
+            {"kvcm.service.admin_http_port", service_admin_http_port_},
+        };
+        for (const auto &[name, port] : occupied_ports) {
+            if (port != 0 && port == kv_meta_rpc_port_) {
+                fprintf(stderr, "kvcm.kv_meta.rpc_port must not share %s\n", name);
+                return false;
+            }
+        }
+        if (enable_debug_service_ && service_http_port_ > 0 && service_http_port_ <= 62535 &&
+            kv_meta_rpc_port_ == service_http_port_ + 3000) {
+            fprintf(stderr, "kvcm.kv_meta.rpc_port must not share the derived debug HTTP port\n");
+            return false;
+        }
+    }
 
     if (!MetricsReporterFactory::IsSupportedType(metrics_reporter_type_)) {
         fprintf(stderr,

@@ -74,6 +74,10 @@ kvcm.logger.log_level=4
 # 指定Metaservice主服务的RPC监听端口
 kvcm.service.rpc_port=6381
 
+# 通用对象（embedding 等）MetaService 使用的独立 gRPC 端口。
+# 0 表示禁用（默认）；非 0 时范围为 1..65535，且不能与其他服务端口冲突。
+kvcm.kv_meta.rpc_port=0
+
 # 指定Metaservice主服务的HTTP监听端口
 kvcm.service.http_port=6382
 
@@ -159,6 +163,17 @@ kvcm.metrics.prometheus_prefix=kvcm
 # log event publisher的初始化配置值，暂未启用
 kvcm.event.event_publishers_configs
 ```
+
+### KVMeta 通用对象服务
+
+`kvcm.kv_meta.rpc_port` 默认是 `0`。此时不会创建 KVMeta manager、写会话线程或额外 gRPC server，
+现有 KVCache 服务的启动和请求路径保持不变。配置非零端口后，KVMeta 使用独立 gRPC server；升主时主服务
+先完成原有恢复并放流，KVMeta 再在可取消的独立线程中恢复，恢复完成前仅 KVMeta 请求返回 not-leader/not-ready。
+
+KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache instance 共组。该约束隔离容量统计；
+普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。当前 KVMeta V1 不自动逐出对象，
+容量到限后新写入失败，调用方应使用 `Remove` 或 `TrimAll` 管理生命周期。完整协议、动态长度和 RTP 接入方式见
+[KVMeta 通用对象存储设计](design/kv_meta_object_storage.md)。
 
 ### SchedulePlanExecutor 线程与迁移预算
 

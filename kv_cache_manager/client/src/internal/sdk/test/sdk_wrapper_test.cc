@@ -1,10 +1,11 @@
 #include <atomic>
 #include <chrono>
-#include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -42,6 +43,22 @@ public:
     }
 
 private:
+    int CreateAnonymousSharedMemoryFile() const {
+        const std::string filename = root_path_ + "shared-memory-XXXXXX";
+        std::vector<char> path(filename.begin(), filename.end());
+        path.push_back('\0');
+
+        const int fd = mkstemp(path.data());
+        if (fd < 0) {
+            return -1;
+        }
+        if (unlink(path.data()) != 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
     std::unique_ptr<ClientConfig> CreateTestClientConfig() {
         auto client_config = std::make_unique<ClientConfig>();
         std::string client_config_str = R"({
@@ -116,6 +133,36 @@ TEST_F(SdkWrapperTest, TestInit) {
     ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
 }
 
+TEST_F(SdkWrapperTest, TestKvMetaRuntimePolicyDoesNotMutateReusableClientConfig) {
+    const auto source_wrapper_config = client_config_->sdk_wrapper_config();
+    ASSERT_TRUE(source_wrapper_config);
+    const auto source_backend = source_wrapper_config->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_TRUE(source_backend);
+    ASSERT_FALSE(source_backend->variable_object_size_enabled());
+
+    SdkWrapper kv_meta_wrapper;
+    ASSERT_EQ(ER_OK, kv_meta_wrapper.InitForKvMeta(client_config_, init_params_, 4096));
+    ASSERT_NE(kv_meta_wrapper.wrapper_config_, source_wrapper_config);
+    const auto kv_meta_backend =
+        kv_meta_wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_TRUE(kv_meta_backend);
+    EXPECT_TRUE(kv_meta_backend->variable_object_size_enabled());
+    EXPECT_EQ(4096, kv_meta_backend->max_variable_object_bytes());
+    EXPECT_FALSE(source_backend->variable_object_size_enabled());
+
+    // Reusing the same parsed config for the fixed-block wrapper keeps both
+    // its original object identity and the disabled variable-size policy.
+    SdkWrapper regular_wrapper;
+    ASSERT_EQ(ER_OK, regular_wrapper.Init(client_config_, init_params_));
+    EXPECT_EQ(regular_wrapper.wrapper_config_, source_wrapper_config);
+    EXPECT_FALSE(source_backend->variable_object_size_enabled());
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
+    SdkWrapper sdk_wrapper;
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PutKvMetaObjects({}, {}, {}, nullptr));
+}
+
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
     SdkWrapper sdk_wrapper;
     ASSERT_EQ(ER_INVALID_CLIENT_CONFIG, sdk_wrapper.Init(nullptr, init_params_));
@@ -136,14 +183,14 @@ TEST_F(SdkWrapperTest, TestInitWithInvalidStorageConfigs) {
 }
 
 TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
@@ -153,20 +200,20 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     ASSERT_GE(fd_flags, 0);
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
     struct stat file_stat{};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
 TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     auto sdk_wrapper = std::make_unique<SdkWrapper>();
     SharedMemoryRegistration prepared_registration;
@@ -204,7 +251,7 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     EXPECT_EQ(task_result.get(), ER_OK);
     EXPECT_TRUE(fd_valid_in_task.load());
     EXPECT_EQ(fcntl(owned_fd, F_GETFD), -1);
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationRejectsInvalidValues) {
@@ -219,32 +266,32 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationRejectsInvalidValues) 
     registration.base = init_params_.regist_span->base;
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
 
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
     registration = SharedMemoryRegistration();
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
     ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
 
-    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
         ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &prepared_registration));
@@ -253,7 +300,7 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
         EXPECT_EQ(config->client_base(), registration.base);
     }
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 // TODO: mock mooncake
@@ -681,6 +728,121 @@ TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
 
     // 等 fake 的睡眠结束，避免线程池/进程退出时任务仍在跑。
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+}
+
+// KVMeta buffers are caller-owned and may be destroyed as soon as the API
+// returns. Its opt-in safe drain must therefore wait for an in-flight peer on
+// an error, while TestNoUnboundedWaitOnTimeout above keeps the regular path's
+// existing bounded-return contract unchanged.
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTask) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(2, 8, "KvMetaSafeDrainTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> slow_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([&]() {
+        while (!slow_started.load()) {
+            std::this_thread::yield();
+        }
+        return ER_SDKREAD_ERROR;
+    });
+    tasks.push_back([&]() {
+        slow_started.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        slow_finished.store(true);
+        return ER_OK;
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto ec = sdk_wrapper.RunWithTimeoutParallel(
+        SdkWrapper::OpType::GET, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_EQ(ER_SDKREAD_ERROR, ec);
+    EXPECT_TRUE(slow_finished.load());
+    EXPECT_GE(elapsed_ms, 100);
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTaskBeforeRethrow) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(2, 8, "KvMetaExceptionDrainTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> slow_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([&]() -> ClientErrorCode {
+        while (!slow_started.load()) {
+            std::this_thread::yield();
+        }
+        throw std::runtime_error("injected KVMeta SDK exception");
+    });
+    tasks.push_back([&]() {
+        slow_started.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        slow_finished.store(true);
+        return ER_OK;
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW(sdk_wrapper.RunWithTimeoutParallel(
+                     SdkWrapper::OpType::GET, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true),
+                 std::runtime_error);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_TRUE(slow_finished.load());
+    EXPECT_GE(elapsed_ms, 100);
+}
+
+// KVMeta submission must not block behind a saturated queue before its
+// deadline wait begins. Work accepted before the rejection is drained with
+// the shared stop flag set, so it never enters the underlying object I/O.
+TEST_F(SdkWrapperTest, TestKvMetaQueuePressureRejectsWithoutStartingIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(1, 1, "KvMetaQueueTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    auto release_future = release_blocker.get_future().share();
+    auto blocker = sdk_wrapper.wait_task_thread_pool_->async([&]() -> ClientErrorCode {
+        blocker_started.set_value();
+        release_future.wait();
+        return ER_OK;
+    });
+    blocker_started.get_future().wait();
+
+    std::atomic<int> io_calls{0};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    // autil's queue admits queue_size + 1 items before reporting full, so
+    // three submissions make the third rejection deterministic here.
+    for (size_t i = 0; i < 3; ++i) {
+        tasks.push_back([&]() {
+            io_calls.fetch_add(1);
+            return ER_OK;
+        });
+    }
+
+    std::thread releaser([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        release_blocker.set_value();
+    });
+    const auto start = std::chrono::steady_clock::now();
+    const auto ec = sdk_wrapper.RunWithTimeoutParallel(
+        SdkWrapper::OpType::PUT, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    releaser.join();
+
+    EXPECT_EQ(ER_THREADPOOL_ERROR, ec);
+    EXPECT_EQ(0, io_calls.load());
+    EXPECT_EQ(ER_OK, blocker.get());
+    EXPECT_GE(elapsed_ms, 100);
+    EXPECT_LT(elapsed_ms, 1000);
 }
 
 // 验证静态预算注入：wrapper 在 Init 阶段把自身 timeout_config 注入

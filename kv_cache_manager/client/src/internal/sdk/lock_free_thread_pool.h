@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <future>
 #include <memory>
 
@@ -24,6 +25,9 @@ public:
     void waitFinish();
     bool isFull() const;
     std::future<ClientErrorCode> async(std::function<ClientErrorCode()> &&func);
+    // Try to enqueue without waiting for queue capacity. On failure, no task
+    // is executed and `future` is left unchanged.
+    bool tryAsync(std::function<ClientErrorCode()> &&func, std::future<ClientErrorCode> &future);
 
 private:
     std::unique_ptr<autil::LockFreeThreadPool> pool_;

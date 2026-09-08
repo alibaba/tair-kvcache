@@ -29,6 +29,7 @@ public:
     int32_t GetServiceHttpPort() const { return service_http_port_; }
     int32_t GetServiceAdminRpcPort() const { return service_admin_rpc_port_; }
     int32_t GetServiceAdminHttpPort() const { return service_admin_http_port_; }
+    int32_t GetKvMetaRpcPort() const { return kv_meta_rpc_port_; }
     bool IsEnableDebugService() const { return enable_debug_service_; }
     uint32_t GetLogLevel() const { return log_level_; }
     const std::string &startup_config() { return startup_config_; }
@@ -97,6 +98,9 @@ private:
     int32_t service_http_port_ = 0;
     int32_t service_admin_rpc_port_ = 0;
     int32_t service_admin_http_port_ = 0;
+    // Disabled by default. When enabled, KVMeta uses a distinct gRPC server
+    // and therefore a distinct completion queue/thread pool.
+    int32_t kv_meta_rpc_port_ = 0;
     bool enable_debug_service_ = false;
     uint32_t log_level_ = 0;
     std::string startup_config_;
