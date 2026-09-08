@@ -1,8 +1,7 @@
 import hashlib
 import logging
-import math
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 import time
 import json
 
@@ -25,7 +24,8 @@ except ImportError:
     pass
 if StorageMetrics is None:
     try:
-        from sglang.srt.metrics.collector import StorageMetrics
+        # Older sglang versions kept StorageMetrics here.
+        from sglang.srt.metrics.collector import StorageMetrics  # ty: ignore[unresolved-import]
     except ImportError:
         raise ImportError(
             "Cannot import StorageMetrics from sglang. "
@@ -34,14 +34,20 @@ if StorageMetrics is None:
             "Please check your sglang version is compatible."
         )
 from sglang.srt.distributed import get_tp_group
+
+# get_attention_tp_group moved in newer sglang versions.
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
+    get_attention_tp_group,  # ty: ignore[unresolved-import]
     is_dp_attention_enabled,
 )
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
-from kv_cache_manager.client.pybind import kvcm_py_client
-from kv_cache_manager.py_connector.common._version_info import (
+
+# kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
+from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
+
+# Stamped into the wheel at build time; absent in a source checkout.
+from kv_cache_manager.py_connector.common._version_info import (  # ty: ignore[unresolved-import]
     FULL_VERSION,
     GIT_COMMIT,
     BUILD_TIME,
@@ -51,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 
 class HiCacheKVCM(HiCacheStorage):
-    def __init__(self, storage_config: HiCacheStorageConfig, kwargs):
+    def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Any) -> None:
         logger.warning(
             "KVCM sglang connector version: %s (commit: %s, build: %s)",
             FULL_VERSION,
@@ -60,7 +66,9 @@ class HiCacheKVCM(HiCacheStorage):
         )
         self.storage_config = storage_config
         # --hicache-storage-backend-extra-config '{"k":"v"}'
-        self.extra_config = self.storage_config.extra_config
+        # HiCacheStorageConfig types extra_config as Optional; sglang always
+        # provides it for a hicache storage backend.
+        self.extra_config: Dict[str, Any] = self.storage_config.extra_config  # ty: ignore[invalid-assignment]
 
         # deployment
         self.instance_group = self.extra_config["instance_group"]
@@ -70,7 +78,9 @@ class HiCacheKVCM(HiCacheStorage):
             self.extra_config
         )
 
-        self.registered_pools = {}
+        # PoolName -> the pool object; sglang's pool classes expose more than
+        # the HostKVCache base (e.g. get_page_buffer_meta), hence Any.
+        self.registered_pools: Dict[Any, Any] = {}
 
         self.prefetch_pgs = []
         self.backup_pgs = []
@@ -83,7 +93,7 @@ class HiCacheKVCM(HiCacheStorage):
         # "interface_v1": 1 in --hicache-storage-backend-extra-config.
         self.extra_config.setdefault("interface_v1", 1)
 
-    def _init_kvcm_client(self):
+    def _init_kvcm_client(self) -> None:
         # parallelism
         self.tp_rank = self.storage_config.tp_rank
         self.tp_size = self.storage_config.tp_size
@@ -293,7 +303,7 @@ class HiCacheKVCM(HiCacheStorage):
             "kvcm_py_client.TransferClient.Create failed"
         )
 
-    def parse_hf3fs_configs(self, storage_configs):
+    def parse_hf3fs_configs(self, storage_configs: str) -> List[Dict[str, Any]]:
         hf3fs_configs = []
         storage_configs_json = json.loads(storage_configs)
         for storage_config in storage_configs_json:
@@ -314,11 +324,14 @@ class HiCacheKVCM(HiCacheStorage):
             hf3fs_configs.append(hf3fs_config)
         return hf3fs_configs
 
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
-        self.mem_pool_host = mem_pool_host
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
+        # The pool objects expose more than the HostKVCache base
+        # (get_page_buffer_meta & co).
+        self.mem_pool_host: Any = mem_pool_host
         # Extract all pools from HostPoolGroup.entries if available
         if hasattr(mem_pool_host, "entries"):
-            for entry in mem_pool_host.entries:
+            # HostPoolGroup; sglang types entries as object.
+            for entry in mem_pool_host.entries:  # ty: ignore[not-iterable]
                 self.registered_pools[entry.name] = entry.host_pool
                 logger.info(
                     "register_mem_pool_host: found pool entry name=%s, "
@@ -339,7 +352,9 @@ class HiCacheKVCM(HiCacheStorage):
         )
         self._init_kvcm_client()
 
-    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+    def register_mem_host_pool_v2(
+        self, host_pool: HostKVCache, host_pool_name: str
+    ) -> None:
         # All pools already extracted from HostPoolGroup in register_mem_pool_host,
         # so this is a no-op for KVCM connector.
         pass
@@ -560,7 +575,7 @@ class HiCacheKVCM(HiCacheStorage):
             )
             return [False] * len_new
         else:
-            recv = [None, None, None, None]
+            recv: List[Any] = [None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
             )
@@ -831,7 +846,7 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
                 else:
-                    recv = [None]
+                    recv: List[Any] = [None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
                     )
@@ -1063,8 +1078,10 @@ class HiCacheKVCM(HiCacheStorage):
             logger.error(f"batch_exists_v2 failed: {trace_id=} {e=}")
             return PoolTransferResult.empty()
 
-    def get_stats(self):
-        storage_metrics = StorageMetrics()
+    def get_stats(self) -> Any:
+        # StorageMetrics is a class by the time the module finishes its
+        # import fallback chain; ty cannot prove the None path unreachable.
+        storage_metrics = StorageMetrics()  # ty: ignore[call-non-callable]
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
@@ -1096,8 +1113,8 @@ class HiCacheKVCM(HiCacheStorage):
         return str(uuid.uuid1())
 
     def _sha256_to_int64(self, data: str) -> int:
-        data = data.encode("utf-8")
-        hash_digest = hashlib.sha256(data).digest()
+        data = data.encode("utf-8")  # ty: ignore[invalid-assignment]
+        hash_digest = hashlib.sha256(data).digest()  # ty: ignore[invalid-argument-type]
         hash_int64 = int.from_bytes(hash_digest[:8], "big", signed=True)
         return hash_int64
 
@@ -1194,7 +1211,7 @@ class HiCacheKVCM(HiCacheStorage):
         save_indices = [(i - len_prefix) for i in save_indices if i >= len_prefix]
         return save_indices, prefix_write_count
 
-    def _extract_single_spec_uri(self, location, spec_name: str):
+    def _extract_single_spec_uri(self, location: dict, spec_name: str) -> Optional[str]:
         """Extract the URI for a named spec from a single location dict."""
         for spec in location.get("location_specs", []):
             if spec["name"] == spec_name and spec.get("uri"):
@@ -1232,8 +1249,8 @@ class HiCacheKVCM(HiCacheStorage):
         return 0
 
     def _prepare_extra_pool_buffers(
-        self, ptr_list, size_list, components_per_page: int
-    ):
+        self, ptr_list: List[int], size_list: List[int], components_per_page: int
+    ) -> List[kvcm_py_client.BlockBuffer]:
         """Convert get_page_buffer_meta output to BlockBuffer list.
 
         Each logical page maps to `components_per_page` IOVs in a single BlockBuffer.
@@ -1262,7 +1279,12 @@ class HiCacheKVCM(HiCacheStorage):
             return self.indexer_location_spec_name
         return None
 
-    def _check_pool_spec_existence(self, locations, kv_hit_pages, transfer):
+    def _check_pool_spec_existence(
+        self,
+        locations: List[dict],
+        kv_hit_pages: int,
+        transfer: PoolTransfer,
+    ) -> int:
         """Check how many pages have the extra pool's spec.
 
         Returns the number of contiguous prefix pages that satisfy
@@ -1273,7 +1295,7 @@ class HiCacheKVCM(HiCacheStorage):
         if spec_name is None:
             return kv_hit_pages
 
-        def has_spec(loc):
+        def has_spec(loc: dict) -> bool:
             return any(
                 spec["name"] == spec_name for spec in loc.get("location_specs", [])
             )

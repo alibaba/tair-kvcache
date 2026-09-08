@@ -12,20 +12,24 @@ import signal
 import time
 import os
 import atexit
-from typing import Any
+from typing import Any, cast
 from types import SimpleNamespace
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
     PoolHitPolicy,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MambaPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost, MambaPoolHost
+
+# MHATokenToKVPoolHost / MambaPoolHost moved in newer sglang versions.
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    MambaPoolHost,  # ty: ignore[unresolved-import]
+)
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.distributed import (
     init_distributed_environment,
@@ -213,7 +217,7 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
     )
 
     storage_backend = HiCacheKVCM(storage_config, {})
-    storage_backend.register_mem_pool_host(host_pool_group)
+    storage_backend.register_mem_pool_host(host_pool_group)  # ty: ignore[invalid-argument-type]
 
     # Generate test data
     token_ids = list(range(num_blocks * page_size))
@@ -221,7 +225,7 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
     block_hash = None
     kv_host_indices = []
     for i in range(0, num_blocks * page_size, page_size):
-        block_hash = get_hash_str(token_ids[i : i + page_size], block_hash)
+        block_hash = cast(str, get_hash_str(token_ids[i : i + page_size], block_hash))
         block_hashes.append(block_hash)
         kv_host_indices.extend(range(i, i + page_size))
 
@@ -368,7 +372,6 @@ def test_write_mamba_only_then_exists_v2(kv_pool_host, mamba_pool):
     (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
         _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_mamba_only_0")
     )
-    num_blocks = len(block_hashes)
     _fill_mamba_buffer(mamba_pool)
 
     # Write Mamba only

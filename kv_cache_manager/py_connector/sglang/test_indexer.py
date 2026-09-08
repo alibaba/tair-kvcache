@@ -13,20 +13,23 @@ import signal
 import time
 import os
 import atexit
-from typing import Any
+from typing import Any, cast
 from types import SimpleNamespace
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
     PoolHitPolicy,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+# MHATokenToKVPoolHost moved in newer sglang versions.
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+)
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -256,14 +259,14 @@ def _create_indexer_backend(kv_pool_host, indexer_pool, instance_id, num_blocks=
     )
 
     storage_backend = HiCacheKVCM(storage_config, {})
-    storage_backend.register_mem_pool_host(host_pool_group)
+    storage_backend.register_mem_pool_host(host_pool_group)  # ty: ignore[invalid-argument-type]
 
     token_ids = list(range(num_blocks * page_size))
     block_hashes = []
     block_hash = None
     kv_host_indices = []
     for i in range(0, num_blocks * page_size, page_size):
-        block_hash = get_hash_str(token_ids[i : i + page_size], block_hash)
+        block_hash = cast(str, get_hash_str(token_ids[i : i + page_size], block_hash))
         block_hashes.append(block_hash)
         kv_host_indices.extend(range(i, i + page_size))
 

@@ -7,7 +7,7 @@ import signal
 import time
 import os
 import atexit
-from typing import Any
+from typing import Any, cast
 import requests
 import torch
 import torch.multiprocessing as mp
@@ -17,7 +17,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+# MHATokenToKVPoolHost moved in newer sglang versions.
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+)
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -158,7 +162,7 @@ def test():
     host_indices = []
 
     for i in range(0, 1024, page_size):
-        block_hash = get_hash_str(token_ids[i : i + page_size], block_hash)
+        block_hash = cast(str, get_hash_str(token_ids[i : i + page_size], block_hash))
         block_hashes.append(block_hash)
         host_indices.extend(range(i, i + page_size))
 
@@ -310,7 +314,9 @@ def test_fault_injection(storage_backend):
     fi_block_hash = None
     fi_host_indices = []
     for i in range(0, 1024, page_size):
-        fi_block_hash = get_hash_str(fi_token_ids[i : i + page_size], fi_block_hash)
+        fi_block_hash = cast(
+            str, get_hash_str(fi_token_ids[i : i + page_size], fi_block_hash)
+        )
         fi_block_hashes.append(fi_block_hash)
         fi_host_indices.extend(range(i + 4096, i + 4096 + page_size))
 
@@ -504,7 +510,7 @@ def _multi_rank_worker(rank, world_size, init_port):
         def __init__(self, cpu_group):
             self.cpu_group = cpu_group
 
-    _ps._TP = _GlooTPGroup(
+    _ps._TP = _GlooTPGroup(  # ty: ignore[invalid-assignment]
         torch.distributed.new_group(list(range(world_size)), backend="gloo")
     )
 
@@ -561,11 +567,11 @@ def _multi_rank_worker(rank, world_size, init_port):
     mr_hash = None
     mr_indices = []
     for i in range(0, mr_max_total_num_tokens, page_size):
-        mr_hash = get_hash_str(mr_token_ids[i : i + page_size], mr_hash)
+        mr_hash = cast(str, get_hash_str(mr_token_ids[i : i + page_size], mr_hash))
         mr_hashes.append(mr_hash)
         mr_indices.extend(range(i, i + page_size))
 
-    debug_client = DebugServiceClient(debug_uri) if rank == 0 else None
+    debug_client: Any = DebugServiceClient(debug_uri) if rank == 0 else None
 
     # ------------------------------------------------------------------
     # MR-1: Normal multi-rank set
@@ -742,7 +748,7 @@ def _multi_rank_worker(rank, world_size, init_port):
         h8 = []
         _h = None
         for i in range(0, len(diverge_ids), page_size):
-            _h = get_hash_str(diverge_ids[i : i + page_size], _h)
+            _h = cast(str, get_hash_str(diverge_ids[i : i + page_size], _h))
             h8.append(_h)
 
     idx8 = mr_indices[30 * page_size : 33 * page_size]  # 3 blocks
