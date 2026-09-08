@@ -1,0 +1,27 @@
+# Local hooks for the Python connectors under kv_cache_manager/py_connector.
+#
+# All hooks are `language: system` and deliberately install nothing:
+# when a tool (ruff / ty) is not on PATH the hook exits 0 silently, and
+# without pre-commit itself no hook runs at all. Developers who want the
+# gate see kv_cache_manager/py_connector/README.md for setup.
+repos:
+  - repo: local
+    hooks:
+      - id: py-connector-ruff-check
+        name: ruff check (py_connector)
+        entry: "sh -c 'command -v ruff >/dev/null 2>&1 || exit 0; cd kv_cache_manager/py_connector && exec ruff check .'"
+        language: system
+        pass_filenames: false
+        files: ^kv_cache_manager/py_connector/.*\.py$
+      - id: py-connector-ruff-format
+        name: ruff format --check (py_connector)
+        entry: "sh -c 'command -v ruff >/dev/null 2>&1 || exit 0; cd kv_cache_manager/py_connector && exec ruff format --check .'"
+        language: system
+        pass_filenames: false
+        files: ^kv_cache_manager/py_connector/.*\.py$
+      - id: py-connector-ty
+        name: ty check (py_connector)
+        entry: "sh -c 'command -v ty >/dev/null 2>&1 || exit 0; cd kv_cache_manager/py_connector && exec ty check'"
+        language: system
+        pass_filenames: false
+        files: ^kv_cache_manager/py_connector/.*\.py$

@@ -1,0 +1,11 @@
+# Type-check config for the kv_cache_manager Python connectors.
+# Scope: this directory only; run ty from here (`cd kv_cache_manager/py_connector && ty check`)
+# so that this file and the relative paths below resolve as intended.
+#
+# The Python environment is pinned to the repository-root `.venv` (see
+# README.md "Type environment" for how to build it): the checks and the
+# annotations target vLLM 0.26.0's types, and a pinned environment keeps
+# them reproducible regardless of any activated virtualenv.
+[environment]
+extra-paths = ["../.."]
+python = "../../.venv"
