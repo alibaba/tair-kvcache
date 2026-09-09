@@ -4940,6 +4940,8 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     }
 
     {
+        // Keep an explicit non-default value that spans multiple sampling tasks.
+        ClearSampleReclaimRequests();
         cache_reclaimer_->sampling_size_.store(1000);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
@@ -4948,6 +4950,11 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(1000, keys.size());
         ASSERT_EQ(1000, maps.size());
+        const auto requests = SampleReclaimRequestsSnapshot();
+        ASSERT_EQ(10, requests.size());
+        for (const auto &request : requests) {
+            EXPECT_EQ(100, request.second);
+        }
     }
 
     {

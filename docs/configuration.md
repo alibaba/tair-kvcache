@@ -109,6 +109,9 @@ kvcm.meta_query.parallel_threshold=256
 # 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
 kvcm.meta_query.chunk_size=128
 
+# CacheReclaimer 单个有效 Instance 每轮最多采样的 key 数，默认 100。
+kvcm.cache_reclaimer.key_sampling_size_total=100
+
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000

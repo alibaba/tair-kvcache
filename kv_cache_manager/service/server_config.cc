@@ -312,7 +312,7 @@ void ServerConfig::UpdateDefaultConfig() {
     meta_query_worker_count_ = 4;
     meta_query_parallel_threshold_ = 256;
     meta_query_chunk_size_ = 128;
-    cache_reclaimer_key_sampling_size_total_ = 1000;
+    cache_reclaimer_key_sampling_size_total_ = 100;
     cache_reclaimer_key_sampling_size_per_task_ = 100;
     cache_reclaimer_del_batch_size_ = 100;
     cache_reclaimer_idle_interval_ms_ = 100;
