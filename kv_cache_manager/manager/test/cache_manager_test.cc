@@ -1109,8 +1109,8 @@ TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupNamesWithTokenIdsOnly) {
         tokens.push_back(i);
     }
     const std::vector<std::string> group_names{"full", "attn", "full"};
-    auto [ec, info] = cache_manager_->StartWriteCache(
-        request_context_.get(), "token_only_sg", {}, tokens, group_names, 100000000);
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "token_only_sg", {}, tokens, group_names, 100000000);
     ASSERT_EQ(EC_OK, ec);
     const auto &locs = info.locations().cache_locations_view();
     ASSERT_EQ(3u, locs.size());
@@ -1122,8 +1122,8 @@ TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupNamesWithTokenIdsOnly) {
     ASSERT_EQ("tp0_attn", locs[1].location_specs()[0].name());
 
     // A mismatched length must still be rejected.
-    auto [ec_bad, info_bad] = cache_manager_->StartWriteCache(
-        request_context_.get(), "token_only_sg", {}, tokens, {"full"}, 100000000);
+    auto [ec_bad, info_bad] =
+        cache_manager_->StartWriteCache(request_context_.get(), "token_only_sg", {}, tokens, {"full"}, 100000000);
     ASSERT_NE(EC_OK, ec_bad);
 }
 
@@ -1139,18 +1139,19 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
                                                std::vector<LocationSpecGroup>()));
     // 取出统计的写入量
     auto get_write_bytes = [&]() {
-        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
-                                             {{"type", ToString(kDefaultStorageType)},
-                                              {"unique_name", "nfs_01"}}).Get();
+        return metrics_registry_
+            ->GetCounter("data_storage.write_bytes_dispatched_total",
+                         {{"type", ToString(kDefaultStorageType)}, {"unique_name", "nfs_01"}})
+            .Get();
     };
     // 成功写入
     std::vector<int64_t> keys{1, 2, 3};
     auto [ec, start_write_cache_info] =
         cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
     ASSERT_EQ(EC_OK, ec);
-    ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+    ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
 
-    {// 部分写入成功场景，不新增写入量，写入量统计放在 BatchAddLoation 成功之后
+    { // 部分写入成功场景，不新增写入量，写入量统计放在 BatchAddLoation 成功之后
         auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
         ASSERT_TRUE(meta_indexer);
 
@@ -1158,7 +1159,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
         const auto orig_batch_size = meta_indexer->batch_key_size_;
         const auto orig_max_key_count = meta_indexer->max_key_count_;
         meta_indexer->batch_key_size_ = 1;
-        meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1;  // 已写入的key_count + 1，确保已经写入的是成功的
+        meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1; // 已写入的key_count + 1，确保已经写入的是成功的
 
         std::vector<int64_t> keys{1001, 1002};
         while (meta_indexer->GetMutexShardIndex(keys[0]) == meta_indexer->GetMutexShardIndex(keys[1])) {
@@ -1169,19 +1170,19 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
             cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
         EXPECT_EQ(EC_PARTIAL_OK, ec);
         EXPECT_TRUE(start_write_cache_info.locations().cache_locations_view().empty());
-        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
 
         // 恢复现场
         meta_indexer->batch_key_size_ = orig_batch_size;
         meta_indexer->max_key_count_ = orig_max_key_count;
     }
 
-    {// 重复写入
+    { // 重复写入
         std::vector<int64_t> keys{1, 2};
         auto [ec, start_write_cache_info] =
             cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
-        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
     }
 }
 
@@ -7825,7 +7826,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         }
     }
 
-    // --- Test 2: EVENT_REPORT PREFIX + NFS (NFS on 300,500,700 should not affect event report peer selection) ---
+    // --- Test 2: EVENT_REPORT PREFIX + NFS compose one complete prefix ---
     {
         std::vector<BackendSelector> selectors = {
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
@@ -7844,12 +7845,14 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(5u, locs.size());
 
-        // peer_B wins with prefix=4 (keys 300,400,500,600)
+        // Both peer_A and peer_B compose a full prefix with NFS. peer_B wins
+        // because it covers more keys itself (300,400,500,600).
         // key 300 (index 0): event report + NFS = 2
         {
             const auto &kl = locs[0].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
-            EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, kl[0].type());
+            EXPECT_NE(std::string::npos, kl[1].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 400 (index 1): event report only = 1 (no NFS for 400)
         {
@@ -7862,7 +7865,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         {
             const auto &kl = locs[2].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
-            EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, kl[0].type());
+            EXPECT_NE(std::string::npos, kl[1].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 600 (index 3): event report only = 1 (no NFS for 600)
         {
@@ -7879,7 +7883,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         }
     }
 
-    // --- Test 3: EVENT_REPORT COVERAGE + NFS (NFS presence does not affect event report coverage selection) ---
+    // --- Test 3: EVENT_REPORT COVERAGE scores only hits beyond the NFS base ---
     {
         std::vector<BackendSelector> selectors = {
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
@@ -7898,15 +7902,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(5u, locs.size());
 
-        // peer_B covers most keys (300,400,500,600) = 4
+        // peer_A and peer_B each add 400 and 600 beyond the NFS base. peer_B
+        // wins the tie because it covers more keys itself.
         // key 300 (index 0): event report + NFS = 2
         ASSERT_EQ(2u, locs[0].cache_locations_view().size());
-        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.2"));
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
+        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[1].location_specs()[0].uri().find("192.168.1.2"));
         // key 400 (index 1): event report only = 1
         ASSERT_EQ(1u, locs[1].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[0].type());
         // key 500 (index 2): event report + NFS = 2
         ASSERT_EQ(2u, locs[2].cache_locations_view().size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[2].cache_locations_view()[0].type());
         // key 600 (index 3): event report only = 1
         ASSERT_EQ(1u, locs[3].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[3].cache_locations_view()[0].type());
@@ -7947,7 +7954,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[4].cache_locations_view()[0].type());
     }
 
-    // --- Test 5: PREFIX stops when first key has no event report, but NFS still works ---
+    // --- Test 5: NFS at the first key lets PREFIX continue with one peer ---
     // keys = {700, 300, 400}; NFS exists for 700 and 300, not for 400
     {
         std::vector<int64_t> keys_no_er_first = {700, 300, 400};
@@ -7967,15 +7974,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
                                                                      selectors);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3u, locs.size());
-        // EVENT_REPORT PREFIX stops at key 700 → no event report for any key
         // key 700 (index 0): NFS only = 1
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
-        // key 300 (index 1): NFS only = 1 (event report blocked by prefix)
-        ASSERT_EQ(1u, locs[1].cache_locations_view().size());
+        // key 300 (index 1): peer_A + NFS = 2
+        ASSERT_EQ(2u, locs[1].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[1].cache_locations_view()[0].type());
-        // key 400 (index 2): nothing (no event report from prefix, no NFS written)
-        EXPECT_TRUE(locs[2].cache_locations_view().empty());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[1].type());
+        EXPECT_NE(std::string::npos, locs[1].cache_locations_view()[1].location_specs()[0].uri().find("192.168.1.1"));
+        // key 400 (index 2): peer_A continues the combined prefix
+        ASSERT_EQ(1u, locs[2].cache_locations_view().size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[2].cache_locations_view()[0].type());
+        EXPECT_NE(std::string::npos, locs[2].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.1"));
     }
 
     // --- Test 6: COVERAGE skips keys with no event report, NFS fills gaps independently ---
