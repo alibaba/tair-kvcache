@@ -60,6 +60,8 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+    ER_SDKREGISTER_ERROR = 118,
+    ER_SDKDEREGISTER_ERROR = 119,
 };
 
 enum class QueryType : int {
@@ -168,12 +170,13 @@ inline std::string RoleTypeToString(RoleType role_type) {
 struct RegistSpan {
     void *base{nullptr};
     size_t size{0};
+    int fd{-1};
+    MemoryType type{MemoryType::GPU};
     void set_base_as_uint64(uint64_t base_ptr) { base = reinterpret_cast<void *>(base_ptr); }
     [[nodiscard]] uint64_t base_as_uint64() const { return reinterpret_cast<uint64_t>(base); }
 };
 
-// Keep shared-memory metadata separate from RegistSpan so existing callers
-// retain the original ABI.
+// Host shared-memory registration metadata.
 struct SharedMemoryRegistration {
     void *base{nullptr};
     size_t size{0};

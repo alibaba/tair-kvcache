@@ -26,6 +26,9 @@ public:
                          const InitParams &init_params,
                          const SharedMemoryRegistration *shared_memory_registration = nullptr);
 
+    ClientErrorCode RegisterGpuMemory(const RegistSpan &span);
+    ClientErrorCode DeregisterGpuMemory(int fd);
+
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,

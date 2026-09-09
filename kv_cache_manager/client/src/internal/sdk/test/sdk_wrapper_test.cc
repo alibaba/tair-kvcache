@@ -14,6 +14,7 @@
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -489,4 +490,84 @@ TEST_F(SdkWrapperMultiStorageTest, TestGroupBySdk) {
     ASSERT_EQ(groups[1].indices[0], 1);
     ASSERT_EQ(groups[1].uris.size(), 1);
     ASSERT_EQ(groups[1].buffers.size(), 1);
+}
+
+namespace {
+class GpuRegistrationSdk : public SdkInterface {
+public:
+    explicit GpuRegistrationSdk(SdkType type = SdkType::TAIR_MEMPOOL) : type_(type) {}
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig>&,
+                         const std::shared_ptr<StorageConfig>&) override { return ER_OK; }
+    SdkType Type() override { return type_; }
+    ClientErrorCode Get(const std::vector<DataStorageUri>&, const BlockBuffers&) override { return ER_OK; }
+    ClientErrorCode Put(const std::vector<DataStorageUri>&, const BlockBuffers&,
+                        std::shared_ptr<std::vector<DataStorageUri>>) override { return ER_OK; }
+    ClientErrorCode RegisterGpuMemory(const RegistSpan& span) override {
+        ++register_calls;
+        last_span = span;
+        return result;
+    }
+    ClientErrorCode DeregisterGpuMemory(int fd) override {
+        ++deregister_calls;
+        last_fd = fd;
+        return result;
+    }
+    int register_calls = 0;
+    int deregister_calls = 0;
+    int last_fd = -1;
+    RegistSpan last_span;
+    ClientErrorCode result = ER_OK;
+protected:
+    ClientErrorCode Alloc(const std::vector<DataStorageUri>&, std::vector<DataStorageUri>&) override { return ER_OK; }
+private:
+    SdkType type_;
+};
+}
+
+TEST_F(SdkWrapperTest, GpuRegistrationUsesOneTairSdkAndPreservesFdOwnership) {
+    const int fd = open("/dev/null", O_RDONLY);
+    ASSERT_GE(fd, 0);
+    {
+        SdkWrapper wrapper;
+        auto file = std::make_shared<GpuRegistrationSdk>(SdkType::LOCAL_FILE);
+        auto first = std::make_shared<GpuRegistrationSdk>();
+        auto second = std::make_shared<GpuRegistrationSdk>();
+        wrapper.sdk_map_ = {{"a-file", file}, {"b-tair", first}, {"c-tair", second}};
+        RegistSpan span;
+        span.base = reinterpret_cast<void*>(0x10000);
+        span.size = 8192;
+        span.fd = fd;
+        span.type = MemoryType::GPU;
+        EXPECT_EQ(ER_OK, wrapper.RegisterGpuMemory(span));
+        EXPECT_EQ(1, first->register_calls);
+        EXPECT_EQ(0, second->register_calls);
+        EXPECT_EQ(0, file->register_calls);
+        EXPECT_EQ(span.fd, first->last_span.fd);
+        EXPECT_EQ(span.base, first->last_span.base);
+        EXPECT_EQ(span.size, first->last_span.size);
+        first->result = ER_SDKREGISTER_ERROR;
+        EXPECT_EQ(ER_SDKREGISTER_ERROR, wrapper.RegisterGpuMemory(span));
+        EXPECT_EQ(0, second->register_calls);
+        first->result = ER_SDKDEREGISTER_ERROR;
+        EXPECT_EQ(ER_SDKDEREGISTER_ERROR, wrapper.DeregisterGpuMemory(fd));
+        EXPECT_EQ(fd, first->last_fd);
+        EXPECT_EQ(0, second->deregister_calls);
+    }
+    EXPECT_NE(-1, fcntl(fd, F_GETFD));
+    close(fd);
+}
+
+TEST_F(SdkWrapperTest, GpuRegistrationRejectsInvalidSpanAndMissingBackend) {
+    SdkWrapper wrapper;
+    RegistSpan span;
+    EXPECT_EQ(ER_INVALID_PARAMS, wrapper.RegisterGpuMemory(span));
+    EXPECT_EQ(ER_INVALID_PARAMS, wrapper.DeregisterGpuMemory(-1));
+    span.fd = 7;
+    span.base = reinterpret_cast<void*>(0x10000);
+    span.size = 4096;
+    span.type = MemoryType::CPU;
+    EXPECT_EQ(ER_INVALID_PARAMS, wrapper.RegisterGpuMemory(span));
+    span.type = MemoryType::GPU;
+    EXPECT_EQ(ER_GETSDK_ERROR, wrapper.RegisterGpuMemory(span));
+    EXPECT_EQ(ER_GETSDK_ERROR, wrapper.DeregisterGpuMemory(span.fd));
 }

@@ -132,6 +132,16 @@ void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
     KVCM_LOG_INFO("%s", ss.str().c_str());
 }
 
+ClientErrorCode TransferClientImpl::RegisterGpuMemory(const RegistSpan &span) {
+    CHECK_SDK();
+    return sdk_wrapper_->RegisterGpuMemory(span);
+}
+
+ClientErrorCode TransferClientImpl::DeregisterGpuMemory(int fd) {
+    CHECK_SDK();
+    return sdk_wrapper_->DeregisterGpuMemory(fd);
+}
+
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
                                                  std::shared_ptr<TransferTraceInfo> trace_info) {

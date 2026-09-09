@@ -28,6 +28,9 @@ public:
                  const BlockBuffers &block_buffers,
                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
+    virtual ClientErrorCode RegisterGpuMemory(const RegistSpan &span) = 0;
+    virtual ClientErrorCode DeregisterGpuMemory(int fd) = 0;
+
 protected:
     TransferClient() = default;
     virtual ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) = 0;

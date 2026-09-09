@@ -18,6 +18,9 @@ public:
     virtual ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                  const std::shared_ptr<StorageConfig> &storage_config) = 0;
 
+    virtual ClientErrorCode RegisterGpuMemory(const RegistSpan&) { return ER_UNSUPPORTED_MEMORY_TYPE; }
+    virtual ClientErrorCode DeregisterGpuMemory(int) { return ER_UNSUPPORTED_MEMORY_TYPE; }
+
     virtual SdkType Type() = 0;
 
     // 一个remote_uri和一个Blockbuffer对应一个block

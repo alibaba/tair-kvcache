@@ -142,6 +142,30 @@ ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote
     return ER_OK;
 }
 
+ClientErrorCode SdkWrapper::RegisterGpuMemory(const RegistSpan &span) {
+    if (span.fd < 0 || span.base == nullptr || span.size == 0 || span.type != MemoryType::GPU) {
+        return ER_INVALID_PARAMS;
+    }
+    for (const auto &entry : sdk_map_) {
+        if (entry.second->Type() == SdkType::TAIR_MEMPOOL) {
+            return entry.second->RegisterGpuMemory(span);
+        }
+    }
+    return ER_GETSDK_ERROR;
+}
+
+ClientErrorCode SdkWrapper::DeregisterGpuMemory(int fd) {
+    if (fd < 0) {
+        return ER_INVALID_PARAMS;
+    }
+    for (const auto &entry : sdk_map_) {
+        if (entry.second->Type() == SdkType::TAIR_MEMPOOL) {
+            return entry.second->DeregisterGpuMemory(fd);
+        }
+    }
+    return ER_GETSDK_ERROR;
+}
+
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {

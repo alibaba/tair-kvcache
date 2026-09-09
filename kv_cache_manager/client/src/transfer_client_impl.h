@@ -20,6 +20,9 @@ public:
     TransferClientImpl();
     ~TransferClientImpl() override;
 
+    ClientErrorCode RegisterGpuMemory(const RegistSpan &span) override;
+    ClientErrorCode DeregisterGpuMemory(int fd) override;
+
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
                                  std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
