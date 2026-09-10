@@ -13,7 +13,7 @@ import importlib.util
 import json
 import sys
 import types
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 #: Modules this run replaced with stand-ins (empty when the real deps are
@@ -22,7 +22,10 @@ from unittest.mock import MagicMock
 STUBBED: set = set()
 
 
-def _module(name: str) -> types.ModuleType:
+def _module(name: str) -> Any:
+    """Return (or register) the stub module; Any because the whole point of
+    this helper is dynamic attribute injection that no static type
+    describes."""
     mod = sys.modules.get(name)
     if mod is None:
         mod = types.ModuleType(name)
@@ -78,6 +81,9 @@ def _stub_third_party():
         req.Session = MagicMock(name="requests.Session")
         req.post = MagicMock(name="requests.post")
         req.get = MagicMock(name="requests.get")
+        # manager_client's annotations reference requests.Response, which is
+        # evaluated at import time even when never called.
+        req.Response = MagicMock(name="requests.Response")
 
     # orjson is used functionally (CoordinateMsgSerializer round trips), so
     # the stand-in must actually (de)serialize; stdlib json handles the
@@ -85,7 +91,8 @@ def _stub_third_party():
     if "orjson" not in sys.modules and not _importable("orjson"):
         orjson = _module("orjson")
         orjson.dumps = lambda obj: json.dumps(
-            obj, default=lambda o: o.__dict__).encode()
+            obj, default=lambda o: o.__dict__
+        ).encode()
         orjson.loads = json.loads
 
 
@@ -165,8 +172,9 @@ def _install_stubs():
             self.real_page_size_bytes = page_size_bytes
             # Mirror vLLM's AttentionSpec: page_size_bytes returns the padded
             # size when padding is set.
-            self.page_size_bytes = (page_size_padded if page_size_padded
-                                    is not None else page_size_bytes)
+            self.page_size_bytes = (
+                page_size_padded if page_size_padded is not None else page_size_bytes
+            )
 
     class MambaSpec:
         def __init__(self, block_size, page_size_bytes):
@@ -192,32 +200,40 @@ _install_stubs()
 
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
-    AttentionGroupMeta, GroupMeta, StateGroupMeta)
+    AttentionGroupMeta,
+    StateGroupMeta,
+)
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler  # noqa: E402
 from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker  # noqa: E402
 
 
-def _make_group_metas(num_groups: int, num_state_groups: int,
-                      block_size: int) -> list:
+def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -> list:
     """Attention groups first, then mamba-style state groups; group_idx is the
     vLLM group index (what block tables are indexed by)."""
     return [
-        AttentionGroupMeta(group_idx=i, layer_names=[f"l{i}"],
-                           block_size=block_size, per_block_bytes=0)
+        AttentionGroupMeta(
+            group_idx=i, layer_names=[f"l{i}"], block_size=block_size, per_block_bytes=0
+        )
         for i in range(num_groups)
     ] + [
-        StateGroupMeta(group_idx=num_groups + i, layer_names=[f"m{i}"],
-                       block_size=block_size, per_block_bytes=0,
-                       page_size_bytes=0)
+        StateGroupMeta(
+            group_idx=num_groups + i,
+            layer_names=[f"m{i}"],
+            block_size=block_size,
+            per_block_bytes=0,
+            page_size_bytes=0,
+        )
         for i in range(num_state_groups)
     ]
 
 
-def make_connector(manager_block_size: int = 16,
-                   vllm_block_size: Optional[int] = None,
-                   num_groups: int = 1,
-                   num_state_groups: int = 0,
-                   tp_size: int = 1) -> ConnectorWorker:
+def make_connector(
+    manager_block_size: int = 16,
+    vllm_block_size: Optional[int] = None,
+    num_groups: int = 1,
+    num_state_groups: int = 0,
+    tp_size: int = 1,
+) -> ConnectorWorker:
     """Build a bare ConnectorWorker (no __init__) with the minimal state used by
     the pure translation logic under test (block index translation, transfer
     group building).
@@ -228,16 +244,23 @@ def make_connector(manager_block_size: int = 16,
     truncation)."""
     conn = ConnectorWorker.__new__(ConnectorWorker)
     conn._manager_block_size = manager_block_size
-    conn._vllm_block_size = vllm_block_size or manager_block_size
+    # Extra harness attributes the worker itself never declares.
+    conn._vllm_block_size = (  # ty: ignore[unresolved-attribute]
+        vllm_block_size or manager_block_size
+    )
     conn._tp_size = tp_size
     conn._tp_rank = 0
     conn._self_spec_names = {}
     conn._device = "cpu"
     conn._group_metas = _make_group_metas(
-        num_groups, num_state_groups, conn._vllm_block_size)
+        num_groups,
+        num_state_groups,
+        conn._vllm_block_size,  # ty: ignore[unresolved-attribute]
+    )
     conn._num_groups = len(conn._group_metas)
-    conn._state_group_idxs = [m.group_idx for m in conn._group_metas
-                              if isinstance(m, StateGroupMeta)]
+    conn._state_group_idxs = [  # ty: ignore[unresolved-attribute]
+        m.group_idx for m in conn._group_metas if isinstance(m, StateGroupMeta)
+    ]
     return conn
 
 
@@ -248,15 +271,16 @@ class FakeLocationQueries:
     hook's clamped result (store_result) is what the allocation consumes;
     the offset recorded at get time travels with it."""
 
-    def __init__(self, locations=None):
+    def __init__(self, locations: Optional[list] = None) -> None:
         self.locations = locations
         self.in_flight = locations is None
-        self._stored = None
+        self._stored: Any = None
         self.last_computed_blocks = 0
 
-    def get_locations_for_query(self, request, computed_blocks):
+    def get_locations_for_query(self, request: Any, computed_blocks: int) -> Any:
         self.last_computed_blocks = computed_blocks
-        return None if self.in_flight else list(self.locations)
+        # list(self.locations) is only reached when not in flight.
+        return None if self.in_flight else list(self.locations)  # ty: ignore[invalid-argument-type]
 
     def store_result(self, req_id, locations):
         self._stored = list(locations)
@@ -271,31 +295,37 @@ class FakeLocationQueries:
         self._stored = None
 
 
-def make_connector_scheduler(manager_block_size: int = 16,
-                        vllm_block_size: Optional[int] = None,
-                        num_groups: int = 1,
-                        num_state_groups: int = 0,
-                        tp_size: int = 1,
-                        locations=None) -> ConnectorScheduler:
+def make_connector_scheduler(
+    manager_block_size: int = 16,
+    vllm_block_size: Optional[int] = None,
+    num_groups: int = 1,
+    num_state_groups: int = 0,
+    tp_size: int = 1,
+    locations=None,
+) -> ConnectorScheduler:
     """Build a bare ConnectorScheduler (no __init__) with the scheduler-loop state
     build_connector_meta and friends need, plus a FakeLocationQueries
     answering ``locations`` (None means "still in flight")."""
     from unittest.mock import MagicMock
+
     core = ConnectorScheduler.__new__(ConnectorScheduler)
     core._manager_block_size = manager_block_size
     core._vllm_block_size = vllm_block_size or manager_block_size
     core._tp_size = tp_size
     core._group_metas = _make_group_metas(
-        num_groups, num_state_groups, core._vllm_block_size)
+        num_groups, num_state_groups, core._vllm_block_size
+    )
     core._num_groups = len(core._group_metas)
-    core._state_group_idxs = [m.group_idx for m in core._group_metas
-                              if isinstance(m, StateGroupMeta)]
+    core._state_group_idxs = [
+        m.group_idx for m in core._group_metas if isinstance(m, StateGroupMeta)
+    ]
     core._epoch = 0
     core._tracked = {}
     core._load_failed = set()
     core._load_attempted = set()
     core._waiting_to_load_requests = []
     import threading
+
     core._waiting_to_save_requests_lock = threading.Lock()
     core._waiting_to_save_requests = []
     core._waiting_to_finish_requests = []
@@ -304,5 +334,7 @@ def make_connector_scheduler(manager_block_size: int = 16,
     core._http_executor = MagicMock()
     core._manager_client = MagicMock()
     core._coordinator_client = MagicMock()
-    core._location_query_manager = FakeLocationQueries(locations)
+    core._location_query_manager = (  # ty: ignore[invalid-assignment]
+        FakeLocationQueries(locations)
+    )
     return core

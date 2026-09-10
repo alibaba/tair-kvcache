@@ -38,9 +38,9 @@ class KVLayout(Enum):
     isolation prevents such mixing in practice.
     """
 
-    SPLIT_KV_5D_KV_FIRST = "split_kv_5d_kv_first"   # (2, num_blocks, block, H, D)
-    SPLIT_KV_5D_N_FIRST = "split_kv_5d_n_first"     # (num_blocks, 2, block, H, D)
-    PACKED_4D = "packed_4d"                         # (num_blocks, H, block, 2D)
+    SPLIT_KV_5D_KV_FIRST = "split_kv_5d_kv_first"  # (2, num_blocks, block, H, D)
+    SPLIT_KV_5D_N_FIRST = "split_kv_5d_n_first"  # (num_blocks, 2, block, H, D)
+    PACKED_4D = "packed_4d"  # (num_blocks, H, block, 2D)
 
 
 @dataclass(frozen=True)
@@ -103,7 +103,8 @@ class TransferPlan:
     hole means is the task's disposition logic (see data_transfer)."""
 
     group: TransferGroup
-    uris: List
+    # None where a block carries no data for this group's spec.
+    uris: List[Optional[str]]
     # Attention groups: flat token slots per manager block (gather/scatter).
     token_indices: Optional[List[List[int]]] = None
     # State groups: source/target state block id per manager block.

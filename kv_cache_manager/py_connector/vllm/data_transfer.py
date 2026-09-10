@@ -20,28 +20,40 @@ data path, so the connector competes with the engine for exactly zero HBM.
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
-from kv_cache_manager.client.pybind import kvcm_py_client
+
+# kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
+from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
 
 from kv_cache_manager.py_connector.common.tp_coordinator import (
-    CoordinateMsgSerializer, TpCoordinatorClient, CoordinateMessage,
-    SendBlockFinishedEvent, LoadBlockFinishedEvent,
+    CoordinateMsgSerializer,
+    TpCoordinatorClient,
+    CoordinateMessage,
+    SendBlockFinishedEvent,
+    LoadBlockFinishedEvent,
 )
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.transfer_types import (
-    AttentionTransferGroup, KVCacheInfo, StateTransferGroup, TransferGroup)
+    AttentionTransferGroup,
+    KVCacheInfo,
+    TransferGroup,
+)
 from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
 
 
-def _get_device_module(device=None):
+def _get_device_module(device: Optional[torch.device] = None) -> Any:
     """Return the torch device module matching the runtime device."""
     if device is not None and hasattr(torch, "get_device_module"):
         return torch.get_device_module(device)
     try:
         if hasattr(torch, "musa") and torch.musa.is_available():
             import torch_musa  # noqa: F401
+
             return torch.musa
     except Exception:
         pass
@@ -66,7 +78,9 @@ class _StagingPool:
     an accepted trade-off for removing the GPU staging copy.
     """
 
-    def __init__(self, device, per_block_bytes: int, max_blocks: int):
+    def __init__(
+        self, device: torch.device, per_block_bytes: int, max_blocks: int
+    ) -> None:
         if max_blocks <= 0:
             raise ValueError("staging pool must have at least one block slot")
         self.block_bytes = per_block_bytes
@@ -75,8 +89,9 @@ class _StagingPool:
         total = max_blocks * per_block_bytes
         # Pinned host memory needs a CUDA context; on other devices (tests,
         # CPU-only runs) fall back to pageable memory.
-        self._cpu = torch.empty(total, dtype=torch.uint8, device="cpu",
-                                pin_memory=(device.type == "cuda"))
+        self._cpu = torch.empty(
+            total, dtype=torch.uint8, device="cpu", pin_memory=(device.type == "cuda")
+        )
         # Free runs as [start, start+len) block ranges, kept sorted by start.
         self._runs = [[0, max_blocks]]
 
@@ -89,7 +104,8 @@ class _StagingPool:
             raise ValueError(
                 f"staging task of {n} blocks exceeds the pool capacity "
                 f"{self.max_blocks}; raise staging_pool_blocks or shrink "
-                f"block_per_save_task/block_per_load_task")
+                f"block_per_save_task/block_per_load_task"
+            )
         with self._cond:
             while True:
                 for i, (start, length) in enumerate(self._runs):
@@ -123,7 +139,7 @@ class _StagingPool:
 
     def cpu_view(self, start: int, n: int) -> torch.Tensor:
         b = self.block_bytes
-        return self._cpu[start * b:(start + n) * b]
+        return self._cpu[start * b : (start + n) * b]
 
 
 class MultiResult:
@@ -131,14 +147,14 @@ class MultiResult:
     callback once every task has reported. Each result is a list[bool] aligned
     with the manager blocks the task handled (in submission order)."""
 
-    def __init__(self, size: int, callback):
+    def __init__(self, size: int, callback: Callable[[List[Any]], None]) -> None:
         self._size = size
-        self._results = [None] * size
+        self._results: List[Optional[Sequence[Any]]] = [None] * size
         self._lock = threading.Lock()
         self._finished_num = 0
         self._callback = callback
 
-    def submit_result(self, idx: int, result):
+    def submit_result(self, idx: int, result: Sequence[Any]) -> None:
         with self._lock:
             assert self._results[idx] is None
             self._results[idx] = result
@@ -154,7 +170,9 @@ class MultiResult:
                 self._callback(flat)
 
 
-def _effective_pool_blocks(configured, need, block_bytes, max_bytes):
+def _effective_pool_blocks(
+    configured: int, need: int, block_bytes: int, max_bytes: int
+) -> int:
     """Blocks per staging-pool group under the per-group pinned-RAM ceiling.
 
     min(configured, max_bytes // block_bytes), floored at one full task
@@ -168,8 +186,14 @@ def _effective_pool_blocks(configured, need, block_bytes, max_bytes):
 
 
 class DataTransferManager:
-    def __init__(self, kvcache_info: KVCacheInfo, manager_block_size: int,
-                 transfer_client, coordinator_client: TpCoordinatorClient, extra_config):
+    def __init__(
+        self,
+        kvcache_info: KVCacheInfo,
+        manager_block_size: int,
+        transfer_client: Any,
+        coordinator_client: TpCoordinatorClient,
+        extra_config: TairKvCacheConnectorExtraConfig,
+    ) -> None:
         self._info = kvcache_info
         self._manager_block_size = manager_block_size
         self._transfer_client = transfer_client
@@ -181,15 +205,15 @@ class DataTransferManager:
         self._load_stream = self._device_mod.Stream()
 
         pool_blocks = extra_config.staging_pool_blocks
-        need = max(extra_config.block_per_save_task,
-                   extra_config.block_per_load_task)
+        need = max(extra_config.block_per_save_task, extra_config.block_per_load_task)
         if pool_blocks < need:
             raise ValueError(
                 f"staging_pool_blocks={pool_blocks} is smaller than the "
                 f"largest task batch ({need}); one task stages its whole "
                 f"batch contiguously, so the pool must cover it -- raise "
                 f"staging_pool_blocks or shrink block_per_save_task/"
-                f"block_per_load_task")
+                f"block_per_load_task"
+            )
         # One pool per group: block shapes differ between attention and state
         # groups. The pool is pinned host memory only -- the kernel reaches it
         # over PCIe -- so the connector's device-memory footprint is zero.
@@ -201,40 +225,55 @@ class DataTransferManager:
         self._pools = {}
         for g in kvcache_info.groups:
             blocks = _effective_pool_blocks(
-                pool_blocks, need, g.per_block_bytes,
-                extra_config.staging_pool_max_bytes_per_group)
+                pool_blocks,
+                need,
+                g.per_block_bytes,
+                extra_config.staging_pool_max_bytes_per_group,
+            )
             if blocks < pool_blocks:
                 logger.warning(
                     "staging pool %s: %d blocks x %d bytes would pin "
                     "%.1f GiB; capped to %d blocks (%.1f MiB) by "
                     "staging_pool_max_bytes_per_group=%d",
-                    g.spec_name, pool_blocks, g.per_block_bytes,
-                    pool_blocks * g.per_block_bytes / 2**30, blocks,
+                    g.spec_name,
+                    pool_blocks,
+                    g.per_block_bytes,
+                    pool_blocks * g.per_block_bytes / 2**30,
+                    blocks,
                     blocks * g.per_block_bytes / 2**20,
-                    extra_config.staging_pool_max_bytes_per_group)
+                    extra_config.staging_pool_max_bytes_per_group,
+                )
             self._pools[g.spec_name] = _StagingPool(
-                self._device, g.per_block_bytes, blocks)
+                self._device, g.per_block_bytes, blocks
+            )
         for name, pool in self._pools.items():
-            logger.info("staging pool %s: %d blocks x %d bytes "
-                        "(pinned %.1f MiB, GPU 0)",
-                        name, pool.max_blocks,
-                        pool.block_bytes,
-                        pool.max_blocks * pool.block_bytes / 2**20)
+            logger.info(
+                "staging pool %s: %d blocks x %d bytes (pinned %.1f MiB, GPU 0)",
+                name,
+                pool.max_blocks,
+                pool.block_bytes,
+                pool.max_blocks * pool.block_bytes / 2**20,
+            )
 
-        def _init_worker():
+        def _init_worker() -> None:
             self._device_mod.set_device(self._device)
 
         self._io_executor = ThreadPoolExecutor(
-            max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker)
+            max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker
+        )
 
-    def submit_task(self, func, *args, **kwargs):
+    def submit_task(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Future:
         return self._io_executor.submit(func, *args, **kwargs)
 
     # ------------------------------------------------------------------ #
     # BlockBuffer helper
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _make_block_buffers(base_ptr: int, per_block_bytes: int, count: int):
+    def _make_block_buffers(
+        base_ptr: int, per_block_bytes: int, count: int
+    ) -> List[kvcm_py_client.BlockBuffer]:
         buffers = []
         for i in range(count):
             buf = kvcm_py_client.BlockBuffer()
@@ -250,8 +289,16 @@ class DataTransferManager:
     # ------------------------------------------------------------------ #
     # Save
     # ------------------------------------------------------------------ #
-    def save_task(self, multi_result: MultiResult, task_idx, group: TransferGroup,
-                  remote_uris, block_token_indices, block_ids, ready_event):
+    def save_task(
+        self,
+        multi_result: MultiResult,
+        task_idx: int,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_token_indices: Optional[List[List[int]]],
+        block_ids: Optional[List[int]],
+        ready_event: Any,
+    ) -> None:
         """Gather one group's manager blocks from HBM and save them.
 
         block_token_indices: attention -> list[list[int]] flat token slots per block.
@@ -279,19 +326,34 @@ class DataTransferManager:
             valid = [i for i in range(n) if i not in skipped and i not in failed]
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
-                self._save_valid_blocks(group, remote_uris,
-                                        block_token_indices, block_ids,
-                                        ready_event, valid, ok_mask)
+                self._save_valid_blocks(
+                    group,
+                    remote_uris,
+                    block_token_indices,
+                    block_ids,
+                    ready_event,
+                    valid,
+                    ok_mask,
+                )
         except Exception:
             # Fail the whole task: partially transferred blocks are unknown, so
             # report conservatively -- never publish a block we cannot vouch
             # for (abstentions included; that only costs hit rate, not truth).
-            logger.exception("save task crashed group=%s blocks=%d, failing them all",
-                             group.spec_name, n)
+            logger.exception(
+                "save task crashed group=%s blocks=%d, failing them all",
+                group.spec_name,
+                n,
+            )
             ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
 
-    def _save_dispositions(self, group: TransferGroup, remote_uris, block_ids, n):
+    def _save_dispositions(
+        self,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_ids: Optional[List[int]],
+        n: int,
+    ) -> Tuple[Set[int], Set[int]]:
         """Split the task's blocks into (abstained, failed); the rest transfer.
 
         A state group abstains for a manager block exactly when vLLM's block
@@ -309,34 +371,53 @@ class DataTransferManager:
         if isinstance(group, AttentionTransferGroup):
             failed = {i for i in range(n) if remote_uris[i] is None}
             if failed:
-                logger.warning("save group %s: %d/%d attention blocks have no "
-                               "location, failing them", group.spec_name,
-                               len(failed), n)
+                logger.warning(
+                    "save group %s: %d/%d attention blocks have no "
+                    "location, failing them",
+                    group.spec_name,
+                    len(failed),
+                    n,
+                )
             return set(), failed
         skipped, failed = set(), set()
         for i in range(n):
-            is_null = block_ids[i] == 0
+            is_null = block_ids[i] == 0  # ty: ignore[not-subscriptable]
             has_uri = remote_uris[i] is not None
             if is_null and not has_uri:
                 skipped.add(i)
             elif is_null:
                 failed.add(i)
-                logger.warning("save group %s: block %d has a location but no "
-                               "materialized state; failing it instead of "
-                               "publishing bytes the model never produced",
-                               group.spec_name, i)
+                logger.warning(
+                    "save group %s: block %d has a location but no "
+                    "materialized state; failing it instead of "
+                    "publishing bytes the model never produced",
+                    group.spec_name,
+                    i,
+                )
             elif not has_uri:
                 failed.add(i)
-                logger.warning("save group %s: block %d has a materialized "
-                               "state but no location to write it to; failing it",
-                               group.spec_name, i)
+                logger.warning(
+                    "save group %s: block %d has a materialized "
+                    "state but no location to write it to; failing it",
+                    group.spec_name,
+                    i,
+                )
         if skipped:
-            logger.debug("save group %s: %d/%d blocks carry no state "
-                         "(not published)", group.spec_name, len(skipped), n)
+            logger.debug(
+                "save group %s: %d/%d blocks carry no state (not published)",
+                group.spec_name,
+                len(skipped),
+                n,
+            )
         return skipped, failed
 
     @staticmethod
-    def _load_skipped_blocks(group: TransferGroup, remote_uris, block_ids, n) -> set:
+    def _load_skipped_blocks(
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_ids: Optional[List[int]],
+        n: int,
+    ) -> Set[int]:
         """Blocks this group has nothing to load into.
 
         Asymmetric with the save side on purpose: on load, a null target means
@@ -349,22 +430,40 @@ class DataTransferManager:
         if isinstance(group, AttentionTransferGroup):
             missing = sum(uri is None for uri in remote_uris)
             if missing:
-                logger.warning("load group %s: %d/%d attention blocks have no "
-                               "location, failing them", group.spec_name, missing, n)
+                logger.warning(
+                    "load group %s: %d/%d attention blocks have no "
+                    "location, failing them",
+                    group.spec_name,
+                    missing,
+                    n,
+                )
             return set()
-        skipped = {i for i in range(n) if block_ids[i] == 0}
+        # State tasks always carry block ids (see _iter_task_chunks).
+        skipped = {i for i in range(n) if block_ids[i] == 0}  # ty: ignore[not-subscriptable]
         if skipped:
-            logger.debug("load group %s: %d/%d blocks need no state",
-                         group.spec_name, len(skipped), n)
+            logger.debug(
+                "load group %s: %d/%d blocks need no state",
+                group.spec_name,
+                len(skipped),
+                n,
+            )
         return skipped
 
-    def _save_valid_blocks(self, group, remote_uris,
-                           block_token_indices, block_ids, ready_event,
-                           valid, ok_mask):
+    def _save_valid_blocks(
+        self,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_token_indices: Optional[List[List[int]]],
+        block_ids: Optional[List[int]],
+        ready_event: Any,
+        valid: List[int],
+        ok_mask: List[Optional[bool]],
+    ) -> None:
         uris = [remote_uris[i] for i in valid]
-        assert all(uri is not None for uri in uris), \
-            f"group {group.spec_name}: save batch contains a block without a " \
+        assert all(uri is not None for uri in uris), (
+            f"group {group.spec_name}: save batch contains a block without a "
             f"location; _save_dispositions must have failed it"
+        )
         # Wait for the engine's forward pass *before* taking a pool slot:
         # the slot is needed only for the gather + SDK transfer, so holding
         # it while the model still runs only extends the pool occupancy and
@@ -380,33 +479,52 @@ class DataTransferManager:
                 # directly over PCIe; no device-side staging copy exists.
                 if isinstance(group, AttentionTransferGroup):
                     view = cpu_buffer.view(self._info.dtype).view(
-                        len(valid), group.num_kv_ptrs,
-                        self._manager_block_size, group.per_token_dim)
+                        len(valid),
+                        group.num_kv_ptrs,
+                        self._manager_block_size,
+                        group.per_token_dim,
+                    )
                     batch_gather_scatter_helper.batch_gather_kv_caches(
-                        group.kvcache_ptr_tensor_gpu, view,
-                        [block_token_indices[i] for i in valid],
-                        list(range(len(valid))), self._manager_block_size,
+                        group.kvcache_ptr_tensor_gpu,
+                        view,
+                        # Attention tasks always carry token indices.
+                        [block_token_indices[i] for i in valid],  # ty: ignore[not-subscriptable]
+                        list(range(len(valid))),
+                        self._manager_block_size,
                         group.per_token_dim,
                         block_stride=group.block_stride,
-                        local_block_size=group.kernel_block_size)
+                        local_block_size=group.kernel_block_size,
+                    )
                 else:
+                    # State tasks always carry block ids and state views
+                    # (see _iter_task_chunks).
                     for out_i, i in enumerate(valid):
                         for layer_idx in range(group.layer_num):
-                            dst = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                            cpu_buffer[dst:dst + group.page_size_bytes].copy_(
-                                group.block_view_tensors[layer_idx][block_ids[i]],
-                                non_blocking=True)
+                            dst = (
+                                out_i * group.layer_num + layer_idx
+                            ) * group.page_size_bytes  # ty: ignore[unresolved-attribute]
+                            cpu_buffer[dst : dst + group.page_size_bytes].copy_(  # ty: ignore[unresolved-attribute]
+                                group.block_view_tensors[layer_idx][  # ty: ignore[unresolved-attribute]
+                                    block_ids[i]  # ty: ignore[not-subscriptable]
+                                ],
+                                non_blocking=True,
+                            )
                 done = self._device_mod.Event()
                 done.record(self._save_stream)
             done.synchronize()
 
             buffers = self._make_block_buffers(
-                cpu_buffer.data_ptr(), group.per_block_bytes, len(valid))
+                cpu_buffer.data_ptr(), group.per_block_bytes, len(valid)
+            )
             result = self._transfer_client.SaveKvCaches(uris, buffers)
-            ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+            ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
             if not ok:
-                logger.warning("save task failed group=%s uris=%d result=%s",
-                               group.spec_name, len(uris), result)
+                logger.warning(
+                    "save task failed group=%s uris=%d result=%s",
+                    group.spec_name,
+                    len(uris),
+                    result,
+                )
             for i in valid:
                 ok_mask[i] = ok
         except BaseException:
@@ -417,7 +535,13 @@ class DataTransferManager:
         finally:
             pool.release(start, len(valid))
 
-    def create_save_done_callback(self, req_id, tp_rank, write_session_id, num_blocks):
+    def create_save_done_callback(
+        self,
+        req_id: str,
+        tp_rank: int,
+        write_session_id: str,
+        num_blocks: int,
+    ) -> Callable[[List[Optional[bool]]], None]:
         """block success = AND across all groups that had data for the block.
 
         Task results are ordered group0[blocks], group1[blocks], ... so a
@@ -427,7 +551,8 @@ class DataTransferManager:
         block whose every group is None was never written at all and must not
         be published.
         """
-        def cb(flat):
+
+        def cb(flat: List[Optional[bool]]) -> None:
             is_success = [None] * num_blocks
             for i, ok in enumerate(flat):
                 if ok is None:
@@ -436,17 +561,31 @@ class DataTransferManager:
                 is_success[b] = ok if is_success[b] is None else (is_success[b] and ok)
             # No group wrote anything for the block -> nothing to publish.
             is_success = [bool(ok) for ok in is_success]
-            msg = CoordinateMessage(time.time(), SendBlockFinishedEvent(
-                request_id=req_id, tp_rank=tp_rank,
-                write_session_id=write_session_id, is_success_list=is_success))
+            msg = CoordinateMessage(
+                time.time(),
+                SendBlockFinishedEvent(
+                    request_id=req_id,
+                    tp_rank=tp_rank,
+                    write_session_id=write_session_id,
+                    is_success_list=is_success,
+                ),
+            )
             self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
+
         return cb
 
     # ------------------------------------------------------------------ #
     # Load
     # ------------------------------------------------------------------ #
-    def load_task(self, multi_result: MultiResult, task_idx, group: TransferGroup,
-                  remote_uris, block_token_indices, block_ids):
+    def load_task(
+        self,
+        multi_result: MultiResult,
+        task_idx: int,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_token_indices: Optional[List[List[int]]],
+        block_ids: Optional[List[int]],
+    ) -> None:
         """Load one group's manager blocks from storage into HBM.
 
         Mirror of ``save_task``: ``remote_uris`` is positionally aligned with
@@ -464,36 +603,48 @@ class DataTransferManager:
             skipped = self._load_skipped_blocks(group, remote_uris, block_ids, n)
             # A block we must restore but nothing was published for cannot be
             # loaded; fail it without letting it shift the staging batch.
-            failed = {i for i in range(n)
-                      if i not in skipped and remote_uris[i] is None}
+            failed = {
+                i for i in range(n) if i not in skipped and remote_uris[i] is None
+            }
             valid = [i for i in range(n) if i not in skipped and i not in failed]
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
-                ok = self._load_valid_blocks(group, remote_uris,
-                                             block_token_indices, block_ids,
-                                             valid)
+                ok = self._load_valid_blocks(
+                    group, remote_uris, block_token_indices, block_ids, valid
+                )
                 for i in valid:
                     ok_mask[i] = ok
         except Exception:
-            logger.exception("load task crashed group=%s blocks=%d, failing them all",
-                             group.spec_name, n)
+            logger.exception(
+                "load task crashed group=%s blocks=%d, failing them all",
+                group.spec_name,
+                n,
+            )
             ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
 
-    def _load_valid_blocks(self, group, remote_uris, block_token_indices,
-                           block_ids, valid) -> bool:
+    def _load_valid_blocks(
+        self,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        block_token_indices: Optional[List[List[int]]],
+        block_ids: Optional[List[int]],
+        valid: List[int],
+    ) -> bool:
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
         try:
             cpu_buffer = pool.cpu_view(start, len(valid))
-            buffers = self._make_block_buffers(cpu_buffer.data_ptr(),
-                                               group.per_block_bytes, len(valid))
+            buffers = self._make_block_buffers(
+                cpu_buffer.data_ptr(), group.per_block_bytes, len(valid)
+            )
             uris = [remote_uris[i] for i in valid]
-            assert all(uri is not None for uri in uris), \
-                f"group {group.spec_name}: load batch contains a block without a " \
+            assert all(uri is not None for uri in uris), (
+                f"group {group.spec_name}: load batch contains a block without a "
                 f"location; load_task must have failed it"
+            )
             result = self._transfer_client.LoadKvCaches(uris, buffers)
-            ok = (result == kvcm_py_client.ClientErrorCode.ER_OK)
+            ok = result == kvcm_py_client.ClientErrorCode.ER_OK
             if ok:
                 with self._device_mod.stream(self._load_stream):
                     # Scatter straight out of the pinned host slot: the
@@ -501,28 +652,47 @@ class DataTransferManager:
                     # memory directly over PCIe; no device-side staging copy.
                     if isinstance(group, AttentionTransferGroup):
                         view = cpu_buffer.view(self._info.dtype).view(
-                            len(valid), group.num_kv_ptrs,
-                            self._manager_block_size, group.per_token_dim)
+                            len(valid),
+                            group.num_kv_ptrs,
+                            self._manager_block_size,
+                            group.per_token_dim,
+                        )
                         batch_gather_scatter_helper.batch_scatter_kv_caches(
-                            group.kvcache_ptr_tensor_gpu, view,
-                            [block_token_indices[i] for i in valid],
-                            list(range(len(valid))), self._manager_block_size,
+                            group.kvcache_ptr_tensor_gpu,
+                            view,
+                            # Attention tasks always carry token indices
+                            # (see _iter_task_chunks).
+                            [block_token_indices[i] for i in valid],  # ty: ignore[not-subscriptable]
+                            list(range(len(valid))),
+                            self._manager_block_size,
                             group.per_token_dim,
                             block_stride=group.block_stride,
-                            local_block_size=group.kernel_block_size)
+                            local_block_size=group.kernel_block_size,
+                        )
                     else:
+                        # State tasks always carry block ids and state views
+                        # (see _iter_task_chunks).
                         for out_i, i in enumerate(valid):
                             for layer_idx in range(group.layer_num):
-                                src = (out_i * group.layer_num + layer_idx) * group.page_size_bytes
-                                group.block_view_tensors[layer_idx][block_ids[i]].copy_(
-                                    cpu_buffer[src:src + group.page_size_bytes],
-                                    non_blocking=True)
+                                src = (
+                                    out_i * group.layer_num + layer_idx
+                                ) * group.page_size_bytes  # ty: ignore[unresolved-attribute]
+                                group.block_view_tensors[layer_idx][  # ty: ignore[unresolved-attribute]
+                                    block_ids[i]  # ty: ignore[not-subscriptable]
+                                ].copy_(
+                                    cpu_buffer[src : src + group.page_size_bytes],  # ty: ignore[unresolved-attribute]
+                                    non_blocking=True,
+                                )
                     done = self._device_mod.Event()
                     done.record(self._load_stream)
                 done.synchronize()
             else:
-                logger.warning("load task failed group=%s uris=%d result=%s",
-                               group.spec_name, len(uris), result)
+                logger.warning(
+                    "load task failed group=%s uris=%d result=%s",
+                    group.spec_name,
+                    len(uris),
+                    result,
+                )
             return ok
         except BaseException:
             # Drain the stream before the slots go back (as in save).
@@ -531,8 +701,15 @@ class DataTransferManager:
         finally:
             pool.release(start, len(valid))
 
-    def create_load_done_callback(self, req_id, tp_rank, epoch, block_ids, num_blocks,
-                                  report_failures=True):
+    def create_load_done_callback(
+        self,
+        req_id: str,
+        tp_rank: int,
+        epoch: int,
+        block_ids: List[int],
+        num_blocks: int,
+        report_failures: bool = True,
+    ) -> Callable[[List[Optional[bool]]], None]:
         """A manager block is loaded only if every group that had data for it
         succeeded.
 
@@ -549,7 +726,8 @@ class DataTransferManager:
         failure is logged, vLLM keeps the partially loaded KV, and the request
         may produce corrupt output -- the contained alternative to an
         engine-wide crash. See start_load_kv for the full trade-off."""
-        def cb(flat):
+
+        def cb(flat: List[Optional[bool]]) -> None:
             merged = [None] * num_blocks
             for i, ok in enumerate(flat):
                 if ok is None:
@@ -560,13 +738,28 @@ class DataTransferManager:
             merged = [bool(ok) for ok in merged]
             failed = []
             if report_failures:
-                failed = [block_ids[i] for i in range(min(num_blocks, len(block_ids)))
-                          if not merged[i]]
+                failed = [
+                    block_ids[i]
+                    for i in range(min(num_blocks, len(block_ids)))
+                    if not merged[i]
+                ]
             elif not all(merged):
-                logger.warning("load failed for %d/%d blocks of req %s (hybrid: "
-                               "not reporting invalid block ids)",
-                               merged.count(False), num_blocks, req_id)
-            msg = CoordinateMessage(time.time(), LoadBlockFinishedEvent(
-                request_id=req_id, tp_rank=tp_rank, epoch=epoch, failed_block_idxs=failed))
+                logger.warning(
+                    "load failed for %d/%d blocks of req %s (hybrid: "
+                    "not reporting invalid block ids)",
+                    merged.count(False),
+                    num_blocks,
+                    req_id,
+                )
+            msg = CoordinateMessage(
+                time.time(),
+                LoadBlockFinishedEvent(
+                    request_id=req_id,
+                    tp_rank=tp_rank,
+                    epoch=epoch,
+                    failed_block_idxs=failed,
+                ),
+            )
             self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))
+
         return cb

@@ -45,23 +45,25 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     to_finish_requests (get_finished). Every instruction is self-contained
     -- the worker keeps no per-request mirror of scheduler state."""
 
-    def __init__(self, epoch: int):
+    def __init__(self, epoch: int) -> None:
         self.epoch = epoch
         self.to_load_requests: List[LoadRequest] = []
         self.to_save_requests: List[SaveRequest] = []
         self.to_finish_requests: List[FinishRequest] = []
 
-    def add_load_request(self, request: LoadRequest):
+    def add_load_request(self, request: LoadRequest) -> None:
         self.to_load_requests.append(request)
 
-    def add_save_request(self, save_request: SaveRequest):
+    def add_save_request(self, save_request: SaveRequest) -> None:
         self.to_save_requests.append(save_request)
 
-    def add_finish_request(self, finish_request: FinishRequest):
+    def add_finish_request(self, finish_request: FinishRequest) -> None:
         self.to_finish_requests.append(finish_request)
 
-    def __repr__(self):
-        return (f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
-                f"load={len(self.to_load_requests)}, "
-                f"save={len(self.to_save_requests)}, "
-                f"finish={len(self.to_finish_requests)})")
+    def __repr__(self) -> str:
+        return (
+            f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
+            f"load={len(self.to_load_requests)}, "
+            f"save={len(self.to_save_requests)}, "
+            f"finish={len(self.to_finish_requests)})"
+        )

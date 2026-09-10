@@ -2,7 +2,9 @@
 
 Requires a running KV Cache Manager process and CUDA device.
 """
+
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 
 import subprocess
@@ -10,19 +12,24 @@ import signal
 import time
 import os
 import atexit
+from typing import Any, cast
 from types import SimpleNamespace
 
 import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
     PoolHitPolicy,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MambaPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost, MambaPoolHost
+
+# MHATokenToKVPoolHost / MambaPoolHost moved in newer sglang versions.
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    MambaPoolHost,  # ty: ignore[unresolved-import]
+)
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.distributed import (
     init_distributed_environment,
@@ -74,7 +81,7 @@ kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 proc = None
 
 
-def _stop_manager():
+def _stop_manager(*args: Any) -> None:
     """Stop the KV Cache Manager process."""
     global proc
     if proc and proc.poll() is None:
@@ -97,11 +104,15 @@ def _start_manager():
     global proc
     subprocess.run("rm -rf /root/KVCacheManager/logs/*", shell=True, check=False)
 
-    proc = subprocess.Popen([
-        f"{kvcm_home}/bin/kv_cache_manager_bin",
-        "-c", f"{kvcm_home}/etc/default_server_config.conf",
-        "-l", f"{kvcm_home}/etc/default_logger_config.conf"
-    ])
+    proc = subprocess.Popen(
+        [
+            f"{kvcm_home}/bin/kv_cache_manager_bin",
+            "-c",
+            f"{kvcm_home}/etc/default_server_config.conf",
+            "-l",
+            f"{kvcm_home}/etc/default_logger_config.conf",
+        ]
+    )
 
     signal.signal(signal.SIGINT, _stop_manager)
     signal.signal(signal.SIGTERM, _stop_manager)
@@ -206,7 +217,7 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
     )
 
     storage_backend = HiCacheKVCM(storage_config, {})
-    storage_backend.register_mem_pool_host(host_pool_group)
+    storage_backend.register_mem_pool_host(host_pool_group)  # ty: ignore[invalid-argument-type]
 
     # Generate test data
     token_ids = list(range(num_blocks * page_size))
@@ -214,7 +225,7 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
     block_hash = None
     kv_host_indices = []
     for i in range(0, num_blocks * page_size, page_size):
-        block_hash = get_hash_str(token_ids[i:i + page_size], block_hash)
+        block_hash = cast(str, get_hash_str(token_ids[i : i + page_size], block_hash))
         block_hashes.append(block_hash)
         kv_host_indices.extend(range(i, i + page_size))
 
@@ -249,8 +260,9 @@ def _fill_mamba_buffer(mamba_pool):
 def test_hybrid(kv_pool_host, mamba_pool):
     """Basic hybrid test (migrated from test.py):
     set_v2 (Mamba) + set_v1 (KV), then exists_v2, get_v2 with data verification."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,"hybrid_0")
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "hybrid_0")
+    )
     num_blocks = len(block_hashes)
 
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -303,22 +315,21 @@ def test_hybrid(kv_pool_host, mamba_pool):
     )
 
     for i in range(num_blocks):
-        assert torch.allclose(
-            mamba_pool.temporal_buffer[i], orig_temporal[i]
-        ), f"Temporal data mismatch at page {i}"
+        assert torch.allclose(mamba_pool.temporal_buffer[i], orig_temporal[i]), (
+            f"Temporal data mismatch at page {i}"
+        )
         for j, conv_buf in enumerate(mamba_pool.conv_buffer):
-            assert torch.allclose(
-                conv_buf[i], orig_conv[j][i]
-            ), f"Conv {j} data mismatch at page {i}"
+            assert torch.allclose(conv_buf[i], orig_conv[j][i]), (
+                f"Conv {j} data mismatch at page {i}"
+            )
 
     logger.info("test_hybrid passed!")
 
 
 def test_write_kv_only_then_exists_v2(kv_pool_host, mamba_pool):
     """Write KV only (no Mamba) -> batch_exists_v2 shows KV hit but Mamba boundary=0."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_kv_only_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_kv_only_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -358,11 +369,9 @@ def test_write_mamba_only_then_exists_v2(kv_pool_host, mamba_pool):
     KV ("Full") spec presence.  Since only Linear spec was written,
     kv_hit_pages should be 0 and final_pages should be 0.
     """
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_mamba_only_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_mamba_only_0")
     )
-    num_blocks = len(block_hashes)
     _fill_mamba_buffer(mamba_pool)
 
     # Write Mamba only
@@ -388,9 +397,8 @@ def test_write_mamba_only_then_exists_v2(kv_pool_host, mamba_pool):
 
 def test_kv_then_mamba_cross_order(kv_pool_host, mamba_pool):
     """Write KV first, then Mamba (reverse order of test_hybrid). Both should succeed."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_cross_order_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_cross_order_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -456,9 +464,8 @@ def test_kv_then_mamba_cross_order(kv_pool_host, mamba_pool):
 
 def test_full_hybrid_round_trip(kv_pool_host, mamba_pool):
     """Complete write-clear-read-verify cycle for both KV and Mamba."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_full_rt_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_full_rt_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
@@ -516,18 +523,15 @@ def test_full_hybrid_round_trip(kv_pool_host, mamba_pool):
 
 def test_trailing_pages_policy(kv_pool_host, mamba_pool):
     """Test TRAILING_PAGES boundary: only write Mamba for last N blocks."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_trailing_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_trailing_0")
     )
     num_blocks = len(block_hashes)
     _fill_kv_buffer(kv_pool_host, num_blocks)
     _fill_mamba_buffer(mamba_pool)
 
     # Write all KV blocks
-    set_v1 = storage_backend.batch_set_v1(
-        block_hashes, torch.tensor(kv_host_indices)
-    )
+    set_v1 = storage_backend.batch_set_v1(block_hashes, torch.tensor(kv_host_indices))
     assert all(set_v1)
 
     # Write Mamba only for last 3 blocks
@@ -592,9 +596,10 @@ def test_partial_write_buffer_indexing(kv_pool_host, mamba_pool):
     num_blocks = 6
     first_n = 3
 
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(
-        kv_pool_host, mamba_pool, "linear_partial_idx_0", num_blocks=num_blocks
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(
+            kv_pool_host, mamba_pool, "linear_partial_idx_0", num_blocks=num_blocks
+        )
     )
 
     _fill_mamba_buffer(mamba_pool)
@@ -641,26 +646,23 @@ def test_partial_write_buffer_indexing(kv_pool_host, mamba_pool):
     # Step 4: Verify each page has its own correct data (not swapped).
     # With the old bug, pages 3-5 would contain data from pages 0-2.
     for i in range(num_blocks):
-        assert torch.allclose(
-            mamba_pool.temporal_buffer[i], orig_temporal[i]
-        ), (
+        assert torch.allclose(mamba_pool.temporal_buffer[i], orig_temporal[i]), (
             f"Temporal mismatch at page {i}: "
             f"got {mamba_pool.temporal_buffer[i].flatten()[0].item()}, "
             f"expected {orig_temporal[i].flatten()[0].item()}"
         )
         for j, conv_buf in enumerate(mamba_pool.conv_buffer):
-            assert torch.allclose(
-                conv_buf[i], orig_conv[j][i]
-            ), f"Conv {j} mismatch at page {i}"
+            assert torch.allclose(conv_buf[i], orig_conv[j][i]), (
+                f"Conv {j} mismatch at page {i}"
+            )
 
     logger.info("test_partial_write_buffer_indexing passed!")
 
 
 def test_non_mamba_pool_transfer_returns_false(kv_pool_host, mamba_pool):
     """Non-MAMBA pool transfers in batch_set_v2 / batch_get_v2 return all False."""
-    (storage_backend,
-     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(kv_pool_host, mamba_pool,
-        "linear_non_mamba_0"
+    (storage_backend, block_hashes, kv_host_indices, mamba_host_indices) = (
+        _create_hybrid_backend(kv_pool_host, mamba_pool, "linear_non_mamba_0")
     )
 
     # Use a non-MAMBA pool name

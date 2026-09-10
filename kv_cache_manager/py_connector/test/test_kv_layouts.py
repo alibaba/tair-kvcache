@@ -19,12 +19,15 @@ Runs without torch: a minimal FakeTensor models the strided-view semantics
 
 import sys
 import types
+from typing import Any
 import unittest
 
 from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
 from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
 from kv_cache_manager.py_connector.vllm.v1_connector import (
-    attn_kv_views, ensure_hybrid_supported, GroupMeta)
+    attn_kv_views,
+    ensure_hybrid_supported,
+)
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 
 ITEMSIZE = 2  # bf16/fp16
@@ -59,19 +62,29 @@ class FakeTensor:
         return self._base + self._offset * ITEMSIZE
 
     def permute(self, *dims):
-        return FakeTensor([self.shape[d] for d in dims],
-                          [self._strides[d] for d in dims],
-                          self._offset, self._base)
+        return FakeTensor(
+            [self.shape[d] for d in dims],
+            [self._strides[d] for d in dims],
+            self._offset,
+            self._base,
+        )
 
     def __getitem__(self, idx):
         if isinstance(idx, int):  # t[i]: drop dim 0
-            return FakeTensor(self.shape[1:], self._strides[1:],
-                              self._offset + idx * self._strides[0], self._base)
+            return FakeTensor(
+                self.shape[1:],
+                self._strides[1:],
+                self._offset + idx * self._strides[0],
+                self._base,
+            )
         if isinstance(idx, tuple) and idx[0] == slice(None) and isinstance(idx[1], int):
             # t[:, i]: drop dim 1
-            return FakeTensor(self.shape[:1] + self.shape[2:],
-                              self._strides[:1] + self._strides[2:],
-                              self._offset + idx[1] * self._strides[1], self._base)
+            return FakeTensor(
+                self.shape[:1] + self.shape[2:],
+                self._strides[:1] + self._strides[2:],
+                self._offset + idx[1] * self._strides[1],
+                self._base,
+            )
         raise TypeError(f"unsupported index {idx!r}")
 
 
@@ -97,9 +110,9 @@ class TestAttnKvViews(unittest.TestCase):
         self.assertIs(layout, KVLayout.PACKED_4D)
         self.assertEqual(len(views), 1)
         v = views[0]
-        self.assertEqual(v.shape, (10, 16, 4, 256))          # (n, b, h, 2d)
+        self.assertEqual(v.shape, (10, 16, 4, 256))  # (n, b, h, 2d)
         self.assertEqual(v.stride(), (16 * 4 * 256, 4 * 256, 256, 1))
-        self.assertEqual(v.data_ptr(), BASE_PTR)             # storage base
+        self.assertEqual(v.data_ptr(), BASE_PTR)  # storage base
 
     def test_kv_first_5d(self):
         views, layout = attn_kv_views(kv_first_5d())
@@ -111,8 +124,7 @@ class TestAttnKvViews(unittest.TestCase):
             self.assertEqual(view.stride(), (16 * 4 * 128, 4 * 128, 128, 1))
         self.assertEqual(k.data_ptr(), BASE_PTR)
         # V base = K base + num_blocks * block * h * d elements.
-        self.assertEqual(v.data_ptr() - k.data_ptr(),
-                         10 * 16 * 4 * 128 * ITEMSIZE)
+        self.assertEqual(v.data_ptr() - k.data_ptr(), 10 * 16 * 4 * 128 * ITEMSIZE)
 
     def test_n_first_5d(self):
         views, layout = attn_kv_views(n_first_5d())
@@ -124,14 +136,13 @@ class TestAttnKvViews(unittest.TestCase):
             # K and V of one block are interleaved: the block stride covers
             # both halves while the inner page stays token-major.
             self.assertEqual(view.stride(), (2 * 16 * 4 * 128, 4 * 128, 128, 1))
-        self.assertEqual(v.data_ptr() - k.data_ptr(),
-                         16 * 4 * 128 * ITEMSIZE)
+        self.assertEqual(v.data_ptr() - k.data_ptr(), 16 * 4 * 128 * ITEMSIZE)
 
     def test_unrecognized_layouts_fail_fast(self):
         bad = [
-            FakeTensor.contiguous([10, 16, 4]),           # 3-D
+            FakeTensor.contiguous([10, 16, 4]),  # 3-D
             FakeTensor.contiguous([10, 2, 16, 4, 128, 2]),  # 6-D
-            FakeTensor.contiguous([10, 16, 2, 4, 128]),   # 5-D, K/V dim misplaced
+            FakeTensor.contiguous([10, 16, 2, 4, 128]),  # 5-D, K/V dim misplaced
         ]
         for t in bad:
             with self.subTest(shape=t.shape):
@@ -147,14 +158,16 @@ class TestAttnKvViews(unittest.TestCase):
 
 def _make_group_conn():
     conn = make_connector(manager_block_size=16)
-    conn._self_spec_names = ["tp0_g0"]
+    # list instead of the production dict: group_idx == position here.
+    conn._self_spec_names = ["tp0_g0"]  # ty: ignore[invalid-assignment]
     conn._device = "cpu"
     return conn
 
 
 def _attn_meta(layer_names, block_size=16):
-    return AttentionGroupMeta(group_idx=0, layer_names=layer_names,
-                               block_size=block_size, per_block_bytes=0)
+    return AttentionGroupMeta(
+        group_idx=0, layer_names=layer_names, block_size=block_size, per_block_bytes=0
+    )
 
 
 class TestBuildTransferGroup(unittest.TestCase):
@@ -166,6 +179,7 @@ class TestBuildTransferGroup(unittest.TestCase):
     def _build(self, kv_caches):
         import unittest.mock as mock
         import kv_cache_manager.py_connector.vllm.connector_worker as wc
+
         conn = _make_group_conn()
         captured = []
 
@@ -177,7 +191,8 @@ class TestBuildTransferGroup(unittest.TestCase):
 
         with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
             g = conn._build_attention_group(
-                _attn_meta(list(kv_caches.keys())), kv_caches)
+                _attn_meta(list(kv_caches.keys())), kv_caches
+            )
         return g, captured
 
     def test_packed_one_ptr_per_layer(self):
@@ -198,8 +213,9 @@ class TestBuildTransferGroup(unittest.TestCase):
         self.assertEqual(g.per_token_dim, 4 * 128)
         self.assertEqual(g.block_stride, 0)  # each half is flat token-major
         v_off = 10 * 16 * 4 * 128 * ITEMSIZE
-        self.assertEqual(ptrs, [BASE_PTR, BASE_PTR + v_off,
-                                2 * BASE_PTR, 2 * BASE_PTR + v_off])
+        self.assertEqual(
+            ptrs, [BASE_PTR, BASE_PTR + v_off, 2 * BASE_PTR, 2 * BASE_PTR + v_off]
+        )
 
     def test_n_first_strided_blocks(self):
         kv = {"l0": n_first_5d(base=BASE_PTR)}
@@ -219,9 +235,13 @@ class TestBuildTransferGroup(unittest.TestCase):
 class _BlockedScheduler:
     """Mimics vLLM <= 0.22.x: external loads are asserted away."""
 
-    def _mamba_block_aligned_split(self, request, num_new_tokens,
-                                   num_new_local_computed_tokens=0,
-                                   num_external_computed_tokens=0):
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=0,
+    ):
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
         )
@@ -230,32 +250,48 @@ class _BlockedScheduler:
 class _OpenScheduler:
     """Mimics vLLM >= 0.23.0: the split handles external tokens."""
 
-    def _mamba_block_aligned_split(self, request, num_new_tokens,
-                                   num_new_local_computed_tokens=0,
-                                   num_external_computed_tokens=0):
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=0,
+    ):
         return num_new_tokens
 
 
 # Method exists but inspect.getsource fails (frozen / bytecode-only vLLM):
 # compiled from a string, so there is no source file to read.
 _exec_ns = {}
-exec(compile("def _mamba_block_aligned_split(self, *a, **kw):\n    pass\n",
-             "<kvcm-test-no-source>", "exec"), _exec_ns)
+exec(
+    compile(
+        "def _mamba_block_aligned_split(self, *a, **kw):\n    pass\n",
+        "<kvcm-test-no-source>",
+        "exec",
+    ),
+    _exec_ns,
+)
 _SourcelessScheduler = type(
-    "_SourcelessScheduler", (),
-    {"_mamba_block_aligned_split": _exec_ns["_mamba_block_aligned_split"]})
+    "_SourcelessScheduler",
+    (),
+    {"_mamba_block_aligned_split": _exec_ns["_mamba_block_aligned_split"]},
+)
 
 
 class TestHybridGate(unittest.TestCase):
     MOD = "vllm.v1.core.sched.scheduler"
 
     def _with_scheduler(self, cls):
-        mod = types.ModuleType(self.MOD)
+        mod: Any = types.ModuleType(self.MOD)
         mod.Scheduler = cls
         old = sys.modules.get(self.MOD)
         sys.modules[self.MOD] = mod
-        self.addCleanup(lambda: (sys.modules.pop(self.MOD, None),
-                                 old and sys.modules.__setitem__(self.MOD, old)))
+        self.addCleanup(
+            lambda: (
+                sys.modules.pop(self.MOD, None),
+                old and sys.modules.__setitem__(self.MOD, old),
+            )
+        )
 
     def test_old_vllm_hybrid_raises_gracefully(self):
         self._with_scheduler(_BlockedScheduler)
