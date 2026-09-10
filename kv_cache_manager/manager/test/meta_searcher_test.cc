@@ -455,8 +455,8 @@ public:
         EXPECT_EQ(EC_OK, cache->Init("test", cache_config));
         EXPECT_EQ(EC_OK, cache->Open());
         meta_indexer_->backend_manager_->cache_backend_ = std::move(cache);
-        meta_indexer_->backend_manager_->recover_state_.store(
-            MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
+        meta_indexer_->backend_manager_->recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning,
+                                                              std::memory_order_release);
         return backend;
     }
 
@@ -2068,13 +2068,13 @@ TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsPendingWriteBeforeExpectedVal
     std::vector<std::vector<ErrorCode>> delete_results;
     EXPECT_EQ(EC_OK,
               meta_searcher_->BatchDeleteLocations(request_context_.get(),
-                                                    {key},
-                                                    {{location_id}},
-                                                    delete_results,
-                                                    {{old_location->ToJsonString()}},
-                                                    false,
-                                                    false,
-                                                    true));
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{old_location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
     EXPECT_EQ((std::vector<std::string>{"sync", "read"}), backend->Events());
 
@@ -2110,13 +2110,13 @@ TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsAcceptedDeleteBeforeShardFenc
     std::vector<std::vector<ErrorCode>> delete_results;
     EXPECT_EQ(EC_OK,
               meta_searcher_->BatchDeleteLocations(request_context_.get(),
-                                                    {key},
-                                                    {{location_id}},
-                                                    delete_results,
-                                                    {{location->ToJsonString()}},
-                                                    false,
-                                                    false,
-                                                    true));
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
     EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
 }
@@ -2143,13 +2143,13 @@ TEST_F(MetaSearcherTest, TestCachedMaintenanceDeleteUsesHotMutationInsteadOfPost
     std::vector<std::vector<ErrorCode>> delete_results;
     EXPECT_EQ(EC_OK,
               meta_searcher_->BatchDeleteLocations(request_context_.get(),
-                                                    {key},
-                                                    {{location_id}},
-                                                    delete_results,
-                                                    {{location->ToJsonString()}},
-                                                    false,
-                                                    false,
-                                                    true));
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
     EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key"}), backend->Events());
 }
@@ -2167,12 +2167,10 @@ TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSy
          {LocationSpec("linear_0", "event_report://post-sync-failure:8080/mem?size=17")}},
     }};
     std::vector<ErrorCode> per_key_ec;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, merge_tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, merge_tasks, per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
     ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
-    ASSERT_EQ(17u,
-              meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    ASSERT_EQ(17u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
@@ -2184,15 +2182,10 @@ TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSy
     backend->ResetEvents();
     backend->FailSyncCall(2);
     std::vector<std::vector<ErrorCode>> delete_results;
-    EXPECT_EQ(EC_ERROR,
-              meta_searcher_->BatchDeleteLocations(request_context_.get(),
-                                                    {key},
-                                                    {{location_id}},
-                                                    delete_results,
-                                                    {{expected_value}},
-                                                    true,
-                                                    true,
-                                                    true));
+    EXPECT_EQ(
+        EC_ERROR,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), {key}, {{location_id}}, delete_results, {{expected_value}}, true, true, true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
     EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
     EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
@@ -2202,15 +2195,10 @@ TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSy
     // is visible, that retry converges as NOENT and must not account twice.
     backend->FailSyncCall(0);
     backend->ResetEvents();
-    EXPECT_EQ(EC_OK,
-              meta_searcher_->BatchDeleteLocations(request_context_.get(),
-                                                    {key},
-                                                    {{location_id}},
-                                                    delete_results,
-                                                    {{expected_value}},
-                                                    true,
-                                                    true,
-                                                    true));
+    EXPECT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), {key}, {{location_id}}, delete_results, {{expected_value}}, true, true, true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}), delete_results);
     EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
     EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
@@ -2244,9 +2232,10 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
 
     LocationIdsPerKey location_ids = {{location_id}};
     std::vector<std::vector<ErrorCode>> delete_results;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}, true, true, true));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -2256,11 +2245,18 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
 
     const std::string current_expected_value = location_maps[0].at(location_id)->ToJsonString();
     ASSERT_EQ(EC_BADARGS,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}, {}}, true, true, true));
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}, true, true, true));
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                   keys,
+                                                   location_ids,
+                                                   delete_results,
+                                                   {{current_expected_value}, {}},
+                                                   true,
+                                                   true,
+                                                   true));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -4312,6 +4308,25 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
 class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
 protected:
+    void AddServingLocations(const MetaSearcher::KeyVector &keys, DataStorageType type, const std::string &uri) {
+        for (int64_t key : keys) {
+            auto location = MetaSearcherTestHelper::CreateCacheLocation(
+                type, 1, {MetaSearcherTestHelper::CreateLocationSpec("tp0", uri)});
+            std::vector<std::string> out_ids;
+            ASSERT_EQ(
+                ErrorCode::EC_OK,
+                BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, out_ids));
+            std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+            std::vector<std::vector<ErrorCode>> results;
+            ASSERT_EQ(ErrorCode::EC_OK,
+                      meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results));
+        }
+    }
+
+    void AddTairLocations(const MetaSearcher::KeyVector &keys) {
+        AddServingLocations(keys, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "tair://host_t:6379/tp0");
+    }
+
     void AddRequestedSpecMatrixEventReportPeer() {
         // The requested spec is deliberately the second spec in the first
         // and third locations. The middle key has the same reporter but only
@@ -4433,19 +4448,7 @@ protected:
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 
         // Tair locations for all 5 keys
-        MetaSearcher::KeyVector tair_keys = {80000, 80001, 80002, 80003, 80004};
-        for (int64_t key : tair_keys) {
-            auto tair_loc = MetaSearcherTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                1,
-                {MetaSearcherTestHelper::CreateLocationSpec("tp0", "tair://host_t:6379/tp0")});
-            std::vector<std::string> out_ids;
-            ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {tair_loc}, out_ids);
-            ASSERT_EQ(ec, ErrorCode::EC_OK);
-            std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
-            std::vector<std::vector<ErrorCode>> results;
-            meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results);
-        }
+        AddTairLocations({80000, 80001, 80002, 80003, 80004});
         recording_backend_->ResetReadLog();
     }
 
@@ -4495,6 +4498,168 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
         EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
     }
     EXPECT_TRUE(out[4].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithTairBaseHits) {
+    const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    for (size_t key_index = 1; key_index < keys.size(); ++key_index) {
+        ASSERT_EQ(2u, out[key_index].size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[key_index][0]->type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][1]->type());
+        EXPECT_NE(out[key_index][1]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithIndependentBackendsInEitherSelectorOrder) {
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace://host_s/tp0?size=1&media_type=5");
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_HF3FS, "hf3fs:///tmp/base-hit?offset=0&length=1&size=1");
+
+    const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    for (const DataStorageType base_type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, DataStorageType::DATA_STORAGE_TYPE_HF3FS}) {
+        const std::vector<std::vector<BackendSelector>> selector_orders = {
+            {
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+            },
+            {
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+            },
+        };
+        for (const auto &selectors : selector_orders) {
+            LocationsPerKey out;
+            ASSERT_EQ(
+                ErrorCode::EC_OK,
+                meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+            ASSERT_EQ(keys.size(), out.size());
+            ASSERT_EQ(1u, out[0].size());
+            EXPECT_EQ(base_type, out[0][0]->type());
+            for (size_t key_index = 1; key_index < keys.size(); ++key_index) {
+                ASSERT_EQ(1u, out[key_index].size());
+                EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][0]->type());
+                EXPECT_NE(out[key_index][0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+            }
+        }
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixDoesNotCountSpecFilteredLocationAsBaseHit) {
+    AddRequestedSpecMatrixEventReportPeer();
+    AddTairLocations({82000, 82001, 82002});
+
+    const MetaSearcher::KeyVector keys = {82000, 82001, 82002};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), keys, out, &policy_, selectors, {"linear_1", "linear_1", "linear_1"}));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[0][0]->type());
+    EXPECT_TRUE(std::any_of(out[0][0]->location_specs().begin(),
+                            out[0][0]->location_specs().end(),
+                            [](const LocationSpec &spec) { return spec.name() == "linear_1"; }));
+    EXPECT_TRUE(out[1].empty());
+    EXPECT_TRUE(out[2].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixPreservesV6DHitsBeforeUnfillableGap) {
+    const MetaSearcher::KeyVector keys = {80000, 85000, 80001};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(2u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[0][1]->type());
+    EXPECT_NE(out[0][1]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    EXPECT_TRUE(out[1].empty());
+    ASSERT_EQ(1u, out[2].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[2][0]->type());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageMaximizesHitsBeyondTairBase) {
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+            {"kvs#event_report_l2#mem#peer_b:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_b:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {84000, 84001, 84002, 84003}, upserts, per_key_ec));
+    AddTairLocations({84000, 84001, 84002});
+
+    const MetaSearcher::KeyVector keys = {84000, 84001, 84002, 84003};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    ASSERT_EQ(1u, out[1].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[1][0]->type());
+    ASSERT_EQ(2u, out[2].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[2][0]->type());
+    EXPECT_NE(out[2][1]->location_specs()[0].uri().find("peer_b"), std::string::npos);
+    ASSERT_EQ(1u, out[3].size());
+    EXPECT_NE(out[3][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
 }
 
 TEST_F(BatchGetBestLocationByBackendTest, BlockMaskSkipsMetadataReadsAndPreservesOutputPositions) {

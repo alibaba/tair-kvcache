@@ -350,6 +350,107 @@ SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
     return best;
 }
 
+V6DPeerSelection
+SelectV6DByCombinedPrefix(const std::vector<bool> &base_hits,
+                          const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
+    size_t first_required_index = 0;
+    while (first_required_index < base_hits.size() && base_hits[first_required_index]) {
+        ++first_required_index;
+    }
+
+    auto first_required_candidates = remote_peer_candidates.end();
+    if (first_required_index < base_hits.size()) {
+        first_required_candidates = remote_peer_candidates.find(first_required_index);
+    }
+    if (first_required_index == base_hits.size() || first_required_candidates == remote_peer_candidates.end() ||
+        first_required_candidates->second.empty()) {
+        // Every peer has the same combined prefix when all keys are base hits
+        // or no peer can cover the first base miss. Preserve the existing
+        // tie-break by choosing the peer with the most V6D hits inside that
+        // guaranteed prefix, then by peer address.
+        std::vector<size_t> guaranteed_prefix_indices;
+        guaranteed_prefix_indices.reserve(first_required_index);
+        for (size_t key_index = 0; key_index < first_required_index; ++key_index) {
+            guaranteed_prefix_indices.push_back(key_index);
+        }
+        return SelectV6DByCoverage(guaranteed_prefix_indices, remote_peer_candidates);
+    }
+
+    // Only peers covering the first base miss can extend the guaranteed
+    // prefix. A peer absent there always loses to every peer present there.
+    std::map<std::string, std::vector<bool>> peer_hits;
+    for (const auto &peer_address : first_required_candidates->second) {
+        peer_hits.try_emplace(peer_address, base_hits.size(), false);
+    }
+    for (const auto &[key_index, peer_addresses] : remote_peer_candidates) {
+        for (const auto &peer_address : peer_addresses) {
+            auto peer_it = peer_hits.find(peer_address);
+            if (peer_it != peer_hits.end()) {
+                peer_it->second[key_index] = true;
+            }
+        }
+    }
+
+    V6DPeerSelection best;
+    size_t best_prefix_size = 0;
+    for (const auto &[peer_address, hits] : peer_hits) {
+        std::vector<size_t> peer_covered_indices;
+        size_t prefix_size = 0;
+        for (size_t key_index = 0; key_index < base_hits.size(); ++key_index) {
+            if (!base_hits[key_index] && !hits[key_index]) {
+                break;
+            }
+            ++prefix_size;
+            if (hits[key_index]) {
+                peer_covered_indices.push_back(key_index);
+            }
+        }
+        if (peer_covered_indices.empty()) {
+            continue;
+        }
+        if (prefix_size > best_prefix_size ||
+            (prefix_size == best_prefix_size && peer_covered_indices.size() > best.covered_indices.size()) ||
+            (prefix_size == best_prefix_size && peer_covered_indices.size() == best.covered_indices.size() &&
+             (best.peer_addr.empty() || peer_address < best.peer_addr))) {
+            best_prefix_size = prefix_size;
+            best.peer_addr = peer_address;
+            best.covered_indices = std::move(peer_covered_indices);
+        }
+    }
+    return best;
+}
+
+V6DPeerSelection
+SelectV6DByIncrementalCoverage(const std::vector<bool> &base_hits,
+                               const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
+    std::map<std::string, std::vector<size_t>> peer_to_indices;
+    for (const auto &[key_index, peer_addresses] : remote_peer_candidates) {
+        for (const auto &peer_address : peer_addresses) {
+            peer_to_indices[peer_address].push_back(key_index);
+        }
+    }
+
+    V6DPeerSelection best;
+    size_t best_incremental_hit_count = 0;
+    for (auto &[peer_address, peer_covered_indices] : peer_to_indices) {
+        const size_t incremental_hit_count =
+            std::count_if(peer_covered_indices.begin(), peer_covered_indices.end(), [&base_hits](size_t key_index) {
+                return !base_hits[key_index];
+            });
+        if (incremental_hit_count > best_incremental_hit_count ||
+            (incremental_hit_count == best_incremental_hit_count &&
+             peer_covered_indices.size() > best.covered_indices.size()) ||
+            (incremental_hit_count == best_incremental_hit_count &&
+             peer_covered_indices.size() == best.covered_indices.size() &&
+             (best.peer_addr.empty() || peer_address < best.peer_addr))) {
+            best_incremental_hit_count = incremental_hit_count;
+            best.peer_addr = peer_address;
+            best.covered_indices = peer_covered_indices;
+        }
+    }
+    return best;
+}
+
 CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
                                       CheckLocDataExistFunc check_loc_data_exist,
                                       std::vector<std::string> &out_prune_loc_ids) {
@@ -1494,39 +1595,46 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
         }
     }
 
-    for (const auto &selector : selectors) {
+    auto needs_base_hits = [](const BackendSelector &selector) {
+        return selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
+               (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
+                selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE);
+    };
+    std::vector<BackendSelector> ordered_selectors = selectors;
+    std::stable_partition(ordered_selectors.begin(),
+                          ordered_selectors.end(),
+                          [&needs_base_hits](const BackendSelector &selector) { return !needs_base_hits(selector); });
+
+    std::vector<bool> base_hits(query_keys.size(), false);
+    for (const auto &selector : ordered_selectors) {
         DataStorageType target_type = selector.backend_type;
 
-        if (target_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
-            (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
-             selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
+        if (needs_base_hits(selector)) {
             // --- event report cross-key selection ---
             bool is_prefix = (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX);
 
             // Candidate enumeration
-            std::vector<size_t> candidate_indices;
             std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
             // key_idx -> peer_addr -> CacheLocationConstPtr (for reverse lookup)
             std::unordered_map<size_t, std::unordered_map<std::string, CacheLocationConstPtr>> key_peer_to_location;
 
-            bool stop_vineyard = false;
             for (size_t i = 0; i < query_keys.size(); ++i) {
-                if (stop_vineyard)
-                    break;
-
                 const auto &vmap = valid_maps[i];
                 const std::string_view requested_spec_name =
                     requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() != target_type)
+                    if (loc->type() != target_type) {
                         continue;
-                    if (!MatchesRequestedSpec(*loc, requested_spec_name))
+                    }
+                    if (!MatchesRequestedSpec(*loc, requested_spec_name)) {
                         continue;
+                    }
                     std::string addr = ExtractPeerAddrFromLocation(*loc, requested_spec_name);
-                    if (addr.empty())
+                    if (addr.empty()) {
                         continue;
+                    }
                     // Dedup: only add if not already present
                     if (key_peer_to_location[i].find(addr) == key_peer_to_location[i].end()) {
                         vineyard_addrs.push_back(addr);
@@ -1535,39 +1643,37 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 }
 
                 if (vineyard_addrs.empty()) {
-                    if (is_prefix) {
-                        stop_vineyard = true;
-                    }
                     continue;
                 }
 
                 remote_peer_candidates[i] = std::move(vineyard_addrs);
-                candidate_indices.push_back(i);
             }
 
             // Select best peer
             V6DPeerSelection selection;
             if (is_prefix) {
-                selection = SelectV6DByPrefix(candidate_indices, remote_peer_candidates);
+                selection = SelectV6DByCombinedPrefix(base_hits, remote_peer_candidates);
             } else {
-                selection = SelectV6DByCoverage(candidate_indices, remote_peer_candidates);
+                selection = SelectV6DByIncrementalCoverage(base_hits, remote_peer_candidates);
             }
 
             // Populate results for covered keys
             if (!selection.peer_addr.empty()) {
                 for (size_t idx : selection.covered_indices) {
                     auto peer_it = key_peer_to_location.find(idx);
-                    if (peer_it == key_peer_to_location.end())
+                    if (peer_it == key_peer_to_location.end()) {
                         continue;
+                    }
                     auto loc_it = peer_it->second.find(selection.peer_addr);
-                    if (loc_it == peer_it->second.end())
+                    if (loc_it == peer_it->second.end()) {
                         continue;
+                    }
                     out_locations[query_to_output_index[idx]].push_back(loc_it->second);
                 }
             }
 
         } else {
-            // --- Per-key independent selection (WEIGHTED_RANDOM or other non-event-report) ---
+            // --- Per-key selection that does not depend on base hits ---
             for (size_t i = 0; i < query_keys.size(); ++i) {
                 const std::string_view requested_spec_name =
                     requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
@@ -1578,25 +1684,29 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                         filtered.try_emplace(id, loc);
                     }
                 }
-                if (filtered.empty())
+                if (filtered.empty()) {
                     continue;
+                }
 
                 std::vector<std::string> unused_prune_ids;
                 auto winner = policy->SelectForMatch(filtered, nullptr, unused_prune_ids);
-                if (!winner || winner->id().empty() || winner->location_specs().empty())
+                if (!winner || winner->id().empty() || winner->location_specs().empty()) {
                     continue;
+                }
 
                 // Merge specs from same data storage (same logic as SelectAndMergeForMatch)
                 std::map<std::string, LocationSpec> merged_specs;
                 for (const auto &[id, loc] : filtered) {
-                    if (!policy->IsSameDataStorage(*loc, *winner))
+                    if (!policy->IsSameDataStorage(*loc, *winner)) {
                         continue;
+                    }
                     for (const auto &spec : loc->location_specs()) {
                         merged_specs.try_emplace(spec.name(), spec);
                     }
                 }
-                if (merged_specs.empty())
+                if (merged_specs.empty()) {
                     continue;
+                }
 
                 auto merged = std::make_shared<CacheLocation>();
                 merged->set_id(winner->id() + "_merged");
@@ -1610,6 +1720,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 merged->set_spec_size(specs.size());
                 merged->set_location_specs(std::move(specs));
                 out_locations[query_to_output_index[i]].push_back(std::move(merged));
+                base_hits[i] = true;
             }
         }
     }
@@ -3489,7 +3600,6 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
     }
     return result.ec;
 }
-
 
 ErrorCode
 MetaSearcher::VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor) {
