@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "QuotaPlanTest",
+    srcs = ["quota_plan_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:quota_plan",
+    ],
+)
+
+cc_test(
     name = "LruEvictionPolicyTest",
     srcs = [
         "lru_eviction_policy_test.cc",
@@ -250,8 +259,10 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/event/spec_events",
+        "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/optimizer/manager:online_optimizer_manager",
         "//kv_cache_manager/optimizer:optimizer_service_impl",
+        "//kv_cache_manager/optimizer:quota_plan",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
