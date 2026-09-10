@@ -37,6 +37,29 @@ private:
     std::string serialized_value_;
 };
 
+class ScriptedReclaimMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
+public:
+    ErrorCode RandomSample(RequestContext *, const int64_t, KeyTypeVec &out_keys) noexcept override {
+        out_keys = sampled_keys;
+        return sample_result;
+    }
+
+    std::vector<ErrorCode> GetProperties(RequestContext *,
+                                         const KeyTypeVec &,
+                                         const std::vector<std::string> &field_names,
+                                         PropertyMapVector &out_properties) noexcept override {
+        requested_fields = field_names;
+        out_properties = properties;
+        return property_results;
+    }
+
+    ErrorCode sample_result = EC_OK;
+    KeyTypeVec sampled_keys;
+    std::vector<ErrorCode> property_results;
+    PropertyMapVector properties;
+    std::vector<std::string> requested_fields;
+};
+
 class MetaAsyncRedisBackendTest : public MetaStorageBackendTestBase, public RedisTestBase, public TESTBASE {
 public:
     void SetUp() override {
@@ -122,6 +145,35 @@ TEST_F(MetaAsyncRedisBackendTest, TestInitParams) {
     ASSERT_EQ(1000, backend_->batch_wait_timeout_us_);
     ASSERT_EQ(1000, backend_->queue_max_size_);
     ASSERT_EQ(2000, backend_->drain_timeout_ms_);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesUsesReadOnlyTimestampQuery) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.property_results = {EC_OK, EC_OK};
+    backend.properties = {{{PROPERTY_LRU_TIME, "101"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ((std::vector<std::string>{PROPERTY_LRU_TIME}), backend.requested_fields);
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(1, candidates[0].key);
+    EXPECT_EQ(101, candidates[0].last_access_time_us);
+    EXPECT_EQ(2, candidates[1].key);
+    EXPECT_EQ(0, candidates[1].last_access_time_us);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegradesAllTimestamps) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.property_results = {EC_ERROR, EC_OK};
+    backend.properties = {{{PROPERTY_LRU_TIME, "101"}}, {{PROPERTY_LRU_TIME, "202"}}};
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(0, candidates[0].last_access_time_us);
+    EXPECT_EQ(0, candidates[1].last_access_time_us);
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {

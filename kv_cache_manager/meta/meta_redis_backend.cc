@@ -2,6 +2,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -473,6 +474,56 @@ ErrorCode MetaRedisBackend::SampleReclaimKeys(RequestContext * /*request_context
                                               const int64_t count,
                                               KeyTypeVec &out_keys) noexcept {
     return RandomSample(nullptr, count, out_keys);
+}
+
+ErrorCode MetaRedisBackend::SampleReclaimCandidates(RequestContext *request_context,
+                                                    const int64_t count,
+                                                    ReclaimCandidateVector &out_candidates) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    KeyTypeVec keys;
+    const ErrorCode sample_ec = RandomSample(request_context, count, keys);
+    if (sample_ec != EC_OK || keys.empty()) {
+        return sample_ec;
+    }
+
+    PropertyMapVector properties;
+    const std::vector<ErrorCode> property_results =
+        GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, properties);
+    bool all_properties_available = property_results.size() == keys.size() && properties.size() == keys.size();
+    if (all_properties_available) {
+        for (const ErrorCode ec : property_results) {
+            if (ec != EC_OK) {
+                all_properties_available = false;
+                break;
+            }
+        }
+    }
+
+    out_candidates.reserve(keys.size());
+    if (!all_properties_available) {
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "sample reclaim candidate properties unavailable, use zero lru time, instance[%s]",
+                               instance_id_.c_str());
+        for (const KeyType key : keys) {
+            out_candidates.push_back({key, 0});
+        }
+        return EC_OK;
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int64_t last_access_time_us = 0;
+        const auto it = properties[i].find(PROPERTY_LRU_TIME);
+        if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+            KVCM_INTERVAL_LOG_WARN(
+                10, "sample reclaim candidate has missing or malformed lru time, instance[%s]", instance_id_.c_str());
+            last_access_time_us = 0;
+        }
+        out_candidates.push_back({keys[i], last_access_time_us});
+    }
+    return EC_OK;
 }
 
 // ---------------------------------------------------------------------------

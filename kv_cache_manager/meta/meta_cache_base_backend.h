@@ -21,6 +21,14 @@ public:
     virtual size_t GetMemUsage() const noexcept = 0;
     virtual int64_t GetOldestAccessTime() const noexcept = 0;
 
+    // Reads current access timestamps from the hot cache without marking the
+    // keys as hits, updating revisit metrics, or changing LRU positions.
+    // EC_NOENT means the caller may fall back to the persistent layer.
+    virtual std::vector<ErrorCode>
+    GetLastAccessTimesForMaintenance(RequestContext *request_context,
+                                     const KeyTypeVec &keys,
+                                     std::vector<int64_t> &out_last_access_times) noexcept = 0;
+
     // 写入 locations + properties，仅当 key 在 cache 中不存在时才写入。
     // 若 key 已存在，返回 EC_OK 且不修改已有数据（幂等）。
     // @param request_context    请求上下文；可为 nullptr
