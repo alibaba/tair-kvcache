@@ -1851,22 +1851,6 @@ bool MetaIndexer::ParallelForQuery(std::size_t count, const QueryExecutor::Range
     return false;
 }
 
-MetaIndexer::Result MetaIndexer::GetPropertiesForMaintenance(RequestContext *request_context,
-                                                             const KeyVector &keys,
-                                                             const std::vector<std::string> &property_names,
-                                                             PropertyMapVector &out_properties) noexcept {
-    auto codes = backend_manager_->GetPropertiesForMaintenance(request_context, keys, property_names, out_properties);
-    Result result(keys.size());
-    if (keys.empty()) {
-        result.ec = EC_OK;
-        return result;
-    }
-    const auto &trace_id = request_context->trace_id();
-    const auto errors = ProcessErrorCodes(trace_id, codes, {}, keys, kGetMetaOperation, result);
-    ProcessErrorResult(trace_id, kGetMetaOperation, errors, keys.size(), result);
-    return result;
-}
-
 MetaIndexer::Result MetaIndexer::GetLocationMapsForMaintenance(RequestContext *request_context,
                                                                const KeyVector &keys,
                                                                CacheLocationMapVector &out_locations) noexcept {

@@ -1745,21 +1745,6 @@ std::vector<ErrorCode> ReadForMaintenance(const KeyVector &keys,
 
 } // namespace
 
-std::vector<ErrorCode>
-MetaStorageBackendManager::GetPropertiesForMaintenance(RequestContext *request_context,
-                                                       const KeyVector &keys,
-                                                       const std::vector<std::string> &field_names,
-                                                       PropertyMapVector &out_properties) noexcept {
-    return ReadForMaintenance(keys,
-                              cache_backend_.get(),
-                              persistent_backend_.get(),
-                              recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning,
-                              out_properties,
-                              [&](const auto &backend, const auto &batch, auto &out) {
-                                  return backend->GetPropertiesForMaintenance(request_context, batch, field_names, out);
-                              });
-}
-
 std::vector<ErrorCode> MetaStorageBackendManager::GetLocationMapsForMaintenance(
     RequestContext *request_context, const KeyVector &keys, CacheLocationMapVector &out_locations) noexcept {
     return ReadForMaintenance(keys,

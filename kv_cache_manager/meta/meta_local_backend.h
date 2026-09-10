@@ -240,10 +240,6 @@ public:
     std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
                                                         const KeyTypeVec &keys,
                                                         LocationIdsPerKey &out_location_ids) noexcept override;
-    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
-                                                       const KeyTypeVec &keys,
-                                                       const std::vector<std::string> &field_names,
-                                                       PropertyMapVector &out_properties) noexcept override;
     std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
                                                          const KeyTypeVec &keys,
                                                          CacheLocationMapVector &out_locations) noexcept override;

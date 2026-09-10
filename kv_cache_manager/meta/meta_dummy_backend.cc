@@ -435,26 +435,6 @@ ErrorCode MetaDummyBackend::ListKeys(RequestContext * /*request_context*/,
     return ErrorCode::EC_OK;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::GetPropertiesForMaintenance(RequestContext *,
-                                                                     const KeyTypeVec &keys,
-                                                                     const std::vector<std::string> &field_names,
-                                                                     PropertyMapVector &out_properties) noexcept {
-    out_properties.assign(keys.size(), PropertyMap{});
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (!table_.FindAndApply(keys[i], [&](const DummyItem &item) {
-                for (const auto &name : field_names) {
-                    if (const auto it = item.properties.find(name); it != item.properties.end()) {
-                        out_properties[i].emplace(it->first, it->second);
-                    }
-                }
-            })) {
-            results[i] = EC_NOENT;
-        }
-    }
-    return results;
-}
-
 std::vector<ErrorCode> MetaDummyBackend::GetLocationMapsForMaintenance(RequestContext *,
                                                                        const KeyTypeVec &keys,
                                                                        CacheLocationMapVector &out_locations) noexcept {

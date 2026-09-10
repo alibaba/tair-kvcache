@@ -77,10 +77,6 @@ public:
                                                          int32_t &out_reclaimed_count) noexcept;
 
     // ----- Read APIs -----
-    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
-                                                       const KeyVector &keys,
-                                                       const std::vector<std::string> &field_names,
-                                                       PropertyMapVector &out_properties) noexcept;
     std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          CacheLocationMapVector &out_locations) noexcept;

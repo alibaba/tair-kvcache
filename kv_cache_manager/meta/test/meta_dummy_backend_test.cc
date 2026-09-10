@@ -58,9 +58,10 @@ TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime)
         (std::vector<ErrorCode>{EC_OK}),
         meta_storage_backend_->Put(
             nullptr, {1}, CacheLocationMapVector{{{"loc", location}}}, PropertyMapVector{{{PROPERTY_HIT_COUNT, "3"}}}));
-    PropertyMapVector before, after;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, before));
+    ReclaimCandidateVector before, after;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimCandidates(nullptr, 1, before, true));
+    ASSERT_EQ(1, before.size());
+    EXPECT_EQ(1, before[0].key);
     for (int repeat = 0; repeat < 5; ++repeat) {
         KeyVector sampled;
         ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, sampled));
@@ -71,9 +72,10 @@ TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime)
         ASSERT_EQ(2, locations.size());
         EXPECT_EQ(1, locations[0].count("loc"));
         EXPECT_TRUE(locations[1].empty());
-        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
-                  meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1}, {PROPERTY_LRU_TIME}, after));
-        EXPECT_EQ(before, after);
+        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimCandidates(nullptr, 1, after, true));
+        ASSERT_EQ(1, after.size());
+        EXPECT_EQ(before[0].key, after[0].key);
+        EXPECT_EQ(before[0].last_access_time_us, after[0].last_access_time_us);
     }
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
