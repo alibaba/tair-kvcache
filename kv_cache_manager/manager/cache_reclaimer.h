@@ -545,7 +545,14 @@ private:
         ReclaimCandidateVector candidates;
     };
 
-    std::map<std::string, FairRotationState> group_lru_rotation_by_group_;
+    struct GroupLruRotationState {
+        std::deque<std::string> instance_ids;
+        // After partial collection, the first waiter gets the next Location
+        // attempt even if another Instance finishes sampling earlier.
+        bool prioritize_location_waiter{false};
+    };
+
+    std::map<std::string, GroupLruRotationState> group_lru_rotation_by_group_;
 
     /**
      * @brief Calculate the group's WaterLevelExceed data

@@ -244,6 +244,7 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         std::size_t outstanding{0};
         bool started{false};
         bool failed{false};
+        bool location_attempted{false};
         bool collected{false};
         std::shared_ptr<std::atomic<bool>> cancelled{std::make_shared<std::atomic<bool>>(false)};
         std::map<std::int64_t, std::int64_t> times;
@@ -258,7 +259,26 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         states[i].remaining = plan.items[i].sampling_size;
         ready.push_back(i);
     }
-    auto &queue = group_lru_rotation_by_group_[plan.items.front().instance_info->instance_group_name()].instance_ids;
+    auto &rotation = group_lru_rotation_by_group_[plan.items.front().instance_info->instance_group_name()];
+    auto &queue = rotation.instance_ids;
+    const auto priority_index = rotation.prioritize_location_waiter ? std::size_t{0} : states.size();
+    const auto collect_ready_instance = [&](std::size_t index) {
+        auto &state = states[index];
+        if (!state.started || state.failed || state.location_attempted || state.remaining != 0 ||
+            state.outstanding != 0 || !IsRunning() || IsPaused() || std::chrono::steady_clock::now() >= deadline) {
+            return;
+        }
+        // An attempted read consumes this turn even if it fails or exceeds the
+        // deadline. Unattempted peers must retain their next-round priority.
+        state.location_attempted = true;
+        state.collected =
+            FilterGroupLruCandidates(request_context, scope, plan, index, state.times, deadline, out_candidates);
+        state.failed = !state.collected;
+        state.times.clear();
+        if (state.collected) {
+            out_successful_sampling_size += plan.items[index].sampling_size;
+        }
+    };
     std::vector<Task> tasks;
     tasks.reserve(workers_.size());
     while ((!ready.empty() || !tasks.empty()) && IsRunning() && !IsPaused() &&
@@ -318,11 +338,6 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                                  return result;
                              })});
         }
-        if (tasks.empty()) {
-            // No task owned by this collector can release capacity: the pool
-            // is saturated by earlier rounds, or there is no remaining work.
-            break;
-        }
         bool received = false;
         for (auto &task : tasks) {
             if (!task.future.valid() ||
@@ -360,18 +375,28 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                 if (was_at_limit) {
                     ready.push_back(task.instance_index);
                 }
-            } else if (state.outstanding == 0) {
-                state.collected = FilterGroupLruCandidates(
-                    request_context, scope, plan, task.instance_index, state.times, deadline, out_candidates);
-                state.failed = !state.collected;
-                state.times.clear();
-                if (state.collected) {
-                    out_successful_sampling_size += plan.items[task.instance_index].sampling_size;
-                }
             }
         }
         tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](const auto &task) { return !task.future.valid(); }),
                     tasks.end());
+        // Reap and refill sampling independently, but do not let a faster
+        // sampler overtake the previous round's first Location waiter. Once
+        // that waiter has attempted a read or failed sampling, ready peers
+        // can proceed without waiting for other slow samplers.
+        if (priority_index < states.size()) {
+            collect_ready_instance(priority_index);
+        }
+        if (priority_index == states.size() || states[priority_index].location_attempted ||
+            states[priority_index].failed) {
+            for (std::size_t i = 0; i < states.size(); ++i) {
+                collect_ready_instance(i);
+            }
+        }
+        if (tasks.empty() && (ready.empty() || in_flight_sampling_tasks_.load() >= workers_.size())) {
+            // No task owned by this collector can release capacity: the pool
+            // is saturated by earlier rounds, or there is no remaining work.
+            break;
+        }
         if (!received && !tasks.empty()) {
             // Only a short wait before polling/refilling, never a whole-wave barrier.
             const auto remaining = deadline - std::chrono::steady_clock::now();
@@ -390,6 +415,26 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         failed += state.failed;
     }
     plan.partial = collected < plan.eligible_instance_count;
+    if (started > 0) {
+        std::unordered_set<std::string> yielded;
+        for (std::size_t i = 0; i < states.size(); ++i) {
+            const auto &state = states[i];
+            if (state.location_attempted || state.failed || (i == priority_index && state.started)) {
+                // A protected waiter whose sampling timed out must also yield,
+                // otherwise it could block every later Location attempt.
+                yielded.insert(plan.items[i].instance_info->instance_id());
+            }
+        }
+        std::deque<std::string> waiting_ids, yielded_ids;
+        for (auto &id : queue) {
+            (yielded.count(id) ? yielded_ids : waiting_ids).push_back(std::move(id));
+        }
+        waiting_ids.insert(waiting_ids.end(),
+                           std::make_move_iterator(yielded_ids.begin()),
+                           std::make_move_iterator(yielded_ids.end()));
+        queue.swap(waiting_ids);
+        rotation.prioritize_location_waiter = plan.partial;
+    }
     METRICS_(cache_reclaimer, group_lru_started_instance_count) += started;
     METRICS_(cache_reclaimer, group_lru_collected_instance_count) += collected;
     METRICS_(cache_reclaimer, group_lru_failed_instance_count) += failed;
