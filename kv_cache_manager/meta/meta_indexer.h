@@ -159,10 +159,6 @@ public:
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
                                 LocationsPerKey &out_locations) noexcept;
-    Result GetPropertiesForMaintenance(RequestContext *request_context,
-                                       const KeyVector &keys,
-                                       const std::vector<std::string> &property_names,
-                                       PropertyMapVector &out_properties) noexcept;
     Result GetLocationMapsForMaintenance(RequestContext *request_context,
                                          const KeyVector &keys,
                                          CacheLocationMapVector &out_locations) noexcept;

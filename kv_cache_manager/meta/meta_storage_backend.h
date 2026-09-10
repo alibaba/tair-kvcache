@@ -378,16 +378,10 @@ public:
                                                  const std::vector<std::string> &field_names,
                                                  PropertyMapVector &out_properties) noexcept = 0;
 
-    // Maintenance reads must not update timestamps, promote entries, observe
+    // Maintenance Location reads must not update timestamps, promote entries, observe
     // revisit intervals, or populate a cache. The default adapter is only for
     // side-effect-free reads (Redis/async Redis). Backends whose ordinary reads
-    // refresh LRU, including local and dummy, must override these APIs.
-    virtual std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
-                                                               const KeyTypeVec &keys,
-                                                               const std::vector<std::string> &field_names,
-                                                               PropertyMapVector &out_properties) noexcept {
-        return GetProperties(request_context, keys, field_names, out_properties);
-    }
+    // refresh LRU, including local and dummy, must override this API.
     virtual std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
                                                                  const KeyTypeVec &keys,
                                                                  CacheLocationMapVector &out_locations) noexcept {

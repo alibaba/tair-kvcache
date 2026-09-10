@@ -784,9 +784,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
                                          keys,
                                          CacheLocationMapVector(3, {{"loc", location}}),
                                          PropertyMapVector(3, {{PROPERTY_HIT_COUNT, "7"}})));
-    PropertyMapVector before, after;
+    std::vector<int64_t> before, after;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
-              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, keys, {PROPERTY_LRU_TIME}, before));
+              GetLocalBackend()->GetLastAccessTimesForMaintenance(nullptr, keys, before));
     KeyVector legacy_before;
     ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 3, legacy_before));
     const auto usage = GetLocalBackend()->GetMemUsage();
@@ -796,19 +796,14 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
         ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, batch));
         ASSERT_EQ(1, batch.size());
         sampled.push_back(batch[0]);
-        PropertyMapVector props;
         CacheLocationMapVector locations;
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
-                  meta_storage_backend_->GetPropertiesForMaintenance(
-                      nullptr, batch, {PROPERTY_LRU_TIME, PROPERTY_HIT_COUNT}, props));
-        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}),
                   meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, batch, locations));
-        EXPECT_EQ("7", props[0].at(PROPERTY_HIT_COUNT));
         ASSERT_EQ(1, locations[0].size());
     }
     EXPECT_EQ((KeyVector{1, 2, 3, 1, 2, 3}), sampled);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
-              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, keys, {PROPERTY_LRU_TIME}, after));
+              GetLocalBackend()->GetLastAccessTimesForMaintenance(nullptr, keys, after));
     EXPECT_EQ(before, after);
     KeyVector legacy_after;
     ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 3, legacy_after));
@@ -818,9 +813,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
               meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, {1, 99}, missing_locations));
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
-              meta_storage_backend_->GetPropertiesForMaintenance(nullptr, {1, 99}, {PROPERTY_LRU_TIME}, after));
+              GetLocalBackend()->GetLastAccessTimesForMaintenance(nullptr, {1, 99}, after));
     ASSERT_EQ(2, after.size());
-    EXPECT_TRUE(after[1].empty());
+    EXPECT_EQ(0, after[1]);
 }
 
 TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithoutTouchingLru) {
@@ -859,9 +854,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
             backend->Put(nullptr, keys_by_shard[shard], CacheLocationMapVector(2, locations), PropertyMapVector(2)));
         all_keys.insert(all_keys.end(), keys_by_shard[shard].begin(), keys_by_shard[shard].end());
     }
-    PropertyMapVector before, after;
+    std::vector<int64_t> before, after;
     ASSERT_EQ(std::vector<ErrorCode>(all_keys.size(), EC_OK),
-              backend->GetPropertiesForMaintenance(nullptr, all_keys, {PROPERTY_LRU_TIME}, before));
+              backend->GetLastAccessTimesForMaintenance(nullptr, all_keys, before));
     std::vector<int64_t> tails;
     for (size_t shard = 0; shard < kShards; ++shard) {
         tails.push_back(backend->shard_oldest_access_time_[shard].load());
@@ -892,7 +887,7 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
         EXPECT_TRUE(found_reclaimable);
     }
     ASSERT_EQ(std::vector<ErrorCode>(all_keys.size(), EC_OK),
-              backend->GetPropertiesForMaintenance(nullptr, all_keys, {PROPERTY_LRU_TIME}, after));
+              backend->GetLastAccessTimesForMaintenance(nullptr, all_keys, after));
     EXPECT_EQ(before, after);
     for (size_t shard = 0; shard < kShards; ++shard) {
         EXPECT_EQ(tails[shard], backend->shard_oldest_access_time_[shard].load());
