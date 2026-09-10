@@ -1595,20 +1595,21 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
         }
     }
 
-    auto is_cold_storage = [](const BackendSelector &selector) {
-        return selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
-               selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto needs_base_hits = [](const BackendSelector &selector) {
+        return selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
+               (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
+                selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE);
     };
     std::vector<BackendSelector> ordered_selectors = selectors;
-    std::stable_partition(ordered_selectors.begin(), ordered_selectors.end(), is_cold_storage);
+    std::stable_partition(ordered_selectors.begin(),
+                          ordered_selectors.end(),
+                          [&needs_base_hits](const BackendSelector &selector) { return !needs_base_hits(selector); });
 
-    std::vector<bool> cold_base_hits(query_keys.size(), false);
+    std::vector<bool> base_hits(query_keys.size(), false);
     for (const auto &selector : ordered_selectors) {
         DataStorageType target_type = selector.backend_type;
 
-        if (target_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
-            (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
-             selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
+        if (needs_base_hits(selector)) {
             // --- event report cross-key selection ---
             bool is_prefix = (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX);
 
@@ -1651,9 +1652,9 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
             // Select best peer
             V6DPeerSelection selection;
             if (is_prefix) {
-                selection = SelectV6DByCombinedPrefix(cold_base_hits, remote_peer_candidates);
+                selection = SelectV6DByCombinedPrefix(base_hits, remote_peer_candidates);
             } else {
-                selection = SelectV6DByIncrementalCoverage(cold_base_hits, remote_peer_candidates);
+                selection = SelectV6DByIncrementalCoverage(base_hits, remote_peer_candidates);
             }
 
             // Populate results for covered keys
@@ -1672,7 +1673,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
             }
 
         } else {
-            // --- Per-key independent selection (WEIGHTED_RANDOM or other non-event-report) ---
+            // --- Per-key selection that does not depend on base hits ---
             for (size_t i = 0; i < query_keys.size(); ++i) {
                 const std::string_view requested_spec_name =
                     requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
@@ -1719,9 +1720,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 merged->set_spec_size(specs.size());
                 merged->set_location_specs(std::move(specs));
                 out_locations[query_to_output_index[i]].push_back(std::move(merged));
-                if (is_cold_storage(selector)) {
-                    cold_base_hits[i] = true;
-                }
+                base_hits[i] = true;
             }
         }
     }

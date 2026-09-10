@@ -4308,21 +4308,23 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
 class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
 protected:
-    void AddTairLocations(const MetaSearcher::KeyVector &keys) {
+    void AddServingLocations(const MetaSearcher::KeyVector &keys, DataStorageType type, const std::string &uri) {
         for (int64_t key : keys) {
-            auto tair_loc = MetaSearcherTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                1,
-                {MetaSearcherTestHelper::CreateLocationSpec("tp0", "tair://host_t:6379/tp0")});
+            auto location = MetaSearcherTestHelper::CreateCacheLocation(
+                type, 1, {MetaSearcherTestHelper::CreateLocationSpec("tp0", uri)});
             std::vector<std::string> out_ids;
             ASSERT_EQ(
                 ErrorCode::EC_OK,
-                BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {tair_loc}, out_ids));
+                BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, out_ids));
             std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
             std::vector<std::vector<ErrorCode>> results;
             ASSERT_EQ(ErrorCode::EC_OK,
                       meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results));
         }
+    }
+
+    void AddTairLocations(const MetaSearcher::KeyVector &keys) {
+        AddServingLocations(keys, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "tair://host_t:6379/tp0");
     }
 
     void AddRequestedSpecMatrixEventReportPeer() {
@@ -4518,6 +4520,67 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithTairBaseH
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][1]->type());
         EXPECT_NE(out[key_index][1]->location_specs()[0].uri().find("peer_a"), std::string::npos);
     }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithIndependentBackendsInEitherSelectorOrder) {
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace://host_s/tp0?size=1&media_type=5");
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_HF3FS, "hf3fs:///tmp/base-hit?offset=0&length=1&size=1");
+
+    const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    for (const DataStorageType base_type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, DataStorageType::DATA_STORAGE_TYPE_HF3FS}) {
+        const std::vector<std::vector<BackendSelector>> selector_orders = {
+            {
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+            },
+            {
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+            },
+        };
+        for (const auto &selectors : selector_orders) {
+            LocationsPerKey out;
+            ASSERT_EQ(
+                ErrorCode::EC_OK,
+                meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+            ASSERT_EQ(keys.size(), out.size());
+            ASSERT_EQ(1u, out[0].size());
+            EXPECT_EQ(base_type, out[0][0]->type());
+            for (size_t key_index = 1; key_index < keys.size(); ++key_index) {
+                ASSERT_EQ(1u, out[key_index].size());
+                EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][0]->type());
+                EXPECT_NE(out[key_index][0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+            }
+        }
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixDoesNotCountSpecFilteredLocationAsBaseHit) {
+    AddRequestedSpecMatrixEventReportPeer();
+    AddTairLocations({82000, 82001, 82002});
+
+    const MetaSearcher::KeyVector keys = {82000, 82001, 82002};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), keys, out, &policy_, selectors, {"linear_1", "linear_1", "linear_1"}));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[0][0]->type());
+    EXPECT_TRUE(std::any_of(out[0][0]->location_specs().begin(),
+                            out[0][0]->location_specs().end(),
+                            [](const LocationSpec &spec) { return spec.name() == "linear_1"; }));
+    EXPECT_TRUE(out[1].empty());
+    EXPECT_TRUE(out[2].empty());
 }
 
 TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixPreservesV6DHitsBeforeUnfillableGap) {
