@@ -81,6 +81,9 @@ def _stub_third_party():
         req.Session = MagicMock(name="requests.Session")
         req.post = MagicMock(name="requests.post")
         req.get = MagicMock(name="requests.get")
+        # manager_client's annotations reference requests.Response, which is
+        # evaluated at import time even when never called.
+        req.Response = MagicMock(name="requests.Response")
 
     # orjson is used functionally (CoordinateMsgSerializer round trips), so
     # the stand-in must actually (de)serialize; stdlib json handles the
