@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_plan.h"
 
 namespace kv_cache_manager {
 
@@ -55,10 +56,12 @@ public:
     const std::vector<KvcmEventSubscriptionConfig> &kvcm_event_subscriptions() const {
         return kvcm_event_subscriptions_;
     }
+    const QuotaPlannerRuntimeConfig &quota_planner_config() const { return quota_planner_config_; }
 
 private:
     void UpdateEnviron(EnvironMap &environ);
     bool ValidateKvcmEventSubscriptions() const;
+    bool ValidateQuotaPlanner() const;
 
     int32_t rpc_port_ = 50052;
     int32_t http_port_ = 8082;
@@ -69,6 +72,7 @@ private:
     std::string prometheus_prefix_ = "kvcm_optimizer";
     int32_t io_thread_num_ = 4;
     std::vector<KvcmEventSubscriptionConfig> kvcm_event_subscriptions_;
+    QuotaPlannerRuntimeConfig quota_planner_config_;
 
     using SettingFunction = std::function<bool(const std::string &, OnlineOptimizerServerConfig *)>;
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;

@@ -336,6 +336,44 @@ TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
     EXPECT_TRUE(std::isnan(metrics[0].per_capacity_hit_rates[0].hit_rate));
 }
 
+TEST_F(OnlineOptimizerManagerTest, QuotaSnapshotIsIndependentOfMetricsAndOtherInstances) {
+    auto group = MakeGroup("g1", {FullCapacityGb(3)}, "lru", true);
+    RegisterInstanceResult registration;
+    ASSERT_EQ(EC_OK, RegisterInstance(MakeInfo("i1", "g1", 4, 0), group, registration));
+    ASSERT_EQ(EC_OK, RegisterInstance(MakeInfo("i2", "g1", 4, 0), group, registration));
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 1000000000, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 2000000000, result));
+
+    std::vector<MrcMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
+    const std::map<std::string, std::vector<uint64_t>> capacities{
+        {"i1", {2 * 16384, 3 * 16384}}, {"i2", {3 * 16384}}};
+    const auto snapshot = mgr_->TakeQuotaDecisionSnapshot(capacities, 3000000000);
+    ASSERT_EQ(2, snapshot.sources.size());
+    const auto &source = snapshot.sources[0];
+    EXPECT_EQ("i1", source.source_id);
+    EXPECT_EQ(2, source.accepted_facts);
+    EXPECT_EQ(2000000000, source.newest_event_time_ns);
+    ASSERT_EQ(2, source.curve.size());
+    EXPECT_EQ(26, source.curve[0].input_tokens);
+    EXPECT_EQ(8, source.curve[0].hit_tokens);
+    EXPECT_EQ(12, source.curve[1].hit_tokens);
+    EXPECT_EQ(0, snapshot.sources[1].accepted_facts);
+
+    const auto empty = mgr_->TakeQuotaDecisionSnapshot(capacities, 4000000000);
+    EXPECT_GT(empty.snapshot_id, snapshot.snapshot_id);
+    EXPECT_EQ(0, empty.sources[0].accepted_facts);
+    EXPECT_EQ(0, empty.sources[0].curve[0].input_tokens);
+    EXPECT_EQ(0, empty.sources[0].curve[0].hit_tokens);
+    // Draining the decision window must retain LiteHit reuse history.
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3}, 13, 5000000000, result));
+    const auto next = mgr_->TakeQuotaDecisionSnapshot(capacities, 6000000000);
+    EXPECT_EQ(1, next.sources[0].accepted_facts);
+    EXPECT_EQ(13, next.sources[0].curve[1].input_tokens);
+    EXPECT_EQ(12, next.sources[0].curve[1].hit_tokens);
+}
+
 TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     auto info = MakeInfo("i1", "g1", 4, 0);
     auto group = MakeGroup("g1", {FullCapacityGb(20)}, "lru", true);
