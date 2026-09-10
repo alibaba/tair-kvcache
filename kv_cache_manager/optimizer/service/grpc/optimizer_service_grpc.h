@@ -62,6 +62,14 @@ public:
                             const proto::optimizer::OptimizerResetStatsRequest *request,
                             proto::optimizer::OptimizerResetStatsResponse *response) override;
 
+    grpc::Status PullQuotaAllocation(grpc::ServerContext *context,
+                                     const proto::optimizer::PullQuotaAllocationRequest *request,
+                                     proto::optimizer::PullQuotaAllocationResponse *response) override;
+
+    grpc::Status ReportQuotaResizeResult(grpc::ServerContext *context,
+                                         const proto::optimizer::ReportQuotaResizeResultRequest *request,
+                                         proto::optimizer::ReportQuotaResizeResultResponse *response) override;
+
 private:
     std::shared_ptr<OptimizerServiceImpl> service_impl_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;

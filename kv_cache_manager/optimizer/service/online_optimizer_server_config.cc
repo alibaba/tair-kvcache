@@ -89,6 +89,40 @@ std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
      [](const std::string &value, OnlineOptimizerServerConfig *config) {
          return Jsonizable::FromJsonString(value, config->kvcm_event_subscriptions_);
      }},
+    {"kvcm_optimizer.quota_planner_enable",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.enable = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm_optimizer.quota_planner_enable_hard_resize",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.enable_hard_resize = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm_optimizer.quota_planner_period_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.period_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_plan_ttl_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.plan_ttl_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_release_timeout_seconds",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.release_timeout_seconds = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_release_consecutive_samples",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         config->quota_planner_config_.release_consecutive_samples = std::stol(value);
+         return true;
+     }},
+    {"kvcm_optimizer.quota_planner_pools",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         return Jsonizable::FromJsonString(value, config->quota_planner_config_.pools);
+     }},
 };
 // clang-format on
 
@@ -102,7 +136,24 @@ bool OnlineOptimizerServerConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "prometheus_prefix", prometheus_prefix_, std::string("kvcm_optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "io_thread_num", io_thread_num_, int32_t(4));
     KVCM_JSON_GET_MACRO(rapid_value, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
-    return ValidateKvcmEventSubscriptions();
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "quota_planner_enable", quota_planner_config_.enable, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "quota_planner_enable_hard_resize", quota_planner_config_.enable_hard_resize, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "quota_planner_period_seconds", quota_planner_config_.period_seconds, int64_t(300));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "quota_planner_plan_ttl_seconds", quota_planner_config_.plan_ttl_seconds, int64_t(900));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "quota_planner_release_timeout_seconds",
+                                quota_planner_config_.release_timeout_seconds,
+                                int64_t(1800));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "quota_planner_release_consecutive_samples",
+                                quota_planner_config_.release_consecutive_samples,
+                                int64_t(3));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "quota_planner_pools", quota_planner_config_.pools, std::vector<QuotaPoolConfig>());
+    return ValidateKvcmEventSubscriptions() && ValidateQuotaPlanner();
 }
 
 void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -115,6 +166,13 @@ void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "prometheus_prefix", prometheus_prefix_);
     Put(writer, "io_thread_num", io_thread_num_);
     Put(writer, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
+    Put(writer, "quota_planner_enable", quota_planner_config_.enable);
+    Put(writer, "quota_planner_enable_hard_resize", quota_planner_config_.enable_hard_resize);
+    Put(writer, "quota_planner_period_seconds", quota_planner_config_.period_seconds);
+    Put(writer, "quota_planner_plan_ttl_seconds", quota_planner_config_.plan_ttl_seconds);
+    Put(writer, "quota_planner_release_timeout_seconds", quota_planner_config_.release_timeout_seconds);
+    Put(writer, "quota_planner_release_consecutive_samples", quota_planner_config_.release_consecutive_samples);
+    Put(writer, "quota_planner_pools", quota_planner_config_.pools);
 }
 
 bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ) {
@@ -141,13 +199,36 @@ bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ)
             success = false;
         }
     }
-    return success && ValidateKvcmEventSubscriptions();
+    return success && ValidateKvcmEventSubscriptions() && ValidateQuotaPlanner();
 }
 
 bool OnlineOptimizerServerConfig::ValidateKvcmEventSubscriptions() const {
     std::unordered_set<std::string> discovery_urls;
     for (const auto &subscription : kvcm_event_subscriptions_) {
         if (!subscription.Validate() || !discovery_urls.insert(subscription.service_discovery_url()).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool OnlineOptimizerServerConfig::ValidateQuotaPlanner() const {
+    if (!quota_planner_config_.enable) {
+        return !quota_planner_config_.enable_hard_resize;
+    }
+    if (quota_planner_config_.period_seconds <= 0 || quota_planner_config_.plan_ttl_seconds <= 0 ||
+        quota_planner_config_.release_timeout_seconds <= 0 || quota_planner_config_.release_consecutive_samples <= 0 ||
+        quota_planner_config_.pools.empty()) {
+        return false;
+    }
+    if (quota_planner_config_.enable_hard_resize &&
+        quota_planner_config_.plan_ttl_seconds <= quota_planner_config_.release_timeout_seconds) {
+        return false;
+    }
+    std::unordered_set<std::string> pool_ids;
+    for (const auto &pool : quota_planner_config_.pools) {
+        std::string reason;
+        if (!pool.Check(reason) || !pool_ids.insert(pool.pool_id).second) {
             return false;
         }
     }

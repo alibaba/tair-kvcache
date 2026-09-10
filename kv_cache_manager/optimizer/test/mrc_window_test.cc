@@ -93,4 +93,15 @@ TEST_F(MrcWindowTest, TakeClearsReportingWindow) {
     }
 }
 
+TEST_F(MrcWindowTest, ProjectsExactQuotaCandidateCapacitiesAndClearsWindow) {
+    MrcWindow window;
+    RequestFact fact;
+    fact.hit_curve.push_back({1, 3});
+    fact.hit_curve.push_back({10, 2});
+    window.Record(fact);
+
+    EXPECT_EQ((std::vector<uint64_t>{0, 1, 3, 3, 4, 5}), window.TakeHitCounts({0, 1, 3, 9, 10, 11}));
+    EXPECT_EQ((std::vector<uint64_t>{0, 0}), window.TakeHitCounts({3, 11}));
+}
+
 } // namespace kv_cache_manager
