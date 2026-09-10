@@ -492,10 +492,13 @@ struct GroupLruTestBackend {
     ErrorCode property_error{ErrorCode::EC_OK};
     ErrorCode location_error{ErrorCode::EC_OK};
     std::chrono::milliseconds sampling_delay{0};
+    std::chrono::milliseconds location_delay{0};
+    std::function<void()> sampling_hook;
 };
 std::mutex group_lru_test_mutex;
 std::map<std::string, GroupLruTestBackend> group_lru_test_backends;
 std::function<void()> group_lru_location_read_hook;
+std::vector<std::string> group_lru_location_reads;
 
 ErrorCode GroupLruSample_stub(void *obj,
                               RequestContext *request_context,
@@ -506,12 +509,14 @@ ErrorCode GroupLruSample_stub(void *obj,
         return MetaIndexer_SampleReclaimCandidates_stub(obj, request_context, count, candidates, false);
     }
     std::chrono::milliseconds delay{0};
+    std::function<void()> sampling_hook;
     ErrorCode ec = ErrorCode::EC_OK;
     {
         std::lock_guard<std::mutex> lock(group_lru_test_mutex);
         const auto &id = instance_id_by_meta_indexer.at(obj);
         auto &backend = group_lru_test_backends.at(id);
         delay = backend.sampling_delay;
+        sampling_hook = backend.sampling_hook;
         ++backend.sampling_calls;
         if (backend.sampling_calls == backend.fail_sampling_call) {
             ec = ErrorCode::EC_ERROR;
@@ -543,6 +548,9 @@ ErrorCode GroupLruSample_stub(void *obj,
             candidates.push_back({key, time});
         }
     }
+    if (sampling_hook) {
+        sampling_hook();
+    }
     std::this_thread::sleep_for(delay);
     return ec;
 }
@@ -550,9 +558,13 @@ ErrorCode GroupLruSample_stub(void *obj,
 MetaIndexer::Result
 GroupLruLocations_stub(void *obj, RequestContext *, const KeyVector &keys, CacheLocationMapVector &maps) noexcept {
     MetaIndexer::Result result(keys.size());
+    std::chrono::milliseconds delay{0};
     {
         std::lock_guard<std::mutex> lock(group_lru_test_mutex);
-        auto &backend = group_lru_test_backends.at(instance_id_by_meta_indexer.at(obj));
+        const auto &id = instance_id_by_meta_indexer.at(obj);
+        auto &backend = group_lru_test_backends.at(id);
+        delay = backend.location_delay;
+        group_lru_location_reads.push_back(id);
         maps.assign(keys.size(), CacheLocationMap{});
         for (std::size_t i = 0; i < keys.size(); ++i) {
             result.error_codes[i] = backend.location_error;
@@ -565,6 +577,7 @@ GroupLruLocations_stub(void *obj, RequestContext *, const KeyVector &keys, Cache
     if (group_lru_location_read_hook) {
         group_lru_location_read_hook();
     }
+    std::this_thread::sleep_for(delay);
     return result;
 }
 
@@ -599,6 +612,7 @@ public:
         key_count_by_meta_indexer.clear();
         group_lru_test_backends.clear();
         group_lru_location_read_hook = {};
+        group_lru_location_reads.clear();
         {
             std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
             sample_reclaim_requests.clear();
@@ -4625,6 +4639,51 @@ TEST_F(CacheReclaimerTest, TestGroupLruSlowInstanceDoesNotBlockHealthySamplingFr
     EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
 }
 
+TEST_F(CacheReclaimerTest, TestGroupLruLocationTimeoutRotatesBeforeFasterSampler) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    group_lru_test_backends.at("a").location_delay = std::chrono::milliseconds(200);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+
+    // In the first round A must enter its slow Location read before B's
+    // sample completes. Later rounds deliberately keep A's sampler faster.
+    auto location_started = std::make_shared<std::promise<void>>();
+    auto location_ready = location_started->get_future().share();
+    auto signalled = std::make_shared<std::atomic<bool>>(false);
+    group_lru_test_backends.at("b").sampling_hook = [location_ready] {
+        location_ready.wait_for(std::chrono::seconds(1));
+    };
+    group_lru_location_read_hook = [location_started, signalled] {
+        if (!signalled->exchange(true)) {
+            location_started->set_value();
+        }
+    };
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    EXPECT_EQ((std::vector<std::string>{"a"}), group_lru_location_reads);
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}),
+              cache_reclaimer_->group_lru_rotation_by_group_.at(group->name()).instance_ids);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+
+    group_lru_test_backends.at("b").sampling_hook = {};
+    group_lru_location_read_hook = {};
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        group_lru_location_reads.clear();
+        const auto before = SubmittedDelRequestCount();
+        EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+        ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+        ASSERT_FALSE(group_lru_location_reads.empty());
+        EXPECT_EQ("b", group_lru_location_reads.front());
+        const auto requests = SubmittedDelRequestsSnapshot();
+        EXPECT_GT(requests.size(), before);
+        for (std::size_t i = before; i < requests.size(); ++i) {
+            EXPECT_EQ("b", requests[i].instance_id);
+        }
+    }
+}
+
 TEST_F(CacheReclaimerTest, TestGroupLruSaturatedPoolDoesNotAdvanceSamplingQueue) {
     const auto group = SetUpGroupLruScenario();
     cache_reclaimer_->in_flight_sampling_tasks_ = cache_reclaimer_->workers_.size();
@@ -4633,6 +4692,79 @@ TEST_F(CacheReclaimerTest, TestGroupLruSaturatedPoolDoesNotAdvanceSamplingQueue)
     EXPECT_EQ(0, group_lru_test_backends.at("a").sampling_calls);
     EXPECT_EQ((std::deque<std::string>{"a", "b"}),
               cache_reclaimer_->group_lru_rotation_by_group_.at(group->name()).instance_ids);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPriorityWaiterSamplingTimeoutYieldsNextRound) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"a", "b"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(200);
+
+    // The protected waiter cannot complete this round. It must not retain
+    // priority forever while B repeatedly completes sampling without a read.
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    EXPECT_TRUE(group_lru_location_reads.empty());
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_TRUE(rotation.prioritize_location_waiter);
+
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(0);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_EQ("b", group_lru_location_reads.front());
+    EXPECT_FALSE(rotation.prioritize_location_waiter);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPriorityWaiterSamplingFailureReleasesReadyPeers) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"a", "b"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").fail_sampling_call = 1;
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_failed_instance_count_metrics());
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_TRUE(std::all_of(
+        group_lru_location_reads.begin(), group_lru_location_reads.end(), [](const auto &id) { return id == "b"; }));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruRemovedWaiterPreservesNextLocationPriority) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"removed", "b", "a"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").location_delay = std::chrono::milliseconds(200);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_EQ("b", group_lru_location_reads.front());
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSaturatedPoolPreservesLocationWaiter) {
+    const auto group = SetUpGroupLruScenario();
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"b", "a"};
+    rotation.prioritize_location_waiter = true;
+    cache_reclaimer_->in_flight_sampling_tasks_ = cache_reclaimer_->workers_.size();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    cache_reclaimer_->in_flight_sampling_tasks_ = 0;
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_TRUE(rotation.prioritize_location_waiter);
+    EXPECT_TRUE(group_lru_location_reads.empty());
     EXPECT_TRUE(HasNoSubmittedDelRequests());
 }
 
