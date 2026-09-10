@@ -86,7 +86,7 @@ class TestPartialHit(unittest.TestCase):
             wait_for_captures(env.capture_dir, "loaded",
                               expected=shared_abc, timeout=180)
 
-            report = compare_captures(env.capture_dir, tp_size=1)
+            report = compare_captures(env.capture_dir)
             assert_report_ok(report, min_matched=shared_abc)
         finally:
             env.stop()

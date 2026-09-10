@@ -10,14 +10,14 @@ see e2e_lib.run_e2e for the per-model orchestration differences.
 
 import unittest
 
-from e2e_lib import run_e2e
+from e2e_lib import run_e2e, scenario_tp_size
 
 
 class TestBasic(unittest.TestCase):
     def test_basic(self):
         run_e2e(
             scenario="basic",
-            tp_size=1,
+            tp_size=scenario_tp_size(),
             num_prompts=1,
             preferred_block_size=0,  # manager block size == vllm block size
         )
