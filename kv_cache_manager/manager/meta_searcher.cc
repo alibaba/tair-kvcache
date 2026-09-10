@@ -1642,6 +1642,9 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                     }
                 }
 
+                if (is_prefix && !base_hits[i] && vineyard_addrs.empty()) {
+                    break;
+                }
                 if (vineyard_addrs.empty()) {
                     continue;
                 }
