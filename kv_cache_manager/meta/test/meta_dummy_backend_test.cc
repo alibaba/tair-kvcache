@@ -1,11 +1,15 @@
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
@@ -136,6 +140,46 @@ TEST_F(MetaDummyBackendTest, TestInit) {
     // invalid config
     ASSERT_NE(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));
     ASSERT_NE(ErrorCode::EC_OK, meta_storage_backend_->Init(/*instance_id*/ "", meta_storage_backend_config_));
+}
+
+TEST_F(MetaDummyBackendTest, TestFutureGuardFailsOpenInsteadOfBeingSilentlyErased) {
+    const std::string instance_id = "future_guard_instance";
+    const std::string base_path = GetPrivateTestRuntimeDataPath() + "_meta_dummy_backend_future_guard";
+    const std::string persistence_path = base_path + "_" + instance_id;
+    std::filesystem::remove(persistence_path);
+
+    MigrationCopyGuard guard;
+    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
+    guard.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
+    guard.set_operation_id("future-guard-operation");
+    CacheLocation location(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, {LocationSpec("TP0", "dummy://future-guard?size=7")});
+    location.set_id("future-guard-location");
+    location.set_status(CLS_WRITING);
+    location.set_migration_copy_guard(guard);
+    std::string serialized_location = location.ToJsonString();
+    const std::string current_schema =
+        "\"schema_version\":" + std::to_string(MigrationCopyGuard::kCurrentSchemaVersion);
+    const auto schema_pos = serialized_location.find(current_schema);
+    ASSERT_NE(std::string::npos, schema_pos);
+    serialized_location.replace(schema_pos,
+                                current_schema.size(),
+                                "\"schema_version\":" + std::to_string(MigrationCopyGuard::kCurrentSchemaVersion + 1));
+
+    FieldMap fields{{PROPERTY_LOCATION_PREFIX + location.id(), serialized_location}};
+    std::map<std::string, std::string> persisted{{"1", Jsonizable::ToJsonString(fields)}};
+    {
+        std::ofstream output(persistence_path);
+        ASSERT_TRUE(output.is_open());
+        output << Jsonizable::ToJsonString(persisted);
+    }
+
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("file://" + base_path);
+    auto backend = std::make_shared<MetaDummyBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(instance_id, config));
+    EXPECT_EQ(EC_CORRUPTION, backend->Open());
+    std::filesystem::remove(persistence_path);
 }
 
 TEST_F(MetaDummyBackendTest, TestPut) {

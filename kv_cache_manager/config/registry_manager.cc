@@ -172,10 +172,34 @@ ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const
 
 ErrorCode RegistryManager::RemoveStorage(RequestContext *request_context, const std::string &global_unique_name) {
     const auto &trace_id = request_context->request_id();
-    auto ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed");
-    ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
+    // Drain/close the runtime backend before deleting the durable config.
+    // Async Copy recovery needs that config to recreate the PACE client; the
+    // old order could lose the only recovery route when Close returned busy or
+    // failed with in-flight operations.
+    const auto backend = data_storage_manager_->GetDataStorageBackend(global_unique_name);
+    if (!backend) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, EC_NOENT, "remove storage failed: runtime backend not found");
+    }
+    const StorageConfig storage_config = backend->GetStorageConfig();
+    auto ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "remove storage failed");
+    ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
+    if (ec != EC_OK) {
+        // The durable registry still contains this storage. Restore the runtime
+        // backend so the current leader matches the state that the next leader
+        // will recover, and so a retry can make progress instead of failing
+        // permanently with EC_NOENT.
+        const auto rollback_ec =
+            data_storage_manager_->RegisterStorage(request_context, global_unique_name, storage_config);
+        if (rollback_ec != EC_OK) {
+            PREFIX_LOG_S(ERROR,
+                         "load and delete storage failed after backend close, and runtime rollback failed, "
+                         "delete ec[%d] rollback ec[%d]",
+                         static_cast<int>(ec),
+                         static_cast<int>(rollback_ec));
+        }
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed after backend close");
+    }
     PREFIX_LOG_S(INFO, "remove storage OK");
     return ec;
 }

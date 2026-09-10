@@ -232,6 +232,11 @@ enum MigrationMarkClearPolicy {
     MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
 }
 
+enum MigrationCopyExecutionMode {
+    MIGRATION_COPY_SYNC = 0;
+    MIGRATION_COPY_ASYNC_REQUIRED = 1;
+}
+
 // 执行方式配置（Config 后缀用于区分 MigrationMethod 请求枚举）。
 
 // Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
@@ -264,6 +269,16 @@ message MigrationConfig {
     repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
     google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
     MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
+    MigrationCopyExecutionMode copy_execution_mode = 4;
+    google.protobuf.UInt64Value copy_max_inflight_bytes = 5;
+    google.protobuf.Int64Value copy_max_quarantine_operations = 6;
+    google.protobuf.UInt64Value copy_max_quarantine_bytes = 7;
+    google.protobuf.Int64Value copy_operation_deadline_ms = 8;
+    google.protobuf.Int64Value copy_poll_initial_interval_ms = 9;
+    google.protobuf.Int64Value copy_poll_max_interval_ms = 10;
+    google.protobuf.Int64Value copy_connect_timeout_ms = 11;
+    google.protobuf.Int64Value copy_submit_timeout_ms = 12;
+    google.protobuf.Int64Value copy_query_timeout_ms = 13;
 }
 
 enum CachePreferStrategy {
@@ -451,6 +466,43 @@ message MigrateCacheResponse {
     CommonResponseHeader header = 1;
     int64 accepted = 2; // 接受并投递的 block 数
     int64 rejected = 3; // 被准入策略 / 校验拒绝的 block 数
+}
+
+// Fail-closed asynchronous Copy targets that cannot yet prove remote drain.
+message ListAsyncCopyQuarantineRequest {
+    string trace_id = 1;
+    string instance_group_name = 2; // empty = all groups
+}
+
+message AsyncCopyQuarantineRecord {
+    string instance_group_name = 1;
+    string instance_id = 2;
+    int64 block_key = 3;
+    string target_location_id = 4;
+    int32 guard_state = 5;
+    string operation_id = 6;
+    string source_location_id = 7;
+    int64 source_location_create_time = 8;
+    string source_storage_name = 9;
+    string target_storage_name = 10;
+    uint64 total_bytes = 11;
+    repeated string backend_task_ids = 12;
+    int64 create_time_us = 13;
+    int64 update_time_us = 14;
+    string last_error = 15;
+}
+
+message ListAsyncCopyQuarantineResponse {
+    CommonResponseHeader header = 1;
+    repeated AsyncCopyQuarantineRecord records = 2;
+}
+
+message BreakGlassReleaseAsyncCopyRequest {
+    string trace_id = 1;
+    string operation_id = 2;
+    string operator_name = 3;
+    string external_fencing_evidence = 4;
+    bool external_fencing_confirmed = 5;
 }
 
 message ModelDeployment {
@@ -652,6 +704,8 @@ service AdminService {
     rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
     // 跨存储层迁移指定 block 的 cache（Copy / Mark），支持显式 block_keys 或规则采样
     rpc MigrateCache(MigrateCacheRequest) returns (MigrateCacheResponse);
+    rpc ListAsyncCopyQuarantine(ListAsyncCopyQuarantineRequest) returns (ListAsyncCopyQuarantineResponse);
+    rpc BreakGlassReleaseAsyncCopy(BreakGlassReleaseAsyncCopyRequest) returns (CommonResponse);
     // 增删改查instance信息
     rpc RegisterInstance(RegisterInstanceRequest) returns (CommonResponse);
     rpc RemoveInstance(RemoveInstanceRequest) returns (CommonResponse);

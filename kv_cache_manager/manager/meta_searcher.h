@@ -321,6 +321,17 @@ public:
         // This closes the gap between a cleanup scan and its status CAS when
         // a stable location id is refreshed by a newer snapshot.
         std::string expected_location_value;
+        // Optional guard ownership check/mutation.  If expected_operation_id is
+        // non-empty, the location must carry that exact operation guard.
+        std::string expected_operation_id;
+        // Optional state check used by destructive/manual transitions.  NONE
+        // means no state predicate.
+        MigrationCopyGuardState expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_NONE;
+        // Used only when installing the first SUBMITTING guard.  The target
+        // must still be unowned; never overwrite another operation's fence.
+        bool expected_migration_copy_guard_absent = false;
+        bool clear_migration_copy_guard = false;
+        std::shared_ptr<MigrationCopyGuard> new_migration_copy_guard;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
