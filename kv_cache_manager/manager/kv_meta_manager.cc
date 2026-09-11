@@ -563,13 +563,25 @@ private:
             return;
         }
         RequestContext request_context("kv_meta_write_session_expired");
-        std::vector<bool> failed(session.items.size(), false);
-        const ErrorCode ec = owner_->FinishWriteInternal(
-            &request_context, session.internal_instance_id, failed, session.items);
+        const std::vector<bool> failed(session.items.size(), false);
+        ErrorCode ec = EC_IO_ERROR;
+        const char *failure_kind = "error_code";
+        try {
+            ec = owner_->FinishWriteInternal(&request_context, session.internal_instance_id, failed, session.items);
+        } catch (const std::exception &) {
+            failure_kind = "standard_exception";
+        } catch (...) {
+            failure_kind = "unknown_exception";
+        }
         if (ec != EC_OK) {
-            KVCM_LOG_WARN("KVMeta write-session cleanup failed, instance[%s], item_count[%zu], ec[%d]",
-                          session.internal_instance_id.c_str(),
+            // Never replay an uncertain physical delete. Reusable-address
+            // backends do not carry a generation token in the URI, so a retry
+            // could delete an unrelated successor allocation. Metadata-first
+            // cleanup makes the safe failure mode an orphan, not corruption.
+            KVCM_LOG_WARN("KVMeta write-session cleanup did not complete; backend orphan cleanup may be required, "
+                          "item_count[%zu], failure[%s], ec[%d]",
                           session.items.size(),
+                          failure_kind,
                           ec);
         }
     }
@@ -978,6 +990,45 @@ KvMetaManager::Get(RequestContext *request_context,
     return {EC_OK, std::move(result)};
 }
 
+ErrorCode KvMetaManager::DeleteStorageUris(RequestContext *request_context,
+                                           const std::string &storage_name,
+                                           const std::vector<DataStorageUri> &uris) const {
+    if (uris.empty()) {
+        return EC_OK;
+    }
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager) {
+        return EC_ERROR;
+    }
+    std::vector<ErrorCode> delete_results;
+    const char *failure_kind = nullptr;
+    try {
+        delete_results = data_storage_manager->Delete(request_context, storage_name, uris, nullptr);
+    } catch (const std::exception &) {
+        failure_kind = "standard_exception";
+    } catch (...) {
+        failure_kind = "unknown_exception";
+    }
+    if (failure_kind) {
+        KVCM_LOG_WARN("KVMeta storage delete caught a provider exception, item_count[%zu], failure[%s]",
+                      uris.size(),
+                      failure_kind);
+        AddError(request_context, "KVMeta storage delete caught a provider exception");
+        return EC_IO_ERROR;
+    }
+    if (delete_results.size() != uris.size()) {
+        AddError(request_context, "KVMeta storage delete returned a mismatched result count");
+        return EC_MISMATCH;
+    }
+    ErrorCode overall = EC_OK;
+    for (const ErrorCode ec : delete_results) {
+        if (ec != EC_OK && ec != EC_NOENT) {
+            overall = FirstHardError(overall, ec);
+        }
+    }
+    return overall;
+}
+
 ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_context,
                                                    const std::vector<SessionItem> &items) const {
     auto data_storage_manager = registry_manager_->data_storage_manager();
@@ -1008,16 +1059,7 @@ ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_contex
         }
     }
     for (auto &[storage_name, uris] : uris_by_storage) {
-        const auto delete_results = data_storage_manager->Delete(request_context, storage_name, uris, nullptr);
-        if (delete_results.size() != uris.size()) {
-            overall = FirstHardError(overall, EC_MISMATCH);
-            continue;
-        }
-        for (const ErrorCode ec : delete_results) {
-            if (ec != EC_OK && ec != EC_NOENT) {
-                overall = FirstHardError(overall, ec);
-            }
-        }
+        overall = FirstHardError(overall, DeleteStorageUris(request_context, storage_name, uris));
     }
     return overall;
 }
@@ -1304,11 +1346,26 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             "kvmeta/" + StringUtil::Uint64ToHex(instance_path_hash) + "/" +
             StringUtil::Uint64ToHex(static_cast<std::uint64_t>(existing[request_index].internal_key)) + "/" +
             StringUtil::GenerateRandomString(32);
-        const auto create_result = data_storage_manager->Create(request_context,
-                                                                 selected.name,
-                                                                 {object_key},
-                                                                 static_cast<std::size_t>(value_sizes[request_index]),
-                                                                 nullptr);
+        std::vector<std::pair<ErrorCode, DataStorageUri>> create_result;
+        try {
+            create_result = data_storage_manager->Create(request_context,
+                                                         selected.name,
+                                                         {object_key},
+                                                         static_cast<std::size_t>(value_sizes[request_index]),
+                                                         nullptr);
+        } catch (const std::exception &) {
+            KVCM_LOG_WARN("KVMeta storage create caught a standard provider exception; "
+                          "backend orphan cleanup may be required");
+            DeleteAllocatedLocations(request_context, candidates);
+            AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
+            return {EC_IO_ERROR, StartWriteResult{}};
+        } catch (...) {
+            KVCM_LOG_WARN("KVMeta storage create caught an unknown provider exception; "
+                          "backend orphan cleanup may be required");
+            DeleteAllocatedLocations(request_context, candidates);
+            AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
+            return {EC_IO_ERROR, StartWriteResult{}};
+        }
         if (create_result.size() != 1 || create_result[0].first != EC_OK ||
             !UriMatchesStorageBackend(create_result[0].second, selected.name, selected.type) ||
             !HasSingletonAllocationShape(create_result[0].second, selected.type)) {
@@ -1330,13 +1387,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                 }
             }
             if (!malformed_allocations.empty()) {
-                const auto delete_result = data_storage_manager->Delete(
-                    request_context, selected.name, malformed_allocations, nullptr);
-                bool cleanup_failed = delete_result.size() != malformed_allocations.size();
-                for (const ErrorCode ec : delete_result) {
-                    cleanup_failed = cleanup_failed || (ec != EC_OK && ec != EC_NOENT);
-                }
-                if (cleanup_failed) {
+                if (DeleteStorageUris(request_context, selected.name, malformed_allocations) != EC_OK) {
                     KVCM_LOG_WARN("KVMeta could not release every malformed new allocation");
                 }
             }
@@ -1380,10 +1431,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                                                             *location,
                                                             uri_size);
         if (location_ec != EC_OK || uri_size != value_sizes[request_index]) {
-            const auto delete_result =
-                data_storage_manager->Delete(request_context, selected.name, {create_result[0].second}, nullptr);
-            if (delete_result.size() != 1 ||
-                (delete_result[0] != EC_OK && delete_result[0] != EC_NOENT)) {
+            if (DeleteStorageUris(request_context, selected.name, {create_result[0].second}) != EC_OK) {
                 KVCM_LOG_WARN("KVMeta could not release an invalid-size new allocation");
             }
             DeleteAllocatedLocations(request_context, candidates);
@@ -1827,13 +1875,40 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     // I/O, so the lease may expire while this finalizer is queued. Recheck
     // after acquiring the lock; otherwise a value could become visible after
     // the timeout promised to both the client and leader-recovery logic.
-    if (take_result == KvMetaWriteSessionManager::TakeResult::kExpired ||
-        KvMetaWriteSessionManager::Clock::now() >= session.deadline) {
+    const auto cleanup_active_session = [&](ErrorCode completed_result) {
+        ErrorCode cleanup_ec = EC_IO_ERROR;
+        const char *failure_kind = "error_code";
+        try {
+            const std::vector<bool> failed(session.items.size(), false);
+            cleanup_ec = FinishWriteInternal(request_context, session.internal_instance_id, failed, session.items);
+        } catch (const std::exception &) {
+            failure_kind = "standard_exception";
+        } catch (...) {
+            failure_kind = "unknown_exception";
+        }
+        if (cleanup_ec == EC_OK) {
+            return completed_result;
+        }
+        // The physical-delete outcome may be ambiguous. Never replay it
+        // without a generation-bearing URI: an orphan is safer than deleting
+        // a successor allocation that reused the same backend address.
+        KVCM_LOG_WARN("KVMeta active write cleanup did not complete; backend orphan cleanup may be required, "
+                      "item_count[%zu], failure[%s], ec[%d]",
+                      success_keys.size(),
+                      failure_kind,
+                      cleanup_ec);
+        AddError(request_context, "KVMeta active write cleanup failed; backend orphan cleanup may be required");
+        return cleanup_ec;
+    };
+
+    const bool expired = take_result == KvMetaWriteSessionManager::TakeResult::kExpired ||
+                         KvMetaWriteSessionManager::Clock::now() >= session.deadline;
+    if (expired) {
         AddError(request_context, "KVMeta write session expired before FinishWrite");
-        const std::vector<bool> failed(session.items.size(), false);
-        const ErrorCode cleanup_ec =
-            FinishWriteInternal(request_context, session.internal_instance_id, failed, session.items);
-        return cleanup_ec == EC_OK ? EC_TIMEOUT : cleanup_ec;
+        return cleanup_active_session(EC_TIMEOUT);
+    }
+    if (std::any_of(success_keys.begin(), success_keys.end(), [](bool success) { return !success; })) {
+        return cleanup_active_session(EC_OK);
     }
     return FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
 }
@@ -2107,10 +2182,47 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     if (stale_batch.empty()) {
                         return EC_OK;
                     }
-                    const ErrorCode ec =
-                        DeleteItems(&request_context, instance->instance_id(), stale_batch, false, true);
+                    // Complete and persist the ownership change before any
+                    // physical release. A metadata failure must keep the gate
+                    // closed because the active record is still authoritative.
+                    ErrorCode metadata_ec = EC_IO_ERROR;
+                    try {
+                        metadata_ec = DeleteItems(&request_context, instance->instance_id(), stale_batch, true, false);
+                    } catch (const std::exception &) {
+                        KVCM_LOG_WARN("KVMeta recovery metadata cleanup caught a standard exception; "
+                                      "service remains disabled");
+                    } catch (...) {
+                        KVCM_LOG_WARN("KVMeta recovery metadata cleanup caught an unknown exception; "
+                                      "service remains disabled");
+                    }
+                    if (metadata_ec != EC_OK) {
+                        stale_batch.clear();
+                        return metadata_ec;
+                    }
+
+                    ErrorCode physical_ec = EC_IO_ERROR;
+                    const char *failure_kind = "error_code";
+                    try {
+                        physical_ec = DeleteAllocatedLocations(&request_context, stale_batch);
+                    } catch (const std::exception &) {
+                        failure_kind = "standard_exception";
+                    } catch (...) {
+                        failure_kind = "unknown_exception";
+                    }
+                    if (physical_ec != EC_OK) {
+                        // Reusable-address backends do not expose a generation
+                        // token. Once metadata is gone, replaying an uncertain
+                        // delete could remove an unrelated successor object.
+                        // Keep recovery available and leave this unreachable
+                        // allocation to backend-level orphan reclamation.
+                        KVCM_LOG_WARN("KVMeta recovery left objects for backend orphan cleanup, "
+                                      "item_count[%zu], failure[%s], ec[%d]",
+                                      stale_batch.size(),
+                                      failure_kind,
+                                      physical_ec);
+                    }
                     stale_batch.clear();
-                    return ec;
+                    return EC_OK;
                 };
 
                 std::string cursor = SCAN_BASE_CURSOR;
