@@ -19,6 +19,20 @@
 #include "kv_cache_manager/common/logger.h"
 
 namespace {
+
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+bool HasActiveGpuBuffer(const kv_cache_manager::BlockBuffers &buffers) {
+    for (const auto &buffer : buffers) {
+        for (const auto &iov : buffer.iovs) {
+            if (!iov.ignore && iov.size > 0 && iov.type == kv_cache_manager::MemoryType::GPU) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 class MmapHelper {
 public:
     MmapHelper(int fd, void *file_mem, size_t file_size) : fd_(fd), file_mem_(file_mem), file_size_(file_size) {}
@@ -308,6 +322,12 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+    if (HasActiveGpuBuffer(local_buffers)) {
+        KVCM_LOG_ERROR("Get failed, GPU buffer requires a CUDA or MUSA client build");
+        return ER_UNSUPPORTED_MEMORY_TYPE;
+    }
+#endif
     // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
     const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
     auto group_map = SplitByPath(remote_uris, local_buffers);
@@ -341,6 +361,12 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+    if (HasActiveGpuBuffer(local_buffers)) {
+        KVCM_LOG_ERROR("Put failed, GPU buffer requires a CUDA or MUSA client build");
+        return ER_UNSUPPORTED_MEMORY_TYPE;
+    }
+#endif
     // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
     const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
     // 预分配并按原始下标回填，保证同序契约：actual_remote_uris[i] 对应 remote_uris[i]。

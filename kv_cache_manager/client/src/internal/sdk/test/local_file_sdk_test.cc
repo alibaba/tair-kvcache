@@ -232,6 +232,37 @@ TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
 #endif
 }
 
+TEST_F(LocalFileSdkTest, TestGpuBuffersFailClosedWithoutGpuBackend) {
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    const std::string file_path = root_path_ + "/local_file/unsupported_gpu.txt";
+    const std::vector<DataStorageUri> remote_uris = {MakeUri(file_path, 0)};
+    auto *buffer = static_cast<unsigned char *>(malloc(1024));
+    ASSERT_NE(buffer, nullptr);
+    std::memset(buffer, 0xA5, 1024);
+
+    BlockBuffer block;
+    block.iovs.push_back({MemoryType::GPU, buffer, 1024, false});
+    const BlockBuffers local_buffers = {block};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+
+    EXPECT_EQ(ER_UNSUPPORTED_MEMORY_TYPE, sdk.Put(remote_uris, local_buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(file_path));
+
+    CreateSparseFile(file_path, 1024);
+    EXPECT_EQ(ER_UNSUPPORTED_MEMORY_TYPE, sdk.Get(remote_uris, local_buffers));
+    for (size_t i = 0; i < 1024; ++i) {
+        ASSERT_EQ(buffer[i], 0xA5);
+    }
+    free(buffer);
+#else
+    GTEST_SKIP() << "GPU backend is enabled; covered by TestPutGetWithGpu";
+#endif
+}
+
 // 在组级准入处立即返回超时，且一个 block 都不搬（caller buffer 哨兵值完好）。
 TEST_F(LocalFileSdkTest, TestGetTimeoutStopsEarly) {
     constexpr size_t kBlockSize = 1024;

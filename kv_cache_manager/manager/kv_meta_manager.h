@@ -1,7 +1,7 @@
 #pragma once
 
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
@@ -152,6 +153,9 @@ private:
                                   const std::string &internal_instance_id,
                                   const std::vector<bool> &success_keys,
                                   const std::vector<SessionItem> &items);
+    ErrorCode DeleteStorageUris(RequestContext *request_context,
+                                const std::string &storage_name,
+                                const std::vector<DataStorageUri> &uris) const;
     ErrorCode DeleteAllocatedLocations(RequestContext *request_context,
                                        const std::vector<SessionItem> &items) const;
 

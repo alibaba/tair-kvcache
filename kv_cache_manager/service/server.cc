@@ -244,7 +244,17 @@ void Server::StartKvMetaRecovery() {
                 return stop_.load(std::memory_order_acquire) ||
                        kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch;
             };
-            const ErrorCode ec = kv_meta_manager_->DoRecover(should_abort);
+            ErrorCode ec = EC_ERROR;
+            try {
+                ec = kv_meta_manager_->DoRecover(should_abort);
+            } catch (const std::exception &) {
+                // KVMeta recovery is an isolated optional side path. A
+                // provider exception must leave its request gate closed, not
+                // terminate the server process or affect fixed-block KV-cache.
+                KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; service remains disabled");
+            } catch (...) {
+                KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled");
+            }
             bool enabled = false;
             if (ec == EC_OK) {
                 // Serialize the final epoch check and gate opening with
