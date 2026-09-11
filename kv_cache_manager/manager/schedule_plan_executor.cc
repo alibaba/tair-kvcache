@@ -324,7 +324,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {
-                        if (task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
+                        if (!task.confirmed_missing_uris.empty() &&
+                            task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
                             continue;
                         }
                         std::string storage_unique_name = uri.GetHostName();
@@ -353,8 +354,12 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
         if (delete_results.size() != storage_uris.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
-            result.error_message = StringUtil::FormatString(
-                "storage delete result size %zu != request size %zu", delete_results.size(), storage_uris.size());
+            result.error_message =
+                StringUtil::FormatString("storage delete result size %zu != request size %zu, instance[%s] storage[%s]",
+                                         delete_results.size(),
+                                         storage_uris.size(),
+                                         task.instance_id.c_str(),
+                                         storage_unique_name.c_str());
             KVCM_LOG_WARN("%s", result.error_message.c_str());
         }
         const auto result_count = std::min(delete_results.size(), storage_uris.size());
@@ -366,6 +371,11 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                     first_failed_index = i;
                 }
                 ++failed_count;
+                KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] uri[%s] ec[%d]",
+                              task.instance_id.c_str(),
+                              storage_unique_name.c_str(),
+                              storage_uris[i].ToUriString().c_str(),
+                              static_cast<int>(delete_results[i]));
             }
         }
         if (failed_count > 0) {
@@ -381,7 +391,6 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (result.error_message.empty()) {
                 result.error_message = failure_message;
             }
-            KVCM_LOG_WARN("%s", failure_message.c_str());
         }
     }
 
@@ -393,7 +402,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         if (delete_meta_ec != ErrorCode::EC_OK || delete_meta_results.size() != batch_cad_tasks.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
             result.error_message =
-                StringUtil::FormatString("location CAD failed, ec: %d, result size %zu != task size %zu",
+                StringUtil::FormatString("location CAD failed, instance[%s] ec: %d, result size %zu != task size %zu",
+                                         task.instance_id.c_str(),
                                          static_cast<int>(delete_meta_ec),
                                          delete_meta_results.size(),
                                          batch_cad_tasks.size());
@@ -404,16 +414,18 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             auto &results = delete_meta_results[block_key_idx];
             if (results.size() != batch_cad_tasks[block_key_idx].size()) {
                 result.status = ErrorCode::EC_PARTIAL_OK;
-                KVCM_LOG_WARN("location CAD result size %zu != task size %zu for block key %ld",
+                KVCM_LOG_WARN("location CAD result size %zu != task size %zu, instance[%s] block key %ld",
                               results.size(),
                               batch_cad_tasks[block_key_idx].size(),
+                              task.instance_id.c_str(),
                               block_keys_to_delete[block_key_idx]);
             }
             const auto location_result_count = std::min(results.size(), batch_cad_tasks[block_key_idx].size());
             for (size_t location_idx = 0; location_idx < location_result_count; location_idx++) {
                 if (results[location_idx] != ErrorCode::EC_OK) {
                     result.status = ErrorCode::EC_PARTIAL_OK;
-                    KVCM_LOG_WARN("Failed to CAD meta key %ld, location: %s, error_code: %d",
+                    KVCM_LOG_WARN("Failed to CAD meta, instance[%s] key %ld, location: %s, error_code: %d",
+                                  task.instance_id.c_str(),
                                   block_keys_to_delete[block_key_idx],
                                   batch_cad_tasks[block_key_idx][location_idx].location_id.c_str(),
                                   static_cast<int>(results[location_idx]));
@@ -421,6 +433,9 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             }
         }
     }
+    // All storage/CAD failures above have detailed diagnostics. Early returns
+    // and worker exceptions keep the default false so callers still log them.
+    result.error_logged = result.status != ErrorCode::EC_OK;
     return result;
 }
 

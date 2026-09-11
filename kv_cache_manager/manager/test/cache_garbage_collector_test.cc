@@ -4,6 +4,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
 #include <shared_mutex>
 #include <stdexcept>
@@ -52,6 +53,15 @@ struct MightExistCall {
     std::vector<DataStorageUri> uris;
     bool fastpath{false};
 };
+
+std::atomic<size_t> gc_action_warn_count{0};
+void CountGcActionWarnings(int level, const char *, int, const char *func, const char *, ...) {
+    if (level == Logger::LEVEL_WARN && std::string(func) == "PollInflightDeletes") {
+        ++gc_action_warn_count;
+    }
+}
+
+std::pair<size_t, std::string> ThrowScanSummaryStub(const std::map<std::string, size_t> &) { throw std::bad_alloc(); }
 
 enum class SubmitMode {
     kReadyOk,
@@ -1023,11 +1033,15 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
     const std::string existing_a_uri = "dummy://storage_a/existing_a?size=1";
     const std::string existing_b_uri = "dummy://storage_a/existing_b?size=1";
     const std::string missing_b_uri = "dummy://storage_b/missing_b?size=1";
+    const std::string orphan_uri = "dummy://storage_a/orphan?size=1";
     might_exist_by_uri[missing_a_uri] = false;
     might_exist_by_uri[missing_b_uri] = false;
 
     CacheLocationMap first_locations;
-    first_locations["old_writing"] = MakeLocation("old_writing", CLS_WRITING, OldCreateTimeUs(config, /*extra_us=*/1));
+    auto orphan =
+        MakeStoredLocation("old_writing", CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {orphan_uri});
+    orphan->set_create_time(OldCreateTimeUs(config, /*extra_us=*/1));
+    first_locations["old_writing"] = orphan;
     first_locations["serving_missing"] = MakeStoredLocation(
         "serving_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_a_uri, existing_a_uri});
     first_locations["serving_existing"] =
@@ -1694,6 +1708,71 @@ TEST_F(CacheGarbageCollectorTest, FuturePartialAndExceptionAreTerminal) {
     EXPECT_TRUE(gc->inflight_deletes_.empty());
     EXPECT_TRUE(gc->pending_locations_.empty());
     EXPECT_EQ(3, scan_calls.size());
+}
+
+TEST_F(CacheGarbageCollectorTest, CompletedActionsWarnOnlyForUnloggedErrorsAndAlwaysRecordResults) {
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    stub_.set(ADDR(LoggerBroker, Log), CountGcActionWarnings);
+    gc_action_warn_count = 0;
+
+    const auto complete_action = [&](const std::string &action_name, PlanExecuteResult result) {
+        std::promise<PlanExecuteResult> promise;
+        auto future = promise.get_future();
+        promise.set_value(std::move(result));
+        const CacheGarbageCollector::PendingLocationKey key{"instance_a", 1, "location"};
+        gc->pending_locations_.insert(key);
+        gc->inflight_deletes_.push_back({
+            .round_id = 1,
+            .instance_id = "instance_a",
+            .action_name = action_name,
+            .target_count = 1,
+            .submitted_at = CacheGarbageCollector::Clock::now(),
+            .pending_locations = {key},
+            .future = std::move(future),
+        });
+        gc->PollInflightDeletes();
+        EXPECT_TRUE(gc->inflight_deletes_.empty());
+        EXPECT_TRUE(gc->pending_locations_.empty());
+        EXPECT_EQ(0, gc->get_cache_gc_inflight_delete_count_metrics());
+    };
+
+    complete_action("physical_delete", {EC_PARTIAL_OK, "storage failure already logged", true});
+    EXPECT_EQ(0u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_PARTIAL_OK, "unlogged partial failure"});
+    EXPECT_EQ(1u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_ERROR, "worker or admission failure"});
+    EXPECT_EQ(2u, gc_action_warn_count.load());
+    complete_action("event_report_metadata", {EC_ERROR, "metadata cleanup failure"});
+    EXPECT_EQ(3u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_OK, ""});
+    EXPECT_EQ(3u, gc_action_warn_count.load());
+    for (const auto &[status, count] :
+         std::vector<std::pair<ErrorCode, size_t>>{{EC_PARTIAL_OK, 2}, {EC_ERROR, 2}, {EC_OK, 1}}) {
+        EXPECT_EQ(count,
+                  metrics_registry_
+                      ->GetCounter("cache_gc.delete_result_count",
+                                   MetricsTags{{"status", std::to_string(static_cast<int>(status))}})
+                      .Get());
+    }
+}
+
+TEST_F(CacheGarbageCollectorTest, ScanSummaryAllocationFailureIsHandledByTick) {
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    stub_.set(ADDR(CacheGarbageCollector, BuildSubmittedLocationSummary), ThrowScanSummaryStub);
+
+    gc->RunOneTick();
+    EXPECT_EQ(1,
+              metrics_registry_->GetCounter("cache_gc.operation_error_count", MetricsTags{{"stage", "tick_exception"}})
+                  .Get());
+    EXPECT_TRUE(gc->round_active_);
+    EXPECT_EQ(0, gc->get_cache_gc_scan_round_count_metrics());
+
+    stub_.reset(ADDR(CacheGarbageCollector, BuildSubmittedLocationSummary));
+    gc->RunOneTick();
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
 }
 
 TEST_F(CacheGarbageCollectorTest, SnapshotPreservesInstanceIsolationAndCooldown) {

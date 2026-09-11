@@ -44,6 +44,9 @@ struct CacheMetaDelRequest {
 struct PlanExecuteResult {
     ErrorCode status;
     std::string error_message;
+    // True only when every failure in this result has already been logged.
+    // Callers can retain result metrics without repeating the diagnostics.
+    bool error_logged{false};
 };
 
 struct AsyncDeleteSubmitResult {

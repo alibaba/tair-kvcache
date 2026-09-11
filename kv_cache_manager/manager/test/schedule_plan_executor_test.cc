@@ -1,8 +1,11 @@
 #include <atomic>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -28,6 +31,37 @@ std::atomic<bool> sync_completed{false};
 std::atomic<bool> release_sync{true};
 std::atomic<std::int64_t> sync_delay_ms{0};
 std::atomic<std::size_t> sync_thread_hash{0};
+
+// Only the deletion worker writes these entries; tests read them after its Future completes.
+std::vector<std::string> physical_delete_warnings;
+void CapturePhysicalDeleteWarnings(int level, const char *, int, const char *func, const char *format, ...) {
+    if (level != Logger::LEVEL_WARN || std::string(func) != "DoLocationDelTask") {
+        return;
+    }
+    char message[4096];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    physical_delete_warnings.emplace_back(message);
+}
+
+Stub *cas_refresh_stub = nullptr;
+std::string location_to_refresh_during_cas;
+ErrorCode RefreshLocationBeforeCas(void *obj,
+                                   RequestContext *context,
+                                   const KeyVector &keys,
+                                   const std::vector<std::vector<MetaSearcher::LocationCASTask>> &tasks,
+                                   std::vector<std::vector<ErrorCode>> &results,
+                                   bool authoritative_read) {
+    cas_refresh_stub->reset(ADDR(MetaSearcher, BatchCASLocationStatus));
+    auto *searcher = static_cast<MetaSearcher *>(obj);
+    std::vector<std::vector<ErrorCode>> update_results;
+    EXPECT_EQ(EC_OK,
+              searcher->BatchUpdateLocationStatus(
+                  context, {keys.front()}, {{{location_to_refresh_during_cas, CLS_WRITING}}}, update_results));
+    return searcher->BatchCASLocationStatus(context, keys, tasks, results, authoritative_read);
+}
 
 bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
     (void)obj;
@@ -851,14 +885,14 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
     EXPECT_EQ(1u, delete_calls.load());
 }
 
-TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndAggregatesFailures) {
+TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndLogsRealFailures) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
 
     class RecordingDeleteBackend : public DataStorageBackend {
     public:
-        RecordingDeleteBackend() : DataStorageBackend(nullptr) {
+        explicit RecordingDeleteBackend(const std::string &name = "gc_delete_backend") : DataStorageBackend(nullptr) {
             config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-            config_.set_global_unique_name("gc_delete_backend");
+            config_.set_global_unique_name(name);
             SetOpen(true);
             SetAvailable(true);
         }
@@ -875,7 +909,15 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
         std::vector<ErrorCode>
         Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
             delete_batches.push_back(uris);
-            return std::vector<ErrorCode>(uris.size(), delete_result);
+            if (throw_on_delete) {
+                throw std::runtime_error("injected storage delete exception");
+            }
+            std::vector<ErrorCode> results;
+            for (const auto &uri : uris) {
+                const auto it = delete_results_by_uri.find(uri.ToUriString());
+                results.push_back(it == delete_results_by_uri.end() ? delete_result : it->second);
+            }
+            return results;
         }
         std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
             return std::vector<bool>(uris.size(), true);
@@ -888,30 +930,44 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
         }
 
         ErrorCode delete_result{EC_OK};
+        bool throw_on_delete{false};
+        std::map<std::string, ErrorCode> delete_results_by_uri;
         std::vector<std::vector<DataStorageUri>> delete_batches;
 
     private:
         StorageConfig config_;
     };
 
+    Stub log_stub;
+    physical_delete_warnings.clear();
+    log_stub.set(ADDR(LoggerBroker, Log), CapturePhysicalDeleteWarnings);
     auto backend = std::make_shared<RecordingDeleteBackend>();
     data_storage_manager_->storage_map_["gc_delete_backend"] = backend;
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
     RequestContext context("gc_physical_delete_test");
     SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
 
-    const auto add_location = [&](int64_t block_key, const std::vector<std::string> &uris) {
-        std::vector<LocationSpec> specs;
-        for (size_t i = 0; i < uris.size(); ++i) {
-            specs.emplace_back("tp" + std::to_string(i), uris[i]);
-        }
-        const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY, specs.size(), specs);
-        std::vector<std::string> location_ids;
-        EXPECT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, &context, {block_key}, {location}, location_ids));
-        EXPECT_EQ(1u, location_ids.size());
-        return location_ids.empty() ? std::string{} : location_ids.front();
-    };
+    const auto add_location =
+        [&](int64_t block_key, const std::vector<std::string> &uris, CacheLocationStatus status = CLS_SERVING) {
+            std::vector<LocationSpec> specs;
+            for (size_t i = 0; i < uris.size(); ++i) {
+                specs.emplace_back("tp" + std::to_string(i), uris[i]);
+            }
+            const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+                DataStorageType::DATA_STORAGE_TYPE_DUMMY, specs.size(), specs);
+            std::vector<std::string> location_ids;
+            EXPECT_EQ(EC_OK, BatchAddLocationForTest(&meta_searcher, &context, {block_key}, {location}, location_ids));
+            EXPECT_EQ(1u, location_ids.size());
+            if (location_ids.empty()) {
+                return std::string{};
+            }
+            // BatchAddLocation always initializes metadata as WRITING.
+            std::vector<std::vector<ErrorCode>> update_results;
+            EXPECT_EQ(EC_OK,
+                      meta_searcher.BatchUpdateLocationStatus(
+                          &context, {block_key}, {{{location_ids.front(), status}}}, update_results));
+            return location_ids.front();
+        };
     const auto expect_location_deleted = [&](int64_t block_key) {
         std::vector<CacheLocationMap> locations;
         BlockMask empty_mask;
@@ -935,7 +991,81 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     ASSERT_EQ(1u, backend->delete_batches.size());
     ASSERT_EQ(1u, backend->delete_batches.front().size());
     EXPECT_EQ(existing_uri, backend->delete_batches.front().front().ToUriString());
+    EXPECT_FALSE(mixed_result.error_logged);
+    EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(mixed_block_key);
+
+    // When every spec is absent, metadata is still removed without calling Delete.
+    const int64_t missing_block_key = 713;
+    const std::string missing_location_id = add_location(missing_block_key, {missing_uri});
+    const auto missing_result = executor
+                                    .Submit(CacheLocationDelRequest{
+                                        .instance_id = kTestInstanceName,
+                                        .block_keys = {missing_block_key},
+                                        .location_ids = {{missing_location_id}},
+                                        .confirmed_missing_uris = {missing_uri},
+                                    })
+                                    .get();
+    EXPECT_EQ(EC_OK, missing_result.status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_TRUE(physical_delete_warnings.empty());
+    expect_location_deleted(missing_block_key);
+
+    // A mixed GC batch must still physically delete orphan WRITING data.
+    const int64_t orphan_block_key = 714;
+    const std::string orphan_uri = "dummy://gc_delete_backend/orphan?size=1";
+    const std::string orphan_location_id = add_location(orphan_block_key, {orphan_uri}, CLS_WRITING);
+    const std::string missing_sibling_id = add_location(orphan_block_key, {missing_uri});
+    auto orphan_submission = executor.SubmitAsync(CacheLocationDelRequest{
+        .instance_id = kTestInstanceName,
+        .block_keys = {orphan_block_key},
+        .location_ids = {{orphan_location_id, missing_sibling_id}},
+        .authoritative_read = true,
+        .confirmed_missing_uris = {missing_uri},
+    });
+    ASSERT_TRUE(orphan_submission.accepted);
+    EXPECT_EQ(EC_OK, orphan_submission.future.get().status);
+    ASSERT_EQ(2u, backend->delete_batches.size());
+    ASSERT_EQ(1u, backend->delete_batches.back().size());
+    EXPECT_EQ(orphan_uri, backend->delete_batches.back().front().ToUriString());
+    expect_location_deleted(orphan_block_key);
+
+    // Refresh one Location between the worker's read and CAS. Only the unchanged
+    // Location is admitted; its existing spec still needs Delete.
+    const int64_t partial_block_key = 715;
+    const std::string refreshed_uri = "dummy://gc_delete_backend/refreshed?size=1";
+    const std::string unchanged_id = add_location(partial_block_key, {missing_uri, existing_uri});
+    const std::string refreshed_id = add_location(partial_block_key, {refreshed_uri});
+    CacheLocationMapVector before;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {partial_block_key}, empty_mask, before));
+    ASSERT_EQ(1u, before.size());
+    CacheLocationDelRequest partial_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {partial_block_key},
+        .location_ids = {{unchanged_id, refreshed_id}},
+        .expected_location_values = {{before.front().at(unchanged_id)->ToJsonString(),
+                                      before.front().at(refreshed_id)->ToJsonString()}},
+        .authoritative_read = true,
+        .confirmed_missing_uris = {missing_uri, refreshed_uri},
+    };
+    Stub cas_stub;
+    cas_refresh_stub = &cas_stub;
+    location_to_refresh_during_cas = refreshed_id;
+    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    auto partial_submission = executor.SubmitAsync(partial_request);
+    ASSERT_TRUE(partial_submission.accepted);
+    EXPECT_EQ(EC_OK, partial_submission.future.get().status);
+    cas_refresh_stub = nullptr;
+    ASSERT_EQ(3u, backend->delete_batches.size());
+    ASSERT_EQ(1u, backend->delete_batches.back().size());
+    EXPECT_EQ(existing_uri, backend->delete_batches.back().front().ToUriString());
+    CacheLocationMapVector after;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {partial_block_key}, empty_mask, after));
+    ASSERT_EQ(1u, after.size());
+    ASSERT_EQ(1u, after.front().size());
+    EXPECT_EQ(CLS_WRITING, after.front().at(refreshed_id)->status());
+    EXPECT_TRUE(physical_delete_warnings.empty());
 
     backend->delete_result = EC_NOENT;
     const std::string noent_uri = "dummy://gc_delete_backend/already_deleted?size=1";
@@ -949,12 +1079,20 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_OK, noent_result.status) << noent_result.error_message;
+    EXPECT_FALSE(noent_result.error_logged);
+    EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(noent_block_key);
 
     backend->delete_result = EC_ERROR;
     const std::string error_uri = "dummy://gc_delete_backend/error?size=1";
+    const std::string timeout_uri = "dummy://gc_delete_backend/timeout?size=1";
+    const std::string other_uri = "dummy://gc_other_backend/error?size=1";
+    backend->delete_results_by_uri[timeout_uri] = EC_TIMEOUT;
+    auto other_backend = std::make_shared<RecordingDeleteBackend>("gc_other_backend");
+    other_backend->delete_result = EC_ERROR;
+    data_storage_manager_->storage_map_["gc_other_backend"] = other_backend;
     const int64_t error_block_key = 712;
-    const std::string error_location_id = add_location(error_block_key, {error_uri});
+    const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri});
     const auto error_result = executor
                                   .Submit(CacheLocationDelRequest{
                                       .instance_id = kTestInstanceName,
@@ -963,8 +1101,43 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_PARTIAL_OK, error_result.status);
-    EXPECT_NE(std::string::npos, error_result.error_message.find("failed[1]"));
+    EXPECT_TRUE(error_result.error_logged);
+    EXPECT_NE(std::string::npos, error_result.error_message.find("failed[2]"));
+    EXPECT_THAT(physical_delete_warnings,
+                UnorderedElementsAre(
+                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_delete_backend] uri[" +
+                        error_uri + "] ec[" + std::to_string(EC_ERROR) + "]",
+                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_delete_backend] uri[" +
+                        timeout_uri + "] ec[" + std::to_string(EC_TIMEOUT) + "]",
+                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_other_backend] uri[" +
+                        other_uri + "] ec[" + std::to_string(EC_ERROR) + "]"));
     expect_location_deleted(error_block_key);
+
+    // Worker/admission errors have not been diagnosed by DoLocationDelTask.
+    // They must remain visible to GC even though ordinary Delete errors are logged.
+    backend->throw_on_delete = true;
+    const int64_t exception_block_key = 716;
+    const std::string exception_location_id = add_location(exception_block_key, {existing_uri});
+    auto exception_submission = executor.SubmitAsync(CacheLocationDelRequest{
+        .instance_id = kTestInstanceName,
+        .block_keys = {exception_block_key},
+        .location_ids = {{exception_location_id}},
+    });
+    ASSERT_TRUE(exception_submission.accepted);
+    const auto exception_result = exception_submission.future.get();
+    EXPECT_EQ(EC_ERROR, exception_result.status);
+    EXPECT_FALSE(exception_result.error_logged);
+    EXPECT_THAT(exception_result.error_message, HasSubstr("injected storage delete exception"));
+    EXPECT_EQ(3u, physical_delete_warnings.size());
+    const auto admission_error = executor
+                                     .Submit(CacheLocationDelRequest{
+                                         .instance_id = "missing_instance",
+                                         .block_keys = {1},
+                                         .location_ids = {{"missing_location"}},
+                                     })
+                                     .get();
+    EXPECT_EQ(EC_NOENT, admission_error.status);
+    EXPECT_FALSE(admission_error.error_logged);
 }
 
 TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRevalidatesTokenOnWorker) {

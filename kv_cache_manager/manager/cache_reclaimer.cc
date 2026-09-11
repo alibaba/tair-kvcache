@@ -2205,14 +2205,15 @@ void CacheReclaimer::HandleDelRes() noexcept {
             bool terminal = false;
             ErrorCode result_code = ErrorCode::EC_ERROR;
             try {
-                const auto [ec, err_msg] = it->fut_.get();
+                const auto result = it->fut_.get();
+                const auto ec = result.status;
                 terminal = true;
                 result_code = ec;
                 if (ec != ErrorCode::EC_OK) {
                     LOG_WITH_ID(WARN,
                                 "reclaim request execute failed, error_code: [%d], error message: [%s]",
                                 static_cast<std::int32_t>(ec),
-                                err_msg.c_str());
+                                result.error_message.c_str());
                 } else {
                     METRICS_(cache_reclaimer, block_del_count) += it->blk_count_;
                     METRICS_(cache_reclaimer, location_del_count) += it->loc_count_;

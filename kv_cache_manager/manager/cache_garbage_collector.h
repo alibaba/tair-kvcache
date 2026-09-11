@@ -168,7 +168,7 @@ private:
     void CompleteRound() noexcept;
     static std::pair<size_t, std::string>
     BuildSubmittedLocationSummary(const std::map<std::string, size_t> &reason_counts);
-    void LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept;
+    void LogInstanceScanSummary(const InstanceScanEntry &entry) const;
     void AdvanceInstance(bool completed_current) noexcept;
     ScanDeleteActions
     BuildDeleteActions(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);

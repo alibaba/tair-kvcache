@@ -629,7 +629,7 @@ void CacheGarbageCollector::PollInflightDeletes() noexcept {
             }
             const PlanExecuteResult result = it->future.get();
             RecordDeleteResult(std::to_string(static_cast<int>(result.status)));
-            if (result.status != EC_OK) {
+            if (result.status != EC_OK && !result.error_logged) {
                 KVCM_LOG_WARN(
                     "cache gc action completed with status[%d], round[%lu] instance[%s] action[%s] targets[%zu] "
                     "error[%s]",
@@ -762,7 +762,7 @@ CacheGarbageCollector::BuildSubmittedLocationSummary(const std::map<std::string,
     return {submitted_location_count, reason_summary};
 }
 
-void CacheGarbageCollector::LogInstanceScanSummary(const InstanceScanEntry &entry) const noexcept {
+void CacheGarbageCollector::LogInstanceScanSummary(const InstanceScanEntry &entry) const {
     const auto [submitted_location_count, reason_summary] =
         BuildSubmittedLocationSummary(entry.submitted_location_counts);
     KVCM_LOG_INFO(
