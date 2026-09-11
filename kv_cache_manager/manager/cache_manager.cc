@@ -1349,16 +1349,18 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     }
     std::vector<KeyType> success_batch_keys;
     std::vector<std::string> success_batch_location_ids;
-    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> success_batch_update_tasks;
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> success_batch_publish_tasks;
     CacheLocationDelRequest failed_del_request{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
 
     for (size_t block_key_idx = 0; block_key_idx < location_info.keys.size(); block_key_idx++) {
         if (IsIndexInMaskRange(success_block_mask, block_key_idx)) {
-            // success
+            // success：只允许把本次写会话自己创建的 WRITING location 发布为 SERVING，
+            // 迟到的 Finish 不能把已经被逻辑删除（DELETING）的 location 复活。
             success_batch_keys.push_back(location_info.keys[block_key_idx]);
             success_batch_location_ids.push_back(location_info.location_ids[block_key_idx]);
-            success_batch_update_tasks.push_back(
-                {{location_info.location_ids[block_key_idx], CacheLocationStatus::CLS_SERVING}});
+            success_batch_publish_tasks.push_back({{location_info.location_ids[block_key_idx],
+                                                    CacheLocationStatus::CLS_WRITING,
+                                                    CacheLocationStatus::CLS_SERVING}});
         } else {
             // failed
             failed_del_request.block_keys.push_back(location_info.keys[block_key_idx]);
@@ -1372,11 +1374,38 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchUpdateLocation);
     std::vector<std::vector<ErrorCode>> out_batch_results;
     if (!success_batch_keys.empty()) {
-        ec = meta_searcher->BatchUpdateLocationStatus(
-            request_context, success_batch_keys, success_batch_update_tasks, out_batch_results);
+        ec = meta_searcher->BatchCASLocationStatus(
+            request_context, success_batch_keys, success_batch_publish_tasks, out_batch_results);
         if (ec != EC_OK) {
             std::string detail_ec_str = MetaSearcher::BatchErrorCodeToStr(out_batch_results);
-            PREFIX_LOG(WARN, "update location status failed, ec: %d, ec_batches: %s", ec, detail_ec_str.c_str());
+            PREFIX_LOG(WARN, "publish location status failed, ec: %d, ec_batches: %s", ec, detail_ec_str.c_str());
+        }
+        // 聚合 ec 只表示 RMW 机制本身是否跑完；CAS 冲突（EC_MISMATCH）留在 per-location 结果里
+        // 且不会抬高聚合 ec，因此必须按下标对齐逐 location 判定发布结果，否则迟到的 Finish 会在
+        // 没有真正改状态的情况下静默返回成功。NOENT 与既有行为一致，按幂等成功处理（CAS 不会重建）。
+        ErrorCode first_publish_ec = EC_OK;
+        size_t publish_failed_count = 0;
+        for (size_t i = 0; i < success_batch_keys.size(); ++i) {
+            const ErrorCode location_ec = (i < out_batch_results.size() && !out_batch_results[i].empty())
+                                              ? out_batch_results[i][0]
+                                              : ErrorCode::EC_ERROR;
+            if (location_ec == EC_OK || location_ec == ErrorCode::EC_NOENT) {
+                continue;
+            }
+            ++publish_failed_count;
+            if (first_publish_ec == EC_OK) {
+                first_publish_ec = location_ec;
+            }
+        }
+        if (ec == EC_OK && publish_failed_count > 0) {
+            // 外层 transport/storage 失败优先保留；否则全部失败上报首个真实错误码，部分失败上报 PARTIAL_OK。
+            ec = publish_failed_count == success_batch_keys.size() ? first_publish_ec : ErrorCode::EC_PARTIAL_OK;
+            PREFIX_LOG(WARN,
+                       "publish location status rejected, failed: %zu/%zu, first ec: %d, ec: %d",
+                       publish_failed_count,
+                       success_batch_keys.size(),
+                       first_publish_ec,
+                       ec);
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
@@ -1476,7 +1505,12 @@ ErrorCode CacheManager::RemoveCache(RequestContext *request_context,
         auto gen_keys = GenKeyVector(tokens, block_size);
         request.block_keys = std::move(gen_keys);
     }
-    reclaimer_task_supervisor_->Submit(trace_id, std::move(request));
+    // Only the synchronous logical invalidation is awaited here: EC_OK means no
+    // requested location can be served any more. The physical reclamation of the
+    // admitted subset keeps running asynchronously under the supervisor, also
+    // when part of the batch could not be invalidated.
+    const ErrorCode admit_ec = reclaimer_task_supervisor_->SubmitLogicalDelete(trace_id, std::move(request));
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, admit_ec, "remove cache failed: logical invalidation incomplete");
     return EC_OK;
 }
 

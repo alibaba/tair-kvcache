@@ -199,6 +199,39 @@ public:
         control_cv_.notify_all();
     }
 
+    // Blocks *after* the location snapshot has been copied out, instead of
+    // before the read reaches the backend. A before-read gate lets a concurrent
+    // publisher finish first, so the gated reader observes the published state
+    // and the read-WRITING -> publish-SERVING -> CAS-MISMATCH race is never
+    // exercised. Only armed on the arming thread, and only on the non-RMW
+    // CacheLocationMapVector read: MetaIndexer::GetLocations holds no shard
+    // lock there, so a publisher can make progress while this one waits.
+    void BlockAfterNextLocationSnapshotOnCurrentThread() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        block_after_next_snapshot_ = true;
+        snapshot_thread_ = std::this_thread::get_id();
+        snapshot_entered_ = false;
+        release_snapshot_ = false;
+        captured_snapshot_.clear();
+    }
+
+    bool WaitUntilLocationSnapshotEntered(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(control_mutex_);
+        return control_cv_.wait_for(lock, timeout, [&] { return snapshot_entered_; });
+    }
+
+    void ReleaseLocationSnapshot() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        release_snapshot_ = true;
+        control_cv_.notify_all();
+    }
+
+    // location_id -> status actually handed to the admission path.
+    std::map<std::string, CacheLocationStatus> CapturedLocationSnapshot() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return captured_snapshot_;
+    }
+
     void BlockNextUpsert() {
         std::lock_guard<std::mutex> lock(control_mutex_);
         block_next_upsert_ = true;
@@ -220,6 +253,11 @@ public:
     void FailKeyOnNextUpsert(int64_t key) {
         std::lock_guard<std::mutex> lock(control_mutex_);
         fail_key_on_next_upsert_ = key;
+    }
+
+    void FailKeyOnNextLocationRead(int64_t key) {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        fail_key_on_next_location_read_ = key;
     }
 
     size_t GetSyncCallCount() {
@@ -280,7 +318,19 @@ public:
                                         const KeyTypeVec &keys,
                                         CacheLocationMapVector &out_locations) noexcept override {
         MaybeBlockLocationRead();
-        return MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+        auto result = MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (fail_key_on_next_location_read_ == keys[i]) {
+                    result[i] = EC_ERROR;
+                    out_locations[i].clear(); // Preserve the valid result shape.
+                }
+            }
+            fail_key_on_next_location_read_.reset();
+        }
+        MaybeBlockAfterLocationSnapshot(out_locations);
+        return result;
     }
 
     std::vector<ErrorCode> GetLocationValues(RequestContext *request_context,
@@ -320,6 +370,27 @@ private:
         control_cv_.wait(lock, [&] { return release_location_read_; });
     }
 
+    void MaybeBlockAfterLocationSnapshot(const CacheLocationMapVector &out_locations) {
+        std::unique_lock<std::mutex> lock(control_mutex_);
+        if (!block_after_next_snapshot_ || snapshot_thread_ != std::this_thread::get_id()) {
+            return;
+        }
+        block_after_next_snapshot_ = false;
+        snapshot_thread_ = {};
+        captured_snapshot_.clear();
+        for (const auto &location_map : out_locations) {
+            for (const auto &location_kv : location_map) {
+                if (!location_kv.second) {
+                    continue;
+                }
+                captured_snapshot_.emplace(location_kv.second->id(), location_kv.second->status());
+            }
+        }
+        snapshot_entered_ = true;
+        control_cv_.notify_all();
+        control_cv_.wait(lock, [&] { return release_snapshot_; });
+    }
+
     void MaybeBlockUpsert() {
         std::unique_lock<std::mutex> lock(control_mutex_);
         if (!block_next_upsert_) {
@@ -340,7 +411,13 @@ private:
     std::thread::id blocked_location_read_thread_;
     bool location_read_entered_ = false;
     bool release_location_read_ = false;
+    bool block_after_next_snapshot_ = false;
+    std::thread::id snapshot_thread_;
+    bool snapshot_entered_ = false;
+    bool release_snapshot_ = false;
+    std::map<std::string, CacheLocationStatus> captured_snapshot_;
     std::optional<int64_t> fail_key_on_next_upsert_;
+    std::optional<int64_t> fail_key_on_next_location_read_;
     size_t sync_call_count_ = 0;
 };
 
@@ -385,6 +462,64 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     std::atomic<size_t> deleted_uri_count_{0};
+};
+
+// Occupies every SchedulePlanExecutor worker so a queued physical delete cannot
+// start. Proving "the logical ACK does not wait for physical deletion" needs a
+// gate: a sleep only shows the deletion was slow, never that it was still queued
+// when the caller was already acknowledged. Held through a shared_ptr so the
+// blocked tasks keep the gate alive past the end of the test scope.
+class SchedulerWorkerGate {
+public:
+    static void
+    Occupy(const std::shared_ptr<SchedulerWorkerGate> &gate, SchedulePlanExecutor *executor, size_t worker_count) {
+        for (size_t i = 0; i < worker_count; ++i) {
+            executor->SubmitTask([gate]() { gate->Enter(); });
+        }
+    }
+
+    void Enter() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++entered_;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_; });
+    }
+
+    bool WaitUntilOccupied(size_t worker_count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return entered_ >= worker_count; });
+    }
+
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t entered_ = 0;
+    bool released_ = false;
+};
+
+// Releases the gate on every exit path, including a failed ASSERT_*: leaving the
+// workers blocked would deadlock the executor's Stop() during fixture teardown.
+class ScopedWorkerGateRelease {
+public:
+    explicit ScopedWorkerGateRelease(std::shared_ptr<SchedulerWorkerGate> gate) : gate_(std::move(gate)) {}
+    ~ScopedWorkerGateRelease() {
+        if (gate_) {
+            gate_->Release();
+        }
+    }
+    // Hands the responsibility back to the caller: used when the gate must stay
+    // closed past this scope but every early-exit path inside it still has to
+    // release.
+    void Disarm() { gate_.reset(); }
+
+private:
+    std::shared_ptr<SchedulerWorkerGate> gate_;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -2218,6 +2353,694 @@ TEST_F(CacheManagerTest, TestRemoveCache) {
                       meta.at("status"));
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCacheDoesNotReviveLogicallyDeletedLocation) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97001};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    // Submit performs the logical status transition synchronously. Keep physical
+    // deletion queued so this exercises an existing DELETING location, not NOENT.
+    CacheMetaDelRequest delete_request{"test_instance", keys, std::chrono::hours(1)};
+    auto delete_future = cache_manager_->schedule_plan_executor_->Submit(delete_request);
+    ASSERT_TRUE(delete_future.valid());
+    ASSERT_EQ(std::future_status::timeout, delete_future.wait_for(std::chrono::seconds(0)));
+    {
+        auto [meta_ec, meta_info] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+        ASSERT_EQ(EC_OK, meta_ec);
+        ASSERT_EQ(1u, meta_info.metas().size());
+        std::map<std::string, std::string> meta;
+        ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+        ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CLS_DELETING), meta.at("status"));
+    }
+
+    EXPECT_NE(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+    {
+        auto [meta_ec, meta_info] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+        ASSERT_EQ(EC_OK, meta_ec);
+        ASSERT_EQ(1u, meta_info.metas().size());
+        std::map<std::string, std::string> meta;
+        ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+        EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_DELETING), meta.at("status"));
+    }
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(0u, locations.cache_locations_view().size());
+    // Stop cancels the delayed physical task; teardown never waits for its delay.
+    cache_manager_->schedule_plan_executor_->Stop();
+}
+
+TEST_F(CacheManagerTest, TestRemoveCacheRejectsUnknownInstance) {
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    EXPECT_NE(
+        EC_OK,
+        cache_manager_->RemoveCache(request_context_.get(), "unknown_instance", KeyVector{97002}, {}, empty_mask));
+}
+
+TEST_F(CacheManagerTest, TestRemoveCacheRejectsStoppedExecutor) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97003};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    cache_manager_->schedule_plan_executor_->Stop();
+    EXPECT_NE(EC_OK, cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask));
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_SERVING), meta.at("status"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveCacheRejectsReadError) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto *backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, backend);
+    const KeyVector keys{97021};
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+    backend->FailKeyOnNextLocationRead(keys.back());
+    EXPECT_NE(EC_OK,
+              cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, BlockMask{size_t{0}}));
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                  "test_instance",
+                                                                  CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                  KeyVector{keys.back()},
+                                                                  {},
+                                                                  BlockMask{size_t{0}},
+                                                                  0,
+                                                                  {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(1u, locations.cache_locations_view().size());
+}
+
+TEST_F(CacheManagerTest, TestRemoveCacheRejectsPartialReadError) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto *backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, backend);
+    const KeyVector keys{97022, 97023};
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+    backend->FailKeyOnNextLocationRead(keys.back());
+    EXPECT_NE(EC_OK,
+              cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, BlockMask{size_t{0}}));
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                  "test_instance",
+                                                                  CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                  KeyVector{keys.back()},
+                                                                  {},
+                                                                  BlockMask{size_t{0}},
+                                                                  0,
+                                                                  {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(1u, locations.cache_locations_view().size());
+}
+
+TEST_F(CacheManagerTest, TestRemoveCacheReportsPartialLogicalDeleteFailure) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    const KeyVector keys{97004, 97005};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    meta_backend->FailKeyOnNextUpsert(keys.back());
+    const auto remove_ec = cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask);
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(keys.size(), meta_info.metas().size());
+    std::map<std::string, std::string> admitted_meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], admitted_meta));
+    EXPECT_TRUE(admitted_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_DELETING) ||
+                admitted_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_NOT_FOUND));
+    std::map<std::string, std::string> failed_meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[1], failed_meta));
+    const bool failed_key_invalidated =
+        failed_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_DELETING) ||
+        failed_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_NOT_FOUND);
+    // A bounded retry may recover the injected failure. Success is honest only
+    // when every requested key is unavailable for reuse at the time of return.
+    if (remove_ec == EC_OK) {
+        EXPECT_TRUE(failed_key_invalidated);
+    } else {
+        EXPECT_TRUE(failed_key_invalidated ||
+                    failed_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_SERVING));
+    }
+}
+
+// 逻辑失效对"本来就查不到"的 key 必须是诚实的成功：没有任何 location 需要作废，
+// 重复调用同样成功。这条守住"honest admission"不会退化成对缺失 key 报错。
+TEST_F(CacheManagerTest, TestRemoveCacheOnAbsentKeysIsIdempotent) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97101, 97102};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask));
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask));
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(keys.size(), meta_info.metas().size());
+    for (const auto &meta_json : meta_info.metas()) {
+        std::map<std::string, std::string> meta;
+        ASSERT_TRUE(Jsonizable::FromJsonString(meta_json, meta));
+        EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_NOT_FOUND), meta.at("status"));
+    }
+}
+
+// 第二次失效落在已经 CLS_DELETING（物理回收由既有 GC 拥有）或已经消失的 location 上，
+// 属于"已经不可复用"，必须继续返回 EC_OK，而不是把既有 GC 的所有权当成失败。
+TEST_F(CacheManagerTest, TestRemoveCacheRepeatedInvalidationIsIdempotent) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97103};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask));
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask));
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+    EXPECT_NE(CacheLocation::CacheLocationStatusToString(CLS_SERVING), meta.at("status"));
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(0u, locations.cache_locations_view().size());
+}
+
+// 读到 CLS_WRITING 的快照后，并发 Finish 把 location 发布成 CLS_SERVING，
+// 失效的 CAS(WRITING->DELETING) 因此 per-location EC_MISMATCH。
+// BatchCASLocationStatus 的聚合 ec 在这种冲突下仍是 EC_OK，
+// 所以只看聚合值就会返回"假成功"：block 还在 SERVING、仍可被复用。
+// 允许有界重试收敛到"不再 SERVING"，但绝不允许 EC_OK + 仍然 SERVING。
+TEST_F(CacheManagerTest, TestRemoveCacheDoesNotFalselySucceedWhenPublishRacesInvalidation) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    const KeyVector keys{97104};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    // 逻辑失效的准入在调用线程上同步完成，因此把 gate 绑在当前线程；而且必须拦在
+    // GetLocations **返回之后**：拦在读之前只会让 publisher 先跑完，RemoveCache
+    // 读到的快照就是 SERVING，压根走不到 CAS(WRITING->DELETING) 的 MISMATCH。
+    meta_backend->BlockAfterNextLocationSnapshotOnCurrentThread();
+    ErrorCode finish_ec = EC_UNKNOWN;
+    std::string status_seen_by_publisher;
+    std::thread publisher([&]() {
+        EXPECT_TRUE(meta_backend->WaitUntilLocationSnapshotEntered(std::chrono::seconds(10)));
+        finish_ec = cache_manager_->FinishWriteCache(
+            request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()});
+        // 在放行 Remove 之前确认并发状态确实已经是 SERVING。
+        auto [publish_meta_ec, publish_meta_info] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+        std::map<std::string, std::string> published_meta;
+        if (publish_meta_ec == EC_OK && publish_meta_info.metas().size() == 1 &&
+            Jsonizable::FromJsonString(publish_meta_info.metas()[0], published_meta)) {
+            status_seen_by_publisher = published_meta["status"];
+        }
+        meta_backend->ReleaseLocationSnapshot();
+    });
+    const ErrorCode remove_ec =
+        cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask);
+    publisher.join();
+    ASSERT_EQ(EC_OK, finish_ec);
+
+    // 只有这两条同时成立，本用例才真正复现了竞态：Remove 拿到的是 WRITING 快照，
+    // 而它继续做 CAS 时 location 已经被并发发布成 SERVING。
+    const auto captured = meta_backend->CapturedLocationSnapshot();
+    ASSERT_FALSE(captured.empty()) << "snapshot gate never fired: the race was not exercised";
+    for (const auto &location_kv : captured) {
+        EXPECT_EQ(CLS_WRITING, location_kv.second)
+            << "RemoveCache should have captured a WRITING snapshot, location " << location_kv.first;
+    }
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_SERVING), status_seen_by_publisher);
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+    const bool still_servable = meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_SERVING);
+    if (remove_ec == EC_OK) {
+        EXPECT_FALSE(still_servable) << "RemoveCache returned EC_OK while the location is still SERVING";
+    } else {
+        EXPECT_NE(EC_OK, remove_ec);
+    }
+}
+
+// 逻辑失效 ACK 不等物理删除：占满全部 worker 后 RemoveCache 仍必须同步返回，
+// 此时 location 已经是 CLS_DELETING（逻辑失效已持久化），而物理回收（CAD 到
+// CLS_NOT_FOUND）还排在队列里没被执行。放开 gate 后物理回收才推进。
+TEST_F(CacheManagerTest, TestRemoveCacheAcknowledgesBeforePhysicalDeletion) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97105};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    auto *executor = cache_manager_->schedule_plan_executor_.get();
+    ASSERT_NE(nullptr, executor);
+    const size_t worker_count = executor->workers_.size();
+    ASSERT_LT(0u, worker_count);
+    auto gate = std::make_shared<SchedulerWorkerGate>();
+    SchedulerWorkerGate::Occupy(gate, executor, worker_count);
+    {
+        ScopedWorkerGateRelease occupy_guard(gate);
+        ASSERT_TRUE(gate->WaitUntilOccupied(worker_count, std::chrono::seconds(10)));
+        occupy_guard.Disarm();
+    }
+
+    // RemoveCache 必须跑在别的线程上：一旦回归成"同步等物理删除完成"，测试线程会
+    // 永远卡死，RAII 也就没机会放开 gate。析构是声明的逆序，所以放 gate 的守卫要
+    // 声明在 future **之后** —— 任何 ASSERT 提前返回时都先放 gate、再析构（会
+    // join 的）future。
+    auto remove_context = std::make_shared<RequestContext>("remove_ack_test");
+    auto remove_future = std::async(std::launch::async, [&]() {
+        return cache_manager_->RemoveCache(remove_context.get(), "test_instance", keys, {}, empty_mask);
+    });
+    ScopedWorkerGateRelease gate_release(gate);
+
+    ASSERT_EQ(std::future_status::ready, remove_future.wait_for(std::chrono::seconds(10)))
+        << "RemoveCache did not acknowledge while every worker was blocked";
+    EXPECT_EQ(EC_OK, remove_future.get());
+    {
+        auto [meta_ec, meta_info] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+        ASSERT_EQ(EC_OK, meta_ec);
+        ASSERT_EQ(1u, meta_info.metas().size());
+        std::map<std::string, std::string> meta;
+        ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+        // 物理回收一个 worker 都拿不到，此刻只可能停在逻辑失效状态。
+        EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_DELETING), meta.at("status"));
+    }
+    // 逻辑失效已经生效：即使物理回收还没跑，block 也不能再被复用。
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(0u, locations.cache_locations_view().size());
+
+    gate->Release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool physically_deleted = false;
+    while (!physically_deleted && std::chrono::steady_clock::now() < deadline) {
+        auto [meta_ec, meta_info] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+        std::map<std::string, std::string> meta;
+        if (meta_ec == EC_OK && meta_info.metas().size() == 1 &&
+            Jsonizable::FromJsonString(meta_info.metas()[0], meta) &&
+            meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_NOT_FOUND)) {
+            physically_deleted = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(physically_deleted);
+}
+
+// 部分准入：一个 key 的逻辑失效写入失败，另一个成功。成功的子集必须继续被
+// 物理调度（不能因为同批的另一个 slot 失败就被搁置），同时返回值必须诚实。
+TEST_F(CacheManagerTest, TestRemoveCacheKeepsAdmittedSubsetScheduled) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    const KeyVector keys{97106, 97107};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    meta_backend->FailKeyOnNextUpsert(keys.back());
+    const ErrorCode remove_ec =
+        cache_manager_->RemoveCache(request_context_.get(), "test_instance", keys, {}, empty_mask);
+
+    // 被准入的 key 归既有物理回收管道所有，最终必须落到 CLS_NOT_FOUND。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool admitted_key_reclaimed = false;
+    while (!admitted_key_reclaimed && std::chrono::steady_clock::now() < deadline) {
+        auto [meta_ec, meta_info] = cache_manager_->GetCacheMeta(
+            request_context_.get(), "test_instance", KeyVector{keys.front()}, {}, empty_mask, 0);
+        std::map<std::string, std::string> meta;
+        if (meta_ec == EC_OK && meta_info.metas().size() == 1 &&
+            Jsonizable::FromJsonString(meta_info.metas()[0], meta) &&
+            meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_NOT_FOUND)) {
+            admitted_key_reclaimed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(admitted_key_reclaimed);
+
+    auto [meta_ec, meta_info] = cache_manager_->GetCacheMeta(
+        request_context_.get(), "test_instance", KeyVector{keys.back()}, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> failed_meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], failed_meta));
+    if (failed_meta.at("status") == CacheLocation::CacheLocationStatusToString(CLS_SERVING)) {
+        EXPECT_NE(EC_OK, remove_ec) << "unresolved key is still SERVING but RemoveCache reported success";
+    }
+}
+
+// 显式记录这条掩盖风险：per-location CAS 冲突返回 EC_MISMATCH，
+// 但 BatchCASLocationStatus 的聚合 ec 仍是 EC_OK。任何逻辑失效的准入判定
+// 都不能只看聚合值，必须逐 location 检查。
+TEST_F(CacheManagerTest, TestLocationCasAggregateOkMasksPerLocationMismatch) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    const KeyVector keys{97108};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    // 先拿到 CLS_WRITING 的快照，再发布成 CLS_SERVING，让快照过期。
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_FALSE(location_maps.front().empty());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks(1);
+    for (const auto &[location_id, location] : location_maps.front()) {
+        ASSERT_TRUE(location != nullptr);
+        ASSERT_EQ(CLS_WRITING, location->status());
+        cas_tasks[0].push_back(MetaSearcher::LocationCASTask{location_id, CLS_WRITING, CLS_DELETING});
+    }
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    std::vector<std::vector<ErrorCode>> cas_results;
+    const ErrorCode aggregate_ec =
+        meta_searcher->BatchCASLocationStatus(request_context_.get(), keys, cas_tasks, cas_results);
+    EXPECT_EQ(EC_OK, aggregate_ec) << "aggregate ec no longer masks per-location mismatch; revisit admission logic";
+    ASSERT_EQ(1u, cas_results.size());
+    ASSERT_EQ(cas_tasks[0].size(), cas_results[0].size());
+    for (const auto location_ec : cas_results[0]) {
+        EXPECT_EQ(EC_MISMATCH, location_ec);
+    }
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_SERVING), meta.at("status"));
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCachePublishesWritingLocation) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    const KeyVector keys{97009};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(1u, meta_info.metas().size());
+    std::map<std::string, std::string> meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], meta));
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_SERVING), meta.at("status"));
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(1u, locations.cache_locations_view().size());
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCachePublishesOnlyLocationsStillWriting) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    const KeyVector keys{97006, 97007};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    // 只把第二个 key 的 location 逻辑删除，模拟写入过程中该 block 被回收命中。
+    const KeyVector deleted_keys{keys.back()};
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), deleted_keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_FALSE(location_maps.front().empty());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks(1);
+    for (const auto &[location_id, location] : location_maps.front()) {
+        (void)location;
+        cas_tasks[0].push_back(MetaSearcher::LocationCASTask{location_id, CLS_WRITING, CLS_DELETING});
+    }
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchCASLocationStatus(request_context_.get(), deleted_keys, cas_tasks, cas_results));
+    ASSERT_EQ(1u, cas_results.size());
+    ASSERT_EQ(cas_tasks[0].size(), cas_results[0].size());
+    for (const auto location_ec : cas_results[0]) {
+        ASSERT_EQ(EC_OK, location_ec);
+    }
+
+    // 一半发布成功、一半 CAS 冲突：聚合 ec 为 EC_OK，必须靠 per-location 结果才能如实上报。
+    EXPECT_EQ(EC_PARTIAL_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    auto [meta_ec, meta_info] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, empty_mask, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(keys.size(), meta_info.metas().size());
+    std::map<std::string, std::string> published_meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[0], published_meta));
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_SERVING), published_meta.at("status"));
+    std::map<std::string, std::string> deleted_meta;
+    ASSERT_TRUE(Jsonizable::FromJsonString(meta_info.metas()[1], deleted_meta));
+    EXPECT_EQ(CacheLocation::CacheLocationStatusToString(CLS_DELETING), deleted_meta.at("status"));
+
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(1u, locations.cache_locations_view().size());
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCacheDoesNotRecreateDeletedLocation) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    const KeyVector keys{97008};
+    const BlockMask empty_mask = static_cast<size_t>(0);
+    auto [start_ec, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    // 物理回收已经把 location metadata CAD 掉，Finish 只能保持幂等，不允许重建。
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_FALSE(location_maps.front().empty());
+    std::vector<std::vector<MetaSearcher::LocationCADTask>> cad_tasks(1);
+    for (const auto &[location_id, location] : location_maps.front()) {
+        (void)location;
+        cad_tasks[0].push_back(MetaSearcher::LocationCADTask{location_id, CLS_WRITING});
+    }
+    std::vector<std::vector<ErrorCode>> cad_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCADLocationStatus(request_context_.get(), keys, cad_tasks, cad_results));
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_TRUE(location_maps.front().empty());
+
+    EXPECT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), BlockMask{keys.size()}));
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, empty_mask, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    EXPECT_EQ(0u, locations.cache_locations_view().size());
 }
 
 TEST_F(CacheManagerTest, TestTrimCache) {

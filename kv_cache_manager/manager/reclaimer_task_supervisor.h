@@ -17,6 +17,10 @@ public:
     void Start();
     void Submit(const std::string &trace_id, CacheMetaDelRequest &&request);
     void Submit(const std::string &trace_id, CacheLocationDelRequest &&request);
+    // Same submission as Submit(), but returns the logical invalidation result
+    // instead of dropping it. The physical delete keeps being supervised
+    // asynchronously exactly as before; this never waits for it.
+    ErrorCode SubmitLogicalDelete(const std::string &trace_id, CacheMetaDelRequest &&request);
 
 private:
     struct ReclaimerTaskSupervisorCell {

@@ -44,6 +44,35 @@ void ReclaimerTaskSupervisor::Submit(const std::string &trace_id, CacheMetaDelRe
     }
 }
 
+ErrorCode ReclaimerTaskSupervisor::SubmitLogicalDelete(const std::string &trace_id, CacheMetaDelRequest &&request) {
+    auto cell = std::make_shared<ReclaimerTaskSupervisorCell>();
+    cell->trace_id = trace_id;
+    cell->instance_id = request.instance_id;
+    LogicalDeleteAdmission admission;
+    cell->result = schedule_plan_executor_->Submit(request, admission);
+    if (cell->result.valid()) {
+        // Push whatever was admitted even on a partial failure: those blocks are
+        // already DELETING and their physical reclamation still needs watching.
+        cell_queue_.Push(cell);
+    } else {
+        KVCM_LOG_ERROR("Submit CacheMetaDelRequest instance_id[%s] trace_id[%s] failed",
+                       request.instance_id.c_str(),
+                       trace_id.c_str());
+    }
+    const ErrorCode logical_ec = admission.LogicalStatus();
+    if (logical_ec != EC_OK) {
+        KVCM_LOG_WARN("logical delete not fully admitted, instance_id[%s] trace_id[%s] ec[%d] requested[%zu] "
+                      "unresolved[%zu] message[%s]",
+                      cell->instance_id.c_str(),
+                      trace_id.c_str(),
+                      logical_ec,
+                      admission.requested_locations,
+                      admission.unresolved_locations,
+                      admission.error_message.c_str());
+    }
+    return logical_ec;
+}
+
 void ReclaimerTaskSupervisor::Submit(const std::string &trace_id, CacheLocationDelRequest &&request) {
     auto cell = std::make_shared<ReclaimerTaskSupervisorCell>();
     cell->trace_id = trace_id;
