@@ -2,7 +2,7 @@
 
 > 中文 | [English](README.md)
 
-LiteHit 是面向 full-attention KVCache block 的轻量、精确 LRU 命中率分析器。核心只回放一次 trace，为每条请求产出**容量无关的事实**（`RequestFact`，一条等差段 RLE 编码的 hit curve）；任何容量的命中数都由无状态投影器 `HitCurveProjector` 事后从事实推出，核心从不接收容量列表，也不累计任何逐容量结果。
+LiteHit 是面向 full-attention 与 linear/Mamba KVCache 的轻量、精确 LRU 命中率分析器。两种模型共享一个 weighted recency 核心，只回放一次 trace，为每条请求产出**容量无关的事实**；任何容量的命中数都由无状态投影器 `HitCurveProjector` 事后从事实推出，核心从不接收容量列表，也不累计任何逐容量结果。核心默认产出总字节轴 `RequestFact`；只有 Full-only 实例会把它无损压缩成 block 轴 `FullRequestFact` RLE。
 
 LiteHit 要解决的问题是：
 
@@ -16,12 +16,12 @@ LiteHit 要解决的问题是：
 容量不再需要在分析开始前给定。
 ```
 
-第一阶段只支持以下模型：
+当前支持以下模型：
 
-- full attention；
-- 每个完整 block 的 KVCache charge 相同（等 charge，见 6.4）；
+- full attention（每个完整 block 等 charge，见 6.4）；
+- linear/Mamba（Full block 与 Linear state 不同 charge，共享一个 weighted LRU pool）；
 - 精确 LRU，请求内倒序提交；
-- 不处理 linear attention / Mamba、不同大小 block、admission、prefetch 和多级缓存策略；TTL 支持为"每组一个固定 TTL"叠加在 LRU 之上（见 §7 TTL 回放），不支持任意 TTL 的查询期扫描。
+- 不处理 admission、prefetch 和多级缓存策略；TTL 支持为“每组一个固定 TTL”，同时适用于 Full 与 Linear state（见 §7 TTL 回放），但不支持任意 TTL 的查询期扫描。
 
 ## 0. 架构总览
 
@@ -33,9 +33,10 @@ LiteHit 要解决的问题是：
                  └───────────────┬────────────────────────────┘
                                  │ NormalizedRequest
                  ┌───────────────▼────────────────────────────┐
-                 │ LiteHit 核心（容量无关）                     │
-                 │  ProcessRequest(block_keys) → RequestFact   │
-                 │  状态：Fenwick + last_positions             │
+                 │ TtlLiteHit decorator（固定 TTL；0=透传）    │
+                 ├────────────────────────────────────────────┤
+                 │ LiteHit 核心（无时间概念、Full/Mamba 共享） │
+                 │ WeightedLruPool + Linear state policy      │
                  └───────┬───────────────────────┬────────────┘
                          │ RequestFact           │ RequestFact
             Online 路径  │                       │  Offline 路径
@@ -55,7 +56,7 @@ LiteHit 要解决的问题是：
 
 1. **核心容量无关**：`LiteHit::ProcessRequest` 只接收 block key，返回 `RequestFact`；不存在容量参数。
 2. **投影唯一入口**：所有"容量 → 命中块数"的换算必须经过 `HitCurveProjector`，Online 与 facts query 共用同一实现，禁止任何组件自行实现边界逻辑。
-3. **字节换算只发生在投影边界**：核心与事实全部以 block 为单位；`ProjectBytes` 在投影时用 `block_bytes` 做一次 floor 除法。
+3. **byte-step 是默认事实**：核心先在总字节轴生成 `RequestFact`；只有 Full-only 的等 charge 场景才用 `ProcessFullRequest` 转成 block 轴 RLE。
 
 ---
 
@@ -170,7 +171,7 @@ Fenwick 不是一套缓存，只是全局 LRU 顺序的 order-statistics 表示�
 
 ---
 
-## 5. RequestFact：等差段 RLE 编码的 hit curve
+## 5. RequestFact：默认 byte-step，Full-only 可压成 RLE
 
 ### 5.1 从逐块门槛到 hit curve
 
@@ -186,11 +187,11 @@ prefix_required[j] = max(r1, ..., rj)
 hit_blocks(C) = |{ j : prefix_required[j] <= C }|
 ```
 
-这条单调阶梯函数就是本请求的 **hit curve**——它就是这条请求的全部事实。
+这条单调阶梯函数就是本请求的 **hit curve**——它就是这条请求的全部事实。核心将每个门槛直接记录为 `{min_total_capacity_bytes, hit_blocks}`，形成默认的 byte-step `RequestFact`。
 
-### 5.2 契约下门槛严格递增 ⇒ 等差段 RLE 无损
+### 5.2 Full-only：契约下门槛严格递增 ⇒ 等差段 RLE 无损
 
-倒序提交下链上后块的最小命中容量**严格大于**前块（每深一块，快照区间内至少多出它的父 key），因此契约输入的 `prefix_required` 严格递增。更强的结构性质是：链上相邻 block 在全局 LRU 中占据**连续**位置，门槛只在"插队"点（兄弟分支交错进来的位置）跳变。于是把连续 `+1` 的门槛压成一个等差段：
+倒序提交下链上后块的最小命中容量**严格大于**前块（每深一块，快照区间内至少多出它的父 key），因此契约输入的 `prefix_required` 严格递增。Full-only 中每个对象 charge 相同，字节门槛可以精确除以 `full_charge_bytes`；于是把连续 `+1` 的 block 门槛压成一个等差段：
 
 ```text
 HitCurveSegment { start_required_blocks, run_length }
@@ -213,11 +214,11 @@ encoded_threshold = max(prefix_required[j], last_encoded + 1)
 ### 5.4 HitCurveProjector
 
 ```cpp
-ProjectBlocks(fact, capacity_blocks)   // 沿段线性扫描：
-                                       // hits += min(run_length, C - start + 1)，直到 start > C
-ProjectBytes(fact, capacity_bytes, block_bytes)
-                                       // = ProjectBlocks(fact, floor(bytes / block_bytes))
-ProjectInfinite(fact)                  // = Σ run_length（无 capacity miss，仅 cold miss）
+ProjectBytes(fact, capacity_bytes)              // 默认 byte-step
+ProjectInfinite(fact)                           // byte-step 末点
+ProjectFullBlocks(full_fact, capacity_blocks)   // Full-only RLE
+ProjectFullBytes(full_fact, bytes, block_bytes) // floor 后投影 RLE
+ProjectFullInfinite(full_fact)                  // RLE 的 Σ run_length
 ```
 
 空 curve 表示请求头即 cold，任何容量命中为 0。
@@ -249,11 +250,11 @@ capacity_blocks = floor(capacity_bytes / block_bytes)
 capacity_gb 使用二进制换算：capacity_bytes = capacity_gb * 1024^3
 ```
 
-`block_bytes` 来自实例注册的 full location spec group 各 spec.size 之和（`size_full_only`）。facts CSV 每行记录 `block_bytes`，事实自描述：即使日后修正 charge 估计，也能对历史事实重投影。
+Online 对 Full-only 和 Linear instance 都只保存 `capacity_bytes`，不会提前保存一份 Full 专属的 block 容量。`block_bytes` 来自实例注册的 full location spec group 各 spec.size 之和（一个 Full block 的 charge）；只有 Full RLE 最终投影时才执行上述 floor。facts CSV 每行记录 `block_bytes`，事实自描述：即使日后修正 charge 估计，也能对历史事实重投影。
 
 ### 6.4 等 charge 不变量（block 单位 RLE 的前提）
 
-hit curve 以 block 为单位、`ProjectBytes` 做单一 floor 除法，**当且仅当**所有参与块 charge 完全相等才精确——full-only 实例满足（每块 charge 恒为 `size_full_only`，是精确值不是平均值）。linear/Mamba 混合实例每块 charge 不等，必须改用 charge 加权门槛，属于后续独立任务；当前 Offline 拒绝 `linear_step != 0` 的实例。
+Full RLE 以 block 为单位、`ProjectFullBytes` 做单一 floor 除法，**当且仅当**所有参与对象 charge 完全相等才精确——full-attention 实例满足。linear/Mamba 的 Full block 与 Linear state charge 不等，因此保留默认 `RequestFact`，直接在**总字节容量轴**上投影，不做平均 block 换算。
 
 ---
 
@@ -274,7 +275,7 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
 
 **fanout 模式**：`fanout_all_instances = true` 时每条请求广播到全部 lane（各 lane 独立 LRU 状态、独立 facts 行），配合多个不同 `block_size` 的 instance 即可一次回放对同一份 trace 扫多个分析粒度；与 `override_instance_id` 互斥。facts query 的 summary 按 instance 分组输出（每 instance 一行 + 总计一行），fanout 结果直接可读。
 
-**TTL 回放**：instance group 配置 `ttl_seconds != 0` 时，该组 lane 的 `LiteHit` 核心叠加固定 TTL（与 online `TtlCacheIndexerWrapper` 语义一致：块在距上次访问严格小于 TTL 内存活，过期块对任意容量都是 miss 并像冷块一样截断前缀；每次访问（命中或未命中）都刷新 last_access；时间取 trace 时间戳，回放确定性）。年龄沿 LRU 栈单调，过期块不会抬高存活块的复用距离，因此一次回放对"固定 TTL × 任意容量"的联合口径仍然精确，facts 仍是普通 hit curve 行。TTL 是回放期参数，直接取组里的 `ttl_seconds`；要扫多个 TTL 就配多个 group 各带不同 `ttl_seconds`（可配合 fanout 一次回放完成）。
+**TTL 回放**：每个 lane 用 `TtlLiteHit` 装饰无时间概念的 `LiteHit` 核心；`ttl_seconds == 0` 时 decorator 透明透传。Full 与 Linear state 使用同一个请求时间 epoch，age 达到 TTL 即从 weighted LRU 的可见集合失效；Full 每次请求都会 touch，Linear state 只在周期位置或请求尾写入时 touch。时间取 trace 时间戳，因此回放确定性。过期对象不会抬高存活对象的容量门槛，一次回放对“固定 TTL × 任意容量”仍然精确。要扫多个 TTL 就配置多个 group。
 
 **fail-fast**：时间戳乱序、未知 instance、长度校验失败、全文件零有效行，任一发生即整体失败并给出原因——facts 是全有或全无的对账账本，不允许静默丢行。
 
@@ -286,7 +287,7 @@ Offline runner（`lite_hit_main` + `OptimizerLiteHitConfig`）逐批处理标准
 trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,hit_curve
 ```
 
-`hit_curve` 是带引号的 JSON 数组 `[[start_required_blocks, run_length], ...]`；字符串字段按 CSV 规则引用转义。每行独立可解析、自描述、可重投影。
+`hit_curve` 是带引号的 JSON 数组：默认 byte-step 行使用 `bytes:[[min_capacity_bytes, hit_blocks], ...]`；Full-only 使用 `rle:[[start_required_blocks, run_length], ...]`。读取端还兼容旧的 `mamba:` byte-step 与无前缀 Full RLE。字符串字段按 CSV 规则引用转义。
 
 ### 7.2 facts query 工具
 
@@ -305,16 +306,17 @@ trace_id,instance_id,timestamp_ns,input_token_len,block_size_tokens,block_bytes,
 
 ## 8. Online 集成
 
-Online Optimizer 的 full-attention `InstanceState` 直接持有 `LiteHit`（组配置 `ttl_seconds != 0` 时以墙钟时间叠加固定 TTL，口径与 linear 路径的 `TtlCacheIndexerWrapper` 一致）。每次 TraceQuery：
+Online Optimizer 的每个 `InstanceState` 持有一个 `TtlLiteHit` decorator，内部只有一个 `LiteHit` core。任一实例组配置 `ttl_seconds != 0` 时都以墙钟时间应用固定 TTL；TTL 为 0 时直接透传到 core。语义与离线回放一致，只是时间源不同。每次 TraceQuery：
 
 ```text
-NormalizeRequest → ProcessRequest → 得到 RequestFact
-  ├─ 对每个配置容量 slot：ProjectBlocks(fact, lite_hit_capacity_blocks[i])
-  ├─ 理论上界：ProjectInfinite(fact)
+NormalizeRequest
+  ├─ linear：ProcessRequest → RequestFact → ProjectBytes
+  ├─ Full-only：ProcessFullRequest → FullRequestFact → ProjectFullBytes
+  ├─ 理论上界：对应 fact 的 ProjectInfinite / ProjectFullInfinite
   └─ 更新累计整数：total_queries / total_input_tokens / 各 slot total_hits
 ```
 
-Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 继续走 legacy indexer 路径（启用 prefix hash 时仅做 `ApplyPrefixHash`）。
+Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 启用 Linear state 策略并直接投影 byte-step；TTL 水位线同时过滤 Full 与 Linear 对象，统计中的 resident bytes、unique Full blocks 和 TTL eviction 都按过滤后的 working set 计算。
 
 ---
 
@@ -324,8 +326,9 @@ Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInsta
 
 ```text
 ProcessRequest：O(m log U)（m 为请求块数）
-ProjectBlocks： O(S)，与容量值无关
-核心持久状态： Fenwick + last_positions，O(U)
+ProjectBytes / ProjectFullBytes：O(S)，与容量值无关
+核心持久状态： WeightedLruPool（Fenwick + typed positions），O(U)
+TTL decorator：请求时间 epoch + 存活位置 watermark，O(Q)
 ```
 
 **没有基于容量的剪枝**：容量事后才知道，任何 key 都可能被将来某个大容量查询用到，因此核心保留全部历史 unique key（这是容量无关性的固有代价）。第 4 节的 compaction 只回收废弃位置，不删除 key。`memory_usage_bytes()` / `current_unique_blocks()` 提供观测。
@@ -365,7 +368,7 @@ block_size_tokens = 4，block_bytes = 1024
 
 单元测试（`LiteHitTest` / `LiteHitOfflineRunnerTest`）覆盖：
 
-1. **oracle 对拍**：契约输入（随机树状链 + `ApplyPrefixHash`）下，`ProjectBlocks` 与朴素多容量 LRU（快照评估 + 倒序逐块 touch）在容量 {0,1,2,4,9,∞} 上**完全一致**；
+1. **oracle 对拍**：契约输入（随机树状链 + `ApplyPrefixHash`）下，`ProjectFullBlocks` 与朴素多容量 LRU（快照评估 + 倒序逐块 touch）在容量 {0,1,2,4,9,∞} 上**完全一致**；
 2. 非契约输入投影 ≤ oracle（单调防御悲观、绝不乐观），无限容量仍精确；
 3. RLE 形态：整链重放单段、插队断段、相邻段不可合并；
 4. 投影边界：容量 0、段边界、字节 floor 换算；
@@ -400,5 +403,5 @@ block_size_tokens = 4，block_bytes = 1024
    代价是不能做基于容量的剪枝。
 2. block_size_tokens 换 token，block_bytes 换容量，不能互相替代。
 3. 等差段 RLE 的无损性依赖前缀 hash 契约 + 倒序提交 + 等 charge；
-   混合 charge（linear/Mamba）必须另行设计。
+   混合 charge（linear/Mamba）复用同一核心，但用总字节轴显式阶梯编码。
 ```

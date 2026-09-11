@@ -16,7 +16,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/liteHit/facts_csv.h"
-#include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/liteHit/lite_hit_ttl.h"
 #include "kv_cache_manager/optimizer/liteHit/request_preprocess.h"
 #include "kv_cache_manager/optimizer/liteHit/trace_router.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
@@ -30,11 +30,10 @@ namespace {
 
 // One per-instance replay lane. LiteHit state updates are serial inside a
 // lane; preprocessing and row formatting are parallel across the batch.
-// A group with ttl_seconds > 0 layers that fixed TTL onto the lane's core.
+// Every lane owns a TTL decorator around the same LiteHit core. TTL zero is a
+// pass-through; Linear state scheduling remains a core concern.
 struct InstanceLane {
-    explicit InstanceLane(uint64_t ttl_ns) : core(ttl_ns) {}
-
-    LiteHit core;
+    std::unique_ptr<TtlLiteHit> core;
     uint64_t block_size_tokens = 0;
     uint64_t block_bytes = 0;
     bool enable_prefix_hash = false;
@@ -96,8 +95,7 @@ bool LiteHitOfflineRunner::Run() {
     }
 
     // Per-instance lanes. Registration through the manager validates the
-    // config and yields size_full_only, the per-block byte charge recorded
-    // into every fact row.
+    // config and yields the Full block charge recorded into every fact row.
     std::unordered_map<std::string, std::unique_ptr<InstanceLane>> lanes;
     std::vector<std::string> instance_ids;
     instance_ids.reserve(config_.instances().size());
@@ -108,12 +106,6 @@ bool LiteHitOfflineRunner::Run() {
         return false;
     }
     for (const auto &instance : config_.instances()) {
-        if (instance.linear_step() != 0) {
-            KVCM_LOG_ERROR("LiteHitOfflineRunner: instance[%s] has linear_step=%d; the facts replay is Full-only",
-                           instance.instance_id().c_str(),
-                           instance.linear_step());
-            return false;
-        }
         if (static_cast<uint64_t>(instance.block_size()) % config_.block_size() != 0) {
             KVCM_LOG_ERROR(
                 "LiteHitOfflineRunner: instance[%s] block_size=%ld is not a multiple of the trace block_size=%lu "
@@ -135,10 +127,20 @@ bool LiteHitOfflineRunner::Run() {
         // instance group and applies to every instance in it. RegisterInstance
         // already guaranteed the group exists.
         const OptimizerInstanceGroup &group = *groups_by_name.at(instance.instance_group_name());
-        auto lane = std::make_unique<InstanceLane>(static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL);
+        auto lane = std::make_unique<InstanceLane>();
         lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
-        lane->block_bytes = static_cast<uint64_t>(register_result.size_full_only);
+        lane->block_bytes = static_cast<uint64_t>(register_result.full_charge_bytes);
         lane->enable_prefix_hash = group.enable_prefix_hash();
+        LiteHit::CacheObjectConfig object_config;
+        object_config.full_charge_bytes = static_cast<uint64_t>(register_result.full_charge_bytes);
+        if (instance.linear_step() != 0) {
+            // RegisterInstance already validated linear_step as a positive
+            // token multiple of block_size and the non-empty Mamba spec group.
+            object_config.linear_charge_bytes = static_cast<uint64_t>(register_result.linear_charge_bytes);
+            object_config.linear_step_blocks = static_cast<uint64_t>(instance.linear_step() / instance.block_size());
+        }
+        const uint64_t ttl_ns = static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL;
+        lane->core = std::make_unique<TtlLiteHit>(object_config, ttl_ns);
         if (!lanes.emplace(instance.instance_id(), std::move(lane)).second) {
             KVCM_LOG_ERROR("LiteHitOfflineRunner: duplicate instance_id[%s] in config", instance.instance_id().c_str());
             return false;
@@ -211,7 +213,14 @@ bool LiteHitOfflineRunner::Run() {
         // Lane commits stay in input order; only same-lane order is
         // semantically required, and input order trivially satisfies it.
         for (BatchItem &item : batch) {
-            item.record.fact = item.lane->core.ProcessRequest(item.normalized.block_keys, item.record.timestamp_ns);
+            if (item.lane->core->uses_linear()) {
+                item.record.fact =
+                    item.lane->core->ProcessRequest(item.normalized.block_keys, item.record.timestamp_ns);
+            } else {
+                item.record.is_full_rle = true;
+                item.record.full_rle_fact =
+                    item.lane->core->ProcessFullRequest(item.normalized.block_keys, item.record.timestamp_ns);
+            }
         }
 
         ParallelForIndex(batch.size(), worker_count, [&](std::size_t i) {

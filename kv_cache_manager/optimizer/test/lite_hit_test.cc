@@ -61,127 +61,136 @@ private:
     uint64_t cumulative_hits_ = 0;
 };
 
-uint64_t Project(const RequestFact &fact, int64_t capacity_blocks) {
+uint64_t Project(const FullRequestFact &fact, int64_t capacity_blocks) {
     if (capacity_blocks == kInfinite) {
-        return HitCurveProjector::ProjectInfinite(fact);
+        return HitCurveProjector::ProjectFullInfinite(fact);
     }
-    return HitCurveProjector::ProjectBlocks(fact, static_cast<uint64_t>(capacity_blocks));
+    return HitCurveProjector::ProjectFullBlocks(fact, static_cast<uint64_t>(capacity_blocks));
 }
 
 } // namespace
 
 TEST(HitCurveProjectorTest, EmptyCurveHitsNothing) {
-    const RequestFact fact;
-    EXPECT_EQ(0, HitCurveProjector::ProjectBlocks(fact, 0));
-    EXPECT_EQ(0, HitCurveProjector::ProjectBlocks(fact, 1000000));
-    EXPECT_EQ(0, HitCurveProjector::ProjectInfinite(fact));
+    const FullRequestFact fact;
+    EXPECT_EQ(0, HitCurveProjector::ProjectFullBlocks(fact, 0));
+    EXPECT_EQ(0, HitCurveProjector::ProjectFullBlocks(fact, 1000000));
+    EXPECT_EQ(0, HitCurveProjector::ProjectFullInfinite(fact));
 }
 
 TEST(HitCurveProjectorTest, ProjectsSegmentBoundaries) {
-    const RequestFact fact{{HitCurveSegment{1, 2}, HitCurveSegment{4, 1}}};
-    EXPECT_EQ(0, HitCurveProjector::ProjectBlocks(fact, 0));
-    EXPECT_EQ(1, HitCurveProjector::ProjectBlocks(fact, 1));
-    EXPECT_EQ(2, HitCurveProjector::ProjectBlocks(fact, 2));
-    EXPECT_EQ(2, HitCurveProjector::ProjectBlocks(fact, 3));
-    EXPECT_EQ(3, HitCurveProjector::ProjectBlocks(fact, 4));
-    EXPECT_EQ(3, HitCurveProjector::ProjectBlocks(fact, 100));
-    EXPECT_EQ(3, HitCurveProjector::ProjectInfinite(fact));
+    const FullRequestFact fact{{HitCurveSegment{1, 2}, HitCurveSegment{4, 1}}};
+    EXPECT_EQ(0, HitCurveProjector::ProjectFullBlocks(fact, 0));
+    EXPECT_EQ(1, HitCurveProjector::ProjectFullBlocks(fact, 1));
+    EXPECT_EQ(2, HitCurveProjector::ProjectFullBlocks(fact, 2));
+    EXPECT_EQ(2, HitCurveProjector::ProjectFullBlocks(fact, 3));
+    EXPECT_EQ(3, HitCurveProjector::ProjectFullBlocks(fact, 4));
+    EXPECT_EQ(3, HitCurveProjector::ProjectFullBlocks(fact, 100));
+    EXPECT_EQ(3, HitCurveProjector::ProjectFullInfinite(fact));
 }
 
 TEST(HitCurveProjectorTest, ByteProjectionFloorsCapacity) {
-    const RequestFact fact{{HitCurveSegment{2, 3}}};
+    const FullRequestFact fact{{HitCurveSegment{2, 3}}};
     constexpr uint64_t kBlockBytes = 4096;
-    EXPECT_EQ(0, HitCurveProjector::ProjectBytes(fact, 2 * kBlockBytes - 1, kBlockBytes));
-    EXPECT_EQ(1, HitCurveProjector::ProjectBytes(fact, 2 * kBlockBytes, kBlockBytes));
-    EXPECT_EQ(2, HitCurveProjector::ProjectBytes(fact, 4 * kBlockBytes - 1, kBlockBytes));
-    EXPECT_EQ(3, HitCurveProjector::ProjectBytes(fact, 4 * kBlockBytes, kBlockBytes));
+    EXPECT_EQ(0, HitCurveProjector::ProjectFullBytes(fact, 2 * kBlockBytes - 1, kBlockBytes));
+    EXPECT_EQ(1, HitCurveProjector::ProjectFullBytes(fact, 2 * kBlockBytes, kBlockBytes));
+    EXPECT_EQ(2, HitCurveProjector::ProjectFullBytes(fact, 4 * kBlockBytes - 1, kBlockBytes));
+    EXPECT_EQ(3, HitCurveProjector::ProjectFullBytes(fact, 4 * kBlockBytes, kBlockBytes));
+}
+
+TEST(LiteHitTest, DefaultFactIsByteStepEvenForFullOnly) {
+    LiteHit::CacheObjectConfig object_config;
+    object_config.full_charge_bytes = 8;
+    LiteHit core(object_config);
+    EXPECT_TRUE(core.ProcessRequest({1, 2, 3}).points.empty());
+    const RequestFact fact = core.ProcessRequest({1, 2, 3});
+    EXPECT_EQ((std::vector<ByteStepPoint>{{8, 1}, {16, 2}, {24, 3}}), fact.points);
 }
 
 TEST(LiteHitTest, EmptyRequestIsNoOp) {
     LiteHit lite_hit;
-    const RequestFact fact = lite_hit.ProcessRequest({});
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({});
     EXPECT_TRUE(fact.hit_curve.empty());
     EXPECT_EQ(0, lite_hit.current_unique_blocks());
 }
 
 TEST(LiteHitTest, ColdRequestProducesEmptyCurveButCommits) {
     LiteHit lite_hit;
-    const RequestFact cold = lite_hit.ProcessRequest({1, 2, 3});
+    const FullRequestFact cold = lite_hit.ProcessFullRequest({1, 2, 3});
     EXPECT_TRUE(cold.hit_curve.empty());
     EXPECT_EQ(3, lite_hit.current_unique_blocks());
 }
 
 TEST(LiteHitTest, ContiguousChainReplayIsOneSegment) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2, 3});
+    lite_hit.ProcessFullRequest({1, 2, 3});
     // Reverse commit puts the chain contiguously: depths 1, 2, 3.
-    const RequestFact fact = lite_hit.ProcessRequest({1, 2, 3});
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({1, 2, 3});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), fact.hit_curve);
 }
 
 TEST(LiteHitTest, InterleavingChainBreaksSegments) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2, 3});
+    lite_hit.ProcessFullRequest({1, 2, 3});
     // Fork [1, 2, 9] commits 9 between 2 and 3: LRU becomes [1, 2, 9, 3].
-    lite_hit.ProcessRequest({1, 2, 9});
-    const RequestFact fact = lite_hit.ProcessRequest({1, 2, 3});
+    lite_hit.ProcessFullRequest({1, 2, 9});
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({1, 2, 3});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 2}, {4, 1}}), fact.hit_curve);
 }
 
 TEST(LiteHitTest, CurveStopsAtFirstColdKey) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2, 3});
-    const RequestFact fact = lite_hit.ProcessRequest({1, 7, 3});
+    lite_hit.ProcessFullRequest({1, 2, 3});
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({1, 7, 3});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), fact.hit_curve);
 }
 
 TEST(LiteHitTest, BlocksAfterFirstMissStillUpdateGlobalLru) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2});
-    const RequestFact mixed = lite_hit.ProcessRequest({1, 3, 2});
+    lite_hit.ProcessFullRequest({1, 2});
+    const FullRequestFact mixed = lite_hit.ProcessFullRequest({1, 3, 2});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), mixed.hit_curve);
 
     // Key 2 was committed even though it was after that request's first miss.
     // It is the oldest of the three, so it needs the full capacity of 3.
-    const RequestFact next = lite_hit.ProcessRequest({2});
+    const FullRequestFact next = lite_hit.ProcessFullRequest({2});
     EXPECT_EQ((std::vector<HitCurveSegment>{{3, 1}}), next.hit_curve);
 }
 
 TEST(LiteHitTest, ReverseCommitKeepsChainHeadMostRecent) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2, 3});
+    lite_hit.ProcessFullRequest({1, 2, 3});
 
-    const RequestFact head = lite_hit.ProcessRequest({1});
+    const FullRequestFact head = lite_hit.ProcessFullRequest({1});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 1}}), head.hit_curve);
     // After the head query the LRU is [1, 2, 3] again; the leaf needs full
     // capacity.
-    const RequestFact leaf = lite_hit.ProcessRequest({3});
+    const FullRequestFact leaf = lite_hit.ProcessFullRequest({3});
     EXPECT_EQ((std::vector<HitCurveSegment>{{3, 1}}), leaf.hit_curve);
 }
 
 TEST(LiteHitTest, RepeatedKeysEncodeMonotonicallyAndNeverOptimistically) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2});
+    lite_hit.ProcessFullRequest({1, 2});
     // Snapshot depths: 1 -> 1, 2 -> 2. Request [2, 2, 1, 2] violates the
     // prefix-hash contract; thresholds before the guard are [2, 2, 2, 2].
     // The monotonic guard encodes strictly increasing thresholds [2,3,4,5],
     // which is pessimistic (never optimistic) versus the naive oracle.
-    const RequestFact fact = lite_hit.ProcessRequest({2, 2, 1, 2});
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({2, 2, 1, 2});
     EXPECT_EQ((std::vector<HitCurveSegment>{{2, 4}}), fact.hit_curve);
 
     // Sequential final state is [2, 1] with 2 most recent.
-    const RequestFact next = lite_hit.ProcessRequest({2, 1});
+    const FullRequestFact next = lite_hit.ProcessFullRequest({2, 1});
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 2}}), next.hit_curve);
 }
 
 TEST(LiteHitTest, ResetClearsLruState) {
     LiteHit lite_hit;
-    lite_hit.ProcessRequest({1, 2});
+    lite_hit.ProcessFullRequest({1, 2});
     ASSERT_EQ(2, lite_hit.current_unique_blocks());
 
     lite_hit.Reset();
     EXPECT_EQ(0, lite_hit.current_unique_blocks());
-    EXPECT_TRUE(lite_hit.ProcessRequest({1, 2}).hit_curve.empty());
+    EXPECT_TRUE(lite_hit.ProcessFullRequest({1, 2}).hit_curve.empty());
 }
 
 TEST(LiteHitTest, MatchesNaiveMultiCapacityOracleOnRandomContractTraces) {
@@ -206,7 +215,7 @@ TEST(LiteHitTest, MatchesNaiveMultiCapacityOracleOnRandomContractTraces) {
         }
         const std::vector<int64_t> block_keys = ApplyPrefixHash(raw_keys);
 
-        const RequestFact fact = lite_hit.ProcessRequest(block_keys);
+        const FullRequestFact fact = lite_hit.ProcessFullRequest(block_keys);
         for (std::size_t i = 0; i < capacities.size(); ++i) {
             const uint64_t expected_hits = oracles[i].Process(block_keys);
             const uint64_t projected = Project(fact, capacities[i]);
@@ -237,7 +246,7 @@ TEST(LiteHitTest, ProjectionIsNeverOptimisticOnNonContractTraces) {
             block_keys.push_back(static_cast<int64_t>(rng() % 17));
         }
 
-        const RequestFact fact = lite_hit.ProcessRequest(block_keys);
+        const FullRequestFact fact = lite_hit.ProcessFullRequest(block_keys);
         for (std::size_t i = 0; i < capacities.size(); ++i) {
             const uint64_t expected_hits = oracles[i].Process(block_keys);
             const uint64_t projected = Project(fact, capacities[i]);
@@ -253,23 +262,23 @@ TEST(LiteHitTest, ProjectionIsNeverOptimisticOnNonContractTraces) {
 TEST(LiteHitTest, CompactsDynamicPositionsWithoutChangingResults) {
     LiteHit lite_hit;
     for (int64_t i = 0; i < 20000; ++i) {
-        lite_hit.ProcessRequest({i % 7});
+        lite_hit.ProcessFullRequest({i % 7});
     }
 
     EXPECT_EQ(7, lite_hit.current_unique_blocks());
-    EXPECT_LE(lite_hit.fenwick_.size(), 2 * lite_hit.last_positions_.size() + 4096);
-    const RequestFact fact = lite_hit.ProcessRequest({(20000 - 7) % 7});
+    EXPECT_LE(lite_hit.pool_.position_count(), 2 * lite_hit.pool_.full_positions_.size() + 4096);
+    const FullRequestFact fact = lite_hit.ProcessFullRequest({(20000 - 7) % 7});
     EXPECT_EQ((std::vector<HitCurveSegment>{{7, 1}}), fact.hit_curve);
 }
 
 TEST(LiteHitTest, RetainsAllActiveKeysWithoutCapacityPruning) {
     LiteHit lite_hit;
     for (int64_t key = 0; key < 10000; ++key) {
-        lite_hit.ProcessRequest({key});
+        lite_hit.ProcessFullRequest({key});
     }
     EXPECT_EQ(10000, lite_hit.current_unique_blocks());
 
-    const RequestFact oldest = lite_hit.ProcessRequest({0});
+    const FullRequestFact oldest = lite_hit.ProcessFullRequest({0});
     EXPECT_EQ((std::vector<HitCurveSegment>{{10000, 1}}), oldest.hit_curve);
 }
 

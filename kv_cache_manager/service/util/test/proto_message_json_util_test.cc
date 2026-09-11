@@ -88,19 +88,21 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
 }
 
-TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypesFallBackToProtobufJsonUtil) {
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesBytesWithProtobufBase64Semantics) {
     UnsupportedBytesMessage message;
     message.set_value(std::string("\0\1\2", 3));
-    EXPECT_FALSE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
 
     std::string json;
-    ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&message, json));
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(message, json));
     EXPECT_EQ(R"({"value":"AAEC"})", json);
 
     UnsupportedBytesMessage parsed;
-    ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(json, &parsed));
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(json, &parsed));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(message, parsed));
+}
 
+TEST_F(ProtoMessageJsonUtilTest, TestUnsupportedTypesFallBackToProtobufJsonUtil) {
     UnsupportedMapBytesMessage map_bytes;
     (*map_bytes.mutable_value())["key"] = std::string("\0\1\2", 3);
     EXPECT_FALSE(FastProtoJsonCodec::Supports(map_bytes.GetDescriptor()));

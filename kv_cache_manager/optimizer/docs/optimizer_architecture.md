@@ -43,7 +43,7 @@ KVCacheManager Optimizer is a standalone cache optimization analysis module. It 
 The Optimizer currently contains two execution paths: offline trace replay and online optimization service:
 
 - The offline replay path uses `OptimizerManager`, `OptIndexerManager`, `OptEvictionManager`, and `RadixTreeIndex`, depending on replay configuration, trace loader/converter, and data storage types.
-- The online service path uses `OnlineOptimizerManager`, LiteHit, `CacheIndexerFactory`, `LruCacheIndexer`/`TtlCacheIndexerWrapper`, and service/protobuf interfaces, depending on online instance group/instance configuration and registry. Full-attention multi-capacity LRU is directly held by `InstanceState` as LiteHit; linear attention is still simulated by the generic `CacheIndexer`.
+- The online service path uses `OnlineOptimizerManager`, the unified LiteHit runtime, and service/protobuf interfaces, depending on online instance group/instance configuration and registry. Each `InstanceState` holds one `TtlLiteHit` decorator with a single `LiteHit` core inside; full attention uses the Full-only policy, and linear attention additionally enables the Linear state policy.
 
 The two paths share the hit-rate modeling code within the optimizer module, but the runtime, configuration targets, and service boundaries remain independent, avoiding the online service introducing offline replay/data storage dependencies.
 
@@ -78,9 +78,10 @@ OnlineOptimizerManager (online runtime coordinator)
     ├── OptimizerRegistryManager (instance group/instance persistence)
     └── InstanceState (instance_id-isolated runtime state)
         ↓
-    ├── LiteHit (full-attention multi-capacity LRU)
-    └── CacheIndexerFactory (linear attention)
-        └── LruCacheIndexer / TtlCacheIndexerWrapper
+    └── LiteHit (unified weighted LRU core)
+        ├── Full-only (optional block-RLE)
+        └── Linear state policy (mixed Full + Linear charges)
+                    both can layer a fixed TTL
 ```
 
 ### Directory Structure
@@ -97,10 +98,12 @@ kv_cache_manager/optimizer/
 │   └── online_runtime/              # online runtime
 │       └── online_optimizer_manager.h/cc # online instance registration, TraceQuery, and statistics
 ├── index/                # index layer
-│   ├── radix_tree_index.h/cc        # offline Radix tree index
-│   └── online/                    # linear attention online capacity/TTL indexer
-├── liteHit/              # lightweight multi-capacity full-attention LRU hit-rate core
-│   ├── lite_hit.h/cc                # multi-capacity LRU hit-rate analyzer
+│   └── radix_tree_index.h/cc        # offline Radix tree index
+├── liteHit/              # lightweight multi-capacity hit-rate core
+│   ├── lite_hit.h/cc                # capacity-independent weighted LRU core shared by Full/Mamba
+│   ├── lite_hit_linear.h/cc         # Linear state restore points and write policy (no separate LRU state)
+│   ├── lite_hit_ttl.h/cc            # fixed-TTL decorator wrapping LiteHit (epochs/watermark)
+│   ├── weighted_lru_pool.h/cc       # byte-weighted LRU pool (typed keys: Full / Linear)
 │   └── dynamic_fenwick_tree.h/cc    # order-statistics Fenwick for reuse-distance
 ├── eviction_policy/      # eviction policy layer
 │   ├── base.h                   # policy base class
@@ -156,7 +159,9 @@ kv_cache_manager/optimizer/
 
 The online service protocol is defined in `kv_cache_manager/protocol/protobuf/optimizer_service.proto`, and is converted by the service layer into optimizer online config/runtime objects.
 
-A full-attention TraceQuery only puts complete blocks into `block_keys`, and passes the original input length including trailing tokens via `input_token_len`. The Online Manager uses the fixed byte charge of the full location spec group to floor `capacity_gb` to block capacity, then hands the same request to LiteHit; both per-request and cumulative hit rates are `prefix_hit_blocks * block_size_tokens / input_tokens`. When old clients lack the length, the compatibility assumption is that there are no trailing tokens. When a full-attention group config has `ttl_seconds != 0`, a fixed TTL is layered on top of LiteHit with wall-clock time (metrics consistent with `TtlCacheIndexerWrapper`); the statistics metrics and TTL behavior of linear attention keep the legacy path unchanged.
+A full-attention TraceQuery only puts complete blocks into `block_keys`, and passes the original input length including trailing tokens via `input_token_len`. Like linear attention, the Online Manager keeps only byte capacities; the core's default byte-step can be losslessly compressed into Full-only block RLE, and the fixed byte charge of the full location spec group performs a single floor only at final projection. Both per-request and cumulative hit rates are `prefix_hit_blocks * block_size_tokens / input_tokens`. When old clients lack the length, the compatibility assumption is that there are no trailing tokens.
+
+Linear attention (`linear_step > 0`) enables the Linear state policy on the same LiteHit: a Full block and a Linear state are two independent objects that share **one recency order and one total byte budget**; the capacity axis is total bytes rather than a block count, and the hit semantics is "resume from a Linear state". `LiteHit` itself has no notion of time; the outer `TtlLiteHit` decorator filters both Full and Linear states with a shared epoch/watermark, expiring an object from the weighted LRU's visible set once its age reaches the group TTL. Online uses wall-clock time, offline uses trace timestamps, and with TTL 0 the decorator is a transparent pass-through.
 
 ---
 

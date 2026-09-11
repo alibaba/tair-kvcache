@@ -19,10 +19,12 @@ class CoordinationBackend;
 class LeaderElector;
 class RegistryManager;
 class CacheManager;
+class EventManager;
 
 class MetaServiceGRpc;
 class AdminServiceGRpc;
 class DebugServiceGRpc;
+class OptimizerEventServiceGRpc;
 class MetaServiceHttp;
 class AdminServiceHttp;
 class DebugServiceHttp;
@@ -46,6 +48,7 @@ private:
     void CreateMetricsReporter();
     bool StartMetricsReportThread();
     void CreateAndRegisterEventPublisher();
+    void RegisterEventPublishers(const std::shared_ptr<EventManager> &event_manager);
     bool CreateLeaderElector();
 
     void OnBecomeLeader();
@@ -63,6 +66,7 @@ private:
     std::shared_ptr<MetaServiceGRpc> meta_service_;
     std::shared_ptr<AdminServiceGRpc> admin_service_;
     std::shared_ptr<DebugServiceGRpc> debug_service_;
+    std::shared_ptr<OptimizerEventServiceGRpc> optimizer_event_service_;
     std::shared_ptr<grpc::Server> rpc_server_;
     std::shared_ptr<grpc::Server> admin_rpc_server_;
     std::shared_ptr<MetaServiceHttp> meta_http_service_;
