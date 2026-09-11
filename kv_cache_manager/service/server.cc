@@ -12,7 +12,10 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
+#include "kv_cache_manager/event/event_publishers_config.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
+#include "kv_cache_manager/event/optimizer_event_publisher.h"
+#include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
@@ -25,10 +28,12 @@
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/quota_policy_poller.h"
 
 namespace kv_cache_manager {
 
@@ -101,6 +106,23 @@ bool Server::Init(const ServerConfig &config) {
     }
     cache_manager_->SetRevisitHistogramConfig(boundaries);
 
+    const auto quota_poller_config = config_.GetQuotaPolicyPollerConfig();
+    if (quota_poller_config.enable) {
+        quota_policy_poller_ = std::make_unique<QuotaPolicyPoller>(
+            quota_poller_config,
+            registry_manager_,
+            [this]() {
+                return leader_elector_ && leader_elector_->IsLeader() && registry_manager_ &&
+                       registry_manager_->IsRecoverComplete();
+            },
+            cache_manager_->meta_indexer_manager(),
+            metrics_registry_);
+        if (!quota_policy_poller_->Init()) {
+            KVCM_LOG_ERROR("KVBrain quota policy poller init failed");
+            return false;
+        }
+    }
+
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
 
@@ -148,11 +170,17 @@ void Server::OnBecomeLeader() {
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
+    if (optimizer_event_service_) {
+        optimizer_event_service_->EnableSubscriptions();
+    }
     KVCM_LOG_INFO("recover end");
 }
 
 void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
+    if (optimizer_event_service_) {
+        optimizer_event_service_->DisableSubscriptions();
+    }
     cache_manager_->RequestStopCacheGarbageCollector();
     cache_manager_->PauseReclaimer();
 
@@ -214,6 +242,10 @@ bool Server::Start() {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
     }
+    if (quota_policy_poller_ && !quota_policy_poller_->Start()) {
+        KVCM_LOG_ERROR("KVBrain quota policy poller start failed");
+        return false;
+    }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
                   kKvcmArt,
                   kKvcmFullVersion,
@@ -257,6 +289,9 @@ bool Server::StartRpcServer() {
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
+    if (optimizer_event_service_) {
+        builder.RegisterService(optimizer_event_service_.get());
+    }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
     }
@@ -375,18 +410,47 @@ void Server::CreateAndRegisterEventPublisher() {
         KVCM_LOG_WARN("do not have event manager, skip create and register event publisher.");
         return;
     }
-    auto log_publisher = std::make_shared<LogEventPublisher>();
-    // 这里的logpublisher初始化配置需要修改
-    auto event_publishers_configs = config_.event_publishers_configs();
-    if (!log_publisher->Init(event_publishers_configs)) {
-        KVCM_LOG_ERROR("init log event publisher failed");
+    RegisterEventPublishers(event_manager);
+}
+
+void Server::RegisterEventPublishers(const std::shared_ptr<EventManager> &event_manager) {
+    const auto &event_publishers_configs = config_.event_publishers_configs();
+    EventPublishersConfig publishers_config;
+    if (!event_publishers_configs.empty() && !publishers_config.FromJsonString(event_publishers_configs)) {
+        KVCM_LOG_ERROR("parse event publisher config failed; event publishers disabled");
         return;
     }
-    if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
-        KVCM_LOG_ERROR("add log event publisher failed");
+
+    if (publishers_config.enable_log_event_publisher()) {
+        auto log_publisher = std::make_shared<LogEventPublisher>(publishers_config.log_event_publisher_config());
+        if (!log_publisher->Init("")) {
+            KVCM_LOG_ERROR("init log event publisher failed; log publisher disabled");
+        } else if (!event_manager->RegisterPublisher("log_event_publisher", log_publisher)) {
+            KVCM_LOG_ERROR("add log event publisher failed; log publisher disabled");
+            log_publisher->Stop();
+        } else {
+            KVCM_LOG_INFO("create and register log event publisher OK");
+        }
+    }
+
+    if (!publishers_config.enable_optimizer_event_publisher()) {
         return;
     }
-    KVCM_LOG_INFO("create and register event publisher OK");
+    const auto &config = publishers_config.optimizer_event_publisher_config();
+    auto sink = std::make_shared<SubscriptionEventSink>(config);
+    auto optimizer_publisher = std::make_shared<OptimizerEventPublisher>(sink, config);
+    if (!optimizer_publisher->Init("")) {
+        KVCM_LOG_ERROR("init optimizer event publisher failed; publisher disabled");
+        return;
+    }
+    if (!event_manager->RegisterPublisher("optimizer_event_publisher", optimizer_publisher)) {
+        KVCM_LOG_ERROR("add optimizer event publisher failed; publisher disabled");
+        optimizer_publisher->Stop();
+        return;
+    }
+    optimizer_event_service_ =
+        std::make_shared<OptimizerEventServiceGRpc>(sink, registry_manager_, leader_elector_, cache_manager_);
+    KVCM_LOG_INFO("create and register optimizer gRPC event publisher OK, rpc_port=%d", config_.GetServiceRpcPort());
 }
 bool Server::CreateLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
@@ -451,6 +515,12 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (quota_policy_poller_) {
+        quota_policy_poller_->Stop();
+    }
+    if (optimizer_event_service_) {
+        optimizer_event_service_->DisableSubscriptions();
+    }
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }

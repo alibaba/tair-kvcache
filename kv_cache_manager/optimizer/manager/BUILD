@@ -62,6 +62,8 @@ cc_library(
         "//kv_cache_manager/optimizer/liteHit:hit_curve",
         "//kv_cache_manager/optimizer/liteHit:lite_hit",
         "//kv_cache_manager/optimizer/liteHit:request_preprocess",
+        "//kv_cache_manager/optimizer/metrics:mrc_window",
+        "//kv_cache_manager/optimizer:quota_mrc_snapshot",
     ],
 )
 

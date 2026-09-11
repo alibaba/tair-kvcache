@@ -2,7 +2,7 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
 namespace kv_cache_manager {

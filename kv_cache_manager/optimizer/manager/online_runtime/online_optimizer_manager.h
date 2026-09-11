@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -14,6 +16,8 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/metrics/mrc_window.h"
+#include "kv_cache_manager/optimizer/quota_runtime/quota_mrc_snapshot.h"
 
 namespace kv_cache_manager {
 
@@ -31,7 +35,7 @@ struct InstanceState {
     // the existing response contract and used as projection slots.
     std::vector<int64_t> lite_hit_capacity_blocks;
 
-    int64_t size_full_only = 0;
+    int64_t size_full = 0;
     int64_t size_full_linear = 0;
     int32_t linear_step = 0;
     std::mutex mutex;
@@ -44,6 +48,18 @@ struct InstanceState {
     int64_t total_input_tokens = 0;
     std::vector<int64_t> total_hits_per_capacity;
     int64_t total_max_hits = 0;
+
+    int64_t interval_input_tokens = 0;
+    std::vector<int64_t> interval_hits_per_capacity;
+    int64_t interval_max_hits = 0;
+
+    MrcWindow mrc_window;
+    // Independent from the metrics window: reporting must never consume the
+    // data used by quota decisions.
+    MrcWindow quota_mrc_window;
+    uint64_t quota_input_tokens = 0;
+    uint64_t quota_accepted_facts = 0;
+    int64_t quota_newest_event_ns = 0;
 };
 
 struct TraceQueryResult {
@@ -60,7 +76,7 @@ struct TraceQueryResult {
 
 struct RegisterInstanceResult {
     std::vector<int64_t> estimated_capacity_blocks;
-    int64_t size_full_only = 0;
+    int64_t size_full = 0;
     int64_t size_full_linear = 0;
 };
 
@@ -74,6 +90,23 @@ struct HitAgeBucketRatio {
     int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
     int64_t hit_count;
     double ratio; // hit_count / total_max_hits
+};
+
+struct MrcMetricInfo {
+    std::string instance_id;
+    std::string instance_group;
+    // Relative target against the reporting window's theoretical maximum hit
+    // count; 9500 means retaining 95% of those theoretical hits.
+    uint32_t target_basis_points = 0;
+    int64_t capacity_bytes = 0;
+};
+
+struct IntervalMetricInfo {
+    std::string instance_id;
+    std::string instance_group;
+    bool has_theoretical_max_hit_rate = false;
+    double max_hit_rate = 0.0;
+    std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
 };
 
 struct InstanceSummary {
@@ -114,18 +147,25 @@ public:
 
     ErrorCode RemoveInstance(const std::string &instance_id);
 
+    // input_token_len == 0 infers a full-block request. timestamp_ns == 0
+    // falls back to the local arrival time.
     ErrorCode TraceQuery(const std::string &instance_id,
                          const std::vector<int64_t> &block_keys,
                          int64_t input_token_len,
+                         int64_t timestamp_ns,
                          TraceQueryResult &result);
 
-    // Compatibility entry point for legacy block-only callers. It assumes the
-    // request contains no incomplete tail tokens. New full-attention callers
-    // must pass input_token_len explicitly through the overload above.
-    ErrorCode
-    TraceQuery(const std::string &instance_id, const std::vector<int64_t> &block_keys, TraceQueryResult &result);
-
     ErrorCode ListInstances(const std::string &instance_group_filter, std::vector<InstanceSummary> &summaries) const;
+
+    // Returns and clears the query metrics accumulated since the previous call.
+    ErrorCode TakeIntervalMetrics(std::vector<IntervalMetricInfo> &metrics);
+
+    // Returns and clears the MRC curve accumulated since the previous call.
+    ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);
+
+    OnlineMrcDecisionSnapshot
+    TakeQuotaDecisionSnapshot(const std::map<std::string, std::vector<uint64_t>> &capacity_bytes_by_source,
+                              int64_t now_ns = 0);
 
     ErrorCode ResetStats(const std::string &instance_id);
 
@@ -152,6 +192,7 @@ private:
     mutable std::mutex admin_ops_mutex_;
     mutable std::shared_mutex instances_mutex_;
     std::unordered_map<std::string, std::shared_ptr<InstanceState>> instances_;
+    std::atomic<uint64_t> quota_snapshot_generation_{0};
 };
 
 } // namespace kv_cache_manager

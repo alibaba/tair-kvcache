@@ -41,6 +41,8 @@ public:
                 .count();
     }
 
+    void SetEventTriggerTimeUs(int64_t trigger_time_us) { trigger_time_us_ = trigger_time_us; }
+
 protected:
     std::string id_;             // 事件唯一ID
     std::string source_;         // 事件来源实例
