@@ -175,6 +175,7 @@ cc_test(
         "//kv_cache_manager/meta:common",
         "//kv_cache_manager/meta:meta_dummy_backend",
         "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_redis_backend",
         "//kv_cache_manager/meta:meta_storage_backend",
         "//kv_cache_manager/meta:meta_storage_backend_manager",
         "//kv_cache_manager/meta:types",

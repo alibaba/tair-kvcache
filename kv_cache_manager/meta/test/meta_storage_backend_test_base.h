@@ -58,17 +58,34 @@ void AssertReclaimCandidateReadModes() {
     EXPECT_EQ(EC_ERROR, backend.SampleReclaimCandidates(nullptr, 2, candidates, true));
     EXPECT_TRUE(candidates.empty());
 
+    backend.errors = {EC_NOENT, EC_ERROR};
+    backend.properties = {{}, {}};
+    EXPECT_EQ(EC_ERROR, backend.SampleReclaimCandidates(nullptr, 2, candidates, true));
+    EXPECT_TRUE(candidates.empty());
+
     backend.keys = {1, 2, 3, 4};
     backend.errors = {EC_OK, EC_NOENT, EC_OK, EC_OK};
     backend.properties = {{{PROPERTY_LRU_TIME, "101"}}, {}, {}, {{PROPERTY_LRU_TIME, "invalid"}}};
     ASSERT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 4, candidates, true));
-    ASSERT_EQ(3, candidates.size());
+    ASSERT_EQ(4, candidates.size());
     EXPECT_EQ(1, candidates[0].key);
     EXPECT_EQ(101, candidates[0].last_access_time_us);
-    EXPECT_EQ(3, candidates[1].key);
+    // Redis EC_NOENT also means that just the requested LRU field is absent.
+    EXPECT_EQ(2, candidates[1].key);
     EXPECT_EQ(0, candidates[1].last_access_time_us);
-    EXPECT_EQ(4, candidates[2].key);
+    EXPECT_EQ(3, candidates[2].key);
     EXPECT_EQ(0, candidates[2].last_access_time_us);
+    EXPECT_EQ(4, candidates[3].key);
+    EXPECT_EQ(0, candidates[3].last_access_time_us);
+
+    backend.errors.assign(4, EC_NOENT);
+    backend.properties.assign(4, {});
+    ASSERT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 4, candidates, true));
+    ASSERT_EQ(4, candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EXPECT_EQ(backend.keys[i], candidates[i].key);
+        EXPECT_EQ(0, candidates[i].last_access_time_us);
+    }
 }
 
 class MetaStorageBackendTestBase {

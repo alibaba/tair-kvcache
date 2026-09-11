@@ -4813,6 +4813,21 @@ TEST_F(CacheReclaimerTest, TestGroupLruFiltersProtectedLocationsBeforeTopBAndCre
     }
 }
 
+TEST_F(CacheReclaimerTest, TestGroupLruZeroTimeCandidatesStillRequireDeletableLocations) {
+    const auto group = SetUpGroupLruScenario();
+    auto &missing = group_lru_test_backends.at("a");
+    missing.times.clear();
+    missing.locations.clear();
+    missing.location_error = ErrorCode::EC_NOENT;
+    group_lru_test_backends.at("b").times.clear();
+    cache_reclaimer_->pending_locations_.insert({"b", 1, "loc"});
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 2}, {"b", 3}, {"b", 4}, {"b", 5}}),
+              GroupLruSubmittedBlocks());
+    EXPECT_EQ(4, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+}
+
 TEST_F(CacheReclaimerTest, TestGroupLruPendingQuotaIsAppliedAfterGlobalOrdering) {
     const auto group = SetUpGroupLruScenario();
     for (auto &[key, time] : group_lru_test_backends.at("b").times) {
