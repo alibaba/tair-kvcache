@@ -51,6 +51,30 @@ struct AsyncDeleteSubmitResult {
     std::future<PlanExecuteResult> future;
 };
 
+// Outcome of the synchronous logical-invalidation phase of a delete request.
+// Physical reclamation stays asynchronous: the PlanExecuteResult future keeps
+// its existing "physical delete finished" contract and is not affected here.
+struct LogicalDeleteAdmission {
+    // Hard failure that aborted the whole request: unknown instance, stopped
+    // executor, metadata read failure or Sync failure.
+    ErrorCode status{ErrorCode::EC_OK};
+    std::string error_message;
+    // Locations this request tried to invalidate, and the subset that is still
+    // reusable afterwards. Counting instead of collapsing into a single code
+    // keeps the strictness decision with the caller: opportunistic cleanup and
+    // migration may ignore the counts, explicit invalidation must not.
+    std::size_t requested_locations{0};
+    std::size_t unresolved_locations{0};
+    // First per-location error behind unresolved_locations, typically
+    // EC_MISMATCH when a concurrent publish won the CAS.
+    ErrorCode first_unresolved_ec{ErrorCode::EC_OK};
+
+    // EC_OK only when every requested location is unavailable for reuse.
+    // EC_PARTIAL_OK when part of the batch was invalidated; the admitted subset
+    // stays physically scheduled either way.
+    ErrorCode LogicalStatus() const;
+};
+
 struct CacheLocationDelRequest {
     std::string instance_id;
     std::vector<int64_t> block_keys;
@@ -134,6 +158,10 @@ public:
     ~SchedulePlanExecutor();
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
+    // Same submission, but also reports how the synchronous logical phase went.
+    // For callers that must answer "is this cache still reusable?" before the
+    // physical delete has run.
+    std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task, LogicalDeleteAdmission &admission);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
@@ -156,6 +184,12 @@ private:
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
         bool needs_physical_delete{false};
+        // Per-location bookkeeping feeding LogicalDeleteAdmission. Recorded on
+        // every path so that no caller has to re-derive it, but never folded
+        // into `result`: the future must keep reporting physical completion.
+        std::size_t requested_locations{0};
+        std::size_t unresolved_locations{0};
+        ErrorCode first_unresolved_ec{ErrorCode::EC_OK};
     };
 
     std::shared_ptr<MetaIndexerManager> meta_manager_;
@@ -182,12 +216,22 @@ private:
     static bool IsMigrationTaskClass(ScheduleTaskClass task_class);
     static std::size_t TaskClassIndex(ScheduleTaskClass task_class);
     std::size_t WaitingTaskCountLocked() const;
+    // `unresolved_locations` / `first_unresolved_ec` accumulate the slots whose
+    // CAS did not take effect. Aggregate EC_OK from BatchCASLocationStatus does
+    // not imply every location moved to DELETING, so they cannot be inferred
+    // from the return value or from the filled task alone.
     static bool FillActualTask(const std::vector<int64_t> &batch_cas_block_keys,
                                const std::vector<std::vector<MetaSearcher::LocationCASTask>> &batch_cas_tasks,
                                const std::vector<std::vector<ErrorCode>> &batch_results,
                                CacheLocationDelRequest &actual_task,
-                               std::string &error_message);
-    LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task);
+                               std::string &error_message,
+                               std::size_t &unresolved_locations,
+                               ErrorCode &first_unresolved_ec);
+    // Synchronous meta submission checks every read result and re-arms
+    // DELETING locations (CAS, Sync, physical enqueue). DELETING alone does
+    // not prove an owned physical task after a failure or restart.
+    // Async meta and location submissions retain their existing skip behavior.
+    LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task, bool strict_meta_delete = false);
     LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task);
     LocationDelAdmissionResult
     PrepareDeleteTaskImpl(const std::string &instance_id,
@@ -195,14 +239,21 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          bool strict_meta_delete = false);
+    // `admission` is only ever non-null when RunDeleteAdmission is invoked
+    // inline on the submitting thread; the deferred admission path has no
+    // caller frame left to report into.
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
-                            ScheduleTaskClass task_class);
+                            ScheduleTaskClass task_class,
+                            LogicalDeleteAdmission *admission = nullptr);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
-    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
+    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task,
+                                                    ScheduleTaskClass task_class,
+                                                    LogicalDeleteAdmission *admission = nullptr);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);

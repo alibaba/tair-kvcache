@@ -42,6 +42,35 @@ bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
     return true;
 }
 
+std::atomic<int> sync_call_count{0};
+std::atomic<int> sync_failing_calls{0};
+
+// 前 sync_failing_calls 次 Sync 失败，之后成功。用来构造"CAS 已把 location 置成
+// DELETING、但 Sync 失败因而没有排队任何物理删除"的无人认领状态，再验证重试能重新
+// 走完 re-CAS + Sync + 排队。
+bool MetaIndexer_Sync_fail_first_calls_stub(void *obj, const KeyVector &keys) noexcept {
+    (void)obj;
+    (void)keys;
+    const int call_index = sync_call_count.fetch_add(1, std::memory_order_acq_rel);
+    sync_entered.store(true, std::memory_order_release);
+    return call_index >= sync_failing_calls.load(std::memory_order_acquire);
+}
+
+std::atomic<SchedulePlanExecutor *> sync_stop_executor{nullptr};
+
+// Sync 是 prepare 的最后一步，在这里 Stop 就精确落在"逻辑失效已完成、物理任务尚未
+// 入队"的窗口里 —— 这是 SubmitRaw 唯一会拒绝一批已经 DELETING 的 location 的时机。
+bool MetaIndexer_Sync_stop_executor_stub(void *obj, const KeyVector &keys) noexcept {
+    (void)obj;
+    (void)keys;
+    sync_entered.store(true, std::memory_order_release);
+    auto *executor = sync_stop_executor.exchange(nullptr, std::memory_order_acq_rel);
+    if (executor != nullptr) {
+        executor->Stop();
+    }
+    return true;
+}
+
 std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_throw_stub(void *obj, const std::string &instance_id) {
     (void)obj;
     (void)instance_id;
@@ -1901,4 +1930,215 @@ TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetada
     ASSERT_EQ(1u, persistent_results.size());
     ASSERT_EQ(1u, persistent_locations.size());
     EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
+}
+
+// 已经是 DELETING、却没有任何在途物理任务的 location（上一次 Sync 失败、入队被拒或
+// 进程重启都会留下这种状态，GC/LRU 只回收 orphan WRITING 与缺失 SERVING，不会认领它）。
+// 同步 meta Submit 必须重新 CAS + Sync + 排队物理删除：它交给调用方的 future 承诺的是
+// 物理完成，不能因为"看起来已经有人在删"就提前完成。
+TEST_F(SchedulePlanExecutorTest, TestSubmitMetaReinvalidatesStrandedDeletingLocation) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("stranded_deleting_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    const int64_t block_key = 920;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/stranded_deleting?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    // 直接 CAS 构造 DELETING：没有经过 Submit，所以没有任何排队中的物理删除任务。
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    const auto initial_status = location_maps.front().at(location_ids.front())->status();
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchCASLocationStatus(
+                  request_context.get(),
+                  {block_key},
+                  {{MetaSearcher::LocationCASTask{
+                      location_ids.front(), initial_status, CacheLocationStatus::CLS_DELETING, ""}}},
+                  cas_results));
+    ASSERT_EQ(1u, cas_results.size());
+    ASSERT_EQ(1u, cas_results.front().size());
+    ASSERT_EQ(ErrorCode::EC_OK, cas_results.front().front());
+
+    Stub stub;
+    sync_entered.store(false);
+    sync_completed.store(false);
+    release_sync.store(true);
+    sync_delay_ms.store(0);
+    sync_thread_hash.store(0);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_stub);
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    // 占住唯一的 worker：物理删除只能排队，future 在放行之前必须保持未完成。
+    auto blocker_started = std::make_shared<std::promise<void>>();
+    std::promise<void> release_blocker;
+    auto release_blocker_future = release_blocker.get_future().share();
+    ASSERT_TRUE(executor.SubmitTask([blocker_started, release_blocker_future] {
+        blocker_started->set_value();
+        release_blocker_future.wait();
+    }));
+    ASSERT_EQ(std::future_status::ready, blocker_started->get_future().wait_for(std::chrono::seconds(1)));
+
+    CacheMetaDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+    };
+    LogicalDeleteAdmission admission;
+    auto future = executor.Submit(request, admission);
+
+    EXPECT_EQ(ErrorCode::EC_OK, admission.status) << admission.error_message;
+    EXPECT_EQ(ErrorCode::EC_OK, admission.LogicalStatus());
+    EXPECT_EQ(1u, admission.requested_locations);
+    EXPECT_EQ(0u, admission.unresolved_locations);
+    EXPECT_TRUE(sync_entered.load(std::memory_order_acquire))
+        << "already-DELETING location must be re-CAS'd and re-Sync'd by the synchronous meta submit";
+    EXPECT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(200)))
+        << "physical-completion future must not complete before the physical delete actually runs";
+
+    release_blocker.set_value();
+    const auto result = future.get();
+    EXPECT_TRUE(result.status == ErrorCode::EC_OK || result.status == ErrorCode::EC_PARTIAL_OK) << result.error_message;
+
+    location_maps.clear();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    EXPECT_TRUE(location_maps.empty() || location_maps.front().empty())
+        << "physical reclamation must actually progress for a stranded DELETING location";
+
+    stub.reset(ADDR(MetaIndexer, Sync));
+}
+
+// 首次 Sync 失败：CAS 已经把 location 置成 DELETING，但没有排队任何物理任务，逻辑阶段
+// 必须报错。重试必须能重新 CAS DELETING -> DELETING、再 Sync、再排队，并真正完成物理回收。
+TEST_F(SchedulePlanExecutorTest, TestSubmitMetaRetriesAfterInitialSyncFailure) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("sync_failure_retry_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    const int64_t block_key = 921;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/sync_failure_retry?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    Stub stub;
+    sync_entered.store(false);
+    sync_call_count.store(0);
+    sync_failing_calls.store(1);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_fail_first_calls_stub);
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheMetaDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+    };
+
+    LogicalDeleteAdmission first_admission;
+    auto first_future = executor.Submit(request, first_admission);
+    EXPECT_EQ(ErrorCode::EC_ERROR, first_admission.status);
+    EXPECT_NE(std::string::npos, first_admission.error_message.find("Sync failed")) << first_admission.error_message;
+    const auto first_result = first_future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, first_result.status) << first_result.error_message;
+
+    // 逻辑失效已经生效但无人认领：这正是需要靠重试恢复的 stranded DELETING。
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    ASSERT_EQ(CacheLocationStatus::CLS_DELETING, location_maps.front().at(location_ids.front())->status());
+
+    LogicalDeleteAdmission retry_admission;
+    auto retry_future = executor.Submit(request, retry_admission);
+    EXPECT_EQ(ErrorCode::EC_OK, retry_admission.status) << retry_admission.error_message;
+    EXPECT_EQ(ErrorCode::EC_OK, retry_admission.LogicalStatus());
+    EXPECT_EQ(1u, retry_admission.requested_locations);
+    EXPECT_EQ(0u, retry_admission.unresolved_locations);
+    EXPECT_EQ(2, sync_call_count.load(std::memory_order_acquire)) << "retry must Sync again, not skip DELETING";
+
+    const auto retry_result = retry_future.get();
+    EXPECT_TRUE(retry_result.status == ErrorCode::EC_OK || retry_result.status == ErrorCode::EC_PARTIAL_OK)
+        << retry_result.error_message;
+
+    location_maps.clear();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    EXPECT_TRUE(location_maps.empty() || location_maps.front().empty());
+
+    stub.reset(ADDR(MetaIndexer, Sync));
+}
+
+// prepare 成功（CAS + Sync 都过了）之后、物理任务入队之前 executor 被 Stop：入队失败
+// 不能只体现在物理 future 上，逻辑准入必须一起报错，否则调用方会以为失效已被 GC 接管，
+// 而 DELETING 实际上被永久搁浅。
+TEST_F(SchedulePlanExecutorTest, TestSubmitMetaReportsAdmissionFailureWhenPhysicalEnqueueRejected) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("enqueue_rejected_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    const int64_t block_key = 922;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/enqueue_rejected?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    Stub stub;
+    sync_entered.store(false);
+    sync_stop_executor.store(&executor, std::memory_order_release);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_stop_executor_stub);
+
+    CacheMetaDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+    };
+    LogicalDeleteAdmission admission;
+    auto future = executor.Submit(request, admission);
+
+    EXPECT_TRUE(sync_entered.load(std::memory_order_acquire)) << "the stop must land after prepare, not before it";
+    EXPECT_EQ(ErrorCode::EC_ERROR, admission.status);
+    EXPECT_NE(std::string::npos, admission.error_message.find("submit physical delete task failed"))
+        << admission.error_message;
+    EXPECT_EQ(ErrorCode::EC_ERROR, admission.LogicalStatus());
+
+    const auto result = future.get();
+    EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("submit physical delete task failed"))
+        << result.error_message;
+
+    // DELETING 保留下来供重试；不能回滚，也不能被当成已经完成。
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    EXPECT_EQ(CacheLocationStatus::CLS_DELETING, location_maps.front().at(location_ids.front())->status());
+
+    sync_stop_executor.store(nullptr, std::memory_order_release);
+    stub.reset(ADDR(MetaIndexer, Sync));
 }
