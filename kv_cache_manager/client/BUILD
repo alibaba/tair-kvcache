@@ -1,4 +1,17 @@
+load("@rules_python//python:py_library.bzl", "py_library")
+
 package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "kv_meta_object_py_client",
+    srcs = [
+        "__init__.py",
+        "kv_meta_object_client.py",
+    ],
+    deps = [
+        "//kv_cache_manager/client/pybind:kvcm_py_client_lib",
+    ],
+)
 
 cc_binary(
     name = "kv_cache_manager_client.so",
