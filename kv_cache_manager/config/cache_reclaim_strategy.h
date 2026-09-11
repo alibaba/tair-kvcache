@@ -21,6 +21,7 @@ enum class ReclaimPolicy {
 enum class InstanceReclaimBudgetPolicy {
     USAGE_PROPORTIONAL = 0,
     FIXED_PER_INSTANCE = 1,
+    GROUP_LRU = 2,
 };
 
 /**
@@ -37,7 +38,7 @@ public:
         int32_t reclaim_step_size,
         int32_t reclaim_step_percentage,
         int32_t delay_before_delete_ms = 0,
-        InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL)
+        InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = InstanceReclaimBudgetPolicy::GROUP_LRU)
         : storage_unique_name_(storage_unique_name)
         , reclaim_policy_(reclaim_policy)
         , trigger_strategy_(trigger_strategy)
@@ -88,13 +89,13 @@ public:
 
 private:
     std::string storage_unique_name_;
-    ReclaimPolicy reclaim_policy_;
+    ReclaimPolicy reclaim_policy_{ReclaimPolicy::POLICY_UNSPECIFIED};
     TriggerStrategy trigger_strategy_;
-    int32_t trigger_period_seconds_;
-    int32_t reclaim_step_size_;
-    int32_t reclaim_step_percentage_;
-    int32_t delay_before_delete_ms_;
-    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy_{InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL};
+    int32_t trigger_period_seconds_{0};
+    int32_t reclaim_step_size_{0};
+    int32_t reclaim_step_percentage_{0};
+    int32_t delay_before_delete_ms_{0};
+    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy_{InstanceReclaimBudgetPolicy::GROUP_LRU};
 };
 
 } // namespace kv_cache_manager

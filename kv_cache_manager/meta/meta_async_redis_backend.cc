@@ -614,7 +614,8 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimKeys(RequestContext * /*request_co
 
 ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request_context,
                                                          const int64_t count,
-                                                         ReclaimCandidateVector &out_candidates) noexcept {
+                                                         ReclaimCandidateVector &out_candidates,
+                                                         bool require_read_success) noexcept {
     out_candidates.clear();
     if (count <= 0) {
         return EC_OK;
@@ -628,6 +629,16 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
     PropertyMapVector properties;
     const std::vector<ErrorCode> property_results =
         GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, properties);
+    if (require_read_success) {
+        if (property_results.size() != keys.size() || properties.size() != keys.size()) {
+            return EC_ERROR;
+        }
+        for (const auto ec : property_results) {
+            if (ec != EC_OK && ec != EC_NOENT) {
+                return ec;
+            }
+        }
+    }
     bool all_properties_available = property_results.size() == keys.size() && properties.size() == keys.size();
     if (all_properties_available) {
         for (const ErrorCode ec : property_results) {
@@ -639,7 +650,7 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
     }
 
     out_candidates.reserve(keys.size());
-    if (!all_properties_available) {
+    if (!require_read_success && !all_properties_available) {
         KVCM_INTERVAL_LOG_WARN(10,
                                "async redis sample reclaim candidate properties unavailable, use zero lru time, "
                                "instance[%s]",
@@ -651,6 +662,9 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
     }
 
     for (size_t i = 0; i < keys.size(); ++i) {
+        // A missing LRU field maps to EC_NOENT, just like a missing key.
+        // Keep the candidate at time zero; later Location reads exclude keys
+        // that actually disappeared, without an additional existence query.
         int64_t last_access_time_us = 0;
         const auto it = properties[i].find(PROPERTY_LRU_TIME);
         if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {

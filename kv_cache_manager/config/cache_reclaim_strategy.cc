@@ -15,7 +15,7 @@ bool CacheReclaimStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
                                 "instance_reclaim_budget_policy",
                                 instance_reclaim_budget_policy_,
-                                InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
+                                InstanceReclaimBudgetPolicy::GROUP_LRU);
     return true;
 }
 
@@ -38,9 +38,15 @@ bool CacheReclaimStrategy::ValidateRequiredFields(std::string &invalid_fields) c
         local_invalid_fields += "{storage_unique_name}";
     }
     if (instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL &&
-        instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE) {
+        instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE &&
+        instance_reclaim_budget_policy_ != InstanceReclaimBudgetPolicy::GROUP_LRU) {
         valid = false;
         local_invalid_fields += "{instance_reclaim_budget_policy}";
+    }
+    if (instance_reclaim_budget_policy_ == InstanceReclaimBudgetPolicy::GROUP_LRU &&
+        reclaim_policy_ != ReclaimPolicy::POLICY_LRU && reclaim_policy_ != ReclaimPolicy::POLICY_UNSPECIFIED) {
+        valid = false;
+        local_invalid_fields += "{GROUP_LRU requires POLICY_LRU or POLICY_UNSPECIFIED}";
     }
     if (!valid) {
         invalid_fields += "{CacheReclaimStrategy: " + local_invalid_fields + "}";

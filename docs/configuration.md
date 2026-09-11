@@ -109,7 +109,8 @@ kvcm.meta_query.parallel_threshold=256
 # 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
 kvcm.meta_query.chunk_size=128
 
-# CacheReclaimer 单个有效 Instance 每轮最多采样的 key 数，默认 100。
+# CacheReclaimer 基础采样量，默认 100。GROUP_LRU 按有效 Instance 数计算 Group 预算后重新分配，
+# 该模式下此值不是单个 Instance 的硬上限；各模式的预算规则见下文。
 kvcm.cache_reclaimer.key_sampling_size_total=100
 
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
@@ -257,7 +258,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                     "used_percentage": 0.8 # 控制数据用量水位，当用量达到或超过quota * percentage时将触发回收（逐出）
                 },
                 "delay_before_delete_ms": 1000, # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
-                "instance_reclaim_budget_policy": 0 # 0=USAGE_PROPORTIONAL（默认，按用量分配）；1=FIXED_PER_INSTANCE（旧的固定 per-instance 行为）
+                "instance_reclaim_budget_policy": 2 # 2=GROUP_LRU（默认，跨 Instance 按访问时间逐出）；0=USAGE_PROPORTIONAL；1=FIXED_PER_INSTANCE
             },
             # cache_prefer_strategy与storage candidates一起控制storage backend选择策略，可选值如下：
             # enum class CachePreferStrategy {
@@ -299,11 +300,28 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 }
 ```
 
-`instance_reclaim_budget_policy=USAGE_PROPORTIONAL`（内部持久化值为 `0`）时，Reclaimer 按各
-Instance 在当前超水位维度上的用量计算预算份额。
-服务级 `key_sampling_size_total` 和 `del_batch_size` 仍是单个 Instance 一次请求的 sample/batch
-上限，不会因 Group 内 Instance 数量或用量倾斜而放大；超出上限的理论份额留给后续 reclaim 轮次。
-设为 `FIXED_PER_INSTANCE`（内部持久化值为 `1`）时，完整使用旧的固定 per-instance 预算和遍历顺序。
+`instance_reclaim_budget_policy` 选择同一 Group 内如何逐出，Admin API 和 `kvcm_ops` 使用枚举名，Registry JSON 持久化整数：
+
+| 模式 | 值 | 行为 |
+|---|---|---|
+| `GROUP_LRU` | `2` | 默认。各 Instance 提供候选，按访问时间统一排序，优先尝试删除最冷的 block |
+| `USAGE_PROPORTIONAL` | `0` | 按当前超水位维度的用量分配预算，跨轮轮转执行，避免有预算的小 Instance 长期轮不到 |
+| `FIXED_PER_INSTANCE` | `1` | 固定 per-instance 预算，按原注册表顺序执行 |
+
+三种模式都在 Group/Type credit 已使水位恢复后停止，不以清空无流量 Instance 为目标。配置缺字段时进入 `GROUP_LRU`；已有显式 `0`、`1` 不会被默认值覆盖。GET→修改无关字段→UPDATE 应保留返回的模式。`GROUP_LRU` 仅允许 `reclaim_policy=POLICY_LRU` 或 `POLICY_UNSPECIFIED`，不支持与 LFU / TTL 组合。
+
+容量比例模式中，服务级 `key_sampling_size_total` 和 `del_batch_size` 仍限制每个 Instance 的单次采样 / 删除预算，倾斜产生的超额份额留给后续轮次。Group LRU 则将两者作为单 Instance 基准，按有效 Instance 数 `N` 计算理论总量 `S*N`、`B*N`，在 Group 内统一选择 victim；一次请求仍不超过 `B`，同一 Instance 一轮可以收到多次请求。它不承诺每轮必须删满理论预算。
+
+Group LRU 新增两个进程级保护参数，均须为正整数，仅影响该模式：
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `kvcm.cache_reclaimer.group_lru_max_sampling_size` | `65536` | 单个 Group 一轮的总采样名额上限；不足以覆盖全部 Instance 时按队列轮转采样子集 |
+| `kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round` | `128` | 单个 Group 一轮尝试提交的非空删除请求数上限；Executor 拒绝的请求也计数 |
+
+采样总量受限或部分 Instance 收集失败时，Group batch 同步缩小以保持采样 / 删除比例；单次 Instance 采样仍小于 `65536`。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
+
+升级和回滚需注意：缺字段的旧 Registry 数据会采用新默认值；希望保持旧模式的 Group 应提前明确配置 `0` 或 `1`。旧 proto3 客户端会省略隐式零值，若需显式选择 `USAGE_PROPORTIONAL`，应升级到支持该字段 oneof 存在性的客户端，或使用明确携带字段的 Admin JSON。旧二进制不保证识别 `2`，回滚前应把新模式切回旧模式并回读确认。历史 LFU / TTL 配置若缺少模式字段，也应先明确选择旧模式或切为 LRU。
 
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage

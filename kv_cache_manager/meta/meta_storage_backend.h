@@ -378,6 +378,16 @@ public:
                                                  const std::vector<std::string> &field_names,
                                                  PropertyMapVector &out_properties) noexcept = 0;
 
+    // Maintenance Location reads must not update timestamps, promote entries, observe
+    // revisit intervals, or populate a cache. The default adapter is only for
+    // side-effect-free reads (Redis/async Redis). Backends whose ordinary reads
+    // refresh LRU, including local and dummy, must override this API.
+    virtual std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                                 const KeyTypeVec &keys,
+                                                                 CacheLocationMapVector &out_locations) noexcept {
+        return GetLocations(request_context, keys, out_locations);
+    }
+
     // 检查 key 是否存在。
     // @param request_context   请求上下文；可为 nullptr
     // @param keys              待查询的 key 列表
@@ -459,9 +469,15 @@ public:
     // but a timestamp is unavailable or malformed, the candidate is returned
     // with last_access_time_us == 0 to preserve the reclaimer's historical
     // best-effort degradation.
+    // require_read_success distinguishes failed backend reads from missing or
+    // malformed timestamp values. In strict mode read failures fail the sample;
+    // missing or invalid values still degrade to zero. Keys known to have
+    // disappeared may be skipped. If a missing field cannot be distinguished
+    // from a missing key, retain the candidate for subsequent Location checks.
     virtual ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                               int64_t count,
-                                              ReclaimCandidateVector &out_candidates) noexcept = 0;
+                                              ReclaimCandidateVector &out_candidates,
+                                              bool require_read_success = false) noexcept = 0;
 
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）

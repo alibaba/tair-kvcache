@@ -176,6 +176,10 @@ TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegr
     EXPECT_EQ(0, candidates[1].last_access_time_us);
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestGroupLruStrictCandidateReadsPreserveLegacyFallback) {
+    AssertReclaimCandidateReadModes<MetaAsyncRedisBackend>();
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=0&async_max_batch=64");
     ASSERT_EQ(EC_BADARGS, backend_->Init("test_instance", config_));

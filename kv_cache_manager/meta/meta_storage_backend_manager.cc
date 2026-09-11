@@ -1690,6 +1690,73 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(RequestContext 
     return results;
 }
 
+namespace {
+
+// Same cache-first/fallback read view as online reads, without backfilling or
+// promoting either layer. A malformed result is a failure, never an empty value.
+template <typename Values, typename Read>
+std::vector<ErrorCode> ReadForMaintenance(const KeyVector &keys,
+                                          MetaStorageBackend *cache,
+                                          MetaStorageBackend *persistent,
+                                          bool cache_complete,
+                                          Values &out,
+                                          Read read) {
+    out.clear();
+    if (keys.empty()) {
+        return {};
+    }
+    const auto first = cache ? cache : persistent;
+    if (!first) {
+        out.resize(keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    auto results = read(first, keys, out);
+    if (results.size() != keys.size() || out.size() != keys.size()) {
+        out.assign(keys.size(), typename Values::value_type{});
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    if (!cache || cache_complete || !persistent) {
+        return results;
+    }
+    KeyVector missing;
+    std::vector<size_t> positions;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] == EC_NOENT) {
+            missing.push_back(keys[i]);
+            positions.push_back(i);
+        }
+    }
+    if (missing.empty()) {
+        return results;
+    }
+    Values fallback;
+    const auto fallback_results = read(persistent, missing, fallback);
+    const bool valid_shape = fallback_results.size() == missing.size() && fallback.size() == missing.size();
+    for (size_t i = 0; i < positions.size(); ++i) {
+        results[positions[i]] = valid_shape ? fallback_results[i] : EC_ERROR;
+        if (valid_shape && fallback_results[i] == EC_OK) {
+            out[positions[i]] = std::move(fallback[i]);
+        } else {
+            out[positions[i]].clear();
+        }
+    }
+    return results;
+}
+
+} // namespace
+
+std::vector<ErrorCode> MetaStorageBackendManager::GetLocationMapsForMaintenance(
+    RequestContext *request_context, const KeyVector &keys, CacheLocationMapVector &out_locations) noexcept {
+    return ReadForMaintenance(keys,
+                              cache_backend_.get(),
+                              persistent_backend_.get(),
+                              recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning,
+                              out_locations,
+                              [&](const auto &backend, const auto &batch, auto &out) {
+                                  return backend->GetLocationMapsForMaintenance(request_context, batch, out);
+                              });
+}
+
 std::vector<ErrorCode> MetaStorageBackendManager::GetProperties(RequestContext *request_context,
                                                                 const KeyVector &keys,
                                                                 const std::vector<std::string> &field_names,
@@ -1868,24 +1935,27 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
 
 ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,
                                                              const int64_t count,
-                                                             ReclaimCandidateVector &out_candidates) noexcept {
+                                                             ReclaimCandidateVector &out_candidates,
+                                                             bool require_read_success) noexcept {
     out_candidates.clear();
     if (count <= 0) {
         return EC_OK;
     }
     if (!cache_backend_) {
-        return persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+        return persistent_backend_->SampleReclaimCandidates(
+            request_context, count, out_candidates, require_read_success);
     }
 
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
     }
 
     // The persistent layer is the only complete key source while recovery is
     // still backfilling the hot cache. Its timestamps can be stale, however,
     // so overlay every cache hit with the current in-memory timestamp using a
     // no-touch exact-key lookup. Cache misses retain the persistent timestamp.
-    ErrorCode ec = persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates);
+    ErrorCode ec =
+        persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
     if (ec != EC_OK) {
         out_candidates.clear();
         return ec;

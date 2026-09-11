@@ -132,7 +132,7 @@ TEST_F(StartupConfigLoaderTest, TestLoad) {
         auto [ec, ig] = registry_manager->GetInstanceGroup(request_context1, "default");
         ASSERT_EQ(ErrorCode::EC_OK, ec);
         ASSERT_TRUE(ig);
-        ASSERT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
+        ASSERT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU,
                   ig->cache_config()->reclaim_strategy()->instance_reclaim_budget_policy());
         auto [ec2, config_vec] = registry_manager->ListStorage(request_context2);
         ASSERT_EQ(ErrorCode::EC_OK, ec2);
@@ -151,7 +151,7 @@ TEST_F(StartupConfigLoaderTest, TestLoad) {
         auto [ec, ig] = registry_manager->GetInstanceGroup(request_context1, "default");
         ASSERT_EQ(ErrorCode::EC_OK, ec);
         ASSERT_TRUE(ig);
-        ASSERT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
+        ASSERT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU,
                   ig->cache_config()->reclaim_strategy()->instance_reclaim_budget_policy());
         auto [ec2, config_vec] = registry_manager->ListStorage(request_context2);
         ASSERT_EQ(ErrorCode::EC_OK, ec2);

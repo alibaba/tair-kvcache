@@ -146,6 +146,30 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, fair_plan_truncated_instance_count);
     DECLARE_METRICS(cache_reclaimer, fair_item_capped_count);
     DECLARE_METRICS(cache_reclaimer, fair_sampling_size_normalized_count);
+    DECLARE_METRICS(cache_reclaimer, fair_rotation_resume_count);
+    DECLARE_METRICS(cache_reclaimer, fair_rotation_advance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_plan_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_partial_plan_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_plan_failure_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_eligible_instance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_started_instance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_collected_instance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_skipped_instance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_failed_instance_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_sampled_key_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_candidate_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_selected_block_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_submitted_block_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_invalid_time_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_delete_request_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_request_limit_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_watermark_stop_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_scope_change_stop_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_backpressure_stop_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_deadline_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_collect_duration_us);
+    DECLARE_METRICS(cache_reclaimer, group_lru_sort_duration_us);
+    DECLARE_METRICS(cache_reclaimer, group_lru_submit_duration_us);
 
     DECLARE_METRICS(cache_reclaimer, reclaim_cron_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_quota_duration_us);
@@ -434,6 +458,30 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_plan_truncated_instance_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_item_capped_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, fair_sampling_size_normalized_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, fair_rotation_resume_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, fair_rotation_advance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_plan_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_partial_plan_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_plan_failure_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_eligible_instance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_started_instance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_collected_instance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_skipped_instance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_failed_instance_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_sampled_key_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_candidate_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_selected_block_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_submitted_block_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_invalid_time_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_delete_request_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_request_limit_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_watermark_stop_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_scope_change_stop_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_backpressure_stop_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_deadline_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_collect_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_sort_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_submit_duration_us);
 
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_quota_duration_us);
@@ -758,6 +806,30 @@ void KmonitorMetricsReporter::ReportInterval() {
         std::uint64_t fair_plan_truncated_instance_count_v;
         std::uint64_t fair_item_capped_count_v;
         std::uint64_t fair_sampling_size_normalized_count_v;
+        std::uint64_t fair_rotation_resume_count_v;
+        std::uint64_t fair_rotation_advance_count_v;
+        std::uint64_t group_lru_plan_count_v;
+        std::uint64_t group_lru_partial_plan_count_v;
+        std::uint64_t group_lru_plan_failure_count_v;
+        std::uint64_t group_lru_eligible_instance_count_v;
+        std::uint64_t group_lru_started_instance_count_v;
+        std::uint64_t group_lru_collected_instance_count_v;
+        std::uint64_t group_lru_skipped_instance_count_v;
+        std::uint64_t group_lru_failed_instance_count_v;
+        std::uint64_t group_lru_sampled_key_count_v;
+        std::uint64_t group_lru_candidate_count_v;
+        std::uint64_t group_lru_selected_block_count_v;
+        std::uint64_t group_lru_submitted_block_count_v;
+        std::uint64_t group_lru_invalid_time_count_v;
+        std::uint64_t group_lru_delete_request_count_v;
+        std::uint64_t group_lru_request_limit_count_v;
+        std::uint64_t group_lru_watermark_stop_count_v;
+        std::uint64_t group_lru_scope_change_stop_count_v;
+        std::uint64_t group_lru_backpressure_stop_count_v;
+        std::uint64_t group_lru_deadline_count_v;
+        double group_lru_collect_duration_us_v;
+        double group_lru_sort_duration_us_v;
+        double group_lru_submit_duration_us_v;
 
         double reclaim_cron_duration_us_v;
         double reclaim_quota_duration_us_v;
@@ -809,6 +881,30 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, fair_plan_truncated_instance_count, fair_plan_truncated_instance_count_v);
         GET_METRICS_(cr, cache_reclaimer, fair_item_capped_count, fair_item_capped_count_v);
         GET_METRICS_(cr, cache_reclaimer, fair_sampling_size_normalized_count, fair_sampling_size_normalized_count_v);
+        GET_METRICS_(cr, cache_reclaimer, fair_rotation_resume_count, fair_rotation_resume_count_v);
+        GET_METRICS_(cr, cache_reclaimer, fair_rotation_advance_count, fair_rotation_advance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_plan_count, group_lru_plan_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_partial_plan_count, group_lru_partial_plan_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_plan_failure_count, group_lru_plan_failure_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_eligible_instance_count, group_lru_eligible_instance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_started_instance_count, group_lru_started_instance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_collected_instance_count, group_lru_collected_instance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_skipped_instance_count, group_lru_skipped_instance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_failed_instance_count, group_lru_failed_instance_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_sampled_key_count, group_lru_sampled_key_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_candidate_count, group_lru_candidate_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_selected_block_count, group_lru_selected_block_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_submitted_block_count, group_lru_submitted_block_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_invalid_time_count, group_lru_invalid_time_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_delete_request_count, group_lru_delete_request_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_request_limit_count, group_lru_request_limit_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_watermark_stop_count, group_lru_watermark_stop_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_scope_change_stop_count, group_lru_scope_change_stop_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_backpressure_stop_count, group_lru_backpressure_stop_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_deadline_count, group_lru_deadline_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_collect_duration_us, group_lru_collect_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_sort_duration_us, group_lru_sort_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_submit_duration_us, group_lru_submit_duration_us_v);
 
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
@@ -867,6 +963,53 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer,
                        fair_sampling_size_normalized_count,
                        static_cast<double>(fair_sampling_size_normalized_count_v));
+        REPORT_METRICS(cache_reclaimer, fair_rotation_resume_count, static_cast<double>(fair_rotation_resume_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, fair_rotation_advance_count, static_cast<double>(fair_rotation_advance_count_v));
+        REPORT_METRICS(cache_reclaimer, group_lru_plan_count, static_cast<double>(group_lru_plan_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_partial_plan_count, static_cast<double>(group_lru_partial_plan_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_plan_failure_count, static_cast<double>(group_lru_plan_failure_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_eligible_instance_count,
+                       static_cast<double>(group_lru_eligible_instance_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_started_instance_count, static_cast<double>(group_lru_started_instance_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_collected_instance_count,
+                       static_cast<double>(group_lru_collected_instance_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_skipped_instance_count, static_cast<double>(group_lru_skipped_instance_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_failed_instance_count, static_cast<double>(group_lru_failed_instance_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_sampled_key_count, static_cast<double>(group_lru_sampled_key_count_v));
+        REPORT_METRICS(cache_reclaimer, group_lru_candidate_count, static_cast<double>(group_lru_candidate_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_selected_block_count, static_cast<double>(group_lru_selected_block_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_submitted_block_count, static_cast<double>(group_lru_submitted_block_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_invalid_time_count, static_cast<double>(group_lru_invalid_time_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_delete_request_count, static_cast<double>(group_lru_delete_request_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_request_limit_count, static_cast<double>(group_lru_request_limit_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_watermark_stop_count, static_cast<double>(group_lru_watermark_stop_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_scope_change_stop_count,
+                       static_cast<double>(group_lru_scope_change_stop_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_backpressure_stop_count,
+                       static_cast<double>(group_lru_backpressure_stop_count_v));
+        REPORT_METRICS(cache_reclaimer, group_lru_deadline_count, static_cast<double>(group_lru_deadline_count_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_collect_duration_us, static_cast<double>(group_lru_collect_duration_us_v));
+        REPORT_METRICS(cache_reclaimer, group_lru_sort_duration_us, static_cast<double>(group_lru_sort_duration_us_v));
+        REPORT_METRICS(
+            cache_reclaimer, group_lru_submit_duration_us, static_cast<double>(group_lru_submit_duration_us_v));
 
         REPORT_METRICS(cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);

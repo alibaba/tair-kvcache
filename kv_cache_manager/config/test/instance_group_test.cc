@@ -311,24 +311,76 @@ TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPe
               restored.reclaim_strategy()->instance_reclaim_budget_policy());
 }
 
-TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoDefaultsToUsageProportional) {
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoDefaultsToGroupLru) {
     proto::admin::CacheConfig proto_config;
     proto_config.mutable_reclaim_strategy();
 
     CacheConfig restored;
     ProtoConvert::CacheConfigFromProto(&proto_config, restored);
     ASSERT_NE(nullptr, restored.reclaim_strategy());
-    EXPECT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL,
-              restored.reclaim_strategy()->instance_reclaim_budget_policy());
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU, restored.reclaim_strategy()->instance_reclaim_budget_policy());
 }
 
-TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyJsonDefaultsToUsageProportionalAndAcceptsFixedPerInstance) {
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyJsonDefaultsToGroupLruAndPreservesExplicitModes) {
     CacheReclaimStrategy reclaim_strategy;
     ASSERT_TRUE(reclaim_strategy.FromJsonString("{}"));
-    EXPECT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL, reclaim_strategy.instance_reclaim_budget_policy());
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU, reclaim_strategy.instance_reclaim_budget_policy());
 
     ASSERT_TRUE(reclaim_strategy.FromJsonString(R"({"instance_reclaim_budget_policy": 1})"));
     EXPECT_EQ(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE, reclaim_strategy.instance_reclaim_budget_policy());
+    ASSERT_TRUE(reclaim_strategy.FromJsonString(R"({"instance_reclaim_budget_policy": 0})"));
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL, reclaim_strategy.instance_reclaim_budget_policy());
+    ASSERT_TRUE(reclaim_strategy.FromJsonString(R"({"instance_reclaim_budget_policy": 2})"));
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU, reclaim_strategy.instance_reclaim_budget_policy());
+    CacheReclaimStrategy restored;
+    ASSERT_TRUE(restored.FromJsonString(reclaim_strategy.ToJsonString()));
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU, restored.instance_reclaim_budget_policy());
+}
+
+TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyPresencePreservesExplicitZeroOnWire) {
+    for (auto mode : {proto::admin::USAGE_PROPORTIONAL, proto::admin::FIXED_PER_INSTANCE, proto::admin::GROUP_LRU}) {
+        proto::admin::CacheConfig original;
+        original.mutable_reclaim_strategy()->set_instance_reclaim_budget_policy(mode);
+        proto::admin::CacheConfig decoded;
+        ASSERT_TRUE(decoded.ParseFromString(original.SerializeAsString()));
+        ASSERT_EQ(proto::admin::CacheReclaimStrategy::kInstanceReclaimBudgetPolicy,
+                  decoded.reclaim_strategy().instance_reclaim_budget_policy_presence_case());
+        CacheConfig model;
+        ProtoConvert::CacheConfigFromProto(&decoded, model);
+        EXPECT_EQ(static_cast<InstanceReclaimBudgetPolicy>(mode),
+                  model.reclaim_strategy()->instance_reclaim_budget_policy());
+        proto::admin::CacheConfig round_trip;
+        ProtoConvert::CacheConfigToProto(model, &round_trip);
+        EXPECT_EQ(proto::admin::CacheReclaimStrategy::kInstanceReclaimBudgetPolicy,
+                  round_trip.reclaim_strategy().instance_reclaim_budget_policy_presence_case());
+        EXPECT_EQ(mode, round_trip.reclaim_strategy().instance_reclaim_budget_policy());
+    }
+    // An old proto3 client's implicit zero serializes identically to absence.
+    proto::admin::CacheConfig old_client;
+    old_client.mutable_reclaim_strategy();
+    EXPECT_EQ(proto::admin::CacheReclaimStrategy::INSTANCE_RECLAIM_BUDGET_POLICY_PRESENCE_NOT_SET,
+              old_client.reclaim_strategy().instance_reclaim_budget_policy_presence_case());
+    CacheConfig restored;
+    ProtoConvert::CacheConfigFromProto(&old_client, restored);
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::GROUP_LRU, restored.reclaim_strategy()->instance_reclaim_budget_policy());
+}
+
+TEST_F(InstanceGroupTest, GroupLruRejectsUnsupportedReclaimPoliciesButKeepsLegacyFallback) {
+    CacheReclaimStrategy strategy;
+    strategy.set_storage_unique_name("nfs_01");
+    for (auto policy : {ReclaimPolicy::POLICY_UNSPECIFIED,
+                        ReclaimPolicy::POLICY_LRU,
+                        ReclaimPolicy::POLICY_LFU,
+                        ReclaimPolicy::POLICY_TTL}) {
+        strategy.set_reclaim_policy(policy);
+        strategy.set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::GROUP_LRU);
+        std::string invalid;
+        EXPECT_EQ(policy == ReclaimPolicy::POLICY_UNSPECIFIED || policy == ReclaimPolicy::POLICY_LRU,
+                  strategy.ValidateRequiredFields(invalid));
+        strategy.set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
+        invalid.clear();
+        EXPECT_TRUE(strategy.ValidateRequiredFields(invalid));
+    }
 }
 
 TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyValidationRejectsUnknownValue) {

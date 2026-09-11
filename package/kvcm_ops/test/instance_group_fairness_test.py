@@ -36,9 +36,9 @@ def _make_instance_group(instance_reclaim_budget_policy="USAGE_PROPORTIONAL"):
 
 
 class ReclaimStrategyBudgetPolicyTest(unittest.TestCase):
-    def test_defaults_to_usage_proportional(self):
+    def test_defaults_to_group_lru(self):
         self.assertEqual(
-            "USAGE_PROPORTIONAL",
+            "GROUP_LRU",
             ReclaimStrategy().to_json_data()["instance_reclaim_budget_policy"])
 
     def test_json_round_trip_preserves_fixed_per_instance(self):
@@ -48,12 +48,12 @@ class ReclaimStrategyBudgetPolicyTest(unittest.TestCase):
             "FIXED_PER_INSTANCE",
             restored.to_json_data()["instance_reclaim_budget_policy"])
 
-    def test_missing_json_field_defaults_to_usage_proportional(self):
+    def test_missing_json_field_defaults_to_group_lru(self):
         data = ReclaimStrategy(instance_reclaim_budget_policy="FIXED_PER_INSTANCE").to_json_data()
         del data["instance_reclaim_budget_policy"]
         restored = ReclaimStrategy.from_json_data(data)
         self.assertEqual(
-            "USAGE_PROPORTIONAL",
+            "GROUP_LRU",
             restored.to_json_data()["instance_reclaim_budget_policy"])
 
     def test_unknown_policy_is_rejected(self):
@@ -62,6 +62,15 @@ class ReclaimStrategyBudgetPolicyTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ReclaimStrategy.from_json_data(data)
 
+    def test_group_lru_round_trip_and_policy_validation(self):
+        for mode in ("GROUP_LRU", "USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+            data = ReclaimStrategy(instance_reclaim_budget_policy=mode).to_json_data()
+            self.assertEqual(mode, ReclaimStrategy.from_json_data(data).to_json_data()["instance_reclaim_budget_policy"])
+        for policy in ("POLICY_LFU", "POLICY_TTL"):
+            with self.assertRaises(RuntimeError):
+                ReclaimStrategy(reclaim_policy=policy, instance_reclaim_budget_policy="GROUP_LRU")
+            ReclaimStrategy(reclaim_policy=policy, instance_reclaim_budget_policy="USAGE_PROPORTIONAL")
+
 
 class BudgetPolicyValueTest(unittest.TestCase):
     def test_valid_values(self):
@@ -69,7 +78,8 @@ class BudgetPolicyValueTest(unittest.TestCase):
                 ("usage_proportional", "USAGE_PROPORTIONAL"),
                 ("USAGE_PROPORTIONAL", "USAGE_PROPORTIONAL"),
                 ("fixed_per_instance", "FIXED_PER_INSTANCE"),
-                ("FIXED_PER_INSTANCE", "FIXED_PER_INSTANCE")):
+                ("FIXED_PER_INSTANCE", "FIXED_PER_INSTANCE"),
+                ("group_lru", "GROUP_LRU")):
             with self.subTest(value=value):
                 self.assertEqual(expected, instance_reclaim_budget_policy_value(value))
 
@@ -87,8 +97,8 @@ class ParseInstanceGroupArgsTest(unittest.TestCase):
         with patch("sys.argv", argv):
             return parse_instance_group_args(is_create=is_create)
 
-    def test_create_defaults_to_usage_proportional(self):
-        self.assertEqual("USAGE_PROPORTIONAL", self._parse(True).instance_reclaim_budget_policy)
+    def test_create_defaults_to_group_lru(self):
+        self.assertEqual("GROUP_LRU", self._parse(True).instance_reclaim_budget_policy)
 
     def test_create_accepts_fixed_per_instance(self):
         self.assertEqual(
@@ -124,6 +134,12 @@ class UpdateInstanceGroupTest(unittest.TestCase):
         self.assertEqual(
             "FIXED_PER_INSTANCE",
             self._run_update("FIXED_PER_INSTANCE", "--user_data", "changed"))
+
+    def test_omitted_preserves_group_lru_from_server(self):
+        self.assertEqual("GROUP_LRU", self._run_update("GROUP_LRU", "--user_data", "changed"))
+
+    def test_omitted_preserves_usage_proportional_from_server(self):
+        self.assertEqual("USAGE_PROPORTIONAL", self._run_update("USAGE_PROPORTIONAL", "--user_data", "changed"))
 
     def test_explicit_value_overrides_server_value(self):
         self.assertEqual(

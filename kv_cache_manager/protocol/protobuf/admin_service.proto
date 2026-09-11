@@ -194,6 +194,7 @@ enum ReclaimPolicy {
 enum InstanceReclaimBudgetPolicy {
     USAGE_PROPORTIONAL = 0;
     FIXED_PER_INSTANCE = 1;
+    GROUP_LRU = 2;
 }
 
 message QuotaConfig {
@@ -214,7 +215,11 @@ message CacheReclaimStrategy {
     int32 reclaim_step_size = 5;       // 每次回收的步长绝对值,如100GiB
     int32 reclaim_step_percentage = 6; // 每次回收的步长相对比例,如回收5%的数据量
     int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
-    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = 8;
+    // Preserve field 8's enum wire format, while distinguishing missing from explicit 0.
+    // Missing uses the application default GROUP_LRU; explicit 0 retains USAGE_PROPORTIONAL.
+    oneof instance_reclaim_budget_policy_presence {
+        InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = 8;
+    }
 }
 
 // ===== 多层存储迁移（Tiered Storage Migration）配置 =====

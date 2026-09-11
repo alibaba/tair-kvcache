@@ -100,7 +100,8 @@ public:
               uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
               std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
               std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE,
-              CacheGarbageCollector::Config cache_gc_config = {});
+              CacheGarbageCollector::Config cache_gc_config = {},
+              CacheReclaimerGroupLruConfig group_lru_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();

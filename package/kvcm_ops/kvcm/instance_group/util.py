@@ -103,7 +103,7 @@ class ReclaimStrategy(JsonData):
                  reclaim_step_size: int = 0,
                  reclaim_step_percentage: float = 0.0,
                  delay_before_delete_ms: int = 1000,
-                 instance_reclaim_budget_policy: str = "USAGE_PROPORTIONAL",
+                 instance_reclaim_budget_policy: str = "GROUP_LRU",
                  ):
         self._storage_unique_name = storage_unique_name
         self._reclaim_policy = reclaim_policy
@@ -133,15 +133,18 @@ class ReclaimStrategy(JsonData):
 
     def check(self) -> bool:
         _reclaim_policy = self._reclaim_policy.upper()
-        if _reclaim_policy not in ["POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
-            raise RuntimeError(f"reclaim_policy {_reclaim_policy} invalid, support POLICY_LRU|POLICY_LFU|POLICY_TTL")
+        if _reclaim_policy not in ["POLICY_UNSPECIFIED", "POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
+            raise RuntimeError(f"reclaim_policy {_reclaim_policy} invalid")
         self._reclaim_policy = _reclaim_policy
         if not isinstance(self._instance_reclaim_budget_policy, str):
             raise RuntimeError("instance_reclaim_budget_policy must be a string")
         self._instance_reclaim_budget_policy = self._instance_reclaim_budget_policy.strip().upper()
-        if self._instance_reclaim_budget_policy not in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+        if self._instance_reclaim_budget_policy not in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE", "GROUP_LRU"):
             raise RuntimeError(
-                "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
+                "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL, FIXED_PER_INSTANCE or GROUP_LRU")
+        if (self._instance_reclaim_budget_policy == "GROUP_LRU" and
+                self._reclaim_policy not in ("POLICY_UNSPECIFIED", "POLICY_LRU")):
+            raise RuntimeError("GROUP_LRU requires POLICY_LRU or POLICY_UNSPECIFIED")
         return True
 
     @classmethod
@@ -164,7 +167,7 @@ class ReclaimStrategy(JsonData):
             reclaim_step_percentage = float(json_data["reclaim_step_percentage"])
         if JsonData.expect_exist("delay_before_delete_ms", json_data, (str, int)):
             delay_before_delete_ms = int(json_data["delay_before_delete_ms"])
-        instance_reclaim_budget_policy = "USAGE_PROPORTIONAL"
+        instance_reclaim_budget_policy = "GROUP_LRU"
         if JsonData.maybe_exist("instance_reclaim_budget_policy", json_data, str):
             instance_reclaim_budget_policy = json_data["instance_reclaim_budget_policy"]
         return cls(
@@ -183,10 +186,10 @@ def instance_reclaim_budget_policy_value(value: str) -> str:
     if not isinstance(value, str):
         raise argparse.ArgumentTypeError("instance_reclaim_budget_policy must be a string")
     normalized = value.strip().upper()
-    if normalized in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE"):
+    if normalized in ("USAGE_PROPORTIONAL", "FIXED_PER_INSTANCE", "GROUP_LRU"):
         return normalized
     raise argparse.ArgumentTypeError(
-        "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL or FIXED_PER_INSTANCE")
+        "instance_reclaim_budget_policy must be USAGE_PROPORTIONAL, FIXED_PER_INSTANCE or GROUP_LRU")
 
 
 class MetaStorageBackendConfig(JsonData):
@@ -561,9 +564,9 @@ def parse_instance_group_args(is_create: bool):
     parser.add_argument(
         "--instance_reclaim_budget_policy",
         type=instance_reclaim_budget_policy_value,
-        default="USAGE_PROPORTIONAL" if is_create else argparse.SUPPRESS,
+        default="GROUP_LRU" if is_create else argparse.SUPPRESS,
         help=(
-            "cross-instance reclaim budget policy: USAGE_PROPORTIONAL or FIXED_PER_INSTANCE. "
+            "cross-instance reclaim mode: GROUP_LRU (default), USAGE_PROPORTIONAL or FIXED_PER_INSTANCE. "
             "On update, omit to keep the server-side value"
         )
     )
