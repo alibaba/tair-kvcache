@@ -82,3 +82,21 @@ py_test(
         "//kv_cache_manager/client/pybind:kvcm_py_client_lib",
     ],
 )
+
+py_test(
+    name = "KvMetaObjectPythonClientTest",
+    size = "small",
+    srcs = [
+        "asan_runner.py",
+        "kv_meta_object_client_py_test.py",
+    ],
+    args = [
+        "$(location lsan_suppressions.txt)",
+        "$(location kv_meta_object_client_py_test.py)",
+    ],
+    data = ["lsan_suppressions.txt"],
+    main = "asan_runner.py",
+    deps = [
+        "//kv_cache_manager/client:kv_meta_object_py_client",
+    ],
+)
