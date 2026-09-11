@@ -662,9 +662,9 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
     }
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (require_read_success && property_results[i] == EC_NOENT) {
-            continue;
-        }
+        // A missing LRU field maps to EC_NOENT, just like a missing key.
+        // Keep the candidate at time zero; later Location reads exclude keys
+        // that actually disappeared, without an additional existence query.
         int64_t last_access_time_us = 0;
         const auto it = properties[i].find(PROPERTY_LRU_TIME);
         if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {

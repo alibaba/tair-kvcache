@@ -239,7 +239,7 @@ struct GroupLruCandidate {
 
 排序统一使用 `PROPERTY_LRU_TIME` 的微秒时间戳升序，时间相同时按 `instance_id`、block key 排序，保证可复现。V1 已确认：成功读取但属性缺失 / 解析失败的单个 key 沿用历史 LRU 的时间 0 退化规则；新模式将非正时间也归一化为 0，并记录异常时间计数。这不是证明异常 key 一定最冷，而是避免它们因时间不可用长期无法回收的兼容性取舍；优先排序范围从原来的 Instance 内扩大到了整个 Group。批量读取错误必须走局部失败，不能当成所有 key 的时间都是 0。LRU 时间可能在采样后更新，V1 不增加阻塞前台访问的全局快照锁，因此只承诺采样时刻的近似次序。
 
-候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，已消失的 key 跳过，成功读取但时间缺失 / 非法仍按 0 处理。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
+候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，时间缺失 / 非法仍按 0 保留候选。Redis / async Redis 查询 LRU 字段时，`EC_NOENT` 既可能表示字段缺失，也可能表示 key 已消失，因此不能在采样阶段据此直接丢弃 key；恢复时仍有机会使用内存时间，真正已消失或不可删除的 key 由后续 Location 检查排除，不增加额外的存在性查询。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
 
 Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 

@@ -12,6 +12,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/meta_redis_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/types.h"
@@ -557,6 +558,31 @@ TEST_F(MetaStorageBackendManagerTest, TestGroupLruStrictReadModeReachesSelectedB
     ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 1, candidates));
     EXPECT_EQ((std::vector<bool>{true, true}), persistent_ptr->read_modes);
     EXPECT_EQ((std::vector<bool>{true, false}), cache_ptr->read_modes);
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestGroupLruRecoveryRetainsRedisCandidatesWithoutLru) {
+    for (const auto lookup_result : {EC_OK, EC_NOENT}) {
+        SCOPED_TRACE(static_cast<int>(lookup_result));
+        MetaStorageBackendManager mgr;
+        auto persistent = std::make_unique<ScriptedReclaimReadBackend<MetaRedisBackend>>();
+        persistent->errors = {EC_NOENT, EC_NOENT};
+        persistent->properties = {{}, {}};
+        auto cache = std::make_unique<RecordingReclaimBackend>(22, 999, lookup_result);
+        auto *cache_ptr = cache.get();
+        mgr.persistent_backend_ = std::move(persistent);
+        mgr.cache_backend_ = std::move(cache);
+        mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+
+        ReclaimCandidateVector candidates;
+        ASSERT_EQ(EC_OK, mgr.SampleReclaimCandidates(nullptr, 2, candidates, true));
+        ASSERT_EQ(2, candidates.size());
+        EXPECT_EQ(1, candidates[0].key);
+        EXPECT_EQ(2, candidates[1].key);
+        for (const auto &candidate : candidates) {
+            EXPECT_EQ(lookup_result == EC_OK ? 999 : 0, candidate.last_access_time_us);
+        }
+        EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+    }
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesFallsBackForRecoveryCacheMiss) {

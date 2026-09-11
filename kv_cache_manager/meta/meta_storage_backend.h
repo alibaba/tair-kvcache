@@ -470,8 +470,10 @@ public:
     // with last_access_time_us == 0 to preserve the reclaimer's historical
     // best-effort degradation.
     // require_read_success distinguishes failed backend reads from missing or
-    // malformed timestamp values. In strict mode read failures fail the sample
-    // and disappeared keys are skipped; invalid values still degrade to zero.
+    // malformed timestamp values. In strict mode read failures fail the sample;
+    // missing or invalid values still degrade to zero. Keys known to have
+    // disappeared may be skipped. If a missing field cannot be distinguished
+    // from a missing key, retain the candidate for subsequent Location checks.
     virtual ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                               int64_t count,
                                               ReclaimCandidateVector &out_candidates,
