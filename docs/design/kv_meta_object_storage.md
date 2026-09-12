@@ -420,6 +420,11 @@ provider 的标准/未知异常收敛为脱敏告警并继续处理后续 sessio
 失败后不进入进程内重试队列，因为现有可复用地址型 URI 没有 allocation generation；不确定结果若被重放，可能
 删除已经复用同一地址的后继对象。这里选择可运维回收的 orphan，而不是数据破坏。
 
+独立 `KvMetaServiceGRpc` 还在每个 handler 最外层覆盖 request-context 创建和 service implementation 调用。
+标准或未知异常都被截断为不含 provider 文本、key 或 endpoint 的固定错误，并返回非 OK gRPC `INTERNAL`；response
+中的局部结果会先清空。对 Put/Remove/Trim 等 mutation，这个 transport 状态明确表示结果未知，client 不得把它
+当成普通应用错误自动重放。该防火墙只编译进独立 KVMeta gRPC service，不改变既有 Meta/Admin 主链路处理方式。
+
 ### 9.2 caller buffer 生命周期
 
 exact-object worker 使用非阻塞入队，因此 `sdk_config.queue_size` 必须至少为 64。队列压力导致部分任务无法接纳

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/grpc_service/kv_meta_service_grpc.h"
 
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -31,57 +32,85 @@ void KvMetaServiceGRpc::Init() {
 grpc::Status KvMetaServiceGRpc::RegisterInstance(grpc::ServerContext *context,
                                                  const proto::kv_meta::RegisterInstanceRequest *request,
                                                  proto::kv_meta::RegisterInstanceResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaRegisterInstance);
-    service_impl_->RegisterInstance(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("RegisterInstance", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaRegisterInstance);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->RegisterInstance(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::GetInstanceInfo(grpc::ServerContext *context,
                                                 const proto::kv_meta::GetInstanceInfoRequest *request,
                                                 proto::kv_meta::GetInstanceInfoResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaGetInstanceInfo);
-    service_impl_->GetInstanceInfo(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("GetInstanceInfo", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaGetInstanceInfo);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->GetInstanceInfo(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::Get(grpc::ServerContext *context,
                                     const proto::kv_meta::GetRequest *request,
                                     proto::kv_meta::GetResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaGet);
-    service_impl_->Get(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("Get", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaGet);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->Get(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::PutStart(grpc::ServerContext *context,
                                          const proto::kv_meta::PutStartRequest *request,
                                          proto::kv_meta::PutStartResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaPutStart);
-    service_impl_->PutStart(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("PutStart", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaPutStart);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->PutStart(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::PutFinish(grpc::ServerContext *context,
                                           const proto::kv_meta::PutFinishRequest *request,
                                           proto::kv_meta::CommonResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaPutFinish);
-    service_impl_->PutFinish(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("PutFinish", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaPutFinish);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->PutFinish(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::Remove(grpc::ServerContext *context,
                                        const proto::kv_meta::RemoveRequest *request,
                                        proto::kv_meta::CommonResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaRemove);
-    service_impl_->Remove(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("Remove", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaRemove);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->Remove(request_context, request, response);
+    });
 }
 
 grpc::Status KvMetaServiceGRpc::Trim(grpc::ServerContext *context,
                                      const proto::kv_meta::TrimRequest *request,
                                      proto::kv_meta::CommonResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaTrim);
-    service_impl_->Trim(request_context, request, response);
-    return grpc::Status::OK;
+    return InvokeSafely("Trim", response, [&]() {
+        API_CONTEXT_INIT_GRPC(KvMetaTrim);
+        if (service_impl_ == nullptr) {
+            throw std::logic_error("KVMeta service implementation is unavailable");
+        }
+        service_impl_->Trim(request_context, request, response);
+    });
 }
 
 #undef MAKE_KV_META_SERVICE_METRICS_COLLECTOR
