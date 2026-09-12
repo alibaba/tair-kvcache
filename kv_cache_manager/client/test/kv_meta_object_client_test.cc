@@ -1,6 +1,10 @@
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -9,6 +13,23 @@
 
 namespace kv_cache_manager {
 namespace {
+
+static_assert(kKvMetaObjectClientApiVersion == 1);
+
+TEST(KvMetaObjectClientVersionTest, SharedLibraryExportsHeaderCapabilityVersion) {
+    EXPECT_EQ(GetKvMetaObjectClientApiVersion(), kKvMetaObjectClientApiVersion);
+}
+
+enum class ThrowMode { NONE, STANDARD, UNKNOWN };
+
+void ThrowIfRequested(ThrowMode mode) {
+    if (mode == ThrowMode::STANDARD) {
+        throw std::runtime_error("injected provider detail");
+    }
+    if (mode == ThrowMode::UNKNOWN) {
+        throw 7;
+    }
+}
 
 KvMetaValueLocation MakeLocation(const std::string &uri, std::uint64_t size) {
     KvMetaValueLocation location;
@@ -24,6 +45,32 @@ BlockBuffer MakeBuffer(void *base, std::size_t size) {
     return buffer;
 }
 
+KvMetaObjectClientConfig MakeStaticallyValidCreateConfig() {
+    KvMetaObjectClientConfig config;
+    config.metadata.instance_id = "metadata-instance";
+    config.metadata.call_timeout_ms = 1;
+    config.instance_group = "metadata-group";
+    config.transfer_client_config = R"({
+        "instance_group": "metadata-group",
+        "instance_id": "metadata-instance",
+        "block_size": 1,
+        "sdk_config": {
+            "thread_num": 2,
+            "queue_size": 64,
+            "sdk_backend_configs": [],
+            "timeout_config": {
+                "get_timeout_ms": 10,
+                "put_timeout_ms": 10
+            }
+        },
+        "location_spec_infos": {"value": 1}
+    })";
+    config.transfer_init_params.role_type = RoleType::WORKER;
+    config.transfer_init_params.self_location_spec_name = "value";
+    config.write_timeout_seconds = 1;
+    return config;
+}
+
 class FakeKvMetaClient final : public KvMetaClient {
 public:
     std::pair<ClientErrorCode, std::string>
@@ -36,6 +83,7 @@ public:
     std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
                                                     const std::vector<std::string> &keys) override {
         ++get_calls;
+        ThrowIfRequested(get_throw);
         get_trace = trace_id;
         gotten_keys = keys;
         return {get_ec, get_result};
@@ -46,6 +94,7 @@ public:
                                                                   const std::vector<std::uint64_t> &value_sizes,
                                                                   std::int32_t write_timeout_seconds) override {
         ++start_calls;
+        ThrowIfRequested(start_throw);
         start_trace = trace_id;
         started_keys = keys;
         started_sizes = value_sizes;
@@ -57,6 +106,7 @@ public:
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override {
         ++finish_calls;
+        ThrowIfRequested(finish_throw);
         finish_trace = trace_id;
         finished_session = write_session_id;
         finished_keys = success_keys;
@@ -65,6 +115,7 @@ public:
 
     ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override {
         ++remove_calls;
+        ThrowIfRequested(remove_throw);
         remove_trace = trace_id;
         removed_keys = keys;
         return remove_ec;
@@ -76,6 +127,10 @@ public:
     ClientErrorCode start_ec{ER_OK};
     ClientErrorCode finish_ec{ER_OK};
     ClientErrorCode remove_ec{ER_OK};
+    ThrowMode get_throw{ThrowMode::NONE};
+    ThrowMode start_throw{ThrowMode::NONE};
+    ThrowMode finish_throw{ThrowMode::NONE};
+    ThrowMode remove_throw{ThrowMode::NONE};
     KvMetaGetResult get_result;
     KvMetaStartWriteResult start_result;
     int get_calls{0};
@@ -101,6 +156,7 @@ public:
                                 const std::vector<std::uint64_t> &value_sizes,
                                 const BlockBuffers &buffers) override {
         ++load_calls;
+        ThrowIfRequested(load_throw);
         loaded_uris = uris;
         loaded_sizes = value_sizes;
         loaded_buffer_count = buffers.size();
@@ -115,6 +171,7 @@ public:
                                                       const std::vector<std::uint64_t> &value_sizes,
                                                       const BlockBuffers &buffers) override {
         ++save_calls;
+        ThrowIfRequested(save_throw);
         saved_uris = uris;
         saved_sizes = value_sizes;
         saved_buffer_count = buffers.size();
@@ -127,6 +184,8 @@ public:
 
     ClientErrorCode load_ec{ER_OK};
     ClientErrorCode save_ec{ER_OK};
+    ThrowMode load_throw{ThrowMode::NONE};
+    ThrowMode save_throw{ThrowMode::NONE};
     UriStrVec actual_uris;
     int load_calls{0};
     int save_calls{0};
@@ -205,6 +264,18 @@ TEST_F(KvMetaObjectClientTest, StartFailureDoesNotReadWriteOrFinish) {
     EXPECT_EQ(0, metadata_->finish_calls);
 }
 
+TEST_F(KvMetaObjectClientTest, StartExceptionsBecomeAmbiguousErrorsWithoutDataIo) {
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        metadata_->start_throw = mode;
+
+        EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("start-threw", keys_, sizes_, buffers_));
+        EXPECT_EQ(0, metadata_->get_calls);
+        EXPECT_EQ(0, transfer_->save_calls);
+        EXPECT_EQ(0, metadata_->finish_calls);
+    }
+}
+
 TEST_F(KvMetaObjectClientTest, RejectsLegacyInflightMaskAndRollsBackOwnedMisses) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {true, false};
@@ -241,6 +312,25 @@ TEST_F(KvMetaObjectClientTest, ExistingSizeMismatchPreventsMissWriteAndRollsBack
     EXPECT_EQ(0, transfer_->save_calls);
     ASSERT_EQ(1, metadata_->finish_calls);
     EXPECT_EQ((std::vector<bool>{false}), metadata_->finished_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, CompatibilityGetExceptionsAbortOwnedMisses) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {true, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        metadata_->get_throw = mode;
+
+        EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+        EXPECT_EQ(0, transfer_->save_calls);
+        EXPECT_EQ((std::vector<bool>{false}), metadata_->finished_keys);
+    }
+    EXPECT_EQ(2, metadata_->get_calls);
+    EXPECT_EQ(2, metadata_->finish_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, VerifiesAllCommittedHitsWithoutStartingDataIo) {
@@ -304,6 +394,25 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenTransferFails) {
     EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
 }
 
+TEST_F(KvMetaObjectClientTest, DataPlaneSaveExceptionsAreContainedAndAbortTheSession) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        transfer_->save_throw = mode;
+
+        EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+        EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
+    }
+    EXPECT_EQ(2, transfer_->save_calls);
+    EXPECT_EQ(2, metadata_->finish_calls);
+}
+
 TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
@@ -338,6 +447,24 @@ TEST_F(KvMetaObjectClientTest, PropagatesCommitFailureWithoutRepeatingDataWrite)
     EXPECT_EQ((std::vector<bool>{true, true}), metadata_->finished_keys);
 }
 
+TEST_F(KvMetaObjectClientTest, CommitExceptionsBecomeAmbiguousErrorsWithoutRepeatingDataWrite) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        metadata_->finish_throw = mode;
+
+        EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    }
+    EXPECT_EQ(2, transfer_->save_calls);
+    EXPECT_EQ(2, metadata_->finish_calls);
+}
+
 TEST_F(KvMetaObjectClientTest, ReturnsRollbackErrorWhenAbortOutcomeIsUnknown) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
@@ -349,6 +476,23 @@ TEST_F(KvMetaObjectClientTest, ReturnsRollbackErrorWhenAbortOutcomeIsUnknown) {
     transfer_->save_ec = ER_SDKWRITE_ERROR;
 
     EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+}
+
+TEST_F(KvMetaObjectClientTest, RollbackExceptionsBecomeAmbiguousErrors) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    transfer_->save_ec = ER_SDKWRITE_ERROR;
+
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        metadata_->finish_throw = mode;
+        EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    }
+    EXPECT_EQ(2, metadata_->finish_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, RejectsBadBufferBeforeMetadataMutation) {
@@ -389,6 +533,29 @@ TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) 
     EXPECT_EQ(sizes_, transfer_->loaded_sizes);
 }
 
+TEST_F(KvMetaObjectClientTest, MetadataAndDataPlaneLoadExceptionsAreContained) {
+    metadata_->get_result.hit_mask = {true, true};
+    metadata_->get_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE("metadata");
+        metadata_->get_throw = mode;
+        EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("load", keys_, sizes_, buffers_));
+    }
+    EXPECT_EQ(0, transfer_->load_calls);
+
+    metadata_->get_throw = ThrowMode::NONE;
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE("data plane");
+        transfer_->load_throw = mode;
+        EXPECT_EQ(ER_SDKREAD_ERROR, client_->LoadObjects("load", keys_, sizes_, buffers_));
+    }
+    EXPECT_EQ(2, transfer_->load_calls);
+}
+
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataMiss) {
     metadata_->get_result.hit_mask = {true, false};
     metadata_->get_result.locations = {
@@ -409,6 +576,35 @@ TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataSizeMismatch) {
 
     EXPECT_EQ(ER_SERVICE_SIZE_MISMATCH, client_->LoadObjects("trace", keys_, sizes_, buffers_));
     EXPECT_EQ(0, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMismatch) {
+    metadata_->get_result.hit_mask = {true, true};
+    const auto valid_second = MakeLocation("file://nfs/second?size=9", sizeof(second_));
+    const auto expect_internal = [&](KvMetaValueLocation malformed) {
+        metadata_->get_result.locations = {std::move(malformed), valid_second};
+        EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+        EXPECT_EQ(0, transfer_->load_calls);
+    };
+
+    auto malformed = MakeLocation("file://nfs/first?size=5", sizeof(first_));
+    malformed.type = KvMetaStorageType::UNSPECIFIED;
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("file://nfs/first?size=5", sizeof(first_));
+    malformed.type = static_cast<KvMetaStorageType>(999);
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("file://nfs/first?size=5", sizeof(first_));
+    malformed.location_specs.push_back({"unexpected", "file://nfs/other?size=5"});
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("file://nfs/first?size=5", sizeof(first_));
+    malformed.location_specs[0].spec_name = "unexpected";
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("", sizeof(first_));
+    expect_internal(std::move(malformed));
 }
 
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMalformedMetadataAlignment) {
@@ -445,6 +641,15 @@ TEST_F(KvMetaObjectClientTest, RemoveValidatesBeforeMetadataAndForwardsResult) {
     EXPECT_EQ(1, metadata_->remove_calls);
     EXPECT_EQ("remove-trace", metadata_->remove_trace);
     EXPECT_EQ(keys_, metadata_->removed_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, RemoveExceptionsBecomeAmbiguousErrors) {
+    for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        metadata_->remove_throw = mode;
+        EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->Remove("remove", keys_));
+    }
+    EXPECT_EQ(2, metadata_->remove_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, RejectsServiceLimitViolationsBeforeMetadataCalls) {
@@ -505,6 +710,11 @@ TEST_F(KvMetaObjectClientTest, RejectsMalformedObjectVectorsAndIovsBeforeMetadat
     expect_invalid_buffers(malformed);
 
     malformed = buffers_;
+    malformed[0].iovs[0].base =
+        reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - sizeof(first_) + 1);
+    expect_invalid_buffers(malformed);
+
+    malformed = buffers_;
     malformed[0].iovs = {
         {MemoryType::CPU, first_, 3, false},
         {MemoryType::CPU, first_ + 3, 3, false},
@@ -515,6 +725,18 @@ TEST_F(KvMetaObjectClientTest, RejectsMalformedObjectVectorsAndIovsBeforeMetadat
     EXPECT_EQ(0, metadata_->get_calls);
     EXPECT_EQ(0, transfer_->save_calls);
     EXPECT_EQ(0, transfer_->load_calls);
+}
+
+TEST(KvMetaObjectClientDependencyTest, MissingInternalDependenciesFailClosed) {
+    char payload = 0;
+    KvMetaObjectClientImpl client(nullptr, nullptr, 1024, 30);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<std::uint64_t> sizes{1};
+    const BlockBuffers buffers{MakeBuffer(&payload, 1)};
+
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("trace", keys, sizes, buffers));
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.LoadObjects("trace", keys, sizes, buffers));
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.Remove("trace", keys));
 }
 
 TEST(KvMetaObjectClientLimitTest, AcceptsExactBatchByteLimitAndRejectsTheNextObjectBeforeMetadata) {
@@ -566,6 +788,70 @@ TEST(KvMetaObjectClientCreateTest, RejectsGroupIdentityMismatchBeforeMetadataReg
     auto [ec, client] = KvMetaObjectClient::Create("trace", config);
     EXPECT_EQ(ER_INVALID_CLIENT_CONFIG, ec);
     EXPECT_EQ(nullptr, client);
+}
+
+TEST(KvMetaObjectClientCreateTest, RejectsMalformedLocalRegistrationBeforeMetadataInitialization) {
+    auto config = MakeStaticallyValidCreateConfig();
+    RegistSpan span;
+    config.transfer_init_params.regist_span = &span;
+
+    span.base = reinterpret_cast<void *>(0x1000);
+    auto [partial_span_ec, partial_span_client] = KvMetaObjectClient::Create("trace", config);
+    EXPECT_EQ(ER_INVALID_PARAMS, partial_span_ec);
+    EXPECT_EQ(nullptr, partial_span_client);
+
+    span.base = reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 3);
+    span.size = 4;
+    auto [overflow_span_ec, overflow_span_client] = KvMetaObjectClient::Create("trace", config);
+    EXPECT_EQ(ER_INVALID_PARAMS, overflow_span_ec);
+    EXPECT_EQ(nullptr, overflow_span_client);
+
+    config.transfer_init_params.regist_span = nullptr;
+    SharedMemoryRegistration partial_registration;
+    partial_registration.base = reinterpret_cast<void *>(0x1000);
+    auto [partial_shm_ec, partial_shm_client] =
+        KvMetaObjectClient::Create("trace", config, partial_registration);
+    EXPECT_EQ(ER_INVALID_PARAMS, partial_shm_ec);
+    EXPECT_EQ(nullptr, partial_shm_client);
+
+    SharedMemoryRegistration invalid_fd_registration;
+    invalid_fd_registration.base = reinterpret_cast<void *>(0x1000);
+    invalid_fd_registration.size = 4096;
+    invalid_fd_registration.fd = std::numeric_limits<int>::max();
+    auto [invalid_fd_ec, invalid_fd_client] =
+        KvMetaObjectClient::Create("trace", config, invalid_fd_registration);
+    EXPECT_EQ(ER_INVALID_PARAMS, invalid_fd_ec);
+    EXPECT_EQ(nullptr, invalid_fd_client);
+
+    std::unique_ptr<FILE, decltype(&std::fclose)> backing_file(std::tmpfile(), &std::fclose);
+    ASSERT_NE(nullptr, backing_file);
+    ASSERT_EQ(0, ftruncate(fileno(backing_file.get()), 8));
+
+    SharedMemoryRegistration overflowing_registration;
+    overflowing_registration.base =
+        reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 3);
+    overflowing_registration.size = 4;
+    overflowing_registration.fd = fileno(backing_file.get());
+    auto [overflowing_registration_ec, overflowing_registration_client] =
+        KvMetaObjectClient::Create("trace", config, overflowing_registration);
+    EXPECT_EQ(ER_INVALID_PARAMS, overflowing_registration_ec);
+    EXPECT_EQ(nullptr, overflowing_registration_client);
+
+    SharedMemoryRegistration undersized_registration;
+    undersized_registration.base = reinterpret_cast<void *>(0x1000);
+    undersized_registration.size = 9;
+    undersized_registration.fd = fileno(backing_file.get());
+    auto [undersized_registration_ec, undersized_registration_client] =
+        KvMetaObjectClient::Create("trace", config, undersized_registration);
+    EXPECT_EQ(ER_INVALID_PARAMS, undersized_registration_ec);
+    EXPECT_EQ(nullptr, undersized_registration_client);
+
+    // The explicitly disabled registration remains valid and reaches the next
+    // initialization stage. Empty metadata addresses then fail locally.
+    SharedMemoryRegistration disabled_registration;
+    auto [disabled_ec, disabled_client] = KvMetaObjectClient::Create("trace", config, disabled_registration);
+    EXPECT_EQ(ER_METACLIENT_INIT_ERROR, disabled_ec);
+    EXPECT_EQ(nullptr, disabled_client);
 }
 
 TEST(KvMetaObjectClientCreateTest, RejectsInstanceIdentityMismatchBeforeMetadataRegistration) {

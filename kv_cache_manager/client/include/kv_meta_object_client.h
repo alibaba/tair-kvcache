@@ -11,6 +11,17 @@
 
 namespace kv_cache_manager {
 
+// Increment when the Python-visible object API changes incompatibly.  The
+// packaged Python wrapper checks this value before constructing native state so
+// a stale extension cannot silently reinterpret exact-size object requests.
+inline constexpr std::uint32_t kKvMetaObjectClientApiVersion = 1;
+
+// Returns the capability version compiled into kv_cache_manager_client.so.
+// Consumers should compare this with kKvMetaObjectClientApiVersion before
+// constructing native state, so a newer header cannot be paired silently with
+// an incompatible shared library.
+std::uint32_t GetKvMetaObjectClientApiVersion() noexcept;
+
 // Configuration for the isolated exact-key object path. The regular
 // ManagerClient/TransferClient path does not read or enable this policy.
 struct KvMetaObjectClientConfig {

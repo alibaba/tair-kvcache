@@ -43,6 +43,17 @@ class KvMetaObjectClientWheelTest(unittest.TestCase):
         self.assertIn("Requires-Python: >=3.9", metadata)
         self.assertIn("Classifier: Programming Language :: Python :: 3", metadata)
 
+    def test_public_package_exports_object_api_capability_marker(self):
+        package_source = self.archive.read(
+            "kv_cache_manager/client/__init__.py"
+        ).decode("utf-8")
+        wrapper_source = self.archive.read(
+            "kv_cache_manager/client/kv_meta_object_client.py"
+        ).decode("utf-8")
+
+        self.assertIn("KV_META_OBJECT_API_VERSION", package_source)
+        self.assertIn("KV_META_OBJECT_API_VERSION = 1", wrapper_source)
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

@@ -1,5 +1,6 @@
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,12 @@ TEST_F(KvMetaTransferClientTest, RejectsIgnoredOrOversizedObjects) {
     buffer.iovs[0].ignore = true;
     const UriStrVec ignored_uri = {"file://test_nfs/" + root_path_ + "ignored?blkid=0&size=5"};
     EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client->LoadObjects(ignored_uri, {payload.size()}, {buffer}));
+
+    auto overflowing_buffer =
+        MakeBuffer(reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - payload.size() + 1),
+                   payload.size());
+    EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS,
+              client->LoadObjects(ignored_uri, {payload.size()}, {overflowing_buffer}));
 }
 
 TEST_F(KvMetaTransferClientTest, RejectsMaxObjectSizeAboveTheServiceContract) {

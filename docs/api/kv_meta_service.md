@@ -250,6 +250,11 @@ client.close()
 可能具有不确定结果。异常 `KvMetaObjectClientError` 会给出 batch 位置、已确认完成数量及
 `unknown_outcome`，由拥有 key 生命周期的上层决定审计或清理策略。
 
+wheel 的 package 与 native extension 同时导出 `KV_META_OBJECT_API_VERSION=1`，extension 的值来自所链接 client
+shared library 的版本查询。高层 client 在 native client 初始化前校验版本、必需类型、枚举成员和工厂方法；版本缺失
+或不匹配直接失败，避免 Python wrapper、extension 与 client library 混装。
+native mutation 若返回未知/畸形 code，也按 `unknown_outcome=True` 失败关闭，不能把它解释成可安全重试的明确拒绝。
+
 ### 8.2 底层客户端
 
 需要自行编排事务时可以分别使用：
