@@ -205,6 +205,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 
 ### 恢复阶段的 jemalloc arena 轮换（进程环境变量）
 
+单线程恢复会将缓存对象集中分配到一个 arena，后续请求线程在其他 arena 分配更新对象时，旧 arena 中尚未完全空闲的 slab 难以释放、其中的空洞也难以被新分配复用，可能导致 key 数和业务缓存用量稳定而 RSS 持续上涨。
+
 `KVCM_RECOVER_ARENA_ROTATION_ENABLED` 默认 `true`，设为 `false` 可关闭。
 这是当前单线程恢复的过渡方案：按非空批次轮换 arena，以改善恢复对象的分配分布。
 arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per-CPU arena 模式时不生效。
