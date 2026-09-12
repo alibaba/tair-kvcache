@@ -252,6 +252,15 @@ ErrorCode MetaStorageBackendManager::Close() noexcept {
 
 void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
     KVCM_LOG_INFO("meta storage backend manager async recover started, instance[%s]", instance_id_.c_str());
+    // TODO(recovery-executor): Arena rotation is a transitional workaround for
+    // single-threaded recovery. Introduce a bounded business worker pool shared
+    // by HTTP/gRPC request handling and recovery, separate from transport IO.
+    // Dispatch cache-object construction/deserialization AND insertion to those
+    // workers, rather than only enqueueing already-created objects. This aligns
+    // recovery and request allocations without arena switching and allows
+    // parallel recovery batches. Preserve retry/write/tombstone protections,
+    // bound in-flight work, and drain tasks before publishing recovery complete
+    // or closing the backend; retire rotation once this path is validated.
     ScopedJemallocArenaRotation arena_rotation(EnvUtil::GetEnv("KVCM_RECOVER_ARENA_ROTATION_ENABLED", true));
     std::string cursor = SCAN_BASE_CURSOR;
     int64_t total_backfilled_keys = 0;
