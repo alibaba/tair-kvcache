@@ -65,6 +65,11 @@ public:
         // never retained in output.
         std::string_view reporter_medium;
         std::string_view reporter_host;
+        // Optional request-owned projection of one physical reporter onto one
+        // or more schedulable engine identities. Shared L2 reporters use this
+        // to contribute their specs to every active ranked L1P5 engine without
+        // duplicating the stored CacheLocation or its physical Vineyard URI.
+        const std::vector<std::string> *logical_hosts = nullptr;
     };
     using CheckHostCacheLocationFunc =
         std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
