@@ -4,8 +4,8 @@
 
 namespace kv_cache_manager {
 
-// Thread-confined scope: spreads successive allocation batches across jemalloc's
-// automatic arenas and restores the caller's binding on every exit path.
+// Thread-confined scope: rotates the calling thread's binding across jemalloc's
+// automatic arenas and attempts to restore the original binding on scope exit.
 // Existing allocations and tcache entries keep their original arena ownership.
 class ScopedJemallocArenaRotation {
 public:
@@ -19,7 +19,9 @@ public:
     ScopedJemallocArenaRotation(const ScopedJemallocArenaRotation &) = delete;
     ScopedJemallocArenaRotation &operator=(const ScopedJemallocArenaRotation &) = delete;
 
-    void NextBatch();
+    // Select the next automatic arena without flushing tcache. The first call
+    // keeps the original arena if it is automatic; subsequent calls advance.
+    void Rotate();
 
 private:
     static Mallctl ResolveMallctl();

@@ -62,7 +62,7 @@ void ScopedJemallocArenaRotation::Initialize() {
         "jemalloc recovery arena rotation enabled, arenas[%u] original_arena[%u]", arena_count_, original_arena_);
 }
 
-void ScopedJemallocArenaRotation::NextBatch() {
+void ScopedJemallocArenaRotation::Rotate() {
     if (!active_) {
         return;
     }

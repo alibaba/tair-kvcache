@@ -302,7 +302,7 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
             // failed keys disappear before recovery is published complete.
             // Bind before Get allocates/deserializes the cache objects. Retries
             // keep this batch's arena; scope exit restores the original binding.
-            arena_rotation.NextBatch();
+            arena_rotation.Rotate();
             has_pending_batch = true;
         }
         CacheLocationMapVector locations;

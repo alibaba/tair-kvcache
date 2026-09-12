@@ -38,32 +38,10 @@ redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
 
 ### 恢复阶段的 jemalloc arena 轮换
 
-系统环境变量 `KVCM_RECOVER_ARENA_ROTATION_ENABLED` 默认 `true`。
-设为 `false` 可禁用；每次启动后台 metadata 恢复任务时读取。
-这是直接读取的进程环境变量，不是 `kvcm.*` 配置项。
-
-启用时，恢复线程在每个非空 SCAN 批次的 Get/反序列化之前轮换一次
-`thread.arena`，使恢复出的缓存对象分布到多个 automatic arena。
-同一批 Get/回填重试保持绑定不变；恢复成功、失败或被 Close 中止时，
-作用域析构尝试恢复原线程绑定。现有扫描、回填、删除保护和恢复状态机不变。
-
-arena 数量通过当前进程 jemalloc 的 `opt.narenas` 读取，不硬编码，
-不把包含 oversize/manual arena 的 `arenas.narenas` 当作轮换范围，
-也不创建额外 arena。`MALLOC_CONF=narenas:8` 等 allocator 参数仍需在进程启动前设置；
-本功能不改变它们，也不改变在线请求线程的绑定。
-
-没有检测到接管 malloc 的 jemalloc、只有一个 arena、启用 per-CPU arena 模式，
-或控制接口查询失败时，保持原分配行为。切换失败时停止轮换并尝试恢复原绑定，
-不使 metadata 恢复任务失败。查询/切换异常会记录 warning。
-
-切换不强制 flush tcache；已有缓存块仍可能来自此前的 arena，
-因此它提供批次级的分布改善，不保证批次中每个对象都归属目标 arena。
-它不会移动现有对象，也不会整理已经形成的碎片。
-
-收益取决于恢复 arena 集合与在线更新线程实际使用的 arena 集合是否重合。
-arena 很多而在线线程只使用其中少数时，轮换后的部分空洞仍难以复用；
-应结合真实负载对比恢复耗时、allocated、active/RSS 和请求延迟，
-单独评估 arena 数量，不直接由 CPU 数量推导最优值。
+进程环境变量 `KVCM_RECOVER_ARENA_ROTATION_ENABLED` 默认 `true`，设为 `false` 可关闭。
+恢复线程按非空批次轮换 jemalloc arena，以改善恢复对象的分配分布。
+arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per-CPU arena 模式时不生效。
+本功能不调整 arena 数量，也不整理已有碎片。
 
 ### 通用服务配置
 
