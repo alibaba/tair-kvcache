@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -738,6 +739,76 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverRetriesSameBatchUntilFullyBackf
     EXPECT_EQ(2, cache_ptr->put_calls());
     EXPECT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
     EXPECT_TRUE(mgr.deleted_keys_.empty());
+}
+
+// Run with jemalloc preloaded to exercise the production resolver and actual
+// recovery-loop placement. Ordinary non-jemalloc test builds skip this case.
+TEST_F(MetaStorageBackendManagerTest, TestRecoverArenaRotationAndRetryWithJemalloc) {
+    using Control = int (*)(const char *, void *, size_t *, void *, size_t);
+    auto ctl = reinterpret_cast<Control>(dlsym(RTLD_DEFAULT, "mallctl"));
+    if (!ctl) {
+        GTEST_SKIP() << "requires jemalloc LD_PRELOAD";
+    }
+    unsigned count = 0, original = 0;
+    size_t size = sizeof(count);
+    ASSERT_EQ(0, ctl("opt.narenas", &count, &size, nullptr, 0));
+    const char *percpu = nullptr;
+    size = sizeof(percpu);
+    ASSERT_EQ(0, ctl("opt.percpu_arena", &percpu, &size, nullptr, 0));
+    if (count < 2 || !percpu || std::string(percpu) != "disabled") {
+        GTEST_SKIP() << "requires multiple automatic arenas and disabled percpu_arena";
+    }
+    size = sizeof(original);
+    ASSERT_EQ(0, ctl("thread.arena", &original, &size, nullptr, 0));
+
+    class RecordingBackend : public MetaLocalBackend {
+    public:
+        explicit RecordingBackend(Control control) : control_(control) {}
+        ErrorCode ListKeys(RequestContext *,
+                           const std::string &,
+                           const int64_t,
+                           std::string &cursor,
+                           KeyTypeVec &keys) noexcept override {
+            ++scans;
+            cursor = scans == 3 ? "0" : "more";
+            keys = scans == 1 ? KeyTypeVec{} : KeyTypeVec{scans};
+            return EC_OK;
+        }
+        std::vector<ErrorCode> Get(RequestContext *,
+                                   const KeyTypeVec &keys,
+                                   CacheLocationMapVector &locations,
+                                   PropertyMapVector &properties) noexcept override {
+            unsigned arena = 0;
+            size_t size = sizeof(arena);
+            EXPECT_EQ(0, control_("thread.arena", &arena, &size, nullptr, 0));
+            observed.push_back(arena);
+            locations.resize(keys.size());
+            properties.resize(keys.size());
+            return std::vector<ErrorCode>(keys.size(), observed.size() == 1 ? EC_ERROR : EC_OK);
+        }
+        Control control_;
+        int scans = 0;
+        std::vector<unsigned> observed;
+    };
+
+    for (bool enabled : {true, false}) {
+        ScopedEnv env("KVCM_RECOVER_ARENA_ROTATION_ENABLED", enabled ? "true" : "false");
+        MetaStorageBackendManager mgr;
+        auto backend = std::make_unique<RecordingBackend>(ctl);
+        auto *record = backend.get();
+        mgr.persistent_backend_ = std::move(backend);
+        mgr.cache_backend_ = std::make_unique<RecoverContractCacheBackend>();
+        mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+        mgr.AsyncRecoverTask();
+        EXPECT_EQ(3, record->scans);
+        const unsigned first = enabled && original >= count ? 0 : original;
+        EXPECT_EQ(record->observed, (std::vector<unsigned>{first, first, enabled ? (first + 1) % count : first}));
+        EXPECT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
+        unsigned restored = 0;
+        size = sizeof(restored);
+        ASSERT_EQ(0, ctl("thread.arena", &restored, &size, nullptr, 0));
+        EXPECT_EQ(original, restored);
+    }
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestMalformedWriteShapesFailClosed) {

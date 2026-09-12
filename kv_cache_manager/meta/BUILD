@@ -94,6 +94,8 @@ cc_library(
         ":meta_storage_backend",
         ":types",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:env_util",
+        "//kv_cache_manager/common:scoped_jemalloc_arena_rotation",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",

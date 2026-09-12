@@ -8,9 +8,11 @@
 #include <unordered_set>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/scoped_jemalloc_arena_rotation.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -250,6 +252,7 @@ ErrorCode MetaStorageBackendManager::Close() noexcept {
 
 void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
     KVCM_LOG_INFO("meta storage backend manager async recover started, instance[%s]", instance_id_.c_str());
+    ScopedJemallocArenaRotation arena_rotation(EnvUtil::GetEnv("KVCM_RECOVER_ARENA_ROTATION_ENABLED", true));
     std::string cursor = SCAN_BASE_CURSOR;
     int64_t total_backfilled_keys = 0;
     int consecutive_failures = 0;
@@ -297,6 +300,9 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
             // batch, retain those exact keys across Get/backfill retries;
             // rescanning the cursor could return a different set and let the
             // failed keys disappear before recovery is published complete.
+            // Bind before Get allocates/deserializes the cache objects. Retries
+            // keep this batch's arena; scope exit restores the original binding.
+            arena_rotation.NextBatch();
             has_pending_batch = true;
         }
         CacheLocationMapVector locations;

@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "scoped_jemalloc_arena_rotation_test",
+    srcs = ["scoped_jemalloc_arena_rotation_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:scoped_jemalloc_arena_rotation",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "EnvUtilTest",
     srcs = [
         "env_util_test.cc",
