@@ -33,29 +33,39 @@ public:
 
     std::pair<ClientErrorCode, KvMetaInstanceInfo> GetInstanceInfo(const std::string &) override { return {ER_OK, {}}; }
 
-    std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &, const std::vector<std::string> &) override {
+    std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
+                                                    const std::vector<std::string> &keys) override {
         ++get_calls;
+        get_trace = trace_id;
+        gotten_keys = keys;
         return {get_ec, get_result};
     }
 
-    std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &,
-                                                                  const std::vector<std::string> &,
-                                                                  const std::vector<std::uint64_t> &,
-                                                                  std::int32_t) override {
+    std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
+                                                                  const std::vector<std::string> &keys,
+                                                                  const std::vector<std::uint64_t> &value_sizes,
+                                                                  std::int32_t write_timeout_seconds) override {
         ++start_calls;
+        start_trace = trace_id;
+        started_keys = keys;
+        started_sizes = value_sizes;
+        started_timeout_seconds = write_timeout_seconds;
         return {start_ec, start_result};
     }
 
-    ClientErrorCode FinishWrite(const std::string &,
+    ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override {
         ++finish_calls;
+        finish_trace = trace_id;
         finished_session = write_session_id;
         finished_keys = success_keys;
         return finish_ec;
     }
 
-    ClientErrorCode Remove(const std::string &, const std::vector<std::string> &keys) override {
+    ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override {
+        ++remove_calls;
+        remove_trace = trace_id;
         removed_keys = keys;
         return remove_ec;
     }
@@ -71,6 +81,15 @@ public:
     int get_calls{0};
     int start_calls{0};
     int finish_calls{0};
+    int remove_calls{0};
+    std::string get_trace;
+    std::string start_trace;
+    std::string finish_trace;
+    std::string remove_trace;
+    std::vector<std::string> gotten_keys;
+    std::vector<std::string> started_keys;
+    std::vector<std::uint64_t> started_sizes;
+    std::int32_t started_timeout_seconds{0};
     std::string finished_session;
     std::vector<bool> finished_keys;
     std::vector<std::string> removed_keys;
@@ -85,6 +104,10 @@ public:
         loaded_uris = uris;
         loaded_sizes = value_sizes;
         loaded_buffer_count = buffers.size();
+        loaded_bases.clear();
+        for (const auto &buffer : buffers) {
+            loaded_bases.push_back(buffer.iovs.empty() ? nullptr : buffer.iovs.front().base);
+        }
         return load_ec;
     }
 
@@ -95,6 +118,10 @@ public:
         saved_uris = uris;
         saved_sizes = value_sizes;
         saved_buffer_count = buffers.size();
+        saved_bases.clear();
+        for (const auto &buffer : buffers) {
+            saved_bases.push_back(buffer.iovs.empty() ? nullptr : buffer.iovs.front().base);
+        }
         return {save_ec, actual_uris.empty() ? uris : actual_uris};
     }
 
@@ -107,6 +134,8 @@ public:
     UriStrVec saved_uris;
     std::vector<std::uint64_t> loaded_sizes;
     std::vector<std::uint64_t> saved_sizes;
+    std::vector<void *> loaded_bases;
+    std::vector<void *> saved_bases;
     std::size_t loaded_buffer_count{0};
     std::size_t saved_buffer_count{0};
 };
@@ -146,13 +175,34 @@ TEST_F(KvMetaObjectClientTest, SavesOnlyMissingObjectsAndCommits) {
     };
 
     EXPECT_EQ(ER_OK, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ("trace", metadata_->start_trace);
+    EXPECT_EQ(keys_, metadata_->started_keys);
+    EXPECT_EQ(sizes_, metadata_->started_sizes);
+    EXPECT_EQ(30, metadata_->started_timeout_seconds);
     EXPECT_EQ(1, metadata_->get_calls);
+    EXPECT_EQ("trace", metadata_->get_trace);
+    EXPECT_EQ((std::vector<std::string>{"first"}), metadata_->gotten_keys);
     EXPECT_EQ(1, transfer_->save_calls);
+    EXPECT_EQ((UriStrVec{"file://nfs/object?size=9"}), transfer_->saved_uris);
     EXPECT_EQ((std::vector<std::uint64_t>{sizeof(second_)}), transfer_->saved_sizes);
+    EXPECT_EQ((std::vector<void *>{second_}), transfer_->saved_bases);
     EXPECT_EQ(1U, transfer_->saved_buffer_count);
     EXPECT_EQ(1, metadata_->finish_calls);
+    EXPECT_EQ("trace", metadata_->finish_trace);
     EXPECT_EQ("session", metadata_->finished_session);
     EXPECT_EQ((std::vector<bool>{true}), metadata_->finished_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, StartFailureDoesNotReadWriteOrFinish) {
+    metadata_->start_ec = ER_SERVICE_NOT_READY;
+
+    EXPECT_EQ(ER_SERVICE_NOT_READY, client_->SaveObjects("start-failed", keys_, sizes_, buffers_));
+
+    EXPECT_EQ(1, metadata_->start_calls);
+    EXPECT_EQ("start-failed", metadata_->start_trace);
+    EXPECT_EQ(0, metadata_->get_calls);
+    EXPECT_EQ(0, transfer_->save_calls);
+    EXPECT_EQ(0, metadata_->finish_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, RejectsLegacyInflightMaskAndRollsBackOwnedMisses) {
@@ -172,6 +222,24 @@ TEST_F(KvMetaObjectClientTest, RejectsLegacyInflightMaskAndRollsBackOwnedMisses)
     EXPECT_EQ(0, transfer_->save_calls);
     ASSERT_EQ(1, metadata_->finish_calls);
     EXPECT_EQ("session", metadata_->finished_session);
+    EXPECT_EQ((std::vector<bool>{false}), metadata_->finished_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, ExistingSizeMismatchPreventsMissWriteAndRollsBack) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {true, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    metadata_->get_result.hit_mask = {true};
+    metadata_->get_result.locations = {
+        MakeLocation("file://nfs/first?size=4", sizeof(first_) - 1),
+    };
+
+    EXPECT_EQ(ER_SERVICE_SIZE_MISMATCH, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, metadata_->get_calls);
+    EXPECT_EQ(0, transfer_->save_calls);
+    ASSERT_EQ(1, metadata_->finish_calls);
     EXPECT_EQ((std::vector<bool>{false}), metadata_->finished_keys);
 }
 
@@ -236,6 +304,40 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenTransferFails) {
     EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
 }
 
+TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    transfer_->actual_uris = {
+        "file://nfs/first?size=5",
+        "file://nfs/rewritten?size=9",
+    };
+
+    EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, transfer_->save_calls);
+    EXPECT_EQ(1, metadata_->finish_calls);
+    EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, PropagatesCommitFailureWithoutRepeatingDataWrite) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    metadata_->finish_ec = ER_INVALID_GRPCSTATUS;
+
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, metadata_->start_calls);
+    EXPECT_EQ(1, transfer_->save_calls);
+    EXPECT_EQ(1, metadata_->finish_calls);
+    EXPECT_EQ((std::vector<bool>{true, true}), metadata_->finished_keys);
+}
+
 TEST_F(KvMetaObjectClientTest, ReturnsRollbackErrorWhenAbortOutcomeIsUnknown) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
@@ -266,8 +368,25 @@ TEST_F(KvMetaObjectClientTest, LoadsOnlyAfterEveryKeyAndSizeMatches) {
 
     EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
     EXPECT_EQ(1, transfer_->load_calls);
+    EXPECT_EQ((UriStrVec{"file://nfs/first?size=5", "file://nfs/second?size=9"}), transfer_->loaded_uris);
     EXPECT_EQ(sizes_, transfer_->loaded_sizes);
+    EXPECT_EQ((std::vector<void *>{first_, second_}), transfer_->loaded_bases);
     EXPECT_EQ(2U, transfer_->loaded_buffer_count);
+}
+
+TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) {
+    metadata_->get_result.hit_mask = {true, true};
+    metadata_->get_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    transfer_->load_ec = ER_SDKREAD_ERROR;
+
+    EXPECT_EQ(ER_SDKREAD_ERROR, client_->LoadObjects("load", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, metadata_->get_calls);
+    EXPECT_EQ("load", metadata_->get_trace);
+    EXPECT_EQ(1, transfer_->load_calls);
+    EXPECT_EQ(sizes_, transfer_->loaded_sizes);
 }
 
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataMiss) {
@@ -290,6 +409,42 @@ TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataSizeMismatch) {
 
     EXPECT_EQ(ER_SERVICE_SIZE_MISMATCH, client_->LoadObjects("trace", keys_, sizes_, buffers_));
     EXPECT_EQ(0, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMalformedMetadataAlignment) {
+    metadata_->get_result.hit_mask = {true};
+    metadata_->get_result.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(0, transfer_->load_calls);
+
+    metadata_->get_result.hit_mask = {true, true};
+    metadata_->get_result.locations.pop_back();
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(0, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, RemoveValidatesBeforeMetadataAndForwardsResult) {
+    std::vector<std::string> too_many_keys;
+    for (std::size_t i = 0; i < 65; ++i) {
+        too_many_keys.push_back("key-" + std::to_string(i));
+    }
+
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->Remove("trace", {}));
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->Remove("trace", too_many_keys));
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->Remove("trace", {""}));
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->Remove("trace", {std::string(513, 'k')}));
+    EXPECT_EQ(ER_INVALID_PARAMS, client_->Remove("trace", {"duplicate", "duplicate"}));
+    EXPECT_EQ(0, metadata_->remove_calls);
+
+    metadata_->remove_ec = ER_SERVICE_NOT_READY;
+    EXPECT_EQ(ER_SERVICE_NOT_READY, client_->Remove("remove-trace", keys_));
+    EXPECT_EQ(1, metadata_->remove_calls);
+    EXPECT_EQ("remove-trace", metadata_->remove_trace);
+    EXPECT_EQ(keys_, metadata_->removed_keys);
 }
 
 TEST_F(KvMetaObjectClientTest, RejectsServiceLimitViolationsBeforeMetadataCalls) {
