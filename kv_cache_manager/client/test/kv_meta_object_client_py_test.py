@@ -1,6 +1,7 @@
+import gc
 import threading
-import time
 import unittest
+import weakref
 from enum import IntEnum
 from types import SimpleNamespace
 
@@ -54,6 +55,7 @@ class _FakeClient:
             "Remove": [],
         }
         self.closed = False
+        self.close_calls = 0
 
     def _result(self, method):
         results = self.results[method]
@@ -72,6 +74,7 @@ class _FakeClient:
         return self._result("Remove")
 
     def close(self):
+        self.close_calls += 1
         self.closed = True
 
 
@@ -164,16 +167,29 @@ class KvMetaObjectClientConfigTest(unittest.TestCase):
         cases = [
             ({"addresses": []}, ValueError),
             ({"addresses": "host:1"}, TypeError),
+            ({"addresses": None}, TypeError),
+            ({"addresses": [1]}, ValueError),
             ({"addresses": ["same", "same"]}, ValueError),
+            ({"addresses": [f"host-{index}" for index in range(65)]}, ValueError),
             ({"addresses": ["x" * 1025]}, ValueError),
             ({"instance_id": ""}, ValueError),
+            ({"instance_id": None}, ValueError),
+            ({"instance_group": ""}, ValueError),
             ({"instance_group": "x" * 513}, ValueError),
             ({"transfer_client_config": ""}, ValueError),
+            ({"transfer_client_config": None}, ValueError),
+            ({"user_data": b"bytes"}, TypeError),
             ({"user_data": "x" * (64 * 1024 + 1)}, ValueError),
             ({"call_timeout_ms": 0}, ValueError),
             ({"call_timeout_ms": True}, TypeError),
+            ({"call_timeout_ms": 1.0}, TypeError),
+            ({"write_timeout_seconds": True}, TypeError),
             ({"write_timeout_seconds": 1801}, ValueError),
+            ({"max_object_bytes": 0}, ValueError),
             ({"max_object_bytes": KV_META_MAX_OBJECT_BYTES + 1}, ValueError),
+            ({"memory_base": True}, ValueError),
+            ({"memory_size": -1}, ValueError),
+            ({"memory_fd": 1 << 31}, ValueError),
             ({"memory_base": 1, "memory_size": 0}, ValueError),
             ({"memory_fd": 3}, ValueError),
             ({"memory_base": (1 << 64) - 1, "memory_size": 1}, ValueError),
@@ -188,6 +204,26 @@ class KvMetaObjectClientConfigTest(unittest.TestCase):
             _config(instance_id="界" * 171)
         with self.assertRaisesRegex(ValueError, "valid UTF-8"):
             _config(transfer_client_config="\ud800")
+
+    def test_exact_config_boundaries_are_accepted_and_snapshotted(self):
+        addresses = [f"host-{index}" for index in range(64)]
+        config = _config(
+            addresses=iter(addresses),
+            instance_id="界" * 170 + "ab",
+            instance_group="g" * 512,
+            user_data="u" * (64 * 1024),
+            call_timeout_ms=600_000,
+            write_timeout_seconds=1800,
+            max_object_bytes=KV_META_MAX_OBJECT_BYTES,
+            memory_base=1,
+            memory_size=(1 << 64) - 2,
+            memory_fd=(1 << 31) - 1,
+        )
+
+        addresses[0] = "mutated"
+        self.assertEqual(len(config.addresses), 64)
+        self.assertEqual(config.addresses[0], "host-0")
+        self.assertEqual(len(config.instance_id.encode("utf-8")), 512)
 
 
 class KvMetaObjectBufferTest(unittest.TestCase):
@@ -213,7 +249,14 @@ class KvMetaObjectBufferTest(unittest.TestCase):
             (_Tensor(device="xpu"), ValueError),
             (_Tensor(count=0), ValueError),
             (_Tensor(count=-1), ValueError),
+            (_Tensor(count=True), ValueError),
+            (_Tensor(count=1 << 63, width=2), ValueError),
             (_Tensor(width=0), ValueError),
+            (_Tensor(width=True), ValueError),
+            (_Tensor(pointer=0), ValueError),
+            (_Tensor(pointer=True), TypeError),
+            (_Tensor(pointer=1.0), TypeError),
+            (_Tensor(pointer=(1 << 64) - 1, count=1, width=1), ValueError),
             (object(), ValueError),
             (SimpleNamespace(is_contiguous=lambda: True), TypeError),
         ]
@@ -227,7 +270,10 @@ class KvMetaObjectBufferTest(unittest.TestCase):
             (("", 1, 1), {}, ValueError),
             (("界" * 171, 1, 1), {}, ValueError),
             (("key", 0, 1), {}, ValueError),
+            (("key", True, 1), {}, TypeError),
             (("key", 1, 0), {}, ValueError),
+            (("key", 1, True), {}, TypeError),
+            (("key", 1, KV_META_MAX_OBJECT_BYTES + 1), {}, ValueError),
             (("key", (1 << 64) - 1, 1), {}, ValueError),
             (("key", 1, 1), {"memory": "xpu"}, ValueError),
         ]
@@ -235,6 +281,24 @@ class KvMetaObjectBufferTest(unittest.TestCase):
             with self.subTest(args=args, kwargs=kwargs):
                 with self.assertRaises(error):
                     KvMetaObjectBuffer(*args, **kwargs)
+
+    def test_exact_buffer_boundaries_and_string_memory_are_accepted(self):
+        max_key = "界" * 170 + "ab"
+        end_of_address_space = KvMetaObjectBuffer(
+            max_key,
+            (1 << 64) - 2,
+            1,
+            memory="gpu",
+        )
+        max_object = KvMetaObjectBuffer(
+            "max-object",
+            1,
+            KV_META_MAX_OBJECT_BYTES,
+        )
+
+        self.assertEqual(len(end_of_address_space.key.encode("utf-8")), 512)
+        self.assertEqual(end_of_address_space.memory, KvMetaObjectMemory.GPU)
+        self.assertEqual(max_object.nbytes, KV_META_MAX_OBJECT_BYTES)
 
 
 class KvMetaObjectClientTest(unittest.TestCase):
@@ -284,6 +348,32 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "init")
         self.assertEqual(raised.exception.code, _Code.ER_FAILED)
         self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
+    def test_create_exception_is_sanitized_and_chained(self):
+        pybind = _FakePybind()
+
+        def fail_create(*_args):
+            raise OSError("secret endpoint and credentials")
+
+        pybind.KvMetaObjectClient = SimpleNamespace(Create=fail_create)
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertEqual(raised.exception.operation, "init")
+        self.assertEqual(raised.exception.code, "OSError")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_malformed_create_result_fails_closed(self):
+        pybind = _FakePybind()
+        pybind.KvMetaObjectClient = SimpleNamespace(Create=lambda *_args: _Code.ER_OK)
+
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertEqual(raised.exception.operation, "init")
+        self.assertEqual(raised.exception.code, "TypeError")
 
     def test_invalid_binding_closes_injected_native_client(self):
         native = _FakeClient()
@@ -296,6 +386,17 @@ class KvMetaObjectClientTest(unittest.TestCase):
             )
 
         self.assertTrue(native.closed)
+
+    def test_missing_native_operation_closes_created_client(self):
+        native = _FakeClient()
+        native.LoadObjects = None
+        pybind = _FakePybind(native)
+
+        with self.assertRaisesRegex(TypeError, "missing SaveObjects"):
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
 
     def test_variable_sizes_and_cpu_cuda_iovs_reach_native_api(self):
         client, native, _ = _client(config=_config(max_object_bytes=64))
@@ -320,7 +421,36 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertEqual(save[4][0].iovs[0].type, _Memory.CPU)
         self.assertEqual(save[4][1].iovs[0].type, _Memory.GPU)
         self.assertEqual(save[4][0].iovs[0].base, 0x1000)
+        self.assertEqual(save[4][0].iovs[0].size, 12)
+        self.assertEqual(save[4][1].iovs[0].size, 14)
         self.assertFalse(save[4][0].iovs[0].ignore)
+
+    def test_raw_buffer_aliases_preserve_exact_order_and_sizes(self):
+        client, native, _ = _client(config=_config(max_object_bytes=64))
+        self.addCleanup(client.close)
+        owners = [object(), object(), object()]
+        objects = [
+            KvMetaObjectBuffer("one", 0x1000, 1, owner=owners[0]),
+            KvMetaObjectBuffer("seven", 0x2000, 7, KvMetaObjectMemory.GPU, owners[1]),
+            KvMetaObjectBuffer("thirteen", 0x3000, 13, owner=owners[2]),
+        ]
+
+        client.save_buffers(objects, trace_id="raw-save")
+        client.load_buffers(objects, trace_id="raw-load")
+
+        for call, operation, trace in zip(
+            native.calls,
+            ("SaveObjects", "LoadObjects"),
+            ("raw-save", "raw-load"),
+        ):
+            self.assertEqual(call[0], operation)
+            self.assertEqual(call[1], trace)
+            self.assertEqual(call[2], ["one", "seven", "thirteen"])
+            self.assertEqual(call[3], [1, 7, 13])
+            self.assertEqual(
+                [block.iovs[0].base for block in call[4]],
+                [0x1000, 0x2000, 0x3000],
+            )
 
     def test_count_and_byte_limits_split_one_logical_save(self):
         client, native, _ = _client()
@@ -345,6 +475,25 @@ class KvMetaObjectClientTest(unittest.TestCase):
         ]
         client.save_buffers(byte_objects, trace_id="bytes")
         self.assertEqual([len(call[2]) for call in native.calls], [4, 1])
+
+    def test_generated_traces_are_unique_and_batch_qualified(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        objects = [
+            KvMetaObjectBuffer(f"key-{index}", 0x1000 + index, 1)
+            for index in range(KV_META_MAX_BATCH_ITEMS + 1)
+        ]
+
+        client.save_buffers(objects)
+        first_traces = [call[1] for call in native.calls]
+        native.calls.clear()
+        client.load_buffers(objects)
+        second_traces = [call[1] for call in native.calls]
+
+        self.assertRegex(first_traces[0], r"^kvcm-py-save-[0-9a-f]{32}:batch-1-of-2$")
+        self.assertEqual(first_traces[1], first_traces[0].replace("batch-1", "batch-2"))
+        self.assertRegex(second_traces[0], r"^kvcm-py-load-[0-9a-f]{32}:batch-1-of-2$")
+        self.assertNotEqual(first_traces[0], second_traces[0])
 
     def test_whole_operation_is_validated_before_first_native_call(self):
         client, native, _ = _client()
@@ -404,6 +553,43 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertIsInstance(remove_error.exception.__cause__, OSError)
         self.assertNotIn("endpoint", str(remove_error.exception))
 
+    def test_load_failure_stops_before_later_batches_and_is_not_ambiguous(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        native.results["LoadObjects"] = [_Code.ER_FAILED]
+        objects = [
+            KvMetaObjectBuffer(f"key-{index}", 0x1000 + index, 1)
+            for index in range(KV_META_MAX_BATCH_ITEMS + 1)
+        ]
+
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            client.load_buffers(objects, trace_id="load")
+
+        error = raised.exception
+        self.assertEqual(error.operation, "load")
+        self.assertEqual(error.batch_index, 0)
+        self.assertEqual(error.batch_count, 2)
+        self.assertEqual(error.batch_start, 0)
+        self.assertEqual(error.batch_size, KV_META_MAX_BATCH_ITEMS)
+        self.assertEqual(error.completed_items, 0)
+        self.assertFalse(error.unknown_outcome)
+        self.assertEqual(len(native.calls), 1)
+
+    def test_native_load_exception_is_sanitized_and_not_ambiguous(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+
+        def fail_load(*_args):
+            raise OSError("secret object key")
+
+        native.LoadObjects = fail_load
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            client.load(["key"], [_Tensor()])
+
+        self.assertFalse(raised.exception.unknown_outcome)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertNotIn("secret", str(raised.exception))
+
     def test_malformed_zero_like_codes_are_not_success(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
@@ -433,6 +619,28 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertEqual(error.completed_items, 1)
         self.assertTrue(error.unknown_outcome)
 
+    def test_remove_success_batches_all_keys_and_empty_remove_is_a_noop(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        keys = [f"key-{index}" for index in range(129)]
+
+        client.remove(keys, trace_id="remove")
+        client.remove([])
+
+        self.assertEqual([len(call[2]) for call in native.calls], [64, 64, 1])
+        self.assertEqual(
+            [call[1] for call in native.calls],
+            [
+                "remove:batch-1-of-3",
+                "remove:batch-2-of-3",
+                "remove:batch-3-of-3",
+            ],
+        )
+        self.assertEqual(
+            [key for call in native.calls for key in call[2]],
+            keys,
+        )
+
     def test_trace_key_and_object_limit_validation_precedes_native_io(self):
         client, native, _ = _client(config=_config(max_object_bytes=8))
         self.addCleanup(client.close)
@@ -440,7 +648,12 @@ class KvMetaObjectClientTest(unittest.TestCase):
             lambda: client.save((key for key in ["a"]), [_Tensor()]),
             lambda: client.save(["a"], (_Tensor(),)),
             lambda: client.save(["a"], [_Tensor(count=9, width=1)]),
+            lambda: client.save(["a"], [_Tensor()], trace_id=1),
+            lambda: client.save(["a"], [_Tensor()], trace_id=""),
             lambda: client.remove(["a", "a"]),
+            lambda: client.remove("a"),
+            lambda: client.remove([1]),
+            lambda: client.remove(["x" * 513]),
             lambda: client.remove(["a"], trace_id="\ud800"),
         ]
         for invoke in invalid_calls:
@@ -448,6 +661,44 @@ class KvMetaObjectClientTest(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     invoke()
         self.assertEqual(native.calls, [])
+
+    def test_operations_are_serialized_across_threads(self):
+        save_entered = threading.Event()
+        load_entered = threading.Event()
+        release_save = threading.Event()
+
+        class BlockingClient(_FakeClient):
+            def SaveObjects(self, trace_id, keys, sizes, buffers):
+                self.calls.append(("SaveObjects", trace_id, keys, sizes, buffers))
+                save_entered.set()
+                release_save.wait(timeout=5)
+                return _Code.ER_OK
+
+            def LoadObjects(self, trace_id, keys, sizes, buffers):
+                self.calls.append(("LoadObjects", trace_id, keys, sizes, buffers))
+                load_entered.set()
+                return _Code.ER_OK
+
+        native = BlockingClient()
+        client, _, _ = _client(native=native)
+        self.addCleanup(client.close)
+        save_thread = threading.Thread(target=client.save, args=(["save"], [_Tensor()]))
+        load_thread = threading.Thread(target=client.load, args=(["load"], [_Tensor()]))
+
+        save_thread.start()
+        self.assertTrue(save_entered.wait(timeout=2))
+        load_thread.start()
+        self.assertFalse(load_entered.wait(timeout=0.1))
+        release_save.set()
+        save_thread.join(timeout=2)
+        load_thread.join(timeout=2)
+
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(load_thread.is_alive())
+        self.assertTrue(load_entered.is_set())
+        self.assertEqual(
+            [call[0] for call in native.calls], ["SaveObjects", "LoadObjects"]
+        )
 
     def test_close_waits_for_inflight_call_and_is_idempotent(self):
         entered = threading.Event()
@@ -477,14 +728,100 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertFalse(close_thread.is_alive())
         self.assertTrue(native.closed)
         client.close()
+        self.assertEqual(native.close_calls, 1)
         with self.assertRaisesRegex(RuntimeError, "closed"):
             client.load(["key"], [_Tensor()])
+
+    def test_close_failure_still_closes_state_and_drops_registration_owner(self):
+        class WeakOwner:
+            pass
+
+        class FailingCloseClient(_FakeClient):
+            def close(self):
+                super().close()
+                raise OSError("close failed")
+
+        owner = WeakOwner()
+        owner_ref = weakref.ref(owner)
+        native = FailingCloseClient()
+        pybind = _FakePybind(native)
+        client = KvMetaObjectClient(
+            _config(memory_base=0x1000, memory_size=4096),
+            registration_owner=owner,
+            _pybind_module=pybind,
+        )
+        # Do not let the fake binding's call recording retain its temporary
+        # native config and registered-memory owner.
+        pybind.create_calls.clear()
+        del owner
+        gc.collect()
+        self.assertIsNotNone(owner_ref())
+
+        with self.assertRaisesRegex(OSError, "close failed"):
+            client.close()
+        gc.collect()
+
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+        self.assertIsNone(owner_ref())
+        client.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            client.save(["key"], [_Tensor()])
 
     def test_context_manager_closes_client(self):
         client, native, _ = _client()
         with client as active:
             self.assertIs(active, client)
         self.assertTrue(native.closed)
+
+
+class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
+    def test_real_binding_exports_exact_object_types_and_64_bit_iovs(self):
+        from kv_cache_manager.client.pybind import kvcm_py_client
+
+        required = (
+            "ClientErrorCode",
+            "MemoryType",
+            "RoleType",
+            "KvMetaClientConfig",
+            "KvMetaObjectClientConfig",
+            "KvMetaObjectClient",
+            "InitParams",
+            "RegistSpan",
+            "Iov",
+            "BlockBuffer",
+        )
+        self.assertTrue(all(hasattr(kvcm_py_client, name) for name in required))
+
+        iov = kvcm_py_client.Iov()
+        iov.type = kvcm_py_client.MemoryType.CPU
+        iov.base = (1 << 64) - 1
+        iov.size = KV_META_MAX_OBJECT_BYTES
+        iov.ignore = False
+        block = kvcm_py_client.BlockBuffer()
+        block.iovs = [iov]
+
+        self.assertEqual(block.iovs[0].base, (1 << 64) - 1)
+        self.assertEqual(block.iovs[0].size, KV_META_MAX_OBJECT_BYTES)
+        self.assertEqual(block.iovs[0].type, kvcm_py_client.MemoryType.CPU)
+
+    def test_high_level_client_reaches_real_native_create_and_maps_error(self):
+        from kv_cache_manager.client.pybind import kvcm_py_client
+
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            KvMetaObjectClient(
+                _config(
+                    addresses=("127.0.0.1:1",),
+                    transfer_client_config="{invalid-json",
+                )
+            )
+
+        self.assertEqual(raised.exception.operation, "init")
+        self.assertEqual(
+            raised.exception.code,
+            kvcm_py_client.ClientErrorCode.ER_INVALID_CLIENT_CONFIG,
+        )
+        self.assertFalse(raised.exception.unknown_outcome)
 
 
 if __name__ == "__main__":

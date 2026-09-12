@@ -59,3 +59,12 @@ py_wheel(
         ":kvcm_py_client_lib_pkg",
     ],
 )
+
+py_test(
+    name = "KvMetaObjectPythonWheelTest",
+    size = "small",
+    srcs = ["kv_meta_object_client_wheel_test.py"],
+    args = ["$(location :kvcm_py_client_lib_wheel)"],
+    data = [":kvcm_py_client_lib_wheel"],
+    main = "kv_meta_object_client_wheel_test.py",
+)

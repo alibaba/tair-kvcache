@@ -293,8 +293,15 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjects(const std::string &trace_id,
 
 ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id,
                                                const std::vector<std::string> &keys) {
-    if (keys.empty()) {
+    if (keys.empty() || keys.size() > kMaxBatchItems) {
         return ER_INVALID_PARAMS;
+    }
+    std::unordered_set<std::string> unique_keys;
+    unique_keys.reserve(keys.size());
+    for (const auto &key : keys) {
+        if (key.empty() || key.size() > kMaxKeyBytes || !unique_keys.insert(key).second) {
+            return ER_INVALID_PARAMS;
+        }
     }
     return metadata_client_->Remove(trace_id, keys);
 }
