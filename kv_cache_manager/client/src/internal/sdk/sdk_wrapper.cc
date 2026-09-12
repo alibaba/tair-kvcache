@@ -397,9 +397,11 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
 
         std::uint64_t buffer_size = 0;
         for (const auto &iov : buffer.iovs) {
+            const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
             if (iov.ignore || iov.size == 0 || buffer_size > expected_size ||
                 iov.size > expected_size - buffer_size || iov.base == nullptr ||
-                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU)) {
+                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) ||
+                iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
                 return ER_INVALID_LOCAL_BUFFERS;
             }
             buffer_size += iov.size;
