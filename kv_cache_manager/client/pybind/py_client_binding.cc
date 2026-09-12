@@ -76,6 +76,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     });
 
     module.doc() = "kvcm_py_client pybind11 extension";
+    module.attr("KV_META_OBJECT_API_VERSION") = kvcm::GetKvMetaObjectClientApiVersion();
 
     // 绑定枚举
     py::native_enum<kvcm::ClientErrorCode>(module, "ClientErrorCode", "enum.Enum")

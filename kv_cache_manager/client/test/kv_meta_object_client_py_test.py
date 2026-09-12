@@ -6,6 +6,7 @@ from enum import IntEnum
 from types import SimpleNamespace
 
 from kv_cache_manager.client import (
+    KV_META_OBJECT_API_VERSION,
     KvMetaObjectBuffer,
     KvMetaObjectClient,
     KvMetaObjectClientConfig,
@@ -79,6 +80,7 @@ class _FakeClient:
 
 
 class _FakePybind:
+    KV_META_OBJECT_API_VERSION = KV_META_OBJECT_API_VERSION
     ClientErrorCode = _Code
     MemoryType = _Memory
     RoleType = _Role
@@ -387,6 +389,47 @@ class KvMetaObjectClientTest(unittest.TestCase):
 
         self.assertTrue(native.closed)
 
+    def test_incompatible_binding_version_closes_injected_native_client(self):
+        native = _FakeClient()
+        pybind = _FakePybind(native)
+        pybind.KV_META_OBJECT_API_VERSION = KV_META_OBJECT_API_VERSION + 1
+
+        with self.assertRaisesRegex(ImportError, "incompatible.*API version"):
+            KvMetaObjectClient(
+                _config(),
+                _object_client=native,
+                _pybind_module=pybind,
+            )
+
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
+    def test_incomplete_versioned_binding_is_rejected_before_creation(self):
+        pybind = _FakePybind()
+        pybind.MemoryType = SimpleNamespace(CPU=_Memory.CPU)
+
+        with self.assertRaisesRegex(ImportError, "incomplete"):
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertEqual(pybind.create_calls, [])
+
+    def test_uninspectable_binding_fails_closed_and_releases_injected_client(self):
+        class ExplodingPybind:
+            def __getattribute__(self, _name):
+                raise RuntimeError("provider capability detail")
+
+        native = _FakeClient()
+        with self.assertRaisesRegex(ImportError, "inspected safely") as raised:
+            KvMetaObjectClient(
+                _config(),
+                _object_client=native,
+                _pybind_module=ExplodingPybind(),
+            )
+
+        self.assertNotIn("provider capability detail", str(raised.exception))
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
     def test_missing_native_operation_closes_created_client(self):
         native = _FakeClient()
         native.LoadObjects = None
@@ -590,14 +633,78 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertIsInstance(raised.exception.__cause__, OSError)
         self.assertNotIn("secret", str(raised.exception))
 
+    def test_dynamic_native_method_lookup_failure_is_sanitized(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+
+        class ExplodingDescriptor:
+            def __get__(self, _instance, _owner):
+                raise OSError("secret dynamically loaded provider path")
+
+        original_save = type(native).SaveObjects
+        type(native).SaveObjects = ExplodingDescriptor()
+        self.addCleanup(setattr, type(native), "SaveObjects", original_save)
+
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            client.save(["key"], [_Tensor()])
+
+        self.assertEqual(raised.exception.operation, "save")
+        self.assertTrue(raised.exception.unknown_outcome)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertNotIn("secret", str(raised.exception))
+
     def test_malformed_zero_like_codes_are_not_success(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
         for malformed in (False, 0.0, "ER_OK"):
             native.results["SaveObjects"] = [malformed]
             with self.subTest(malformed=malformed):
-                with self.assertRaises(KvMetaObjectClientError):
+                with self.assertRaises(KvMetaObjectClientError) as raised:
                     client.save(["key"], [_Tensor()])
+                self.assertTrue(raised.exception.unknown_outcome)
+
+    def test_unknown_integer_mutation_code_is_ambiguous_but_known_code_is_not(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+
+        native.results["Remove"] = [987654]
+        with self.assertRaises(KvMetaObjectClientError) as unknown:
+            client.remove(["unknown"])
+        self.assertTrue(unknown.exception.unknown_outcome)
+
+        native.results["Remove"] = [_Code.ER_FAILED]
+        with self.assertRaises(KvMetaObjectClientError) as known:
+            client.remove(["known"])
+        self.assertFalse(known.exception.unknown_outcome)
+
+    def test_malformed_native_enum_registry_keeps_mutation_ambiguous(self):
+        client, native, pybind = _client()
+        self.addCleanup(client.close)
+
+        class BrokenMembers:
+            def values(self):
+                raise RuntimeError("malformed native enum registry")
+
+        class ExplodingLookup:
+            def __getattribute__(self, _name):
+                raise RuntimeError("malformed native enum lookup")
+
+        registries = (
+            SimpleNamespace(
+                ER_OK=_Code.ER_OK,
+                ER_INVALID_GRPCSTATUS=_Code.ER_INVALID_GRPCSTATUS,
+                __members__=BrokenMembers(),
+            ),
+            ExplodingLookup(),
+        )
+        for index, registry in enumerate(registries):
+            with self.subTest(registry=type(registry).__name__):
+                pybind.ClientErrorCode = registry
+                native.results["Remove"] = [_Code.ER_FAILED]
+                with self.assertRaises(KvMetaObjectClientError) as raised:
+                    client.remove([f"key-{index}"])
+
+                self.assertTrue(raised.exception.unknown_outcome)
 
     def test_remove_attempts_every_batch_and_reports_aggregate_result(self):
         client, native, _ = _client()
@@ -774,12 +881,33 @@ class KvMetaObjectClientTest(unittest.TestCase):
             self.assertIs(active, client)
         self.assertTrue(native.closed)
 
+    def test_context_close_failure_does_not_mask_body_exception(self):
+        class FailingCloseClient(_FakeClient):
+            def close(self):
+                super().close()
+                raise OSError("secret close detail")
+
+        native = FailingCloseClient()
+        client, _, _ = _client(native=native)
+
+        with self.assertLogs(
+            "kv_cache_manager.client.kv_meta_object_client", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(ValueError, "body failure"):
+                with client:
+                    raise ValueError("body failure")
+
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+        self.assertNotIn("secret close detail", " ".join(logs.output))
+
 
 class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
     def test_real_binding_exports_exact_object_types_and_64_bit_iovs(self):
         from kv_cache_manager.client.pybind import kvcm_py_client
 
         required = (
+            "KV_META_OBJECT_API_VERSION",
             "ClientErrorCode",
             "MemoryType",
             "RoleType",
@@ -792,6 +920,10 @@ class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
             "BlockBuffer",
         )
         self.assertTrue(all(hasattr(kvcm_py_client, name) for name in required))
+        self.assertEqual(
+            kvcm_py_client.KV_META_OBJECT_API_VERSION,
+            KV_META_OBJECT_API_VERSION,
+        )
 
         iov = kvcm_py_client.Iov()
         iov.type = kvcm_py_client.MemoryType.CPU

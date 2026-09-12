@@ -30,6 +30,9 @@ KV_META_MAX_OBJECT_BYTES = 1024 * 1024 * 1024
 KV_META_MAX_BATCH_BYTES = 4 * 1024 * 1024 * 1024
 KV_META_MAX_CALL_TIMEOUT_MS = 600_000
 KV_META_MAX_WRITE_TIMEOUT_SECONDS = 1800
+# Must match kKvMetaObjectClientApiVersion in the native public header.  This is
+# an API/ABI capability marker, not the wheel package version.
+KV_META_OBJECT_API_VERSION = 1
 
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_INT32 = (1 << 31) - 1
@@ -310,9 +313,42 @@ def _validate_pybind_module(pybind: Any) -> None:
         "Iov",
         "BlockBuffer",
     )
-    if not all(hasattr(pybind, name) for name in required):
+    try:
+        has_required_types = all(hasattr(pybind, name) for name in required)
+        native_version = getattr(pybind, "KV_META_OBJECT_API_VERSION", None)
+    except Exception:
+        raise ImportError(
+            "installed kvcm_py_client cannot be inspected safely"
+        ) from None
+    if not has_required_types:
         raise ImportError(
             "installed kvcm_py_client does not export the KVMeta object API"
+        )
+    if (
+        type(native_version) is not int
+        or native_version != KV_META_OBJECT_API_VERSION
+    ):
+        raise ImportError(
+            "installed kvcm_py_client has an incompatible KVMeta object API version"
+        )
+    try:
+        required_members = (
+            (pybind.ClientErrorCode, ("ER_OK", "ER_INVALID_GRPCSTATUS")),
+            (pybind.MemoryType, ("CPU", "GPU")),
+            (pybind.RoleType, ("WORKER",)),
+        )
+        has_required_members = not any(
+            not all(hasattr(enum_type, name) for name in names)
+            for enum_type, names in required_members
+        )
+        has_factory = callable(getattr(pybind.KvMetaObjectClient, "Create", None))
+    except Exception:
+        raise ImportError(
+            "installed kvcm_py_client cannot be inspected safely"
+        ) from None
+    if not has_required_members or not has_factory:
+        raise ImportError(
+            "installed kvcm_py_client exports an incomplete KVMeta object API"
         )
 
 
@@ -322,8 +358,15 @@ def _matches_native_code(pybind: Any, code: Any, name: str, raw_value: int) -> b
     # accepted, so malformed bindings cannot turn a failed write into success.
     if type(code) is int:
         return code == raw_value
-    expected = getattr(getattr(pybind, "ClientErrorCode", object()), name, None)
-    return expected is not None and type(code) is type(expected) and code == expected
+    try:
+        expected = getattr(getattr(pybind, "ClientErrorCode", object()), name, None)
+        return (
+            expected is not None
+            and type(code) is type(expected)
+            and code == expected
+        )
+    except Exception:
+        return False
 
 
 def _is_ok_code(pybind: Any, code: Any) -> bool:
@@ -332,6 +375,29 @@ def _is_ok_code(pybind: Any, code: Any) -> bool:
 
 def _is_ambiguous_code(pybind: Any, code: Any) -> bool:
     return _matches_native_code(pybind, code, "ER_INVALID_GRPCSTATUS", 2)
+
+
+def _is_known_native_code(pybind: Any, code: Any) -> bool:
+    """Return whether *code* is a documented member of the native error enum."""
+
+    try:
+        members = tuple(pybind.ClientErrorCode.__members__.values())
+        if type(code) is int:
+            return any(
+                type(getattr(member, "value", None)) is int
+                and member.value == code
+                for member in members
+            )
+        return any(type(code) is type(member) and code == member for member in members)
+    except Exception:  # A malformed binding must fail closed after a mutation.
+        return False
+
+
+def _mutation_outcome_is_unknown(pybind: Any, code: Any) -> bool:
+    # A transport-status failure is explicitly ambiguous.  A malformed or
+    # unknown return value is equally unsafe: treating it as a confirmed
+    # rejection could make an upper layer retry an already-committed mutation.
+    return _is_ambiguous_code(pybind, code) or not _is_known_native_code(pybind, code)
 
 
 def _best_effort_close(client: Any, phase: str) -> None:
@@ -555,12 +621,16 @@ class KvMetaObjectClient:
 
         with self._lock:
             self._check_open_locked()
-            native_method = getattr(self._client, method_name)
             for batch_index, (begin, end) in enumerate(batches):
                 batch_trace = self._batch_trace_id(
                     resolved_trace_id, batch_index, len(batches)
                 )
                 try:
+                    # Resolve the operation inside the exception boundary. A
+                    # malformed/dynamically proxied binding can throw from
+                    # attribute lookup even though it passed initialization
+                    # inspection; such provider details must not escape.
+                    native_method = getattr(self._client, method_name)
                     code = native_method(
                         batch_trace,
                         list(keys[begin:end]),
@@ -586,7 +656,7 @@ class KvMetaObjectClient:
                         code,
                         unknown_outcome=(
                             operation == "save"
-                            and _is_ambiguous_code(self._pybind, code)
+                            and _mutation_outcome_is_unknown(self._pybind, code)
                         ),
                         batch_index=batch_index,
                         batch_count=len(batches),
@@ -718,7 +788,9 @@ class KvMetaObjectClient:
                         list(materialized[begin:end]),
                     )
                     failed = not _is_ok_code(self._pybind, code)
-                    unknown = failed and _is_ambiguous_code(self._pybind, code)
+                    unknown = failed and _mutation_outcome_is_unknown(
+                        self._pybind, code
+                    )
                 except KvMetaObjectClientError:
                     raise
                 except Exception as error:
@@ -780,4 +852,16 @@ class KvMetaObjectClient:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except Exception as error:
+            # A cleanup failure must not replace the exception that caused the
+            # with-body to unwind.  Keep provider text out of the warning.
+            _LOGGER.warning(
+                "KVCM client close failed while preserving an active exception "
+                "(exception_type=%s)",
+                type(error).__name__,
+            )
