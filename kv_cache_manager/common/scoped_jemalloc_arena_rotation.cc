@@ -25,8 +25,16 @@ ScopedJemallocArenaRotation::Mallctl ScopedJemallocArenaRotation::ResolveMallctl
     void *control = dlsym(RTLD_DEFAULT, "mallctl");
     void *allocate = dlsym(RTLD_DEFAULT, "malloc");
     Dl_info control_info{}, allocate_info{};
-    if (!control || !allocate || dladdr(control, &control_info) == 0 || dladdr(allocate, &allocate_info) == 0 ||
-        control_info.dli_fbase != allocate_info.dli_fbase) {
+    if (!control || !allocate) {
+        KVCM_LOG_INFO("skip jemalloc arena rotation: mallctl or malloc symbol unavailable");
+        return nullptr;
+    }
+    if (dladdr(control, &control_info) == 0 || dladdr(allocate, &allocate_info) == 0) {
+        KVCM_LOG_INFO("skip jemalloc arena rotation: cannot identify mallctl or malloc library");
+        return nullptr;
+    }
+    if (control_info.dli_fbase != allocate_info.dli_fbase) {
+        KVCM_LOG_INFO("skip jemalloc arena rotation: mallctl and malloc belong to different libraries");
         return nullptr;
     }
     return reinterpret_cast<Mallctl>(control);
@@ -51,8 +59,14 @@ void ScopedJemallocArenaRotation::Initialize() {
     }
     // arenas.narenas also includes manually created and the oversize arena.
     // opt.narenas is the effective, immutable automatic arena count.
-    if (!ReadControl(mallctl_, "opt.narenas", arena_count_) || arena_count_ <= 1 ||
-        !ReadControl(mallctl_, "thread.arena", original_arena_)) {
+    if (!ReadControl(mallctl_, "opt.narenas", arena_count_)) {
+        return;
+    }
+    if (arena_count_ <= 1) {
+        KVCM_LOG_INFO("skip jemalloc arena rotation: automatic arena count[%u] <= 1", arena_count_);
+        return;
+    }
+    if (!ReadControl(mallctl_, "thread.arena", original_arena_)) {
         return;
     }
     current_arena_ = original_arena_;
