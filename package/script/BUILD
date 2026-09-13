@@ -1,5 +1,11 @@
 package(default_visibility = ["//visibility:public"])
 
+py_test(
+    name = "start_server_spectrum_test",
+    srcs = ["start_server_spectrum_test.py"],
+    data = ["start_server_spectrum.sh"],
+)
+
 filegroup(
     name = "start_server_script",
     srcs = [
