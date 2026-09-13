@@ -45,6 +45,22 @@ function wait_for_spectrum_sidecar() {
 
 function main() {
     wait_for_spectrum_sidecar || exit 1
+
+    # Temporary recovery-memory mitigation: jemalloc's CPU-scaled arena default
+    # can spread cache capacity across more arenas than metadata IO workers use.
+    # Single-threaded recovery followed by cross-thread updates can leave holes
+    # in partially live slabs that other arenas cannot reuse. Default to 8 to
+    # reduce capacity dispersion and the risk of arenas outnumbering IO workers;
+    # this does not guarantee that every arena is covered by metadata workers.
+    # On high-core-count / high-thread-count deployments, fewer arenas may
+    # increase allocation-lock contention and significantly reduce throughput.
+    # Revisit this default after a more complete recovery-memory solution aligns
+    # recovery object creation and updates (e.g. a shared business worker pool).
+    # For allocation/performance investigations, check this setting as well as
+    # IO worker counts. Prepend the default so explicit MALLOC_CONF options,
+    # including narenas, take precedence and remain available for tuning.
+    export MALLOC_CONF="narenas:8${MALLOC_CONF:+,$MALLOC_CONF}"
+    echo "Spectrum jemalloc configuration: MALLOC_CONF=$MALLOC_CONF (explicit options override defaults)"
     exec "$SCRIPT_DIR/start_server.sh" "$@"
 }
 
