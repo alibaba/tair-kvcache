@@ -5,6 +5,7 @@ cc_binary(
     testonly = True,
     srcs = ["recovery_memory_probe.cc"],
     copts = ["-fno-access-control"],
+    linkopts = ["-rdynamic"],
     deps = [
         "//kv_cache_manager/meta:meta_local_backend",
         "//kv_cache_manager/meta:meta_storage_backend_manager",

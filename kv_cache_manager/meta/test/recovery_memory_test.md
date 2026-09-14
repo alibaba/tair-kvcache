@@ -16,6 +16,7 @@ bazel test //kv_cache_manager/meta/test:recovery_memory_test \
 可追加 `--runs_per_test=3` 检查重复性。测试进程必须能访问指定的库；不满足前提会失败，不会静默跳过。
 Python runner 只给 C++ 子进程设置 `LD_PRELOAD` 和 `MALLOC_CONF`，不会给 Bazel/Python 本身预加载分配器。
 轮换关闭、开启两组对照顺序执行，各自启动新进程，固定 4 个自动 arena、关闭 per-CPU arena 和后台线程，保留正常 tcache。
+probe 使用与生产服务一致的 `-rdynamic` 链接方式，覆盖主程序导出的 `malloc@plt` 不能干扰实际 allocator provider 识别的回归场景。
 
 ## 覆盖范围
 
