@@ -37,8 +37,9 @@ docker build -f Dockerfile.dev -t kv_cache_manager_dev:latest .
 | Python 维护脚本依赖 | `requests`、`redis`（Python 包） | `7146e3658`（2026-03-19）的 stale cache 清理脚本及后续 ReportEvent 压测脚本使用。 |
 
 Python 开发依赖统一维护在 [requirements-dev.txt](requirements-dev.txt)，固定直接依赖版本，开发镜像通过 Python 3.11 安装。
-Ubuntu 环境的系统依赖也同步到 [setup_env_ubuntu.sh](../../tools/scripts/setup_env_ubuntu.sh)；该脚本不安装 Connector 静态检查工具，可按下方通用镜像示例补充。
-Python 的 `redis` 包保留为现有维护脚本的协议客户端，连接的是 Valkey 服务。
+Ubuntu 环境的系统依赖也同步到 [setup_env_ubuntu.sh](../../tools/scripts/setup_env_ubuntu.sh)：apt 源同时提供 `valkey-server` 和 `valkey-tools` 安装候选版本时优先安装 Valkey，否则安装 `redis-server` 和 `redis-tools`，兼容 Ubuntu 24.04 之前的系统。
+该脚本不安装 Connector 静态检查工具，可按下方通用镜像示例补充。
+Python 的 `redis` 包保留为现有维护脚本的协议客户端，可连接 Valkey 或 Redis 服务。
 
 近期新增的 msgpack-cxx、xxHash、zstd 和 Mooncake 升级由 `open_source/deps/*.bzl` 下载和构建；
 `pydantic`、`orjson`、`grpcio-tools` 及 kvcm_ops 的运行依赖由 `open_source/deps/requirements_lock_cpu.txt` 管理。
@@ -79,8 +80,8 @@ docker run --rm kv_cache_manager_dev:latest bash -lc '
 通用开发镜像用于推理引擎（vllm/sglang） + Tair KVCache Manager + Tair KVCache Manager Connector的构建和开发环境。
 参考 `open_source/docker/Dockerfile.dev` 补充相关依赖即可。
 具体请结合推理引擎镜像的实际情况。
-以下 apt 示例要求软件源提供 `valkey-server` 和 `valkey-tools`（例如 [Ubuntu 24.04 的 universe 仓库](https://packages.ubuntu.com/noble/valkey-server)）；
-软件源不提供这两个包的旧基础镜像（如 Ubuntu 22.04），需先按 [Valkey 安装说明](https://valkey.io/topics/installation/)准备 Valkey，并从下面的 apt 安装列表中移除这两个包名。
+以下 apt 示例也按安装候选版本选择 Valkey 或 Redis：例如 [Ubuntu 24.04 的 universe 仓库](https://packages.ubuntu.com/noble/valkey-server)可安装 Valkey，Ubuntu 22.04 默认源则回退到 Redis。
+如果旧系统已配置提供 Valkey 的源，同样优先安装 Valkey；集成测试保留 `REDIS_SERVER_BIN` 覆盖及 `redis-server` 回退。
 
 <details>
 
@@ -100,15 +101,20 @@ ARG BAZELISK_BASE_URL
 
 USER root
 
-# 安装系统依赖
+# 安装系统依赖；仅当服务端和工具都可安装时选择 Valkey
 RUN apt-get update && \
+    server_packages="redis-server redis-tools" && \
+    if LC_ALL=C apt-cache policy valkey-server valkey-tools | \
+        awk '$1 == "Candidate:" && $2 != "(none)" { n++ } END { exit n != 2 }'; then \
+        server_packages="valkey-server valkey-tools"; \
+    fi && \
     apt-get install -y --no-install-recommends \
     # 基础开发工具
     vim gcc g++ git openssh-client wget curl jq procps iproute2 tar gdb file \
     # RDMA相关依赖
     librdmacm-dev libibverbs-dev libnuma-dev \
     # 构建工具
-    cpio rpm2cpio patchelf libaio-dev pigz libjemalloc2 valkey-server valkey-tools \
+    cpio rpm2cpio patchelf libaio-dev pigz libjemalloc2 $server_packages \
     # Python开发环境（Ubuntu 22.04默认使用Python 3.10）
     python3 python3-pip python3-dev \
     # 代码格式化工具
@@ -150,11 +156,16 @@ RUN wget "$BAZELISK_URL" -O /usr/local/bin/bazelisk && chmod a+x /usr/local/bin/
 <summary>快速依赖补充脚本</summary>
 
 ```bash
-# 更新包列表并安装依赖
+# 更新包列表，优先安装源中可用的 Valkey，否则使用 Redis
 apt-get update && \
+server_packages="redis-server redis-tools" && \
+if LC_ALL=C apt-cache policy valkey-server valkey-tools | \
+    awk '$1 == "Candidate:" && $2 != "(none)" { n++ } END { exit n != 2 }'; then
+    server_packages="valkey-server valkey-tools"
+fi && \
 apt-get install -y --no-install-recommends \
     librdmacm-dev libibverbs-dev libnuma-dev \
-    cpio rpm2cpio patchelf libaio-dev pigz libjemalloc2 valkey-server valkey-tools \
+    cpio rpm2cpio patchelf libaio-dev pigz libjemalloc2 $server_packages \
     python3 python3-pip python3-dev \
     clang-format libicu-dev curl jq gdb file
 
