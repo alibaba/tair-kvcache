@@ -31,8 +31,8 @@
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
-#include "kv_cache_manager/service/meta_service_impl.h"
 #include "kv_cache_manager/service/kv_meta_service_impl.h"
+#include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
 
@@ -113,7 +113,7 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
-    if (config_.GetKvMetaRpcPort() != 0) {
+    if (config_.IsKvMetaEnabled()) {
         kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
         if (!kv_meta_manager_->Init()) {
             KVCM_LOG_ERROR("KVMeta manager init failed");
@@ -121,7 +121,7 @@ bool Server::Init(const ServerConfig &config) {
         }
         kv_meta_impl_ = std::make_shared<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, metrics_reporter_);
         kv_meta_impl_->DisableLeaderOnlyRequests();
-        KVCM_LOG_INFO("KVMeta service enabled on its isolated RPC port %d", config_.GetKvMetaRpcPort());
+        KVCM_LOG_INFO("KVMeta service enabled on the primary RPC port %d", config_.GetServiceRpcPort());
     }
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -234,8 +234,7 @@ void Server::StartKvMetaRecovery() {
 
     const std::uint64_t epoch = kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
-    if (stop_.load(std::memory_order_acquire) ||
-        kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch) {
+    if (stop_.load(std::memory_order_acquire) || kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch) {
         return;
     }
     try {
@@ -351,9 +350,6 @@ bool Server::Wait() {
     if (rpc_server_) {
         rpc_server_->Wait();
     }
-    if (kv_meta_rpc_server_) {
-        kv_meta_rpc_server_->Wait();
-    }
     if (meta_http_thread_.joinable()) {
         meta_http_thread_.join();
     }
@@ -377,14 +373,31 @@ bool Server::StartRpcServer() {
     meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
+    if (config_.IsKvMetaEnabled()) {
+        if (!kv_meta_impl_ || !kv_meta_manager_) {
+            KVCM_LOG_ERROR("KVMeta is enabled but its manager is unavailable");
+            return false;
+        }
+        kv_meta_service_ = std::make_shared<KvMetaServiceGRpc>(metrics_registry_, kv_meta_impl_);
+    }
 
     meta_service_->Init();
     admin_service_->Init();
     debug_service_->Init();
+    if (kv_meta_service_) {
+        kv_meta_service_->Init();
+    }
 
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    int selected_port = 0;
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(meta_service_.get());
+    if (kv_meta_service_) {
+        // The protobuf packages are distinct, so KVMeta and the fixed-block
+        // MetaService have different fully qualified RPC method names even
+        // though both proto services are named MetaService.
+        builder.RegisterService(kv_meta_service_.get());
+    }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
     }
@@ -396,12 +409,21 @@ bool Server::StartRpcServer() {
         KVCM_LOG_ERROR("Failed to start rpc server");
         return false;
     }
+    if (selected_port <= 0 || selected_port > 65535) {
+        KVCM_LOG_ERROR("RPC server returned invalid selected port %d", selected_port);
+        server->Shutdown();
+        return false;
+    }
     rpc_server_.reset(server.release());
+    bound_rpc_port_ = selected_port;
     KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
+    if (kv_meta_service_) {
+        KVCM_LOG_INFO("KVMeta service registered on primary RPC port %d", bound_rpc_port_);
+    }
     if (use_separate_admin_server && !StartSeparateAdminRpcServer()) {
         return false;
     }
-    return StartKvMetaRpcServer();
+    return true;
 }
 
 bool Server::StartSeparateAdminRpcServer() {
@@ -420,33 +442,6 @@ bool Server::StartSeparateAdminRpcServer() {
     }
     admin_rpc_server_.reset(server.release());
     KVCM_LOG_INFO("Admin Server listening on %s success", server_address.c_str());
-    return true;
-}
-
-bool Server::StartKvMetaRpcServer() {
-    const int32_t rpc_port = config_.GetKvMetaRpcPort();
-    if (rpc_port == 0) {
-        return true;
-    }
-    if (!kv_meta_impl_ || !kv_meta_manager_) {
-        KVCM_LOG_ERROR("KVMeta RPC port is configured but KVMeta manager is unavailable");
-        return false;
-    }
-
-    kv_meta_service_ = std::make_shared<KvMetaServiceGRpc>(metrics_registry_, kv_meta_impl_);
-    kv_meta_service_->Init();
-
-    const std::string server_address = "0.0.0.0:" + std::to_string(rpc_port);
-    grpc::ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(kv_meta_service_.get());
-    auto server = builder.BuildAndStart();
-    if (!server) {
-        KVCM_LOG_ERROR("Failed to start isolated KVMeta RPC server on %s", server_address.c_str());
-        return false;
-    }
-    kv_meta_rpc_server_.reset(server.release());
-    KVCM_LOG_INFO("KVMeta Server listening on %s success", server_address.c_str());
     return true;
 }
 
@@ -617,9 +612,9 @@ void Server::Stop() {
         kv_meta_manager_->CancelMaintenance();
     }
 
-    // Preserve the original main-service shutdown order. KVMeta admission is
-    // already closed above, but a slow generic-object backend operation must
-    // not delay shutdown of the existing RPC/HTTP endpoints.
+    // Close KVMeta admission before shutting down the shared primary listener.
+    // In-flight KVMeta and fixed-block calls then follow the same existing
+    // graceful gRPC shutdown semantics.
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
@@ -644,9 +639,6 @@ void Server::Stop() {
     }
     KVCM_LOG_INFO("admin http server stopped.");
 
-    if (kv_meta_rpc_server_) {
-        kv_meta_rpc_server_->Shutdown();
-    }
     if (kv_meta_manager_) {
         kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
         // DoRecover and DoCleanup both update KVMeta manager state. The stop

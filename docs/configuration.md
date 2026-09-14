@@ -74,9 +74,9 @@ kvcm.logger.log_level=4
 # 指定Metaservice主服务的RPC监听端口
 kvcm.service.rpc_port=6381
 
-# 通用对象（embedding 等）MetaService 使用的独立 gRPC 端口。
-# 0 表示禁用（默认）；非 0 时范围为 1..65535，且不能与其他服务端口冲突。
-kvcm.kv_meta.rpc_port=0
+# 是否在主 gRPC 端口上启用通用对象（embedding 等）MetaService。
+# 默认 false；启用后与固定 block MetaService 共用 kvcm.service.rpc_port。
+kvcm.kv_meta.enabled=false
 
 # 指定Metaservice主服务的HTTP监听端口
 kvcm.service.http_port=6382
@@ -166,9 +166,10 @@ kvcm.event.event_publishers_configs
 
 ### KVMeta 通用对象服务
 
-`kvcm.kv_meta.rpc_port` 默认是 `0`。此时不会创建 KVMeta manager、写会话线程或额外 gRPC server，
-现有 KVCache 服务的启动和请求路径保持不变。配置非零端口后，KVMeta 使用独立 gRPC server；升主时主服务
-先完成原有恢复并放流，KVMeta 再在可取消的独立线程中恢复，恢复完成前仅 KVMeta 请求返回 not-leader/not-ready。
+`kvcm.kv_meta.enabled` 默认是 `false`。此时不会创建 KVMeta manager、写会话线程或 service adapter，主 gRPC
+ServerBuilder 的注册集合也保持不变。设为 `true` 后，KVMeta 与固定 block MetaService 共用
+`kvcm.service.rpc_port`，依靠不同的 protobuf service 全名路由，不创建第二个 listener。升主时主服务先完成原有
+恢复并放流，KVMeta 再在可取消的独立线程中恢复，恢复完成前仅 KVMeta 请求返回 not-leader/not-ready。
 
 KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache instance 共组。该约束隔离容量统计；
 普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。当前 KVMeta V1 不自动逐出对象，

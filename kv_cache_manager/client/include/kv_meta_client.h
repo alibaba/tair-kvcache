@@ -58,8 +58,8 @@ struct KvMetaInstanceInfo {
 };
 
 struct KvMetaClientConfig {
-    // Addresses must point to the isolated kvcm.kv_meta.rpc_port, not to the
-    // existing MetaService port. Calls try the preferred endpoint first.
+    // Addresses point to the primary KVCM gRPC endpoint shared with the
+    // fixed-block MetaService. Calls try the preferred endpoint first.
     // Reads and idempotent registration fail over on transport errors; all
     // calls fail over when a server explicitly responds not-leader or
     // not-ready. Data mutations never retry an ambiguous transport result.
@@ -77,24 +77,20 @@ public:
     static std::unique_ptr<KvMetaClient> Create(const KvMetaClientConfig &config);
 
     virtual std::pair<ClientErrorCode, std::string>
-    RegisterInstance(const std::string &trace_id,
-                     const std::string &instance_group,
-                     const std::string &user_data) = 0;
+    RegisterInstance(const std::string &trace_id, const std::string &instance_group, const std::string &user_data) = 0;
 
-    virtual std::pair<ClientErrorCode, KvMetaInstanceInfo>
-    GetInstanceInfo(const std::string &trace_id) = 0;
+    virtual std::pair<ClientErrorCode, KvMetaInstanceInfo> GetInstanceInfo(const std::string &trace_id) = 0;
 
-    virtual std::pair<ClientErrorCode, KvMetaGetResult>
-    Get(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
+    virtual std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
+                                                            const std::vector<std::string> &keys) = 0;
 
     // ER_INVALID_GRPCSTATUS means the server may already have reserved an
     // active session. Do not blindly retry; query the keys and, for misses,
     // wait for write_timeout_seconds before attempting another StartWrite.
-    virtual std::pair<ClientErrorCode, KvMetaStartWriteResult>
-    StartWrite(const std::string &trace_id,
-               const std::vector<std::string> &keys,
-               const std::vector<std::uint64_t> &value_sizes,
-               std::int32_t write_timeout_seconds) = 0;
+    virtual std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
+                                                                          const std::vector<std::string> &keys,
+                                                                          const std::vector<std::uint64_t> &value_sizes,
+                                                                          std::int32_t write_timeout_seconds) = 0;
 
     // success_keys is aligned with StartWriteResult.locations, not with the
     // original request. A single false value aborts the complete session.
