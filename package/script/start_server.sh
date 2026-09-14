@@ -60,7 +60,7 @@ function configure_jemalloc() {
         *":$jemalloc_path:"*) ;;
         *) export LD_PRELOAD="$jemalloc_path${LD_PRELOAD:+:$LD_PRELOAD}" ;;
     esac
-    echo "jemalloc enabled: LD_PRELOAD=$LD_PRELOAD"
+    echo "jemalloc enabled: LD_PRELOAD=$LD_PRELOAD MALLOC_CONF=${MALLOC_CONF:-<unset>}"
 }
 
 function install_kvcm_ops() {
