@@ -20,6 +20,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
@@ -48,6 +49,8 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 
@@ -75,12 +78,15 @@ MakeServingLocationMaps(const std::size_t count, const DataStorageType type = Da
 CacheLocationConstPtr MakeCacheLocation(const std::string &location_id,
                                         const CacheLocationStatus status,
                                         const DataStorageType type,
-                                        const std::string &uri) {
+                                        const std::string &uri,
+                                        const std::int64_t create_time = 0) {
     std::vector<LocationSpec> specs;
     if (!uri.empty()) {
         specs.emplace_back("test_spec", uri);
     }
-    return std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
+    auto location = std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
+    location->set_create_time(create_time);
+    return location;
 }
 
 class TypedTestBackend : public DataStorageBackend {
@@ -776,6 +782,18 @@ public:
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_filter_duration_us));
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_submit_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_min_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_min_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_max_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_max_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_avg_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_avg_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_min_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_min_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_max_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_max_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_avg_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_avg_us));
         cache_reclaimer_->METRICS_(cache_reclaimer, pending_delete_handler_count) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_delete_handler_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, pending_location_count) =
@@ -990,6 +1008,9 @@ public:
     }
 
     std::shared_ptr<InstanceGroup> SetUpGroupLruScenario(const std::vector<std::string> &ids = {"a", "b"}) {
+        // Existing scheduling/ordering cases specify their own small S/B
+        // budgets. Default-ratio behavior is covered separately below.
+        cache_reclaimer_->group_lru_config_.min_sampling_ratio = 1;
         stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), GroupLruSample_stub);
         stub_.set(ADDR(MetaIndexer, GetLocationMapsForMaintenance), GroupLruLocations_stub);
         cache_reclaimer_->job_state_flag_ = true;
@@ -1036,6 +1057,15 @@ public:
             }
         }
         return result;
+    }
+
+    std::array<double, 6> GroupLruAgeMetrics() {
+        return {cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_min_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_max_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_avg_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_min_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_max_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_avg_us_metrics()};
     }
 
     std::shared_ptr<InstanceGroup> SetUpFairRotationScenario() {
@@ -4384,6 +4414,87 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
 }
 
+TEST_F(CacheReclaimerTest, TestGroupLruDefaultRatioExpandsSamplesWithoutChangingBatch) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->group_lru_config_ = CacheReclaimerGroupLruConfig{};
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100, 100, plan));
+    EXPECT_EQ(2000, plan.sampling_size);
+    EXPECT_EQ(200, plan.theoretical_batch_size);
+    EXPECT_EQ(200, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+    // Explicitly larger shared sampling baselines remain effective.
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 2000, 100, plan));
+    EXPECT_EQ(4000, plan.sampling_size);
+    CacheReclaimer::FairReclaimPlan fair;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), scope, instance_infos, 100, 100, fair));
+    EXPECT_EQ(200, fair.group_sampling_size);
+    EXPECT_EQ(200, fair.group_batch_size);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSamplingRatioZeroAndOverflowRejected) {
+    const auto group = SetUpGroupLruScenario();
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupKeysWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    for (const auto ratio : {std::size_t{0}, std::numeric_limits<std::size_t>::max()}) {
+        cache_reclaimer_->group_lru_config_.min_sampling_ratio = ratio;
+        if (ratio == 0) {
+            EXPECT_EQ(ErrorCode::EC_BADARGS, cache_reclaimer_->Start());
+        }
+        EXPECT_FALSE(cache_reclaimer_->BuildGroupLruPlan(
+            request_context_.get(), group->name(), scope, instance_infos, 100, 2, plan));
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLargerSampleKeepsNewInstanceOutOfTopBatch) {
+    const auto group = SetUpGroupLruScenario();
+    // Equal configured baselines formerly selected the entire sample pool.
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 10));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 5;
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    ASSERT_TRUE(result.made_progress);
+    const auto blocks = GroupLruSubmittedBlocks();
+    // Each Instance supplies 32 distinct keys; at 5:1 select only 12 of 64,
+    // not 20 based on the requested (partly duplicate) sample count of 100.
+    ASSERT_EQ(12, blocks.size());
+    for (const auto &[id, key] : blocks) {
+        EXPECT_EQ("a", id);
+        EXPECT_LE(key, 12);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruEffectiveCandidatesPreserveOneKeyProgress) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &backend = group_lru_test_backends.at("a");
+    backend.keys = {1, 1, 2, 3};
+    backend.locations.erase(2);
+    backend.locations.erase(3);
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 10;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto blocks = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, blocks.size());
+    EXPECT_EQ(1, blocks.front().second);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLocalSamplerUsesOneTaskPerInstance) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 10;
+    for (const auto &id : {"a", "b"}) {
+        auto &indexer = meta_indexers_by_instance.at(id);
+        indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+        indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();
+        ASSERT_TRUE(indexer->PreferSingleTaskReclaimSampling());
+    }
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(1, group_lru_test_backends.at("a").sampling_calls);
+    EXPECT_EQ(1, group_lru_test_backends.at("b").sampling_calls);
+}
+
 TEST_F(CacheReclaimerTest, TestGroupLruSamplingCombinesBaseAndKeyWeightsNotBytes) {
     const auto group = SetUpGroupLruScenario();
     AddMetaIndexerForInstance("a", 10000, 1);
@@ -4512,6 +4623,7 @@ TEST_F(CacheReclaimerTest, TestGroupLruAllVictimsMayComeFromSmallColdInstance) {
 
 TEST_F(CacheReclaimerTest, TestGroupLruPreservesInterleavedOrderAndInstanceKeyIdentity) {
     const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 2));
     group_lru_test_backends.at("a").keys = {1, 2};
     group_lru_test_backends.at("b").keys = {1, 2};
     group_lru_test_backends.at("a").times = {{1, "1"}, {2, "3"}};
@@ -4525,6 +4637,8 @@ TEST_F(CacheReclaimerTest, TestGroupLruPreservesInterleavedOrderAndInstanceKeyId
 
 TEST_F(CacheReclaimerTest, TestGroupLruDuplicateUsesNewerTimeAndInvalidTimeRemainsZero) {
     const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 5));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 4));
     group_lru_test_backends.at("a").keys = {1, 2};
     group_lru_test_backends.at("a").time_versions[1] = {"1", "100"};
     group_lru_test_backends.at("a").times[2] = "50";
@@ -4534,6 +4648,117 @@ TEST_F(CacheReclaimerTest, TestGroupLruDuplicateUsesNewerTimeAndInvalidTimeRemai
     EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}, {"b", 3}, {"a", 2}}),
               GroupLruSubmittedBlocks());
     EXPECT_GT(cache_reclaimer_->get_cache_reclaimer_group_lru_invalid_time_count_metrics(), 0);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsUseFinalAcceptedLocations) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 5;
+    cache_reclaimer_->batching_size_ = 3;
+    auto &data = group_lru_test_backends.at("a");
+    data.keys = {1, 2, 3, 4, 5};
+    const auto before = TimestampUtil::GetCurrentTimeUs();
+    for (const auto key : data.keys) {
+        data.times[key] = std::to_string(before - 1000000 + key * 100);
+    }
+    data.locations[2] = {{"first",
+                          MakeCacheLocation("first",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 300)},
+                         {"second",
+                          MakeCacheLocation("second",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 500)}};
+    data.locations[3] = {{"third",
+                          MakeCacheLocation("third",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 100)}};
+    // Eligibility sees key 1, but the final admission read no longer does.
+    group_lru_location_read_hook = [&data] {
+        if (group_lru_location_reads.size() == 1) {
+            data.locations.erase(1);
+        }
+    };
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto elapsed = TimestampUtil::GetCurrentTimeUs() - before;
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 2}, {"a", 3}}), GroupLruSubmittedBlocks());
+    const auto ages = GroupLruAgeMetrics();
+    // LRU counts two blocks; creation age counts their three Locations.
+    const std::array<double, 6> expected = {999700, 999800, 999750, 100, 500, 300};
+    for (std::size_t i = 0; i < ages.size(); ++i) {
+        EXPECT_GE(ages[i], expected[i]) << i;
+        EXPECT_LE(ages[i], expected[i] + elapsed) << i;
+    }
+    EXPECT_DOUBLE_EQ(100, ages[1] - ages[0]);
+    EXPECT_DOUBLE_EQ(400, ages[4] - ages[3]);
+    EXPECT_DOUBLE_EQ((ages[3] + ages[4]) / 2, ages[5]);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsKeepLastAcceptedRequestWhenLaterRequestRejected) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 2;
+    const auto before = TimestampUtil::GetCurrentTimeUs();
+    group_lru_test_backends.at("a").keys = {1, 2};
+    group_lru_test_backends.at("b").keys = {1, 2};
+    group_lru_test_backends.at("a").times = {{1, std::to_string(before - 400)}, {2, std::to_string(before - 200)}};
+    group_lru_test_backends.at("b").times = {{1, std::to_string(before - 300)}, {2, std::to_string(before - 100)}};
+    for (const auto &id : {"a", "b"}) {
+        for (const auto key : {1, 2}) {
+            group_lru_test_backends.at(id).locations[key] = {{"loc",
+                                                              MakeCacheLocation("loc",
+                                                                                CacheLocationStatus::CLS_SERVING,
+                                                                                DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                                                "nfs://key?size=1",
+                                                                                before - key * 1000)}};
+        }
+    }
+    spe_submit_accepted_by_instance["b"] = false;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto elapsed = TimestampUtil::GetCurrentTimeUs() - before;
+    ASSERT_EQ(4, SubmittedDelRequestCount());
+    const auto ages = GroupLruAgeMetrics();
+    // A1 -> rejected B1 -> A2 -> rejected B2: report A2, not B2 or a round average.
+    for (std::size_t i = 0; i < ages.size(); ++i) {
+        const double expected = i < 3 ? 200 : 2000;
+        EXPECT_GE(ages[i], expected);
+        EXPECT_LE(ages[i], expected + elapsed);
+    }
+    spe_submit_accepted = false;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(ages, GroupLruAgeMetrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsResetWhenAcceptedBatchHasNoValidTimes) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 2;
+    auto &data = group_lru_test_backends.at("a");
+    data.keys = {1, 2};
+    for (const auto key : data.keys) {
+        data.locations[key] = {{"loc",
+                                MakeCacheLocation("loc",
+                                                  CacheLocationStatus::CLS_SERVING,
+                                                  DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                  "nfs://key?size=1",
+                                                  1000)}};
+    }
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    for (const auto age : GroupLruAgeMetrics()) {
+        ASSERT_GT(age, 0);
+    }
+    data.keys = {3, 4};
+    data.times[3] = "invalid";
+    data.times.erase(4);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::array<double, 6>{}), GroupLruAgeMetrics());
+    EXPECT_EQ(4, GroupLruSubmittedBlocks().size());
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruStopsImmediatelyOnAcceptedCredit) {
@@ -4548,6 +4773,13 @@ TEST_F(CacheReclaimerTest, TestGroupLruStopsImmediatelyOnAcceptedCredit) {
               cache_reclaimer_->credited_delete_bytes_by_group_.at(
                   group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
     EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_watermark_stop_count_metrics());
+    const auto ages = GroupLruAgeMetrics();
+    EXPECT_GT(ages[0], 0);
+    EXPECT_DOUBLE_EQ(1, ages[1] - ages[0]);
+    EXPECT_DOUBLE_EQ(ages[0], ages[2]);
+    EXPECT_DOUBLE_EQ(0, ages[3]);
+    EXPECT_DOUBLE_EQ(0, ages[4]);
+    EXPECT_DOUBLE_EQ(0, ages[5]);
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruStopsOnScopeChangeWithGroupStillOverWatermark) {
@@ -4567,6 +4799,7 @@ TEST_F(CacheReclaimerTest, TestGroupLruStopsOnScopeChangeWithGroupStillOverWater
 
 TEST_F(CacheReclaimerTest, TestGroupLruRejectedRequestsConsumeAttemptLimitNotCredit) {
     const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 2));
     group_lru_test_backends.at("a").times = {{1, "1"}, {2, "3"}};
     group_lru_test_backends.at("b").times = {{1, "2"}, {2, "4"}};
     group_lru_test_backends.at("a").keys = {1, 2};
@@ -4803,9 +5036,9 @@ TEST_F(CacheReclaimerTest, TestGroupLruFiltersProtectedLocationsBeforeTopBAndCre
     mm_->DebugInsertActiveCopyTask("a", 3, "copy_target");
     data.locations[4].emplace("reporter", reporter);
     EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
-    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 4}, {"a", 5}, {"a", 6}, {"a", 7}}),
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 4}, {"a", 5}, {"a", 6}}),
               GroupLruSubmittedBlocks());
-    EXPECT_EQ(3, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+    EXPECT_EQ(2, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
     for (const auto &request : SubmittedDelRequestsSnapshot()) {
         for (const auto &locations : request.location_ids) {
             EXPECT_EQ((std::vector<std::string>{"loc"}), locations);
@@ -4823,9 +5056,8 @@ TEST_F(CacheReclaimerTest, TestGroupLruZeroTimeCandidatesStillRequireDeletableLo
     cache_reclaimer_->pending_locations_.insert({"b", 1, "loc"});
 
     EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
-    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 2}, {"b", 3}, {"b", 4}, {"b", 5}}),
-              GroupLruSubmittedBlocks());
-    EXPECT_EQ(4, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruPendingQuotaIsAppliedAfterGlobalOrdering) {
@@ -6056,6 +6288,34 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         ReclaimCandidateVector candidates;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
         ASSERT_EQ(91, candidates.size());
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudgets) {
+    auto indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
+    ASSERT_NE(nullptr, indexer);
+    indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+    indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();
+    indexer->backend_manager_->cache_backend_ = std::make_unique<MetaLocalBackend>();
+    cache_reclaimer_->job_state_flag_ = true;
+    cache_reclaimer_->sampling_size_.store(1000);
+    cache_reclaimer_->sampling_size_per_task_.store(100);
+
+    for (const bool recovered : {false, true}) {
+        indexer->backend_manager_->recover_state_.store(recovered ? MetaStorageBackendManager::RecoverState::kRunning
+                                                                  : MetaStorageBackendManager::RecoverState::kRecover);
+        for (const bool bounded : {false, true}) {
+            ClearSampleReclaimRequests();
+            ReclaimCandidateVector candidates;
+            ASSERT_TRUE(cache_reclaimer_->DoKeySamplingWithSize(
+                request_context_, instance_infos.front(), 1000, bounded, candidates));
+            EXPECT_EQ(1000, candidates.size());
+            const auto requests = SampleReclaimRequestsSnapshot();
+            ASSERT_EQ(recovered ? 1 : 10, requests.size());
+            for (const auto &request : requests) {
+                EXPECT_EQ(recovered ? 1000 : 100, request.second);
+            }
+        }
     }
 }
 

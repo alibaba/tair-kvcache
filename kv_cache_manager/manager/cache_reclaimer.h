@@ -76,6 +76,9 @@ struct CacheReclaimerAsyncDeleteConfig {
 struct CacheReclaimerGroupLruConfig {
     std::size_t max_sampling_size{65536};
     std::size_t max_delete_requests_per_round{128};
+    // Group LRU needs more candidates than victims, even when the shared
+    // per-Instance sampling and deletion baselines are configured equally.
+    std::size_t min_sampling_ratio{10};
 };
 
 /**

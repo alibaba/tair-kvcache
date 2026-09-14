@@ -1964,6 +1964,10 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
     return ec;
 }
 
+bool MetaIndexer::PreferSingleTaskReclaimSampling() const noexcept {
+    return backend_manager_ && backend_manager_->PreferSingleTaskReclaimSampling();
+}
+
 ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
                                                const int64_t count,
                                                ReclaimCandidateVector &out_candidates,

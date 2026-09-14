@@ -200,6 +200,14 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_reclaimer_pending_bytes_limit_ = std::stoull(value);
          return true;
      }},
+    {"kvcm.cache_reclaimer.group_lru_min_sampling_ratio",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         config->cache_reclaimer_group_lru_min_sampling_ratio_ = std::stoull(value);
+         return config->cache_reclaimer_group_lru_min_sampling_ratio_ > 0;
+     }},
     {"kvcm.cache_reclaimer.group_lru_max_sampling_size",
      [](const std::string &value, ServerConfig *config) {
          if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
@@ -339,6 +347,7 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_pending_delete_handler_limit_ = 1024;
     cache_reclaimer_pending_bytes_limit_ = 4ULL * 1024 * 1024 * 1024 * 1024;
     cache_reclaimer_group_lru_max_sampling_size_ = 65536;
+    cache_reclaimer_group_lru_min_sampling_ratio_ = 10;
     cache_reclaimer_group_lru_max_delete_requests_per_round_ = 128;
     cache_gc_enabled_ = true;
     cache_gc_scan_interval_ms_ = 1000;
@@ -478,7 +487,8 @@ bool ServerConfig::Check() {
         return false;
     }
 
-    if (cache_reclaimer_group_lru_max_sampling_size_ == 0 ||
+    if (cache_reclaimer_group_lru_max_sampling_size_ == 0 || cache_reclaimer_group_lru_min_sampling_ratio_ == 0 ||
+        cache_reclaimer_group_lru_min_sampling_ratio_ > std::numeric_limits<std::size_t>::max() ||
         cache_reclaimer_group_lru_max_delete_requests_per_round_ == 0 ||
         cache_reclaimer_group_lru_max_sampling_size_ > std::numeric_limits<std::size_t>::max() ||
         cache_reclaimer_group_lru_max_delete_requests_per_round_ > std::numeric_limits<std::size_t>::max()) {

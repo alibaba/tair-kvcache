@@ -67,11 +67,19 @@ bool CacheReclaimer::BuildGroupLruPlan(const RequestContext *request_context,
                                        GroupLruPlan &out_plan) noexcept {
     out_plan = GroupLruPlan{};
     if (configured_sampling_size == 0 || configured_batch_size == 0 || group_lru_config_.max_sampling_size == 0 ||
-        group_lru_config_.max_delete_requests_per_round == 0 || !scope.CheckGroupWaterLevelExceed()) {
+        group_lru_config_.max_delete_requests_per_round == 0 || group_lru_config_.min_sampling_ratio == 0 ||
+        !scope.CheckGroupWaterLevelExceed()) {
+        return false;
+    }
+    if (configured_batch_size > std::numeric_limits<std::size_t>::max() / group_lru_config_.min_sampling_ratio) {
+        KVCM_LOG_ERROR("trace_id [%s] group [%s] Group LRU sampling ratio overflow",
+                       request_context->trace_id().c_str(),
+                       instance_group.c_str());
         return false;
     }
     out_plan.configured_batch_size = configured_batch_size;
-    out_plan.normalized_sampling_size = std::max(configured_sampling_size, configured_batch_size);
+    out_plan.normalized_sampling_size =
+        std::max(configured_sampling_size, configured_batch_size * group_lru_config_.min_sampling_ratio);
 
     struct EligibleInstance {
         std::shared_ptr<const InstanceInfo> info;
@@ -309,7 +317,9 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                 state.failed = true;
                 continue;
             }
-            const auto count = per_task == 0 ? state.remaining : std::min(per_task, state.remaining);
+            const auto count = indexer->PreferSingleTaskReclaimSampling() || per_task == 0
+                                   ? state.remaining
+                                   : std::min(per_task, state.remaining);
             state.remaining -= count;
             ++state.outstanding;
             if (state.remaining > 0 && state.outstanding < per_instance_tasks) {
@@ -508,7 +518,11 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         return std::tie(a.lru_time_us, plan.items[a.instance_index].instance_info->instance_id(), a.block_key) <
                std::tie(b.lru_time_us, plan.items[b.instance_index].instance_info->instance_id(), b.block_key);
     });
-    candidates.resize(std::min(candidates.size(), GroupLruBatchSize(plan, successful_sampling_size)));
+    // Requested samples can include duplicates or non-deletable keys. Keep
+    // selection headroom in the actual, unique eligible candidate set too.
+    // GroupLruBatchSize retains one-key progress for a nonempty tiny tail.
+    candidates.resize(
+        std::min(candidates.size(), GroupLruBatchSize(plan, std::min(successful_sampling_size, candidates.size()))));
     METRICS_(cache_reclaimer, group_lru_sort_duration_us) = TimestampUtil::GetSteadyTimeUs() - sort_begin;
     METRICS_(cache_reclaimer, group_lru_selected_block_count) += candidates.size();
 
@@ -547,6 +561,7 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         CacheLocationDelRequest request;
         request.instance_id = info->instance_id();
         request.delay = std::chrono::milliseconds(delay);
+        const auto request_begin = position;
         while (position < candidates.size() && candidates[position].instance_index == index &&
                request.block_keys.size() < request_limit) {
             request.block_keys.push_back(candidates[position++].block_key);
@@ -580,6 +595,35 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
         ++attempted_requests;
         METRICS_(cache_reclaimer, group_lru_delete_request_count) += 1;
         if (SubmitDelReq(request_context, info, request, bytes, counts, predicted_keys)) {
+            // These gauges describe the last accepted request, not the whole
+            // candidate pool. Blocks removed by the final Location filter do
+            // not contribute; creation ages already cover its selected Locations.
+            AgeStats lru_ages;
+            const auto now_us = TimestampUtil::GetCurrentTimeUs();
+            __int128 age_sum = 0;
+            std::size_t age_count = 0;
+            for (std::size_t i = 0; i < request.block_keys.size(); ++i) {
+                const auto time_us = candidates[request_begin + i].lru_time_us;
+                if (request.location_ids[i].empty() || time_us <= 0) {
+                    continue;
+                }
+                const auto age_us = now_us - time_us;
+                lru_ages.min_us = std::min(lru_ages.min_us, age_us);
+                lru_ages.max_us = std::max(lru_ages.max_us, age_us);
+                age_sum += age_us;
+                ++age_count;
+            }
+            if (age_count == 0) {
+                lru_ages.Clear();
+            } else {
+                lru_ages.avg_us = static_cast<std::int64_t>(age_sum / age_count);
+            }
+            METRICS_(cache_reclaimer, reclaim_batch_lru_age_min_us) = static_cast<double>(lru_ages.min_us);
+            METRICS_(cache_reclaimer, reclaim_batch_lru_age_max_us) = static_cast<double>(lru_ages.max_us);
+            METRICS_(cache_reclaimer, reclaim_batch_lru_age_avg_us) = static_cast<double>(lru_ages.avg_us);
+            METRICS_(cache_reclaimer, reclaim_batch_create_age_min_us) = static_cast<double>(ages.min_us);
+            METRICS_(cache_reclaimer, reclaim_batch_create_age_max_us) = static_cast<double>(ages.max_us);
+            METRICS_(cache_reclaimer, reclaim_batch_create_age_avg_us) = static_cast<double>(ages.avg_us);
             result.made_progress = true;
             METRICS_(cache_reclaimer, reclaim_job_count) += 1;
             METRICS_(cache_reclaimer, group_lru_submitted_block_count) += nonempty_blocks;

@@ -312,14 +312,15 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
 
 容量比例模式中，服务级 `key_sampling_size_total` 和 `del_batch_size` 仍限制每个 Instance 的单次采样 / 删除预算，倾斜产生的超额份额留给后续轮次。Group LRU 则将两者作为单 Instance 基准，按有效 Instance 数 `N` 计算理论总量 `S*N`、`B*N`，在 Group 内统一选择 victim；一次请求仍不超过 `B`，同一 Instance 一轮可以收到多次请求。它不承诺每轮必须删满理论预算。
 
-Group LRU 新增两个进程级保护参数，均须为正整数，仅影响该模式：
+Group LRU 使用以下进程级参数，均须为正整数，仅影响该模式：
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `kvcm.cache_reclaimer.group_lru_max_sampling_size` | `65536` | 单个 Group 一轮的总采样名额上限；不足以覆盖全部 Instance 时按队列轮转采样子集 |
+| `kvcm.cache_reclaimer.group_lru_min_sampling_ratio` | `10` | 采样 / 删除基准的最小倍数；新模式使用 `S=max(S_cfg, B_cfg*ratio)`，不改变旧模式的共享预算。显式设为 `1` 可用于低采样比例对照，但可能提前选中其他 Instance 的较新数据 |
 | `kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round` | `128` | 单个 Group 一轮尝试提交的非空删除请求数上限；Executor 拒绝的请求也计数 |
 
-采样总量受限或部分 Instance 收集失败时，Group batch 同步缩小以保持采样 / 删除比例；单次 Instance 采样仍小于 `65536`。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
+采样总量受限、部分 Instance 收集失败，或去重及 Location 过滤后有效候选不足时，Group batch 同步缩小以保持采样 / 删除比例；非空候选至少保留一个删除名额，避免小尾部因取整无法清空。单次 Instance 采样仍小于 `65536`。纯 Local 或 cached 恢复完成且实际采样后端为 Local 时，同一 Instance 使用一个采样任务，不因提高采样预算而并行拆分；纯 Redis、恢复中的 cached 保留有界任务拆分，不同 Instance 仍可并行。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
 
 升级和回滚需注意：缺字段的旧 Registry 数据会采用新默认值；希望保持旧模式的 Group 应提前明确配置 `0` 或 `1`。旧 proto3 客户端会省略隐式零值，若需显式选择 `USAGE_PROPORTIONAL`，应升级到支持该字段 oneof 存在性的客户端，或使用明确携带字段的 Admin JSON。旧二进制不保证识别 `2`，回滚前应把新模式切回旧模式并回读确认。历史 LFU / TTL 配置若缺少模式字段，也应先明确选择旧模式或切为 LRU。
 

@@ -295,7 +295,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
 
     def test_no_over_eviction_same_group_multiple_instances(self):
-        """A Group-wide credit stops admission before the next instance."""
+        """Group credit stops admission after three one-key requests."""
         self.worker_manager.stop_worker(0)
         self.assertTrue(
             self.worker_manager.start_worker(
@@ -360,7 +360,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         })
 
         self._wait_metric_value(
-            "cache_reclaimer.pending_delete_handler_count", 1, timeout_s=5
+            "cache_reclaimer.pending_delete_handler_count", 3, timeout_s=5
         )
         self._wait_metric_value(
             "cache_reclaimer.pending_delete_handler_count", 0, timeout_s=10
@@ -371,13 +371,13 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertEqual(
             self._metric_value("cache_reclaimer.delete_submit_count"),
-            1,
+            3,
             "Group credit should prevent admission from the next instance",
         )
         self.assertGreaterEqual(
             surviving_blocks,
-            8,
-            "Group credit should limit delayed reclaim to one four-key batch",
+            9,
+            "Group credit should limit delayed reclaim to three one-key requests",
         )
         self.assertLess(
             surviving_blocks,
@@ -422,11 +422,11 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             "trace_id": self._trace_id, "instance_group": group, "current_version": current_version,
         })
         # Do not read keys while waiting: foreground verification would itself refresh LRU.
-        self._wait_metric_value("cache_reclaimer.delete_submit_count", 1, timeout_s=5)
+        self._wait_metric_value("cache_reclaimer.delete_submit_count", 2, timeout_s=5)
         self._wait_metric_value("cache_reclaimer.pending_delete_handler_count", 0, timeout_s=10)
         self.assertEqual(2, self._count_surviving_blocks("old_small", range(4)))
         self.assertEqual(12, self._count_surviving_blocks("new_large", range(12)))
-        self.assertEqual(1, self._metric_value("cache_reclaimer.delete_submit_count"))
+        self.assertEqual(2, self._metric_value("cache_reclaimer.delete_submit_count"))
         self.assertEqual(2, self._metric_value("cache_reclaimer.group_lru_submitted_block_count"))
 
     def test_group_lru_default_and_explicit_modes_survive_restart(self):
@@ -552,9 +552,9 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
     ):
         """Write 12 blocks, then trigger reclaim with a five-second delay.
 
-        A four-key batch is sufficient to move either configured water level
-        from 60% to 40%. The pending request must therefore credit the water
-        level immediately and prevent a second batch during the delay window.
+        The effective-candidate ratio produces one-key requests in this
+        small pool. Three requests move either water level from 60% to 45%
+        (equality at 50% still triggers). Credit must prevent a fourth request.
         The Future terminal state must release all temporary accounting.
         """
         self.worker_manager.stop_worker(0)
@@ -626,46 +626,46 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             "instance_group": self._instance_group_name,
         }
         inflight_metrics = self._wait_metric_values([
-            ("cache_reclaimer.delete_submit_count", {}, 1),
+            ("cache_reclaimer.delete_submit_count", {}, 3),
             ("cache_reclaimer.delete_complete_count", {}, 0),
-            ("cache_reclaimer.pending_delete_handler_count", {}, 1),
-            ("cache_reclaimer.pending_location_count", {}, 4),
-            ("cache_reclaimer.pending_delete_bytes", {}, 4 * 1024),
-            ("cache_reclaimer.credited_delete_bytes", {}, 4 * 1024),
-            ("cache_reclaimer.predicted_deleted_key_count", {}, 4),
+            ("cache_reclaimer.pending_delete_handler_count", {}, 3),
+            ("cache_reclaimer.pending_location_count", {}, 3),
+            ("cache_reclaimer.pending_delete_bytes", {}, 3 * 1024),
+            ("cache_reclaimer.credited_delete_bytes", {}, 3 * 1024),
+            ("cache_reclaimer.predicted_deleted_key_count", {}, 3),
             (
                 "cache_reclaimer.pending_location_count",
                 expected_group_type_tags,
-                4,
+                3,
             ),
             (
                 "cache_reclaimer.pending_delete_bytes",
                 expected_group_type_tags,
-                4 * 1024,
+                3 * 1024,
             ),
             (
                 "cache_reclaimer.credited_delete_bytes",
                 expected_group_type_tags,
-                4 * 1024,
+                3 * 1024,
             ),
             (
                 "cache_reclaimer.predicted_deleted_key_count",
                 expected_group_tags,
-                4,
+                3,
             ),
         ])
         logging.info("delayed reclaim in-flight metrics: %s", inflight_metrics)
         self._wait_surviving_block_count(
             self._instance_id,
             range(12),
-            expected_count=8,
+            expected_count=9,
             timeout_s=2,
         )
 
         completed_metrics = self._wait_metric_values(
             [
-                ("cache_reclaimer.delete_submit_count", {}, 1),
-                ("cache_reclaimer.delete_complete_count", {}, 1),
+                ("cache_reclaimer.delete_submit_count", {}, 3),
+                ("cache_reclaimer.delete_complete_count", {}, 3),
                 ("cache_reclaimer.pending_delete_handler_count", {}, 0),
                 ("cache_reclaimer.pending_location_count", {}, 0),
                 ("cache_reclaimer.pending_delete_bytes", {}, 0),
@@ -708,8 +708,8 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertGreaterEqual(
             surviving_blocks,
-            8,
-            "in-flight credit should limit delayed reclaim to one batch",
+            9,
+            "in-flight credit should limit delayed reclaim to three one-key requests",
         )
         self.assertLess(
             surviving_blocks,
@@ -718,8 +718,8 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertEqual(
             self._metric_value("cache_reclaimer.delete_submit_count"),
-            1,
-            "fresh credit should prevent admission of a second batch",
+            3,
+            "fresh credit should prevent admission of a fourth request",
         )
 
     def _wait_metric_value(

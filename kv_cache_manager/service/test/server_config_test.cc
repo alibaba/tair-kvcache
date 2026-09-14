@@ -99,15 +99,22 @@ TEST_F(ServerConfigTest, TestGroupLruLimits) {
     ASSERT_TRUE(defaults.Parse("", {}));
     EXPECT_EQ(65536, defaults.GetCacheReclaimerGroupLruMaxSamplingSize());
     EXPECT_EQ(128, defaults.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound());
+    EXPECT_EQ(10, defaults.GetCacheReclaimerGroupLruMinSamplingRatio());
+    // Group LRU's larger sample pool must not change the shared legacy defaults.
+    EXPECT_EQ(100, defaults.GetCacheReclaimerKeySamplingSizeTotal());
+    EXPECT_EQ(100, defaults.GetCacheReclaimerDelBatchSize());
     ServerConfig configured;
     ASSERT_TRUE(configured.Parse("",
                                  {{"kvcm.cache_reclaimer.group_lru_max_sampling_size", "131072"},
-                                  {"kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round", "256"}}));
+                                  {"kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round", "256"},
+                                  {"kvcm.cache_reclaimer.group_lru_min_sampling_ratio", "5"}}));
     ASSERT_TRUE(configured.Check());
     EXPECT_EQ(131072, configured.GetCacheReclaimerGroupLruMaxSamplingSize());
     EXPECT_EQ(256, configured.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound());
+    EXPECT_EQ(5, configured.GetCacheReclaimerGroupLruMinSamplingRatio());
     for (const auto &key : {"kvcm.cache_reclaimer.group_lru_max_sampling_size",
-                            "kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round"}) {
+                            "kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round",
+                            "kvcm.cache_reclaimer.group_lru_min_sampling_ratio"}) {
         for (const auto &value : {"0", "-1", "", "1.5", "100x", "18446744073709551616"}) {
             ServerConfig invalid;
             EXPECT_FALSE(invalid.Parse("", {{key, value}})) << key << "=" << value;

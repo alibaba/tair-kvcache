@@ -16,6 +16,7 @@
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
+- [Group LRU 持续流量验证](../integration_test/reclaimer/group_lru_validation.md) - 多 Instance 持续写入、停止访问后的清零、采样比例对照、结果口径与复现方法
 - [Commit 要求](develop/commit_requirements.md) - 提交前检查和 commit message 格式约定
 - [Pull Request 协作指南](develop/pull_request_guidelines.md) - PR 的可评审性、协作表达、标题和双语正文约定
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式

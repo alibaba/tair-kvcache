@@ -3,8 +3,8 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | 已实现，单测与端到端功能回归通过；性能压测待开展 |
-| 更新时间 | 2026-09-08 |
-| 代码基线 | `origin/main`，`a6e5d176` |
+| 更新时间 | 2026-09-14 |
+| 代码基线 | `origin/main`，`0d242f74` |
 | 涉及模块 | `manager`、`meta`、`common`、`config`、`metrics`、`service`、`protocol`、`kvcm_ops` |
 | 关联能力 | Instance Group 水位回收、LRU、异步删除、分层存储迁移 |
 
@@ -150,14 +150,17 @@ EventReport Location 不进入通用逐出，Type 别名按现有 BaseType 口�
 
 ### 5.2 Group 总预算
 
-`S_cfg` 和 `B_cfg` 仍是现有配置中的单 Instance 基准，不是 Group 总预算。为保持与旧策略相同的理论总量，分别乘以有效 Instance 数 `N`，再对新模式增加独立的聚合采样上限：
+`S_cfg` 和 `B_cfg` 仍是现有配置中的单 Instance 基准，不是 Group 总预算。删除理论总量沿用 `B_cfg*N`；采样先满足新模式的最小倍数，再乘以有效 Instance 数 `N`，并受独立的聚合采样上限约束：
 
 ```text
-S = max(S_cfg, B_cfg)
+R = group_lru_min_sampling_ratio  // 默认 10；仅影响 Group LRU
+S = max(S_cfg, checked_multiply(B_cfg, R))
 S_theory = checked_multiply(S, N)
 B_theory = checked_multiply(B_cfg, N)
 S_plan = min(S_theory, group_lru_max_sampling_size)
 ```
+
+`R` 是 Group LRU 专用的正整数参数，避免扩大共享采样基准时影响容量比例和固定策略。默认 `S_cfg=B_cfg=100`、两个有效 Instance 时，理论采样从 200 增加到 2000，删除上限仍为 200；已有更大的 `S_cfg` 继续生效。显式设 `R=1` 可作旧采样比例对照，不保证留出冷热筛选空间。默认 10 是可调整的起点，不代表吞吐最优或严格全局 LRU 保证。
 
 `S_cfg`、`B_cfg` 任一为 0 时不生成计划，不能通过归一化意外开启逐出。乘法溢出时计划失败并记录原因。`group_lru_max_sampling_size` 是新增的独立 Group 总量限制，默认 65536；不是把现有单 Instance 的 `kSizeLimit` 当成 Group 上限。该限制只影响新模式，不能限制旧容量比例计划的 Group 总量。新增保护参数必须为正数；非法值在参数校验时拒绝，运行期若仍读到 0 则拒绝该计划并记录原因，不能当作无限制。
 
@@ -174,19 +177,22 @@ S_plan = min(S_theory, group_lru_max_sampling_size)
 
 key count 只是可取得的采样规模估计，不代表这些 key 都含本轮可删除的 Location；资格仍在候选阶段检查。“一半基础、一半按 key 数”的固定 V1 折中缓解覆盖偏差，但不是严格的全局随机采样承诺，后端本身也可能使用冷候选采样。基础份额保留对小 Instance 冷数据的覆盖，后续可依据冷候选产出调整补采样。均不引入“每个 Instance 至少删除一个”的约束。
 
-采样总量被裁剪时，同步缩小 Group batch，保留配置的采样放大倍数：
+采样总量被裁剪时，同步缩小 Group batch。收集完成后，还要按去重及 Location 过滤后的实际候选数 `C` 再次收缩，避免计划采样很多、实际候选很少时仍把全部候选删除：
 
 ```text
-B_group = min(B_theory, max(1, floor(uint128(S_effective) * B_cfg / S)))
+E = min(S_effective, C)
+B_group = E == 0 ? 0 : min(B_theory, max(1, floor(uint128(E) * B_cfg / S)))
 ```
 
-该式仅用于 `N > 0`、原始配置和 `S_effective` 均非零的成功计划。`S >= B_cfg` 保证 `B_group <= S_effective`；宽整型乘法避免溢出；`max(1, ...)` 只防止已有非零 Group 预算被二次取整清零。正常未裁剪时，仍有 `B_group = B_cfg * N`。单个 Instance 的采样预算不是其逐出份额，最终只受它实际提供的候选数限制。
+该式仅用于 `N > 0`、原始配置和 `S_effective` 均非零的成功计划。`S >= B_cfg` 保证 `B_group <= E`；宽整型乘法避免溢出。`max(1, ...)` 保留非空候选的一步进展，允许最后一个可删除 key 被回收，不提供逐 Instance 最少删除份额。只有采样未裁剪、候选也足够时才保持 `B_group = B_cfg * N`。单个 Instance 的采样预算不是其逐出份额，所有 victim 仍可来自同一个 Instance。
 
 ### 5.4 并发、截止时间与局部失败
 
+采样量和采样并发独立控制。`MetaStorageBackendManager` 按与真实采样相同的后端选择规则提供提示：纯 Local，或 cached 恢复完成且采样源为 Local 时，同一 Instance 用一个任务读取完整预算；没有本地后端、恢复未完成或采样源非 Local 时，继续按 `sampling_size_per_task` 拆分。旧两种策略也复用这一任务提示，但其预算计算不变。各 Instance 之间仍可在既有 worker pool 中并行，不把远程 I/O 放到 cron 同步执行；所有任务继续受原有 in-flight 和 deadline 限制。
+
 复用现有采样 worker pool，不创建新线程池。Group 按 Instance 轮流派发采样子任务，优先让各 Instance 获得第一批采样机会。收集器不等待整批任务全部结束：哪个任务完成，就回收哪个任务的名额并继续派发；慢 Instance 不能挡住健康 Instance 的后续分片。
 
-将本轮开始时可用 worker 数除以计划 Instance 数，向下取整且至少为 1，作为每个 Instance 的在途分片上限；所有任务仍受进程级 in-flight 上限约束。这样慢 Instance 不能反复占用健康 Instance 释放的 worker，单 Instance 场景仍可并行使用可用 worker。这个限制只分配采样并发，不分配删除份额；本轮不动态借用其他 Instance 的并发份额。
+需要拆分的后端，将本轮开始时可用 worker 数除以计划 Instance 数，向下取整且至少为 1，作为每个 Instance 的在途分片上限；所有任务仍受进程级 in-flight 上限约束。这样慢 Instance 不能反复占用健康 Instance 释放的 worker；Local 单任务路径不消耗多份并发额度。这个限制只分配采样并发，不分配删除份额；本轮不动态借用其他 Instance 的并发份额。
 
 新旧有界路径共用采样任务提交能力，由 Group 收集器统一管理新模式的任务和结果，不能并发调用多个各自认为可以占满整个 pool 的采样循环。同一 Instance 的分片结果按实际完成状态合并，不能跨 Instance 混淆。
 
@@ -343,7 +349,11 @@ B_request = min(B_cfg, kSizeLimit - 1)
 
 复用现有删除 bytes、Location、Future、credit 和反压指标。Group LRU 的 DEBUG 汇总包含 Group、有效与预算覆盖的 Instance 数、是否 partial、计划与成功收集的采样预算、Top B 数量和请求尝试数；单请求沿用现有提交日志。暂停和停止由运行状态检查保护，未增加独立的暂停计数。上述信息不能被表述为全量 keyspace 的冷热分布。
 
+Group LRU 同时更新已有的 `reclaim_batch_lru_age_{min,max,avg}_us` 和 `reclaim_batch_create_age_{min,max,avg}_us`。这六个 gauge 表示最近一个 accepted 删除请求的年龄：LRU 年龄按最终仍有待删 Location 的 block 统计，创建年龄按最终待删 Location 统计，不把整个候选池或被反压过滤的项算进去。复用已读取的时间和 Location 统计，不增加 I/O。无效或缺失时间不参与年龄统计；该请求没有有效时间时对应三项置 0。本轮没有 accepted 请求时保留最近一批的值，异步删除是否实际成功仍需结合完成 / 失败指标判断。原容量策略和固定策略的上报时机不变。
+
 ## 10. 验证范围与结果
+
+持续流量场景的实际结果、统计口径与复现方法见 [Group LRU 持续流量验证](../../integration_test/reclaimer/group_lru_validation.md)。本节保留设计验收要求，不将未执行的场景列为已通过。
 
 ### 10.1 验证范围
 
@@ -364,6 +374,9 @@ B_request = min(B_cfg, kSizeLimit - 1)
 13. **配置兼容**：新建和旧 Registry 缺字段时默认 Group LRU，显式旧值 0 / 1 保持原模式；覆盖协议字段缺省与显式 0 的区别、旧客户端省略零值、新枚举 round-trip、非法 LFU / TTL 组合、CLI 更新无关字段不丢策略，以及下一轮切换和在途状态不变。
 14. **单 Instance 回归**：合法完整候选下与原 LRU 选择基本一致。新路径过滤前移、确定性 tie-break 和显式 I/O 失败处理造成的差异单独断言，不承诺输出逐项完全相同。
 15. **迁移回归**：本轮 accepted Location 出现在 Migration pending 排除快照中；仅达到迁移水位时仍能迁移。
+16. **采样比例与持续流量**：默认放大采样且不改变旧策略预算；用 1:1、5:1、10:1 对照旧大 / 新小 Instance 的持续写入，另覆盖冷小 Instance 清空、多 Instance 不同写速和热点读取、突发流量、无压力不清空。去重 / 不可删过滤后的有效候选不足应缩批，最后一个 key 保留进展。规模、持续时间、剩余 key、快照冷热顺序和请求延迟由独立测试输出记录，不把小规模功能测试当作生产吞吐结论。
+17. **旧大 Instance 清空**：旧大 Instance 先占满目标容量，停止访问后注册空的新 Instance 并持续写入；另测新 Instance 已有少量数据的情况。新写入量足以持续触发回收，观察旧大 Instance 从大量 key 经过少量尾部最终清到 0；过程中只读取用量指标，核验旧 key 的查询在关闭压力并等待在途删除完成后进行。
+18. **回收年龄指标**：检查 accepted 请求的 LRU / 创建年龄 min、max、avg；覆盖多 Location、最终准入过滤、请求拒绝、提前恢复水位、无效时间清零和连续请求覆盖最近值，并通过服务指标接口验证可读性。
 
 端到端场景应包括“旧 Instance 无访问、新 Instance 持续读写”的稳定容量压力：验证冷旧数据优先回收、各 Instance 容量允许不同、新 Instance 不受固定份额限制。另测水位恢复后停止，明确不会在无压力时继续清空旧 Instance。
 

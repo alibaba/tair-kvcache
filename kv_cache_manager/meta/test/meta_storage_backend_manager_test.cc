@@ -512,6 +512,26 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestSingleTaskReclaimSamplingTracksActualSourceAndRecovery) {
+    MetaStorageBackendManager mgr;
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.persistent_backend_ = std::make_unique<MetaRedisBackend>();
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+    class NonLocalCache : public MetaLocalBackend {
+        std::string GetStorageType() noexcept override { return "non_local_test_cache"; }
+    };
+    mgr.cache_backend_ = std::make_unique<NonLocalCache>();
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.cache_backend_.reset();
+    mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+}
+
 TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTimeDuringRecovery) {
     MetaStorageBackendManager mgr;
     auto persistent = std::make_unique<RecordingReclaimBackend>(11);

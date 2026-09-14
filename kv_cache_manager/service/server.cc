@@ -68,6 +68,7 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
     CacheReclaimerGroupLruConfig group_lru_config;
+    group_lru_config.min_sampling_ratio = config_.GetCacheReclaimerGroupLruMinSamplingRatio();
     group_lru_config.max_sampling_size = config_.GetCacheReclaimerGroupLruMaxSamplingSize();
     group_lru_config.max_delete_requests_per_round = config_.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound();
     CacheGarbageCollector::Config cache_gc_config;

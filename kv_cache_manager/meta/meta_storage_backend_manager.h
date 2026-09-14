@@ -163,6 +163,9 @@ public:
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
                                       bool require_read_success = false) noexcept;
+    // Follow the same source selection as SampleReclaimCandidates: cached
+    // metadata is complete only after recovery, not merely when configured.
+    bool PreferSingleTaskReclaimSampling() const noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;

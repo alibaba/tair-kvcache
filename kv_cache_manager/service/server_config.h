@@ -54,6 +54,7 @@ public:
     }
     uint64_t GetCacheReclaimerPendingBytesLimit() const { return cache_reclaimer_pending_bytes_limit_; }
     uint64_t GetCacheReclaimerGroupLruMaxSamplingSize() const { return cache_reclaimer_group_lru_max_sampling_size_; }
+    uint64_t GetCacheReclaimerGroupLruMinSamplingRatio() const { return cache_reclaimer_group_lru_min_sampling_ratio_; }
     uint64_t GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound() const {
         return cache_reclaimer_group_lru_max_delete_requests_per_round_;
     }
@@ -120,6 +121,7 @@ private:
     uint64_t cache_reclaimer_pending_delete_handler_limit_ = 0;
     uint64_t cache_reclaimer_pending_bytes_limit_ = 0;
     uint64_t cache_reclaimer_group_lru_max_sampling_size_ = 0;
+    uint64_t cache_reclaimer_group_lru_min_sampling_ratio_ = 0;
     uint64_t cache_reclaimer_group_lru_max_delete_requests_per_round_ = 0;
     bool cache_gc_enabled_ = true;
     int64_t cache_gc_scan_interval_ms_ = 0;

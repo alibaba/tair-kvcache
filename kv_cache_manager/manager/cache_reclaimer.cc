@@ -619,8 +619,9 @@ CacheReclaimer::~CacheReclaimer() {
 }
 
 ErrorCode CacheReclaimer::Start() noexcept {
-    if (group_lru_config_.max_sampling_size == 0 || group_lru_config_.max_delete_requests_per_round == 0) {
-        KVCM_LOG_ERROR("Group LRU resource limits must be positive");
+    if (group_lru_config_.max_sampling_size == 0 || group_lru_config_.max_delete_requests_per_round == 0 ||
+        group_lru_config_.min_sampling_ratio == 0) {
+        KVCM_LOG_ERROR("Group LRU resource limits and sampling ratio must be positive");
         return ErrorCode::EC_BADARGS;
     }
     if (registry_manager_ == nullptr) {
@@ -1211,7 +1212,8 @@ bool CacheReclaimer::DoKeySamplingWithSize(const std::shared_ptr<RequestContext>
         KVCM_LOG_ERROR("sampling size == 0");
         return false;
     }
-    if (sampling_sz_per_task == 0 || sampling_sz_per_task > total_sampling_sz) {
+    if (meta_indexer->PreferSingleTaskReclaimSampling() || sampling_sz_per_task == 0 ||
+        sampling_sz_per_task > total_sampling_sz) {
         sampling_sz_per_task = total_sampling_sz;
     }
 

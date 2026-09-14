@@ -1933,6 +1933,17 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
     return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
 }
 
+bool MetaStorageBackendManager::PreferSingleTaskReclaimSampling() const noexcept {
+    auto *source = persistent_backend_.get();
+    if (cache_backend_) {
+        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
+            return false;
+        }
+        source = cache_backend_.get();
+    }
+    return source && source->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
+}
+
 ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,
                                                              const int64_t count,
                                                              ReclaimCandidateVector &out_candidates,
