@@ -448,7 +448,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint32_t meta_query_worker_count,
                         std::size_t meta_query_parallel_threshold,
                         std::size_t meta_query_chunk_size,
-                        CacheGarbageCollector::Config cache_gc_config) {
+                        CacheGarbageCollector::Config cache_gc_config,
+                        CacheReclaimerGroupLruConfig group_lru_config) {
     if (schedule_plan_executor_thread_count <= 1 || schedule_plan_migration_worker_budget == 0 ||
         schedule_plan_migration_worker_budget >= static_cast<uint32_t>(schedule_plan_executor_thread_count)) {
         KVCM_LOG_ERROR("invalid schedule executor budget: worker_count=%d migration_worker_budget=%u",
@@ -515,7 +516,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         event_manager_,
                                                         write_location_manager_,
                                                         std::move(cache_reclaimer_async_delete_config),
-                                                        migration_manager_);
+                                                        migration_manager_,
+                                                        group_lru_config);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;

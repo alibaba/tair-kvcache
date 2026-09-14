@@ -12,6 +12,8 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
         "//kv_cache_manager/manager:migration_manager",
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
         "@cpp_stub",
     ],
 )

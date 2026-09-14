@@ -435,6 +435,19 @@ ErrorCode MetaDummyBackend::ListKeys(RequestContext * /*request_context*/,
     return ErrorCode::EC_OK;
 }
 
+std::vector<ErrorCode> MetaDummyBackend::GetLocationMapsForMaintenance(RequestContext *,
+                                                                       const KeyTypeVec &keys,
+                                                                       CacheLocationMapVector &out_locations) noexcept {
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!table_.FindAndApply(keys[i], [&](const DummyItem &item) { out_locations[i] = item.locations; })) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
+}
+
 ErrorCode MetaDummyBackend::ScanLocationsForMaintenance(RequestContext *request_context,
                                                         const std::string &cursor,
                                                         const int64_t limit,
@@ -481,7 +494,8 @@ ErrorCode MetaDummyBackend::SampleReclaimKeys(RequestContext *request_context,
 
 ErrorCode MetaDummyBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
                                                     const std::int64_t count,
-                                                    ReclaimCandidateVector &out_candidates) noexcept {
+                                                    ReclaimCandidateVector &out_candidates,
+                                                    bool /*require_read_success*/) noexcept {
     out_candidates.clear();
     if (count <= 0) {
         return EC_OK;

@@ -91,7 +91,10 @@ cc_library(
 
 cc_library(
     name = "cache_reclaimer",
-    srcs = ["cache_reclaimer.cc"],
+    srcs = [
+        "cache_reclaimer.cc",
+        "cache_reclaimer_group_lru.cc",
+    ],
     hdrs = ["cache_reclaimer.h"],
     deps = [
         "//kv_cache_manager/config",

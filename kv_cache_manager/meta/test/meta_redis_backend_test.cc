@@ -358,6 +358,52 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegradesA
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 
+TEST_F(MetaRedisBackendTest, TestGroupLruStrictCandidateReadsPreserveLegacyFallback) {
+    AssertReclaimCandidateReadModes<MetaRedisBackend>();
+}
+
+TEST_F(MetaRedisBackendTest, TestGroupLruMissingRedisTimestampRetainsCandidates) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> random_replies;
+        for (int i = 0; i < 20; ++i) {
+            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
+        }
+        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
+        random_replies[1] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
+        const std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
+            .WillOnce(Return(ByMove(std::move(random_replies))));
+
+        // Exercise RedisClient's actual nil/empty-field -> EC_NOENT mapping.
+        std::vector<ReplyUPtr> property_replies;
+        property_replies.emplace_back(MakeFakeReplyArrayString({std::nullopt}));
+        property_replies.emplace_back(MakeFakeReplyArrayString({""}));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(
+                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq(PROPERTY_LRU_TIME)),
+                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq(PROPERTY_LRU_TIME)))))
+            .WillOnce(Return(ByMove(std::move(property_replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(EC_OK, meta_redis_backend_->SampleReclaimCandidates(nullptr, 2, candidates, true));
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(1, candidates[0].key);
+    EXPECT_EQ(0, candidates[0].last_access_time_us);
+    EXPECT_EQ(2, candidates[1].key);
+    EXPECT_EQ(0, candidates[1].last_access_time_us);
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
 TEST_F(MetaRedisBackendTest, TestRedisError) {
     EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri empty_storage_uri;
