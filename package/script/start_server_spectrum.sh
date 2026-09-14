@@ -60,7 +60,6 @@ function main() {
     # IO worker counts. Prepend the default so explicit MALLOC_CONF options,
     # including narenas, take precedence and remain available for tuning.
     export MALLOC_CONF="narenas:8${MALLOC_CONF:+,$MALLOC_CONF}"
-    echo "Spectrum jemalloc configuration: MALLOC_CONF=$MALLOC_CONF (explicit options override defaults)"
     exec "$SCRIPT_DIR/start_server.sh" "$@"
 }
 
