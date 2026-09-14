@@ -2,11 +2,25 @@
 
 #include <cstring>
 #include <dlfcn.h>
+#include <link.h>
 
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
 namespace {
+bool IsCanonicalPltSymbol(const void *address) {
+    if (!address) {
+        return false;
+    }
+    Dl_info info{};
+    void *symbol_entry = nullptr;
+    if (dladdr1(address, &info, &symbol_entry, RTLD_DL_SYMENT) == 0) {
+        return false;
+    }
+    const auto *symbol = static_cast<const ElfW(Sym) *>(symbol_entry);
+    return symbol && symbol->st_shndx == SHN_UNDEF && symbol->st_value != 0;
+}
+
 template <typename T>
 bool ReadControl(ScopedJemallocArenaRotation::Mallctl mallctl, const char *name, T &value) {
     size_t size = sizeof(value);
@@ -24,6 +38,11 @@ ScopedJemallocArenaRotation::Mallctl ScopedJemallocArenaRotation::ResolveMallctl
     // must not cause us to change the state of an allocator that malloc bypasses.
     void *control = dlsym(RTLD_DEFAULT, "mallctl");
     void *allocate = dlsym(RTLD_DEFAULT, "malloc");
+    // An executable may export an undefined symbol whose nonzero value is its
+    // canonical PLT entry. Only then skip the executable to find the provider.
+    if (IsCanonicalPltSymbol(allocate)) {
+        allocate = dlsym(RTLD_NEXT, "malloc");
+    }
     Dl_info control_info{}, allocate_info{};
     if (!control || !allocate) {
         KVCM_LOG_INFO("skip jemalloc arena rotation: mallctl or malloc symbol unavailable");
