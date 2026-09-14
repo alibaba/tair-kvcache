@@ -240,6 +240,9 @@ public:
     std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
                                                         const KeyTypeVec &keys,
                                                         LocationIdsPerKey &out_location_ids) noexcept override;
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept override;
     std::vector<ErrorCode> GetProperties(RequestContext *request_context,
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
@@ -275,7 +278,8 @@ public:
                                 std::vector<KeyType> &out_keys) noexcept override;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
-                                      ReclaimCandidateVector &out_candidates) noexcept override;
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) noexcept override;
     std::vector<ErrorCode>
     GetLastAccessTimesForMaintenance(RequestContext *request_context,
                                      const KeyTypeVec &keys,

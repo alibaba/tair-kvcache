@@ -10,10 +10,13 @@
 - [CacheReclaimer 异步删除与过度逐出优化](design/cache_reclaimer_async_delete.md) - 异步删除生命周期、in-flight credit、反压与无进展退避
 - [后台扫描 GC](design/cache_garbage_collector.md) - 基于 authoritative cursor 的后台全量巡检；V1 清理长期 orphan WRITING 和普通 SERVING storage-missing，并提供无副作用读取、精确值条件 CAS 与 HA 生命周期
 - [CacheReclaimer 跨 Instance 公平逐出](design/cache_reclaimer_instance_fairness.md) - 按 Instance 用量分配采样与逐出预算，并与异步 credit 协同
+- [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到
+- [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
+- [Group LRU 持续流量验证](../integration_test/reclaimer/group_lru_validation.md) - 多 Instance 持续写入、停止访问后的清零、采样比例对照、结果口径与复现方法
 - [Commit 要求](develop/commit_requirements.md) - 提交前检查和 commit message 格式约定
 - [Pull Request 协作指南](develop/pull_request_guidelines.md) - PR 的可评审性、协作表达、标题和双语正文约定
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式

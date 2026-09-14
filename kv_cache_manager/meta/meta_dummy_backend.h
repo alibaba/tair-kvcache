@@ -94,6 +94,10 @@ public:
                        std::int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept override;
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept override;
+
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           int64_t limit,
@@ -103,7 +107,8 @@ public:
     SampleReclaimKeys(RequestContext *request_context, std::int64_t count, KeyTypeVec &out_keys) noexcept override;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       std::int64_t count,
-                                      ReclaimCandidateVector &out_candidates) noexcept override;
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) noexcept override;
 
     // =====================================================================
     // Metadata APIs

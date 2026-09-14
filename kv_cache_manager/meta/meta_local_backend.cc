@@ -1268,6 +1268,20 @@ MetaLocalBackend::DeleteLocationsForMaintenance(RequestContext * /*request_conte
     return results;
 }
 
+std::vector<ErrorCode> MetaLocalBackend::GetLocationMapsForMaintenance(RequestContext * /*request_context*/,
+                                                                       const KeyTypeVec &keys,
+                                                                       CacheLocationMapVector &out_locations) noexcept {
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    std::vector<ErrorCode> results(keys.size(), EC_ERROR);
+    if (!cache_) {
+        return results;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKeyForMaintenance(keys[i], &out_locations[i], nullptr);
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::GetProperties(RequestContext * /*request_context*/,
                                                        const KeyTypeVec &keys,
                                                        const std::vector<std::string> &field_names,
@@ -1469,7 +1483,8 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context
 
 ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
                                                     const int64_t count,
-                                                    ReclaimCandidateVector &out_candidates) noexcept {
+                                                    ReclaimCandidateVector &out_candidates,
+                                                    bool /*require_read_success*/) noexcept {
     out_candidates.clear();
     if (!cache_) {
         KVCM_LOG_ERROR("local backend not inited");
@@ -1480,9 +1495,7 @@ ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_c
     }
 
     const size_t num_shards = shard_mask_ + 1;
-    size_t num_rounds = std::min(sample_times_, num_shards);
-    num_rounds = std::min(num_rounds, static_cast<size_t>(count));
-    const int64_t per_round_count = (count + static_cast<int64_t>(num_rounds) - 1) / static_cast<int64_t>(num_rounds);
+    const size_t num_rounds = std::max(size_t{1}, std::min({sample_times_, num_shards, static_cast<size_t>(count)}));
     std::vector<std::pair<int64_t, uint32_t>> shard_times;
     shard_times.reserve(num_shards);
     for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
@@ -1496,15 +1509,19 @@ ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_c
     }
 
     const size_t select_count = std::min(num_rounds, shard_times.size());
-    std::sort(shard_times.begin(), shard_times.end());
+    // Reserve half the slots for stable shard-ID rotation. Sorting only by
+    // physical tails would detach shard priority from the advancing key cursor.
+    // The remaining slots retain a preference for cold, unselected shards.
+    const size_t rotating = select_count / 2 + select_count % 2;
     const size_t start =
-        reclaim_sample_shard_cursor_.fetch_add(select_count, std::memory_order_relaxed) % shard_times.size();
+        reclaim_sample_shard_cursor_.fetch_add(rotating, std::memory_order_relaxed) % shard_times.size();
+    std::rotate(shard_times.begin(), shard_times.begin() + start, shard_times.end());
+    std::partial_sort(shard_times.begin() + rotating, shard_times.begin() + select_count, shard_times.end());
+    const int64_t per_round_count = (count - 1) / static_cast<int64_t>(select_count) + 1;
     int64_t remaining = count;
     for (size_t i = 0; i < select_count && remaining > 0; ++i) {
         const size_t batch = static_cast<size_t>(std::min(per_round_count, remaining));
-        const size_t shard_index = (start + i) % shard_times.size();
-        const size_t collected =
-            CollectNextReclaimCandidatesFromShard(shard_times[shard_index].second, batch, out_candidates);
+        const size_t collected = CollectNextReclaimCandidatesFromShard(shard_times[i].second, batch, out_candidates);
         remaining -= static_cast<int64_t>(collected);
     }
     return EC_OK;

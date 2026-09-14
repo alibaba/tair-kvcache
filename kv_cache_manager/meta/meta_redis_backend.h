@@ -83,7 +83,8 @@ public:
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept override;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
-                                      ReclaimCandidateVector &out_candidates) noexcept override;
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) noexcept override;
 
     // ----- Metadata APIs -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
