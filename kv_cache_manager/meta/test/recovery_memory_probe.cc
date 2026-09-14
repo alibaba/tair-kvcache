@@ -181,7 +181,10 @@ void Run() {
     control = reinterpret_cast<Control>(dlsym(RTLD_DEFAULT, "mallctl"));
     Require(control != nullptr, "requires jemalloc LD_PRELOAD");
     Dl_info malloc_info{}, control_info{};
-    Require(dladdr(dlsym(RTLD_DEFAULT, "malloc"), &malloc_info) &&
+    // The production binary is linked with -rdynamic. RTLD_DEFAULT can then
+    // resolve malloc to the executable's exported PLT trampoline even though
+    // its GOT target is jemalloc. Validate the real next provider instead.
+    Require(dladdr(dlsym(RTLD_NEXT, "malloc"), &malloc_info) &&
                 dladdr(reinterpret_cast<void *>(control), &control_info) &&
                 malloc_info.dli_fbase == control_info.dli_fbase,
             "malloc and mallctl must belong to the same allocator");
