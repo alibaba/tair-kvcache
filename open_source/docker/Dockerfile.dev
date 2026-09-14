@@ -30,7 +30,7 @@ RUN sed -i.bak 's|http://mirrors\.cloud\.aliyuncs\.com|http://mirrors.aliyun.com
     rm -rf /var/cache/yum
 
 COPY requirements-dev.txt /tmp/requirements-dev.txt
-RUN python3.11 -m pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple && \
+RUN python3.11 -m pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
     python3.11 -m pip install --no-cache-dir -r /tmp/requirements-dev.txt && \
     rm /tmp/requirements-dev.txt
 
