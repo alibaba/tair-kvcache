@@ -37,7 +37,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
-        ASSERT_EQ(0, config.GetKvMetaRpcPort());
+        ASSERT_FALSE(config.IsKvMetaEnabled());
     }
     // config_file not exist
     {
@@ -123,28 +123,39 @@ TEST_F(ServerConfigTest, TestGroupLruLimits) {
     }
 }
 
-TEST_F(ServerConfigTest, TestKvMetaRpcPortIsOptInAndIsolated) {
+TEST_F(ServerConfigTest, TestKvMetaIsOptInOnPrimaryRpcListener) {
     ServerConfig config;
-    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.rpc_port", "6500"}}));
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.enabled", "true"}}));
     EXPECT_TRUE(config.Check());
-    EXPECT_EQ(6500, config.GetKvMetaRpcPort());
+    EXPECT_TRUE(config.IsKvMetaEnabled());
 
     ASSERT_TRUE(config.Parse("", {}));
     EXPECT_TRUE(config.Check());
-    EXPECT_EQ(0, config.GetKvMetaRpcPort());
+    EXPECT_FALSE(config.IsKvMetaEnabled());
 
-    for (const auto &environ : std::vector<std::unordered_map<std::string, std::string>>{
-             {{"kvcm.kv_meta.rpc_port", "-1"}},
-             {{"kvcm.kv_meta.rpc_port", "65536"}},
-             {{"kvcm.kv_meta.rpc_port", "6381"}, {"kvcm.service.rpc_port", "6381"}},
-             {{"kvcm.kv_meta.rpc_port", "6382"}, {"kvcm.service.http_port", "6382"}},
-             {{"kvcm.kv_meta.rpc_port", "9382"},
-              {"kvcm.service.http_port", "6382"},
-              {"kvcm.service.enable_debug_service", "true"}},
-         }) {
+    for (const auto *value : {"", "TRUE", "1", "yes", "falsex"}) {
         ServerConfig invalid;
-        ASSERT_TRUE(invalid.Parse("", environ));
-        EXPECT_FALSE(invalid.Check());
+        EXPECT_FALSE(invalid.Parse("", {{"kvcm.kv_meta.enabled", value}})) << value;
+    }
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.enabled", "false"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsKvMetaEnabled());
+}
+
+TEST_F(ServerConfigTest, TestDeprecatedKvMetaPortFailsClosedWithoutAffectingDisabledConfig) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.rpc_port", "0"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsKvMetaEnabled());
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.enabled", "true"}, {"kvcm.kv_meta.rpc_port", "0"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_TRUE(config.IsKvMetaEnabled());
+
+    for (const auto *value : {"6383", "-1", "not-a-port"}) {
+        ServerConfig invalid;
+        EXPECT_FALSE(invalid.Parse("", {{"kvcm.kv_meta.rpc_port", value}})) << value;
     }
 }
 

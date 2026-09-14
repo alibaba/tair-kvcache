@@ -69,8 +69,8 @@ opaque tensor byte stream，不同请求、不同 tensor，甚至同一批次中
 - 用 `PutStart`/`PutFinish` 写会话保证未完成对象不可读，并在失败、超时和换主后收敛；
 - 对容量、请求规模、并发 session 和字符串长度设置明确上限；
 - 为 C++/Python 上层提供组合好的 `KvMetaObjectClient`，同时保留底层元数据与数据面 API；
-- 默认关闭；启用后保持独立端口、namespace、请求门、锁和后台维护，并明确共享进程/存储仍需部署 QoS 才能获得
-  性能隔离。
+- 默认关闭；启用后与固定 block MetaService 共享主 gRPC listener，但保持独立 protobuf namespace、请求门、锁和
+  后台维护，并明确共享 RPC worker、进程和存储仍需部署 QoS 才能获得性能隔离。
 
 ### 2.3 V1 非目标
 
@@ -97,7 +97,7 @@ flowchart LR
     object_client["KvMetaObjectClient"]
     meta_client["KvMetaClient"]
     transfer_client["KvMetaTransferClient"]
-    grpc["独立 KVMeta gRPC Server"]
+    grpc["主 gRPC Server<br/>Meta + KVMeta services"]
     service["KvMetaServiceImpl"]
     manager["KvMetaManager"]
     registry["Registry / MetaIndexer"]
@@ -122,7 +122,7 @@ KVCM 不传递图中的 receipt。RTP 自己在 ViT 与 LLM 之间传递 tensor 
 
 | 组件 | 职责 | 不负责 |
 |---|---|---|
-| `KvMetaServiceImpl` / 独立 gRPC server | 请求门控、参数边界、错误码映射、响应形状校验 | 不直接搬运对象 bytes |
+| `KvMetaServiceGRpc` / `KvMetaServiceImpl` | 独立 RPC 路由、请求门控、参数边界、错误码映射、响应形状校验 | 不直接搬运对象 bytes |
 | `KvMetaManager` | exact-key metadata、allocation、动态 byte quota、写会话、HA 恢复、Remove/Trim | 不进入 KV cache 写入/淘汰流程 |
 | `RegistryManager` / `MetaIndexer` | 保存 KVMeta 专用 instance 和 `CacheLocation` | 不理解 tensor 语义 |
 | `DataStorageManager` | 选择 backend，创建/删除物理对象 | 不执行客户端 buffer 搬运 |
@@ -149,17 +149,22 @@ KVCM 不传递图中的 receipt。RTP 自己在 ViT 与 LLM 之间传递 tensor 
 ## 4. 与 KV cache 主链路的隔离
 
 隔离是本设计的首要约束。V1 在代码路径、元数据和生命周期上提供强制隔离；CPU、网络、内存和物理 backend 的
-性能隔离仍取决于部署方式，不能仅凭独立 RPC 端口宣称“对主链路零影响”。
+性能隔离仍取决于部署方式；共享 RPC listener 和进程不构成性能隔离保证。
 
-### 4.1 启停与网络隔离
+### 4.1 启停与 RPC 路由隔离
 
-- `kvcm.kv_meta.rpc_port=0` 为默认值。此时不创建 `KvMetaManager`、session expiry worker 或额外 gRPC server；
-- 非零端口启用独立 gRPC server 和请求计数器，不向既有 MetaService 增加 RPC；
-- KVMeta 端口必须与主 RPC/HTTP、Admin RPC/HTTP 和 Debug HTTP 端口不同。
+- `kvcm.kv_meta.enabled=false` 为默认值。此时不创建 `KvMetaManager`、session expiry worker、KVMeta service adapter，
+  也不改变主 gRPC ServerBuilder 的 service 注册集合；
+- 配置 `kvcm.kv_meta.enabled=true` 后，`KvMetaServiceGRpc` 注册到 `kvcm.service.rpc_port` 对应的同一个
+  `grpc::ServerBuilder`，不创建第二个 listener 或 `grpc::Server`；
+- 升级时，遗留 `kvcm.kv_meta.rpc_port=0` 作为禁用占位可继续解析且不会启用任何资源；非零旧端口会 fail
+  closed，要求服务端 flag 与客户端 endpoint 一起显式迁移，避免静默连接到已移除的第二 listener；
+- 固定 block RPC 路径以 `/kv_cache_manager.proto.meta.MetaService/` 开头，KVMeta RPC 路径以
+  `/kv_cache_manager.proto.kv_meta.MetaService/` 开头；既有 MetaService proto 和方法集合不变。
 
-独立端口是故障与部署边界，不是身份认证。V1 沿用 KVCM 的受信网络模型，知道 instance/key 的 client 可以调用
-Get/Remove；生产环境必须用网络策略限制端口来源。V2 ownership token 仍需绑定经过认证的 tenant/instance，不能
-用随机 key 或 token 猜测难度代替服务认证。
+共享端口只是传输复用，不是身份认证。V1 沿用 KVCM 的受信网络模型，知道 instance/key 的 client 可以调用
+Get/Remove；生产环境必须用网络策略限制主 RPC 端口来源。V2 ownership token 仍需绑定经过认证的
+tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证。
 
 ### 4.2 元数据与容量隔离
 
@@ -190,7 +195,7 @@ Migration，最后 join KVMeta recovery/session worker。内存 session 被丢�
 
 | 资源 | V1 已隔离 | 仍可能共享的部分 | 生产建议 |
 |---|---|---|---|
-| RPC | 独立 gRPC server、端口和请求计数 | 同一进程 CPU、内存、调度 | 限制 KVMeta RPC 并发；高负载时使用独立进程/cgroup |
+| RPC | protobuf service 路由、请求门和 metrics namespace 独立 | listener、gRPC sync worker、进程 CPU/内存 | 在调用方/网关限制 KVMeta 并发；高负载时使用独立进程/cgroup |
 | 锁 | KVMeta group admission shard 只由 KVMeta 获取 | Registry/MetaIndexer 的底层实现 | KVMeta 使用专用 Instance Group 和 metadata namespace |
 | 后台线程 | recovery、session expiry 独立，失败不阻塞主服务放流 | 进程线程数和 CPU quota | 设置独立线程/队列上限，监控 gate 和积压 |
 | 容量 | 按真实 bytes 使用专用 group/type quota | backend 的真实总容量 | storage candidate 指向专用 pool/namespace |
@@ -420,7 +425,7 @@ provider 的标准/未知异常收敛为脱敏告警并继续处理后续 sessio
 失败后不进入进程内重试队列，因为现有可复用地址型 URI 没有 allocation generation；不确定结果若被重放，可能
 删除已经复用同一地址的后继对象。这里选择可运维回收的 orphan，而不是数据破坏。
 
-独立 `KvMetaServiceGRpc` 还在每个 handler 最外层覆盖 request-context 创建和 service implementation 调用。
+独立的 `KvMetaServiceGRpc` adapter 还在每个 handler 最外层覆盖 request-context 创建和 service implementation 调用。
 标准或未知异常都被截断为不含 provider 文本、key 或 endpoint 的固定错误，并返回非 OK gRPC `INTERNAL`；response
 中的局部结果会先清空。对 Put/Remove/Trim 等 mutation，这个 transport 状态明确表示结果未知，client 不得把它
 当成普通应用错误自动重放。该防火墙只编译进独立 KVMeta gRPC service，不改变既有 Meta/Admin 主链路处理方式。
@@ -472,11 +477,12 @@ Trim 和 recovery 每 1000 个 key 检查取消，并把物理删除拆成最多
 ### 11.1 服务端
 
 ```text
-kvcm.kv_meta.rpc_port=<独立端口>
+kvcm.service.rpc_port=6381
+kvcm.kv_meta.enabled=true
 ```
 
-除此之外，KVMeta 复用现有 Registry、MetaIndexer、Instance Group quota 和 storage backend 配置。部署必须提前
-创建仅供 KVMeta 使用的 Instance Group。
+KVMeta client 的 `addresses` 使用同一个主 RPC endpoint。除此之外，KVMeta 复用现有 Registry、MetaIndexer、
+Instance Group quota 和 storage backend 配置。部署必须提前创建仅供 KVMeta 使用的 Instance Group。
 
 ### 11.2 对象客户端
 
@@ -560,8 +566,8 @@ V1 在 metadata 删除时同步扣减 usage。若后续物理 Delete 失败，or
 adapter 中。普通 `DataStorageBackend`、`TransferClient`、CacheReclaimer、Migration 和固定 block proto 不读取这些
 capability，也不改变既有调用。
 
-实现上由 `KvMetaManager` 持有独立的 adapter registry。只有启用非零 KVMeta 端口时才创建 adapter：legacy adapter
-委托现有 `DataStorageManager` 做 singleton Create/Delete；支持方通过独立 target/factory 提供新接口。不要给共享
+实现上由 `KvMetaManager` 持有独立的 adapter registry。只有配置 `kvcm.kv_meta.enabled=true` 时才创建 adapter：
+legacy adapter 委托现有 `DataStorageManager` 做 singleton Create/Delete；支持方通过独立 target/factory 提供新接口。不要给共享
 `DataStorageBackend` 追加必选 virtual method，也不要让普通 selector 返回或缓存 KVMeta capability。
 
 ### 13.2 KVMeta 专用 storage capability

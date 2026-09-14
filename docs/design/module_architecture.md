@@ -31,7 +31,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 | 模块 | 目录 | 职责 |
 |---|---|---|
 | **入口** | `main.cpp` | 构造 `CommandLine` 并运行，唯一依赖 `service`。 |
-| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug，以及可选的 kv_meta）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。KVMeta 默认关闭，启用时使用独立 gRPC 端口、请求门和恢复线程。 |
+| **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug，以及可选的 kv_meta）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。KVMeta 默认关闭，启用时注册到主 gRPC listener，并使用独立 service namespace、请求门和恢复线程。 |
 | **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是 KVCache 中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。`KvMetaManager` 是隔离的 exact-key 通用对象侧路，复用索引、注册表与存储后端，但不进入固定 block 写链路。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 管理 `MetaIndexer`，维护 cache key → `CacheLocation` 的索引；元数据后端可插拔；`meta_search_cache` 做查询缓存。`CacheLocation` 是被广泛共享的核心类型。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义各类配置对象；`RegistryManager` 持久化实例注册信息；`CoordinationBackend` + `LeaderElector` 提供一主多备的分布式选主。 |
@@ -162,7 +162,7 @@ flowchart TD
     client --> protocol
     client --> common
     client -. proto 转换复用 .-> service
-    client -. KvMetaClient / 独立 gRPC .-> service
+    client -. KvMetaClient / 主 gRPC listener .-> service
 
     %% optimizer 的关联
     optimizer -. cache_location 类型 .-> meta
@@ -313,8 +313,8 @@ flowchart LR
 
 ### 4.9 KVMeta 变长通用对象侧路
 
-配置非零 `kvcm.kv_meta.rpc_port` 后，`KvMetaClient` 经独立 gRPC server 调用 `KvMetaServiceImpl`，再进入
-`KvMetaManager`。KVMeta 将业务 string key 映射为一级哈希 key，并把完整 key 编码进 location id，以
+配置 `kvcm.kv_meta.enabled=true` 后，`KvMetaClient` 经主 `kvcm.service.rpc_port` 上独立的 protobuf service 路由
+调用 `KvMetaServiceImpl`，再进入 `KvMetaManager`。KVMeta 将业务 string key 映射为一级哈希 key，并把完整 key 编码进 location id，以
 exact-key 方式复用 `MetaIndexer`；数据 allocation 直接使用注册表中的 `DataStorageManager`。同一请求内每个
 缺失 key 按自己的 value size 发起 singleton `Create`。client 侧 `KvMetaObjectClient` 组合元数据事务与
 `KvMetaTransferClient`；后者对每个对象发起 singleton SDK IO 并共享一次 batch 超时。服务端和 client 的两层
