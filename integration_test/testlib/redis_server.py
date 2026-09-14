@@ -20,9 +20,15 @@ class RedisServer(object):
         return f"redis://127.0.0.1:{self.port}/"
 
     def start(self):
-        redis_server = os.environ.get("REDIS_SERVER_BIN") or shutil.which("redis-server")
+        redis_server = (
+            os.environ.get("REDIS_SERVER_BIN")
+            or shutil.which("valkey-server")
+            or shutil.which("redis-server")
+        )
         if redis_server is None:
-            raise RuntimeError("redis-server is required for this integration test; set REDIS_SERVER_BIN or PATH")
+            raise RuntimeError(
+                "valkey-server or redis-server is required for this integration test; set REDIS_SERVER_BIN or PATH"
+            )
 
         redis_dir = os.path.join(self.workdir, "redis")
         os.makedirs(redis_dir, exist_ok=True)
@@ -77,7 +83,7 @@ class RedisServer(object):
             except Exception as e:
                 last_error = e
                 time.sleep(0.1)
-        raise RuntimeError(f"redis-server did not become ready: {last_error}")
+        raise RuntimeError(f"Valkey/Redis server did not become ready: {last_error}")
 
     def command(self, *args):
         with socket.create_connection(("127.0.0.1", self.port), timeout=2) as sock:

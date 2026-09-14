@@ -84,11 +84,15 @@ install_apt_packages() {
         clang-format
         cpio
         curl
+        file
+        gdb
         git
         iproute2
+        jq
         libaio-dev
         libibverbs-dev
         libicu-dev
+        libjemalloc2
         libnuma-dev
         librdmacm-dev
         openssh-client
@@ -100,9 +104,13 @@ install_apt_packages() {
         python3-dev
         python3-packaging
         python3-pip
+        python3-redis
+        python3-requests
         rpm2cpio
         tar
         unzip
+        valkey-server
+        valkey-tools
         vim
         wget
         zip

@@ -3,6 +3,7 @@
 - Manager开发镜像（仅包含Manager相关依赖，不包含CUDA）：
   - 镜像：ghcr.io/alibaba/tair-kvcache-kvcm-dev:latest
   - Dockerfile位置：open_source/docker/Dockerfile.dev
+  - 预装依赖和镜像自检命令见[开发依赖清单](../../open_source/docker/README.md#开发依赖清单)，包括 jemalloc、Valkey、调试工具及 Connector 静态检查工具。
 - Connector开发镜像：请直接基于对应推理引擎的开发镜像补充Manager依赖来构造通用开发镜像，参考：[open_source/docker/README.md](../../open_source/docker/README.md)
 
 如果希望在同一容器内开发Manager和Connector，建议使用对应推理引擎的开发镜像。Manager的依赖安装比推理引擎更加简单。
