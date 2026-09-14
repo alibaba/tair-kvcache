@@ -1,5 +1,28 @@
 package(default_visibility = ["//visibility:public"])
 
+cc_binary(
+    name = "recovery_memory_probe",
+    testonly = True,
+    srcs = ["recovery_memory_probe.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
+        "//kv_cache_manager/meta:utils",
+    ],
+)
+
+py_test(
+    name = "recovery_memory_test",
+    size = "large",
+    srcs = ["recovery_memory_test.py"],
+    data = [":recovery_memory_probe"],
+    tags = [
+        "jemalloc",
+        "manual",
+    ],
+)
+
 cc_test(
     name = "query_executor_test",
     srcs = ["query_executor_test.cc"],
