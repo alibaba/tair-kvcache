@@ -23,7 +23,9 @@ ScopedJemallocArenaRotation::Mallctl ScopedJemallocArenaRotation::ResolveMallctl
     // Do not dlopen another allocator. A linked but non-interposing jemalloc
     // must not cause us to change the state of an allocator that malloc bypasses.
     void *control = dlsym(RTLD_DEFAULT, "mallctl");
-    void *allocate = dlsym(RTLD_DEFAULT, "malloc");
+    // Skip an executable-local malloc PLT symbol exported by -rdynamic and
+    // resolve the allocator provider that follows the executable instead.
+    void *allocate = dlsym(RTLD_NEXT, "malloc");
     Dl_info control_info{}, allocate_info{};
     if (!control || !allocate) {
         KVCM_LOG_INFO("skip jemalloc arena rotation: mallctl or malloc symbol unavailable");
