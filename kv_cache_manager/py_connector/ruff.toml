@@ -1,0 +1,15 @@
+# Lint & format rules for the kv_cache_manager Python connectors.
+# Scope: this directory only, so the rest of the repository is unaffected.
+# Mirrors the team's standard ruff setting (select ANN + F, ANN401 off).
+target-version = "py312"
+
+[lint]
+select = ["ANN", "F"]
+ignore = ["ANN401"]
+
+[lint.per-file-ignores]
+# Tests carry no annotations. They live in test/ and as flat test*.py
+# scripts next to the connectors they exercise (sglang/, trtllm/).
+"test/**" = ["ANN"]
+"**/test_*.py" = ["ANN"]
+"**/test.py" = ["ANN"]

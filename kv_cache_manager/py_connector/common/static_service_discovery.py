@@ -13,7 +13,6 @@ URL 形式（由工厂解析后注入）::
 import threading
 from typing import List, Optional, Sequence
 
-from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.service_discovery import (
     ServiceDiscovery,
     ServiceEndpoint,
@@ -28,13 +27,15 @@ def parse_host_port_list(host_list: str) -> List[ServiceEndpoint]:
     if not host_list:
         raise ValueError("host_list is empty")
     endpoints: List[ServiceEndpoint] = []
-    for token in host_list.split(','):
+    for token in host_list.split(","):
         token = token.strip()
         if not token:
             continue
-        if ':' not in token:
-            raise ValueError(f"static endpoint missing host:port format, token={token!r}")
-        host, _, port_str = token.partition(':')
+        if ":" not in token:
+            raise ValueError(
+                f"static endpoint missing host:port format, token={token!r}"
+            )
+        host, _, port_str = token.partition(":")
         if not host or not port_str:
             raise ValueError(f"static endpoint missing host or port, token={token!r}")
         if not port_str.isdigit():
@@ -44,7 +45,9 @@ def parse_host_port_list(host_list: str) -> List[ServiceEndpoint]:
             raise ValueError(f"static endpoint port out of range, token={token!r}")
         endpoints.append(ServiceEndpoint(ip=host, port=port, host=f"{host}:{port}"))
     if not endpoints:
-        raise ValueError(f"static endpoint list is empty after parsing, raw={host_list!r}")
+        raise ValueError(
+            f"static endpoint list is empty after parsing, raw={host_list!r}"
+        )
     return endpoints
 
 
@@ -61,7 +64,7 @@ class StaticServiceDiscovery(ServiceDiscovery):
         host_list: Optional[str] = None,
         *,
         endpoints: Optional[Sequence[ServiceEndpoint]] = None,
-    ):
+    ) -> None:
         if endpoints is not None:
             parsed: List[ServiceEndpoint] = list(endpoints)
         elif host_list is not None:

@@ -1,4 +1,5 @@
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 
 import subprocess
@@ -6,6 +7,7 @@ import signal
 import time
 import os
 import atexit
+from typing import Any, cast
 import requests
 import torch
 import torch.multiprocessing as mp
@@ -15,7 +17,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+# MHATokenToKVPoolHost moved in newer sglang versions.
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+)
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -38,7 +44,9 @@ hicache_mem_layout = "page_first_direct"
 
 manager_uri = os.environ.get("KVCM_MANAGER_URI", "http://127.0.0.1:6382")
 manager_http_port = int(manager_uri.rsplit(":", 1)[-1])
-debug_uri = os.environ.get("KVCM_DEBUG_URI", f"http://127.0.0.1:{manager_http_port + 3000}")
+debug_uri = os.environ.get(
+    "KVCM_DEBUG_URI", f"http://127.0.0.1:{manager_http_port + 3000}"
+)
 
 manager_bin = os.environ.get(
     "KVCM_MANAGER_BIN",
@@ -58,7 +66,7 @@ manager_log_dir = os.environ.get("KVCM_LOG_DIR", "/root/KVCacheManager/logs")
 proc = None
 
 
-def _stop_manager():
+def _stop_manager(*args: Any) -> None:
     """Stop the KV Cache Manager process."""
     global proc
     if proc and proc.poll() is None:
@@ -83,12 +91,17 @@ def _start_manager():
     subprocess.run(f"rm -rf {manager_log_dir}/*", shell=True, check=False)
 
     # Start the manager process (with debug service enabled for fault injection)
-    proc = subprocess.Popen([
-        manager_bin,
-        "-c", manager_server_conf,
-        "-l", manager_logger_conf,
-        "--env", "kvcm.service.enable_debug_service=true",
-    ])
+    proc = subprocess.Popen(
+        [
+            manager_bin,
+            "-c",
+            manager_server_conf,
+            "-l",
+            manager_logger_conf,
+            "--env",
+            "kvcm.service.enable_debug_service=true",
+        ]
+    )
 
     # Register cleanup handlers
     signal.signal(signal.SIGINT, _stop_manager)
@@ -149,7 +162,7 @@ def test():
     host_indices = []
 
     for i in range(0, 1024, page_size):
-        block_hash = get_hash_str(token_ids[i: i + page_size], block_hash)
+        block_hash = cast(str, get_hash_str(token_ids[i : i + page_size], block_hash))
         block_hashes.append(block_hash)
         host_indices.extend(range(i, i + page_size))
 
@@ -163,18 +176,22 @@ def test():
 
     # Test 1: Basic set/get operations
     block_hashes_0 = block_hashes[:10]
-    host_indices_0 = host_indices[:(10 * page_size)]
+    host_indices_0 = host_indices[: (10 * page_size)]
 
     # Verify blocks don't exist initially
     assert storage_backend.batch_exists(block_hashes_0) == 0
 
     # Set blocks and verify they exist
-    set_result = storage_backend.batch_set_v1(block_hashes_0, torch.tensor(host_indices_0))
+    set_result = storage_backend.batch_set_v1(
+        block_hashes_0, torch.tensor(host_indices_0)
+    )
     assert all(set_result)
     assert storage_backend.batch_exists(block_hashes_0) == len(block_hashes_0)
 
     # Get blocks and verify data integrity
-    get_result = storage_backend.batch_get_v1(block_hashes_0, torch.tensor(host_indices_0))
+    get_result = storage_backend.batch_get_v1(
+        block_hashes_0, torch.tensor(host_indices_0)
+    )
     assert all(get_result)
 
     # Verify data in KV buffer
@@ -190,26 +207,32 @@ def test():
     prefix_keys_1 = block_hashes_0
     extra_info_1 = HiCacheStorageExtraInfo(prefix_keys=prefix_keys_1)
     block_hashes_1 = block_hashes[10:20]
-    host_indices_1 = host_indices[(10 * page_size):(20 * page_size)]
+    host_indices_1 = host_indices[(10 * page_size) : (20 * page_size)]
 
     # Verify blocks don't exist initially
     assert storage_backend.batch_exists(block_hashes_1, extra_info_1) == 0
 
     # Set blocks with prefix and verify they exist
-    set_result = storage_backend.batch_set_v1(block_hashes_1, torch.tensor(host_indices_1), extra_info_1)
+    set_result = storage_backend.batch_set_v1(
+        block_hashes_1, torch.tensor(host_indices_1), extra_info_1
+    )
     assert all(set_result)
-    assert storage_backend.batch_exists(block_hashes_1, extra_info_1) == len(block_hashes_1)
+    assert storage_backend.batch_exists(block_hashes_1, extra_info_1) == len(
+        block_hashes_1
+    )
 
     # Test 3: Get with different prefix
     prefix_keys_2 = block_hashes[:5]
     extra_info_2 = HiCacheStorageExtraInfo(prefix_keys=prefix_keys_2)
     block_hashes_2 = block_hashes[5:15]
-    host_indices_2 = host_indices[(5 * page_size):(15 * page_size)]
+    host_indices_2 = host_indices[(5 * page_size) : (15 * page_size)]
     index_shift = 1024
     host_indices_2 = [v + index_shift for v in host_indices_2]
 
     # Get blocks with different prefix
-    get_result = storage_backend.batch_get_v1(block_hashes_2, torch.tensor(host_indices_2), extra_info_2)
+    get_result = storage_backend.batch_get_v1(
+        block_hashes_2, torch.tensor(host_indices_2), extra_info_2
+    )
     assert all(get_result)
 
     # Verify data in KV buffer
@@ -218,7 +241,9 @@ def test():
         token_id = i % page_size
         bf16_i = torch.tensor(i - index_shift, dtype=torch.bfloat16)
         tensor_i = mem_pool_host.kv_buffer[:, page_id, :, token_id]
-        assert torch.mean(tensor_i).item() == bf16_i, f"{torch.mean(tensor_i).item()=} == {bf16_i=}"
+        assert torch.mean(tensor_i).item() == bf16_i, (
+            f"{torch.mean(tensor_i).item()=} == {bf16_i=}"
+        )
         assert torch.std(tensor_i).item() == 0
 
     return storage_backend
@@ -230,20 +255,30 @@ class DebugServiceClient:
     def __init__(self, base_url):
         self.base_url = base_url
         self.session = requests.Session()
-        self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        self.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
     def _make_request(self, endpoint, data=None):
         url = self.base_url + endpoint
         response = self.session.post(url, json=data, headers=self.headers)
         response_data = response.json()
-        assert response.status_code == 200, \
+        assert response.status_code == 200, (
             f"Debug API {endpoint} failed: {response.status_code}"
-        assert response_data.get('header', {}).get('status', {}).get('code') == 'OK', \
+        )
+        assert response_data.get("header", {}).get("status", {}).get("code") == "OK", (
             f"Debug API {endpoint} error: {response_data}"
+        )
         return response_data
 
-    def inject_fault(self, api_name, fault_type="INTERNAL_ERROR",
-                     strategy="ALWAYS", trigger_at_call=None):
+    def inject_fault(
+        self,
+        api_name,
+        fault_type="INTERNAL_ERROR",
+        strategy="ALWAYS",
+        trigger_at_call=None,
+    ):
         data = {
             "api_name": api_name,
             "fault_type": fault_type,
@@ -251,13 +286,13 @@ class DebugServiceClient:
         }
         if trigger_at_call is not None:
             data["trigger_at_call"] = trigger_at_call
-        return self._make_request('/api/injectFault', data)
+        return self._make_request("/api/injectFault", data)
 
     def remove_fault(self, api_name):
-        return self._make_request('/api/removeFault', {"api_name": api_name})
+        return self._make_request("/api/removeFault", {"api_name": api_name})
 
     def clear_faults(self):
-        return self._make_request('/api/clearFaults', {})
+        return self._make_request("/api/clearFaults", {})
 
     def close(self):
         self.session.close()
@@ -279,7 +314,9 @@ def test_fault_injection(storage_backend):
     fi_block_hash = None
     fi_host_indices = []
     for i in range(0, 1024, page_size):
-        fi_block_hash = get_hash_str(fi_token_ids[i:i + page_size], fi_block_hash)
+        fi_block_hash = cast(
+            str, get_hash_str(fi_token_ids[i : i + page_size], fi_block_hash)
+        )
         fi_block_hashes.append(fi_block_hash)
         fi_host_indices.extend(range(i + 4096, i + 4096 + page_size))
 
@@ -293,12 +330,14 @@ def test_fault_injection(storage_backend):
         debug_client.inject_fault("StartWriteCache")
 
         hashes = fi_block_hashes[:5]
-        indices = fi_host_indices[:(5 * page_size)]
-        set_result = storage_backend.batch_set_v1(
-            hashes, torch.tensor(indices))
-        assert all(r is False for r in set_result), \
+        indices = fi_host_indices[: (5 * page_size)]
+        set_result = storage_backend.batch_set_v1(hashes, torch.tensor(indices))
+        assert all(r is False for r in set_result), (
             f"FI-1 FAILED: expected all False, got {set_result}"
-        logger.info("FI-1 PASSED: StartWriteCache fault → batch_set_v1 returns all False")
+        )
+        logger.info(
+            "FI-1 PASSED: StartWriteCache fault → batch_set_v1 returns all False"
+        )
 
         debug_client.remove_fault("StartWriteCache")
 
@@ -308,19 +347,20 @@ def test_fault_injection(storage_backend):
         logger.info("=== FI-2: GetCacheLocation ALWAYS fault (batch_get) ===")
         debug_client.inject_fault("GetCacheLocation")
 
-        get_result = storage_backend.batch_get_v1(
-            hashes, torch.tensor(indices))
-        assert all(r is False for r in get_result), \
+        get_result = storage_backend.batch_get_v1(hashes, torch.tensor(indices))
+        assert all(r is False for r in get_result), (
             f"FI-2 FAILED: expected all False, got {get_result}"
-        logger.info("FI-2 PASSED: GetCacheLocation fault → batch_get_v1 returns all False")
+        )
+        logger.info(
+            "FI-2 PASSED: GetCacheLocation fault → batch_get_v1 returns all False"
+        )
 
         # ----------------------------------------------------------
         # Test FI-3: GetCacheLocation ALWAYS fault (batch_exists)
         # ----------------------------------------------------------
         logger.info("=== FI-3: GetCacheLocation ALWAYS fault (batch_exists) ===")
         exists_result = storage_backend.batch_exists(hashes)
-        assert exists_result == 0, \
-            f"FI-3 FAILED: expected 0, got {exists_result}"
+        assert exists_result == 0, f"FI-3 FAILED: expected 0, got {exists_result}"
         logger.info("FI-3 PASSED: GetCacheLocation fault → batch_exists returns 0")
 
         debug_client.remove_fault("GetCacheLocation")
@@ -337,12 +377,14 @@ def test_fault_injection(storage_backend):
         debug_client.inject_fault("FinishWriteCache")
 
         fi4_hashes = fi_block_hashes[10:15]
-        fi4_indices = fi_host_indices[(10 * page_size):(15 * page_size)]
-        set_result = storage_backend.batch_set_v1(
-            fi4_hashes, torch.tensor(fi4_indices))
-        assert all(r is False for r in set_result), \
+        fi4_indices = fi_host_indices[(10 * page_size) : (15 * page_size)]
+        set_result = storage_backend.batch_set_v1(fi4_hashes, torch.tensor(fi4_indices))
+        assert all(r is False for r in set_result), (
             f"FI-4 FAILED: expected all False, got {set_result}"
-        logger.info("FI-4 PASSED: FinishWriteCache fault → batch_set_v1 returns all False")
+        )
+        logger.info(
+            "FI-4 PASSED: FinishWriteCache fault → batch_set_v1 returns all False"
+        )
 
         debug_client.remove_fault("FinishWriteCache")
 
@@ -357,29 +399,31 @@ def test_fault_injection(storage_backend):
         # The blocks were never successfully written during fault tests,
         # so batch_exists and batch_get should report miss.
         exists_result = storage_backend.batch_exists(hashes)
-        assert exists_result == 0, \
+        assert exists_result == 0, (
             f"FI-5 FAILED: expected 0 (not cached), got {exists_result}"
+        )
 
-        get_result = storage_backend.batch_get_v1(
-            hashes, torch.tensor(indices))
-        assert all(r is False for r in get_result), \
+        get_result = storage_backend.batch_get_v1(hashes, torch.tensor(indices))
+        assert all(r is False for r in get_result), (
             f"FI-5 FAILED: expected all False (cache miss), got {get_result}"
+        )
 
         # Now set should succeed.
-        set_result = storage_backend.batch_set_v1(
-            hashes, torch.tensor(indices))
-        assert all(set_result), \
+        set_result = storage_backend.batch_set_v1(hashes, torch.tensor(indices))
+        assert all(set_result), (
             f"FI-5 FAILED: expected all True after clearing faults, got {set_result}"
+        )
 
         # After successful set, get should hit.
-        get_result = storage_backend.batch_get_v1(
-            hashes, torch.tensor(indices))
-        assert all(get_result), \
+        get_result = storage_backend.batch_get_v1(hashes, torch.tensor(indices))
+        assert all(get_result), (
             f"FI-5 FAILED: expected all True (cache hit), got {get_result}"
+        )
 
         exists_result = storage_backend.batch_exists(hashes)
-        assert exists_result == len(hashes), \
+        assert exists_result == len(hashes), (
             f"FI-5 FAILED: expected {len(hashes)}, got {exists_result}"
+        )
         logger.info("FI-5 PASSED: get miss → set → get hit after clearing faults")
 
         # ----------------------------------------------------------
@@ -392,12 +436,16 @@ def test_fault_injection(storage_backend):
         prefix_keys = fi_block_hashes[:5]
         extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
         suffix_hashes = fi_block_hashes[5:10]
-        suffix_indices = fi_host_indices[(5 * page_size):(10 * page_size)]
+        suffix_indices = fi_host_indices[(5 * page_size) : (10 * page_size)]
         set_result = storage_backend.batch_set_v1(
-            suffix_hashes, torch.tensor(suffix_indices), extra_info)
-        assert all(r is False for r in set_result), \
+            suffix_hashes, torch.tensor(suffix_indices), extra_info
+        )
+        assert all(r is False for r in set_result), (
             f"FI-6 FAILED: expected all False, got {set_result}"
-        logger.info("FI-6 PASSED: StartWriteCache fault with prefix → returns all False")
+        )
+        logger.info(
+            "FI-6 PASSED: StartWriteCache fault with prefix → returns all False"
+        )
 
         debug_client.remove_fault("StartWriteCache")
 
@@ -408,17 +456,20 @@ def test_fault_injection(storage_backend):
         debug_client.inject_fault("GetCacheLocation")
 
         get_result = storage_backend.batch_get_v1(
-            suffix_hashes, torch.tensor(suffix_indices), extra_info)
-        assert all(r is False for r in get_result), \
+            suffix_hashes, torch.tensor(suffix_indices), extra_info
+        )
+        assert all(r is False for r in get_result), (
             f"FI-7 FAILED: expected all False, got {get_result}"
-        logger.info("FI-7 PASSED: GetCacheLocation fault with prefix → returns all False")
+        )
+        logger.info(
+            "FI-7 PASSED: GetCacheLocation fault with prefix → returns all False"
+        )
 
         debug_client.remove_fault("GetCacheLocation")
 
     finally:
         debug_client.clear_faults()
         debug_client.close()
-
 
 
 # ---------------------------------------------------------------------------
@@ -455,10 +506,11 @@ def _multi_rank_worker(rank, world_size, init_port):
 
     class _GlooTPGroup:
         """Minimal stand-in for GroupCoordinator (gloo only)."""
+
         def __init__(self, cpu_group):
             self.cpu_group = cpu_group
 
-    _ps._TP = _GlooTPGroup(
+    _ps._TP = _GlooTPGroup(  # ty: ignore[invalid-assignment]
         torch.distributed.new_group(list(range(world_size)), backend="gloo")
     )
 
@@ -515,17 +567,17 @@ def _multi_rank_worker(rank, world_size, init_port):
     mr_hash = None
     mr_indices = []
     for i in range(0, mr_max_total_num_tokens, page_size):
-        mr_hash = get_hash_str(mr_token_ids[i:i + page_size], mr_hash)
+        mr_hash = cast(str, get_hash_str(mr_token_ids[i : i + page_size], mr_hash))
         mr_hashes.append(mr_hash)
         mr_indices.extend(range(i, i + page_size))
 
-    debug_client = DebugServiceClient(debug_uri) if rank == 0 else None
+    debug_client: Any = DebugServiceClient(debug_uri) if rank == 0 else None
 
     # ------------------------------------------------------------------
     # MR-1: Normal multi-rank set
     # ------------------------------------------------------------------
     h1 = mr_hashes[:5]
-    idx1 = mr_indices[:5 * page_size]
+    idx1 = mr_indices[: 5 * page_size]
     torch.distributed.barrier()
     result = storage_backend.batch_set_v1(h1, torch.tensor(idx1))
     assert all(result), f"MR-1 rank {rank}: expected all True, got {result}"
@@ -548,7 +600,7 @@ def _multi_rank_worker(rank, world_size, init_port):
     #   With the fix, both ranks return [False] gracefully.
     # ------------------------------------------------------------------
     h3 = mr_hashes[5:10]
-    idx3 = mr_indices[5 * page_size:10 * page_size]
+    idx3 = mr_indices[5 * page_size : 10 * page_size]
 
     torch.distributed.barrier()
     if rank == 0:
@@ -556,8 +608,9 @@ def _multi_rank_worker(rank, world_size, init_port):
     torch.distributed.barrier()
 
     result = storage_backend.batch_set_v1(h3, torch.tensor(idx3))
-    assert all(r is False for r in result), \
+    assert all(r is False for r in result), (
         f"MR-3 rank {rank}: expected all False, got {result}"
+    )
 
     torch.distributed.barrier()
     if rank == 0:
@@ -572,7 +625,7 @@ def _multi_rank_worker(rank, world_size, init_port):
     #   This is a known inconsistency. We verify no hang occurs.
     # ------------------------------------------------------------------
     h4 = mr_hashes[15:20]
-    idx4 = mr_indices[15 * page_size:20 * page_size]
+    idx4 = mr_indices[15 * page_size : 20 * page_size]
 
     torch.distributed.barrier()
     if rank == 0:
@@ -581,8 +634,9 @@ def _multi_rank_worker(rank, world_size, init_port):
 
     result = storage_backend.batch_set_v1(h4, torch.tensor(idx4))
     if rank == 0:
-        assert all(r is False for r in result), \
+        assert all(r is False for r in result), (
             f"MR-4 rank 0: expected all False, got {result}"
+        )
     logger.info(f"[Rank {rank}] MR-4: result = {result}")
 
     torch.distributed.barrier()
@@ -596,7 +650,7 @@ def _multi_rank_worker(rank, world_size, init_port):
     #   Clear faults, verify set -> get works on all ranks.
     # ------------------------------------------------------------------
     h5 = mr_hashes[20:25]
-    idx5 = mr_indices[20 * page_size:25 * page_size]
+    idx5 = mr_indices[20 * page_size : 25 * page_size]
 
     torch.distributed.barrier()
     if rank == 0:
@@ -622,9 +676,9 @@ def _multi_rank_worker(rank, world_size, init_port):
     # ------------------------------------------------------------------
     h6 = mr_hashes[25:30]
     if rank == 0:
-        idx6 = mr_indices[25 * page_size:30 * page_size]  # 5 blocks
+        idx6 = mr_indices[25 * page_size : 30 * page_size]  # 5 blocks
     else:
-        idx6 = mr_indices[25 * page_size:28 * page_size]  # 3 blocks
+        idx6 = mr_indices[25 * page_size : 28 * page_size]  # 3 blocks
 
     torch.distributed.barrier()
     result = storage_backend.batch_set_v1(h6, torch.tensor(idx6))
@@ -632,10 +686,12 @@ def _multi_rank_worker(rank, world_size, init_port):
     # Both ranks should get [True, True, True, False, False]:
     # blocks 0-2 succeeded on all ranks, blocks 3-4 only rank 0 had data
     assert len(result) == 5, f"MR-6 rank {rank}: expected 5 results, got {len(result)}"
-    assert result[:3] == [True, True, True], \
+    assert result[:3] == [True, True, True], (
         f"MR-6 rank {rank}: first 3 blocks should be True, got {result[:3]}"
-    assert result[3:] == [False, False], \
+    )
+    assert result[3:] == [False, False], (
         f"MR-6 rank {rank}: last 2 blocks should be False, got {result[3:]}"
+    )
 
     torch.distributed.barrier()
     logger.info(f"[Rank {rank}] MR-6 PASSED: per-block best-effort")
@@ -649,13 +705,13 @@ def _multi_rank_worker(rank, world_size, init_port):
     #   After all_reduce(MIN): blocks [0,1] succeed, block [2] fails.
     #   Verifies prefix best-effort + per-block MIN in multi-rank.
     # ------------------------------------------------------------------
-    prefix_keys_7 = mr_hashes[5:8]    # 3 blocks never written → not in cache
-    h7 = mr_hashes[8:11]              # 3 new blocks
+    prefix_keys_7 = mr_hashes[5:8]  # 3 blocks never written → not in cache
+    h7 = mr_hashes[8:11]  # 3 new blocks
 
     if rank == 0:
-        idx7 = mr_indices[8 * page_size:11 * page_size]   # 3 blocks of data
+        idx7 = mr_indices[8 * page_size : 11 * page_size]  # 3 blocks of data
     else:
-        idx7 = mr_indices[8 * page_size:10 * page_size]   # 2 blocks of data
+        idx7 = mr_indices[8 * page_size : 10 * page_size]  # 2 blocks of data
 
     extra_info_7 = HiCacheStorageExtraInfo(prefix_keys=prefix_keys_7)
 
@@ -666,10 +722,12 @@ def _multi_rank_worker(rank, world_size, init_port):
     # Rank 0 writes blocks [0,1,2]; Rank 1 writes blocks [0,1] only.
     # all_reduce(MIN) → [1,1,0]. Result for new keys: [True, True, False]
     assert len(result) == 3, f"MR-7 rank {rank}: expected 3 results, got {len(result)}"
-    assert result[:2] == [True, True], \
+    assert result[:2] == [True, True], (
         f"MR-7 rank {rank}: first 2 blocks should be True, got {result[:2]}"
-    assert result[2] == False, \
+    )
+    assert result[2] == False, (
         f"MR-7 rank {rank}: last block should be False, got {result[2]}"
+    )
 
     torch.distributed.barrier()
     logger.info(f"[Rank {rank}] MR-7 PASSED: prefix best-effort multi-rank")
@@ -690,17 +748,18 @@ def _multi_rank_worker(rank, world_size, init_port):
         h8 = []
         _h = None
         for i in range(0, len(diverge_ids), page_size):
-            _h = get_hash_str(diverge_ids[i:i + page_size], _h)
+            _h = cast(str, get_hash_str(diverge_ids[i : i + page_size], _h))
             h8.append(_h)
 
-    idx8 = mr_indices[30 * page_size:33 * page_size]  # 3 blocks
+    idx8 = mr_indices[30 * page_size : 33 * page_size]  # 3 blocks
 
     torch.distributed.barrier()
     result = storage_backend.batch_set_v1(h8, torch.tensor(idx8))
 
     assert len(result) == 3, f"MR-8 rank {rank}: expected 3 results, got {len(result)}"
-    assert all(r is False for r in result), \
+    assert all(r is False for r in result), (
         f"MR-8 rank {rank}: expected all False (input diverged), got {result}"
+    )
 
     torch.distributed.barrier()
     logger.info(f"[Rank {rank}] MR-8 PASSED: input divergence → all False")

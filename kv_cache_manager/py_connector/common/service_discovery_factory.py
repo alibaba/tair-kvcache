@@ -41,7 +41,7 @@ def _parse_url(url: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
         logger.error(f"invalid service discovery url, missing scheme: {url!r}")
         return None
     scheme = url[:sep]
-    rest = url[sep + 3:]
+    rest = url[sep + 3 :]
     if not rest:
         logger.error(f"invalid service discovery url, empty body: {url!r}")
         return None
@@ -93,10 +93,13 @@ def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
         from kv_cache_manager.py_connector.common.static_service_discovery import (
             StaticServiceDiscovery,
         )
+
         try:
             return StaticServiceDiscovery(body)
         except Exception as e:
-            logger.error(f"failed to create StaticServiceDiscovery for url={url!r}: {e}")
+            logger.error(
+                f"failed to create StaticServiceDiscovery for url={url!r}: {e}"
+            )
             return None
 
     if scheme == _SCHEME_SPECTRUM:
@@ -111,7 +114,7 @@ def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
                 f"SpectrumServiceDiscovery not available (requires internal build), url={url!r}"
             )
             return None
-        
+
         cache_ttl = _get_int_param(params, "cache_time", 30)
         # URL 里 timeout 单位是毫秒（与 C++ 端对齐），Python SDK 用秒，这里换算。
         timeout_ms = _get_int_param(params, "timeout", 0)
@@ -132,7 +135,9 @@ def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
             logger.error(f"Spectrum service discovery not available: {e}")
             return None
         except Exception as e:
-            logger.error(f"failed to create SpectrumServiceDiscovery for url={url!r}: {e}")
+            logger.error(
+                f"failed to create SpectrumServiceDiscovery for url={url!r}: {e}"
+            )
             return None
 
     if scheme == _SCHEME_VIPSERVER:

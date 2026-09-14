@@ -1,27 +1,31 @@
 # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0rc0/examples/llm-api/llm_kv_cache_connector.py
 
-import os
-import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from tempfile import TemporaryDirectory
 import json
 import logging
-import uuid
 import math
+import os
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple
 
-import click
 import torch
-
-from tensorrt_llm import LLM, SamplingParams, logger
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
-    KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 import torch.distributed as dist
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+    KvCacheConnectorScheduler,
+    KvCacheConnectorWorker,
+    SchedulerOutput,
+)
+
+# tensorrt_llm.bindings is compiled only; it ships no type stubs.
+from tensorrt_llm.bindings.internal.batch_manager import (  # ty: ignore[unresolved-import]
+    LlmRequest,
+)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
-from kv_cache_manager.client.pybind import kvcm_py_client
+
+# kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
+from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +38,13 @@ logger = logging.getLogger(__name__)
 KVCM_CONFIG_PATH_KEY = "KVCM_CONFIG_PATH"
 
 
-def init_kvcm_config():
+def init_kvcm_config() -> Dict[str, Any]:
     kvcm_config_path = os.environ.get(KVCM_CONFIG_PATH_KEY)
     assert kvcm_config_path is not None, f"env {KVCM_CONFIG_PATH_KEY} is needed"
     logger.info(f"{kvcm_config_path=}")
 
     try:
-        with open(kvcm_config_path, 'r', encoding='utf-8') as f:
+        with open(kvcm_config_path, "r", encoding="utf-8") as f:
             kvcm_config = json.load(f)
     except FileNotFoundError:
         raise FileNotFoundError(f"KVCM config file not found at {kvcm_config_path}")
@@ -50,14 +54,20 @@ def init_kvcm_config():
     return kvcm_config
 
 
-def init_kvcm_meta_client(llm_args: TorchLlmArgs):
+def init_kvcm_meta_client(
+    llm_args: TorchLlmArgs,
+) -> Tuple[Dict[str, Any], KvCacheManagerClient]:
     kvcm_config = init_kvcm_config()
     manager_client = KvCacheManagerClient.from_connector_config(kvcm_config)
     logger.info("kvcm manager_client initialized")
     return kvcm_config, manager_client
 
 
-def init_kvcm_transfer_client(llm_args, kvcm_config, extra_config):
+def init_kvcm_transfer_client(
+    llm_args: TorchLlmArgs,
+    kvcm_config: Dict[str, Any],
+    extra_config: Dict[str, Any],
+) -> Any:
     location_spec_name = extra_config["location_spec_name"]
     location_spec_size = extra_config["location_spec_size"]
     register_response = extra_config["register_response"]
@@ -119,18 +129,19 @@ def tp_rank_to_spec_name(tp_rank: int) -> str:
 
 @dataclass
 class KVCMKvCacheConnectorMetadata:
-    # [locations, block_ids]
-    load: list[tuple[list[str], list[int]]] = field(default_factory=list)
+    # [locations (manager CacheLocation dicts), block_ids]
+    load: list[tuple[list[dict], list[int]]] = field(default_factory=list)
     # [locations, block_ids, write_session_id]
-    save: list[tuple[list[str], list[int], str]] = field(default_factory=list)
+    save: list[tuple[list[dict], list[int], str]] = field(default_factory=list)
 
 
 class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
-
-    def __init__(self, llm_args: TorchLlmArgs):
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
 
-        self.kv_cache_tensor = None
+        # torch.Tensor once register_kv_caches ran; every use below is
+        # order-guarded by the connector contract.
+        self.kv_cache_tensor: Any = None
 
         self.kvcm_config, self.manager_client = init_kvcm_meta_client(self._llm_args)
 
@@ -138,23 +149,30 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         self.instance_id = self.kvcm_config["instance_id"]
 
         self.write_timeout_seconds = self.kvcm_config.get("write_timeout_seconds", 30)
+        # The base class types the bound connector metadata as a plain
+        # object; ours always carries the KVCM payload below.
+        self._metadata: KVCMKvCacheConnectorMetadata
 
-    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor) -> None:
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
         self.kv_cache_tensor = kv_cache_tensor
         extra_config = self._register_kvcm()
         self._init_kvcm_transfer_client(extra_config)
 
-    def _register_kvcm(self):
-        mapping = self._llm_args.parallel_config.to_mapping()
+    def _register_kvcm(self) -> Dict[str, Any]:
+        # to_mapping() is typed as a plain Mapping; the parallel config
+        # fields are accessed dynamically.
+        mapping: Any = self._llm_args.parallel_config.to_mapping()
         if not dist.is_initialized():
             master_ip = os.getenv("KVCM_CONNECTOR_ADDR", "localhost")
             master_port = os.getenv("KVCM_CONNECTOR_PORT", "6688")
             init_method = f"tcp://{master_ip}:{master_port}"
-            dist.init_process_group(backend="nccl",
-                                    init_method=init_method,
-                                    world_size=mapping.world_size,
-                                    rank=mapping.rank)
+            dist.init_process_group(
+                backend="nccl",
+                init_method=init_method,
+                world_size=mapping.world_size,
+                rank=mapping.rank,
+            )
         self.cpu_tp_group = dist.new_group(mapping.tp_group, backend="gloo")
 
         self.tp_rank = mapping.tp_rank
@@ -173,14 +191,21 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0rc0/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp#L828
         # self.kv_cache_tensor.shape = {mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize}
         assert self.kv_cache_tensor.shape[2] == (
-            1 if self.kvcm_config["use_mla"] else 2)  # mKVFactor == (1 if use_mla else 2)
+            1 if self.kvcm_config["use_mla"] else 2
+        )  # mKVFactor == (1 if use_mla else 2)
         # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0rc0/cpp/include/tensorrt_llm/batch_manager/kvCacheManager.h#L543
         # blockSize = (numKvHeads * sizePerHead * tokensPerBlock)
-        location_spec_size = math.prod(self.kv_cache_tensor.shape[1:]) * self.kv_cache_tensor.dtype.itemsize
-        location_spec_infos = [{
-            "name": tp_rank_to_spec_name(rank),
-            "size": location_spec_size,
-        } for rank in range(mapping.tp_size)]
+        location_spec_size = (
+            math.prod(self.kv_cache_tensor.shape[1:])
+            * self.kv_cache_tensor.dtype.itemsize
+        )
+        location_spec_infos = [
+            {
+                "name": tp_rank_to_spec_name(rank),
+                "size": location_spec_size,
+            }
+            for rank in range(mapping.tp_size)
+        ]
 
         register_request = {
             "trace_id": get_trace_id(),
@@ -202,11 +227,12 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         }
         return extra_config
 
-    def _init_kvcm_transfer_client(self, extra_config):
+    def _init_kvcm_transfer_client(self, extra_config: Dict[str, Any]) -> None:
         self.transfer_client = init_kvcm_transfer_client(
-            self._llm_args, self.kvcm_config, extra_config)
+            self._llm_args, self.kvcm_config, extra_config
+        )
 
-    def start_load_kv(self, stream: torch.cuda.Stream):
+    def start_load_kv(self, stream: torch.cuda.Stream) -> None:
         for locations, block_ids in self._metadata.load:
             uris = self._extract_uris(locations)
             buffers, cpu_tensors = self._prepare_buffers(block_ids)
@@ -215,13 +241,13 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
             for block_id, cpu_tensor in zip(block_ids, cpu_tensors):
                 self.kv_cache_tensor[block_id].copy_(cpu_tensor, non_blocking=False)
 
-    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
+    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
         pass
 
-    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
+    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
         pass
 
-    def wait_for_save(self, stream: torch.cuda.Stream):
+    def wait_for_save(self, stream: torch.cuda.Stream) -> None:
 
         # Make sure the forward pass is complete before beginning our save.
         stream.synchronize()
@@ -231,7 +257,7 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
             buffers, _ = self._prepare_buffers(block_ids)
             result = self.transfer_client.SaveKvCaches(uris, buffers)
             logger.debug(f"SaveKvCaches {result=}")
-            flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+            flag = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
             if self.tp_world_size > 1:
                 flag_tensor = torch.tensor(flag, dtype=torch.int)
                 dist.all_reduce(
@@ -243,12 +269,14 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
 
             if self.tp_rank == 0:
                 finish_mask = [flag] * len(locations)
-                self.manager_client.finish_write_cache({
-                    "trace_id": get_trace_id(),
-                    "instance_id": self.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {"bool_masks": {"values": finish_mask}},
-                })
+                self.manager_client.finish_write_cache(
+                    {
+                        "trace_id": get_trace_id(),
+                        "instance_id": self.instance_id,
+                        "write_session_id": write_session_id,
+                        "success_blocks": {"bool_masks": {"values": finish_mask}},
+                    }
+                )
 
     def _extract_uris(self, locations: list[dict]) -> list[str]:
         uris = []
@@ -258,7 +286,9 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
                     uris.append(location_spec["uri"])
         return uris
 
-    def _prepare_buffers(self, block_ids: list[int]) -> list[kvcm_py_client.BlockBuffer]:
+    def _prepare_buffers(
+        self, block_ids: list[int]
+    ) -> tuple[list[kvcm_py_client.BlockBuffer], list[torch.Tensor]]:
         buffers = []
         cpu_tensors = []
         for block_id in block_ids:
@@ -279,15 +309,14 @@ class KVCMKvCacheConnectorWorker(KvCacheConnectorWorker):
         return buffers, cpu_tensors
 
     def get_finished(
-            self, finished_gen_req_ids: list[int],
-            started_loading_req_ids: list[int]) -> tuple[list[int], list[int]]:
+        self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
+    ) -> tuple[list[int], list[int]]:
 
         return [], []
 
 
 class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
-
-    def __init__(self, llm_args: TorchLlmArgs):
+    def __init__(self, llm_args: TorchLlmArgs) -> None:
         super().__init__(llm_args)
 
         self.block_size = self._llm_args.kv_cache_config.tokens_per_block
@@ -299,7 +328,9 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         self.write_timeout_seconds = self.kvcm_config.get("write_timeout_seconds", 30)
 
-    def build_connector_meta(self, scheduler_output: SchedulerOutput):
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVCMKvCacheConnectorMetadata:
         # NOTE: This is a simplified implementation, and does not work with chunked prefill.
 
         metadata = KVCMKvCacheConnectorMetadata()
@@ -312,20 +343,33 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
             num_computed_blocks = req.computed_position // self.block_size
             block_ids = req.new_block_ids
 
-            load_locations, computed_hashes, remaining_hashes = self.pending_loads[req.request_id]
+            load_locations, computed_hashes, remaining_hashes = self.pending_loads[
+                req.request_id
+            ]
             assert num_computed_blocks == len(computed_hashes)
             assert len(load_locations) == len(remaining_hashes)
 
             metadata.load.append(
-                (load_locations, [
-                    block_ids[block_pos] for block_pos in range(
-                        num_computed_blocks, num_computed_blocks + len(load_locations))]))
+                (
+                    load_locations,
+                    [
+                        block_ids[block_pos]
+                        for block_pos in range(
+                            num_computed_blocks,
+                            num_computed_blocks + len(load_locations),
+                        )
+                    ],
+                )
+            )
 
             # Break up the remainder of the token sequence into chunks.
             chunks = self._chunk_tokens(req.new_tokens)
 
-            new_chunks = [chunk for chunk in chunks[len(computed_hashes) +
-                                                    len(remaining_hashes):] if len(chunk) == self.block_size]
+            new_chunks = [
+                chunk
+                for chunk in chunks[len(computed_hashes) + len(remaining_hashes) :]
+                if len(chunk) == self.block_size
+            ]
             new_hashes = [self._hash_tokens(chunk) for chunk in new_chunks]
             block_keys = computed_hashes + remaining_hashes + new_hashes
             request = {
@@ -342,15 +386,26 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
                 write_session_id = result["write_session_id"]
                 block_mask = result["block_mask"]
             except Exception as e:
-                logger.error(f"get_cache_location {e=}, {get_request=}")
-                len_locations = 0
+                # Best-effort: skip saving this request (mirrors the error
+                # handling of get_num_new_matched_tokens) instead of crashing
+                # the scheduler loop.
+                logger.error(
+                    f"start_write_cache failed for request {req.request_id}, "
+                    f"skip saving: {e=}"
+                )
+                continue
 
             save_indices = self._parse_block_mask(block_mask, len(block_keys))
             assert len(store_locations) == len(save_indices)
 
-            metadata.save.append((store_locations, [block_ids[block_pos]
-                                 for block_pos in save_indices], write_session_id))
-        
+            metadata.save.append(
+                (
+                    store_locations,
+                    [block_ids[block_pos] for block_pos in save_indices],
+                    write_session_id,
+                )
+            )
+
         logger.info(f"{metadata=}")
 
         self.pending_loads = {}
@@ -362,24 +417,26 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
     def _chunk_tokens(self, tokens: list[int]) -> list[list[int]]:
         return [
-            tokens[i:i + self.block_size]
+            tokens[i : i + self.block_size]
             for i in range(0, len(tokens), self.block_size)
         ]
 
-    def _parse_block_mask(self, block_mask: dict, len_block_keys: int) -> int:
-        save_indices = None
+    def _parse_block_mask(self, block_mask: dict, len_block_keys: int) -> list[int]:
+        save_indices: list[int] = []
         if "offset" in block_mask:
             offset = block_mask["offset"]
             save_indices = list(range(offset, len_block_keys))
         else:
             # False: need to store
             bool_masks = block_mask.get("bool_masks", {}).get("values", [])
-            save_indices = [idx for idx, is_saved in enumerate(bool_masks) if not is_saved]
+            save_indices = [
+                idx for idx, is_saved in enumerate(bool_masks) if not is_saved
+            ]
         return save_indices
 
     def get_num_new_matched_tokens(
-            self, request: LlmRequest,
-            num_computed_tokens: int) -> tuple[int, bool]:
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> tuple[int, bool]:
         self.pending_loads[request.request_id] = [[], [], []]
 
         # Don't bother with sequences with partial matches.
@@ -388,10 +445,9 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         computed_blocks = num_computed_tokens // self.block_size
 
-        computed_tokens = request.get_tokens(0)[:computed_blocks * self.block_size]
+        computed_tokens = request.get_tokens(0)[: computed_blocks * self.block_size]
         # Get all the tokens that don't have a cache hit on device.
-        remaining_tokens = request.get_tokens(0)[computed_blocks *
-                                                 self.block_size:]
+        remaining_tokens = request.get_tokens(0)[computed_blocks * self.block_size :]
 
         computed_chunks = self._chunk_tokens(computed_tokens)
         remaining_chunks = self._chunk_tokens(remaining_tokens)
@@ -421,7 +477,9 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
         self.pending_loads[request.request_id][1].extend(computed_hashes)
         if len_locations > 0:
             self.pending_loads[request.request_id][0].extend(locations)
-            self.pending_loads[request.request_id][2].extend(remaining_hashes[:len(locations)])
+            self.pending_loads[request.request_id][2].extend(
+                remaining_hashes[: len(locations)]
+            )
 
         logger.info(
             f"KV CONNECTOR: Matched {len_locations} blocks for request {request.request_id}"
@@ -430,11 +488,11 @@ class KVCMKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return len_locations * self.block_size, False
 
-    def request_finished(self, request: LlmRequest,
-                         cache_block_ids: list[int]) -> bool:
+    def request_finished(self, request: LlmRequest, cache_block_ids: list[int]) -> bool:
         # We don't do any asynchronous saving, so always return False
         return False
 
-    def update_state_after_alloc(self, request: LlmRequest,
-                                 block_ids: list[int]):
+    def update_state_after_alloc(
+        self, request: LlmRequest, block_ids: list[int]
+    ) -> None:
         pass
