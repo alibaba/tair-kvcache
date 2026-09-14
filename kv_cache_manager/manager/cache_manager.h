@@ -150,6 +150,14 @@ public:
                      int32_t sw_size,
                      const std::vector<std::string> &location_spec_names);
 
+    ErrorCode ReportOptimizerEvent(RequestContext *request_context,
+                                   const std::string &instance_id,
+                                   const KeyVector &keys,
+                                   const TokenIdsVector &tokens,
+                                   int64_t input_token_len,
+                                   int64_t timestamp_ns,
+                                   const std::vector<std::string> &location_spec_names);
+
     std::pair<ErrorCode, BatchLocationsView>
     GetCacheLocationsByBackend(RequestContext *request_context,
                                const std::string &instance_id,

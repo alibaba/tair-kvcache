@@ -25,11 +25,11 @@ public:
 
     // Initialize the indexer with capacity and size parameters.
     // capacity_gb: capacity tiers in GB.
-    // size_full_only: byte size of a full-only block.
+    // size_full: byte size of a full-only block.
     // size_full_linear: byte size of a full+linear block.
     // linear_step: linear step factor (>=0).
     virtual void Init(const std::vector<double> &capacity_gb,
-                      int64_t size_full_only,
+                      int64_t size_full,
                       int64_t size_full_linear,
                       int32_t linear_step) = 0;
 
@@ -44,6 +44,17 @@ public:
                              std::vector<int64_t> &hit_count,
                              int64_t &max_hit_count,
                              std::vector<bool> *key_hits = nullptr) = 0;
+
+    // Process a request at its producer timestamp. Indexers without
+    // time-based behavior use the normal path; TTL wrappers override this so
+    // queueing delay does not shift expiry decisions.
+    virtual void ProcessKeysAtTimestamp(const std::vector<int64_t> &keys,
+                                        int64_t /*timestamp_ns*/,
+                                        std::vector<int64_t> &hit_count,
+                                        int64_t &max_hit_count,
+                                        std::vector<bool> *key_hits = nullptr) {
+        ProcessKeys(keys, hit_count, max_hit_count, key_hits);
+    }
 
     virtual int64_t unique_count() const = 0;
 

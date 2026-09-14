@@ -1,7 +1,7 @@
 #include "kv_cache_manager/optimizer/service/grpc/optimizer_service_grpc.h"
 
 #include "kv_cache_manager/common/request_context.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
 
@@ -126,6 +126,25 @@ grpc::Status OptimizerServiceGRpc::ResetStats(grpc::ServerContext *context,
     RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
     request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
     service_impl_->ResetStats(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status OptimizerServiceGRpc::PullQuotaAllocation(grpc::ServerContext *context,
+                                                       const proto::optimizer::PullQuotaAllocationRequest *request,
+                                                       proto::optimizer::PullQuotaAllocationResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->PullQuotaAllocation(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status
+OptimizerServiceGRpc::ReportQuotaResizeResult(grpc::ServerContext *context,
+                                              const proto::optimizer::ReportQuotaResizeResultRequest *request,
+                                              proto::optimizer::ReportQuotaResizeResultResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->ReportQuotaResizeResult(&request_context, request, response);
     return grpc::Status::OK;
 }
 
