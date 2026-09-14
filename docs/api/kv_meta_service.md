@@ -15,10 +15,15 @@ dtype 等业务信息。推荐调用方使用 `KvMetaObjectClient`，由它组�
 
 ## 2. 调用前提
 
-1. 服务端必须配置非零 `kvcm.kv_meta.rpc_port`；这是独立于既有 MetaService 的 gRPC 端口；
+1. 服务端必须配置 `kvcm.kv_meta.enabled=true`；KVMeta 与既有 MetaService 共用
+   `kvcm.service.rpc_port`，按不同的 protobuf service 全名路由；
 2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
 4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status。
+
+升级说明：遗留的 `kvcm.kv_meta.rpc_port=0` 仅作为无副作用的禁用配置兼容；任何非零旧端口都会使配置解析
+失败，避免服务端切换到主端口后客户端仍误连旧端口。启用时必须同时迁移为
+`kvcm.kv_meta.enabled=true`，并将客户端地址改为 `kvcm.service.rpc_port`。
 
 ### 2.1 与原 `kv_meta_service.proto` 的关系
 
@@ -233,7 +238,7 @@ from kv_cache_manager.client import KvMetaObjectClient, KvMetaObjectClientConfig
 
 client = KvMetaObjectClient(
     KvMetaObjectClientConfig(
-        addresses=("127.0.0.1:6383",),
+        addresses=("127.0.0.1:6381",),
         instance_id="rtp-emb",
         instance_group="epd-emb-only",
         transfer_client_config=transfer_json,

@@ -47,7 +47,6 @@ public:
 private:
     bool StartRpcServer();
     bool StartSeparateAdminRpcServer();
-    bool StartKvMetaRpcServer();
     bool StartHttpServer();
     void CreateMetricsReporter();
     bool StartMetricsReportThread();
@@ -75,7 +74,9 @@ private:
     std::shared_ptr<KvMetaServiceGRpc> kv_meta_service_;
     std::shared_ptr<grpc::Server> rpc_server_;
     std::shared_ptr<grpc::Server> admin_rpc_server_;
-    std::shared_ptr<grpc::Server> kv_meta_rpc_server_;
+    // Captures the actual primary RPC port selected by gRPC. It differs from
+    // GetServiceRpcPort() only when an integration test requests port zero.
+    int32_t bound_rpc_port_ = 0;
     std::shared_ptr<MetaServiceHttp> meta_http_service_;
     std::shared_ptr<AdminServiceHttp> admin_http_service_;
     std::shared_ptr<DebugServiceHttp> debug_http_service_;

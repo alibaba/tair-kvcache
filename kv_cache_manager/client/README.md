@@ -20,7 +20,7 @@ KVMeta 对象。完整配置和状态机见
 from kv_cache_manager.client import KvMetaObjectClient, KvMetaObjectClientConfig
 
 config = KvMetaObjectClientConfig(
-    addresses=("127.0.0.1:6383",),
+    addresses=("127.0.0.1:6381",),
     instance_id="model-v1-embedding",
     instance_group="embedding-only-group",
     transfer_client_config=transfer_json,
@@ -45,14 +45,14 @@ mutation 返回 transport error、未知 error code 或畸形 code 时，Python 
 需要自行编排控制面和数据面时，才直接使用下面的低层 `KvMetaClient`：
 
 `include/kv_meta_client.h` 是独立于现有 `MetaClient` 的 exact-key 元数据客户端，随
-`kv_cache_manager_client.so` 一起发布。配置中的地址必须指向服务端
-`kvcm.kv_meta.rpc_port`，不能填写原 MetaService 端口。
+`kv_cache_manager_client.so` 一起发布。它与原 MetaService 使用同一个
+`kvcm.service.rpc_port`，由不同的 protobuf service 全名完成 RPC 路由。
 
 ```cpp
 #include <kv_meta_client.h>
 
 kv_cache_manager::KvMetaClientConfig config;
-config.addresses = {"127.0.0.1:6383"};
+config.addresses = {"127.0.0.1:6381"};
 config.instance_id = "model-v1-embedding";
 auto client = kv_cache_manager::KvMetaClient::Create(config);
 

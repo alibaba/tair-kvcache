@@ -13,8 +13,9 @@ class MetricsReporter;
 class RequestContext;
 
 // Protocol adapter for the generic object metadata path. This service has its
-// own leader gate and is hosted on a separate, opt-in gRPC server so enabling
-// it does not add work to the existing KV-cache RPC path.
+// own leader gate and is registered only when explicitly enabled. Its fully
+// qualified gRPC methods are disjoint from the fixed-block MetaService even
+// though both services share the primary listener.
 class KvMetaServiceImpl final : public ServiceImplBase {
 public:
     KvMetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
