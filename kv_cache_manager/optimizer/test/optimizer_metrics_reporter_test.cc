@@ -1,11 +1,13 @@
 #include <cmath>
 
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
 namespace kv_cache_manager {
 
@@ -40,8 +42,13 @@ protected:
 
         std::vector<LocationSpecInfo> specs = {LocationSpecInfo("full", 1024)};
         std::vector<LocationSpecGroup> groups = {LocationSpecGroup("full_group", {"full"})};
-        OptimizerInstanceInfo info(
-            "grp1", instance_id, 1024, specs, groups, linear_step, OptimizerStateInfo("full_group", ""));
+        OptimizerStateInfo state_info("full_group", "");
+        if (linear_step > 0) {
+            specs.emplace_back("linear", 256);
+            groups.emplace_back("linear_group", std::vector<std::string>{"linear"});
+            state_info.set_linear_location_spec_group_name("linear_group");
+        }
+        OptimizerInstanceInfo info("grp1", instance_id, 1024, specs, groups, linear_step, state_info);
         RegisterInstanceResult result;
         return manager_->RegisterInstance(info, result);
     }
@@ -224,6 +231,62 @@ TEST_F(OptimizerMetricsReporterTest, ReportPerQueryCapacityEfficiency) {
     EXPECT_TRUE(std::isnan(registry_->GetGauge("query_capacity_efficiency", tags5).Get()));
 }
 
+TEST_F(OptimizerMetricsReporterTest, MambaPerQueryMetricsKeepTokenAndByteSemanticsEndToEnd) {
+    constexpr double kBytesPerGiB = 1024.0 * 1024.0 * 1024.0;
+    const double capacity_gb = 2304.0 / kBytesPerGiB;
+    // block_size=1024, Full charge=1024, Linear charge=256, step=2 blocks.
+    // On the warm request 2304 bytes restores two of three complete blocks.
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {capacity_gb}, 0, true, /*linear_step tokens=*/2048));
+    auto service = std::make_shared<OptimizerServiceImpl>(manager_, reporter_);
+
+    proto::optimizer::TraceQueryRequest request;
+    request.set_instance_id("inst1");
+    request.set_input_token_len(4095); // three complete blocks plus a 1023-token tail
+    request.add_block_keys(1);
+    request.add_block_keys(2);
+    request.add_block_keys(3);
+
+    auto run_query = [&](const std::string &trace_id) {
+        auto collector = std::make_shared<OptimizerServiceMetricsCollector>(registry_);
+        EXPECT_TRUE(collector->Init());
+        RequestContext context(trace_id, collector);
+        context.set_client_ip("10.0.0.9");
+        proto::optimizer::TraceQueryResponse response;
+        service->TraceQuery(&context, &request, &response);
+        EXPECT_EQ(proto::optimizer::OK, response.header().status().code());
+        return response;
+    };
+
+    const auto cold = run_query("cold");
+    ASSERT_EQ(1, cold.capacity_results_size());
+    EXPECT_EQ(0, cold.capacity_results(0).cache_hit_count());
+
+    const auto warm = run_query("warm");
+    ASSERT_EQ(1, warm.capacity_results_size());
+    EXPECT_EQ(2, warm.capacity_results(0).cache_hit_count());
+    EXPECT_DOUBLE_EQ(2048.0 / 4095.0, warm.capacity_results(0).hit_rate());
+    EXPECT_EQ(3, warm.theoretical_result().max_hit_count());
+    EXPECT_DOUBLE_EQ(3072.0 / 4095.0, warm.theoretical_result().hit_rate());
+
+    const MetricsTags query_tags = {{"instance_group", "grp1"},
+                                    {"instance_id", "inst1"},
+                                    {"client_ip", "10.0.0.9"},
+                                    {"capacity_gb", std::to_string(capacity_gb)}};
+    EXPECT_DOUBLE_EQ(2.0, registry_->GetGauge("query_hit_count", query_tags).Get());
+    EXPECT_DOUBLE_EQ(2048.0 / 4095.0, registry_->GetGauge("query_hit_rate", query_tags).Get());
+    EXPECT_NEAR(2.0 / 3.0, registry_->GetGauge("query_capacity_efficiency", query_tags).Get(), 1e-12);
+
+    MetricsTags base_query_tags = query_tags;
+    base_query_tags.erase("capacity_gb");
+    EXPECT_DOUBLE_EQ(3.0, registry_->GetGauge("query_total_blocks", base_query_tags).Get());
+    EXPECT_DOUBLE_EQ(3.0, registry_->GetGauge("query_max_hit_count", base_query_tags).Get());
+    EXPECT_DOUBLE_EQ(3072.0 / 4095.0, registry_->GetGauge("query_max_hit_rate", base_query_tags).Get());
+
+    const MetricsTags service_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    EXPECT_EQ(2u, registry_->GetCounter("service.query_counter", service_tags).Get());
+    EXPECT_EQ(8190u, registry_->GetCounter("service.input_tokens_total", service_tags).Get());
+}
+
 TEST_F(OptimizerMetricsReporterTest, ReportPerQueryMaxHitNotApplicable) {
     auto collector = std::make_shared<OptimizerServiceMetricsCollector>(registry_);
     ASSERT_TRUE(collector->Init());
@@ -377,6 +440,40 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMrc) {
         MetricsTags tags = {
             {"instance_group", "grp1"}, {"instance_id", "inst1"}, {"target_hit_rate_percent", entry.first}};
         EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("mrc", tags).Get());
+    }
+}
+
+TEST_F(OptimizerMetricsReporterTest, ReportIntervalMambaMrcAndHitRates) {
+    // One Linear state every two 1024-token blocks; Full and Linear charges
+    // are 1024 and 256 bytes respectively.
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 0, true, /*linear_step tokens=*/2048));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2, 3}, 3072, 0, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2, 3}, 3072, 0, result));
+    reporter_->ReportInterval();
+
+    const MetricsTags instance_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    EXPECT_DOUBLE_EQ(2048.0, registry_->GetGauge("trace_query_linear_step", instance_tags).Get());
+    // Current working set: (3 Full * 1024 + 2 Linear * 256) / 3 Full blocks.
+    EXPECT_DOUBLE_EQ(3584.0 / 3.0, registry_->GetGauge("trace_query_bytes_per_block", instance_tags).Get());
+    EXPECT_DOUBLE_EQ(3584.0, registry_->GetGauge("trace_query_kv_cache_usage_bytes", instance_tags).Get());
+    EXPECT_DOUBLE_EQ(3.0, registry_->GetGauge("trace_query_unique_keys", instance_tags).Get());
+    EXPECT_DOUBLE_EQ(0.5, registry_->GetGauge("trace_query_max_hit_rate", instance_tags).Get());
+    EXPECT_DOUBLE_EQ(0.5, registry_->GetGauge("interval.query_max_hit_rate", instance_tags).Get());
+
+    MetricsTags capacity_tags = instance_tags;
+    capacity_tags["capacity_gb"] = std::to_string(1.0);
+    EXPECT_DOUBLE_EQ(0.5, registry_->GetGauge("trace_query_hit_rate", capacity_tags).Get());
+    EXPECT_DOUBLE_EQ(0.5, registry_->GetGauge("interval.query_hit_rate", capacity_tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, registry_->GetGauge("interval.query_capacity_efficiency", capacity_tags).Get());
+
+    // Warm request byte-step fact: 2304 bytes -> 2 blocks, 3584 -> 3.
+    const std::vector<std::pair<std::string, double>> expected = {
+        {"60", 2304.0}, {"80", 3584.0}, {"90", 3584.0}, {"95", 3584.0}, {"99", 3584.0}, {"99.5", 3584.0}};
+    for (const auto &[target, required_bytes] : expected) {
+        MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"target_hit_rate_percent", target}};
+        EXPECT_DOUBLE_EQ(required_bytes, registry_->GetGauge("mrc", tags).Get());
     }
 }
 

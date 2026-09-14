@@ -87,6 +87,17 @@ int64_t CapacityBlocksForResponse(uint64_t capacity_bytes,
     return ClampToInt64(static_cast<long double>(capacity_bytes) * step_blocks / bytes_per_step);
 }
 
+// Every hit count is a recoverable Full-block prefix length in both modes.
+// Linear states affect the byte capacity required to reach that prefix, not
+// the number of recovered tokens. Promote before multiplying so long-running
+// cumulative counters cannot overflow in integer arithmetic.
+double TokenHitRate(uint64_t hit_blocks, uint64_t block_size_tokens, uint64_t input_tokens) {
+    if (input_tokens == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(static_cast<long double>(hit_blocks) * block_size_tokens / input_tokens);
+}
+
 } // namespace
 
 int64_t OnlineOptimizerManager::ComputeSizeForGroup(const std::vector<LocationSpecInfo> &specs,
@@ -316,17 +327,12 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
         KVCM_LOG_ERROR("RegisterInstance failed: non-positive token block_size for instance[%s]", instance_id.c_str());
         return EC_BADARGS;
     }
-    // linear_step counts tokens; Linear states can only land on complete block
-    // boundaries, so it must divide evenly into whole blocks.
-    if (linear_step > 0 && linear_step % instance_info.block_size() != 0) {
-        KVCM_LOG_ERROR(
-            "RegisterInstance failed: linear_step=%d tokens is not a multiple of block_size=%d for instance[%s]",
-            linear_step,
-            instance_info.block_size(),
-            instance_id.c_str());
-        return EC_BADARGS;
-    }
-    const int32_t linear_step_blocks = linear_step / instance_info.block_size();
+    // Linear states can only land on complete Full-block boundaries. Project
+    // the token interval down to that granularity; a positive sub-block step
+    // is represented by one state per Full block rather than becoming the
+    // Full-only sentinel (zero).
+    const int32_t linear_step_blocks =
+        linear_step == 0 ? 0 : std::max<int32_t>(1, linear_step / instance_info.block_size());
     std::string invalid_group_fields;
     if (!instance_group.ValidateRequiredFields(invalid_group_fields)) {
         KVCM_LOG_ERROR("RegisterInstance failed: invalid group config %s for instance[%s]",
@@ -449,6 +455,7 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     result.estimated_capacity_blocks = estimated_capacity_blocks;
     result.full_charge_bytes = full_charge_bytes;
     result.linear_charge_bytes = linear_charge_bytes;
+    result.linear_step_blocks = linear_step_blocks;
 
     KVCM_LOG_INFO(
         "RegisterInstance OK: instance[%s] group[%s] linear_step=%d full_charge=%ld linear_charge=%ld caps=%zu",
@@ -541,20 +548,17 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_BADARGS;
         }
 
-        const FullRequestFact fact =
-            state->lite_hit->ProcessFullRequest(normalized.block_keys, replay_timestamp_ns);
+        const FullRequestFact fact = state->lite_hit->ProcessFullRequest(normalized.block_keys, replay_timestamp_ns);
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
-        const double token_denominator = static_cast<double>(normalized.input_token_len);
         result.hit_count_per_capacity.reserve(num_caps);
         result.hit_rate_per_capacity.reserve(num_caps);
         for (std::size_t i = 0; i < num_caps; ++i) {
             const uint64_t hits = HitCurveProjector::ProjectFullBytes(
                 fact, state->capacity_bytes[i], static_cast<uint64_t>(state->full_charge_bytes));
             result.hit_count_per_capacity.push_back(ClampToInt64(hits));
-            result.hit_rate_per_capacity.push_back(
-                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(hits * block_size) / token_denominator);
+            result.hit_rate_per_capacity.push_back(TokenHitRate(hits, block_size, normalized.input_token_len));
             state->total_hits_per_capacity[i] += static_cast<int64_t>(hits);
             state->interval_hits_per_capacity[i] += static_cast<int64_t>(hits);
         }
@@ -570,8 +574,7 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             const uint64_t max_hits = HitCurveProjector::ProjectFullInfinite(fact);
             state->mrc_window.Record(fact);
             result.max_hit_count = ClampToInt64(max_hits);
-            result.max_hit_rate =
-                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
+            result.max_hit_rate = TokenHitRate(max_hits, block_size, normalized.input_token_len);
             result.theoretical_unique_keys = ClampToInt64(unique_blocks);
             state->total_max_hits += static_cast<int64_t>(max_hits);
             state->interval_max_hits += static_cast<int64_t>(max_hits);
@@ -610,14 +613,12 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
-        const double token_denominator = static_cast<double>(normalized.input_token_len);
         result.hit_count_per_capacity.reserve(num_caps);
         result.hit_rate_per_capacity.reserve(num_caps);
         for (std::size_t i = 0; i < num_caps; ++i) {
             const uint64_t hits = HitCurveProjector::ProjectBytes(fact, state->capacity_bytes[i]);
             result.hit_count_per_capacity.push_back(ClampToInt64(hits));
-            result.hit_rate_per_capacity.push_back(
-                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(hits * block_size) / token_denominator);
+            result.hit_rate_per_capacity.push_back(TokenHitRate(hits, block_size, normalized.input_token_len));
             state->total_hits_per_capacity[i] += static_cast<int64_t>(hits);
             state->interval_hits_per_capacity[i] += static_cast<int64_t>(hits);
         }
@@ -630,9 +631,9 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
 
         if (state->instance_group->enable_theoretical_max_cache()) {
             const uint64_t max_hits = HitCurveProjector::ProjectInfinite(fact);
+            state->byte_mrc_window.Record(fact);
             result.max_hit_count = ClampToInt64(max_hits);
-            result.max_hit_rate =
-                normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
+            result.max_hit_rate = TokenHitRate(max_hits, block_size, normalized.input_token_len);
             result.theoretical_unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             state->total_max_hits += static_cast<int64_t>(max_hits);
             state->interval_max_hits += static_cast<int64_t>(max_hits);
@@ -668,8 +669,8 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.instance_group = state->instance_info->instance_group_name();
         s.block_size = state->instance_info->block_size();
         s.total_blocks_queried = state->total_blocks_queried;
-        // Exact configured charge for full-attention. The Mamba branch below
-        // replaces it with the current resident working-set average.
+        // Full-only has a uniform object charge. The Mamba branch below
+        // replaces this with the current Full+Linear resident-byte average.
         s.bytes_per_block = static_cast<double>(state->full_charge_bytes);
         s.linear_step = state->linear_step;
 
@@ -701,23 +702,22 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // Full-attention rates are token based: cumulative hit blocks are
             // converted to tokens with the fixed block size and divided by the
             // cumulative input tokens.
-            const double token_denominator = static_cast<double>(state->total_input_tokens);
             const int64_t block_size_tokens = state->instance_info->block_size();
             for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); ++i) {
                 PerCapacityHitRateInfo info;
                 info.capacity_gb = caps[i];
                 info.total_hits = state->total_hits_per_capacity[i];
-                info.hit_rate = state->total_input_tokens > 0
-                                    ? static_cast<double>(info.total_hits * block_size_tokens) / token_denominator
-                                    : 0.0;
+                info.hit_rate = TokenHitRate(static_cast<uint64_t>(info.total_hits),
+                                             static_cast<uint64_t>(block_size_tokens),
+                                             static_cast<uint64_t>(state->total_input_tokens));
                 s.per_capacity_hit_rates.push_back(info);
             }
 
             if (state->instance_group->enable_theoretical_max_cache()) {
                 s.total_max_hits = state->total_max_hits;
-                s.max_hit_rate = state->total_input_tokens > 0
-                                     ? static_cast<double>(s.total_max_hits * block_size_tokens) / token_denominator
-                                     : 0.0;
+                s.max_hit_rate = TokenHitRate(static_cast<uint64_t>(s.total_max_hits),
+                                              static_cast<uint64_t>(block_size_tokens),
+                                              static_cast<uint64_t>(state->total_input_tokens));
             } else {
                 // Same -1 sentinel as TraceQuery: "not computed" stays
                 // distinguishable from "computed as 0".
@@ -734,24 +734,22 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
                 resident_full_blocks == 0
                     ? 0.0
                     : static_cast<double>(static_cast<long double>(resident_bytes) / resident_full_blocks);
-
-            const double token_denominator = static_cast<double>(state->total_input_tokens);
             const int64_t block_size_tokens = state->instance_info->block_size();
             for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); ++i) {
                 PerCapacityHitRateInfo info;
                 info.capacity_gb = caps[i];
                 info.total_hits = state->total_hits_per_capacity[i];
-                info.hit_rate = state->total_input_tokens > 0
-                                    ? static_cast<double>(info.total_hits * block_size_tokens) / token_denominator
-                                    : 0.0;
+                info.hit_rate = TokenHitRate(static_cast<uint64_t>(info.total_hits),
+                                             static_cast<uint64_t>(block_size_tokens),
+                                             static_cast<uint64_t>(state->total_input_tokens));
                 s.per_capacity_hit_rates.push_back(info);
             }
 
             if (state->instance_group->enable_theoretical_max_cache()) {
                 s.total_max_hits = state->total_max_hits;
-                s.max_hit_rate = state->total_input_tokens > 0
-                                     ? static_cast<double>(s.total_max_hits * block_size_tokens) / token_denominator
-                                     : 0.0;
+                s.max_hit_rate = TokenHitRate(static_cast<uint64_t>(s.total_max_hits),
+                                              static_cast<uint64_t>(block_size_tokens),
+                                              static_cast<uint64_t>(state->total_input_tokens));
             } else {
                 s.max_hit_rate = -1.0;
             }
@@ -768,18 +766,29 @@ ErrorCode OnlineOptimizerManager::TakeMrcMetrics(std::vector<MrcMetricInfo> &met
 
     for (const auto &[id, state] : instances_) {
         std::lock_guard<std::mutex> guard(state->mutex);
-        if (state->linear_step != 0 || !state->lite_hit || !state->instance_group->enable_theoretical_max_cache()) {
+        if (!state->lite_hit || !state->instance_group->enable_theoretical_max_cache()) {
             continue;
         }
 
-        for (const auto &point : state->mrc_window.Take()) {
-            MrcMetricInfo metric;
-            metric.instance_id = id;
-            metric.instance_group = state->instance_info->instance_group_name();
-            metric.target_basis_points = point.target_basis_points;
-            metric.capacity_bytes =
-                SaturatingMultiplyToInt64(point.required_blocks, static_cast<uint64_t>(state->full_charge_bytes));
-            metrics.push_back(std::move(metric));
+        if (state->linear_step == 0) {
+            for (const auto &point : state->mrc_window.Take()) {
+                MrcMetricInfo metric;
+                metric.instance_id = id;
+                metric.instance_group = state->instance_info->instance_group_name();
+                metric.target_basis_points = point.target_basis_points;
+                metric.capacity_bytes =
+                    SaturatingMultiplyToInt64(point.required_blocks, static_cast<uint64_t>(state->full_charge_bytes));
+                metrics.push_back(std::move(metric));
+            }
+        } else {
+            for (const auto &point : state->byte_mrc_window.Take()) {
+                MrcMetricInfo metric;
+                metric.instance_id = id;
+                metric.instance_group = state->instance_info->instance_group_name();
+                metric.target_basis_points = point.target_basis_points;
+                metric.capacity_bytes = ClampToInt64(point.required_bytes);
+                metrics.push_back(std::move(metric));
+            }
         }
     }
     return EC_OK;
@@ -802,22 +811,24 @@ ErrorCode OnlineOptimizerManager::TakeIntervalMetrics(std::vector<IntervalMetric
         metric.has_theoretical_max_hit_rate = state->instance_group->enable_theoretical_max_cache();
 
         const auto &capacities = state->instance_group->capacity_gb();
-        const double input_tokens = static_cast<double>(state->interval_input_tokens);
-        const double block_size = static_cast<double>(state->instance_info->block_size());
+        const uint64_t input_tokens = static_cast<uint64_t>(state->interval_input_tokens);
+        const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
         metric.per_capacity_hit_rates.reserve(capacities.size());
         for (size_t i = 0; i < capacities.size() && i < state->interval_hits_per_capacity.size(); ++i) {
             PerCapacityHitRateInfo capacity_metric;
             capacity_metric.capacity_gb = capacities[i];
             capacity_metric.total_hits = state->interval_hits_per_capacity[i];
-            capacity_metric.hit_rate = state->interval_input_tokens > 0
-                                           ? static_cast<double>(capacity_metric.total_hits) * block_size / input_tokens
-                                           : std::numeric_limits<double>::quiet_NaN();
+            capacity_metric.hit_rate =
+                state->interval_input_tokens > 0
+                    ? TokenHitRate(static_cast<uint64_t>(capacity_metric.total_hits), block_size, input_tokens)
+                    : std::numeric_limits<double>::quiet_NaN();
             metric.per_capacity_hit_rates.push_back(capacity_metric);
         }
         if (metric.has_theoretical_max_hit_rate) {
-            metric.max_hit_rate = state->interval_input_tokens > 0
-                                      ? static_cast<double>(state->interval_max_hits) * block_size / input_tokens
-                                      : std::numeric_limits<double>::quiet_NaN();
+            metric.max_hit_rate =
+                state->interval_input_tokens > 0
+                    ? TokenHitRate(static_cast<uint64_t>(state->interval_max_hits), block_size, input_tokens)
+                    : std::numeric_limits<double>::quiet_NaN();
         }
 
         state->interval_input_tokens = 0;
@@ -853,6 +864,7 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::fill(state->interval_hits_per_capacity.begin(), state->interval_hits_per_capacity.end(), 0);
     state->interval_max_hits = 0;
     state->mrc_window.Reset();
+    state->byte_mrc_window.Reset();
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

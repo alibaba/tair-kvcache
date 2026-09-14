@@ -69,6 +69,31 @@ proto::optimizer::KvcmConfigurationResponse MakeConfiguration(const std::vector<
     return response;
 }
 
+proto::optimizer::KvcmConfigurationResponse MakeLinearFanoutConfiguration(const std::string &instance_id) {
+    proto::optimizer::KvcmConfigurationResponse response;
+    auto *group = response.add_instance_groups();
+    group->set_name("g1");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    auto *instance = response.add_instances();
+    instance->set_instance_group_name("g1");
+    instance->set_instance_id(instance_id);
+    instance->set_block_size(4);
+    auto *full_spec = instance->add_location_spec_infos();
+    full_spec->set_name("full-spec");
+    full_spec->set_size(16);
+    auto *linear_spec = instance->add_location_spec_infos();
+    linear_spec->set_name("linear-spec");
+    linear_spec->set_size(4);
+    auto *full_group = instance->add_location_spec_groups();
+    full_group->set_name("full-cache");
+    full_group->add_spec_names("full-spec");
+    auto *linear_group = instance->add_location_spec_groups();
+    linear_group->set_name("mamba-state");
+    linear_group->add_spec_names("linear-spec");
+    return response;
+}
+
 class TestMetaService final : public proto::meta::MetaService::Service {
 public:
     void SetLeader(const std::string &host, int port) {
@@ -217,6 +242,14 @@ KvcmEventSubscriptionConfig MakeMultiCapacityConfig(const std::string &seed_endp
     return server_config.kvcm_event_subscriptions().front();
 }
 
+KvcmEventSubscriptionConfig MakeLinearFanoutConfig(const std::string &seed_endpoint) {
+    OnlineOptimizerServerConfig server_config;
+    EXPECT_TRUE(server_config.FromJsonString(
+        std::string(R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://)") + seed_endpoint +
+        R"(","consumer_id":"subscriber-test","discovery_refresh_interval_ms":50,"fanout_all_instances":true,"linear_steps":[0,10,20],"full_location_spec_group_name":"full-cache","linear_location_spec_group_name":"mamba-state"}]})"));
+    return server_config.kvcm_event_subscriptions().front();
+}
+
 } // namespace
 
 class KvcmEventSubscriberTest : public TESTBASE {
@@ -304,6 +337,42 @@ TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
 
     leader.event_service_.Publish(MakeEvent("known", "multi-capacity", 1));
     ASSERT_TRUE(WaitUntil([this] { return TotalQueries("known") == 1; }));
+    subscriber.Stop();
+}
+
+TEST_F(KvcmEventSubscriberTest, FansOutEachEventToDerivedLinearStepInstances) {
+    TestKvcmServer leader;
+    leader.event_service_.SetConfiguration(MakeLinearFanoutConfiguration("known"));
+
+    KvcmEventSubscriber subscriber(
+        MakeLinearFanoutConfig(leader.endpoint()), optimizer_service_, metrics_registry_, metrics_reporter_);
+    ASSERT_TRUE(subscriber.Init());
+    ASSERT_TRUE(subscriber.Start());
+
+    const std::vector<std::string> instance_ids = {"known", "known@linear_step_10", "known@linear_step_20"};
+    ASSERT_TRUE(WaitUntil([this, &instance_ids] {
+        return std::all_of(instance_ids.begin(), instance_ids.end(), [this](const std::string &instance_id) {
+            return IsRegistered(instance_id);
+        });
+    }));
+    ASSERT_TRUE(WaitUntil([&leader] { return leader.event_service_.active_subscribers_.load() == 1; }));
+
+    leader.event_service_.Publish(MakeEvent("known", "miss", 1));
+    leader.event_service_.Publish(MakeEvent("known", "hit", 1));
+    ASSERT_TRUE(WaitUntil([this, &instance_ids] {
+        return std::all_of(instance_ids.begin(), instance_ids.end(), [this](const std::string &instance_id) {
+            return TotalQueries(instance_id) == 2;
+        });
+    }));
+
+    metrics_reporter_->ReportInterval();
+    for (std::size_t i = 0; i < instance_ids.size(); ++i) {
+        const MetricsTags tags = {{"instance_group", "g1"}, {"instance_id", instance_ids[i]}};
+        EXPECT_DOUBLE_EQ(i == 0 ? 0.0 : (i == 1 ? 10.0 : 20.0),
+                         metrics_registry_->GetGauge("trace_query_linear_step", tags).Get());
+        EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", tags).Get());
+    }
+
     subscriber.Stop();
 }
 

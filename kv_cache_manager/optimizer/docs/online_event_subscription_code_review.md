@@ -100,10 +100,14 @@ online_optimizer_server_main -c default_optimizer_config.json
 订阅配置对象是 `KvcmEventSubscriptionConfig`，字段为：
 
 ```text
-enable
 service_discovery_url
 consumer_id
 discovery_refresh_interval_ms
+capacity_gb
+fanout_all_instances
+linear_steps
+full_location_spec_group_name
+linear_location_spec_group_name
 ```
 
 解析顺序：
@@ -117,9 +121,10 @@ OnlineOptimizerServerConfig::FromRapidValue
 
 当前行为：
 
-- `enable=false` 时不要求服务发现地址。
-- `enable=true` 时要求 discovery URL、consumer ID 非空，刷新周期大于 0。
+- discovery URL、consumer ID 必须非空，刷新周期必须大于 0。
 - `consumer_id` 只用于 KVCM 日志，不是带 offset 的消费组。
+- `fanout_all_instances=false` 时保持单 Instance 路由，其余 fanout 配置必须为空。
+- `linear_steps` 非空时必须开启 fanout、值非负且不重复，并且必须包含代表 full-only 的 `0`；存在正值时必须显式给出不同的 Full/Linear location spec group 名称。
 
 审查清单：
 
@@ -275,7 +280,8 @@ KvcmInstanceConfiguration
 - 配置同步只新增缺失项，不更新、不删除已有配置。
 - 只有配置同步成功才会启动或切换 stream；同步失败时保留当前 Leader 的旧 stream。
 - Group、registry 或受支持的 full-only Instance 应用失败时，整个配置同步返回失败。
-- 暂不支持的 multi-group Instance 会被明确记录并跳过，不阻止其他 Instance 开始消费。
+- 默认模式下，暂不支持的 multi-group Instance 会被明确记录并跳过，不阻止其他 Instance 开始消费。
+- 配置 `fanout_all_instances + linear_steps` 后，multi-group 源 Instance 会按显式 Full/Linear group 映射派生多个对比 Instance。
 
 审查清单：
 
@@ -307,9 +313,9 @@ ttl_seconds            -> 24 hours
 KVCM instance_id       -> Optimizer instance_id
 KVCM block_size        -> Optimizer block_size
 location_spec_infos    -> 全量原样转换
-location_spec_groups   -> 一个时原样保留；为空时合成名为 full、包含全部 specs 的 group；多个时跳过
-linear_step            -> 0
-OptimizerStateInfo     -> 接入层不填写，由 OnlineOptimizerManager 判断
+location_spec_groups   -> 全量原样保留；为空时合成名为 full、包含全部 specs 的 group
+linear_step            -> 默认 0；派生模式使用 linear_steps 中的值
+OptimizerStateInfo     -> 默认由 Manager 补齐；派生模式显式指定 Full/Linear group
 ```
 
 `KvcmEventSubscriber` 调用：
@@ -327,12 +333,15 @@ OnlineOptimizerManager::RegisterInstance
 
 当前行为：
 
-- 自动注册明确按 full-attention、full-only 处理。
+- 默认自动注册按 full-attention、full-only 处理。
 - ServiceImpl 不根据 group 名称判断哪个 group 是 full；唯一 group 原样交给 Manager，空 group 列表按普通
   full-attention 配置合成一个包含全部 specs 的 `full` group。
 - Manager 的直接注册接口对无显式状态的 full-only Instance 只在唯一 group 时采用该 group；多 group 返回
   `EC_BADARGS`。
-- KVCM 自动接入暂不推断 linear state；多 group 的语义不明确时标记为 unsupported 并跳过。
+- 默认模式不推断 linear state；多 group 的语义不明确时标记为 unsupported 并跳过。
+- 派生模式对每个源 Instance 保留 `linear_step=0` 的源 ID，并为正值创建
+  `<source_instance_id>@linear_step_<value>`；Full/Linear group 由订阅配置显式指定。
+- fanout 按源 Instance 所属 group 枚举全部活跃 Instance；各目标必须与源 Instance 使用同一个 block size。
 - Subscriber 收到已知 unsupported Instance 的事件时直接丢弃，不触发配置刷新。
 - KVCM Group quota 被每个 Instance 分别作为完整容量模拟，不是共享 quota。
 - KVCM 自动创建的 Group 固定使用 24 小时 TTL，限制 LiteHit 保留的历史工作集。
@@ -344,7 +353,7 @@ OnlineOptimizerManager::RegisterInstance
 - [x] 自动 Group 默认开启 `enable_prefix_hash=true`。
 - [x] 自动 Group 默认开启 `enable_theoretical_max_cache=true`。
 - [x] 不根据 group 名称猜测 full group；空 group 列表时使用全部 specs 合成 full-only group。
-- [ ] 支持多 group 时，由协议显式提供 `full_location_spec_group_name`。
+- [x] 支持多 group 派生时，由订阅配置显式提供 Full/Linear location spec group 名称。
 - [ ] GLM-5.2 是否可以按 `linear_step=0` 的 full-only 模型处理。
 - [ ] 已存在但配置不一致的 Group / Instance 如何迁移。
 
@@ -486,7 +495,7 @@ EC_INSTANCE_NOT_EXIST
 
 ## 13. 步骤十一：LiteHit、理论命中率和 MRC
 
-`TraceQuery` 的 full-only 路径：
+`TraceQuery` 的 MRC 路径：
 
 ```text
 校验 input_token_len / timestamp_ns
@@ -495,9 +504,9 @@ EC_INSTANCE_NOT_EXIST
   -> input_token_len == 0 时按完整 block 推算
   -> 加 InstanceState mutex
   -> NormalizeRequest / prefix hash
-  -> TtlLiteHit::ProcessFullRequest
-  -> 生成 FullRequestFact.hit_curve
-  -> MrcWindow::Record
+  -> Full-only: TtlLiteHit::ProcessFullRequest -> FullRequestFact.hit_curve
+  -> Linear/Mamba: TtlLiteHit::ProcessRequest -> RequestFact.points
+  -> 对应的 block-axis / byte-axis MRC Window::Record
   -> 投影各容量命中率
   -> 按需计算理论无限容量命中
   -> 更新累计统计
@@ -524,14 +533,15 @@ MRC = 最近一个上报窗口内，保留上述目标命中量所需的最小 L
 命中率为 68.6% 时，`target_hit_rate_percent=95` 对应的绝对命中率目标约为
 `68.6% × 95% = 65.17%`，而不是 95%。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。
 
-MRC 窗口使用 required blocks 的稀疏差分点，避免大 reuse distance 直接扩张出同等长度的数组。
+Full-only MRC 窗口使用 required blocks 的稀疏差分点，避免大 reuse distance 直接扩张出同等长度的数组；Linear/Mamba MRC 窗口直接聚合 byte-axis fact 每个阈值新增的可恢复 block 数，精确保留阶梯跳变。
 
 审查清单：
 
 - [x] MRC 只在 theoretical 统计开启时累计。
 - [x] 输出理论无限容量命中 block 数 60%、80%、90%、95%、99%、99.5% 的容量点。
 - [x] 使用稀疏差分点，避免大 reuse distance 导致大内存。
-- [x] MRC 使用 full location spec group 的 `size_full` 转换成 byte。
+- [x] Full-only MRC 使用 full location spec group 的 `size_full` 转换成 byte。
+- [x] Linear/Mamba MRC 直接使用同时包含 Full 与 Linear state charge 的 byte-axis 阈值。
 - [ ] 乱序时间采用单调 clamp 是否符合 trace 语义。
 - [ ] input length 回退是否会系统性高估命中率。
 
@@ -551,7 +561,7 @@ OnlineOptimizerManager::ListInstances
   -> 读取累计查询数和累计命中率
 
 OnlineOptimizerManager::TakeMrcMetrics
-  -> 在同一个 MrcWindow 快照中计算六个目标比例的 MRC 容量点
+  -> 在对应的 block-axis / byte-axis MRC Window 快照中计算六个目标比例的容量点
   -> 清空该窗口
 
 OptimizerMetricsReporter::ReportInterval

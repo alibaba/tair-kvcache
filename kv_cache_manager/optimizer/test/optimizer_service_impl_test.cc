@@ -584,12 +584,89 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationUsesCapacityOverride) {
     group->set_name("kvcm-group");
     group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
 
+    KvcmConfigurationApplyOptions options;
+    options.capacity_gb = {40.0, 10.0, 20.0};
     std::unordered_set<std::string> unsupported_instance_ids;
-    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, {40.0, 10.0, 20.0}));
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, options));
 
     auto stored_group = registry_->GetInstanceGroup("kvcm-group");
     ASSERT_NE(nullptr, stored_group);
     EXPECT_EQ((std::vector<double>{10.0, 20.0, 40.0}), stored_group->capacity_gb());
+}
+
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationDerivesLinearStepInstancesForFanout) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("kvcm-group");
+    group->set_capacity_bytes(2LL * 1024 * 1024 * 1024);
+
+    auto *source = configuration.add_instances();
+    source->set_instance_group_name("kvcm-group");
+    source->set_instance_id("kvcm-instance");
+    source->set_block_size(4);
+    auto *full_spec = source->add_location_spec_infos();
+    full_spec->set_name("full-spec");
+    full_spec->set_size(16);
+    auto *linear_spec = source->add_location_spec_infos();
+    linear_spec->set_name("linear-spec");
+    linear_spec->set_size(4);
+    auto *full_group = source->add_location_spec_groups();
+    full_group->set_name("full-cache");
+    full_group->add_spec_names("full-spec");
+    auto *linear_group = source->add_location_spec_groups();
+    linear_group->set_name("mamba-state");
+    linear_group->add_spec_names("linear-spec");
+
+    KvcmConfigurationApplyOptions options;
+    options.fanout_all_instances = true;
+    options.linear_steps = {0, 10, 20};
+    options.full_location_spec_group_name = "full-cache";
+    options.linear_location_spec_group_name = "mamba-state";
+    std::unordered_set<std::string> unsupported_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported_instance_ids, options));
+    EXPECT_TRUE(unsupported_instance_ids.empty());
+
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance", [](const InstanceState &state) {
+        EXPECT_EQ(0, state.linear_step);
+        EXPECT_EQ(0, state.linear_step_blocks);
+        EXPECT_EQ(16, state.full_charge_bytes);
+        EXPECT_EQ(0, state.linear_charge_bytes);
+    }));
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance@linear_step_10", [](const InstanceState &state) {
+        EXPECT_EQ(10, state.linear_step);
+        EXPECT_EQ(2, state.linear_step_blocks);
+        EXPECT_EQ(16, state.full_charge_bytes);
+        EXPECT_EQ(4, state.linear_charge_bytes);
+    }));
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("kvcm-instance@linear_step_20", [](const InstanceState &state) {
+        EXPECT_EQ(20, state.linear_step);
+        EXPECT_EQ(5, state.linear_step_blocks);
+        EXPECT_EQ(16, state.full_charge_bytes);
+        EXPECT_EQ(4, state.linear_charge_bytes);
+    }));
+
+    std::vector<std::string> fanout_instance_ids;
+    ASSERT_EQ(EC_OK, service_->ListFanoutInstanceIds("kvcm-instance", fanout_instance_ids));
+    EXPECT_EQ(
+        (std::vector<std::string>{"kvcm-instance", "kvcm-instance@linear_step_10", "kvcm-instance@linear_step_20"}),
+        fanout_instance_ids);
+}
+
+TEST_F(OptimizerServiceImplTest, FanoutRejectsDifferentBlockSizesInOneGroup) {
+    CreateTestGroup("fanout-group");
+
+    for (const auto &[instance_id, block_size] :
+         std::vector<std::pair<std::string, int32_t>>{{"source", 4}, {"different-granularity", 8}}) {
+        auto request = MakeRegisterRequest("fanout-group", instance_id, block_size, 0);
+        proto::optimizer::OptimizerRegisterInstanceResponse response;
+        RequestContext context("register-" + instance_id, nullptr);
+        service_->RegisterInstance(&context, &request, &response);
+        ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+    }
+
+    std::vector<std::string> fanout_instance_ids;
+    EXPECT_EQ(EC_BADARGS, service_->ListFanoutInstanceIds("source", fanout_instance_ids));
+    EXPECT_TRUE(fanout_instance_ids.empty());
 }
 
 TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSkipsUnsupportedSpecGroups) {

@@ -37,7 +37,11 @@ TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
                 "service_discovery_url": "static://127.0.0.1:6490",
                 "consumer_id": "optimizer-a",
                 "discovery_refresh_interval_ms": 1234,
-                "capacity_gb": [10.0, 20.0, 40.0]
+                "capacity_gb": [10.0, 20.0, 40.0],
+                "fanout_all_instances": true,
+                "linear_steps": [0, 4096, 8192],
+                "full_location_spec_group_name": "full-cache",
+                "linear_location_spec_group_name": "mamba-state"
             },
             {
                 "service_discovery_url": "static://127.0.0.1:6491",
@@ -62,10 +66,16 @@ TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
     EXPECT_EQ("optimizer-a", config.kvcm_event_subscriptions()[0].consumer_id());
     EXPECT_EQ(1234, config.kvcm_event_subscriptions()[0].discovery_refresh_interval_ms());
     EXPECT_EQ((std::vector<double>{10.0, 20.0, 40.0}), config.kvcm_event_subscriptions()[0].capacity_gb());
+    EXPECT_TRUE(config.kvcm_event_subscriptions()[0].fanout_all_instances());
+    EXPECT_EQ((std::vector<int32_t>{0, 4096, 8192}), config.kvcm_event_subscriptions()[0].linear_steps());
+    EXPECT_EQ("full-cache", config.kvcm_event_subscriptions()[0].full_location_spec_group_name());
+    EXPECT_EQ("mamba-state", config.kvcm_event_subscriptions()[0].linear_location_spec_group_name());
     EXPECT_EQ("static://127.0.0.1:6491", config.kvcm_event_subscriptions()[1].service_discovery_url());
     EXPECT_EQ("optimizer-b", config.kvcm_event_subscriptions()[1].consumer_id());
     EXPECT_EQ(2345, config.kvcm_event_subscriptions()[1].discovery_refresh_interval_ms());
     EXPECT_TRUE(config.kvcm_event_subscriptions()[1].capacity_gb().empty());
+    EXPECT_FALSE(config.kvcm_event_subscriptions()[1].fanout_all_instances());
+    EXPECT_TRUE(config.kvcm_event_subscriptions()[1].linear_steps().empty());
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, PartialJsonUsesDefaults) {
@@ -110,7 +120,11 @@ TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
                 "service_discovery_url": "static://127.0.0.1:6490",
                 "consumer_id": "optimizer-a",
                 "discovery_refresh_interval_ms": 4321,
-                "capacity_gb": [12.0, 24.0]
+                "capacity_gb": [12.0, 24.0],
+                "fanout_all_instances": true,
+                "linear_steps": [0, 4096, 8192],
+                "full_location_spec_group_name": "full-cache",
+                "linear_location_spec_group_name": "mamba-state"
             },
             {
                 "service_discovery_url": "static://127.0.0.1:6491",
@@ -145,6 +159,14 @@ TEST_F(OnlineOptimizerServerConfigTest, SerializeAndDeserialize) {
                   config2.kvcm_event_subscriptions()[i].discovery_refresh_interval_ms());
         EXPECT_EQ(config1.kvcm_event_subscriptions()[i].capacity_gb(),
                   config2.kvcm_event_subscriptions()[i].capacity_gb());
+        EXPECT_EQ(config1.kvcm_event_subscriptions()[i].fanout_all_instances(),
+                  config2.kvcm_event_subscriptions()[i].fanout_all_instances());
+        EXPECT_EQ(config1.kvcm_event_subscriptions()[i].linear_steps(),
+                  config2.kvcm_event_subscriptions()[i].linear_steps());
+        EXPECT_EQ(config1.kvcm_event_subscriptions()[i].full_location_spec_group_name(),
+                  config2.kvcm_event_subscriptions()[i].full_location_spec_group_name());
+        EXPECT_EQ(config1.kvcm_event_subscriptions()[i].linear_location_spec_group_name(),
+                  config2.kvcm_event_subscriptions()[i].linear_location_spec_group_name());
     }
 }
 
@@ -186,6 +208,18 @@ TEST_F(OnlineOptimizerServerConfigTest, RejectsInvalidSubscriptions) {
         R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","capacity_gb":[1e20]}]})"));
     EXPECT_FALSE(config.FromJsonString(
         R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381"},{"service_discovery_url":"static://127.0.0.1:6381"}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","linear_steps":[0]}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","fanout_all_instances":true,"linear_steps":[4096],"full_location_spec_group_name":"full","linear_location_spec_group_name":"linear"}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","fanout_all_instances":true,"linear_steps":[0,4096,4096],"full_location_spec_group_name":"full","linear_location_spec_group_name":"linear"}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","fanout_all_instances":true,"linear_steps":[0,-1]}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","fanout_all_instances":true,"linear_steps":[0,4096]}]})"));
+    EXPECT_FALSE(config.FromJsonString(
+        R"({"kvcm_event_subscriptions":[{"service_discovery_url":"static://127.0.0.1:6381","fanout_all_instances":true,"linear_steps":[0,4096],"full_location_spec_group_name":"state","linear_location_spec_group_name":"state"}]})"));
 }
 
 TEST_F(OnlineOptimizerServerConfigTest, OverrideFromSystemEnv) {

@@ -113,7 +113,7 @@ message OptimizerRegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5;   // KVCM 风格 spec 定义
     repeated LocationSpecGroup location_spec_groups = 6; // KVCM 风格 spec group 定义
     OptimizerStateInfo optimizer_state_info = 7; // 显式声明 optimizer full/linear 状态如何映射到 KVCM group
-    int32 linear_step = 8;       // 0 表示 full-only；>0 表示每 linear_step 个 **token** 产生一次 Linear 状态（须为 block_size 的整数倍，Linear 状态只落在完整 block 边界）
+    int32 linear_step = 8;       // 0 表示 full-only；>0 为 Linear 状态的 token 间隔，按 max(1, floor(linear_step / block_size)) 映射到完整 block 边界
 }
 
 message OptimizerRegisterInstanceResponse {

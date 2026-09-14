@@ -361,6 +361,50 @@ TEST_F(LiteHitOfflineRunnerTest, PublishesMambaFactsAndMatchesOnlineReplay) {
     EXPECT_EQ(4, second.max_hit_count);
 }
 
+TEST_F(LiteHitOfflineRunnerTest, FanoutComparesFullAndFlooredLinearOnTheSameTrace) {
+    // The 10-token Linear interval floors to two 4-token Full blocks. Fanout
+    // gives the Full-only and Linear lanes independent state over identical
+    // requests in one replay.
+    const std::string trace_path = WriteTrace("facts_full_linear_fanout.jsonl",
+                                              {
+                                                  TraceLine("ignored", "r1", 1000, {1, 2, 3, 4}, 17),
+                                                  TraceLine("ignored", "r2", 2000, {1, 2, 3, 4}, 17),
+                                              });
+    const std::string output_dir = GetTestTempRootPath() + "/full_linear_fanout";
+    ASSERT_EQ(0, ::system(("mkdir -p " + output_dir).c_str()));
+
+    OptimizerLiteHitConfig config = MakeConfig(trace_path, output_dir);
+    config.set_instances({MakeInfo("full"), MakeHybridInfo("linear", 4, /*linear_step tokens=*/10)});
+    config.set_fanout_all_instances(true);
+    ASSERT_TRUE(LiteHitOfflineRunner(config).Run());
+
+    const std::vector<std::string> lines = ReadLines(output_dir + "/" + kLiteHitFactsFileName);
+    ASSERT_EQ(5, lines.size()); // header + 2 requests x 2 independent lanes
+
+    bool saw_full_warm = false;
+    bool saw_linear_warm = false;
+    std::string error;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        LiteHitFactRecord record;
+        ASSERT_TRUE(ParseLiteHitFactRow(lines[i], record, error)) << error;
+        if (record.trace_id != "r2") {
+            continue;
+        }
+        if (record.instance_id == "full") {
+            saw_full_warm = true;
+            EXPECT_TRUE(record.is_full_rle);
+            EXPECT_EQ((std::vector<HitCurveSegment>{{1, 4}}), record.full_rle_fact.hit_curve);
+        } else if (record.instance_id == "linear") {
+            saw_linear_warm = true;
+            EXPECT_FALSE(record.is_full_rle);
+            // Checkpoints at blocks 2 and 4 after floor(10 / 4) == 2.
+            EXPECT_EQ((std::vector<ByteStepPoint>{{36864, 2}, {73728, 4}}), record.fact.points);
+        }
+    }
+    EXPECT_TRUE(saw_full_warm);
+    EXPECT_TRUE(saw_linear_warm);
+}
+
 TEST_F(LiteHitOfflineRunnerTest, LinearInstanceHonorsGroupTtl) {
     const std::string trace_path = WriteTrace("facts_mamba_ttl.jsonl",
                                               {

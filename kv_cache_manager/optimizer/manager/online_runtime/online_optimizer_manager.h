@@ -12,8 +12,8 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
-#include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit_ttl.h"
+#include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
 namespace kv_cache_manager {
 
@@ -56,6 +56,7 @@ struct InstanceState {
     int64_t interval_max_hits = 0;
 
     MrcWindow mrc_window;
+    ByteMrcWindow byte_mrc_window;
 };
 
 struct TraceQueryResult {
@@ -76,6 +77,9 @@ struct RegisterInstanceResult {
     std::vector<int64_t> estimated_capacity_blocks;
     int64_t full_charge_bytes = 0;
     int64_t linear_charge_bytes = 0;
+    // Effective Linear-state interval after projecting the token interval to
+    // the complete Full-block granularity. Zero means Full-only.
+    int32_t linear_step_blocks = 0;
 };
 
 struct PerCapacityHitRateInfo {
@@ -111,7 +115,8 @@ struct InstanceSummary {
     double max_hit_rate = 0.0;
     int64_t unique_keys = 0;
     // Full-attention: exact configured Full block charge. Mamba: current
-    // resident Full+Mamba working-set bytes divided by resident Full blocks.
+    // resident Full+Linear working-set bytes divided by resident Full blocks.
+    // The numerator is also reported as kv_cache_usage_bytes.
     double bytes_per_block = 0.0;
     int32_t linear_step = 0;
     int64_t eviction_count = 0;

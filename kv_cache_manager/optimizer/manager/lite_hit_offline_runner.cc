@@ -134,10 +134,10 @@ bool LiteHitOfflineRunner::Run() {
         LiteHit::CacheObjectConfig object_config;
         object_config.full_charge_bytes = static_cast<uint64_t>(register_result.full_charge_bytes);
         if (instance.linear_step() != 0) {
-            // RegisterInstance already validated linear_step as a positive
-            // token multiple of block_size and the non-empty Mamba spec group.
+            // Reuse RegisterInstance's floor projection from tokens to
+            // complete blocks so online and offline schedule identical states.
             object_config.linear_charge_bytes = static_cast<uint64_t>(register_result.linear_charge_bytes);
-            object_config.linear_step_blocks = static_cast<uint64_t>(instance.linear_step() / instance.block_size());
+            object_config.linear_step_blocks = static_cast<uint64_t>(register_result.linear_step_blocks);
         }
         const uint64_t ttl_ns = static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL;
         lane->core = std::make_unique<TtlLiteHit>(object_config, ttl_ns);

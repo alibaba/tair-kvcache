@@ -23,6 +23,12 @@ bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
     KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "fanout_all_instances", fanout_all_instances_, false);
+    KVCM_JSON_GET_MACRO(rapid_value, "linear_steps", linear_steps_);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "full_location_spec_group_name", full_location_spec_group_name_, std::string());
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "linear_location_spec_group_name", linear_location_spec_group_name_, std::string());
     return Validate();
 }
 
@@ -31,15 +37,47 @@ void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
     Put(writer, "capacity_gb", capacity_gb_);
+    Put(writer, "fanout_all_instances", fanout_all_instances_);
+    Put(writer, "linear_steps", linear_steps_);
+    Put(writer, "full_location_spec_group_name", full_location_spec_group_name_);
+    Put(writer, "linear_location_spec_group_name", linear_location_spec_group_name_);
 }
 
 bool KvcmEventSubscriptionConfig::Validate() const {
     if (service_discovery_url_.empty() || consumer_id_.empty() || discovery_refresh_interval_ms_ <= 0) {
         return false;
     }
-    return std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
-        return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;
-    });
+    if (!std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
+            return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;
+        })) {
+        return false;
+    }
+    if (!fanout_all_instances_) {
+        return linear_steps_.empty() && full_location_spec_group_name_.empty() &&
+               linear_location_spec_group_name_.empty();
+    }
+    if (linear_steps_.empty()) {
+        return full_location_spec_group_name_.empty() && linear_location_spec_group_name_.empty();
+    }
+
+    std::unordered_set<int32_t> unique_steps;
+    bool has_full_only = false;
+    bool has_linear = false;
+    for (int32_t linear_step : linear_steps_) {
+        if (linear_step < 0 || !unique_steps.insert(linear_step).second) {
+            return false;
+        }
+        has_full_only = has_full_only || linear_step == 0;
+        has_linear = has_linear || linear_step > 0;
+    }
+    if (!has_full_only) {
+        return false;
+    }
+    if (!has_linear) {
+        return linear_location_spec_group_name_.empty();
+    }
+    return !full_location_spec_group_name_.empty() && !linear_location_spec_group_name_.empty() &&
+           full_location_spec_group_name_ != linear_location_spec_group_name_;
 }
 
 // clang-format off

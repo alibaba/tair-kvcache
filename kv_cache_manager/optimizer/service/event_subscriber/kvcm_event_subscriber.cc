@@ -184,9 +184,14 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
         return false;
     }
 
+    KvcmConfigurationApplyOptions apply_options;
+    apply_options.capacity_gb = config_.capacity_gb();
+    apply_options.fanout_all_instances = config_.fanout_all_instances();
+    apply_options.linear_steps = config_.linear_steps();
+    apply_options.full_location_spec_group_name = config_.full_location_spec_group_name();
+    apply_options.linear_location_spec_group_name = config_.linear_location_spec_group_name();
     std::unordered_set<std::string> unsupported_instance_ids;
-    const ErrorCode ec =
-        optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, config_.capacity_gb());
+    const ErrorCode ec = optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, apply_options);
     if (ec != EC_OK) {
         KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
                       leader_endpoint.c_str(),
@@ -307,13 +312,43 @@ void KvcmEventSubscriber::StopWorker(std::unique_ptr<EndpointWorker> worker) {
 }
 
 void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip) {
+    if (!config_.fanout_all_instances()) {
+        ProcessEventForInstance(event, event.instance_id(), event.instance_id(), kvcm_ip);
+        return;
+    }
+
+    std::vector<std::string> target_instance_ids;
+    const ErrorCode resolve_ec = optimizer_service_->ListFanoutInstanceIds(event.instance_id(), target_instance_ids);
+    if (resolve_ec == EC_INSTANCE_NOT_EXIST) {
+        // Preserve the existing unknown-instance path: it records the failed
+        // request and wakes configuration synchronization immediately.
+        ProcessEventForInstance(event, event.instance_id(), event.instance_id(), kvcm_ip);
+        return;
+    }
+    if (resolve_ec != EC_OK) {
+        KVCM_LOG_WARN("KvcmEventSubscriber: drop fanout event, trace_id=%s source_instance_id=%s ec=%d",
+                      event.trace_id().c_str(),
+                      event.instance_id().c_str(),
+                      static_cast<int>(resolve_ec));
+        return;
+    }
+
+    for (const std::string &target_instance_id : target_instance_ids) {
+        ProcessEventForInstance(event, target_instance_id, event.instance_id(), kvcm_ip);
+    }
+}
+
+void KvcmEventSubscriber::ProcessEventForInstance(const proto::optimizer::TraceQueryRequest &event,
+                                                  const std::string &target_instance_id,
+                                                  const std::string &source_instance_id,
+                                                  const std::string &kvcm_ip) {
     std::shared_ptr<OptimizerServiceMetricsCollector> collector;
     if (metrics_registry_) {
         collector = std::make_shared<OptimizerServiceMetricsCollector>(metrics_registry_);
         if (!collector->Init()) {
             collector.reset();
         } else {
-            collector->set_instance_id(event.instance_id());
+            collector->set_instance_id(target_instance_id);
             collector->set_service_error_code_metrics(static_cast<double>(EC_OK));
         }
     }
@@ -326,7 +361,7 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
     ErrorCode ec = EC_OK;
     {
         OptimizerCallGuard guard(&request_context, metrics_reporter_.get());
-        ec = optimizer_service_->ExecuteTraceQuery(event, &response);
+        ec = optimizer_service_->ExecuteTraceQueryForInstance(event, target_instance_id, &response);
         request_context.set_status_code(static_cast<int>(ec));
         if (ec == EC_OK) {
             if (collector) {
@@ -350,17 +385,18 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
     }
     if (ec == EC_INSTANCE_NOT_EXIST) {
         std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
-        if (unsupported_instance_ids_.find(event.instance_id()) != unsupported_instance_ids_.end()) {
-            KVCM_LOG_DEBUG("KvcmEventSubscriber: ignore unsupported instance event, trace_id=%s instance_id=%s",
+        if (unsupported_instance_ids_.find(source_instance_id) != unsupported_instance_ids_.end()) {
+            KVCM_LOG_DEBUG("KvcmEventSubscriber: ignore unsupported instance event, trace_id=%s source_instance_id=%s",
                            event.trace_id().c_str(),
-                           event.instance_id().c_str());
+                           source_instance_id.c_str());
             return;
         }
     }
     if (ec != EC_OK) {
-        KVCM_LOG_WARN("KvcmEventSubscriber: drop event, trace_id=%s instance_id=%s ec=%d",
+        KVCM_LOG_WARN("KvcmEventSubscriber: drop event, trace_id=%s source_instance_id=%s target_instance_id=%s ec=%d",
                       event.trace_id().c_str(),
-                      event.instance_id().c_str(),
+                      source_instance_id.c_str(),
+                      target_instance_id.c_str(),
                       static_cast<int>(ec));
         if (ec == EC_INSTANCE_NOT_EXIST) {
             RequestConfigurationRefresh();

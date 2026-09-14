@@ -317,7 +317,9 @@ NormalizeRequest
   └─ update cumulative integers: total_queries / total_input_tokens / total_hits per slot
 ```
 
-Online does not persist facts (facts persistence is currently Offline-exclusive); the hit rate of `ListInstances` is derived from cumulative integers (`total_hits * block_size_tokens / total_input_tokens`). linear attention enables the Linear state policy and projects the byte-step directly; the TTL watermark filters both Full and Linear objects, and the resident bytes, unique Full blocks and TTL evictions in the statistics are all computed over the filtered working set.
+Online does not persist facts (facts persistence is currently Offline-exclusive); the hit rate of `ListInstances` is derived from cumulative integers (`total_hits * block_size_tokens / total_input_tokens`). linear attention enables the Linear state policy and projects the byte-step directly; the TTL watermark filters both Full and Linear objects, and the resident bytes, unique Full blocks and TTL evictions in the statistics are all computed over the filtered working set. For linear/Mamba instances, `trace_query_bytes_per_block` is the current active Full+Linear resident bytes divided by the current active Full block count (or zero when no Full block is active); `trace_query_kv_cache_usage_bytes` reports that numerator. Full-only instances keep the exact configured Full-block charge.
+
+When theoretical statistics are enabled, the reporting-window MRC is exact for both modes. Full-only facts retain their sparse block-axis difference encoding and are converted to bytes with the configured Full charge at output. Linear/Mamba facts accumulate the increase in recoverable blocks at each explicit byte threshold, so the resulting minimum capacity includes both Full and Linear-state charges without projecting onto the configured capacity slots.
 
 ---
 

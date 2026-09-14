@@ -316,7 +316,9 @@ NormalizeRequest
   └─ 更新累计整数：total_queries / total_input_tokens / 各 slot total_hits
 ```
 
-Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 启用 Linear state 策略并直接投影 byte-step；TTL 水位线同时过滤 Full 与 Linear 对象，统计中的 resident bytes、unique Full blocks 和 TTL eviction 都按过滤后的 working set 计算。
+Online 不持久化 facts（facts 落盘当前是 Offline 专属）；`ListInstances` 的命中率从累计整数推导（`total_hits * block_size_tokens / total_input_tokens`）。linear attention 启用 Linear state 策略并直接投影 byte-step；TTL 水位线同时过滤 Full 与 Linear 对象，统计中的 resident bytes、unique Full blocks 和 TTL eviction 都按过滤后的 working set 计算。对 linear/Mamba Instance，`trace_query_bytes_per_block` 为当前活跃 Full+Linear resident bytes 除以当前活跃 Full block 数（无活跃 Full block 时为 0），`trace_query_kv_cache_usage_bytes` 上报该分子；Full-only Instance 仍使用准确的 Full block 配置 charge。
+
+开启 theoretical 统计后，两种模式都会精确计算上报窗口 MRC。Full-only fact 继续使用稀疏的 block 轴差分编码，输出时再按配置的 Full charge 转成 byte；linear/Mamba fact 则在每个显式字节阈值上累计新增的可恢复 block 数，因此最终最小容量会精确包含 Full 与 Linear state 的不同 charge，也不依赖预先配置的容量档位。
 
 ---
 

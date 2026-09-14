@@ -21,6 +21,10 @@ public:
     const std::string &consumer_id() const { return consumer_id_; }
     int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
     const std::vector<double> &capacity_gb() const { return capacity_gb_; }
+    bool fanout_all_instances() const { return fanout_all_instances_; }
+    const std::vector<int32_t> &linear_steps() const { return linear_steps_; }
+    const std::string &full_location_spec_group_name() const { return full_location_spec_group_name_; }
+    const std::string &linear_location_spec_group_name() const { return linear_location_spec_group_name_; }
 
 private:
     friend class OnlineOptimizerServerConfig;
@@ -29,6 +33,13 @@ private:
     std::string consumer_id_ = "online-optimizer";
     int64_t discovery_refresh_interval_ms_ = 5000;
     std::vector<double> capacity_gb_;
+    // Online Event fanout is scoped to the source instance's group. Optional
+    // linear_steps additionally derives comparison instances from every KVCM
+    // source instance; zero keeps the source id and represents Full-only.
+    bool fanout_all_instances_ = false;
+    std::vector<int32_t> linear_steps_;
+    std::string full_location_spec_group_name_;
+    std::string linear_location_spec_group_name_;
 };
 
 class OnlineOptimizerServerConfig : public Jsonizable {

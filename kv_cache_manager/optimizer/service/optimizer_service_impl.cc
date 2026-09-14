@@ -1,5 +1,6 @@
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 
+#include <algorithm>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -24,6 +25,42 @@ namespace {
 constexpr long double kBytesPerGb = 1024.0L * 1024.0L * 1024.0L;
 constexpr int64_t kKvcmAutoGroupTtlSeconds = 24 * 60 * 60;
 constexpr const char *kKvcmSynthesizedFullSpecGroupName = "full";
+
+bool ValidateKvcmConfigurationApplyOptions(const KvcmConfigurationApplyOptions &options) {
+    if (!options.fanout_all_instances) {
+        return options.linear_steps.empty() && options.full_location_spec_group_name.empty() &&
+               options.linear_location_spec_group_name.empty();
+    }
+    if (options.linear_steps.empty()) {
+        return options.full_location_spec_group_name.empty() && options.linear_location_spec_group_name.empty();
+    }
+
+    std::unordered_set<int32_t> unique_steps;
+    bool has_full_only = false;
+    bool has_linear = false;
+    for (int32_t linear_step : options.linear_steps) {
+        if (linear_step < 0 || !unique_steps.insert(linear_step).second) {
+            return false;
+        }
+        has_full_only = has_full_only || linear_step == 0;
+        has_linear = has_linear || linear_step > 0;
+    }
+    if (!has_full_only) {
+        return false;
+    }
+    if (!has_linear) {
+        return options.linear_location_spec_group_name.empty();
+    }
+    return !options.full_location_spec_group_name.empty() && !options.linear_location_spec_group_name.empty() &&
+           options.full_location_spec_group_name != options.linear_location_spec_group_name;
+}
+
+std::string LinearStepInstanceId(const std::string &source_instance_id, int32_t linear_step) {
+    if (linear_step == 0) {
+        return source_instance_id;
+    }
+    return source_instance_id + "@linear_step_" + std::to_string(linear_step);
+}
 
 void SetPbResponseHeader(proto::optimizer::CommonResponseHeader *header, ErrorCode ec) {
     auto *status = header->mutable_status();
@@ -308,8 +345,12 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
                                                        std::unordered_set<std::string> &unsupported_instance_ids,
-                                                       const std::vector<double> &capacity_gb_override) {
+                                                       const KvcmConfigurationApplyOptions &options) {
     unsupported_instance_ids.clear();
+    if (!ValidateKvcmConfigurationApplyOptions(options)) {
+        KVCM_LOG_ERROR("ApplyKvcmConfiguration: invalid Event fanout options");
+        return EC_BADARGS;
+    }
     if (!manager_) {
         KVCM_LOG_ERROR("ApplyKvcmConfiguration: optimizer manager is null");
         return EC_ERROR;
@@ -335,11 +376,11 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (!registry->GetInstanceGroup(source.name())) {
             OptimizerInstanceGroup group;
             group.set_name(source.name());
-            if (capacity_gb_override.empty()) {
+            if (options.capacity_gb.empty()) {
                 group.set_capacity_gb(
                     {static_cast<double>(static_cast<long double>(source.capacity_bytes()) / kBytesPerGb)});
             } else {
-                group.set_capacity_gb(capacity_gb_override);
+                group.set_capacity_gb(options.capacity_gb);
             }
             group.set_eviction_policy("lru");
             group.set_enable_prefix_hash(true);
@@ -368,15 +409,21 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         available_groups.insert(source.name());
     }
 
+    const bool derive_linear_step_instances = options.fanout_all_instances && !options.linear_steps.empty();
+    const std::vector<int32_t> default_linear_steps = {0};
+    const std::vector<int32_t> &linear_steps =
+        derive_linear_step_instances ? options.linear_steps : default_linear_steps;
+
     for (const auto &source : configuration.instances()) {
         if (source.instance_id().empty()) {
             KVCM_LOG_ERROR("ApplyKvcmConfiguration: empty KVCM instance id");
             return EC_BADARGS;
         }
-        if (manager_->GetInstanceState(source.instance_id(), [](const InstanceState &) {}) == EC_OK) {
+        if (!derive_linear_step_instances &&
+            manager_->GetInstanceState(source.instance_id(), [](const InstanceState &) {}) == EC_OK) {
             continue;
         }
-        if (source.location_spec_groups_size() > 1) {
+        if (!derive_linear_step_instances && source.location_spec_groups_size() > 1) {
             KVCM_LOG_WARN("ApplyKvcmConfiguration: ignore unsupported multi-group instance[%s], groups=%d",
                           source.instance_id().c_str(),
                           source.location_spec_groups_size());
@@ -411,22 +458,53 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
             }
         }
 
-        OptimizerInstanceInfo instance(source.instance_group_name(),
-                                       source.instance_id(),
-                                       source.block_size(),
-                                       spec_infos,
-                                       spec_groups,
-                                       0,
-                                       OptimizerStateInfo());
-        RegisterInstanceResult result;
-        const ErrorCode ec = manager_->RegisterInstance(instance, result);
-        if (ec != EC_OK) {
-            KVCM_LOG_ERROR("ApplyKvcmConfiguration: register instance[%s] failed, ec=%d",
-                           source.instance_id().c_str(),
-                           static_cast<int>(ec));
-            return ec;
+        std::string full_group_name;
+        if (derive_linear_step_instances) {
+            full_group_name = options.full_location_spec_group_name;
+            if (full_group_name.empty()) {
+                if (spec_groups.size() != 1) {
+                    KVCM_LOG_ERROR(
+                        "ApplyKvcmConfiguration: fanout source instance[%s] has %zu spec groups but no explicit "
+                        "full_location_spec_group_name",
+                        source.instance_id().c_str(),
+                        spec_groups.size());
+                    return EC_BADARGS;
+                }
+                full_group_name = spec_groups.front().name();
+            }
         }
-        ++registered_instances;
+
+        for (int32_t linear_step : linear_steps) {
+            const std::string target_instance_id = LinearStepInstanceId(source.instance_id(), linear_step);
+            if (manager_->GetInstanceState(target_instance_id, [](const InstanceState &) {}) == EC_OK) {
+                continue;
+            }
+
+            OptimizerStateInfo state_info;
+            if (derive_linear_step_instances) {
+                state_info.set_full_location_spec_group_name(full_group_name);
+                if (linear_step > 0) {
+                    state_info.set_linear_location_spec_group_name(options.linear_location_spec_group_name);
+                }
+            }
+            OptimizerInstanceInfo instance(source.instance_group_name(),
+                                           target_instance_id,
+                                           source.block_size(),
+                                           spec_infos,
+                                           spec_groups,
+                                           linear_step,
+                                           state_info);
+            RegisterInstanceResult result;
+            const ErrorCode ec = manager_->RegisterInstance(instance, result);
+            if (ec != EC_OK) {
+                KVCM_LOG_ERROR("ApplyKvcmConfiguration: register source instance[%s] target[%s] failed, ec=%d",
+                               source.instance_id().c_str(),
+                               target_instance_id.c_str(),
+                               static_cast<int>(ec));
+                return ec;
+            }
+            ++registered_instances;
+        }
     }
 
     KVCM_LOG_INFO("ApplyKvcmConfiguration: groups=%d instances=%d created_groups=%zu registered_instances=%zu "
@@ -437,6 +515,47 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
                   registered_instances,
                   unsupported_instance_ids.size());
     return EC_OK;
+}
+
+ErrorCode OptimizerServiceImpl::ListFanoutInstanceIds(const std::string &source_instance_id,
+                                                      std::vector<std::string> &instance_ids) const {
+    instance_ids.clear();
+    if (!manager_) {
+        return EC_ERROR;
+    }
+    auto registry = manager_->registry_manager();
+    if (!registry) {
+        return EC_ERROR;
+    }
+
+    std::string instance_group_name;
+    int32_t source_block_size = 0;
+    const ErrorCode source_ec = manager_->GetInstanceState(source_instance_id, [&](const InstanceState &state) {
+        instance_group_name = state.instance_info->instance_group_name();
+        source_block_size = state.instance_info->block_size();
+    });
+    if (source_ec != EC_OK) {
+        return source_ec;
+    }
+
+    for (const auto &instance_info : registry->ListInstanceInfos(instance_group_name)) {
+        if (manager_->GetInstanceState(instance_info->instance_id(), [](const InstanceState &) {}) != EC_OK) {
+            continue;
+        }
+        if (instance_info->block_size() != source_block_size) {
+            KVCM_LOG_ERROR(
+                "ListFanoutInstanceIds: source instance[%s] block_size=%d differs from target[%s] block_size=%d",
+                source_instance_id.c_str(),
+                source_block_size,
+                instance_info->instance_id().c_str(),
+                instance_info->block_size());
+            instance_ids.clear();
+            return EC_BADARGS;
+        }
+        instance_ids.push_back(instance_info->instance_id());
+    }
+    std::sort(instance_ids.begin(), instance_ids.end());
+    return instance_ids.empty() ? EC_INSTANCE_NOT_EXIST : EC_OK;
 }
 
 void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
@@ -475,6 +594,12 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
 
 ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,
                                                   proto::optimizer::TraceQueryResponse *response) {
+    return ExecuteTraceQueryForInstance(request, request.instance_id(), response);
+}
+
+ErrorCode OptimizerServiceImpl::ExecuteTraceQueryForInstance(const proto::optimizer::TraceQueryRequest &request,
+                                                             const std::string &target_instance_id,
+                                                             proto::optimizer::TraceQueryResponse *response) {
     std::vector<int64_t> block_keys(request.block_keys().begin(), request.block_keys().end());
     int64_t input_token_len = request.input_token_len();
     if (input_token_len == 0 && request.token_ids_size() > 0) {
@@ -483,7 +608,7 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
 
     TraceQueryResult result;
     const ErrorCode ec =
-        manager_->TraceQuery(request.instance_id(), block_keys, input_token_len, request.timestamp_ns(), result);
+        manager_->TraceQuery(target_instance_id, block_keys, input_token_len, request.timestamp_ns(), result);
     if (ec != EC_OK || !response) {
         return ec;
     }
@@ -506,7 +631,7 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
     response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
 
     if (event_manager_) {
-        auto event = std::make_shared<OptimizerQueryHitEvent>(request.instance_id());
+        auto event = std::make_shared<OptimizerQueryHitEvent>(target_instance_id);
         event->SetEventTriggerTime();
         event->SetAdditionalArgs(
             request.trace_id(), request.timestamp_ns(), response->input_token_len(), response->total_blocks());

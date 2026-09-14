@@ -62,6 +62,10 @@ private:
     void EndpointLoop(EndpointWorker *worker);
     void StopWorker(std::unique_ptr<EndpointWorker> worker);
     void ProcessEvent(const proto::optimizer::TraceQueryRequest &event, const std::string &kvcm_ip);
+    void ProcessEventForInstance(const proto::optimizer::TraceQueryRequest &event,
+                                 const std::string &target_instance_id,
+                                 const std::string &source_instance_id,
+                                 const std::string &kvcm_ip);
     void RequestConfigurationRefresh();
     bool WaitForSupervisor(std::chrono::milliseconds duration);
     bool WaitForReconnect(EndpointWorker *worker, std::chrono::milliseconds duration);

@@ -200,18 +200,26 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceMissingSpecInStateGroupFails)
     EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
 }
 
-TEST_F(OnlineOptimizerManagerTest, RegisterInstanceLinearStepNotTokenMultipleFails) {
-    // linear_step counts tokens and must divide into whole blocks.
+TEST_F(OnlineOptimizerManagerTest, RegisterInstanceLinearStepUsesFloorBlockProjection) {
+    // 24 / 16 floors to one complete block instead of rejecting the instance.
     auto info = MakeHybridInfo("i1", "g1", 16, /*linear_step tokens=*/24);
     auto group = MakeGroup();
     RegisterInstanceResult result;
-    EXPECT_EQ(EC_BADARGS, RegisterInstance(info, group, result));
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, result));
+    EXPECT_EQ(1, result.linear_step_blocks);
+    ASSERT_EQ(EC_OK, mgr_->GetInstanceState("i1", [](const InstanceState &state) {
+        EXPECT_EQ(24, state.linear_step);
+        EXPECT_EQ(1, state.linear_step_blocks);
+    }));
 
-    auto ok_info = MakeHybridInfo("i1", "g1", 16, /*linear_step tokens=*/32);
-    EXPECT_EQ(EC_OK, RegisterInstance(ok_info, group, result));
+    // A positive interval below one Full block remains Linear and is clamped
+    // to the finest representable schedule: one state per Full block.
+    auto sub_block_info = MakeHybridInfo("i2", "g1", 16, /*linear_step tokens=*/8);
+    ASSERT_EQ(EC_OK, RegisterInstance(sub_block_info, group, result));
+    EXPECT_EQ(1, result.linear_step_blocks);
 
     // A linear instance without a Mamba spec group is rejected.
-    auto no_mamba_group = MakeInfo("i2", "g1", 16, /*linear_step tokens=*/32);
+    auto no_mamba_group = MakeInfo("i3", "g1", 16, /*linear_step tokens=*/32);
     EXPECT_EQ(EC_BADARGS, RegisterInstance(no_mamba_group, group, result));
 }
 
@@ -454,6 +462,42 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcRequiresTheoreticalMetrics) {
     EXPECT_TRUE(metrics.empty());
 }
 
+TEST_F(OnlineOptimizerManagerTest, MambaMrcUsesExactByteAxisThresholds) {
+    // block_size 16, linear_step 48 tokens -> checkpoints at block 3 and the
+    // request tail. Full charge is 16384 bytes and Linear charge is 4096.
+    auto info = MakeHybridInfo("i1", "g1", 16, 48);
+    auto group = MakeGroup("g1", {1.0}, "lru", /*enable_theoretical_max_cache=*/true);
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, 0, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2, 3, 4}, 70, 0, result));
+    ASSERT_EQ(4, result.max_hit_count);
+
+    std::vector<MrcMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
+    ASSERT_EQ(6, metrics.size());
+    const std::vector<uint32_t> expected_targets = {6000, 8000, 9000, 9500, 9900, 9950};
+    // Warm request byte-step fact:
+    //   53248 bytes -> 3 hit blocks, 73728 bytes -> 4 hit blocks.
+    // 60% of four theoretical hits rounds up to three; every other target
+    // rounds up to four.
+    const std::vector<int64_t> expected_bytes = {53248, 73728, 73728, 73728, 73728, 73728};
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        EXPECT_EQ("i1", metrics[i].instance_id);
+        EXPECT_EQ("g1", metrics[i].instance_group);
+        EXPECT_EQ(expected_targets[i], metrics[i].target_basis_points);
+        EXPECT_EQ(expected_bytes[i], metrics[i].capacity_bytes);
+    }
+
+    ASSERT_EQ(EC_OK, mgr_->TakeMrcMetrics(metrics));
+    ASSERT_EQ(6, metrics.size());
+    for (const auto &metric : metrics) {
+        EXPECT_EQ(0, metric.capacity_bytes);
+    }
+}
+
 TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesSharedLiteHit) {
     // block_size 16, linear_step 48 tokens -> one Linear state every 3 blocks
     // plus the forced last block. Hybrid specs: full charge 16384, mamba
@@ -463,7 +507,7 @@ TEST_F(OnlineOptimizerManagerTest, MambaLinearUsesSharedLiteHit) {
     RegisterInstanceResult reg_result;
     ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
 
-    // An empty working set has no per-resident-block average yet.
+    // An empty working set has no resident Full block as the denominator.
     {
         std::vector<InstanceSummary> empty_summaries;
         ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", empty_summaries));
@@ -544,7 +588,7 @@ TEST_F(OnlineOptimizerManagerTest, MambaCountsHistoricalForcedTailLinearState) {
     EXPECT_DOUBLE_EQ(32.0 / 96.0, summaries[0].per_capacity_hit_rates[0].hit_rate);
     EXPECT_DOUBLE_EQ(32.0 / 96.0, summaries[0].max_hit_rate);
     // 4 Full blocks plus current Linear states 3/4 and historical forced-tail
-    // Linear state 2: the real working-set average is (4F + 3M) / 4.
+    // Linear state 2: the current working-set average is (4F + 3M) / 4.
     EXPECT_EQ(4 * 16384 + 3 * 4096, summaries[0].kv_cache_usage_bytes);
     EXPECT_DOUBLE_EQ(static_cast<double>(4 * 16384 + 3 * 4096) / 4, summaries[0].bytes_per_block);
 }
@@ -600,8 +644,8 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryUsesProducerTimeForTtl) {
         const std::string suffix = use_linear ? "linear" : "full";
         const std::string instance_id = "i-" + suffix;
         const std::string group_name = "g-" + suffix;
-        auto info = use_linear ? MakeHybridInfo(instance_id, group_name, 4, 4)
-                               : MakeInfo(instance_id, group_name, 4, 0);
+        auto info =
+            use_linear ? MakeHybridInfo(instance_id, group_name, 4, 4) : MakeInfo(instance_id, group_name, 4, 0);
         auto group = MakeGroup(group_name,
                                {1.0},
                                "lru",
