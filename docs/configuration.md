@@ -36,6 +36,8 @@ redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
 
 ## KVCacheManager Server Config
 
+### 通用服务配置
+
 KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置。
 CacheReclaimer 异步删除相关参数的生命周期语义见
 [CacheReclaimer 异步删除与过度逐出优化设计](design/cache_reclaimer_async_delete.md)。
@@ -203,6 +205,16 @@ p99、CPU 与 ReportEvent RT。设计、指标含义、测试命令见
 相同 source 迁移到不同 target、不同 source 迁移到相同 target，以及 `hot -> warm -> cold` 级联均可配置；只有
 完全相同的 source/target route 会被拒绝。重复 route 无法明确选择各自的 threshold、method、retention 和 Mark
 timeout，因此不会使用配置数组顺序作为隐式优先级。
+
+### 恢复阶段的 jemalloc arena 轮换（进程环境变量）
+
+单线程恢复会将缓存对象集中分配到一个 arena，后续请求线程在其他 arena 分配更新对象时，旧 arena 中尚未完全空闲的 slab 难以释放、其中的空洞也难以被新分配复用，可能导致 key 数和业务缓存用量稳定而 RSS 持续上涨。
+
+`KVCM_RECOVER_ARENA_ROTATION_ENABLED` 默认 `true`，设为 `false` 可关闭。
+这是当前单线程恢复的过渡方案：按非空批次轮换 arena，以改善恢复对象的分配分布。
+arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per-CPU arena 模式时不生效。
+本功能不调整 arena 数量，也不整理已有碎片；后续共享业务线程池的演进方向记录在
+[`MetaStorageBackendManager::AsyncRecoverTask`](../kv_cache_manager/meta/meta_storage_backend_manager.cc) 的 TODO 中。
 
 ## CacheManager Initial Config
 
