@@ -313,6 +313,13 @@ public:
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        struct SpecChecksum {
+            std::string location_spec_name;
+            int64_t checksum = 0;
+        };
+        // Optional independently stored spec payload checksums. Unnamed specs
+        // are untouched; zero is a valid value.
+        std::vector<SpecChecksum> spec_checksums;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,

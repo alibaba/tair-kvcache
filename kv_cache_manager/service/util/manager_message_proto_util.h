@@ -32,7 +32,9 @@ public:
     static void ModelDeploymentFromProto(const T *proto_model_deployment, ModelDeployment &model_deployment_info);
 
     template <typename T>
-    static void CacheLocationViewToProto(const CacheLocationView &cache_location_info, T *proto_cache_location);
+    static void CacheLocationViewToProto(const CacheLocationView &cache_location_info,
+                                         T *proto_cache_location,
+                                         bool include_checksum);
 
     template <typename T>
     static void BlockMaskToProto(const BlockMask &block_mask_info, T *proto_block_mask);
@@ -198,7 +200,9 @@ void ProtoConvert::ModelDeploymentFromProto(const T *proto_model_deployment, Mod
 }
 // DONE
 template <typename T>
-void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_location_info, T *proto_cache_location) {
+void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_location_info,
+                                            T *proto_cache_location,
+                                            bool include_checksum) {
     static_assert(std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>,
                   "T must be either proto::meta::CacheLocation or proto::admin::CacheLocation");
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
@@ -211,11 +215,16 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         DataStorageTypeToProto(cache_location_info.type(), &type);
         proto_cache_location->set_type(type);
     }
-
     for (const auto &location_spec : cache_location_info.location_specs()) {
         auto *proto_spec = proto_cache_location->add_location_specs();
         proto_spec->set_name(location_spec.name());
         proto_spec->set_uri(location_spec.uri());
+        // Leave checksum scalars at their defaults for legacy/non-opt-in
+        // queries. Explicit presence keeps a valid value of zero representable.
+        if (include_checksum && location_spec.has_checksum()) {
+            proto_spec->set_checksum_present(true);
+            proto_spec->set_checksum(location_spec.checksum());
+        }
     }
 }
 // DONE
@@ -512,12 +521,23 @@ std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<
 ProtoConvert::LocationSpecToProto(const LocationSpec &location_spec_info, T *proto_location_spec) {
     proto_location_spec->set_name(location_spec_info.name());
     proto_location_spec->set_uri(location_spec_info.uri());
+    proto_location_spec->set_checksum_present(location_spec_info.has_checksum());
+    if (location_spec_info.has_checksum()) {
+        proto_location_spec->set_checksum(location_spec_info.checksum());
+    }
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
 ProtoConvert::LocationSpecFromProto(const T *proto_location_spec, LocationSpec &location_spec_info) {
     location_spec_info.set_name(proto_location_spec->name());
     location_spec_info.set_uri(proto_location_spec->uri());
+    // The non-zero inference accepts payloads produced during early checksum
+    // development, before checksum_present was added.
+    if (proto_location_spec->checksum_present() || proto_location_spec->checksum() != 0) {
+        location_spec_info.set_checksum(proto_location_spec->checksum());
+    } else {
+        location_spec_info.clear_checksum();
+    }
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>

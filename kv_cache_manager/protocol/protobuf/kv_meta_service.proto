@@ -47,6 +47,23 @@ enum StorageType {
     ST_TAIRMEMPOOL_SSD = 9;
 }
 
+// Checksum algorithm. Keep values and persisted legacy semantics aligned with
+// meta_service.proto. Re-declared per package to avoid cross-package imports;
+// revised behavior requires a new enum value.
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. Same semantics as meta_service.proto.
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    // Built-in KVCM algorithm; caller-provided opaque checksums are not tagged.
+    ChecksumAlgo algo = 4;
+}
+
 // 使用URI统一多种存储表示，由client或者connector负责解析
 // ThreeFSLocation: 3fs://na61_3fs_cluster_01/data_root/dir1/filename?offset=0&size=1024
 // MoonCakeLocation: mooncake://na61_mc_bucket_01/my_key1
@@ -133,6 +150,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 message RegisterInstanceRequest {

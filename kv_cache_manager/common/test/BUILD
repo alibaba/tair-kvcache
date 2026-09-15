@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "HashUtilTest",
+    srcs = ["hash_util_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:hash_util",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "scoped_jemalloc_arena_rotation_test",
     srcs = ["scoped_jemalloc_arena_rotation_test.cc"],
     deps = [
@@ -51,10 +60,10 @@ cc_test(
         "crash_handler_test.cc",
     ],
     copts = ["-fno-access-control"],
+    data = [],
     linkopts = [
         "-rdynamic",
     ],
-    data = [],
     deps = [
         "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:unittest",
@@ -208,9 +217,9 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:service_discovery_factory",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         "//kv_cache_manager/common:static_service_discovery",
         "//kv_cache_manager/common:unittest",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
     ],
 )
 

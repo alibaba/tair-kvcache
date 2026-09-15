@@ -15,6 +15,8 @@ public:
 
     inline const std::string &name() const { return raw_location_spec_.name(); }
     inline const std::string &uri() const { return raw_location_spec_.uri(); }
+    inline int64_t checksum() const { return raw_location_spec_.checksum(); }
+    inline bool has_checksum() const { return raw_location_spec_.has_checksum(); }
 
 private:
     const LocationSpec &raw_location_spec_;

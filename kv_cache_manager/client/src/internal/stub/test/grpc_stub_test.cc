@@ -1,6 +1,7 @@
 #include <atomic>
 #include <grpcpp/grpcpp.h>
 #include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
@@ -63,6 +64,29 @@ private:
     int fd_;
 };
 
+class FinishWriteCaptureService final : public proto::meta::MetaService::Service {
+public:
+    grpc::Status FinishWriteCache(grpc::ServerContext *,
+                                  const proto::meta::FinishWriteCacheRequest *request,
+                                  proto::meta::CommonResponse *response) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            request_ = *request;
+        }
+        response->mutable_header()->mutable_status()->set_code(proto::meta::OK);
+        return grpc::Status::OK;
+    }
+
+    proto::meta::FinishWriteCacheRequest request() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return request_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    proto::meta::FinishWriteCacheRequest request_;
+};
+
 } // namespace
 
 class GrpcStubTest : public TESTBASE {
@@ -94,6 +118,46 @@ public:
             EXPECT_EQ(location[1].spec_name, "tp1");
             EXPECT_GT(location[1].uri.size(), 0);
         }
+    }
+
+    std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
+                                                           const std::string &instance_id,
+                                                           QueryType query_type,
+                                                           const Stub::KeyVector &keys,
+                                                           const Stub::TokenIdsVector &tokens,
+                                                           const BlockMask &block_mask,
+                                                           int32_t sw_size,
+                                                           const std::vector<std::string> &location_spec_names) {
+        auto [ec, result] = stub_->GetCacheLocation(trace_id,
+                                                    instance_id,
+                                                    query_type,
+                                                    keys,
+                                                    tokens,
+                                                    block_mask,
+                                                    location_spec_names,
+                                                    MatchLocationOptions::WithSlideWindowSize(sw_size));
+        return {ec, std::move(result.locations)};
+    }
+
+    std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
+                                                            const std::string &instance_id,
+                                                            QueryType query_type,
+                                                            const Stub::KeyVector &keys,
+                                                            const Stub::TokenIdsVector &tokens,
+                                                            int32_t sw_size) {
+        return stub_->GetCacheLocationLen(
+            trace_id, instance_id, query_type, keys, tokens, MatchLocationLenOptions::WithSlideWindowSize(sw_size));
+    }
+
+    std::pair<ClientErrorCode, Metas> GetCacheMeta(const std::string &trace_id,
+                                                   const std::string &instance_id,
+                                                   const Stub::KeyVector &keys,
+                                                   const Stub::TokenIdsVector &tokens,
+                                                   const BlockMask &block_mask,
+                                                   int32_t detail_level) {
+        auto [ec, result] = stub_->GetCacheMeta(
+            trace_id, instance_id, keys, tokens, block_mask, MatchMetaOptions::WithDetailLevel(detail_level));
+        return {ec, std::move(result.metas)};
     }
 
 private:
@@ -244,8 +308,7 @@ TEST_F(GrpcStubTest, TestRetry) {
     // 每次断连后首次RPC会因subchannel状态异常而立即失败，用dummy call触发subchannel重连。
     // 升级到grpc1.45.0+后可以去掉所有dummyCall调用。
     auto dummyCall = [this]() {
-        stub_->GetCacheLocation(
-            "trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {});
+        GetCacheLocation("trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {});
     };
 
     // Helper: 关停server后执行rpcOp，验证RPC被阻塞，再重启server验证retry成功
@@ -283,7 +346,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 2: GetCacheLocation (写入中，应返回空) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         EXPECT_EQ(ER_OK, success);
         EXPECT_EQ(Locations({}), locations);
@@ -298,7 +361,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 4: GetCacheLocation (finish后，应返回缓存数据) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         EXPECT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, locations);
@@ -306,7 +369,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 5: GetCacheLocation with offset (应返回子集) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
         EXPECT_EQ(ER_OK, success);
         ExpectLocationsEq(Locations(target_locations.begin() + 1, target_locations.end()), locations);
@@ -480,6 +543,210 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheSuccess) {
     }
 }
 
+TEST_F(GrpcStubTest, FinishWriteChecksumUsesAdditiveFieldNumber) {
+    const auto *descriptor = proto::meta::FinishWriteCacheRequest::descriptor();
+    const auto *legacy_locations = descriptor->FindFieldByName("locations");
+    const auto *checksum_batches = descriptor->FindFieldByName("checksum_batches");
+    ASSERT_NE(nullptr, legacy_locations);
+    ASSERT_NE(nullptr, checksum_batches);
+    EXPECT_EQ(5, legacy_locations->number());
+    EXPECT_TRUE(legacy_locations->options().deprecated());
+    EXPECT_EQ(google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE, legacy_locations->cpp_type());
+    EXPECT_EQ(6, checksum_batches->number());
+    EXPECT_TRUE(checksum_batches->is_repeated());
+    EXPECT_EQ(google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE, checksum_batches->cpp_type());
+    EXPECT_EQ("LocationSpecChecksumBatch", checksum_batches->message_type()->name());
+
+    const auto *location_include =
+        proto::meta::GetCacheLocationRequest::descriptor()->FindFieldByName("include_checksums");
+    const auto *backend_include =
+        proto::meta::GetCacheLocationsByBackendRequest::descriptor()->FindFieldByName("include_checksums");
+    const auto *meta_include = proto::meta::GetCacheMetaRequest::descriptor()->FindFieldByName("include_checksums");
+    ASSERT_NE(nullptr, location_include);
+    ASSERT_NE(nullptr, backend_include);
+    ASSERT_NE(nullptr, meta_include);
+    EXPECT_EQ(9, location_include->number());
+    EXPECT_EQ(10, backend_include->number());
+    EXPECT_EQ(7, meta_include->number());
+    EXPECT_EQ(google::protobuf::FieldDescriptor::CPPTYPE_BOOL, location_include->cpp_type());
+    EXPECT_EQ(google::protobuf::FieldDescriptor::CPPTYPE_BOOL, backend_include->cpp_type());
+    EXPECT_EQ(google::protobuf::FieldDescriptor::CPPTYPE_BOOL, meta_include->cpp_type());
+}
+
+TEST_F(GrpcStubTest, FinishWriteSerializesLegacyLocationsAndChecksumBatches) {
+    FinishWriteCaptureService capture_service;
+    grpc::ServerBuilder builder;
+    const int capture_port = GetFreePort();
+    ASSERT_LT(0, capture_port);
+    builder.AddListeningPort("127.0.0.1:" + std::to_string(capture_port), grpc::InsecureServerCredentials());
+    builder.RegisterService(&capture_service);
+    auto capture_server = builder.BuildAndStart();
+    ASSERT_NE(nullptr, capture_server);
+
+    GrpcStub capture_stub(1, 5000);
+    const auto connect_ec = capture_stub.AddConnection("127.0.0.1:" + std::to_string(capture_port), 1000);
+    const Locations legacy_locations = {
+        {{"tp0", "file:///legacy/tp0"}, {"tp1", "file:///legacy/tp1"}},
+        {{"tp0", "file:///legacy/tp0-second"}},
+    };
+    const FinishWriteOptions options =
+        FinishWriteOptions::WithChecksumBatches({{"tp0", {0, -1}}, {"tp1", {INT64_MIN, INT64_MAX}}});
+    ClientErrorCode finish_ec = ER_CONNECT_FAIL;
+    if (connect_ec == ER_OK) {
+        finish_ec = capture_stub.FinishWriteCache(
+            "wire-trace", "wire-instance", "wire-session", BlockMaskVector{true, false}, legacy_locations, options);
+    }
+    const auto captured = capture_service.request();
+    capture_server->Shutdown();
+    capture_server->Wait();
+
+    ASSERT_EQ(ER_OK, connect_ec);
+    ASSERT_EQ(ER_OK, finish_ec);
+    ASSERT_EQ(2, captured.locations_size());
+    ASSERT_EQ(2, captured.locations(0).location_specs_size());
+    EXPECT_EQ("tp0", captured.locations(0).location_specs(0).name());
+    EXPECT_EQ("file:///legacy/tp0", captured.locations(0).location_specs(0).uri());
+    ASSERT_EQ(1, captured.locations(1).location_specs_size());
+    EXPECT_EQ("file:///legacy/tp0-second", captured.locations(1).location_specs(0).uri());
+    ASSERT_EQ(2, captured.checksum_batches_size());
+    EXPECT_EQ("tp0", captured.checksum_batches(0).location_spec_name());
+    EXPECT_EQ((std::vector<int64_t>{0, -1}),
+              std::vector<int64_t>(captured.checksum_batches(0).checksums().begin(),
+                                   captured.checksum_batches(0).checksums().end()));
+    EXPECT_EQ("tp1", captured.checksum_batches(1).location_spec_name());
+    EXPECT_EQ((std::vector<int64_t>{INT64_MIN, INT64_MAX}),
+              std::vector<int64_t>(captured.checksum_batches(1).checksums().begin(),
+                                   captured.checksum_batches(1).checksums().end()));
+}
+
+TEST_F(GrpcStubTest, TestFinishWriteCacheWithChecksums) {
+    // default_storage_configs has enable_meta_checksum=false. This deliberately
+    // exercises the caller-computed mode: FinishWrite persists opaque values and
+    // GetCacheLocation returns them without requiring KVCM's GPU checksum pool.
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+    std::string write_session_id;
+    Locations target_locations;
+    {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        ASSERT_EQ(ER_OK, success);
+        write_session_id = write_location.write_session_id;
+        target_locations = write_location.locations;
+    }
+    {
+        BlockMask success_block = static_cast<size_t>(4);
+        Locations unrelated_locations = {{{"tp0", "file://caller-owned-location-subset"}}};
+        // Zero is a real caller-provided checksum; explicit presence must keep
+        // it distinct from legacy metadata with no checksum.
+        const std::vector<int64_t> tp0_checksums = {0x11, 0, 0x33, 0x44};
+        const std::vector<int64_t> tp1_checksums = {-1, 0x22, INT64_MIN, INT64_MAX};
+        ASSERT_EQ(ER_OK,
+                  stub_->FinishWriteCache(
+                      "trace3",
+                      "instance1",
+                      write_session_id,
+                      success_block,
+                      unrelated_locations,
+                      FinishWriteOptions::WithChecksumBatches({{"tp0", tp0_checksums}, {"tp1", tp1_checksums}})));
+    }
+    {
+        auto [success, result] = stub_->GetCacheLocation("trace4-default",
+                                                         "instance1",
+                                                         QueryType::QT_PREFIX_MATCH,
+                                                         {1, 2, 3, 4},
+                                                         {},
+                                                         static_cast<size_t>(0),
+                                                         {},
+                                                         MatchLocationOptions{});
+        ASSERT_EQ(ER_OK, success);
+        ExpectLocationsEq(target_locations, result.locations);
+        EXPECT_TRUE(result.checksum_results.empty());
+    }
+    {
+        auto [success, result] = stub_->GetCacheLocation("trace4",
+                                                         "instance1",
+                                                         QueryType::QT_PREFIX_MATCH,
+                                                         {1, 2, 3, 4},
+                                                         {},
+                                                         static_cast<size_t>(0),
+                                                         {},
+                                                         MatchLocationOptions::WithChecksums());
+        ASSERT_EQ(ER_OK, success);
+        ExpectLocationsEq(target_locations, result.locations);
+        const auto *tp0 = result.FindChecksums("tp0");
+        const auto *tp1 = result.FindChecksums("tp1");
+        ASSERT_NE(nullptr, tp0);
+        ASSERT_NE(nullptr, tp1);
+        EXPECT_EQ((std::vector<int64_t>{0x11, 0, 0x33, 0x44}), tp0->checksums);
+        EXPECT_EQ((std::vector<int64_t>{-1, 0x22, INT64_MIN, INT64_MAX}), tp1->checksums);
+        EXPECT_EQ((std::vector<bool>{true, true, true, true}), tp0->checksum_present);
+        EXPECT_EQ((std::vector<bool>{true, true, true, true}), tp1->checksum_present);
+        const auto tp0_verify = result.VerifyChecksums("tp0", {0x11, 0, 0x33, 0x44});
+        const auto tp1_verify = result.VerifyChecksums("tp1", {-1, 0x22, INT64_MIN, INT64_MAX});
+        EXPECT_FALSE(tp0_verify.mismatch);
+        EXPECT_FALSE(tp1_verify.mismatch);
+        EXPECT_EQ(tp0_verify.stage, ChecksumValidationStage::CVS_META_ROUND_TRIP);
+    }
+    {
+        auto [success, result] = stub_->GetCacheMeta(
+            "trace5", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), MatchMetaOptions::WithChecksums());
+        ASSERT_EQ(ER_OK, success);
+        ExpectLocationsEq(target_locations, result.metas.locations);
+        ASSERT_NE(nullptr, result.FindChecksums("tp0"));
+        ASSERT_NE(nullptr, result.FindChecksums("tp1"));
+        EXPECT_EQ((std::vector<int64_t>{0x11, 0, 0x33, 0x44}), result.FindChecksums("tp0")->checksums);
+        EXPECT_EQ((std::vector<int64_t>{-1, 0x22, INT64_MIN, INT64_MAX}), result.FindChecksums("tp1")->checksums);
+    }
+}
+
+TEST_F(GrpcStubTest, TestFinishWriteCacheRejectsChecksumSizeMismatch) {
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+    std::string write_session_id;
+    {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        ASSERT_EQ(ER_OK, success);
+        write_session_id = write_location.write_session_id;
+    }
+    {
+        BlockMask success_block = static_cast<size_t>(4);
+        ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT,
+                  stub_->FinishWriteCache("trace3",
+                                          "instance1",
+                                          write_session_id,
+                                          success_block,
+                                          {},
+                                          FinishWriteOptions::WithChecksums("tp0", std::vector<int64_t>{0x11})));
+        // A shape error is retryable: the rejected request must not consume the
+        // write session or leave the location permanently in WRITING.
+        const std::vector<int64_t> corrected = {0x11, 0, -1, INT64_MAX};
+        ASSERT_EQ(ER_OK,
+                  stub_->FinishWriteCache("trace4",
+                                          "instance1",
+                                          write_session_id,
+                                          success_block,
+                                          {},
+                                          FinishWriteOptions::WithChecksums("tp0", corrected)));
+        auto [query_ec, result] = stub_->GetCacheLocation("trace5",
+                                                          "instance1",
+                                                          QueryType::QT_BATCH_GET,
+                                                          {1, 2, 3, 4},
+                                                          {},
+                                                          static_cast<size_t>(0),
+                                                          {},
+                                                          MatchLocationOptions::WithChecksums());
+        ASSERT_EQ(ER_OK, query_ec);
+        const auto *tp0 = result.FindChecksums("tp0");
+        ASSERT_NE(nullptr, tp0);
+        EXPECT_EQ(corrected, tp0->checksums);
+        EXPECT_EQ((std::vector<bool>{true, true, true, true}), tp0->checksum_present);
+    }
+}
+
 TEST_F(GrpcStubTest, TestFinishWriteCacheFail) {
     auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
     ASSERT_EQ(expected,
@@ -503,8 +770,14 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheFail) {
     }
     {
         BlockMask success_block = static_cast<size_t>(6);
-        ASSERT_EQ(ER_SERVICE_INTERNAL_ERROR,
+        ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT,
                   stub_->FinishWriteCache("trace5", "instance1", write_session_id, success_block, {}));
+    }
+    {
+        // Invalid masks no longer consume the session, so a corrected retry can
+        // still complete the original write.
+        BlockMask success_block = static_cast<size_t>(4);
+        ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace6", "instance1", write_session_id, success_block, {}));
     }
 }
 
@@ -540,7 +813,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({}), locations);
@@ -551,14 +824,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         target_locations.resize(target_locations.size() - 2); // Only the successful blocks
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, locations);
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(locations.size(), 1);
@@ -566,15 +839,15 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(6), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({}), locations);
     }
     {
         BlockMask block_mask = BlockMaskVector({true, false, false, false});
-        auto [success, locations] = stub_->GetCacheLocation(
-            "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, block_mask, 0, {});
+        auto [success, locations] =
+            GetCacheLocation("trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, block_mask, 0, {});
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(Locations({target_locations[1]}), locations);
         ASSERT_FALSE(HasFailure());
@@ -595,7 +868,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationBatchGet) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_BATCH_GET, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({{{"tp0", ""}, {"tp1", ""}},
@@ -609,7 +882,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationBatchGet) {
         ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace4", "instance1", write_session_id, success_block, {}));
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_BATCH_GET, {0, 1, 22, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         Locations expected_batch = {{{"tp0", ""}, {"tp1", ""}},
@@ -637,14 +910,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace3",
-                                                            "instance1",
-                                                            QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                            {1, 2, 3, 4, 5, 6},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            3,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace3",
+                                                     "instance1",
+                                                     QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                     {1, 2, 3, 4, 5, 6},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     3,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({{{"tp0", ""}, {"tp1", ""}},
                              {{"tp0", ""}, {"tp1", ""}},
@@ -663,14 +936,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         target_locations[5] = {};
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
-                                                            "instance1",
-                                                            QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                            {1, 2, 3, 4, 5, 6},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            3,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace5",
+                                                     "instance1",
+                                                     QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                     {1, 2, 3, 4, 5, 6},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     3,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         Locations expected_locations_rrsw = {{{"tp0", ""}, {"tp1", ""}},
                                              {{"tp0", ""}, {"tp1", ""}},
@@ -682,14 +955,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
-                                                            "instance1",
-                                                            QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                            {1, 2, 3, 4, 6, 7, 8},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            3,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace5",
+                                                     "instance1",
+                                                     QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                     {1, 2, 3, 4, 6, 7, 8},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     3,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         Locations expected_locations_rrsw2 = {{{"tp0", ""}, {"tp1", ""}},
                                               target_locations[1],
@@ -702,14 +975,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
-                                                            "instance1",
-                                                            QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                            {1, 2, 3, 10, 5, 7, 8},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            3,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace5",
+                                                     "instance1",
+                                                     QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                     {1, 2, 3, 10, 5, 7, 8},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     3,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         Locations expected_locations_rrsw3 = {target_locations[0],
                                               target_locations[1],
@@ -741,7 +1014,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationLen) {
     {
         // After finish, should return 2 (number of successful blocks)
         auto [success, len] =
-            stub_->GetCacheLocationLen("trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, 0);
+            GetCacheLocationLen("trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, 0);
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(2, len);
     }
@@ -785,16 +1058,14 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, meta] =
-            stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
+        auto [success, meta] = GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, meta.locations);
         ASSERT_FALSE(HasFailure());
         ASSERT_PRED2(meta_pred, std::vector<std::string>(4, "CLS_WRITING"), meta.metas);
     }
     {
-        auto [success, meta] =
-            stub_->GetCacheMeta("trace4", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
+        auto [success, meta] = GetCacheMeta("trace4", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
         ASSERT_EQ(ER_OK, success);
         Locations extended_target_locations = target_locations;
         extended_target_locations.push_back({});
@@ -819,7 +1090,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
         bool result = WaitUntil(
             [this, &expected_locations_after_finished, &meta_pred]() {
                 auto [success, meta] =
-                    stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
+                    GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
                 if (success != ER_OK) {
                     return false;
                 }
@@ -842,7 +1113,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
         bool result = WaitUntil(
             [this, &expected_locations_after_finished, &meta_pred]() {
                 auto [success, meta] =
-                    stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
+                    GetCacheMeta("trace3", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
                 if (success != ER_OK) {
                     return false;
                 }
@@ -882,14 +1153,14 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace3__kvcm_need_span_tracer",
-                                                            "instance1",
-                                                            QueryType::QT_PREFIX_MATCH,
-                                                            {1, 2, 3, 4},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            0,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace3__kvcm_need_span_tracer",
+                                                     "instance1",
+                                                     QueryType::QT_PREFIX_MATCH,
+                                                     {1, 2, 3, 4},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     0,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({}), locations);
     }
@@ -901,14 +1172,14 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
         target_locations.resize(target_locations.size() - 2);
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5__kvcm_need_span_tracer",
-                                                            "instance1",
-                                                            QueryType::QT_PREFIX_MATCH,
-                                                            {1, 2, 3, 4},
-                                                            {},
-                                                            static_cast<size_t>(0),
-                                                            0,
-                                                            {});
+        auto [success, locations] = GetCacheLocation("trace5__kvcm_need_span_tracer",
+                                                     "instance1",
+                                                     QueryType::QT_PREFIX_MATCH,
+                                                     {1, 2, 3, 4},
+                                                     {},
+                                                     static_cast<size_t>(0),
+                                                     0,
+                                                     {});
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, locations);
         ASSERT_FALSE(HasFailure());

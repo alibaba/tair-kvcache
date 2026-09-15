@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/util/report_event_json_parser.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -186,6 +187,20 @@ bool SetString(const JsonValue &value, Setter &&setter) {
     return true;
 }
 
+bool ParseInt64(const JsonValue &value, int64_t &out) {
+    if (value.IsInt64()) {
+        out = value.GetInt64();
+        return true;
+    }
+    if (!value.IsString()) {
+        return false;
+    }
+    const char *begin = value.GetString();
+    const char *end = begin + value.GetStringLength();
+    const auto [ptr, ec] = std::from_chars(begin, end, out);
+    return ec == std::errc{} && ptr == end;
+}
+
 bool ParseStorageType(const JsonValue &value, proto::meta::StorageType &out) {
     if (value.IsInt()) {
         switch (value.GetInt()) {
@@ -278,6 +293,8 @@ bool ParseLocationSpec(const JsonValue &value, proto::meta::LocationSpec *out) {
     }
     bool seen_name = false;
     bool seen_uri = false;
+    bool seen_checksum = false;
+    bool seen_checksum_present = false;
     for (const auto &member : value.GetObject()) {
         if (NameIs(member.name, "name")) {
             if (seen_name ||
@@ -291,6 +308,19 @@ bool ParseLocationSpec(const JsonValue &value, proto::meta::LocationSpec *out) {
                 return false;
             }
             seen_uri = true;
+        } else if (NameIs(member.name, "checksum")) {
+            int64_t checksum = 0;
+            if (seen_checksum || !ParseInt64(member.value, checksum)) {
+                return false;
+            }
+            out->set_checksum(checksum);
+            seen_checksum = true;
+        } else if (NameIs(member.name, "checksum_present", "checksumPresent")) {
+            if (seen_checksum_present || !member.value.IsBool()) {
+                return false;
+            }
+            out->set_checksum_present(member.value.GetBool());
+            seen_checksum_present = true;
         }
     }
     return true;
