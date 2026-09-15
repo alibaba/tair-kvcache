@@ -1,0 +1,53 @@
+# === Qoder / local agent state ===
+.qoder/
+
+# === 本地环境信息 ===
+env.txt
+
+# === Python & uv ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# uv 虚拟环境与锁文件缓存
+.venv/
+.python-version
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy / ruff / linting 缓存
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# === PyCharm / JetBrains IDE ===
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === 环境变量与密钥（切勿提交）===
+.env
+.env.*
+!.env.example
+
+*.log

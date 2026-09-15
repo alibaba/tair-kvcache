@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.meta;
+
+// Authoritative source for the hand-maintained protobuf 3.20-compatible
+// kvcm_meta_service_pb2.py subset used by the subscriber.
+
+enum ErrorCode {
+  UNSPECIFIED = 0;
+  OK = 1;
+  UNSUPPORTED = 2;
+  INTERNAL_ERROR = 3;
+  SERVICE_NOT_READY = 4;
+  INVALID_ARGUMENT = 5;
+  DUPLICATE_ENTITY = 6;
+  REACH_MAX_ENTITY_CAPACITY = 7;
+  INSTANCE_NOT_EXIST = 8;
+  SERVER_NOT_LEADER = 9;
+  NODE_NOT_REGISTERED = 10;
+  SNAPSHOT_IN_PROGRESS = 11;
+  SNAPSHOT_RATE_LIMITED = 13;
+  SNAPSHOT_REQUIRED = 14;
+  IO_ERROR = 20;
+  UNKNOWN_ERROR = 100;
+  ERROR_MAX = 65535;
+}
+
+enum StorageType {
+  ST_UNSPECIFIED = 0;
+  ST_3FS = 1;
+  ST_MOONCAKE = 2;
+  ST_TAIRMEMPOOL = 3;
+  ST_NFS = 4;
+  ST_VCNS_3FS = 5;
+  ST_DUMMY = 6;
+  ST_EVENT_REPORT_L1P5 = 7;
+  ST_EVENT_REPORT_L2 = 8;
+}
+
+enum ReportEventType {
+  EVENT_UNSPECIFIED = 0;
+  EVENT_NODE_REGISTER = 1;
+  EVENT_BLOCK_ADD = 2;
+  EVENT_BLOCK_DELETE = 3;
+  EVENT_HOST_DOWN = 4;
+  EVENT_HEARTBEAT = 5;
+  EVENT_BLOCK_SNAPSHOT = 6;
+}
+
+enum QueryType {
+  QT_UNSPECIFIED = 0;
+  QT_BATCH_GET = 1;
+  QT_PREFIX_MATCH = 2;
+  QT_REVERSE_ROLL_SW_MATCH = 3;
+  QT_PREFIX_MATCH_WITH_MAMBA = 4;
+}
+
+message Status {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+message CommonResponseHeader {
+  Status status = 1;
+  string request_id = 2;
+  string tracer_result = 3;
+}
+
+message NodeRegisterEventParams {
+  repeated string mediums = 1;
+}
+
+message LocationSpec {
+  string name = 1;
+  string uri = 2;
+}
+
+message BlockAddEventParams {
+  string block_key = 1;
+  string uri = 2;
+  string medium = 3;
+  repeated LocationSpec specs = 4;
+}
+
+message BlockDeleteEventParams {
+  string block_key = 1;
+  string medium = 2;
+  repeated string spec_names = 3;
+}
+
+message BlockSnapshotItem {
+  string block_key = 1;
+  string medium = 2;
+  repeated LocationSpec specs = 3;
+}
+
+message BlockSnapshotEventParams {
+  string medium = 1;
+  repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {}
+
+message HeartbeatEventParams {
+  map<string, string> system_status = 1;
+}
+
+message EventItem {
+  ReportEventType event_type = 1;
+  oneof event_params {
+    NodeRegisterEventParams node_register = 2;
+    BlockAddEventParams block_add = 3;
+    BlockDeleteEventParams block_delete = 4;
+    HostDownEventParams host_down = 5;
+    HeartbeatEventParams heartbeat = 6;
+    BlockSnapshotEventParams block_snapshot = 7;
+  }
+}
+
+message ReportEventRequest {
+  string trace_id = 1;
+  string instance_id = 2;
+  string host_ip_port = 3;
+  repeated EventItem events = 4;
+  StorageType storage_type = 5;
+}
+
+message ReportEventResponse {
+  CommonResponseHeader header = 1;
+  repeated ErrorCode item_results = 2;
+  string committed_snapshot_version = 3;
+  uint64 retry_after_ms = 4;
+  bool snapshot_required = 5;
+  string extra_info = 6;
+}
+
+message LocationSpecInfo {
+  string name = 1;
+  int64 size = 2;
+}
+
+message ModelDeployment {
+  string model_name = 1;
+  string dtype = 2;
+  bool use_mla = 3;
+  int32 tp_size = 4;
+  int32 dp_size = 5;
+  string lora_name = 6;
+  int32 pp_size = 7;
+  string extra = 8;
+  string user_data = 9;
+  bool use_eagle_pop = 10;
+}
+
+message LocationSpecGroup {
+  string name = 1;
+  repeated string spec_names = 2;
+}
+
+message RegisterInstanceRequest {
+  string trace_id = 1;
+  string instance_group = 2;
+  string instance_id = 3;
+  int32 block_size = 4;
+  repeated LocationSpecInfo location_spec_infos = 5;
+  ModelDeployment model_deployment = 6;
+  repeated LocationSpecGroup location_spec_groups = 7;
+  QueryType default_query_type = 8;
+}
+
+message RegisterInstanceResponse {
+  CommonResponseHeader header = 1;
+  string storage_configs = 2;
+  string extra_info = 3;
+}
+
+message MetaNodeEndpoint {
+  string node_id = 1;
+  string host = 2;
+  int32 meta_rpc_port = 3;
+  int32 meta_http_port = 4;
+  string custom_info = 5;
+}
+
+message GetClusterInfoRequest {
+  string trace_id = 1;
+  string instance_id = 2;
+}
+
+message GetClusterInfoResponse {
+  CommonResponseHeader header = 1;
+  string self_node_id = 2;
+  string leader_node_id = 3;
+  MetaNodeEndpoint leader_endpoint = 4;
+}
+
+service MetaService {
+  rpc RegisterInstance(RegisterInstanceRequest)
+      returns (RegisterInstanceResponse);
+  rpc GetClusterInfo(GetClusterInfoRequest)
+      returns (GetClusterInfoResponse);
+  rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+}
