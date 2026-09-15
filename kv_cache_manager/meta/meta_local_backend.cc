@@ -111,10 +111,12 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     }
 
     shard_mask_ = (1 << num_shard_bits) - 1;
+    // Reclaim sampling and oldest-age metrics require the physical LRU list to preserve strict access order.
     cache_ = NewLRUCache(capacity * 1024 * 1024ULL,
                          num_shard_bits,
                          /*strict_capacity_limit=*/true,
-                         /*no_evict_on_insert=*/true);
+                         /*no_evict_on_insert=*/true,
+                         /*high_pri_pool_ratio=*/0.0);
     if (!cache_) {
         KVCM_LOG_ERROR("fail to create LRUCache");
         return EC_ERROR;
