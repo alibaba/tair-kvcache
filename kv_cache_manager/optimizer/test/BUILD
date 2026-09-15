@@ -302,6 +302,17 @@ cc_test(
 )
 
 cc_test(
+    name = "FanoutExecutorTest",
+    srcs = [
+        "fanout_executor_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:fanout_executor",
+    ],
+)
+
+cc_test(
     name = "KvcmEventSubscriberTest",
     srcs = [
         "kvcm_event_subscriber_test.cc",

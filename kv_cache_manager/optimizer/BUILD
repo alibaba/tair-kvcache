@@ -144,6 +144,19 @@ cc_library(
 )
 
 cc_library(
+    name = "fanout_executor",
+    srcs = [
+        "service/event_subscriber/fanout_executor.cc",
+    ],
+    hdrs = [
+        "service/event_subscriber/fanout_executor.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
     name = "kvcm_event_subscriber",
     srcs = [
         "service/event_subscriber/kvcm_event_subscriber.cc",
@@ -152,6 +165,7 @@ cc_library(
         "service/event_subscriber/kvcm_event_subscriber.h",
     ],
     deps = [
+        ":fanout_executor",
         ":online_optimizer_server_config",
         ":optimizer_call_guard",
         "//kv_cache_manager/optimizer/metrics:optimizer_metrics_collector",

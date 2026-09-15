@@ -20,6 +20,7 @@ class ClientContext;
 namespace kv_cache_manager {
 
 class MetricsRegistry;
+class FanoutExecutor;
 class OptimizerMetricsReporter;
 class OptimizerServiceImpl;
 class ServiceDiscovery;
@@ -87,6 +88,7 @@ private:
     bool configuration_refresh_requested_ = false;
     std::mutex unsupported_instances_mutex_;
     std::unordered_set<std::string> unsupported_instance_ids_;
+    std::unique_ptr<FanoutExecutor> fanout_executor_;
 };
 
 } // namespace kv_cache_manager

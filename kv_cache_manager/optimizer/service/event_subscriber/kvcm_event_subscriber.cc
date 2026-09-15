@@ -14,6 +14,7 @@
 #include "kv_cache_manager/common/service_discovery_factory.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/fanout_executor.h"
 #include "kv_cache_manager/optimizer/service/optimizer_call_guard.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
@@ -333,8 +334,30 @@ void KvcmEventSubscriber::ProcessEvent(const proto::optimizer::TraceQueryRequest
         return;
     }
 
+    if (target_instance_ids.size() == 1) {
+        ProcessEventForInstance(event, target_instance_ids.front(), event.instance_id(), kvcm_ip);
+        return;
+    }
+
+    if (!fanout_executor_ || fanout_executor_->parallelism() != target_instance_ids.size()) {
+        fanout_executor_ = std::make_unique<FanoutExecutor>(target_instance_ids.size());
+        KVCM_LOG_INFO("KvcmEventSubscriber: initialized parallel fanout executor, targets=%zu consumer_id=%s",
+                      target_instance_ids.size(),
+                      config_.consumer_id().c_str());
+    }
+
+    std::vector<FanoutExecutor::Task> tasks;
+    tasks.reserve(target_instance_ids.size());
     for (const std::string &target_instance_id : target_instance_ids) {
-        ProcessEventForInstance(event, target_instance_id, event.instance_id(), kvcm_ip);
+        tasks.emplace_back([this, &event, &kvcm_ip, target_instance_id] {
+            ProcessEventForInstance(event, target_instance_id, event.instance_id(), kvcm_ip);
+        });
+    }
+    if (!fanout_executor_->Run(std::move(tasks))) {
+        KVCM_LOG_ERROR("KvcmEventSubscriber: parallel fanout failed, trace_id=%s source_instance_id=%s targets=%zu",
+                       event.trace_id().c_str(),
+                       event.instance_id().c_str(),
+                       target_instance_ids.size());
     }
 }
 

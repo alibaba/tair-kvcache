@@ -16,6 +16,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_registry_manager.h"
 #include "kv_cache_manager/optimizer/manager/online_runtime/online_optimizer_manager.h"
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/service/event_subscriber/fanout_executor.h"
 #include "kv_cache_manager/optimizer/service/event_subscriber/kvcm_event_subscriber.h"
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 #include "kv_cache_manager/optimizer/service/optimizer_service_impl.h"
@@ -364,6 +365,17 @@ TEST_F(KvcmEventSubscriberTest, FansOutEachEventToDerivedLinearStepInstances) {
             return TotalQueries(instance_id) == 2;
         });
     }));
+    ASSERT_NE(nullptr, subscriber.fanout_executor_);
+    EXPECT_EQ(instance_ids.size(), subscriber.fanout_executor_->parallelism());
+    ASSERT_TRUE(WaitUntil([this, &instance_ids] {
+        return std::all_of(instance_ids.begin(), instance_ids.end(), [this](const std::string &instance_id) {
+            const MetricsTags capacity_tags = {{"instance_group", "g1"},
+                                               {"instance_id", instance_id},
+                                               {"client_ip", "127.0.0.1"},
+                                               {"capacity_gb", std::to_string(2.0)}};
+            return metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get() == 1.0;
+        });
+    }));
 
     metrics_reporter_->ReportInterval();
     for (std::size_t i = 0; i < instance_ids.size(); ++i) {
@@ -371,6 +383,11 @@ TEST_F(KvcmEventSubscriberTest, FansOutEachEventToDerivedLinearStepInstances) {
         EXPECT_DOUBLE_EQ(i == 0 ? 0.0 : (i == 1 ? 10.0 : 20.0),
                          metrics_registry_->GetGauge("trace_query_linear_step", tags).Get());
         EXPECT_EQ(2u, metrics_registry_->GetCounter("service.query_counter", tags).Get());
+        const MetricsTags capacity_tags = {{"instance_group", "g1"},
+                                           {"instance_id", instance_ids[i]},
+                                           {"client_ip", "127.0.0.1"},
+                                           {"capacity_gb", std::to_string(2.0)}};
+        EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("query_hit_count", capacity_tags).Get());
     }
 
     subscriber.Stop();
