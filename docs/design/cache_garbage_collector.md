@@ -470,7 +470,9 @@ V1 只保留能回答“是否在扫描、发现了什么、删除是否卡住�
 | `cache_gc.inflight_delete_age_ms` | Gauge | 最老在途 Future 的年龄，无任务时为 0 |
 | `cache_gc.round_duration_ms` | Gauge | 最近一个 active round 耗时 |
 
-round 和结果日志包含 `round_id`、`instance_id`、target 数、result；扫描错误日志额外包含 cursor 和 error stage。正常逐 key 扫描不打 INFO，block/location 明细只在诊断级日志中输出，避免 GC 自身制造日志压力。
+每个 Instance 扫描完成后输出一次 INFO，包含扫描 key 数、batch 数、按原因成功提交的 Location 数和 inflight 限流 tick 数。`submitted_locations` 表示提交数量，不代表异步删除已完成；总数与 reason 明细由同一次遍历生成。正常 action 完成不逐条打印日志。
+
+GC 将 `MightExist` 已确认缺失的 URI 传给 Executor，跳过这些 URI 的物理删除并继续清理 metadata；`Delete` 返回 `EC_NOENT` 也视为幂等成功。真实存储删除失败由 Executor 按 URI 记录 WARN，包含 instance、storage、URI 和错误码。`PlanExecuteResult.error_logged` 仅在结果中的所有失败已有诊断时置为 true，GC 始终记录结果指标，但只对尚未记录的错误输出 action WARN；准入失败、worker 异常和 EventReport metadata 清理异常因此仍可见。扫描错误日志另带 cursor 和 error stage。
 
 上述固定指标和带 `reason/status/stage` 标签的指标族同时进入本地 registry、Prometheus 和 KMonitor；KMonitor 周期上报直接遍历 registry 中已 touched 的 series，避免另维护一份易遗漏的标签枚举。
 

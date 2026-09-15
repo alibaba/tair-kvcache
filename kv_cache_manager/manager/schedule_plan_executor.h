@@ -44,6 +44,9 @@ struct CacheMetaDelRequest {
 struct PlanExecuteResult {
     ErrorCode status;
     std::string error_message;
+    // True only when every failure in this result has already been logged.
+    // Callers can retain result metrics without repeating the diagnostics.
+    bool error_logged{false};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -65,6 +68,10 @@ struct CacheLocationDelRequest {
     // GC physical deletion revalidates against the persistent source of truth
     // and refreshes candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
+    // URIs that the submitter has already confirmed absent. Physical deletion
+    // skips these idempotently while still deleting any remaining specs in the
+    // same Location.
+    std::set<std::string> confirmed_missing_uris;
 };
 
 struct EventReportMetadataDeleteTarget {
