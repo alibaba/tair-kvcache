@@ -22,9 +22,10 @@ void SignalHandler(int sig) {
 void PrintUsage(const char *prog_name) {
     fprintf(stderr,
             "Usage: %s [options]\n"
-            "    -c, --config       config file path (JSON)\n"
-            "    -e, --env          set config override, e.g., -e kvcm_optimizer.rpc_port=50053\n"
-            "    -h, --help         display this help and exit\n"
+            "    -c, --config           config file path (JSON)\n"
+            "    -l, --log_config_file  config file path for logger\n"
+            "    -e, --env              set config override, e.g., -e kvcm_optimizer.rpc_port=50053\n"
+            "    -h, --help             display this help and exit\n"
             "\n",
             prog_name);
 }
@@ -32,11 +33,15 @@ void PrintUsage(const char *prog_name) {
 
 int main(int argc, char **argv) {
     std::string config_file;
+    std::string log_config_file;
     std::unordered_map<std::string, std::string> environ;
 
-    const char *opt_string = "hc:e:";
-    struct option long_opts[] = {
-        {"help", 0, nullptr, 'h'}, {"config", 1, nullptr, 'c'}, {"env", 1, nullptr, 'e'}, {0, 0, 0, 0}};
+    const char *opt_string = "hc:l:e:";
+    struct option long_opts[] = {{"help", 0, nullptr, 'h'},
+                                 {"config", 1, nullptr, 'c'},
+                                 {"log_config_file", 1, nullptr, 'l'},
+                                 {"env", 1, nullptr, 'e'},
+                                 {0, 0, 0, 0}};
     int opt;
     while ((opt = getopt_long(argc, argv, opt_string, long_opts, nullptr)) != -1) {
         switch (opt) {
@@ -45,6 +50,9 @@ int main(int argc, char **argv) {
             return 0;
         case 'c':
             config_file = optarg;
+            break;
+        case 'l':
+            log_config_file = optarg;
             break;
         case 'e': {
             std::string kv(optarg);
@@ -62,7 +70,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    kv_cache_manager::LoggerBroker::InitLogger("");
+    kv_cache_manager::LoggerBroker::InitLogger(log_config_file);
 
     if (config_file.empty()) {
         KVCM_LOG_ERROR("--config / -c is required");

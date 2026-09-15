@@ -140,8 +140,7 @@ bool SupportsDescriptor(const Descriptor *descriptor, std::unordered_set<const D
 
     for (int i = 0; i < descriptor->field_count(); ++i) {
         const FieldDescriptor *field = descriptor->field(i);
-        if (field->type() == FieldDescriptor::TYPE_BYTES || field->type() == FieldDescriptor::TYPE_GROUP ||
-            field->is_extension()) {
+        if (field->type() == FieldDescriptor::TYPE_GROUP || field->is_extension()) {
             return false;
         }
         if (field->cpp_type() == FieldDescriptor::CPPTYPE_ENUM &&
@@ -274,6 +273,12 @@ bool WriteFieldValue(
         const std::string &value =
             repeated ? reflection->GetRepeatedStringReference(message, field, repeated_index, &scratch)
                      : reflection->GetStringReference(message, field, &scratch);
+        if (field->type() == FieldDescriptor::TYPE_BYTES) {
+            std::string encoded;
+            ::google::protobuf::Base64Escape(value, &encoded);
+            writer.String(encoded.data(), static_cast<rapidjson::SizeType>(encoded.size()));
+            return true;
+        }
         if (!::google::protobuf::internal::IsStructurallyValidUTF8(value)) {
             return false;
         }
@@ -525,10 +530,20 @@ bool ParseScalarValue(const rapidjson::Value &value, Message *message, const Fie
         if (!value.IsString()) {
             return false;
         }
-        if (repeated) {
-            reflection->AddString(message, field, std::string(value.GetString(), value.GetStringLength()));
-        } else {
-            reflection->SetString(message, field, std::string(value.GetString(), value.GetStringLength()));
+        {
+            std::string result(value.GetString(), value.GetStringLength());
+            if (field->type() == FieldDescriptor::TYPE_BYTES) {
+                std::string decoded;
+                if (!::google::protobuf::Base64Unescape(result, &decoded)) {
+                    return false;
+                }
+                result.swap(decoded);
+            }
+            if (repeated) {
+                reflection->AddString(message, field, result);
+            } else {
+                reflection->SetString(message, field, result);
+            }
         }
         return true;
     case FieldDescriptor::CPPTYPE_MESSAGE:
