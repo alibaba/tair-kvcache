@@ -32,7 +32,7 @@ jobs:
 
       - name: Build server package
         env:
-          BUILD_IMAGE: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+          BUILD_IMAGE: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_09_15_04_41_9b2e152
         run: |
           docker run --rm --privileged \
             -v "${GITHUB_WORKSPACE}:/workspace" \
