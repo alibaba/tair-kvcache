@@ -641,6 +641,21 @@ public:
         return {ec, std::move(response)};
     }
 
+    void ReportEventSnapshotForKeys(const std::shared_ptr<EventReportBackend> &backend,
+                                    const std::string &host,
+                                    const std::vector<int64_t> &keys,
+                                    const std::string &trace_id) {
+        ASSERT_EQ(EC_OK, backend->RegisterNode("test_instance", host, {"mem"}));
+        std::vector<std::pair<int64_t, std::string>> key_sources;
+        key_sources.reserve(keys.size());
+        for (int64_t key : keys) {
+            key_sources.emplace_back(key, trace_id);
+        }
+        const auto [ec, response] = CallReportEvent(MakeSnapshotRequest(host, key_sources), trace_id);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(proto::meta::OK, response.header().status().code());
+    }
+
     std::vector<std::string> QueryEventReportUris(const std::vector<int64_t> &keys) {
         RequestContext context("query_report_event_ordering");
         auto [ec, locations] = cache_manager_->GetCacheLocation(
@@ -7766,6 +7781,32 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         EXPECT_TRUE(locs.empty());
     }
 
+    // Non-positive max_peer_count values use the backward-compatible default
+    // of one peer, including for selectors that do not support multiple peers.
+    for (int32_t max_peer_count : {0, -1}) {
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_NFS,
+             LocationSelectStrategy::LSS_WEIGHTED_RANDOM,
+             max_peer_count},
+        };
+        BlockMask bm = static_cast<size_t>(0);
+        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                     instance_id,
+                                                                     CacheManager::QueryType::QT_BATCH_GET,
+                                                                     all_keys,
+                                                                     {},
+                                                                     bm,
+                                                                     0,
+                                                                     {},
+                                                                     selectors);
+        ASSERT_EQ(EC_OK, ec) << "max_peer_count=" << max_peer_count;
+        ASSERT_EQ(all_keys.size(), locs.size());
+        for (size_t i = 0; i < locs.size(); ++i) {
+            EXPECT_EQ(i % 2 == 0 ? 1u : 0u, locs[i].cache_locations_view().size())
+                << "max_peer_count=" << max_peer_count << ", key_index=" << i;
+        }
+    }
+
     // Invalid masks must fail closed. An omitted protobuf mask is represented
     // as an empty bool vector and remains backward-compatible with no mask.
     const std::vector<BackendSelector> nfs_selectors = {
@@ -8239,6 +8280,94 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
     }
 
     dsm->storage_map_.erase("event_report_default");
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendSelectsMultiplePeersForPrefix) {
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    const std::string peer_a = "10.0.1.1:8080";
+    const std::string peer_b = "10.0.1.2:8080";
+    const std::string peer_c = "10.0.1.3:8080";
+    const std::vector<int64_t> keys = {88'000, 88'001, 88'002, 88'003, 88'004};
+    // Peer A opens the prefix and retains non-contiguous later hits. Peer B
+    // beats peer C in round two and closes every remaining gap.
+    ReportEventSnapshotForKeys(event_backend, peer_a, {keys[0], keys[2], keys[4]}, "multi_prefix_peer_a");
+    ReportEventSnapshotForKeys(
+        event_backend, peer_b, {keys[1], keys[2], keys[3], keys[4]}, "multi_prefix_peer_b");
+    ReportEventSnapshotForKeys(event_backend, peer_c, {keys[1], keys[2]}, "multi_prefix_peer_c");
+
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX, 2},
+    };
+    BlockMask block_mask = static_cast<size_t>(0);
+    auto [ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                       "test_instance",
+                                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                                       keys,
+                                                                       {},
+                                                                       block_mask,
+                                                                       0,
+                                                                       {},
+                                                                       selectors);
+
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(keys.size(), locations.size());
+    const std::vector<std::string> expected_peers = {peer_a, peer_b, peer_a, peer_b, peer_a};
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        const auto &key_locations = locations[key_index].cache_locations_view();
+        ASSERT_EQ(1u, key_locations.size()) << "key_index=" << key_index;
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, key_locations[0].type());
+        ASSERT_EQ(1u, key_locations[0].location_specs().size());
+        EXPECT_NE(std::string::npos, key_locations[0].location_specs()[0].uri().find(expected_peers[key_index]));
+    }
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendSelectsPeersByIncrementalCoverage) {
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+
+    const std::string peer_a = "10.0.2.1:8080";
+    const std::string peer_b = "10.0.2.2:8080";
+    const std::string peer_c = "10.0.2.3:8080";
+    const std::vector<int64_t> keys = {89'000, 89'001, 89'002, 89'003, 89'004, 89'005, 89'006};
+    // Peer A wins the first-round tie with peer B by address. After that,
+    // peer C adds two new hits while peer B adds only one.
+    ReportEventSnapshotForKeys(
+        event_backend, peer_a, {keys[0], keys[1], keys[2], keys[4]}, "multi_coverage_peer_a");
+    ReportEventSnapshotForKeys(
+        event_backend, peer_b, {keys[0], keys[1], keys[2], keys[5]}, "multi_coverage_peer_b");
+    ReportEventSnapshotForKeys(
+        event_backend, peer_c, {keys[2], keys[5], keys[6]}, "multi_coverage_peer_c");
+
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE, 2},
+    };
+    BlockMask block_mask = static_cast<size_t>(0);
+    auto [ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                       "test_instance",
+                                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                                       keys,
+                                                                       {},
+                                                                       block_mask,
+                                                                       0,
+                                                                       {},
+                                                                       selectors);
+
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(keys.size(), locations.size());
+    const std::vector<std::string> expected_peers = {peer_a, peer_a, peer_a, "", peer_a, peer_c, peer_c};
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        const auto &key_locations = locations[key_index].cache_locations_view();
+        if (expected_peers[key_index].empty()) {
+            EXPECT_TRUE(key_locations.empty()) << "key_index=" << key_index;
+            continue;
+        }
+        ASSERT_EQ(1u, key_locations.size()) << "key_index=" << key_index;
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, key_locations[0].type());
+        ASSERT_EQ(1u, key_locations[0].location_specs().size());
+        EXPECT_NE(std::string::npos, key_locations[0].location_specs()[0].uri().find(expected_peers[key_index]));
+    }
 }
 
 // =============================================================

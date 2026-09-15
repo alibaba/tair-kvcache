@@ -38,6 +38,7 @@ enum class LocationSelectStrategy : int32_t {
 struct BackendSelector {
     DataStorageType backend_type;
     LocationSelectStrategy strategy;
+    int32_t max_peer_count = 1;
 };
 
 class MetaSearcher {
