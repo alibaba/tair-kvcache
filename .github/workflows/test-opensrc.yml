@@ -40,7 +40,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || vars.TEST_OPEN_SRC_RUNS_ON || 'ubuntu-latest' }}
     container:
-      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_09_15_04_41_9b2e152
       volumes:
         - /:/host_root/
       options: --privileged
@@ -95,7 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -x
-          # Install gh and jq (not pre-installed in the container image)
+          # Install gh and pin jq for cache maintenance
           ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
           curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-${ARCH}" && chmod +x /usr/local/bin/jq
           GH_VER=2.89.0
@@ -191,7 +191,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: aliyun-ecs-x64
     container:
-      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_09_15_04_41_9b2e152
       options: --privileged
     steps:
       - *checkout_step
