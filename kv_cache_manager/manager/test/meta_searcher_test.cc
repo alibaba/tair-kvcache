@@ -4500,6 +4500,81 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
     EXPECT_TRUE(out[4].empty());
 }
 
+TEST_F(BatchGetBestLocationByBackendTest, EventReportExplicitSinglePeerMatchesDefault) {
+    const MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    for (const auto strategy : {LocationSelectStrategy::LSS_V6D_PREFIX,
+                                LocationSelectStrategy::LSS_V6D_COVERAGE}) {
+        LocationsPerKey default_out;
+        const std::vector<BackendSelector> default_selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy},
+        };
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchGetBestLocationByBackend(
+                      request_context_.get(), keys, default_out, &policy_, default_selectors));
+
+        LocationsPerKey explicit_out;
+        const std::vector<BackendSelector> explicit_selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy, 1},
+        };
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  meta_searcher_->BatchGetBestLocationByBackend(
+                      request_context_.get(), keys, explicit_out, &policy_, explicit_selectors));
+
+        ASSERT_EQ(default_out.size(), explicit_out.size());
+        for (size_t key_index = 0; key_index < default_out.size(); ++key_index) {
+            ASSERT_EQ(default_out[key_index].size(), explicit_out[key_index].size());
+            if (!default_out[key_index].empty()) {
+                EXPECT_EQ(default_out[key_index][0]->id(), explicit_out[key_index][0]->id());
+            }
+        }
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixCombinesConfiguredPeers) {
+    AddServingLocations(
+        {84000, 84002}, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report://peer_a:8080/tp0");
+    AddServingLocations(
+        {84001}, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report://peer_b:8080/tp0");
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX, 2},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {84000, 84001, 84002}, out, &policy_, selectors));
+
+    ASSERT_EQ(3u, out.size());
+    for (size_t key_index = 0; key_index < out.size(); ++key_index) {
+        ASSERT_EQ(1u, out[key_index].size());
+        const std::string expected_peer = key_index == 1 ? "peer_b" : "peer_a";
+        EXPECT_NE(std::string::npos, out[key_index][0]->location_specs()[0].uri().find(expected_peer));
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStopsWhenPeersAreExhaustedWithoutDuplicateLocations) {
+    AddServingLocations(
+        {85000, 85001}, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report://peer_a:8080/tp0");
+    AddServingLocations(
+        {85001, 85002}, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "event_report://peer_b:8080/tp0");
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE, 3},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), {85000, 85001, 85002}, out, &policy_, selectors));
+
+    ASSERT_EQ(3u, out.size());
+    for (const auto &locations : out) {
+        ASSERT_EQ(1u, locations.size());
+    }
+    EXPECT_NE(std::string::npos, out[0][0]->location_specs()[0].uri().find("peer_a"));
+    EXPECT_NE(std::string::npos, out[1][0]->location_specs()[0].uri().find("peer_a"));
+    EXPECT_NE(std::string::npos, out[2][0]->location_specs()[0].uri().find("peer_b"));
+}
+
 TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithTairBaseHits) {
     const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
     const std::vector<BackendSelector> selectors = {
@@ -4586,7 +4661,7 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixDoesNotCountSpecFilte
 TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixPreservesV6DHitsBeforeUnfillableGap) {
     const MetaSearcher::KeyVector keys = {80000, 85000, 80001};
     const std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX, 2},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
     };
 

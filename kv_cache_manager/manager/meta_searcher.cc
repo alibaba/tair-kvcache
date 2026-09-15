@@ -351,18 +351,18 @@ SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
 }
 
 V6DPeerSelection
-SelectV6DByCombinedPrefix(const std::vector<bool> &base_hits,
+SelectV6DByCombinedPrefix(const std::vector<bool> &combined_hits,
                           const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
     size_t first_required_index = 0;
-    while (first_required_index < base_hits.size() && base_hits[first_required_index]) {
+    while (first_required_index < combined_hits.size() && combined_hits[first_required_index]) {
         ++first_required_index;
     }
 
     auto first_required_candidates = remote_peer_candidates.end();
-    if (first_required_index < base_hits.size()) {
+    if (first_required_index < combined_hits.size()) {
         first_required_candidates = remote_peer_candidates.find(first_required_index);
     }
-    if (first_required_index == base_hits.size() || first_required_candidates == remote_peer_candidates.end() ||
+    if (first_required_index == combined_hits.size() || first_required_candidates == remote_peer_candidates.end() ||
         first_required_candidates->second.empty()) {
         // Every peer has the same combined prefix when all keys are base hits
         // or no peer can cover the first base miss. Preserve the existing
@@ -380,7 +380,7 @@ SelectV6DByCombinedPrefix(const std::vector<bool> &base_hits,
     // prefix. A peer absent there always loses to every peer present there.
     std::map<std::string, std::vector<bool>> peer_hits;
     for (const auto &peer_address : first_required_candidates->second) {
-        peer_hits.try_emplace(peer_address, base_hits.size(), false);
+        peer_hits.try_emplace(peer_address, combined_hits.size(), false);
     }
     for (const auto &[key_index, peer_addresses] : remote_peer_candidates) {
         for (const auto &peer_address : peer_addresses) {
@@ -396,8 +396,8 @@ SelectV6DByCombinedPrefix(const std::vector<bool> &base_hits,
     for (const auto &[peer_address, hits] : peer_hits) {
         std::vector<size_t> peer_covered_indices;
         size_t prefix_size = 0;
-        for (size_t key_index = 0; key_index < base_hits.size(); ++key_index) {
-            if (!base_hits[key_index] && !hits[key_index]) {
+        for (size_t key_index = 0; key_index < combined_hits.size(); ++key_index) {
+            if (!combined_hits[key_index] && !hits[key_index]) {
                 break;
             }
             ++prefix_size;
@@ -421,7 +421,7 @@ SelectV6DByCombinedPrefix(const std::vector<bool> &base_hits,
 }
 
 V6DPeerSelection
-SelectV6DByIncrementalCoverage(const std::vector<bool> &base_hits,
+SelectV6DByIncrementalCoverage(const std::vector<bool> &combined_hits,
                                const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
     std::map<std::string, std::vector<size_t>> peer_to_indices;
     for (const auto &[key_index, peer_addresses] : remote_peer_candidates) {
@@ -434,8 +434,8 @@ SelectV6DByIncrementalCoverage(const std::vector<bool> &base_hits,
     size_t best_incremental_hit_count = 0;
     for (auto &[peer_address, peer_covered_indices] : peer_to_indices) {
         const size_t incremental_hit_count =
-            std::count_if(peer_covered_indices.begin(), peer_covered_indices.end(), [&base_hits](size_t key_index) {
-                return !base_hits[key_index];
+            std::count_if(peer_covered_indices.begin(), peer_covered_indices.end(), [&combined_hits](size_t key_index) {
+                return !combined_hits[key_index];
             });
         if (incremental_hit_count > best_incremental_hit_count ||
             (incremental_hit_count == best_incremental_hit_count &&
@@ -449,6 +449,112 @@ SelectV6DByIncrementalCoverage(const std::vector<bool> &base_hits,
         }
     }
     return best;
+}
+
+std::vector<V6DPeerSelection>
+SelectV6DPeers(const std::vector<bool> &base_hits,
+               const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates,
+               LocationSelectStrategy strategy,
+               size_t max_peer_count) {
+    const bool is_prefix = strategy == LocationSelectStrategy::LSS_V6D_PREFIX;
+    auto select_peer = [is_prefix](const std::vector<bool> &combined_hits, const auto &candidates) {
+        return is_prefix ? SelectV6DByCombinedPrefix(combined_hits, candidates)
+                         : SelectV6DByIncrementalCoverage(combined_hits, candidates);
+    };
+    auto get_prefix_size = [](const std::vector<bool> &hits) {
+        size_t prefix_size = 0;
+        while (prefix_size < hits.size() && hits[prefix_size]) {
+            ++prefix_size;
+        }
+        return prefix_size;
+    };
+    if (max_peer_count == 1) {
+        auto selection = select_peer(base_hits, remote_peer_candidates);
+        if (selection.peer_addr.empty()) {
+            return {};
+        }
+        std::vector<V6DPeerSelection> selections;
+        selections.push_back(std::move(selection));
+        return selections;
+    }
+
+    std::vector<bool> combined_hits = base_hits;
+    auto remaining_candidates = remote_peer_candidates;
+    std::vector<std::string> owner_by_key(base_hits.size());
+    std::vector<V6DPeerSelection> selections;
+
+    while (selections.size() < max_peer_count) {
+        const size_t prefix_size = is_prefix ? get_prefix_size(combined_hits) : 0;
+        if (is_prefix) {
+            const auto gap_candidates = remaining_candidates.find(prefix_size);
+            if (!selections.empty() && prefix_size < combined_hits.size() &&
+                (gap_candidates == remaining_candidates.end() || gap_candidates->second.empty())) {
+                break;
+            }
+        }
+
+        auto selection = select_peer(combined_hits, remaining_candidates);
+        if (selection.peer_addr.empty()) {
+            break;
+        }
+
+        std::vector<size_t> peer_indices;
+        size_t incremental_hit_count = 0;
+        for (const auto &[key_index, peer_addresses] : remote_peer_candidates) {
+            if (std::find(peer_addresses.begin(), peer_addresses.end(), selection.peer_addr) == peer_addresses.end()) {
+                continue;
+            }
+            peer_indices.push_back(key_index);
+            if (!combined_hits[key_index]) {
+                ++incremental_hit_count;
+            }
+        }
+        if (!selections.empty() && incremental_hit_count == 0) {
+            break;
+        }
+
+        selection.covered_indices.clear();
+        for (size_t key_index : peer_indices) {
+            combined_hits[key_index] = true;
+            if (owner_by_key[key_index].empty()) {
+                owner_by_key[key_index] = selection.peer_addr;
+                selection.covered_indices.push_back(key_index);
+            }
+        }
+        for (auto &candidate : remaining_candidates) {
+            auto &peer_addresses = candidate.second;
+            peer_addresses.erase(std::remove(peer_addresses.begin(), peer_addresses.end(), selection.peer_addr),
+                                 peer_addresses.end());
+        }
+        selections.push_back(std::move(selection));
+
+        if (is_prefix) {
+            const size_t next_prefix_size = get_prefix_size(combined_hits);
+            if (next_prefix_size == prefix_size || next_prefix_size == combined_hits.size()) {
+                break;
+            }
+        } else if (incremental_hit_count == 0) {
+            break;
+        }
+    }
+
+    if (is_prefix) {
+        const size_t prefix_size = get_prefix_size(combined_hits);
+        for (auto &selection : selections) {
+            selection.covered_indices.erase(
+                std::remove_if(selection.covered_indices.begin(),
+                               selection.covered_indices.end(),
+                               [prefix_size](size_t key_index) { return key_index >= prefix_size; }),
+                selection.covered_indices.end());
+        }
+        selections.erase(std::remove_if(selections.begin(),
+                                        selections.end(),
+                                        [](const V6DPeerSelection &selection) {
+                                            return selection.covered_indices.empty();
+                                        }),
+                         selections.end());
+    }
+    return selections;
 }
 
 CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
@@ -1652,16 +1758,14 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 remote_peer_candidates[i] = std::move(vineyard_addrs);
             }
 
-            // Select best peer
-            V6DPeerSelection selection;
-            if (is_prefix) {
-                selection = SelectV6DByCombinedPrefix(base_hits, remote_peer_candidates);
-            } else {
-                selection = SelectV6DByIncrementalCoverage(base_hits, remote_peer_candidates);
-            }
+            // Select best peers
+            const auto selections = SelectV6DPeers(base_hits,
+                                                   remote_peer_candidates,
+                                                   selector.strategy,
+                                                   static_cast<size_t>(selector.max_peer_count));
 
             // Populate results for covered keys
-            if (!selection.peer_addr.empty()) {
+            for (const auto &selection : selections) {
                 for (size_t idx : selection.covered_indices) {
                     auto peer_it = key_peer_to_location.find(idx);
                     if (peer_it == key_peer_to_location.end()) {
