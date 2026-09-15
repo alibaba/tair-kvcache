@@ -72,6 +72,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_TRANSFERCLIENT_INIT_ERROR", kvcm::ClientErrorCode::ER_TRANSFERCLIENT_INIT_ERROR)
         .value("ER_MANAGERCLIENT_INIT_ERROR", kvcm::ClientErrorCode::ER_MANAGERCLIENT_INIT_ERROR)
         .value("ER_CLIENT_NOT_EXISTS", kvcm::ClientErrorCode::ER_CLIENT_NOT_EXISTS)
+        .value("ER_INIT_CHECK_BUFFER_ERROR", kvcm::ClientErrorCode::ER_INIT_CHECK_BUFFER_ERROR)
         .value("ER_SERVICE_NO_STATUS", kvcm::ClientErrorCode::ER_SERVICE_NO_STATUS)
         .value("ER_SERVICE_INTERNAL_ERROR", kvcm::ClientErrorCode::ER_SERVICE_INTERNAL_ERROR)
         .value("ER_SERVICE_UNSUPPORTED", kvcm::ClientErrorCode::ER_SERVICE_UNSUPPORTED)
@@ -96,6 +97,9 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_CUDA_STREAM_SYNCHRONIZE_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_SYNCHRONIZE_ERROR)
         .value("ER_CUDA_STREAM_DESTROY_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_DESTROY_ERROR)
         .value("ER_CUDA_HOST_REGISTER_ERROR", kvcm::ClientErrorCode::ER_CUDA_HOST_REGISTER_ERROR)
+        .value("ER_CHECKSUM_MISMATCH", kvcm::ClientErrorCode::ER_CHECKSUM_MISMATCH)
+        .value("ER_INLINE_HEADER_INVALID", kvcm::ClientErrorCode::ER_INLINE_HEADER_INVALID)
+        .value("ER_CHECKSUM_UNAVAILABLE", kvcm::ClientErrorCode::ER_CHECKSUM_UNAVAILABLE)
         .finalize();
 
     py::native_enum<kvcm::MemoryType>(module, "MemoryType", "enum.Enum")
@@ -181,17 +185,33 @@ PYBIND11_MODULE(kvcm_py_client, module) {
             },
             py::arg("client_config"),
             py::arg("init_params"))
-        .def("LoadKvCaches",
-             &kvcm::TransferClient::LoadKvCaches,
-             py::arg("uri_str_vec"),
-             py::arg("block_buffers"),
-             py::arg("trace_info") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("SaveKvCaches",
-             &kvcm::TransferClient::SaveKvCaches,
-             py::arg("uri_str_vec"),
-             py::arg("block_buffers"),
-             py::arg("trace_info") = nullptr,
-             py::call_guard<py::gil_scoped_release>());
+        // C++ interface exposes checksum reporting through options. The Python binding
+        // intentionally keeps the legacy 3-argument signature via a lambda (default
+        // nullptr), letting connectors (vLLM / SGLang / TRT-LLM) keep building
+        // unchanged. Extend here once py_connector adopts checksum reporting.
+        .def(
+            "LoadKvCaches",
+            [](kvcm::TransferClient *self,
+               const kvcm::UriStrVec &uri_str_vec,
+               const kvcm::BlockBuffers &block_buffers,
+               std::shared_ptr<kvcm::TransferTraceInfo> trace_info) {
+                return self->LoadKvCaches(uri_str_vec, block_buffers, trace_info);
+            },
+            py::arg("uri_str_vec"),
+            py::arg("block_buffers"),
+            py::arg("trace_info") = nullptr,
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "SaveKvCaches",
+            [](kvcm::TransferClient *self,
+               const kvcm::UriStrVec &uri_str_vec,
+               const kvcm::BlockBuffers &block_buffers,
+               std::shared_ptr<kvcm::TransferTraceInfo> trace_info) {
+                return self->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+            },
+            py::arg("uri_str_vec"),
+            py::arg("block_buffers"),
+            py::arg("trace_info") = nullptr,
+            py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager

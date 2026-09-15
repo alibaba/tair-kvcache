@@ -26,6 +26,10 @@ curl -g -vvv -X POST http://localhost:6492/api/addStorage \
             "root_path": "/tmp/my_tmp_dir",
             "key_count_per_file": 8
         },
+        "integrity": {
+            "enable_meta_checksum": true,
+            "algo": "CA_CRC32_XOR_INT64"
+        },
         "check_storage_available_when_open": true
     }
 }'
@@ -48,6 +52,12 @@ curl -g -vvv -X POST http://127.0.0.1:6492/api/addStorage \
     }
 }'
 ```
+
+`integrity` 可省略。`enable_meta_checksum=true` 为使用该 storage 配置的 CUDA/MUSA TransferClient
+开启 KVCM 内置计算能力；调用方只透传自有 checksum 时不要求开启。`enable_inline_header` 当前不可用，
+启用会返回参数错误。Update Storage 是完整配置更新：自行调用 HTTP API 时应先 List Storage 并保留已有
+`integrity`；`kvcm_ops update_storage` 已自动执行该保留逻辑。详见
+[数据完整性设计](../design/data_integrity.md)。
 
 ## Enable Storage
 ```bash

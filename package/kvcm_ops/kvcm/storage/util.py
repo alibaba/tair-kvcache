@@ -1,7 +1,54 @@
 import argparse
+import copy
 from ..common.common_args import *
 
 # for add_storage/update_storage
+
+CHECKSUM_ALGO_TO_PROTO = {
+    "crc32_xor_int64": "CA_CRC32_XOR_INT64",
+}
+
+
+def add_integrity_args(parser, method):
+    enable_group = parser.add_mutually_exclusive_group()
+    enable_group.add_argument(
+        '--enable_meta_checksum',
+        dest='meta_checksum_enabled',
+        action='store_const',
+        const=True,
+        default=None,
+        help='enable KVCM crc32_xor_int64 checksum compute/verify capability')
+    if method == "update_storage":
+        enable_group.add_argument(
+            '--disable_meta_checksum',
+            dest='meta_checksum_enabled',
+            action='store_const',
+            const=False,
+            help='disable KVCM checksum compute/verify capability')
+    parser.add_argument(
+        '--checksum_algo',
+        choices=sorted(CHECKSUM_ALGO_TO_PROTO),
+        default=None,
+        help='KVCM built-in checksum algorithm')
+
+
+def gen_integrity_config_data(args, existing_integrity=None):
+    if existing_integrity is not None and not isinstance(existing_integrity, dict):
+        raise RuntimeError("existing storage integrity config is not an object")
+
+    enabled = getattr(args, "meta_checksum_enabled", None)
+    algo = getattr(args, "checksum_algo", None)
+    if enabled is None and algo is None:
+        return copy.deepcopy(existing_integrity)
+
+    integrity = copy.deepcopy(existing_integrity) if existing_integrity is not None else {}
+    if enabled is not None:
+        integrity["enable_meta_checksum"] = enabled
+    if algo is not None:
+        integrity["algo"] = CHECKSUM_ALGO_TO_PROTO[algo]
+    elif integrity.get("enable_meta_checksum") and integrity.get("algo") in (None, "", 0, "CA_UNSPECIFIED"):
+        integrity["algo"] = CHECKSUM_ALGO_TO_PROTO["crc32_xor_int64"]
+    return integrity
 
 
 def gen_nfs_config_data(args):
@@ -189,6 +236,15 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
         'event_report_l2',
         'L2 event report storage options',
         'ST_EVENT_REPORT_L2')
+
+    for storage_parser in (
+            parser_nfs,
+            parser_pace,
+            parser_pace_ssd,
+            parser_3fs,
+            parser_event_report_l1p5,
+            parser_event_report_l2):
+        add_integrity_args(storage_parser, method)
 
     parser_nfs.set_defaults(func=handle_nfs)
     parser_pace.set_defaults(func=handle_pace)

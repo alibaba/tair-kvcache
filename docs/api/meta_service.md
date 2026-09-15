@@ -49,11 +49,18 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheLocation \
     "trace_id": "trace_id_125",
     "instance_id": "test_instance",
     "block_keys": [123],
+    "include_checksums": true,
     "block_mask": {
         "offset": 0
     }
 }'
 ```
+
+`include_checksums` 默认为 `false`；只有显式设为 `true`，服务端才把已保存的 checksum 放入响应。
+响应中每个 `locations[].location_specs[]` 都可能包含独立的 `checksum` 和 `checksum_present`。只有
+`checksum_present=true` 时该 spec 的数值有效；`checksum=0` 是合法值，不能用数值本身判断是否存在。
+老数据没有 checksum 时返回 `checksum_present=false`。`GetCacheLocationsByBackend` 使用同名开关和
+相同语义。
 
 ## Start Write Cache
 ```bash
@@ -63,7 +70,7 @@ curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \
   -d '{
     "trace_id": "trace_id_126",
     "instance_id": "test_instance_id_2",
-    "block_keys": [1234, 4567, 1234],
+    "block_keys": [1234],
     "token_ids": [],
     "write_timeout_seconds": 10
 }'
@@ -76,17 +83,32 @@ curl -g -vvv -X POST http://localhost:6382/api/finishWriteCache \
   -H "Accept: application/json" \
   -d '{
     "trace_id": "trace_id_127",
-    "instance_id": "test_instance",
+    "instance_id": "test_instance_id_2",
     "write_session_id": "session_id_from_start_write",
     "success_blocks": {
         "bool_masks": {
           "values": [true]
         }
-    }
+    },
+    "checksum_batches": [
+        {
+            "location_spec_name": "tp0",
+            "checksums": ["0"]
+        }
+    ]
 }'
 ```
 
 Note: To use the Finish Write Cache API, you need to replace "session_id_from_start_write" with the actual write_session_id returned by the Start Write Cache API.
+
+`checksum_batches` 可省略；每组通过 `location_spec_name` 标识独立 payload，其 `checksums` 必须与 Start
+Write Cache **返回并捕获的紧凑 session batch** 等长，而不是原始请求或成功子集。失败位置保留占位但
+不会使用。空、重复、StartWrite 未分配的 spec name、长度错误、非法 success mask 或与 StartWrite 不同的
+`instance_id` 都会被拒绝，且不会消费 session，可以修正后重试。数值由调用方或 KVCM TransferClient
+计算，Manager 将其作为 opaque `int64` 保存，`0` 同样有效。
+字段号 5 的 `locations` 只为滚动升级保留并已废弃，client 仍按旧行为发送，但当前 server 不用它做
+checksum 对齐；新调用方使用字段号 6 的 `checksum_batches`。详细调用链
+见[数据完整性设计](../design/data_integrity.md)。
 
 ## Remove Cache
 ```bash
@@ -187,7 +209,9 @@ curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
               "specs": [
                 {
                   "name": "full_attention:group=0:tp=0",
-                  "uri": "event_report://physical-storage:9600/gpu/123?size=4096"
+                  "uri": "event_report://physical-storage:9600/gpu/123?size=4096",
+                  "checksum": "0",
+                  "checksum_present": true
                 }
               ]
             }
@@ -197,6 +221,11 @@ curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
     ]
 }'
 ```
+
+`BLOCK_ADD` 和 `BLOCK_SNAPSHOT` 的每个 spec 都可携带调用方计算的 `checksum`；HTTP 中 `int64`
+按 protobuf JSON 规则推荐使用十进制字符串，`checksum_present=true` 用于区分合法值 `0` 与未提供。
+Manager 将其作为 opaque 值保存，查询时仍需设置 `include_checksums=true`。完整生命周期语义见
+[数据完整性设计](../design/data_integrity.md)。
 
 ## Trim Cache
 ```bash
@@ -224,6 +253,10 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
     "block_mask": {
         "offset": 0
     },
-    "detail_level": 1
+    "detail_level": 1,
+    "include_checksums": true
 }'
 ```
+
+Get Cache Meta 与 Get Cache Location 一样，仅在 `include_checksums=true` 时为每个返回
+`location_specs[]` 携带有效的 `checksum` / `checksum_present`。

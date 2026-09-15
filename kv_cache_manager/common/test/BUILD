@@ -1,6 +1,15 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "HashUtilTest",
+    srcs = ["hash_util_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:hash_util",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "scoped_jemalloc_arena_rotation_test",
     srcs = ["scoped_jemalloc_arena_rotation_test.cc"],
     deps = [

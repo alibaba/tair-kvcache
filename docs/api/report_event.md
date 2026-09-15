@@ -253,7 +253,9 @@ InstanceGroup 必须把对应 EventReport storage 配置在
     "specs": [
       {
         "name": "F0",
-        "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096"
+        "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096",
+        "checksum": "0",
+        "checksum_present": true
       },
       {
         "name": "L1",
@@ -272,6 +274,8 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - 每个 `spec.name` 非空、已在 `RegisterInstance.location_spec_infos` 中注册，且同一事件内不能重复；
 - 每个 URI 必须合法；
 - 客户端 URI 不能带 `s_version`；
+- `checksum` 可选，是该 spec payload 的 opaque `int64`；提供合法值 `0` 时必须同时设置
+  `checksum_present=true`；
 - 旧字段 `block_add.uri` 已废弃，只有 `specs` 生效。
 
 行为：
@@ -279,6 +283,11 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - 按 spec name merge；
 - 本次未涉及的其他 spec 会保留；
 - 同一逻辑 spec 再次 ADD 会覆盖旧 URI；
+- 本次提供 checksum 时原样覆盖；未提供时保留同名 spec 已有 checksum；
+- 同一请求内多个 ADD 被折叠时也遵守上述 patch 语义：后一个仅刷新 URI、未提供 checksum 时，保留本批次
+  较早 ADD 已提供的 checksum；
+- 因此实际覆盖 payload 的 ADD 必须同时提交新 checksum，否则后续 strict read 会以保留的旧值报 mismatch；
+  如需明确清除 checksum，应通过完整 snapshot 提交不含 checksum 的该 spec；
 - 首条合法 ADD 可以创建 generation；
 - KVCM 会给每个 URI 追加一个 `s_version`。
 
@@ -325,7 +334,9 @@ InstanceGroup 必须把对应 EventReport storage 配置在
         "specs": [
           {
             "name": "F0",
-            "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096"
+            "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096",
+            "checksum": "-42",
+            "checksum_present": true
           },
           {
             "name": "L1",
@@ -358,6 +369,8 @@ Snapshot 的完整性规则：
 - `medium` 不能包含 location id 分隔符 `#`；
 - 每个 block 的 specs 必须非空，且 spec name 必须已在
   `RegisterInstance.location_spec_infos` 中注册并且不能重复；
+- 每个 spec 的 `checksum`/presence 规则与 BLOCK_ADD 相同；snapshot 是完整替换，未提供 checksum 的
+  spec 会明确变为“无 checksum”，不会继承旧 snapshot 的值；
 - `blocks=[]` 表示该 reporter 当前没有任何 cache；旧 location 会立即从 strict 查询结果隐藏，并由后台 GC 周期回收 metadata。
 
 Snapshot 的更新语义：
@@ -833,6 +846,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | D-13 | 第一条 delta 已创建 generation、metadata 写失败时准确报错，重试复用 generation | `TestReportEventFirstDeltaMetadataFailureReportsFailureAndReusesGeneration` |
 | D-14 | 同一 spec 的折叠事件共享最终 metadata 写入失败结果 | `TestReportEventFoldedDeltaEventsShareFinalWriteFailure` |
 | D-15 | 大于 32 KiB 的部分失败批次保持逐项结果与输入索引严格对齐，只重试失败项后复用 generation 并最终收敛 | snapshot 集成 `test_34_large_partial_batch_preserves_item_alignment_and_retry` |
+| D-16 | ADD 保留调用方 checksum（含合法值 0），同请求折叠仍遵守 checksum patch 语义，HTTP 快速解析与查询 opt-in 不丢字段 | `TestReportEventPreservesCallerProvidedChecksum`；HTTP 集成 `test_event_report_requested_spec_filters_before_peer_selection` |
 | S-01 | snapshot 跨 medium 完整上报、响应返回 generation | `TestReportEventSnapshotReplacesCompleteSpecSetPerBlock`；snapshot 集成 `test_17/22` |
 | S-02 | 同 block 跨 medium 合法，同 block+medium 重复非法 | `TestReportEventRejectsCanonicalDuplicateSnapshotKeysButAllowsDifferentMedia`；snapshot 集成 `test_27_*` |
 | S-03 | snapshot block 内重复 spec name 被拒绝 | `TestReportEventRejectsDuplicateSpecNamesWithinSnapshotBlock` |
@@ -846,6 +860,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | S-11 | snapshot commit 后增量刷新 mixed/legacy location，旧 cleanup 不删除新写 | `TestSnapshotCleanupPreservesPostCommitDeltaOnMixedGenerationLocation`、`TestSnapshotCleanupPreservesCurrentDeltaBesideLegacySpec`；snapshot 集成 `test_32_*` |
 | S-12 | snapshot cleanup 只删 metadata，不调用外部 URI backend | `TestMetadataOnlyLocationDeleteSkipsPhysicalBackend`、`TestCleanupLocationsByPredicateSubmitsExactObservedValue` |
 | S-13 | unavailable reporter 可完成 snapshot，但 HEARTBEAT 恢复前查询保持隐藏 | `TestReportEventSnapshotWhileUnavailableCommitsButStaysHiddenUntilHeartbeat` |
+| S-14 | snapshot 完整替换仍保留本次调用方 checksum，不复用旧对象中的值 | `TestReportEventPreservesCallerProvidedChecksum`；`TestMergeAndReplaceLocationSpecsKeepStorageUsageExact` |
 | Q-01 | soft 接受合法历史/legacy；strict 只接受至少含 committed spec 的 location，in-flight candidate 在 commit 前不单独可见 | `TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessfulSnapshot`、`TestGetCheckLocDataExistFuncEventReportUriValidationMatrix` |
 | Q-02 | 空 spec、坏 URI、重复/畸形 s_version 整条 location fail closed | `TestGetCheckLocDataExistFuncEventReportUriValidationMatrix` |
 | Q-03 | malformed location id、错误 storage type、未知 host 不可见 | 同上；`TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed` |
