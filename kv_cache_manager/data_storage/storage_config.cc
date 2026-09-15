@@ -3,6 +3,8 @@
 #include <limits>
 #include <sstream>
 
+#include "kv_cache_manager/common/logger.h"
+
 namespace kv_cache_manager {
 
 std::string ThreeFSStorageSpec::ToString() const {
@@ -210,6 +212,82 @@ DataStorageType ToBaseType(const DataStorageType &type) noexcept {
     return type;
 }
 
+std::string ToString(ChecksumAlgo algo) {
+    switch (algo) {
+    case ChecksumAlgo::CA_UNSPECIFIED:
+        return "unspecified";
+    case ChecksumAlgo::CA_CRC32_XOR_INT64:
+        return "crc32_xor_int64";
+    default:
+        return "unrecognized";
+    }
+}
+
+ChecksumAlgo ToChecksumAlgo(const std::string &name) {
+    if (name == "crc32_xor_int64") {
+        return ChecksumAlgo::CA_CRC32_XOR_INT64;
+    }
+    return ChecksumAlgo::CA_UNSPECIFIED;
+}
+
+// DataIntegrityConfig
+bool DataIntegrityConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_meta_checksum", enable_meta_checksum_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_inline_header", enable_inline_header_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "inline_header_version", inline_header_version_, uint32_t{0});
+    std::string algo_str;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "algo", algo_str, std::string("crc32_xor_int64"));
+    algo_ = ToChecksumAlgo(algo_str);
+    if (algo_ == ChecksumAlgo::CA_UNSPECIFIED && algo_str != "unspecified") {
+        KVCM_LOG_ERROR("unsupported checksum algorithm [%s]", algo_str.c_str());
+        return false;
+    }
+    return true;
+}
+
+void DataIntegrityConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "enable_meta_checksum", enable_meta_checksum_);
+    Put(writer, "enable_inline_header", enable_inline_header_);
+    Put(writer, "inline_header_version", inline_header_version_);
+    Put(writer, "algo", kv_cache_manager::ToString(algo_));
+}
+
+bool DataIntegrityConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (algo_ != ChecksumAlgo::CA_UNSPECIFIED && algo_ != ChecksumAlgo::CA_CRC32_XOR_INT64) {
+        valid = false;
+        local_invalid_fields += "{unsupported checksum algorithm}";
+    }
+    // Scheme B inline header is reserved but not implemented; reject at runtime so the
+    // proto/config slot is kept for a future P1 without touching wire format.
+    if (enable_inline_header_) {
+        valid = false;
+        local_invalid_fields += "{enable_inline_header is reserved, not implemented yet}";
+    }
+    // inline_header_version != 0 implies inline header is on, but the flag is off:
+    // contradictory config.
+    if (inline_header_version_ != 0 && !enable_inline_header_) {
+        valid = false;
+        local_invalid_fields += "{inline_header_version requires enable_inline_header=true}";
+    }
+    if (enable_meta_checksum_ && algo_ == ChecksumAlgo::CA_UNSPECIFIED) {
+        valid = false;
+        local_invalid_fields += "{algo must be set when enable_meta_checksum=true}";
+    }
+    if (!valid) {
+        invalid_fields += "{DataIntegrityConfig: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+std::string DataIntegrityConfig::ToString() const {
+    std::ostringstream oss;
+    oss << "enable_meta_checksum: " << enable_meta_checksum_ << ", enable_inline_header: " << enable_inline_header_
+        << ", inline_header_version: " << inline_header_version_ << ", algo: " << kv_cache_manager::ToString(algo_);
+    return oss.str();
+}
+
 // ThreeFSStorageSpec
 bool ThreeFSStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "cluster_name", cluster_name_);
@@ -373,12 +451,29 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         auto tmp = std::make_shared<DummyStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
     } else if (IsEventReportStorageType(type_)) {
         auto tmp = std::make_shared<EventReportStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
     } else {
         storage_spec_ = nullptr; // 对未知或未支持类型，设为空
+    }
+    // integrity 字段是后加的。每次解析先重置，保证复用同一个 StorageConfig
+    // 对象读取老配置时不会残留上一次的开启状态。
+    integrity_ = DataIntegrityConfig{};
+    // 老配置不带该字段时保留默认值 (全部关闭)。
+    // 存在但字段类型错乱 (例如 "enable_meta_checksum": "true" 用了字符串)
+    // 必须让整个 StorageConfig 解析失败，否则会静默降级为「全关」。
+    if (rapid_value.HasMember("integrity")) {
+        if (!rapid_value["integrity"].IsObject()) {
+            KVCM_LOG_ERROR("integrity must be a json object");
+            return false;
+        }
+        if (!integrity_.FromRapidValue(rapid_value["integrity"])) {
+            return false;
+        }
     }
     return true;
 }
@@ -388,6 +483,9 @@ void StorageConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "is_available", is_available_);
     Put(writer, "global_unique_name", global_unique_name_);
     Put(writer, "storage_spec", storage_spec_);
+    if (!integrity_.IsDefault()) {
+        Put(writer, "integrity", integrity_);
+    }
 }
 
 bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -410,6 +508,9 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
             valid = false;
             local_invalid_fields += "{tair_mempool_ssd_requires_media_type_5}";
         }
+    }
+    if (!integrity_.ValidateRequiredFields(local_invalid_fields)) {
+        valid = false;
     }
     if (!valid) {
         invalid_fields += "{StorageConfig: " + local_invalid_fields + "}";

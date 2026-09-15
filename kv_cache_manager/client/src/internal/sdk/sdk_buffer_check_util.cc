@@ -1,7 +1,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 
 #include <algorithm>
-#include <cassert>
+#include <limits>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/hash_util.h"
@@ -9,15 +9,24 @@
 namespace kv_cache_manager {
 
 std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block_buffers) {
+    if (block_buffers.empty() || block_buffers.front().iovs.empty()) {
+        return {};
+    }
     std::vector<IovDevice> iov_h;
-    size_t iov_num = block_buffers.front().iovs.size();
+    const size_t iov_num = block_buffers.front().iovs.size();
     iov_h.reserve(iov_num * block_buffers.size());
     for (const auto &block_buffer : block_buffers) {
+        if (block_buffer.iovs.size() != iov_num) {
+            return {};
+        }
         for (const auto &raw_iov : block_buffer.iovs) {
             iov_h.push_back({raw_iov.base, raw_iov.size});
         }
     }
     auto crcs = GetIovsCrc(iov_h);
+    if (crcs.size() != iov_h.size()) {
+        return {};
+    }
     std::vector<int64_t> result;
     result.reserve(block_buffers.size());
     for (size_t offset = 0; offset < crcs.size(); offset += iov_num) {
@@ -28,6 +37,9 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 
 std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(
     const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, GpuStream_t stream) {
+    if (max_iov_num == 0 || max_iov_num > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
     std::vector<IovDevice> iov_h(max_iov_num);
     return GetBlocksHash(block_buffers, iovs_d, crcs_d, iov_h.data(), max_iov_num, stream);
 }
@@ -38,11 +50,17 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
                                                        IovDevice *iovs_h_to_save,
                                                        size_t max_iov_num,
                                                        GpuStream_t stream) {
-    size_t iov_num = block_buffers.front().iovs.size();
+    if (block_buffers.empty() || block_buffers.front().iovs.empty() || iovs_d == nullptr || crcs_d == nullptr ||
+        iovs_h_to_save == nullptr || max_iov_num == 0) {
+        return {};
+    }
+    const size_t iov_num = block_buffers.front().iovs.size();
     size_t iovs_size = 0;
     for (const auto &block_buffer : block_buffers) {
-        assert(iov_num == block_buffer.iovs.size());
-        if (iovs_size + block_buffer.iovs.size() > max_iov_num) {
+        if (iov_num != block_buffer.iovs.size()) {
+            return {};
+        }
+        if (block_buffer.iovs.size() > max_iov_num - iovs_size) {
             break;
         }
         for (const auto &raw_iov : block_buffer.iovs) {
@@ -52,6 +70,9 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
         }
     }
     auto crcs = GetIovsCrc(iovs_h_to_save, iovs_size, iovs_d, crcs_d, stream);
+    if (crcs.size() != iovs_size) {
+        return {};
+    }
     std::vector<int64_t> result;
     result.reserve(iovs_size / iov_num);
     for (size_t offset = 0; offset < crcs.size(); offset += iov_num) {
@@ -61,6 +82,9 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 }
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice> &iovs_h) {
+    if (iovs_h.empty() || iovs_h.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
     CudaBufferGuard iovs_guard, crcs_guard;
     size_t iovs_byte_size = sizeof(IovDevice) * iovs_h.size();
     size_t crcs_byte_size = sizeof(uint32_t) * iovs_h.size();
@@ -83,6 +107,9 @@ SdkBufferCheckPool::SdkBufferCheckPool(size_t cell_num) { cells_.resize(cell_num
 
 SdkBufferCheckPool::~SdkBufferCheckPool() {
     for (const auto &cell : cells_) {
+        if (cell.gpu_stream) {
+            CHECK_CUDA_ERROR(cudaStreamDestroy(cell.gpu_stream), "cuda stream destroy failed");
+        }
         if (cell.h_iovs) {
             CHECK_CUDA_ERROR(cudaFreeHost(cell.h_iovs), "cuda free iovs_h_mem[%p] failed", cell.h_iovs);
         }
@@ -96,6 +123,15 @@ SdkBufferCheckPool::~SdkBufferCheckPool() {
 }
 
 bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
+    if (cells_.empty() || max_check_iov_num == 0 ||
+        max_check_iov_num > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        max_check_iov_num > std::numeric_limits<size_t>::max() / sizeof(IovDevice) ||
+        max_check_iov_num > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+        KVCM_LOG_ERROR("invalid checksum pool config, cell_num [%lu], max_check_iov_num [%lu]",
+                       cells_.size(),
+                       max_check_iov_num);
+        return false;
+    }
     size_t iovs_byte_size = max_check_iov_num * sizeof(IovDevice);
     size_t crcs_byte_size = max_check_iov_num * sizeof(uint32_t);
     CHECK_CUDA_ERROR_RETURN(cudaGetDevice(&device_id_), false, "cudaGetDevice failed");
@@ -122,8 +158,11 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
 }
 
 bool SdkBufferCheckPool::WarmUp() {
-    const std::string warmup_str("12345678");
-    // crc32("12345678") == 9AE0DAAF
+    // A two-byte fixture is fully sampled for every valid positive
+    // KVCM_CHECK_IOV_BYTE_SIZE. The previous eight-byte fixture only matched
+    // its hard-coded CRC when the configured sample size was at least four.
+    const std::string warmup_str("12");
+    // crc32("12") == 4F5344CD
     CudaBufferGuard buffer_guard;
     auto byte_size = warmup_str.size();
     if (!buffer_guard.Alloc(byte_size)) {
@@ -136,10 +175,10 @@ bool SdkBufferCheckPool::WarmUp() {
                             warmup_str.data(),
                             buffer);
     std::vector<IovDevice> iovs_h{{buffer, byte_size}};
-    const std::vector<uint32_t> ecpected_crcs({0x9AE0DAAF});
+    const std::vector<uint32_t> expected_crcs({0x4F5344CD});
     for (auto &cell : cells_) {
         auto real_crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, cell.d_iovs, cell.d_crcs, cell.gpu_stream);
-        if (ecpected_crcs != real_crcs) {
+        if (expected_crcs != real_crcs) {
             KVCM_LOG_ERROR("warm up failed");
             return false;
         }
@@ -157,8 +196,12 @@ SdkBufferCheckPool::CellHandle::CellHandle(SdkBufferCheckPool *pool, Cell *cell,
     if (err != cudaSuccess) {
         KVCM_LOG_WARN("cuda error [%d] [%s] | cudaGetDevice failed", err, cudaGetErrorString(err));
     } else if (prev_device_id_ != device_id) {
-        CHECK_CUDA_ERROR(cudaSetDevice(device_id), "cudaSetDevice [%d] failed", device_id);
-        changed_device_ = true;
+        err = cudaSetDevice(device_id);
+        if (err != cudaSuccess) {
+            KVCM_LOG_WARN("cuda error [%d] [%s] | cudaSetDevice [%d] failed", err, cudaGetErrorString(err), device_id);
+        } else {
+            changed_device_ = true;
+        }
     }
 }
 

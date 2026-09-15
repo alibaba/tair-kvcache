@@ -1,7 +1,8 @@
 #include <atomic>
+#include <limits>
 #include <string>
 #include <thread>
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 #endif
 #include "kv_cache_manager/common/unittest.h"
@@ -9,6 +10,37 @@
 using namespace kv_cache_manager;
 
 class SdkBufferCheckUtilTest : public TESTBASE {};
+
+TEST_F(SdkBufferCheckUtilTest, TestGetBlocksHashRejectsEmptyOrInconsistentShape) {
+    EXPECT_TRUE(SdkBufferCheckUtil::GetBlocksHash({}).empty());
+    EXPECT_TRUE(SdkBufferCheckUtil::GetBlocksHash(BlockBuffers{{}}).empty());
+    BlockBuffers inconsistent(2);
+    inconsistent[0].iovs.resize(1);
+    inconsistent[1].iovs.resize(2);
+    EXPECT_TRUE(SdkBufferCheckUtil::GetBlocksHash(inconsistent).empty());
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestChecksumPoolRejectsZeroCellsBeforeGpuAllocation) {
+    SdkBufferCheckPool pool(0);
+    EXPECT_FALSE(pool.Init(1));
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestChecksumPoolRejectsKernelIndexOverflowBeforeGpuAllocation) {
+    SdkBufferCheckPool pool(1);
+    EXPECT_FALSE(pool.Init(static_cast<size_t>(std::numeric_limits<int>::max()) + 1));
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestChecksumPoolWarmUpSupportsOneByteSample) {
+#ifdef USING_CUDA
+    const size_t previous_sample_size = SdkBufferCheckUtil::min_cal_byte_size_;
+    SdkBufferCheckUtil::min_cal_byte_size_ = 1;
+    {
+        SdkBufferCheckPool pool(1);
+        EXPECT_TRUE(pool.Init(2));
+    }
+    SdkBufferCheckUtil::min_cal_byte_size_ = previous_sample_size;
+#endif
+}
 
 TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrc_1) {
 #ifdef USING_CUDA
@@ -91,6 +123,63 @@ TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrcAutoMalloc) {
 #endif
 }
 
+TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrcUsesPerIovSampleSize) {
+#ifdef USING_CUDA
+    SdkBufferCheckUtil::min_cal_byte_size_ = 4;
+    const std::string large("1234xxxxxxxx5678");
+    const std::string small("abcd");
+    char *buffer = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&buffer, large.size() + small.size()));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer, large.data(), large.size(), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer + large.size(), small.data(), small.size(), cudaMemcpyHostToDevice));
+
+    const IovDevice large_iov{buffer, large.size()};
+    const IovDevice small_iov{buffer + large.size(), small.size()};
+    const auto expected_large = SdkBufferCheckUtil::GetIovsCrc({large_iov});
+    const auto expected_small = SdkBufferCheckUtil::GetIovsCrc({small_iov});
+    const auto combined = SdkBufferCheckUtil::GetIovsCrc({large_iov, small_iov});
+
+    ASSERT_EQ(1u, expected_large.size());
+    ASSERT_EQ(1u, expected_small.size());
+    ASSERT_EQ(2u, combined.size());
+    EXPECT_EQ(expected_large[0], combined[0]);
+    EXPECT_EQ(expected_small[0], combined[1]);
+    ASSERT_EQ(cudaSuccess, cudaFree(buffer));
+#endif
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestGetBlocksHashSupportsDifferentIovSizesPerBlock) {
+#ifdef USING_CUDA
+    SdkBufferCheckUtil::min_cal_byte_size_ = 4;
+    constexpr size_t kTotalSize = 80;
+    char *buffer = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&buffer, kTotalSize));
+    const std::string contents(kTotalSize, 'x');
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer, contents.data(), contents.size(), cudaMemcpyHostToDevice));
+
+    BlockBuffer first;
+    first.iovs = {
+        {MemoryType::GPU, buffer, 16, false},
+        {MemoryType::GPU, buffer + 16, 8, false},
+    };
+    BlockBuffer second;
+    second.iovs = {
+        {MemoryType::GPU, buffer + 24, 4, false},
+        {MemoryType::GPU, buffer + 28, 32, false},
+    };
+    const auto first_hash = SdkBufferCheckUtil::GetBlocksHash({first});
+    const auto second_hash = SdkBufferCheckUtil::GetBlocksHash({second});
+    const auto combined = SdkBufferCheckUtil::GetBlocksHash({first, second});
+
+    ASSERT_EQ(1u, first_hash.size());
+    ASSERT_EQ(1u, second_hash.size());
+    ASSERT_EQ(2u, combined.size());
+    EXPECT_EQ(first_hash[0], combined[0]);
+    EXPECT_EQ(second_hash[0], combined[1]);
+    ASSERT_EQ(cudaSuccess, cudaFree(buffer));
+#endif
+}
+
 TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrcWithStream) {
 #ifdef USING_CUDA
     char *buffer = nullptr;
@@ -112,6 +201,7 @@ TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrcWithStream) {
 
     auto crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, iovs_d, crcs_d, stream);
     ASSERT_EQ(4, crcs.size());
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
     ASSERT_EQ(cudaSuccess, cudaFree(buffer));
     ASSERT_EQ(cudaSuccess, cudaFree(iovs_d));
     ASSERT_EQ(cudaSuccess, cudaFree(crcs_d));
@@ -141,6 +231,7 @@ TEST_F(SdkBufferCheckUtilTest, TestGetIovsCrcWithStreamAndPinnedMem) {
 
     auto crcs = SdkBufferCheckUtil::GetIovsCrc(pinned_iovs_ptr, iovs_size, iovs_d, crcs_d, stream);
     ASSERT_EQ(4, crcs.size());
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
     ASSERT_EQ(cudaSuccess, cudaFree(buffer));
     ASSERT_EQ(cudaSuccess, cudaFree(iovs_d));
     ASSERT_EQ(cudaSuccess, cudaFree(crcs_d));
@@ -272,6 +363,7 @@ TEST_F(SdkBufferCheckUtilTest, TestGetBlocksHashManuallyMallocAndPinnedMem) {
     ASSERT_EQ(std::string(not_change_crcs_d_byte_size, 'a'),
               after_hash_crcs_d.substr(change_crcs_d_byte_size, not_change_crcs_d_byte_size));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
     ASSERT_EQ(cudaSuccess, cudaFree(block_buffers[0].iovs[0].base));
     ASSERT_EQ(cudaSuccess, cudaFree(block_buffers[1].iovs[0].base));
     ASSERT_EQ(cudaSuccess, cudaFree(iovs_d));
@@ -382,6 +474,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
 }
 
 TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiDevice) {
+#ifdef USING_CUDA
     auto byte_size = 4 * 1024;
     size_t max_check_iov_num = 10;
     auto push_buffer = [byte_size](BlockBuffers &block_buffers) {
@@ -447,4 +540,5 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiDevice) {
     // in device0 context, get device0 block hash by pool_device_1
     int64_t hash_device_err = get_block_hash(pool_device_1, block_buffers_vec_device_0);
     ASSERT_EQ(-1, hash_device_err);
+#endif
 }

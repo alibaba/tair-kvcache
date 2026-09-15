@@ -36,6 +36,77 @@ TEST_F(WriteLocationManagerTest, NoExpireLoopTest) {
     ASSERT_EQ(1, manager_.ExpireSize());
 }
 
+TEST_F(WriteLocationManagerTest, ExpectedKeyCountMismatchDoesNotConsumeSession) {
+    manager_.Put("session", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [](WriteLocationInfoPtr) {});
+    WriteLocationManager::WriteLocationInfo info;
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::KEY_COUNT_MISMATCH,
+              manager_.GetAndDeleteForFinish("session", "", BlockMaskOffset{3}, 1, {}, info));
+    EXPECT_EQ(1, manager_.ExpireSize());
+    EXPECT_TRUE(manager_.HasLocationId("id1"));
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::SUCCESS,
+              manager_.GetAndDeleteForFinish("session", "", BlockMaskOffset{3}, 3, {}, info));
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3}), info.keys);
+    EXPECT_EQ(0, manager_.ExpireSize());
+    EXPECT_FALSE(manager_.HasLocationId("id1"));
+    EXPECT_EQ(WriteLocationManager::TakeResult::NOT_FOUND,
+              manager_.GetAndDeleteForFinish("session", "", BlockMaskOffset{3}, 3, {}, info));
+}
+
+TEST_F(WriteLocationManagerTest, ExpectedSpecNameMismatchDoesNotConsumeSession) {
+    manager_.Put("session", {1, 2}, {"id1", "id2"}, {"tp0", "tp1"}, 1000, [](WriteLocationInfoPtr) {});
+    WriteLocationManager::WriteLocationInfo info;
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::SPEC_NAME_MISMATCH,
+              manager_.GetAndDeleteForFinish("session", "", BlockMaskOffset{2}, 2, {"tp2"}, info));
+    EXPECT_EQ(1, manager_.ExpireSize());
+    EXPECT_TRUE(manager_.HasLocationId("id1"));
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::SUCCESS,
+              manager_.GetAndDeleteForFinish("session", "", BlockMaskOffset{2}, 2, {"tp1"}, info));
+    EXPECT_EQ((std::unordered_set<std::string>{"tp0", "tp1"}), info.location_spec_names);
+    EXPECT_EQ(0, manager_.ExpireSize());
+    EXPECT_FALSE(manager_.HasLocationId("id1"));
+}
+
+TEST_F(WriteLocationManagerTest, FinishValidationMismatchDoesNotConsumeSession) {
+    manager_.Put("session",
+                 "instance-a",
+                 {1, 2, 3},
+                 {"id1", "id2", "id3"},
+                 {"tp0", "tp1"},
+                 1000,
+                 [](WriteLocationInfoPtr) {});
+    WriteLocationManager::WriteLocationInfo info;
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::INSTANCE_ID_MISMATCH,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-b", BlockMaskOffset{3}, 3, {"tp0"}, info));
+    EXPECT_EQ(WriteLocationManager::TakeResult::BLOCK_MASK_MISMATCH,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-a", BlockMaskVector{true, true}, 3, {"tp0"}, info));
+    EXPECT_EQ(WriteLocationManager::TakeResult::BLOCK_MASK_MISMATCH,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-a", BlockMaskOffset{4}, 3, {"tp0"}, info));
+    EXPECT_EQ(WriteLocationManager::TakeResult::KEY_COUNT_MISMATCH,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-a", BlockMaskOffset{3}, 2, {"tp0"}, info));
+    EXPECT_EQ(WriteLocationManager::TakeResult::SPEC_NAME_MISMATCH,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-a", BlockMaskOffset{3}, 3, {"tp-missing"}, info));
+    EXPECT_EQ(1, manager_.ExpireSize());
+    EXPECT_TRUE(manager_.HasLocationId("id1"));
+
+    EXPECT_EQ(WriteLocationManager::TakeResult::SUCCESS,
+              manager_.GetAndDeleteForFinish(
+                  "session", "instance-a", BlockMaskVector{true, false, true}, 3, {"tp0", "tp1"}, info));
+    EXPECT_EQ("instance-a", info.instance_id);
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3}), info.keys);
+    EXPECT_EQ(0, manager_.ExpireSize());
+    EXPECT_FALSE(manager_.HasLocationId("id1"));
+}
+
 TEST_F(WriteLocationManagerTest, ExpireLoopTest) {
     manager_.Start();
     manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1, [this](WriteLocationInfoPtr info) {

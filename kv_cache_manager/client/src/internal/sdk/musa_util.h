@@ -20,3 +20,37 @@
             return return_value;                                                                                       \
         }                                                                                                              \
     } while (0)
+
+namespace kv_cache_manager {
+
+class MusaBufferGuard {
+public:
+    MusaBufferGuard() = default;
+    MusaBufferGuard(const MusaBufferGuard &) = delete;
+    MusaBufferGuard &operator=(const MusaBufferGuard &) = delete;
+    ~MusaBufferGuard() {
+        if (ptr_ != nullptr) {
+            auto err = musaFree(ptr_);
+            if (err != musaSuccess) {
+                KVCM_LOG_ERROR("musaFree [%p] failed in destructor: %s", ptr_, musaGetErrorString(err));
+            }
+        }
+    }
+
+    bool Alloc(size_t size) {
+        auto err = musaMalloc(&ptr_, size);
+        if (err != musaSuccess) {
+            ptr_ = nullptr;
+            KVCM_LOG_ERROR("musaMalloc [%lu] bytes failed: %s", size, musaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    void *Get() const { return ptr_; }
+
+private:
+    void *ptr_ = nullptr;
+};
+
+} // namespace kv_cache_manager

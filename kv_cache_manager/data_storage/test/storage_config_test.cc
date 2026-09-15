@@ -51,6 +51,24 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     EXPECT_EQ(nfs_spec2.key_count_per_file(), nfs_spec.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, TestStorageConfigJsonizeDummyRemainsValidForRecovery) {
+    auto dummy_spec = std::make_shared<DummyStorageSpec>();
+    dummy_spec->set_root_path("/tmp/dummy");
+    dummy_spec->set_key_count_per_file(3);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "dummy_1", dummy_spec);
+
+    StorageConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config.ToJsonString()));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, restored.type());
+    EXPECT_EQ("dummy_1", restored.global_unique_name());
+    const auto restored_spec = std::dynamic_pointer_cast<DummyStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ("/tmp/dummy", restored_spec->root_path());
+    EXPECT_EQ(3, restored_spec->key_count_per_file());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}
+
 TEST_F(StorageConfigTest, TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings) {
     EventReportStorageSpec spec;
     spec.set_heartbeat_timeout_ms(1234);
@@ -117,6 +135,94 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     EXPECT_EQ(spec.media_type(), kTairMemPoolMediaTypeSsd);
 }
 
+TEST_F(StorageConfigTest, TestDataIntegrityConfigDefaults) {
+    DataIntegrityConfig integrity;
+    EXPECT_FALSE(integrity.enable_meta_checksum());
+    EXPECT_FALSE(integrity.enable_inline_header());
+    EXPECT_EQ(integrity.inline_header_version(), 0u);
+    EXPECT_EQ(integrity.algo(), ChecksumAlgo::CA_CRC32_XOR_INT64);
+
+    std::string invalid_fields;
+    EXPECT_TRUE(integrity.ValidateRequiredFields(invalid_fields));
+    EXPECT_TRUE(invalid_fields.empty());
+}
+
+TEST_F(StorageConfigTest, TestDataIntegrityConfigJsonRoundTrip) {
+    DataIntegrityConfig integrity;
+    integrity.set_enable_meta_checksum(true);
+    integrity.set_algo(ChecksumAlgo::CA_CRC32_XOR_INT64);
+    const std::string json = integrity.ToJsonString();
+    EXPECT_NE(json.find("enable_meta_checksum"), std::string::npos);
+    EXPECT_NE(json.find("crc32_xor_int64"), std::string::npos);
+
+    DataIntegrityConfig parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(parsed.enable_meta_checksum(), integrity.enable_meta_checksum());
+    EXPECT_EQ(parsed.algo(), integrity.algo());
+}
+
+TEST_F(StorageConfigTest, TestDataIntegrityConfigRejectInlineHeader) {
+    // 方案 B 拒绝防线：enable_inline_header=true 必须被 Validate 拒绝，
+    // 这样 server / client 启动时不会把 "B 已实现" 的错觉传到上层。
+    DataIntegrityConfig integrity;
+    integrity.set_enable_inline_header(true);
+    std::string invalid_fields;
+    EXPECT_FALSE(integrity.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("enable_inline_header is reserved"), std::string::npos);
+}
+
+TEST_F(StorageConfigTest, TestDataIntegrityConfigRejectVersionWithoutHeader) {
+    // 配置矛盾：inline_header_version != 0 但开关没开。
+    DataIntegrityConfig integrity;
+    integrity.set_inline_header_version(1);
+    std::string invalid_fields;
+    EXPECT_FALSE(integrity.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("inline_header_version requires enable_inline_header=true"), std::string::npos);
+}
+
+TEST_F(StorageConfigTest, TestStorageConfigOmittedIntegrityBackwardCompatible) {
+    // 老 JSON 配置不带 integrity 字段 -> 解析成功，integrity 全部走默认 (关闭)。
+    const std::string old_json =
+        R"({"type":"file","is_available":true,"global_unique_name":"old_cfg","storage_spec":{"root_path":"/mnt/nfs","key_count_per_file":5}})";
+    StorageConfig config;
+    ASSERT_TRUE(config.FromJsonString(old_json));
+    EXPECT_FALSE(config.integrity().enable_meta_checksum());
+    EXPECT_FALSE(config.integrity().enable_inline_header());
+}
+
+TEST_F(StorageConfigTest, TestReparseLegacyStorageConfigClearsPreviousIntegrity) {
+    const std::string enabled_json = R"({
+        "type": "file",
+        "global_unique_name": "enabled_cfg",
+        "storage_spec": {"root_path": "/mnt/nfs", "key_count_per_file": 5},
+        "integrity": {"enable_meta_checksum": true, "algo": "crc32_xor_int64"}
+    })";
+    const std::string legacy_json = R"({
+        "type": "file",
+        "global_unique_name": "legacy_cfg",
+        "storage_spec": {"root_path": "/mnt/nfs", "key_count_per_file": 5}
+    })";
+    StorageConfig config;
+    ASSERT_TRUE(config.FromJsonString(enabled_json));
+    ASSERT_TRUE(config.integrity().enable_meta_checksum());
+
+    ASSERT_TRUE(config.FromJsonString(legacy_json));
+    EXPECT_FALSE(config.integrity().enable_meta_checksum());
+    EXPECT_FALSE(config.integrity().enable_inline_header());
+    EXPECT_EQ(ChecksumAlgo::CA_CRC32_XOR_INT64, config.integrity().algo());
+}
+
+TEST_F(StorageConfigTest, TestStorageConfigPropagatesIntegrityRejection) {
+    // StorageConfig::ValidateRequiredFields 应该把 DataIntegrityConfig 的拒绝传出来。
+    std::shared_ptr<NfsStorageSpec> nfs_spec_ptr(new NfsStorageSpec());
+    nfs_spec_ptr->set_root_path("/mnt/nfs");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "cfg", nfs_spec_ptr);
+    config.mutable_integrity().set_enable_inline_header(true);
+    std::string invalid_fields;
+    EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("DataIntegrityConfig"), std::string::npos);
+}
+
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields) {
     // 老 admin/老持久化数据：只有 enable_vipserver + vipserver_domain，没有 service_discovery_url。
     // 新版应当自动迁移成 service_discovery_url=vipserver://<domain>。
@@ -157,9 +263,8 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigr
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecNewSchemaTakesPrecedenceOverLegacy) {
     // 同时有 service_discovery_url 与老字段时，以 service_discovery_url 为准。
-    const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
-        R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
+                             R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-yy");
@@ -250,4 +355,39 @@ TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRequiresSsdMedia) {
     spec->set_media_type(kTairMemPoolMediaTypeSsd);
     invalid_fields.clear();
     EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}
+
+// integrity 字段类型错乱 (bool 位置放了 string) 时 StorageConfig 必须整体解析失败,
+// 而不是把 integrity 静默降级为全默认后照收。
+TEST_F(StorageConfigTest, TestStorageConfigRejectsMalformedIntegrity) {
+    const std::string malformed_json = R"({
+        "type": "file",
+        "global_unique_name": "bad_integrity",
+        "storage_spec": {"root_path": "/tmp/x", "key_count_per_file": 1},
+        "integrity": {"enable_meta_checksum": "true", "enable_inline_header": false}
+    })";
+    StorageConfig config;
+    EXPECT_FALSE(config.FromJsonString(malformed_json));
+}
+
+TEST_F(StorageConfigTest, TestStorageConfigRejectsNonObjectIntegrity) {
+    const std::string malformed_json = R"({
+        "type": "file",
+        "global_unique_name": "bad_integrity",
+        "storage_spec": {"root_path": "/tmp/x", "key_count_per_file": 1},
+        "integrity": "bad"
+    })";
+    StorageConfig config;
+    EXPECT_FALSE(config.FromJsonString(malformed_json));
+}
+
+TEST_F(StorageConfigTest, TestStorageConfigRejectsUnknownChecksumAlgorithm) {
+    const std::string malformed_json = R"({
+        "type": "file",
+        "global_unique_name": "unknown_checksum_algo",
+        "storage_spec": {"root_path": "/tmp/x", "key_count_per_file": 1},
+        "integrity": {"enable_meta_checksum": true, "algo": "sha256"}
+    })";
+    StorageConfig config;
+    EXPECT_FALSE(config.FromJsonString(malformed_json));
 }
