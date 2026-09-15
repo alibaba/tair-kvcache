@@ -41,6 +41,25 @@ instance_id + storage_type + host_ip_port
 - 同一 instance 的两个 host 互不影响；
 - snapshot 栅栏、generation、限流和节点生命周期都按上述身份隔离。
 
+同机多 engine 部署将 `host_ip_port` 作为逻辑 engine identity，规范格式为：
+
+```text
+<canonical-ip-port>@<engine-index>
+```
+
+例如，一台 8 卡机器配置 `TP=4`、`DS_LLM_MULTI_ENGINE_NUM=2`，效果相当于
+在两台 4 卡机器上各运行一个 engine：
+
+- engine 0 使用 GPU 0–3，engine rank 为 0，上报身份是 `10.0.0.8:8080@0`；
+- engine 1 使用 GPU 4–7，engine rank 为 1，上报身份是 `10.0.0.8:8080@1`。
+
+KVCM 把这两个 `host_ip_port` 当作两个独立 engine，因此它们的注册、心跳、
+HOST_DOWN、snapshot 和缓存命中互不影响。单 engine 也携带后缀，固定使用 `@0`。
+
+数据 URI 仍然只表示真实的数据访问地址，例如两个 engine 的 subscriber URI 都可以是
+`vllm://10.0.0.8:8080/hbm`。URI 不携带 index；engine 区分只使用上述
+`host_ip_port@index`，请求最终由 DashServing 根据 engine rank 路由。
+
 `RegisterInstance` 与 `EVENT_NODE_REGISTER` 不是同一层注册：
 
 - `RegisterInstance` 持久化 instance 的静态配置，并在 KVCM 重启时恢复；
@@ -177,7 +196,7 @@ HTTP 接口为 `POST /api/reportEvent`，gRPC 方法为 `ReportEvent`。
 | 字段 | 要求 |
 | --- | --- |
 | `instance_id` | 必填，必须已经通过 `RegisterInstance` 创建 |
-| `host_ip_port` | 必填，必须稳定且与查询侧识别的 worker 地址一致；不能包含 location id 分隔符 `#` |
+| `host_ip_port` | 必填，必须稳定且与查询侧识别的逻辑 worker identity 一致；同机多 engine 使用 `<canonical-ip-port>@<engine-index>`；不能包含 location id 分隔符 `#` |
 | `storage_type` | 非空请求必填，只支持 `ST_EVENT_REPORT_L1P5`、`ST_EVENT_REPORT_L2` |
 | `events` | 有序事件列表；空列表是 no-op success |
 | `trace_id` | 建议每次请求唯一，便于排查 |
