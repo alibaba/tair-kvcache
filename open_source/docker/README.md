@@ -73,7 +73,7 @@ docker run --rm kv_cache_manager_dev:latest bash -lc '
 '
 ```
 
-发布新镜像后，还需将 CI 中固定的 `2026_02_13_12_03_24230b1` 镜像标签更新为实际发布的新标签，已有固定标签不会自动获得这些依赖。
+CI 测试容器及 `build-dev-image.yml` 的 `BUILD_IMAGE` 固定使用从主分支发布的 `2026_09_15_04_41_9b2e152`（支持 `linux/amd64` 和 `linux/arm64`）。后续发布新镜像时需同步更新这些引用，已有固定标签不会自动获得新依赖。
 
 ### 基于已有推理引擎开发镜像构建通用开发镜像（Manager+Connector）
 
