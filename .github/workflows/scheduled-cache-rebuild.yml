@@ -23,3 +23,13 @@ jobs:
             -f rebuildDiskCache=true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger coverage workflow with cache rebuild
+        run: |
+          gh workflow run coverage.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f runs-on=aliyun-ecs-x64 \
+            -f rebuildDiskCache=true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
