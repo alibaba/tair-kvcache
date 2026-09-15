@@ -70,17 +70,7 @@ uint64_t WeightedLruPool::resident_full_count(std::size_t alive_from_position) c
 }
 
 uint64_t WeightedLruPool::resident_linear_count(std::size_t alive_from_position) const {
-    const std::size_t alive_from = NormalizeAliveFrom(alive_from_position);
-    if (alive_from <= 1) {
-        return static_cast<uint64_t>(linear_positions_.size());
-    }
-    uint64_t count = 0;
-    for (const auto &[_, position] : linear_positions_) {
-        if (position >= alive_from) {
-            ++count;
-        }
-    }
-    return count;
+    return ActiveObjectCount(alive_from_position) - resident_full_count(alive_from_position);
 }
 
 uint64_t WeightedLruPool::resident_bytes(std::size_t alive_from_position) const {
@@ -132,14 +122,7 @@ WeightedLruPool::PositionRemap WeightedLruPool::MaybeCompactPositions(std::size_
     }
 
     const std::size_t alive_from = NormalizeAliveFrom(alive_from_position);
-    std::size_t active_positions = 0;
-    for (const PositionMap *map : {&full_positions_, &linear_positions_}) {
-        for (const auto &[_, position] : *map) {
-            if (position >= alive_from) {
-                ++active_positions;
-            }
-        }
-    }
+    const std::size_t active_positions = static_cast<std::size_t>(ActiveObjectCount(alive_from));
     const std::size_t positions_over_slack = fenwick_.size() - kCompactionSlackPositions;
     if (active_positions >= (positions_over_slack + 1) / 2) {
         return remap;
@@ -194,6 +177,28 @@ WeightedLruPool::PositionRemap WeightedLruPool::MaybeCompactPositions(std::size_
         }
     }
     return remap;
+}
+
+uint64_t WeightedLruPool::ActiveObjectCount(std::size_t alive_from_position) const {
+    const std::size_t alive_from = NormalizeAliveFrom(alive_from_position);
+    const std::size_t position_count = fenwick_.size();
+    if (alive_from > position_count) {
+        return 0;
+    }
+
+    const uint64_t active_full =
+        full_count_fenwick_.PrefixSum(position_count) - full_count_fenwick_.PrefixSum(alive_from - 1);
+    const uint64_t linear_charge = charge_of(CacheObjectType::kLinear);
+    if (linear_charge == 0) {
+        // Full-only pools never contain Linear objects.
+        return active_full;
+    }
+
+    const uint64_t active_bytes = fenwick_.PrefixSum(position_count) - fenwick_.PrefixSum(alive_from - 1);
+    // Every live marker has one of the two fixed charges, hence:
+    // active_bytes = active_full * full_charge + active_linear * linear_charge.
+    const uint64_t active_linear = (active_bytes - active_full * charge_of(CacheObjectType::kFull)) / linear_charge;
+    return active_full + active_linear;
 }
 
 void WeightedLruPool::Reset() {

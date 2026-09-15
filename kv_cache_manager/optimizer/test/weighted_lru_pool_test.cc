@@ -189,4 +189,42 @@ TEST_F(WeightedLruPoolTest, CompactionPreservesOrderAndBytes) {
     EXPECT_EQ(oracle.TotalBytes(), pool.resident_bytes());
 }
 
+TEST_F(WeightedLruPoolTest, CompactionDropsMixedObjectsBelowLivenessBoundary) {
+    WeightedLruPool pool(/*full=*/3, /*linear=*/5);
+    for (int64_t key = 0; key < 5000; ++key) {
+        pool.Touch({key % 2 == 0 ? CacheObjectType::kFull : CacheObjectType::kLinear, key});
+    }
+
+    constexpr std::size_t kAliveFrom = 4801;
+    EXPECT_EQ(100u, pool.resident_full_count(kAliveFrom));
+    EXPECT_EQ(100u, pool.resident_linear_count(kAliveFrom));
+    EXPECT_EQ(800u, pool.resident_bytes(kAliveFrom));
+
+    const auto remap = pool.MaybeCompactPositions(kAliveFrom);
+    ASSERT_TRUE(remap.compacted);
+    EXPECT_EQ(200u, pool.position_count());
+    EXPECT_EQ(100u, pool.resident_full_count());
+    EXPECT_EQ(100u, pool.resident_linear_count());
+    EXPECT_EQ(800u, pool.resident_bytes());
+    EXPECT_FALSE(pool.IsResident({CacheObjectType::kFull, 0}));
+    EXPECT_TRUE(pool.IsResident({CacheObjectType::kFull, 4998}));
+    EXPECT_TRUE(pool.IsResident({CacheObjectType::kLinear, 4999}));
+}
+
+TEST_F(WeightedLruPoolTest, FullOnlyCompactionSupportsZeroLinearCharge) {
+    WeightedLruPool pool(/*full=*/7, /*linear=*/0);
+    for (int round = 0; round < 1000; ++round) {
+        for (int64_t key = 0; key < 8; ++key) {
+            pool.Touch({CacheObjectType::kFull, key});
+        }
+    }
+
+    const auto remap = pool.MaybeCompactPositions();
+    ASSERT_TRUE(remap.compacted);
+    EXPECT_EQ(8u, pool.position_count());
+    EXPECT_EQ(8u, pool.resident_full_count());
+    EXPECT_EQ(0u, pool.resident_linear_count());
+    EXPECT_EQ(56u, pool.resident_bytes());
+}
+
 } // namespace kv_cache_manager

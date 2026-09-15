@@ -95,6 +95,11 @@ private:
         return alive_from_position <= 1 ? 1 : alive_from_position;
     }
 
+    // Counts live typed objects from the existing byte and Full-count Fenwick
+    // trees. This keeps the ordinary compaction eligibility check logarithmic;
+    // hash maps are traversed only when a compaction is actually required.
+    uint64_t ActiveObjectCount(std::size_t alive_from_position) const;
+
     uint64_t charges_[2];
     DynamicFenwickTree fenwick_;
     // Parallel order-statistics view counting 1 per Full marker at the same
