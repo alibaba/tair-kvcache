@@ -945,6 +945,29 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestReclaimOrderRemainsStrictLruAfterHitAndInsert) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("strict_lru_order", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2"}}}));
+
+    PropertyMapVector properties;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->GetProperties(nullptr, {2}, {PROPERTY_URI}, properties));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}}}));
+
+    KeyVector reclaim_keys;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 3, reclaim_keys));
+    EXPECT_EQ((KeyVector{1, 2, 3}), reclaim_keys);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesDoesNotTouchLruState) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_reclaim_candidates_no_touch", meta_storage_backend_config_));
