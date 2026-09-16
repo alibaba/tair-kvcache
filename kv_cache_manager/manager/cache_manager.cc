@@ -965,6 +965,9 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
             selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
             (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
              selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE);
+        if (supports_multiple_peers) {
+            selector.max_peer_count = EnvUtil::GetEnv("KVCM_V6D_MAX_PEER_COUNT", selector.max_peer_count);
+        }
         if (selector.max_peer_count != 1 && !supports_multiple_peers) {
             request_context->error_tracer()->AddErrorMsg(
                 "backend selector max_peer_count only applies to V6D selection strategies");

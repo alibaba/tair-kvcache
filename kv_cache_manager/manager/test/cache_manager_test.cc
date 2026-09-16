@@ -14,6 +14,7 @@
 #include <thread>
 #include <tuple>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -8280,6 +8281,48 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
     }
 
     dsm->storage_map_.erase("event_report_default");
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendV6DMaxPeerCountEnvOverride) {
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    const std::vector<int64_t> keys = {87'000, 87'001};
+    ReportEventSnapshotForKeys(event_backend, "10.0.3.1:8080", {keys[0]}, "env_peer_a");
+    ReportEventSnapshotForKeys(event_backend, "10.0.3.2:8080", {keys[1]}, "env_peer_b");
+
+    auto check_hits = [&](LocationSelectStrategy strategy, int32_t requested_count, size_t expected_hits) {
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, strategy, requested_count},
+        };
+        auto [ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                        "test_instance",
+                                                                        CacheManager::QueryType::QT_BATCH_GET,
+                                                                        keys,
+                                                                        {},
+                                                                        BlockMask{static_cast<size_t>(0)},
+                                                                        0,
+                                                                        {},
+                                                                        selectors);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(keys.size(), locations.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(i < expected_hits ? 1u : 0u, locations[i].cache_locations_view().size());
+        }
+    };
+
+    for (auto strategy : {LocationSelectStrategy::LSS_V6D_PREFIX, LocationSelectStrategy::LSS_V6D_COVERAGE}) {
+        check_hits(strategy, 4, 2);
+        {
+            ScopedEnv env("KVCM_V6D_MAX_PEER_COUNT", "1");
+            check_hits(strategy, 4, 1);
+        }
+        {
+            ScopedEnv env("KVCM_V6D_MAX_PEER_COUNT", "2");
+            check_hits(strategy, 1, 2);
+            check_hits(LocationSelectStrategy::LSS_WEIGHTED_RANDOM, 1, 2);
+        }
+        check_hits(strategy, 1, 1);
+    }
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendSelectsMultiplePeersForPrefix) {
