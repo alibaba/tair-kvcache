@@ -102,8 +102,7 @@ TEST_F(KvMetaTransferClientTest, RejectsUriAndBufferSizeMismatchBeforeIo) {
     const std::string path = root_path_ + "must_not_exist";
     const UriStrVec uris = {"file://test_nfs/" + path + "?blkid=0&size=4"};
 
-    auto [ec, actual_uris] =
-        client->SaveObjects(uris, {payload.size()}, {MakeBuffer(payload.data(), payload.size())});
+    auto [ec, actual_uris] = client->SaveObjects(uris, {payload.size()}, {MakeBuffer(payload.data(), payload.size())});
     EXPECT_EQ(ER_INVALID_PARAMS, ec);
     EXPECT_TRUE(actual_uris.empty());
     EXPECT_FALSE(std::filesystem::exists(path));
@@ -123,18 +122,14 @@ TEST_F(KvMetaTransferClientTest, RejectsIgnoredOrOversizedObjects) {
     const UriStrVec ignored_uri = {"file://test_nfs/" + root_path_ + "ignored?blkid=0&size=5"};
     EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client->LoadObjects(ignored_uri, {payload.size()}, {buffer}));
 
-    auto overflowing_buffer =
-        MakeBuffer(reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - payload.size() + 1),
-                   payload.size());
-    EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS,
-              client->LoadObjects(ignored_uri, {payload.size()}, {overflowing_buffer}));
+    auto overflowing_buffer = MakeBuffer(
+        reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - payload.size() + 1), payload.size());
+    EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client->LoadObjects(ignored_uri, {payload.size()}, {overflowing_buffer}));
 }
 
 TEST_F(KvMetaTransferClientTest, RejectsMaxObjectSizeAboveTheServiceContract) {
     EXPECT_EQ(nullptr, KvMetaTransferClient::Create(client_config_, init_params_, 0));
-    EXPECT_EQ(nullptr,
-              KvMetaTransferClient::Create(
-                  client_config_, init_params_, 1ULL * 1024 * 1024 * 1024 + 1));
+    EXPECT_EQ(nullptr, KvMetaTransferClient::Create(client_config_, init_params_, 1ULL * 1024 * 1024 * 1024 + 1));
 }
 
 TEST_F(KvMetaTransferClientTest, RejectsMalformedConstructionInputsBeforeBackendInitialization) {
@@ -163,22 +158,19 @@ TEST_F(KvMetaTransferClientTest, RejectsServiceBatchLimitsBeforeDataPlaneIo) {
     std::vector<std::uint64_t> too_many_sizes;
     BlockBuffers too_many_buffers;
     for (std::size_t i = 0; i < 65; ++i) {
-        too_many_uris.push_back(
-            "file://test_nfs/" + root_path_ + "too-many-" + std::to_string(i) + "?blkid=0&size=1");
+        too_many_uris.push_back("file://test_nfs/" + root_path_ + "too-many-" + std::to_string(i) + "?blkid=0&size=1");
         too_many_sizes.push_back(1);
         too_many_buffers.push_back(MakeBuffer(&payload, 1));
     }
-    EXPECT_EQ(ER_INVALID_PARAMS,
-              client->LoadObjects(too_many_uris, too_many_sizes, too_many_buffers));
+    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(too_many_uris, too_many_sizes, too_many_buffers));
 
     constexpr std::size_t kOneGiB = 1ULL * 1024 * 1024 * 1024;
     UriStrVec oversized_batch_uris;
     std::vector<std::uint64_t> oversized_batch_sizes;
     BlockBuffers oversized_batch_buffers;
     for (std::size_t i = 0; i < 5; ++i) {
-        oversized_batch_uris.push_back(
-            "file://test_nfs/" + root_path_ + "too-large-" + std::to_string(i) +
-            "?blkid=0&size=" + std::to_string(kOneGiB));
+        oversized_batch_uris.push_back("file://test_nfs/" + root_path_ + "too-large-" + std::to_string(i) +
+                                       "?blkid=0&size=" + std::to_string(kOneGiB));
         oversized_batch_sizes.push_back(kOneGiB);
         oversized_batch_buffers.push_back(MakeBuffer(&payload, kOneGiB));
     }
@@ -204,17 +196,15 @@ TEST_F(KvMetaTransferClientTest, RejectsConfigsThatDoNotUseTheExactKvMetaMarker)
     const auto wrong_marker_size = replace_once(client_config_, R"("value": 1)", R"("value": 2)");
     EXPECT_EQ(nullptr, KvMetaTransferClient::Create(wrong_marker_size, init_params_, 1024));
 
-    const auto extra_location_spec =
-        replace_once(client_config_, R"("value": 1)", R"("value": 1, "other": 1)");
+    const auto extra_location_spec = replace_once(client_config_, R"("value": 1)", R"("value": 1, "other": 1)");
     EXPECT_EQ(nullptr, KvMetaTransferClient::Create(extra_location_spec, init_params_, 1024));
 
     const auto wrong_block_size = replace_once(client_config_, R"("block_size": 1)", R"("block_size": 2)");
     EXPECT_EQ(nullptr, KvMetaTransferClient::Create(wrong_block_size, init_params_, 1024));
 
-    const auto grouped_location_spec =
-        replace_once(client_config_,
-                     R"("value": 1)",
-                     R"("value": 1
+    const auto grouped_location_spec = replace_once(client_config_,
+                                                    R"("value": 1)",
+                                                    R"("value": 1
             },
             "location_spec_groups": {
                 "value_group": ["value"])");

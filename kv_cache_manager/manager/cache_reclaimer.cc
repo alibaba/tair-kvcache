@@ -2726,11 +2726,10 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
     // KVMeta objects intentionally remain CLS_NEW and are managed by the
     // isolated generic-object path. Do not spend the KV-cache reclaim or
     // migration budget sampling those exact-key namespaces.
-    instance_infos.erase(
-        std::remove_if(instance_infos.begin(), instance_infos.end(), [](const auto &instance) {
-            return instance && IsKvMetaInstance(*instance);
-        }),
-        instance_infos.end());
+    instance_infos.erase(std::remove_if(instance_infos.begin(),
+                                        instance_infos.end(),
+                                        [](const auto &instance) { return instance && IsKvMetaInstance(*instance); }),
+                         instance_infos.end());
     if (instance_infos.empty()) {
         return result;
     }

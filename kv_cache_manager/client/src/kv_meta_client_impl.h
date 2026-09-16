@@ -15,18 +15,16 @@ public:
     KvMetaClientImpl() = default;
     ~KvMetaClientImpl() override = default;
 
-    std::pair<ClientErrorCode, std::string>
-    RegisterInstance(const std::string &trace_id,
-                     const std::string &instance_group,
-                     const std::string &user_data) override;
+    std::pair<ClientErrorCode, std::string> RegisterInstance(const std::string &trace_id,
+                                                             const std::string &instance_group,
+                                                             const std::string &user_data) override;
     std::pair<ClientErrorCode, KvMetaInstanceInfo> GetInstanceInfo(const std::string &trace_id) override;
-    std::pair<ClientErrorCode, KvMetaGetResult>
-    Get(const std::string &trace_id, const std::vector<std::string> &keys) override;
-    std::pair<ClientErrorCode, KvMetaStartWriteResult>
-    StartWrite(const std::string &trace_id,
-               const std::vector<std::string> &keys,
-               const std::vector<std::uint64_t> &value_sizes,
-               std::int32_t write_timeout_seconds) override;
+    std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
+                                                    const std::vector<std::string> &keys) override;
+    std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
+                                                                  const std::vector<std::string> &keys,
+                                                                  const std::vector<std::uint64_t> &value_sizes,
+                                                                  std::int32_t write_timeout_seconds) override;
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override;

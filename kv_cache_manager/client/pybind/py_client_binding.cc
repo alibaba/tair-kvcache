@@ -104,8 +104,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_SERVICE_INSTANCE_NOT_EXIST", kvcm::ClientErrorCode::ER_SERVICE_INSTANCE_NOT_EXIST)
         .value("ER_SERVICE_NOT_LEADER", kvcm::ClientErrorCode::ER_SERVICE_NOT_LEADER)
         .value("ER_SERVICE_NOT_READY", kvcm::ClientErrorCode::ER_SERVICE_NOT_READY)
-        .value("ER_SERVICE_REACH_MAX_ENTITY_CAPACITY",
-               kvcm::ClientErrorCode::ER_SERVICE_REACH_MAX_ENTITY_CAPACITY)
+        .value("ER_SERVICE_REACH_MAX_ENTITY_CAPACITY", kvcm::ClientErrorCode::ER_SERVICE_REACH_MAX_ENTITY_CAPACITY)
         .value("ER_SERVICE_RESOURCE_EXHAUSTED", kvcm::ClientErrorCode::ER_SERVICE_RESOURCE_EXHAUSTED)
         .value("ER_SERVICE_NOT_FOUND", kvcm::ClientErrorCode::ER_SERVICE_NOT_FOUND)
         .value("ER_SERVICE_WRITE_IN_PROGRESS", kvcm::ClientErrorCode::ER_SERVICE_WRITE_IN_PROGRESS)

@@ -47,8 +47,7 @@ ClientErrorCode SdkWrapper::InitForKvMeta(const std::unique_ptr<ClientConfig> &c
                                           std::uint64_t max_object_bytes,
                                           const SharedMemoryRegistration *shared_memory_registration) {
     if (max_object_bytes == 0 || max_object_bytes > std::numeric_limits<std::size_t>::max()) {
-        KVCM_LOG_WARN("KVMeta max object bytes is invalid: %llu",
-                      static_cast<unsigned long long>(max_object_bytes));
+        KVCM_LOG_WARN("KVMeta max object bytes is invalid: %llu", static_cast<unsigned long long>(max_object_bytes));
         return ER_INVALID_PARAMS;
     }
     return InitInternal(client_config, init_params, true, max_object_bytes, shared_memory_registration);
@@ -310,11 +309,10 @@ ClientErrorCode SdkWrapper::GetKvMetaObjects(const std::vector<DataStorageUri> &
         OpType::GET, std::move(tasks), wrapper_config_->timeout_config().get_timeout_ms(), true);
 }
 
-ClientErrorCode SdkWrapper::PutKvMetaObjects(
-    const std::vector<DataStorageUri> &remote_uris,
-    const std::vector<std::uint64_t> &value_sizes,
-    const BlockBuffers &local_buffers,
-    std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
+ClientErrorCode SdkWrapper::PutKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
+                                             const std::vector<std::uint64_t> &value_sizes,
+                                             const BlockBuffers &local_buffers,
+                                             std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
     if (!actual_remote_uris) {
         return ER_INVALID_PARAMS;
     }
@@ -339,16 +337,14 @@ ClientErrorCode SdkWrapper::PutKvMetaObjects(
         BlockBuffers object_buffer{local_buffers[i]};
         auto object_result = std::make_shared<std::vector<DataStorageUri>>();
         object_results.push_back(object_result);
-        tasks.push_back([sdk,
-                         object_uri = std::move(object_uri),
-                         object_buffer = std::move(object_buffer),
-                         object_result]() {
-            return sdk->Put(object_uri, object_buffer, object_result);
-        });
+        tasks.push_back(
+            [sdk, object_uri = std::move(object_uri), object_buffer = std::move(object_buffer), object_result]() {
+                return sdk->Put(object_uri, object_buffer, object_result);
+            });
     }
 
-    ec = RunWithTimeoutParallel(
-        OpType::PUT, std::move(tasks), wrapper_config_->timeout_config().put_timeout_ms(), true);
+    ec =
+        RunWithTimeoutParallel(OpType::PUT, std::move(tasks), wrapper_config_->timeout_config().put_timeout_ms(), true);
     if (ec != ER_OK) {
         return ec;
     }
@@ -398,9 +394,8 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         std::uint64_t buffer_size = 0;
         for (const auto &iov : buffer.iovs) {
             const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
-            if (iov.ignore || iov.size == 0 || buffer_size > expected_size ||
-                iov.size > expected_size - buffer_size || iov.base == nullptr ||
-                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) ||
+            if (iov.ignore || iov.size == 0 || buffer_size > expected_size || iov.size > expected_size - buffer_size ||
+                iov.base == nullptr || (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) ||
                 iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
                 return ER_INVALID_LOCAL_BUFFERS;
             }
@@ -505,8 +500,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                     auto overdue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::steady_clock::now() - deadline)
                                           .count();
-                    KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O",
-                                  static_cast<long long>(overdue_ms));
+                    KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
                     return ER_SDK_TIMEOUT;
                 }
                 return task();
@@ -542,8 +536,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                     auto overdue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::steady_clock::now() - deadline)
                                           .count();
-                    KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O",
-                                  static_cast<long long>(overdue_ms));
+                    KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
                     return ER_SDK_TIMEOUT;
                 }
                 return task();

@@ -45,9 +45,9 @@ public:
         : NfsBackend(std::move(metrics_registry)) {}
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
-                                                              size_t size_per_key,
-                                                              const std::string &,
-                                                              std::function<void()> cb) override {
+                                                             size_t size_per_key,
+                                                             const std::string &,
+                                                             std::function<void()> cb) override {
         std::vector<std::pair<ErrorCode, DataStorageUri>> result;
         for (const char *path : {"/malformed/first", "/malformed/second"}) {
             DataStorageUri uri;
@@ -67,9 +67,8 @@ public:
         return result;
     }
 
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
-                                  const std::string &,
-                                  std::function<void()> cb) override {
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
         deleted_uris.insert(deleted_uris.end(), storage_uris.begin(), storage_uris.end());
         if (cb) {
             cb();
@@ -86,9 +85,9 @@ public:
         : NfsBackend(std::move(metrics_registry)) {}
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
-                                                              size_t size_per_key,
-                                                              const std::string &,
-                                                              std::function<void()> cb) override {
+                                                             size_t size_per_key,
+                                                             const std::string &,
+                                                             std::function<void()> cb) override {
         DataStorageUri uri;
         uri.SetProtocol("file");
         uri.SetPath("/malformed/shared-file");
@@ -100,9 +99,8 @@ public:
         return {{EC_OK, std::move(uri)}};
     }
 
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
-                                  const std::string &,
-                                  std::function<void()> cb) override {
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
         delete_calls += storage_uris.size();
         if (cb) {
             cb();
@@ -119,9 +117,9 @@ public:
         : NfsBackend(std::move(metrics_registry)) {}
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
-                                                              size_t size_per_key,
-                                                              const std::string &,
-                                                              std::function<void()> cb) override {
+                                                             size_t size_per_key,
+                                                             const std::string &,
+                                                             std::function<void()> cb) override {
         DataStorageUri uri;
         uri.SetProtocol("file");
         uri.SetPath("/malformed/reused-singleton");
@@ -133,9 +131,8 @@ public:
         return {{EC_OK, std::move(uri)}};
     }
 
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
-                                  const std::string &,
-                                  std::function<void()> cb) override {
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
         delete_calls += storage_uris.size();
         if (cb) {
             cb();
@@ -151,9 +148,8 @@ public:
     explicit BlockingDeleteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : NfsBackend(std::move(metrics_registry)) {}
 
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
-                                  const std::string &,
-                                  std::function<void()> cb) override {
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
         std::unique_lock<std::mutex> lock(mutex_);
         delete_entered_ = true;
         condition_.notify_all();
@@ -336,8 +332,7 @@ TEST_F(KvMetaManagerTest, DynamicSizesAreIndependentAndInvisibleUntilFinish) {
     EXPECT_FALSE(before_finish[0].found);
     EXPECT_FALSE(before_finish[1].found);
 
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, keys);
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
@@ -349,8 +344,8 @@ TEST_F(KvMetaManagerTest, DynamicSizesAreIndependentAndInvisibleUntilFinish) {
     // Committed generic objects deliberately remain CLS_NEW. The negative
     // timestamp is private to KVMeta and keeps them out of the existing
     // CLS_SERVING reclaimer/migration path.
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     KeyVector internal_keys;
     LocationIdsPerKey location_ids;
@@ -390,8 +385,7 @@ TEST_F(KvMetaManagerTest, MalformedCreateResponseReleasesOnlyOwnedAllocations) {
         storage_manager->storage_map_["nfs_01"] = malformed;
     }
 
-    const auto [ec, result] = manager_->StartWrite(
-        &request_context_, kInstanceId, {"malformed-create"}, {17}, 30);
+    const auto [ec, result] = manager_->StartWrite(&request_context_, kInstanceId, {"malformed-create"}, {17}, 30);
 
     EXPECT_EQ(EC_MISMATCH, ec);
     EXPECT_TRUE(result.key_mask.empty());
@@ -456,8 +450,7 @@ TEST_F(KvMetaManagerTest, RejectsPackedFileMemberWithoutDeletingItsSharedAllocat
         storage_manager->storage_map_["nfs_01"] = malformed;
     }
 
-    const auto [ec, result] = manager_->StartWrite(
-        &request_context_, kInstanceId, {"packed-member"}, {17}, 30);
+    const auto [ec, result] = manager_->StartWrite(&request_context_, kInstanceId, {"packed-member"}, {17}, 30);
 
     EXPECT_EQ(EC_CORRUPTION, ec);
     EXPECT_TRUE(result.key_mask.empty());
@@ -485,16 +478,15 @@ TEST_F(KvMetaManagerTest, RejectsAStorageBackendThatReusesOneSingletonForTwoKeys
         storage_manager->storage_map_["nfs_01"] = malformed;
     }
 
-    const auto [ec, result] = manager_->StartWrite(
-        &request_context_, kInstanceId, {"duplicate-uri-a", "duplicate-uri-b"}, {17, 17}, 30);
+    const auto [ec, result] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"duplicate-uri-a", "duplicate-uri-b"}, {17, 17}, 30);
 
     EXPECT_EQ(EC_CORRUPTION, ec);
     EXPECT_TRUE(result.key_mask.empty());
     EXPECT_TRUE(result.locations.empty());
     EXPECT_TRUE(result.write_session_id.empty());
     EXPECT_EQ(1, malformed->delete_calls);
-    const auto [get_ec, values] =
-        manager_->Get(&request_context_, kInstanceId, {"duplicate-uri-a", "duplicate-uri-b"});
+    const auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"duplicate-uri-a", "duplicate-uri-b"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
     EXPECT_FALSE(values[0].found);
@@ -508,8 +500,7 @@ TEST_F(KvMetaManagerTest, AtomicFinishFailureRollsBackEveryValue) {
     ASSERT_EQ(2, start.locations.size());
 
     // One failed item aborts the complete generic-object transaction.
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, false}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, false}));
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, keys);
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
@@ -520,8 +511,7 @@ TEST_F(KvMetaManagerTest, AtomicFinishFailureRollsBackEveryValue) {
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, keys, {7, 9}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     EXPECT_EQ((std::vector<bool>{false, false}), retry.key_mask);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false, false}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false, false}));
 }
 
 TEST_F(KvMetaManagerTest, RecoveryRebuildsExactDynamicByteUsage) {
@@ -530,11 +520,10 @@ TEST_F(KvMetaManagerTest, RecoveryRebuildsExactDynamicByteUsage) {
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_EQ(2, start.locations.size());
     ASSERT_EQ(start.locations[0].type, start.locations[1].type);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     indexer->SetStorageUsageByType(start.locations[0].type, 1);
     ASSERT_EQ(1, indexer->GetStorageUsage());
@@ -563,8 +552,8 @@ TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
                                         std::vector<bool>(start.locations.size(), true)));
     }
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     ASSERT_EQ(kObjectCount, indexer->GetStorageUsage());
 
@@ -573,8 +562,7 @@ TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
     // leader recovery explicitly resumes maintenance.
     manager_->CancelMaintenance();
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->TrimAll(&request_context_, kInstanceId, false));
-    auto [before_resume_ec, before_resume] =
-        manager_->Get(&request_context_, kInstanceId, {"trim-0", "trim-256"});
+    auto [before_resume_ec, before_resume] = manager_->Get(&request_context_, kInstanceId, {"trim-0", "trim-256"});
     ASSERT_EQ(EC_OK, before_resume_ec);
     ASSERT_EQ(2, before_resume.size());
     EXPECT_TRUE(before_resume[0].found);
@@ -586,8 +574,7 @@ TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
     ASSERT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
     EXPECT_EQ(0, indexer->GetStorageUsage());
 
-    auto [get_ec, values] = manager_->Get(
-        &request_context_, kInstanceId, {"trim-0", "trim-128", "trim-256"});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"trim-0", "trim-128", "trim-256"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(3, values.size());
     EXPECT_FALSE(values[0].found);
@@ -651,8 +638,8 @@ TEST_F(KvMetaManagerTest, ExistingKeysAreMaskedAndInflightKeysAreRetryable) {
     EXPECT_TRUE(second.locations.empty());
     EXPECT_TRUE(second.write_session_id.empty());
 
-    auto [mixed_ec, mixed] = manager_->StartWrite(
-        &request_context_, kInstanceId, {"same-key", "must-not-allocate"}, {21, 7}, 30);
+    auto [mixed_ec, mixed] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"same-key", "must-not-allocate"}, {21, 7}, 30);
     EXPECT_EQ(EC_EXIST, mixed_ec);
     EXPECT_TRUE(mixed.key_mask.empty());
     EXPECT_TRUE(mixed.locations.empty());
@@ -663,15 +650,14 @@ TEST_F(KvMetaManagerTest, ExistingKeysAreMaskedAndInflightKeysAreRetryable) {
     ASSERT_EQ(2, mixed_values.size());
     EXPECT_FALSE(mixed_values[0].found);
     EXPECT_FALSE(mixed_values[1].found);
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     EXPECT_EQ(21, indexer->GetStorageUsage());
 
     // A malformed finish request must not consume the valid session.
     EXPECT_EQ(EC_BADARGS, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {}));
-    EXPECT_EQ(EC_MISMATCH,
-              manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {true, true}));
+    EXPECT_EQ(EC_MISMATCH, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {true, true}));
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {true}));
 
     auto [wrong_committed_ec, wrong_committed] =
@@ -687,21 +673,16 @@ TEST_F(KvMetaManagerTest, ExistingKeysAreMaskedAndInflightKeysAreRetryable) {
 }
 
 TEST_F(KvMetaManagerTest, TrimRejectsActiveSessionsWithoutDeletingCommittedValues) {
-    auto [committed_ec, committed] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"trim-committed"}, {13}, 30);
+    auto [committed_ec, committed] = manager_->StartWrite(&request_context_, kInstanceId, {"trim-committed"}, {13}, 30);
     ASSERT_EQ(EC_OK, committed_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, committed.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, committed.write_session_id, {true}));
 
-    auto [active_ec, active] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"trim-active"}, {17}, 30);
+    auto [active_ec, active] = manager_->StartWrite(&request_context_, kInstanceId, {"trim-active"}, {17}, 30);
     ASSERT_EQ(EC_OK, active_ec);
     ASSERT_FALSE(active.write_session_id.empty());
 
     EXPECT_EQ(EC_EXIST, manager_->TrimAll(&request_context_, kInstanceId, false));
-    auto [get_ec, values] =
-        manager_->Get(&request_context_, kInstanceId, {"trim-committed", "trim-active"});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"trim-committed", "trim-active"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
     EXPECT_TRUE(values[0].found);
@@ -709,9 +690,7 @@ TEST_F(KvMetaManagerTest, TrimRejectsActiveSessionsWithoutDeletingCommittedValue
 
     // Rejection does not consume the writer's session. Once the caller ends
     // it, the same explicit Trim can safely remove the whole namespace.
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, active.write_session_id, {false}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, active.write_session_id, {false}));
     ASSERT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
     auto [after_ec, after] = manager_->Get(&request_context_, kInstanceId, {"trim-committed"});
     ASSERT_EQ(EC_OK, after_ec);
@@ -720,8 +699,7 @@ TEST_F(KvMetaManagerTest, TrimRejectsActiveSessionsWithoutDeletingCommittedValue
 }
 
 TEST_F(KvMetaManagerTest, TrimWaitBarrierIncludesSessionFinalization) {
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"finalizing-trim"}, {17}, 30);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"finalizing-trim"}, {17}, 30);
     ASSERT_EQ(EC_OK, start_ec);
 
     auto storage_manager = registry_manager_->data_storage_manager();
@@ -737,8 +715,7 @@ TEST_F(KvMetaManagerTest, TrimWaitBarrierIncludesSessionFinalization) {
 
     auto finish = std::async(std::launch::async, [&]() {
         RequestContext context("finish-while-trim");
-        return manager_->FinishWrite(
-            &context, kInstanceId, start.write_session_id, {false});
+        return manager_->FinishWrite(&context, kInstanceId, start.write_session_id, {false});
     });
     ASSERT_TRUE(blocking->WaitForDelete(std::chrono::seconds(2)));
 
@@ -759,18 +736,13 @@ TEST_F(KvMetaManagerTest, RemoveDoesNotInvalidateAnActiveWriteSession) {
     auto [committed_start_ec, committed_start] =
         manager_->StartWrite(&request_context_, kInstanceId, {"committed-remove-guard"}, {13}, 30);
     ASSERT_EQ(EC_OK, committed_start_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, committed_start.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, committed_start.write_session_id, {true}));
 
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"active-remove"}, {21}, 30);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"active-remove"}, {21}, 30);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
 
-    EXPECT_EQ(EC_EXIST,
-              manager_->Remove(
-                  &request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
+    EXPECT_EQ(EC_EXIST, manager_->Remove(&request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
 
     // Batch validation finishes before DeleteItems, so the committed key is
     // preserved when a later key in the same request is still active.
@@ -781,26 +753,20 @@ TEST_F(KvMetaManagerTest, RemoveDoesNotInvalidateAnActiveWriteSession) {
     EXPECT_TRUE(before_finish[0].found);
     EXPECT_FALSE(before_finish[1].found);
 
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
 
-    auto [get_ec, values] =
-        manager_->Get(&request_context_, kInstanceId, {"active-remove"});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"active-remove"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_TRUE(values[0].found);
-    EXPECT_EQ(EC_OK,
-              manager_->Remove(
-                  &request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {"committed-remove-guard", "active-remove"}));
 }
 
 TEST_F(KvMetaManagerTest, RemoveFinishesPhysicalDeleteBeforeReadmittingTheKey) {
     constexpr const char *key = "remove-recreate";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {key}, {17}, 30);
     ASSERT_EQ(EC_OK, start_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, start.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
 
     auto storage_manager = registry_manager_->data_storage_manager();
     ASSERT_TRUE(storage_manager);
@@ -825,8 +791,7 @@ TEST_F(KvMetaManagerTest, RemoveFinishesPhysicalDeleteBeforeReadmittingTheKey) {
     });
     // Remove still owns the KVMeta group shard while the old allocation is
     // being deleted, so a new generation cannot reach backend allocation yet.
-    EXPECT_EQ(std::future_status::timeout,
-              recreate.wait_for(std::chrono::milliseconds(100)));
+    EXPECT_EQ(std::future_status::timeout, recreate.wait_for(std::chrono::milliseconds(100)));
 
     blocking->ReleaseDelete();
     EXPECT_EQ(EC_OK, remove.get());
@@ -835,9 +800,7 @@ TEST_F(KvMetaManagerTest, RemoveFinishesPhysicalDeleteBeforeReadmittingTheKey) {
     ASSERT_EQ((std::vector<bool>{false}), recreated.key_mask);
     ASSERT_EQ(1, recreated.locations.size());
     ASSERT_FALSE(recreated.write_session_id.empty());
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, recreated.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, RemoveContainsPhysicalDeleteExceptionWithoutReplay) {
@@ -903,8 +866,7 @@ TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey)
 
     auto rollback = std::async(std::launch::async, [&]() {
         RequestContext context("rollback-before-recreate");
-        return manager_->FinishWrite(
-            &context, kInstanceId, start.write_session_id, {false});
+        return manager_->FinishWrite(&context, kInstanceId, start.write_session_id, {false});
     });
     // Metadata is already durably absent when the physical delete blocks, but
     // the group shard still prevents a new generation from being allocated
@@ -915,8 +877,7 @@ TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey)
         RequestContext context("recreate-after-rollback");
         return manager_->StartWrite(&context, kInstanceId, {key}, {19}, 30);
     });
-    EXPECT_EQ(std::future_status::timeout,
-              recreate.wait_for(std::chrono::milliseconds(100)));
+    EXPECT_EQ(std::future_status::timeout, recreate.wait_for(std::chrono::milliseconds(100)));
 
     blocking->ReleaseDelete();
     EXPECT_EQ(EC_OK, rollback.get());
@@ -925,9 +886,7 @@ TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey)
     ASSERT_EQ((std::vector<bool>{false}), recreated.key_mask);
     ASSERT_EQ(1, recreated.locations.size());
     ASSERT_FALSE(recreated.write_session_id.empty());
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, recreated.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionWithoutReplay) {
@@ -1013,8 +972,7 @@ TEST_F(KvMetaManagerTest, RollbackRejectsMalformedPhysicalDeleteResult) {
 
 TEST_F(KvMetaManagerTest, ExpiredSessionIsCleanedBeforeTheKeyCanBeWrittenAgain) {
     constexpr const char *kKey = "expires-and-retries";
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
 
@@ -1033,19 +991,15 @@ TEST_F(KvMetaManagerTest, ExpiredSessionIsCleanedBeforeTheKeyCanBeWrittenAgain) 
 
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_FALSE(retry.write_session_id.empty());
-    EXPECT_EQ(EC_NOENT,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, start.write_session_id, {true}));
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, retry.write_session_id, {false}));
+    EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     EXPECT_EQ(0, indexer->GetStorageUsage());
 }
@@ -1134,11 +1088,9 @@ TEST_F(KvMetaManagerTest, ExpiryWorkerSurvivesUnknownPhysicalDeleteException) {
 }
 
 TEST_F(KvMetaManagerTest, FinishCannotCommitAfterItsLeaseDeadlineWhileExpiryIsBusy) {
-    auto [first_ec, first] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"expiry-blocker"}, {11}, 1);
+    auto [first_ec, first] = manager_->StartWrite(&request_context_, kInstanceId, {"expiry-blocker"}, {11}, 1);
     ASSERT_EQ(EC_OK, first_ec);
-    auto [late_ec, late] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"late-finish"}, {13}, 1);
+    auto [late_ec, late] = manager_->StartWrite(&request_context_, kInstanceId, {"late-finish"}, {13}, 1);
     ASSERT_EQ(EC_OK, late_ec);
 
     auto storage_manager = registry_manager_->data_storage_manager();
@@ -1159,58 +1111,46 @@ TEST_F(KvMetaManagerTest, FinishCannotCommitAfterItsLeaseDeadlineWhileExpiryIsBu
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     auto finish = std::async(std::launch::async, [&]() {
         RequestContext context("late-finish-after-deadline");
-        return manager_->FinishWrite(
-            &context, kInstanceId, late.write_session_id, {true});
+        return manager_->FinishWrite(&context, kInstanceId, late.write_session_id, {true});
     });
     EXPECT_EQ(std::future_status::timeout, finish.wait_for(std::chrono::milliseconds(100)));
     blocking->ReleaseDelete();
     EXPECT_EQ(EC_TIMEOUT, finish.get());
 
-    EXPECT_EQ(EC_NOENT,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, first.write_session_id, {true}));
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {true}));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    const auto usage_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (indexer->GetStorageUsage() != 0 &&
-           std::chrono::steady_clock::now() < usage_deadline) {
+    const auto usage_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (indexer->GetStorageUsage() != 0 && std::chrono::steady_clock::now() < usage_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_EQ(0, indexer->GetStorageUsage());
 }
 
 TEST_F(KvMetaManagerTest, OversizedSessionIdIsRejectedWithoutConsumingTheSession) {
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"bounded-session-id"}, {17}, 30);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"bounded-session-id"}, {17}, 30);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
 
     EXPECT_EQ(EC_BADARGS,
-              manager_->FinishWrite(
-                  &request_context_,
-                  kInstanceId,
-                  std::string(manager_->limits().max_write_session_id_bytes + 1, 'x'),
-                  {true}));
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, start.write_session_id, {true}));
+              manager_->FinishWrite(&request_context_,
+                                    kInstanceId,
+                                    std::string(manager_->limits().max_write_session_id_bytes + 1, 'x'),
+                                    {true}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
 }
 
 TEST_F(KvMetaManagerTest, FinishRechecksLeaseAfterWaitingForTheGroupShard) {
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"finish-lock-wait"}, {17}, 1);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"finish-lock-wait"}, {17}, 1);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
 
-    auto [instance_ec, instance_info] = manager_->GetValidatedInstanceInfo(
-        &request_context_, kInstanceId);
+    auto [instance_ec, instance_info] = manager_->GetValidatedInstanceInfo(&request_context_, kInstanceId);
     ASSERT_EQ(EC_OK, instance_ec);
     ASSERT_TRUE(instance_info);
     const std::size_t quota_shard =
-        std::hash<std::string>{}(instance_info->instance_group_name()) %
-        manager_->quota_admission_mutexes_.size();
+        std::hash<std::string>{}(instance_info->instance_group_name()) % manager_->quota_admission_mutexes_.size();
 
     std::promise<void> shard_locked;
     auto release_shard = shard_locked.get_future();
@@ -1222,18 +1162,15 @@ TEST_F(KvMetaManagerTest, FinishRechecksLeaseAfterWaitingForTheGroupShard) {
     release_shard.wait();
 
     RequestContext finish_context("finish-after-group-lock-wait");
-    EXPECT_EQ(EC_TIMEOUT,
-              manager_->FinishWrite(
-                  &finish_context, kInstanceId, start.write_session_id, {true}));
+    EXPECT_EQ(EC_TIMEOUT, manager_->FinishWrite(&finish_context, kInstanceId, start.write_session_id, {true}));
     blocker.join();
 
-    auto [get_ec, values] =
-        manager_->Get(&request_context_, kInstanceId, {"finish-lock-wait"});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"finish-lock-wait"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     EXPECT_EQ(0, indexer->GetStorageUsage());
 }
@@ -1251,8 +1188,8 @@ TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     auto corrupt_scheme = [](const std::vector<ErrorCode> &get_ecs,
                              const LocationIdVector &,
@@ -1269,8 +1206,8 @@ TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
         locations[0] = std::move(replacement);
         return {MA_OK, {EC_OK}};
     };
-    const auto rmw = indexer->ReadModifyWriteTargetLocations(
-        &request_context_, {internal_key}, {{location_id}}, corrupt_scheme);
+    const auto rmw =
+        indexer->ReadModifyWriteTargetLocations(&request_context_, {internal_key}, {{location_id}}, corrupt_scheme);
     ASSERT_EQ(EC_OK, rmw.ec);
     ASSERT_EQ(1, rmw.per_location_error_codes.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), rmw.per_location_error_codes[0]);
@@ -1280,8 +1217,7 @@ TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
 }
 
 TEST_F(KvMetaManagerTest, RejectsAmbiguousOrUnboundedRequestsBeforeAllocation) {
-    auto [duplicate_ec, duplicate] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"dup", "dup"}, {1, 2}, 30);
+    auto [duplicate_ec, duplicate] = manager_->StartWrite(&request_context_, kInstanceId, {"dup", "dup"}, {1, 2}, 30);
     EXPECT_EQ(EC_DUPLICATE_ENTITY, duplicate_ec);
     EXPECT_TRUE(duplicate.locations.empty());
 
@@ -1313,8 +1249,7 @@ TEST_F(KvMetaManagerTest, RejectsAmbiguousOrUnboundedRequestsBeforeAllocation) {
 
 TEST_F(KvMetaManagerTest, RejectsWriteTimeoutLimitOutsideTheProtocolRange) {
     KvMetaManager::Limits limits;
-    limits.max_write_timeout_seconds =
-        static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1;
+    limits.max_write_timeout_seconds = static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1;
     KvMetaManager invalid_manager(cache_manager_, registry_manager_, limits);
 
     EXPECT_FALSE(invalid_manager.Init());
@@ -1333,20 +1268,18 @@ TEST_F(KvMetaManagerTest, RecoveryCanBeCancelledWithoutTouchingMetadata) {
 }
 
 TEST_F(KvMetaManagerTest, DemotionDefersUnboundedSessionCleanupToRecovery) {
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"demoted-active"}, {19}, 1);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"demoted-active"}, {19}, 1);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     LocationsPerKey active_location;
-    const auto active_result = indexer->GetLocations(
-        &request_context_,
-        {KvMetaManager::InternalKey("demoted-active")},
-        {{KvMetaManager::StableLocationId("demoted-active")}},
-        active_location);
+    const auto active_result = indexer->GetLocations(&request_context_,
+                                                     {KvMetaManager::InternalKey("demoted-active")},
+                                                     {{KvMetaManager::StableLocationId("demoted-active")}},
+                                                     active_location);
     ASSERT_EQ(1, active_result.per_location_error_codes.size());
     ASSERT_EQ(1, active_location.size());
     ASSERT_EQ(1, active_location[0].size());
@@ -1356,11 +1289,8 @@ TEST_F(KvMetaManagerTest, DemotionDefersUnboundedSessionCleanupToRecovery) {
     EXPECT_GT(active_location[0][0]->create_time(), std::int64_t{1} << 62);
 
     manager_->DoCleanup();
-    EXPECT_EQ(EC_NOENT,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, start.write_session_id, {true}));
-    auto [hidden_ec, hidden] =
-        manager_->Get(&request_context_, kInstanceId, {"demoted-active"});
+    EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    auto [hidden_ec, hidden] = manager_->Get(&request_context_, kInstanceId, {"demoted-active"});
     ASSERT_EQ(EC_OK, hidden_ec);
     ASSERT_EQ(1, hidden.size());
     EXPECT_FALSE(hidden[0].found);
@@ -1368,29 +1298,24 @@ TEST_F(KvMetaManagerTest, DemotionDefersUnboundedSessionCleanupToRecovery) {
     const auto recovery_start = std::chrono::steady_clock::now();
     ASSERT_EQ(EC_OK, manager_->DoRecover());
     const auto recovery_elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - recovery_start);
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - recovery_start);
     // Recovery must not immediately delete a lease that an old leader has
     // already handed to a client. Keep the lower bound loose for slow ASAN
     // hosts while still distinguishing it from the old eager deletion.
     EXPECT_GE(recovery_elapsed.count(), 100);
     ASSERT_TRUE(manager_->ResumeMaintenance());
-    auto [retry_ec, retry] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"demoted-active"}, {19}, 30);
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"demoted-active"}, {19}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     EXPECT_EQ((std::vector<bool>{false}), retry.key_mask);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, retry.write_session_id, {false}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, RecoveryProtectsUntaggedActiveMarkerDuringRollingUpgrade) {
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"legacy-active"}, {19}, 30);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"legacy-active"}, {19}, 30);
     ASSERT_EQ(EC_OK, start_ec);
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     const auto internal_key = KvMetaManager::InternalKey("legacy-active");
     const auto location_id = KvMetaManager::StableLocationId("legacy-active");
@@ -1420,8 +1345,7 @@ TEST_F(KvMetaManagerTest, RecoveryProtectsUntaggedActiveMarkerDuringRollingUpgra
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->DoRecover(abort_after_poll));
 
     LocationsPerKey still_active;
-    const auto active_result = indexer->GetLocations(
-        &request_context_, {internal_key}, {{location_id}}, still_active);
+    const auto active_result = indexer->GetLocations(&request_context_, {internal_key}, {{location_id}}, still_active);
     ASSERT_EQ(1, active_result.per_location_error_codes.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), active_result.per_location_error_codes[0]);
     ASSERT_EQ(1, still_active.size());
@@ -1484,30 +1408,25 @@ TEST_F(KvMetaManagerTest, RecoveryContainsPhysicalDeleteExceptionWithoutReplay) 
 }
 
 TEST_F(KvMetaManagerTest, CancellationClosesSessionAdmissionBeforeWorkerJoin) {
-    auto [first_ec, first] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"before-cancel"}, {19}, 30);
+    auto [first_ec, first] = manager_->StartWrite(&request_context_, kInstanceId, {"before-cancel"}, {19}, 30);
     ASSERT_EQ(EC_OK, first_ec);
 
     manager_->CancelMaintenance();
-    auto [cancelled_ec, cancelled] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
+    auto [cancelled_ec, cancelled] = manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, cancelled_ec);
     EXPECT_TRUE(cancelled.locations.empty());
     EXPECT_FALSE(manager_->ResumeMaintenance());
 
     // An already admitted Finish may still drain cleanly. No new session can
     // be published after cancellation, and DoCleanup performs the final join.
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {false}));
     manager_->DoCleanup();
     ASSERT_EQ(EC_OK, manager_->DoRecover());
     ASSERT_TRUE(manager_->ResumeMaintenance());
 
-    auto [retry_ec, retry] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"after-cancel"}, {23}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, ActiveSessionCountIsBoundedBeforeAllocation) {
@@ -1517,24 +1436,17 @@ TEST_F(KvMetaManagerTest, ActiveSessionCountIsBoundedBeforeAllocation) {
     manager_ = std::make_unique<KvMetaManager>(cache_manager_, registry_manager_, limits);
     ASSERT_TRUE(manager_->Init());
 
-    auto [first_ec, first] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"session-a"}, {7}, 30);
+    auto [first_ec, first] = manager_->StartWrite(&request_context_, kInstanceId, {"session-a"}, {7}, 30);
     ASSERT_EQ(EC_OK, first_ec);
-    auto [second_ec, second] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"session-b"}, {9}, 30);
+    auto [second_ec, second] = manager_->StartWrite(&request_context_, kInstanceId, {"session-b"}, {9}, 30);
     EXPECT_EQ(EC_NOSPC, second_ec);
     EXPECT_TRUE(second.key_mask.empty());
     EXPECT_TRUE(second.locations.empty());
 
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, first.write_session_id, {false}));
-    auto [retry_ec, retry] =
-        manager_->StartWrite(&request_context_, kInstanceId, {"session-b"}, {9}, 30);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {false}));
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"session-b"}, {9}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, kInstanceId, retry.write_session_id, {false}));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
 TEST_F(KvMetaManagerTest, RejectsAnInstanceGroupAlreadyUsedByKvCache) {
@@ -1570,36 +1482,27 @@ TEST_F(KvMetaManagerTest, ExactValueSizesAreIncludedInByteAdmission) {
     object_group.set_name("small-object-group");
     object_group.set_global_quota_group_name("small-object-quota");
     object_group.set_version(1);
-    object_group.set_quota(InstanceGroupQuota(
-        20, {QuotaConfig(20, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
+    object_group.set_quota(InstanceGroupQuota(20, {QuotaConfig(20, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
     ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
     ASSERT_EQ(EC_OK,
               manager_->RegisterInstance(&request_context_, "small-object-group", "small-object-instance", "").first);
 
-    auto [oversized_ec, oversized] = manager_->StartWrite(
-        &request_context_, "small-object-instance", {"a", "b"}, {17, 4}, 30);
+    auto [oversized_ec, oversized] =
+        manager_->StartWrite(&request_context_, "small-object-instance", {"a", "b"}, {17, 4}, 30);
     EXPECT_EQ(EC_NOSPC, oversized_ec);
     EXPECT_TRUE(oversized.locations.empty());
 
-    auto [start_ec, start] =
-        manager_->StartWrite(&request_context_, "small-object-instance", {"a"}, {17}, 30);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, "small-object-instance", {"a"}, {17}, 30);
     ASSERT_EQ(EC_OK, start_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, "small-object-instance", start.write_session_id, {true}));
-    auto [remaining_ec, remaining] =
-        manager_->StartWrite(&request_context_, "small-object-instance", {"b"}, {4}, 30);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, "small-object-instance", start.write_session_id, {true}));
+    auto [remaining_ec, remaining] = manager_->StartWrite(&request_context_, "small-object-instance", {"b"}, {4}, 30);
     EXPECT_EQ(EC_NOSPC, remaining_ec);
     EXPECT_TRUE(remaining.locations.empty());
 
-    auto [fill_ec, fill] =
-        manager_->StartWrite(&request_context_, "small-object-instance", {"b"}, {3}, 30);
+    auto [fill_ec, fill] = manager_->StartWrite(&request_context_, "small-object-instance", {"b"}, {3}, 30);
     ASSERT_EQ(EC_OK, fill_ec);
-    ASSERT_EQ(EC_OK,
-              manager_->FinishWrite(
-                  &request_context_, "small-object-instance", fill.write_session_id, {true}));
-    auto [full_ec, full] =
-        manager_->StartWrite(&request_context_, "small-object-instance", {"c"}, {1}, 30);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, "small-object-instance", fill.write_session_id, {true}));
+    auto [full_ec, full] = manager_->StartWrite(&request_context_, "small-object-instance", {"c"}, {1}, 30);
     EXPECT_EQ(EC_NOSPC, full_ec);
     EXPECT_TRUE(full.locations.empty());
 }
@@ -1612,12 +1515,10 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
     object_group.set_name("concurrent-object-group");
     object_group.set_global_quota_group_name("concurrent-object-quota");
     object_group.set_version(1);
-    object_group.set_quota(InstanceGroupQuota(
-        20, {QuotaConfig(20, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
+    object_group.set_quota(InstanceGroupQuota(20, {QuotaConfig(20, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
     ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
     ASSERT_EQ(EC_OK,
-              manager_->RegisterInstance(
-                  &request_context_, "concurrent-object-group", "concurrent-object-instance", "")
+              manager_->RegisterInstance(&request_context_, "concurrent-object-group", "concurrent-object-instance", "")
                   .first);
 
     std::atomic<int> ready{0};
@@ -1632,11 +1533,8 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            auto [ec, result] = manager_->StartWrite(&context,
-                                                      "concurrent-object-instance",
-                                                      {"key-" + std::to_string(i)},
-                                                      {15},
-                                                      30);
+            auto [ec, result] =
+                manager_->StartWrite(&context, "concurrent-object-instance", {"key-" + std::to_string(i)}, {15}, 30);
             errors[i] = ec;
             results[i] = std::move(result);
         });
@@ -1649,8 +1547,7 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
         worker.join();
     }
 
-    const std::size_t success_count =
-        static_cast<std::size_t>(std::count(errors.begin(), errors.end(), EC_OK));
+    const std::size_t success_count = static_cast<std::size_t>(std::count(errors.begin(), errors.end(), EC_OK));
     const std::size_t quota_failure_count =
         static_cast<std::size_t>(std::count(errors.begin(), errors.end(), EC_NOSPC));
     EXPECT_EQ(1, success_count);
@@ -1666,10 +1563,8 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
             ASSERT_EQ(1, results[i].locations.size());
             EXPECT_EQ(15, results[i].locations.front().value_size);
             ASSERT_EQ(EC_OK,
-                      manager_->FinishWrite(&request_context_,
-                                            "concurrent-object-instance",
-                                            results[i].write_session_id,
-                                            {false}));
+                      manager_->FinishWrite(
+                          &request_context_, "concurrent-object-instance", results[i].write_session_id, {false}));
         } else {
             EXPECT_TRUE(results[i].key_mask.empty());
             EXPECT_TRUE(results[i].locations.empty());

@@ -88,8 +88,7 @@ CreateObjectClient(const std::string &trace_id,
         config.transfer_init_params.self_location_spec_name != kKvMetaValueSpecName) {
         return {ER_INVALID_PARAMS, nullptr};
     }
-    const auto registration_ec =
-        ValidateLocalRegistration(config.transfer_init_params, shared_memory_registration);
+    const auto registration_ec = ValidateLocalRegistration(config.transfer_init_params, shared_memory_registration);
     if (registration_ec != ER_OK) {
         return {registration_ec, nullptr};
     }
@@ -115,47 +114,39 @@ CreateObjectClient(const std::string &trace_id,
     transfer_init_params.storage_configs = std::move(storage_configs);
     std::unique_ptr<KvMetaTransferClient> transfer_client;
     if (shared_memory_registration == nullptr) {
-        transfer_client = KvMetaTransferClient::Create(
-            config.transfer_client_config, transfer_init_params, config.max_object_bytes);
+        transfer_client =
+            KvMetaTransferClient::Create(config.transfer_client_config, transfer_init_params, config.max_object_bytes);
     } else {
-        transfer_client = KvMetaTransferClient::Create(config.transfer_client_config,
-                                                       transfer_init_params,
-                                                       config.max_object_bytes,
-                                                       *shared_memory_registration);
+        transfer_client = KvMetaTransferClient::Create(
+            config.transfer_client_config, transfer_init_params, config.max_object_bytes, *shared_memory_registration);
     }
     if (!transfer_client) {
         return {ER_TRANSFERCLIENT_INIT_ERROR, nullptr};
     }
-    std::unique_ptr<KvMetaObjectClient> object_client =
-        std::make_unique<KvMetaObjectClientImpl>(std::move(metadata_client),
-                                                 std::move(transfer_client),
-                                                 config.max_object_bytes,
-                                                 config.write_timeout_seconds);
+    std::unique_ptr<KvMetaObjectClient> object_client = std::make_unique<KvMetaObjectClientImpl>(
+        std::move(metadata_client), std::move(transfer_client), config.max_object_bytes, config.write_timeout_seconds);
     return {ER_OK, std::move(object_client)};
 }
 
 } // namespace
 
-std::uint32_t GetKvMetaObjectClientApiVersion() noexcept {
-    return kKvMetaObjectClientApiVersion;
-}
+std::uint32_t GetKvMetaObjectClientApiVersion() noexcept { return kKvMetaObjectClientApiVersion; }
 
 KvMetaObjectClientImpl::KvMetaObjectClientImpl(std::unique_ptr<KvMetaClient> metadata_client,
                                                std::unique_ptr<KvMetaTransferClient> transfer_client,
                                                std::uint64_t max_object_bytes,
                                                std::int32_t write_timeout_seconds)
-    : metadata_client_(std::move(metadata_client)),
-      transfer_client_(std::move(transfer_client)),
-      max_object_bytes_(max_object_bytes),
-      write_timeout_seconds_(write_timeout_seconds) {}
+    : metadata_client_(std::move(metadata_client))
+    , transfer_client_(std::move(transfer_client))
+    , max_object_bytes_(max_object_bytes)
+    , write_timeout_seconds_(write_timeout_seconds) {}
 
 ClientErrorCode KvMetaObjectClientImpl::ValidateRequest(const std::vector<std::string> &keys,
                                                         const std::vector<std::uint64_t> &value_sizes,
                                                         const BlockBuffers &object_buffers,
                                                         std::uint64_t max_object_bytes) {
     if (max_object_bytes == 0 || max_object_bytes > kMaxServiceObjectBytes || keys.empty() ||
-        keys.size() > kMaxBatchItems || keys.size() != value_sizes.size() ||
-        keys.size() != object_buffers.size()) {
+        keys.size() > kMaxBatchItems || keys.size() != value_sizes.size() || keys.size() != object_buffers.size()) {
         return ER_INVALID_PARAMS;
     }
     std::unordered_set<std::string> unique_keys;
@@ -219,8 +210,7 @@ ClientErrorCode KvMetaObjectClientImpl::AbortWrite(const std::string &trace_id,
     }
     ClientErrorCode abort_ec = ER_INVALID_GRPCSTATUS;
     try {
-        abort_ec =
-            metadata_client_->FinishWrite(trace_id, write_session_id, std::vector<bool>(location_count, false));
+        abort_ec = metadata_client_->FinishWrite(trace_id, write_session_id, std::vector<bool>(location_count, false));
     } catch (...) {
         KVCM_LOG_WARN("KVMeta object write rollback threw, original error [%d]; rollback outcome is unknown",
                       static_cast<int>(original_error));
@@ -261,10 +251,8 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
         return start_ec;
     }
     if (start_result.key_mask.size() != keys.size()) {
-        return AbortWrite(trace_id,
-                          start_result.write_session_id,
-                          start_result.locations.size(),
-                          ER_SERVICE_INTERNAL_ERROR);
+        return AbortWrite(
+            trace_id, start_result.write_session_id, start_result.locations.size(), ER_SERVICE_INTERNAL_ERROR);
     }
 
     std::vector<std::uint64_t> missing_sizes;
@@ -286,16 +274,11 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
     }
     if (missing_sizes.empty()) {
         if (!start_result.locations.empty() || !start_result.write_session_id.empty()) {
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              start_result.locations.size(),
-                              ER_SERVICE_INTERNAL_ERROR);
+            return AbortWrite(
+                trace_id, start_result.write_session_id, start_result.locations.size(), ER_SERVICE_INTERNAL_ERROR);
         }
     } else if (missing_sizes.size() != start_result.locations.size() || start_result.write_session_id.empty()) {
-        return AbortWrite(trace_id,
-                          start_result.write_session_id,
-                          missing_sizes.size(),
-                          ER_SERVICE_INTERNAL_ERROR);
+        return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), ER_SERVICE_INTERNAL_ERROR);
     }
 
     if (!hit_keys.empty()) {
@@ -311,37 +294,22 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
             hit_result = std::move(result.second);
         } catch (...) {
             KVCM_LOG_WARN("KVMeta compatibility Get threw while an object write session was active");
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              missing_sizes.size(),
-                              ER_SERVICE_INTERNAL_ERROR);
+            return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), ER_SERVICE_INTERNAL_ERROR);
         }
         if (get_ec != ER_OK) {
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              missing_sizes.size(),
-                              get_ec);
+            return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), get_ec);
         }
-        if (hit_result.hit_mask.size() != hit_keys.size() ||
-            hit_result.locations.size() != hit_keys.size()) {
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              missing_sizes.size(),
-                              ER_SERVICE_INTERNAL_ERROR);
+        if (hit_result.hit_mask.size() != hit_keys.size() || hit_result.locations.size() != hit_keys.size()) {
+            return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), ER_SERVICE_INTERNAL_ERROR);
         }
         if (std::any_of(hit_result.hit_mask.begin(), hit_result.hit_mask.end(), [](bool hit) { return !hit; })) {
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              missing_sizes.size(),
-                              ER_SERVICE_WRITE_IN_PROGRESS);
+            return AbortWrite(
+                trace_id, start_result.write_session_id, missing_sizes.size(), ER_SERVICE_WRITE_IN_PROGRESS);
         }
         UriStrVec hit_uris;
         const auto hit_location_ec = ExtractUris(hit_result.locations, hit_sizes, hit_uris);
         if (hit_location_ec != ER_OK) {
-            return AbortWrite(trace_id,
-                              start_result.write_session_id,
-                              missing_sizes.size(),
-                              hit_location_ec);
+            return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), hit_location_ec);
         }
     }
     if (missing_sizes.empty()) {
@@ -361,19 +329,13 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
         actual_uris = std::move(result.second);
     } catch (...) {
         KVCM_LOG_WARN("KVMeta object data-plane save threw; aborting the write session");
-        return AbortWrite(trace_id,
-                          start_result.write_session_id,
-                          start_result.locations.size(),
-                          ER_SDKWRITE_ERROR);
+        return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), ER_SDKWRITE_ERROR);
     }
     if (save_ec != ER_OK) {
         return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), save_ec);
     }
     if (actual_uris != requested_uris) {
-        return AbortWrite(trace_id,
-                          start_result.write_session_id,
-                          start_result.locations.size(),
-                          ER_SDKWRITE_ERROR);
+        return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), ER_SDKWRITE_ERROR);
     }
     try {
         return metadata_client_->FinishWrite(
@@ -429,8 +391,7 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjects(const std::string &trace_id,
     }
 }
 
-ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id,
-                                               const std::vector<std::string> &keys) {
+ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, const std::vector<std::string> &keys) {
     if (keys.empty() || keys.size() > kMaxBatchItems) {
         return ER_INVALID_PARAMS;
     }

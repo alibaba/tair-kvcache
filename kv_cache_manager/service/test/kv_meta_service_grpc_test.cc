@@ -19,8 +19,7 @@ namespace {
 
 TEST(KvMetaServiceGRpcTest, MetricsAreNamespacedAwayFromMainService) {
     auto registry = std::make_shared<MetricsRegistry>();
-    auto main_metric =
-        registry->GetCounter("service.query_counter", MetricsTags{{"api_name", "RegisterInstance"}});
+    auto main_metric = registry->GetCounter("service.query_counter", MetricsTags{{"api_name", "RegisterInstance"}});
 
     KvMetaServiceGRpc service(registry, nullptr);
     service.Init();

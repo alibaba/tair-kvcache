@@ -26,8 +26,7 @@ bool LockFreeThreadPool::isFull() const { return pool_->isFull(); }
 std::future<ClientErrorCode> LockFreeThreadPool::async(std::function<ClientErrorCode()> &&func) {
     return pool_->async(func);
 }
-bool LockFreeThreadPool::tryAsync(std::function<ClientErrorCode()> &&func,
-                                  std::future<ClientErrorCode> &future) {
+bool LockFreeThreadPool::tryAsync(std::function<ClientErrorCode()> &&func, std::future<ClientErrorCode> &future) {
     auto task = std::make_shared<std::packaged_task<ClientErrorCode()>>(std::move(func));
     auto pending = task->get_future();
     auto ec = pool_->pushTask([task = std::move(task)] { (*task)(); }, /*isBlocked=*/false);

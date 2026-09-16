@@ -130,8 +130,7 @@ TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) 
     proto::kv_meta::PutStartResponse wrong_size_response;
     RequestContext wrong_size_context(wrong_size_request.trace_id());
     service_->PutStart(&wrong_size_context, &wrong_size_request, &wrong_size_response);
-    EXPECT_EQ(proto::kv_meta::SIZE_MISMATCH,
-              wrong_size_response.header().status().code());
+    EXPECT_EQ(proto::kv_meta::SIZE_MISMATCH, wrong_size_response.header().status().code());
     EXPECT_TRUE(wrong_size_response.write_session_id().empty());
     EXPECT_TRUE(wrong_size_response.locations().empty());
 }
@@ -217,14 +216,11 @@ TEST_F(KvMetaServiceImplTest, OversizedRequestShapesAreRejectedAtTheRpcBoundary)
 
     finish_request.mutable_success_keys()->clear_values();
     finish_request.mutable_success_keys()->add_values(true);
-    finish_request.set_write_session_id(
-        std::string(kv_meta_manager_->limits().max_write_session_id_bytes + 1, 's'));
+    finish_request.set_write_session_id(std::string(kv_meta_manager_->limits().max_write_session_id_bytes + 1, 's'));
     proto::kv_meta::CommonResponse oversized_session_response;
     RequestContext oversized_session_context("oversized-finish-session");
-    service_->PutFinish(
-        &oversized_session_context, &finish_request, &oversized_session_response);
-    EXPECT_EQ(proto::kv_meta::INVALID_ARGUMENT,
-              oversized_session_response.header().status().code());
+    service_->PutFinish(&oversized_session_context, &finish_request, &oversized_session_response);
+    EXPECT_EQ(proto::kv_meta::INVALID_ARGUMENT, oversized_session_response.header().status().code());
 }
 
 TEST_F(KvMetaServiceImplTest, RemoveReportsAnActiveWriterWithoutConsumingItsSession) {
@@ -277,8 +273,7 @@ TEST_F(KvMetaServiceImplTest, PutStartReportsAnActiveWriterWithoutClaimingACache
     proto::kv_meta::PutStartResponse second_response;
     RequestContext second_context(second_request.trace_id());
     service_->PutStart(&second_context, &second_request, &second_response);
-    EXPECT_EQ(proto::kv_meta::WRITE_IN_PROGRESS,
-              second_response.header().status().code());
+    EXPECT_EQ(proto::kv_meta::WRITE_IN_PROGRESS, second_response.header().status().code());
     EXPECT_TRUE(second_response.write_session_id().empty());
     EXPECT_TRUE(second_response.key_mask().values().empty());
     EXPECT_TRUE(second_response.locations().empty());
