@@ -8,6 +8,7 @@ filegroup(
         "default_logger_config.conf",
         "default_server_config.conf",
         "default_startup_config.json",
+        "home_admin_logger_config.conf",
     ],
     visibility = ["//visibility:public"],
 )
