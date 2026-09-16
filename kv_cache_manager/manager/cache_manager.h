@@ -126,7 +126,8 @@ public:
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
                                                        const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED);
+                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED,
+                                                       std::string *tair_mempool_metaservice_url = nullptr);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -339,6 +340,9 @@ private:
     static void FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
                                        CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
+
+    std::string SelectTairMempoolMetaServiceUrl(RequestContext *request_context,
+                                                const std::string &instance_group_name) const;
 
     void CleanupHostLocations(const std::string &instance_id,
                               const std::string &host_ip_port,

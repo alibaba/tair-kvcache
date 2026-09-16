@@ -299,6 +299,8 @@ message RegisterInstanceResponse {
     CommonResponseHeader header = 1;
     string storage_configs = 2;
     string extra_info = 3; // opaque JSON passed through from InstanceGroup
+    // KVCM-selected TairMempool MetaService discovery URL for deferred consumer registration.
+    string tair_mempool_metaservice_url = 4;
 }
 
 message GetInstanceInfoRequest {

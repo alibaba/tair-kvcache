@@ -5,6 +5,8 @@
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
+#include <cctype>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
@@ -22,6 +24,7 @@
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/service_discovery_url.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -53,6 +56,81 @@
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr double kTairMempoolUsageRatioWindow = 0.05;
+constexpr const char *kDefaultTairMempoolMetaServicePort = "12348";
+
+bool IsValidPort(std::string_view value) {
+    if (value.empty()) {
+        return false;
+    }
+    uint32_t port = 0;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const uint32_t digit = static_cast<uint32_t>(ch - '0');
+        if (port > (65535 - digit) / 10) {
+            return false;
+        }
+        port = port * 10 + digit;
+    }
+    return port != 0;
+}
+
+std::string CanonicalizeTairMempoolMetaServiceUrl(const std::string &url) {
+    if (std::any_of(url.begin(), url.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }) ||
+        url.find('#') != std::string::npos) {
+        return {};
+    }
+
+    ServiceDiscoveryUrl parsed;
+    if (!ServiceDiscoveryUrl::Parse(url, parsed) || parsed.scheme != "spectrum" || parsed.body.empty()) {
+        return {};
+    }
+
+    std::string virtual_service_id = parsed.body;
+    std::string port = kDefaultTairMempoolMetaServicePort;
+    const auto port_it = parsed.params.find("port");
+    if (port_it != parsed.params.end()) {
+        if (!IsValidPort(port_it->second)) {
+            return {};
+        }
+        port = port_it->second;
+    }
+
+    const auto colon = virtual_service_id.rfind(':');
+    if (colon != std::string::npos) {
+        if (port_it != parsed.params.end() || colon == 0 || virtual_service_id.find(':') != colon) {
+            return {};
+        }
+        const std::string legacy_port = virtual_service_id.substr(colon + 1);
+        if (!IsValidPort(legacy_port)) {
+            return {};
+        }
+        port = legacy_port;
+        virtual_service_id.resize(colon);
+    }
+
+    if (virtual_service_id.empty() ||
+        std::any_of(virtual_service_id.begin(), virtual_service_id.end(), [](unsigned char ch) {
+            return !(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.');
+        })) {
+        return {};
+    }
+
+    std::string canonical = "spectrum://" + virtual_service_id + "?port=" + port;
+    for (const auto &[key, value] : parsed.params) {
+        if (key != "port") {
+            canonical += "&" + key + "=" + value;
+        }
+    }
+    return canonical;
+}
+
+} // namespace
 
 #define PREFIX_LOG(LEVEL, format, args...)                                                                             \
     do {                                                                                                               \
@@ -558,10 +636,14 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
-                               QueryType default_query_type) {
+                               QueryType default_query_type,
+                               std::string *tair_mempool_metaservice_url) {
     SPAN_TRACER(request_context);
     // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
+    if (tair_mempool_metaservice_url != nullptr) {
+        tair_mempool_metaservice_url->clear();
+    }
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
         auto mismatched = instance_info->MismatchFields(block_size,
@@ -583,6 +665,10 @@ CacheManager::RegisterInstance(RequestContext *request_context,
         }
         auto ec = TryCreateMetaSearcher(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
+        if (tair_mempool_metaservice_url != nullptr) {
+            *tair_mempool_metaservice_url =
+                SelectTairMempoolMetaServiceUrl(request_context, instance_group);
+        }
         PREFIX_LOG(INFO, "register instance OK");
         return {ec, GetStorageConfigStr(request_context, instance_id)};
     }
@@ -597,6 +683,9 @@ CacheManager::RegisterInstance(RequestContext *request_context,
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
     ec = TryCreateMetaSearcher(request_context, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
+    if (tair_mempool_metaservice_url != nullptr) {
+        *tair_mempool_metaservice_url = SelectTairMempoolMetaServiceUrl(request_context, instance_group);
+    }
     PREFIX_LOG(INFO, "register instance OK");
     return {ec, GetStorageConfigStr(request_context, instance_id)};
 }
@@ -4253,6 +4342,90 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
         }
     }
     return Jsonizable::ToJsonString(result);
+}
+
+std::string CacheManager::SelectTairMempoolMetaServiceUrl(RequestContext *request_context,
+                                                          const std::string &instance_group_name) const {
+    struct Candidate {
+        std::string storage_name;
+        std::string canonical_url;
+        StorageLoadSnapshot snapshot;
+    };
+
+    const auto &trace_id = request_context->trace_id();
+    auto [ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, instance_group_name);
+    if (ec != EC_OK || instance_group == nullptr) {
+        KVCM_LOG_WARN("trace_id [%s] instance_group [%s] | cannot select TairMempool MetaService: group not found",
+                      trace_id.c_str(),
+                      instance_group_name.c_str());
+        return {};
+    }
+
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    std::vector<Candidate> candidates;
+    double lowest_usage_ratio = std::numeric_limits<double>::infinity();
+    for (const auto &storage_name : instance_group->storage_candidates()) {
+        const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
+        if (backend == nullptr || !backend->Available()) {
+            continue;
+        }
+        const auto &config = backend->GetStorageConfig();
+        if (!IsTairMempoolStorageType(config.type())) {
+            continue;
+        }
+        const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(config.storage_spec());
+        if (spec == nullptr) {
+            continue;
+        }
+        const std::string canonical_url = CanonicalizeTairMempoolMetaServiceUrl(spec->service_discovery_url());
+        if (canonical_url.empty()) {
+            KVCM_LOG_WARN("trace_id [%s] instance_group [%s] storage [%s] | invalid TairMempool service discovery URL",
+                          trace_id.c_str(),
+                          instance_group_name.c_str(),
+                          storage_name.c_str());
+            continue;
+        }
+        const StorageLoadSnapshot snapshot = backend->GetStorageLoadSnapshot(trace_id);
+        if (!snapshot.valid || !std::isfinite(snapshot.storage_usage_ratio) ||
+            snapshot.storage_usage_ratio < 0.0 || snapshot.storage_usage_ratio > 1.0) {
+            KVCM_LOG_WARN("trace_id [%s] instance_group [%s] storage [%s] | invalid storage load snapshot",
+                          trace_id.c_str(),
+                          instance_group_name.c_str(),
+                          storage_name.c_str());
+            continue;
+        }
+        lowest_usage_ratio = std::min(lowest_usage_ratio, snapshot.storage_usage_ratio);
+        candidates.push_back({storage_name, canonical_url, snapshot});
+    }
+
+    const Candidate *selected = nullptr;
+    for (const auto &candidate : candidates) {
+        if (candidate.snapshot.storage_usage_ratio > lowest_usage_ratio + kTairMempoolUsageRatioWindow) {
+            continue;
+        }
+        if (selected == nullptr ||
+            candidate.snapshot.healthy_consumer_count < selected->snapshot.healthy_consumer_count ||
+            (candidate.snapshot.healthy_consumer_count == selected->snapshot.healthy_consumer_count &&
+             candidate.snapshot.storage_usage_ratio < selected->snapshot.storage_usage_ratio)) {
+            selected = &candidate;
+        }
+    }
+    if (selected == nullptr) {
+        KVCM_LOG_WARN("trace_id [%s] instance_group [%s] | no eligible TairMempool MetaService candidate",
+                      trace_id.c_str(),
+                      instance_group_name.c_str());
+        return {};
+    }
+
+    KVCM_LOG_INFO("trace_id [%s] instance_group [%s] storage [%s] | selected TairMempool MetaService, "
+                  "usage_ratio [%f], healthy_consumers [%u], healthy_providers [%u]",
+                  trace_id.c_str(),
+                  instance_group_name.c_str(),
+                  selected->storage_name.c_str(),
+                  selected->snapshot.storage_usage_ratio,
+                  selected->snapshot.healthy_consumer_count,
+                  selected->snapshot.healthy_provider_count);
+    return selected->canonical_url;
 }
 
 ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,

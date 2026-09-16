@@ -29,6 +29,25 @@ curl -g -vvv -X POST http://localhost:6382/api/registerInstance \
 ```
 `default_query_type` is optional. When `GetHostCacheState` does not set request-level `query_type`, the service uses this registered value.
 
+The successful response includes the complete client-visible `storage_configs` and, when an eligible
+TairMempool backend exists, one KVCM-selected MetaService discovery URL:
+
+```json
+{
+  "header": {"status": {"code": "OK"}},
+  "storage_configs": "[...]",
+  "extra_info": "{}",
+  "tair_mempool_metaservice_url": "spectrum://v-selected?port=12348"
+}
+```
+
+KVCM first finds the lowest valid storage usage ratio among available TairMempool
+`storage_candidates`. Within five percentage points of that minimum, it selects the backend with the
+fewest healthy registered consumers; remaining ties use the lower usage ratio and then the configured
+candidate order. Migration-only storage remains visible in `storage_configs` but is not an initial
+MetaService candidate. If no candidate has a valid load snapshot, registration still succeeds and
+`tair_mempool_metaservice_url` is empty so compatible clients can use their legacy fallback.
+
 ## Get Instance Info
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/getInstanceInfo \

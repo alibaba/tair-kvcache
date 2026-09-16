@@ -29,6 +29,7 @@ struct PyInitParams {
     std::shared_ptr<PyRegistSpan> regist_span;
     std::string self_location_spec_name;
     std::string storage_configs;
+    std::string tair_mempool_metaservice_url;
 
     kvcm::InitParams ToCpp() const {
         kvcm::InitParams params;
@@ -36,6 +37,7 @@ struct PyInitParams {
         params.regist_span = regist_span == nullptr ? nullptr : &regist_span->span;
         params.self_location_spec_name = self_location_spec_name;
         params.storage_configs = storage_configs;
+        params.tair_mempool_metaservice_url = tair_mempool_metaservice_url;
         return params;
     }
 };
@@ -134,7 +136,8 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_readwrite("role_type", &PyInitParams::role_type)
         .def_readwrite("regist_span", &PyInitParams::regist_span)
         .def_readwrite("self_location_spec_name", &PyInitParams::self_location_spec_name)
-        .def_readwrite("storage_configs", &PyInitParams::storage_configs);
+        .def_readwrite("storage_configs", &PyInitParams::storage_configs)
+        .def_readwrite("tair_mempool_metaservice_url", &PyInitParams::tair_mempool_metaservice_url);
 
     py::class_<kvcm::ForwardContext, py::smart_holder>(module, "ForwardContext")
         .def(py::init<>())
