@@ -11,8 +11,8 @@
 
 namespace kv_cache_manager {
 
-#define MAKE_KV_META_SERVICE_METRICS_COLLECTOR(method)                                                               \
-    KVCM_MAKE_METRICS_COLLECTOR_(                                                                                     \
+#define MAKE_KV_META_SERVICE_METRICS_COLLECTOR(method)                                                                 \
+    KVCM_MAKE_METRICS_COLLECTOR_(                                                                                      \
         metrics_registry_, KvMeta##method, Service, (MetricsTags{{"api_name", "KvMeta." #method}}))
 
 KvMetaServiceGRpc::KvMetaServiceGRpc(std::shared_ptr<MetricsRegistry> metrics_registry,

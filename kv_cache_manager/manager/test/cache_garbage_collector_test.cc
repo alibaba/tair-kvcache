@@ -431,15 +431,15 @@ public:
         deployment.set_dp_size(1);
         deployment.set_pp_size(1);
         deployment.set_extra(std::string(kKvMetaDeploymentExtra));
-        auto instance = std::make_shared<InstanceInfo>("quota",
-                                                       group_name,
-                                                       std::string(kKvMetaInternalInstancePrefix) + encoded_id,
-                                                       1,
-                                                       std::vector<LocationSpecInfo>{LocationSpecInfo(
-                                                           std::string(kKvMetaValueSpecName), 1)},
-                                                       deployment,
-                                                       std::vector<LocationSpecGroup>{},
-                                                       1);
+        auto instance = std::make_shared<InstanceInfo>(
+            "quota",
+            group_name,
+            std::string(kKvMetaInternalInstancePrefix) + encoded_id,
+            1,
+            std::vector<LocationSpecInfo>{LocationSpecInfo(std::string(kKvMetaValueSpecName), 1)},
+            deployment,
+            std::vector<LocationSpecGroup>{},
+            1);
         instances_by_group[group_name].first = EC_OK;
         instances_by_group[group_name].second.push_back(instance);
         group_by_instance[instance->instance_id()] = group_name;

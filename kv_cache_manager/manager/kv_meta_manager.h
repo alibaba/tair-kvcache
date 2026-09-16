@@ -61,8 +61,7 @@ public:
         std::vector<ValueLocation> locations;
     };
 
-    KvMetaManager(std::shared_ptr<CacheManager> cache_manager,
-                  std::shared_ptr<RegistryManager> registry_manager);
+    KvMetaManager(std::shared_ptr<CacheManager> cache_manager, std::shared_ptr<RegistryManager> registry_manager);
     KvMetaManager(std::shared_ptr<CacheManager> cache_manager,
                   std::shared_ptr<RegistryManager> registry_manager,
                   Limits limits);
@@ -93,8 +92,8 @@ public:
                                                        const std::string &instance_id,
                                                        const std::string &user_data);
 
-    std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>>
-    GetInstanceInfo(RequestContext *request_context, const std::string &instance_id) const;
+    std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>> GetInstanceInfo(RequestContext *request_context,
+                                                                              const std::string &instance_id) const;
 
     std::pair<ErrorCode, std::vector<GetResult>>
     Get(RequestContext *request_context, const std::string &instance_id, const std::vector<std::string> &keys) const;
@@ -110,9 +109,8 @@ public:
                           const std::string &write_session_id,
                           const std::vector<bool> &success_keys);
 
-    ErrorCode Remove(RequestContext *request_context,
-                     const std::string &instance_id,
-                     const std::vector<std::string> &keys);
+    ErrorCode
+    Remove(RequestContext *request_context, const std::string &instance_id, const std::vector<std::string> &keys);
 
     ErrorCode TrimAll(RequestContext *request_context, const std::string &instance_id, bool metadata_only);
 
@@ -156,8 +154,7 @@ private:
     ErrorCode DeleteStorageUris(RequestContext *request_context,
                                 const std::string &storage_name,
                                 const std::vector<DataStorageUri> &uris) const;
-    ErrorCode DeleteAllocatedLocations(RequestContext *request_context,
-                                       const std::vector<SessionItem> &items) const;
+    ErrorCode DeleteAllocatedLocations(RequestContext *request_context, const std::vector<SessionItem> &items) const;
 
 private:
     friend class KvMetaWriteSessionManager;

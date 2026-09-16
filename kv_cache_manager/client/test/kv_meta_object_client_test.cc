@@ -20,7 +20,11 @@ TEST(KvMetaObjectClientVersionTest, SharedLibraryExportsHeaderCapabilityVersion)
     EXPECT_EQ(GetKvMetaObjectClientApiVersion(), kKvMetaObjectClientApiVersion);
 }
 
-enum class ThrowMode { NONE, STANDARD, UNKNOWN };
+enum class ThrowMode {
+    NONE,
+    STANDARD,
+    UNKNOWN
+};
 
 void ThrowIfRequested(ThrowMode mode) {
     if (mode == ThrowMode::STANDARD) {
@@ -809,8 +813,7 @@ TEST(KvMetaObjectClientCreateTest, RejectsMalformedLocalRegistrationBeforeMetada
     config.transfer_init_params.regist_span = nullptr;
     SharedMemoryRegistration partial_registration;
     partial_registration.base = reinterpret_cast<void *>(0x1000);
-    auto [partial_shm_ec, partial_shm_client] =
-        KvMetaObjectClient::Create("trace", config, partial_registration);
+    auto [partial_shm_ec, partial_shm_client] = KvMetaObjectClient::Create("trace", config, partial_registration);
     EXPECT_EQ(ER_INVALID_PARAMS, partial_shm_ec);
     EXPECT_EQ(nullptr, partial_shm_client);
 
@@ -818,8 +821,7 @@ TEST(KvMetaObjectClientCreateTest, RejectsMalformedLocalRegistrationBeforeMetada
     invalid_fd_registration.base = reinterpret_cast<void *>(0x1000);
     invalid_fd_registration.size = 4096;
     invalid_fd_registration.fd = std::numeric_limits<int>::max();
-    auto [invalid_fd_ec, invalid_fd_client] =
-        KvMetaObjectClient::Create("trace", config, invalid_fd_registration);
+    auto [invalid_fd_ec, invalid_fd_client] = KvMetaObjectClient::Create("trace", config, invalid_fd_registration);
     EXPECT_EQ(ER_INVALID_PARAMS, invalid_fd_ec);
     EXPECT_EQ(nullptr, invalid_fd_client);
 
@@ -828,8 +830,7 @@ TEST(KvMetaObjectClientCreateTest, RejectsMalformedLocalRegistrationBeforeMetada
     ASSERT_EQ(0, ftruncate(fileno(backing_file.get()), 8));
 
     SharedMemoryRegistration overflowing_registration;
-    overflowing_registration.base =
-        reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 3);
+    overflowing_registration.base = reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 3);
     overflowing_registration.size = 4;
     overflowing_registration.fd = fileno(backing_file.get());
     auto [overflowing_registration_ec, overflowing_registration_client] =

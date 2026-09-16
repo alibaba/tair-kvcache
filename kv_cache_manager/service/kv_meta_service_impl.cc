@@ -94,8 +94,7 @@ bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::Va
     const bool scheme_matches =
         IsTairMempoolStorageType(source.type)
             ? uri.GetProtocol() == kTairMempoolUriScheme
-            : uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN &&
-                  ToBaseType(uri_type) == ToBaseType(source.type);
+            : uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(source.type);
     if (!uri.Valid() || uri.GetHostName().empty() || uri_size != source.value_size || !scheme_matches) {
         return false;
     }
@@ -171,22 +170,23 @@ bool HasBoundedKvMetaKeys(const RepeatedStrings &keys, const KvMetaManager::Limi
 
 } // namespace
 
-#define KV_META_API_CALL_GUARD(api_name)                                                                              \
+#define KV_META_API_CALL_GUARD(api_name)                                                                               \
     request_context->set_api_name(api_name);                                                                           \
-    auto *header = response->mutable_header();                                                                          \
-    header->set_request_id(request_context->request_id());                                                              \
-    if (!CheckAndIncrementRequestCount(true)) {                                                                         \
-        SetDirectError(request_context, header->mutable_status(), proto::kv_meta::SERVER_NOT_LEADER,                   \
+    auto *header = response->mutable_header();                                                                         \
+    header->set_request_id(request_context->request_id());                                                             \
+    if (!CheckAndIncrementRequestCount(true)) {                                                                        \
+        SetDirectError(request_context,                                                                                \
+                       header->mutable_status(),                                                                       \
+                       proto::kv_meta::SERVER_NOT_LEADER,                                                              \
                        "Server is not the active KVMeta leader");                                                      \
-        if (request_context->need_span_tracer()) {                                                                      \
+        if (request_context->need_span_tracer()) {                                                                     \
             header->set_tracer_result(request_context->EndAndGetSpanTracerDebugStr());                                 \
-        }                                                                                                               \
-        return;                                                                                                         \
-    }                                                                                                                   \
-    ServiceCallGuard service_call_guard(cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() {     \
-        DecrementRequestCount(true);                                                                                    \
-    });                                                                                                                 \
-    TracerResultGuard tracer_result_guard(request_context, header);                                                     \
+        }                                                                                                              \
+        return;                                                                                                        \
+    }                                                                                                                  \
+    ServiceCallGuard service_call_guard(                                                                               \
+        cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() { DecrementRequestCount(true); });    \
+    TracerResultGuard tracer_result_guard(request_context, header);                                                    \
     auto *status = header->mutable_status()
 
 KvMetaServiceImpl::KvMetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
@@ -304,10 +304,8 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     auto [ec, result] = kv_meta_manager_->StartWrite(
         request_context, request->instance_id(), keys, sizes, request->write_timeout_seconds());
     if (ec == EC_EXIST) {
-        SetDirectError(request_context,
-                       status,
-                       proto::kv_meta::WRITE_IN_PROGRESS,
-                       ErrorMessage("PutStart", ec, request_context));
+        SetDirectError(
+            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("PutStart", ec, request_context));
         return;
     }
     SetResult(request_context, status, ec, "PutStart");
@@ -324,8 +322,7 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
         // cardinality. If even that shape is malformed, locations is the only
         // remaining bounded hint; a wrong count fails without consuming the
         // session and timeout recovery remains the final safety net.
-        const std::size_t abort_count =
-            result.key_mask.size() == keys.size() ? write_count : result.locations.size();
+        const std::size_t abort_count = result.key_mask.size() == keys.size() ? write_count : result.locations.size();
         if (abort_count == 0) {
             return;
         }
@@ -380,13 +377,11 @@ void KvMetaServiceImpl::PutFinish(RequestContext *request_context,
     if (request->write_session_id().empty() ||
         request->write_session_id().size() > kv_meta_manager_->limits().max_write_session_id_bytes ||
         !request->has_success_keys() || request->success_keys().values().empty() ||
-        static_cast<std::size_t>(request->success_keys().values_size()) >
-            kv_meta_manager_->limits().max_batch_items) {
-        SetDirectError(
-            request_context,
-            status,
-            proto::kv_meta::INVALID_ARGUMENT,
-            "KVMeta PutFinish requires a bounded session id and success mask");
+        static_cast<std::size_t>(request->success_keys().values_size()) > kv_meta_manager_->limits().max_batch_items) {
+        SetDirectError(request_context,
+                       status,
+                       proto::kv_meta::INVALID_ARGUMENT,
+                       "KVMeta PutFinish requires a bounded session id and success mask");
         return;
     }
     std::vector<bool> successes;
@@ -394,8 +389,8 @@ void KvMetaServiceImpl::PutFinish(RequestContext *request_context,
     for (const bool value : request->success_keys().values()) {
         successes.push_back(value);
     }
-    const ErrorCode ec = kv_meta_manager_->FinishWrite(
-        request_context, request->instance_id(), request->write_session_id(), successes);
+    const ErrorCode ec =
+        kv_meta_manager_->FinishWrite(request_context, request->instance_id(), request->write_session_id(), successes);
     SetResult(request_context, status, ec, "PutFinish", true);
 }
 
@@ -417,10 +412,8 @@ void KvMetaServiceImpl::Remove(RequestContext *request_context,
     const std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     const ErrorCode ec = kv_meta_manager_->Remove(request_context, request->instance_id(), keys);
     if (ec == EC_EXIST) {
-        SetDirectError(request_context,
-                       status,
-                       proto::kv_meta::WRITE_IN_PROGRESS,
-                       ErrorMessage("Remove", ec, request_context));
+        SetDirectError(
+            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("Remove", ec, request_context));
         return;
     }
     SetResult(request_context, status, ec, "Remove");
@@ -442,10 +435,8 @@ void KvMetaServiceImpl::Trim(RequestContext *request_context,
         metadata_only = true;
         break;
     case proto::kv_meta::TS_TIMESTAMP:
-        SetDirectError(request_context,
-                       status,
-                       proto::kv_meta::UNSUPPORTED,
-                       "Timestamp-based KVMeta trim is not implemented");
+        SetDirectError(
+            request_context, status, proto::kv_meta::UNSUPPORTED, "Timestamp-based KVMeta trim is not implemented");
         return;
     case proto::kv_meta::TS_UNSPECIFIED:
     default:
@@ -454,10 +445,8 @@ void KvMetaServiceImpl::Trim(RequestContext *request_context,
     }
     const ErrorCode ec = kv_meta_manager_->TrimAll(request_context, request->instance_id(), metadata_only);
     if (ec == EC_EXIST) {
-        SetDirectError(request_context,
-                       status,
-                       proto::kv_meta::WRITE_IN_PROGRESS,
-                       ErrorMessage("Trim", ec, request_context));
+        SetDirectError(
+            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("Trim", ec, request_context));
         return;
     }
     SetResult(request_context, status, ec, "Trim");

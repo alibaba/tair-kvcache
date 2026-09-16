@@ -310,11 +310,9 @@ bool LocalFileSdk::IsAllowedObjectSize(std::size_t size) const {
     if (variable_object_size_enabled_) {
         return size > 0 && size <= max_variable_object_bytes_;
     }
-    return std::any_of(spec_byte_sizes_per_block_.begin(),
-                       spec_byte_sizes_per_block_.end(),
-                       [size](const auto &entry) {
-                           return entry.second > 0 && size == static_cast<std::size_t>(entry.second);
-                       });
+    return std::any_of(spec_byte_sizes_per_block_.begin(), spec_byte_sizes_per_block_.end(), [size](const auto &entry) {
+        return entry.second > 0 && size == static_cast<std::size_t>(entry.second);
+    });
 }
 
 ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
