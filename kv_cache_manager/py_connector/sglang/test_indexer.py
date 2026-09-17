@@ -76,7 +76,10 @@ indexer_quant_block_size = 128
 indexer_dtype = torch.uint8
 indexer_page_num = 256
 
-manager_uri = os.environ.get("KVCM_URI", "http://127.0.0.1:6382")
+# KVCM_URI is the legacy name, still honoured when the new one is unset.
+manager_uri = os.environ.get("KVCM_MANAGER_URI") or os.environ.get(
+    "KVCM_URI", "http://127.0.0.1:6382"
+)
 kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 
 proc = None

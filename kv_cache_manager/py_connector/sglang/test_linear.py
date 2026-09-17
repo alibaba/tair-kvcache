@@ -84,7 +84,10 @@ mamba_head_dim = 16
 mamba_state_size = 16
 mamba_conv_kernel = 4
 
-manager_uri = os.environ.get("KVCM_URI", "http://127.0.0.1:6382")
+# KVCM_URI is the legacy name, still honoured when the new one is unset.
+manager_uri = os.environ.get("KVCM_MANAGER_URI") or os.environ.get(
+    "KVCM_URI", "http://127.0.0.1:6382"
+)
 kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 
 # Global process reference
