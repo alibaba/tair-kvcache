@@ -371,7 +371,8 @@ private:
                                         KeyVector &query_keys,
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
-                                                                  const std::string &instance_id) const;
+                                                                  const std::string &instance_id,
+                                                                  bool allow_unavailable_storages = false) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     MetaSearcher::CheckHostCacheLocationFunc
     GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;

@@ -4490,7 +4490,8 @@ ErrorCode CacheManager::DoCleanup() {
 }
 
 std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(RequestContext *request_context,
-                                                                            const std::string &instance_id) const {
+                                                                            const std::string &instance_id,
+                                                                            bool allow_unavailable_storages) const {
     const auto &trace_id = request_context->trace_id();
     auto all_storages = registry_manager_->data_storage_manager()->GetAllStorageNames();
     auto all_available_storages = registry_manager_->data_storage_manager()->GetAvailableStorages();
@@ -4537,6 +4538,11 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
         return std::make_unique<StaticWeightSLPolicy>();
     }
     if (group_available_storages.empty()) {
+        if (allow_unavailable_storages) {
+            // Host cache queries can still use local and V6D data. An empty
+            // named policy excludes every base storage without changing shared weights.
+            return std::make_unique<NamedStorageWeightedSLPolicy>(NamedStorageWeightedSLPolicy::WeightMap{});
+        }
         request_context->error_tracer()->AddErrorMsg("all storages are unavailable");
         KVCM_INTERVAL_LOG_WARN(10, "all storages are unavailable!");
         return nullptr;
@@ -4793,7 +4799,9 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
-    auto policy = global_kvs_host_count > 0 ? genSelectLocationPolicy(request_context, instance_id) : nullptr;
+    auto policy = global_kvs_host_count > 0
+                      ? genSelectLocationPolicy(request_context, instance_id, /*allow_unavailable_storages=*/true)
+                      : nullptr;
     if (global_kvs_host_count > 0 && !policy) {
         return {EC_ERROR, {}};
     }

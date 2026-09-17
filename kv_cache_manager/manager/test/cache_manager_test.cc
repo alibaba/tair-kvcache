@@ -9081,6 +9081,66 @@ TEST_F(HostCacheStateWithoutP2PTest, MambaPrefixMatchUsesTairWithoutP2P) {
     Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
 }
 
+TEST_F(HostCacheStateWithoutP2PTest, UnavailableBaseStoragePreservesLocalAndP2P) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    registry_manager_->instance_group_configs_["default"]->set_storage_candidates({tair_name_});
+    Report(101, {"tp0"});
+    Report(103, {"tp0"});
+    Report(102, {"tp0"}, true);
+    AddTair(104, "tp0");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+    const auto query = [&](size_t count, bool p2p, int64_t expected_global) {
+        auto [ec, matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH,
+            {101, 102, 103, 104}, {"mem"}, count, p2p);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(worker_, matches[0].host_ip_port);
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(expected_global, matches[0].global);
+    };
+    ON_CALL(*tair_, Available()).WillByDefault(testing::Return(false));
+    query(0, false, 1);
+    query(1, false, 1);
+    query(1, true, 3);
+    // Ordinary data-access callers must retain their existing failure behavior.
+    EXPECT_EQ(nullptr, cache_manager_->genSelectLocationPolicy(request_context_.get(), instance_id_));
+    ON_CALL(*tair_, Available()).WillByDefault(testing::Return(true));
+    query(1, true, 4);
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, UnavailableBaseStoragePreservesMambaLocalAndP2P) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+            {LocationSpecInfo("full", 512), LocationSpecInfo("linear", 512)},
+            {LocationSpecGroup("F0", {"full"}), LocationSpecGroup("L0", {"linear"})});
+    registry_manager_->instance_group_configs_["default"]->set_storage_candidates({tair_name_});
+    Report(101, {"full", "linear"});
+    Report(102, {"full"});
+    Report(102, {"linear"}, true);
+    AddTair(103, "full");
+    AddTair(103, "linear");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+    const auto query = [&](bool p2p, int64_t expected_global) {
+        auto [ec, matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+            {101, 102, 103}, {"mem"}, 1, p2p);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(worker_, matches[0].host_ip_port);
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(expected_global, matches[0].global);
+    };
+    ON_CALL(*tair_, Available()).WillByDefault(testing::Return(false));
+    query(false, 1);
+    query(true, 2);
+    ON_CALL(*tair_, Available()).WillByDefault(testing::Return(true));
+    query(true, 3);
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_host_cache_state_single_p2p";
