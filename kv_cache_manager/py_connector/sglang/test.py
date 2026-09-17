@@ -484,7 +484,9 @@ def test_fault_injection(storage_backend):
 # ---------------------------------------------------------------------------
 # Smaller parameters to reduce GPU memory usage (2 workers share one GPU).
 mr_layer_num = 4
-mr_max_total_num_tokens = 2048
+# 34 pages: MR-8 writes blocks mr_hashes[30:33], i.e. three blocks above the
+# ones MR-1..MR-7 already used; 2048 tokens would only provide 32 pages.
+mr_max_total_num_tokens = 2176
 mr_init_port = 23457
 
 
