@@ -739,8 +739,8 @@ cache 发起物理 DELETE。清理以稳定 location 为粒度：如果一次增
 启用 EventReport 后台 GC 扩展后，Snapshot/HOST_DOWN 不再各自触发一次全 Instance 扫描；它们
 只更新 Backend 当前状态，统一 GC 在下一次成功覆盖目标 key 的 shared round 中完成 metadata
 回收。该路径是低优先级 best-effort 收敛，不提供事件级实时 SLA：对 scan view 中持续可见的
-目标，默认 2 小时 round cooldown 下保守量级约为
-`2h + 两段 round 扫描时间 + action 失败后的重新发现`。cached metadata 模式下 GC 只扫描内存 cache，
+目标，默认 5 分钟 round cooldown 下保守量级约为
+`5min + 两段 round 扫描时间 + action 失败后的重新发现`。cached metadata 模式下 GC 只扫描内存 cache，
 不主动加载已淘汰的冷 key，因此这类 persistent-only metadata 不受上述时间上界约束。查询可见性
 不等待 GC，cleanup 延迟或残留只影响 metadata 空间和统计，不会让已判无效的 Reporter/旧
 generation 重新参与 strict 查询。
