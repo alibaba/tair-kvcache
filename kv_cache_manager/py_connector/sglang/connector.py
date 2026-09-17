@@ -33,13 +33,12 @@ if StorageMetrics is None:
             "sglang.srt.metrics.collector. "
             "Please check your sglang version is compatible."
         )
-from sglang.srt.distributed import get_tp_group
 
-# get_attention_tp_group moved in newer sglang versions.
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,  # ty: ignore[unresolved-import]
-    is_dp_attention_enabled,
-)
+# get_attn_tp_group lives in sglang.srt.distributed since v0.5.9; the old
+# alias sglang.srt.layers.dp_attention.get_attention_tp_group was removed in
+# v0.5.16.
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 
@@ -102,7 +101,7 @@ class HiCacheKVCM(HiCacheStorage):
         self.pp_size = 1
 
         tp_group = (
-            get_attention_tp_group().cpu_group
+            get_attn_tp_group().cpu_group
             if is_dp_attention_enabled()
             else get_tp_group().cpu_group
         )
