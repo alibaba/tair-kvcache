@@ -56,6 +56,11 @@ logger = logging.getLogger(__name__)
 
 
 class HiCacheKVCM(HiCacheStorage):
+    # Pools sglang asked for that this connector does not manage, already
+    # reported as misses. Process-wide so the warning is emitted once per pool
+    # instead of once per block batch, and survives a backend re-creation.
+    _warned_unknown_pools: set = set()
+
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Any) -> None:
         logger.warning(
             "KVCM sglang connector version: %s (commit: %s, build: %s)",
@@ -1310,7 +1315,11 @@ class HiCacheKVCM(HiCacheStorage):
         """
         spec_name = self._get_extra_pool_spec_name(transfer.name)
         if spec_name is None:
-            return kv_hit_pages
+            # Unmanaged pool (e.g. a newer sglang side pool such as SWA): its
+            # data is never written, so claiming hits here would only make the
+            # caller move KV pages that batch_get_v2 then reports as misses.
+            self._warn_unknown_pool_once(transfer.name)
+            return 0
 
         def has_spec(loc: dict) -> bool:
             return any(
@@ -1339,6 +1348,18 @@ class HiCacheKVCM(HiCacheStorage):
             transfer.hit_policy,
         )
         return 0
+
+    def _warn_unknown_pool_once(self, pool_name: Any) -> None:
+        """Report once that sglang asked for a pool this connector ignores."""
+        if pool_name in self._warned_unknown_pools:
+            return
+        self._warned_unknown_pools.add(pool_name)
+        logger.warning(
+            "batch_exists_v2: pool %s is not managed by this connector; "
+            "reporting 0 hit pages for it. Its entries are neither written "
+            "nor read from KVCM (check the sglang/connector version pairing).",
+            pool_name,
+        )
 
     ##################################################
 

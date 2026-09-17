@@ -14,6 +14,10 @@ Covered:
   formula silently shifts every page's data;
 * a transfer whose host page count does not match its key count is rejected
   instead of being mapped page-by-page onto the wrong keys;
+* ``batch_exists_v2`` reports 0 hit pages for pools the connector does not
+  manage, instead of implying the caller can fetch them (see
+  ``UNMANAGED_POOL`` for the enum member used; sglang < v0.5.15 has no
+  ``PoolName.SWA``).
 
 Prerequisites: the connector needs a sglang runtime that can actually import
 its backend (``sgl_kernel`` and friends), and ``kv_cache_manager`` must be
@@ -85,6 +89,13 @@ PAGE_STRIDE = 0x1000
 TEMPORAL_BYTES = 0x100
 CONV_BYTES = 0x80
 INDEXER_PAGE_BYTES = 0x200
+
+# A pool the connector does not manage: PoolName.SWA is the realistic case
+# (sglang >= v0.5.15 only), MAMBA is the stand-in on older versions where the
+# enum member does not exist yet.  It has to stay an enum member -- enum
+# hashes differ from plain string hashes, so a bare "swa" would not find the
+# connector's per-pool result entries.
+UNMANAGED_POOL = getattr(PoolName, "SWA", PoolName.MAMBA)
 
 
 def expected_mamba_page_iovs(
@@ -405,6 +416,45 @@ class TestTransferShapeGuard(unittest.TestCase):
 
         self.assertEqual(result[PoolName.MAMBA], [False] * num_keys)
         connector.transfer_client.LoadKvCaches.assert_not_called()
+
+
+class TestUnmanagedPoolPolicy(unittest.TestCase):
+    """batch_exists_v2 must not claim hits for pools the connector ignores."""
+
+    def setUp(self):
+        # The warning is deduplicated per process; start each test loud.
+        HiCacheKVCM._warned_unknown_pools.clear()
+
+    def test_unmanaged_pool_reports_zero_hits_and_warns_once(self):
+        connector = _build_connector(pools={})
+        num_pages = 3
+        keys = [f"block-{i}" for i in range(num_pages)]
+        connector._manager_client.get_cache_location.return_value = {
+            "locations": _locations("tp_0", [0, 1, 2], num_pages)
+        }
+        transfer = PoolTransfer(
+            name=UNMANAGED_POOL,
+            host_indices=torch.arange(num_pages),
+            keys=keys,
+            hit_policy=PoolHitPolicy.ALL_PAGES,
+        )
+
+        with self.assertLogs("kv_cache_manager.py_connector.sglang.connector") as logs:
+            result = connector.batch_exists_v2(keys, [transfer])
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].levelname, "WARNING")
+        self.assertIn(str(UNMANAGED_POOL), logs.records[0].getMessage())
+        # The KV pages are cached, but without the side pool the prefix is
+        # unusable: report the KV count per pool, and 0 usable pages overall.
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], num_pages)
+        self.assertEqual(result.extra_pool_hit_pages[UNMANAGED_POOL], 0)
+        self.assertEqual(result.kv_hit_pages, 0)
+
+        # Second query: same conservative answer, no duplicate warning.
+        with self.assertNoLogs("kv_cache_manager.py_connector.sglang.connector"):
+            result = connector.batch_exists_v2(keys, [transfer])
+        self.assertEqual(result.kv_hit_pages, 0)
 
 
 if __name__ == "__main__":
