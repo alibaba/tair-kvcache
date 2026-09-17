@@ -446,9 +446,17 @@ class TestInitializationTiming(unittest.TestCase):
             )
             manager = _manager(connector)
             manager.get_cache_location.return_value = {
-                # Two KV pages, so the per-pool check below actually runs.
+                # Realistic shapes: two KV pages *and* the registered pool's
+                # own spec (tp_0_linear), so "the spec is missing from the
+                # Manager" cannot be the reason why the late pool must come
+                # back as a miss.
                 "locations": [
-                    {"location_specs": [{"name": "tp_0_full", "uri": f"uri-{i}"}]}
+                    {
+                        "location_specs": [
+                            {"name": "tp_0_full", "uri": f"uri-{i}"},
+                            {"name": "tp_0_linear", "uri": f"lin-{i}"},
+                        ]
+                    }
                     for i in range(2)
                 ]
             }
@@ -501,7 +509,8 @@ class TestInitializationTiming(unittest.TestCase):
 
             with self.assertNoLogs(connector_module.__name__, level="WARNING"):
                 self.assertEqual(
-                    connector.batch_set_v2([draft]), {PoolName.DRAFT: [False, False]}
+                    connector.batch_set_v2([draft]),
+                    {UNMANAGED_DRAFT: [False, False]},
                 )
 
 
@@ -705,6 +714,12 @@ class TestClose(unittest.TestCase):
             )
             _manager(connector).register_instance.side_effect = slow_register
             _mock_kvcm.TransferClient.Create.side_effect = slow_create
+            # MagicMock.reset_mock() (the other classes' setUp) does not clear
+            # side_effect, and this class runs first: put the shared mock back
+            # so later tests still see the default MagicMock client.
+            self.addCleanup(
+                setattr, _mock_kvcm.TransferClient.Create, "side_effect", None
+            )
 
             storage_call = threading.Thread(
                 target=connector.batch_exists, args=(["block-0"],)
