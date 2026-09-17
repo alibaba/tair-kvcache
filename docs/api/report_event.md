@@ -667,8 +667,7 @@ HTTP 接口为 `POST /api/getHostCacheState`：
     {
       "host_ip_port": "10.0.0.8:8080",
       "local": "3",
-      "p2p_1_fetch": "0",
-      "p2p_1_total_match": "3"
+      "global": "3"
     }
   ]
 }
@@ -680,15 +679,19 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 - 每个 host 从第一个 key 开始连续计数，遇到第一个 miss 即停止；
 - 第一个 key 就 miss 的 host 不返回；
 - `medium` 为空表示考虑所有 medium；
-- `medium` 非空时只使用指定 medium；
+- `medium` 非空时只约束本地和 V6D 上报介质，不过滤 TairMempool/NFS 的路径；
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
 - 支持 `QT_PREFIX_MATCH` 和 `QT_PREFIX_MATCH_WITH_MAMBA`，其他类型返回参数错误；
-- 同一个 host 在多个 backend 的有效 cache 会按 host 汇总参与匹配；
+- local 按逻辑 engine 身份汇总，独立 rank 不合并；共享 V6D 沿 reporter 映射贡献给对应 rank；
 - `local` 包含同一 host 的 subscriber 与 Vineyard 上报；
 - 非混合注意力对 full local-miss 使用 Prefix 选择远端 Vineyard；混合注意力先对
   FullAttention group 使用 Prefix，再对 Mamba local-miss spec 使用 Coverage；
-- `p2p_1_fetch` 表示各 P2P 阶段实际选中并拉取的 spec 所属的去重 block key 数；
-- `p2p_1_total_match` 表示本地 cache 与实际选中的远端 spec 合并后的最终前缀；
+- `global_kvs_host_count`（默认 0，不能为负）控制按 local 降序选出的逻辑 engine 数，同分按 host 升序；
+- 入选 engine 合并本地与 TairMempool/NFS；`enable_p2p`（默认 false）决定是否追加 V6D；
+- 每次最多选择一个 peer；Mamba 各 Full group 分别选一个，Linear 缺失组汇总选一个；
+- `global` 是本地与本次远端评估合并后的可复用前缀，未入选时等于 `local`；
+- `global - local` 是额外可复用块数，不等于实际传输块数；
+- 旧的请求/返回字段已移除并保留编号，调用方需同步升级；
 - 远端 P2P 候选只使用 `ST_EVENT_REPORT_L2`，且不会让 `local` 为 0 的 host 出现在响应中；
 - reporter unavailable 时，该 host 对应的 event-report location 不参与匹配。
 
