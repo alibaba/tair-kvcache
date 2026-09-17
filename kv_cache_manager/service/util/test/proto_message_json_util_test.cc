@@ -544,11 +544,11 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventFastJsonParserMatchesGenericPars
         "host_ip_port":"10.0.0.8:8080",
         "events":[
             {"eventType":"EVENT_NODE_REGISTER","nodeRegister":{"mediums":["mem","disk"],"ignored":1}},
-            {"event_type":"EVENT_BLOCK_ADD","block_add":{"blockKey":"-1","uri":"legacy://uri","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem"},{"name":"tp1","uri":"event_report://host/mem?part=1"}]}},
+            {"event_type":"EVENT_BLOCK_ADD","block_add":{"blockKey":"-1","uri":"legacy://uri","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem","checksum":"0","checksumPresent":true},{"name":"tp1","uri":"event_report://host/mem?part=1","checksum":-42,"checksum_present":true}]}},
             {"event_type":3,"blockDelete":{"block_key":"2","medium":"disk","specNames":["tp0","tp1"]}},
             {"event_type":"EVENT_HOST_DOWN","hostDown":{"ignored":{"nested":true}}},
             {"event_type":"EVENT_HEARTBEAT","heartbeat":{"systemStatus":{"state":"ready","load":"7"}}},
-            {"event_type":"EVENT_BLOCK_SNAPSHOT","blockSnapshot":{"medium":"legacy","blocks":[{"blockKey":"3","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem?block=3"}]}]}}
+            {"event_type":"EVENT_BLOCK_SNAPSHOT","blockSnapshot":{"medium":"legacy","blocks":[{"blockKey":"3","medium":"mem","specs":[{"name":"tp0","uri":"event_report://host/mem?block=3","checksum":"9223372036854775807","checksumPresent":true}]}]}}
         ],
         "storageType":8,
         "ignored_top_level":{"deep":[1,2,3]}
@@ -718,6 +718,14 @@ TEST_F(ProtoMessageJsonUtilTest, TestReportEventJsonParserCompatibilityCorpusMat
          R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_ADDED_LATER","heartbeat":{"system_status":{}}}],"storage_type":"ST_ADDED_LATER"})json"},
         {"numeric_string_fields",
          R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":18446744073709551615,"medium":"mem","specs":[]}}],"storage_type":8})json"},
+        {"checksum_int64_min",
+         R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem","checksum":"-9223372036854775808","checksum_present":true}]}}],"storage_type":8})json"},
+        {"checksum_out_of_int64_range",
+         R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem","checksum":"9223372036854775808","checksum_present":true}]}}],"storage_type":8})json"},
+        {"checksum_wrong_type",
+         R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem","checksum":true,"checksum_present":true}]}}],"storage_type":8})json"},
+        {"duplicate_checksum_presence_aliases",
+         R"json({"instance_id":"i","host_ip_port":"h:1","events":[{"event_type":"EVENT_BLOCK_ADD","block_add":{"block_key":"1","medium":"mem","specs":[{"name":"tp0","uri":"event_report://h:1/mem","checksum":"7","checksum_present":true,"checksumPresent":false}]}}],"storage_type":8})json"},
         {"duplicate_aliases",
          R"json({"trace_id":"first","traceId":"second","instance_id":"i","host_ip_port":"h:1","events":[],"storage_type":8})json"},
         {"duplicate_map_keys",

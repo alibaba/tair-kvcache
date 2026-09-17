@@ -58,6 +58,23 @@ enum QueryType {
     QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
+// Checksum algorithm. Same persisted legacy semantics as meta_service.proto.
+// Re-declared per package to keep proto files independent (no cross-package
+// imports); revised behavior requires a new enum value.
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. Same semantics as meta_service.proto.
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    // Built-in KVCM algorithm; caller-provided opaque checksums are not tagged.
+    ChecksumAlgo algo = 4;
+}
+
 message LocalStorageSpec {}
 
 message DummyStorageSpec {
@@ -142,6 +159,7 @@ message StorageConfig {
     // 配置 EventReport storage 时必须显式指定 ST_EVENT_REPORT_L1P5 或 ST_EVENT_REPORT_L2；
     // 配置 TairMempool SSD 时必须显式指定 ST_TAIRMEMPOOL_SSD，并设置 media_type=5。
     StorageType storage_type = 11;
+    DataIntegrityConfig integrity = 12; // data integrity config; absent = all disabled
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -384,6 +402,8 @@ message GetCacheMetaRequest {
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
     int32 detail_level = 6;   // 返回数据的详细级别,越大获取的信息越多,暂定为数字
+    // Opt in to checksum fields on returned locations.
+    bool include_checksums = 7;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -394,6 +414,9 @@ message GetCacheMetaRequest {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Opaque checksum of this spec's independently stored payload.
+    int64 checksum = 3;
+    bool checksum_present = 4;
 }
 
 message CacheLocation {

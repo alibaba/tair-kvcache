@@ -53,6 +53,10 @@ class MetaServiceHttpClient(cases.MetaServiceClientBase):
         """Get cache location for specified block keys"""
         return self._make_api_request('/api/getCacheLocation', data, check_response)
 
+    def get_cache_meta(self, data, check_response=True):
+        """Get cache metadata for specified block keys"""
+        return self._make_api_request('/api/getCacheMeta', data, check_response)
+
     def start_write_cache(self, data, check_response=True):
         """Start writing cache data"""
         return self._make_api_request('/api/startWriteCache', data, check_response)
@@ -223,16 +227,30 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
                 {"name": "linear_1", "spec_names": ["linear_1"]},
             ],
         })
+        full_events = self._node_and_block_events(full_host, "full_0", block_keys)
+        full_events[1]["block_add"]["specs"][0].update({
+            "checksum": "0",
+            "checksum_present": True,
+        })
+        full_events[2]["block_add"]["specs"][0].update({
+            "checksum": "73",
+            "checksum_present": True,
+        })
+        linear_events = self._node_and_block_events(linear_host, "linear_1", block_keys[:1])
+        linear_events[1]["block_add"]["specs"][0].update({
+            "checksum": "-42",
+            "checksumPresent": True,
+        })
         self._client.report_event(self._report_events(
             instance_id,
             full_host,
-            self._node_and_block_events(full_host, "full_0", block_keys),
+            full_events,
             "event_report_full_peer",
         ))
         self._client.report_event(self._report_events(
             instance_id,
             linear_host,
-            self._node_and_block_events(linear_host, "linear_1", block_keys[:1]),
+            linear_events,
             "event_report_linear_peer",
         ))
 
@@ -244,6 +262,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
                 "block_keys": block_keys,
                 "block_mask": {"offset": 0},
                 "location_spec_names": ["linear_1"] * len(block_keys),
+                "include_checksums": True,
                 "backend_selectors": [{
                     "backend_type": "ST_EVENT_REPORT_L2",
                     "strategy": strategy,
@@ -256,7 +275,26 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             first_specs = first_locations[0].get("location_specs", [])
             self.assertEqual(["linear_1"], [spec.get("name") for spec in first_specs], response)
             self.assertIn(linear_host, first_specs[0].get("uri", ""), response)
+            self.assertTrue(first_specs[0].get("checksum_present"), response)
+            self.assertEqual(-42, int(first_specs[0].get("checksum")), response)
             self.assertEqual([], key_locations[1].get("locations", []), response)
+
+        zero_checksum = self._client.get_cache_locations_by_backend({
+            "trace_id": "event_report_query_zero_checksum",
+            "instance_id": instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_keys[0]],
+            "block_mask": {"offset": 0},
+            "location_spec_names": ["full_0"],
+            "include_checksums": True,
+            "backend_selectors": [{
+                "backend_type": "ST_EVENT_REPORT_L2",
+                "strategy": "LSS_V6D_PREFIX",
+            }],
+        })
+        zero_spec = zero_checksum["key_locations"][0]["locations"][0]["location_specs"][0]
+        self.assertTrue(zero_spec.get("checksum_present"), zero_checksum)
+        self.assertEqual(0, int(zero_spec.get("checksum")), zero_checksum)
 
         unknown_response = self._client.get_cache_locations_by_backend({
             "trace_id": "event_report_query_unknown_spec",

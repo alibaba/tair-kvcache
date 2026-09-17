@@ -233,6 +233,12 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
         "storage_spec": { # storage spec 需根据不同backend类型相应配置，TODO：具体每个type的spec配置文档
             "root_path": "/tmp/nfs/",
             "key_count_per_file": 8
+        },
+        "integrity": { # 可选；省略时不启用 KVCM 内置 checksum 计算/校验
+            "enable_meta_checksum": true,
+            "enable_inline_header": false,
+            "inline_header_version": 0,
+            "algo": "crc32_xor_int64"
         }
     },
     "instance_group": {
@@ -311,6 +317,16 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
     }
 }
 ```
+
+`storage_config.integrity.enable_meta_checksum` 是 TransferClient 的内置 checksum 计算能力开关；
+当前算法只支持 `crc32_xor_int64`。调用方自行计算并仅通过 FinishWrite 保存 checksum 时不依赖该开关；
+要求 KVCM 重算或读后校验时则必须开启。`enable_inline_header` 尚未实现，设为 `true` 会被拒绝。
+该算法默认只采样每个 iov 的头尾各 4 字节；`KVCM_CHECK_IOV_BYTE_SIZE` 在进程初始化时读取一次，且属于
+checksum 结果的一部分。所有参与 KVCM 算法重算/校验的 writer、reader 和外部 checksum 生产者必须在建立
+baseline 前固定相同值，不能在已有 baseline 的滚动发布中静默修改；纯 opaque 透传不受该环境变量约束。
+调大固定窗口也不等同于覆盖整个 block。
+完整算法、采样范围、API opt-in 与兼容性见
+[KVCache 读写链路数据完整性校验](design/data_integrity.md)。
 
 `instance_reclaim_budget_policy` 选择同一 Group 内如何逐出，Admin API 和 `kvcm_ops` 使用枚举名，Registry JSON 持久化整数：
 

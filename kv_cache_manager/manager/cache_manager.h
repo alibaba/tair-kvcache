@@ -10,6 +10,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -176,12 +177,36 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
-    ErrorCode
-    FinishWriteCache(RequestContext *request_context,
-                     const std::string &instance_id,
-                     const std::string &write_session_id,
-                     const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+    struct FinishWriteCacheOptions {
+        std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
+        struct ChecksumBatch {
+            std::string location_spec_name;
+            std::vector<int64_t> checksums;
+        };
+        // Each batch is parallel to the compact keys captured by StartWrite.
+        // Empty means no checksum update; failed positions and positions whose
+        // location omits that spec are ignored.
+        std::vector<ChecksumBatch> checksum_batches;
+
+        static FinishWriteCacheOptions
+        WithWriteLocationInfo(std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+            FinishWriteCacheOptions options;
+            options.write_location_info_internal = std::move(write_location_info_internal);
+            return options;
+        }
+
+        static FinishWriteCacheOptions WithChecksumBatches(std::vector<ChecksumBatch> checksum_batches) {
+            FinishWriteCacheOptions options;
+            options.checksum_batches = std::move(checksum_batches);
+            return options;
+        }
+    };
+
+    ErrorCode FinishWriteCache(RequestContext *request_context,
+                               const std::string &instance_id,
+                               const std::string &write_session_id,
+                               const BlockMask &success_block_mask,
+                               FinishWriteCacheOptions options = FinishWriteCacheOptions{});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,

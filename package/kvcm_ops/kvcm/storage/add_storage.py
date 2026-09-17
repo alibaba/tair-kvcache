@@ -30,6 +30,9 @@ def create_add_storage_data(args, storage_type: str, storage_spec: dict):
         storage["storage_type"] = args.event_report_storage_type
     elif storage_type == "tair_mem_pool":
         storage["storage_type"] = get_pace_storage_type(args.media_type)
+    integrity = gen_integrity_config_data(args)
+    if integrity is not None:
+        storage["integrity"] = integrity
     return {
         "trace_id": args.trace_id,
         "storage": storage
