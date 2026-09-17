@@ -100,6 +100,10 @@ class HiCacheKVCM(HiCacheStorage):
     # block batch, and so the report survives a backend re-creation.
     _reported_pools: set = set()
 
+    # Legacy entry points (batch_get/batch_set) already reported as not
+    # implemented; same process-wide, report-once reasoning.
+    _warned_legacy_ops: set = set()
+
     # Immutable so hand-built instances (tests bypass __init__) can read it
     # without sharing one mutable object: late names are added by rebinding,
     # never by mutating a shared set.
@@ -1602,7 +1606,22 @@ class HiCacheKVCM(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None] | int:
-        raise NotImplementedError()
+        """Legacy page interface (sglang <= 0.5.18 draft/MTP path).
+
+        KVCM backs KV/Mamba/Indexer location specs, not the draft pool, so the
+        honest answer is "nothing stored": the caller skips every ``None``.
+
+        Answering instead of raising is about visibility, not about keeping
+        the request alive.  Upstream wraps the draft functions in a bare
+        ``except Exception`` that logs at DEBUG, so the old
+        ``NotImplementedError`` was swallowed silently; the one-time WARNING
+        below names the missing L3 path instead.  (Only with ``interface_v1``
+        forced to 0 would this interface also carry KV, where ``_page_backup``
+        has no handler and a raise would kill the backup thread; the connector
+        sets ``interface_v1 = 1`` itself, so that needs an explicit override.)
+        """
+        self._report_legacy_op("batch_get")
+        return [None] * len(keys)
 
     def set(
         self,
@@ -1620,4 +1639,25 @@ class HiCacheKVCM(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        raise NotImplementedError()
+        """Legacy page interface (sglang <= 0.5.18 draft/MTP path).
+
+        Same reasoning as ``batch_get``: the draft wrapper swallows exceptions
+        into a DEBUG log and discards the return value, so a failed write is
+        equivalent in effect -- and the one-time WARNING below makes it
+        visible.
+        """
+        self._report_legacy_op("batch_set")
+        return False
+
+    def _report_legacy_op(self, op: str) -> None:
+        """Report once per legacy entry point that it is not implemented."""
+        if op in self._warned_legacy_ops:
+            return
+        self._warned_legacy_ops.add(op)
+        logger.warning(
+            "%s: this backend only serves the v1/v2 location-spec interfaces; "
+            "draft/MTP L3 is not backed by KVCM, so the call is answered "
+            "conservatively (miss / failed write) instead of raising an error "
+            "that upstream would only log at DEBUG.",
+            op,
+        )
