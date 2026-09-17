@@ -148,6 +148,10 @@ class HiCacheKVCM(HiCacheStorage):
         self._client_ready = False
         self._closed = False
 
+        # SDK handles, created by _ensure_client() and dropped by close().
+        self.transfer_client: Any = None
+        self.init_params: Any = None
+
         self.prefetch_pgs = []
         self.backup_pgs = []
         self.prefetch_bandwidth = []
@@ -1318,6 +1322,40 @@ class HiCacheKVCM(HiCacheStorage):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+    def close(self) -> None:
+        """Release what this backend owns; sglang calls it on detach.
+
+        sglang builds a fresh backend instance on re-attach, so nothing has to
+        be re-armed here and the method is idempotent.
+
+        close() takes the initialization lock, so it cannot interleave with
+        the one-time init: either it wins and the init then fails on
+        ``_closed``, or it waits and releases everything the init created.  A
+        client created during the race can therefore never stay referenced
+        (upstream also joins the storage threads before detaching, but the
+        ordering is enforced here instead of assumed).
+
+        Dropping ``transfer_client`` runs the pybind destructor of the SDK
+        wrapper.  The Manager HTTP client (its session and leader-refresh
+        thread) and the gloo group created for the TP collectives are per
+        instance resources too, so they are released explicitly.
+        """
+        with self._init_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.transfer_client = None
+            self.init_params = None
+            self._manager_client.close()
+
+            group = getattr(self, "storage_tp_group", None)
+            if group is not None:
+                self.storage_tp_group = None
+                try:
+                    torch.distributed.destroy_process_group(group)
+                except Exception as e:
+                    logger.warning("close: storage_tp_group not destroyed: %s", e)
 
     ##################################################
 
