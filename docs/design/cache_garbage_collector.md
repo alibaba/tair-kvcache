@@ -28,7 +28,7 @@ CLS_WRITING -> CLS_SERVING -> CLS_DELETING -> metadata removed
 
 当前 metadata backend 没有按 Location 状态或创建时间查询的索引。V1 不在写入热路径维护新索引，而是按 cursor 分批扫描 maintenance view：dual-backend 模式扫描内存 cache backend，single-backend 模式扫描唯一的 persistent backend。cursor 只把一次扫描摊到多个 tick；在 dual-backend 模式下，已从内存淘汰且未再次加载的冷 metadata 可能不会被发现，这是避免周期性全量扫描 Redis 的显式精度取舍。
 
-V1 采用“以固定间隔扫完一轮，再休眠固定时间”的简单策略。WRITING grace 默认 24 小时，round cooldown 默认 2 小时；两者分别控制删除资格和重复扫描频率。若 active round 的开销仍不可接受，再根据性能数据引入动态 pacing 或到期索引。
+V1 采用“以固定间隔扫完一轮，再休眠固定时间”的简单策略。WRITING grace 默认 24 小时，round cooldown 默认 5 分钟；两者分别控制删除资格和重复扫描频率。若 active round 的开销仍不可接受，再根据性能数据引入动态 pacing 或到期索引。
 
 ### 1.2 当前已知的异常状态
 
@@ -213,7 +213,7 @@ std::set<PendingLocationKey> pending_locations;
 10. 无论当前 cursor 是否回到 base，下一 tick 都轮转到下一个未完成 Instance；当前 Instance 回到 base 时将其标记完成。单个 Instance 在同一 round 内连续 3 次 Scan 失败后也标记为本轮完成，剩余 keyspace 延迟到下一 round 从 base cursor 重试，避免一个故障 Instance 永久卡住其他 Instance 和 Registry 新快照。全部 Instance 完成后结束 round，并设置 `next_round_at = now + round_pause_ms`。
 11. tick 结束后至少等待 `scan_interval_ms`。慢调用返回后不追赶错过的 tick。
 
-窗口默认包含 2 个请求。一个慢或卡住的物理删除或 metadata action 只占用一个槽位，其他槽位仍可继续扫描和提交；只有全部槽位被占用时才暂停扫描。这为当前无容量上限的 Executor 队列提供 GC 调用方侧的硬反压，同时利用 #234 已提供的 worker 并发。基础 GC 每 tick 最多提交一个物理删除；EventReport 扩展开启时，同一批最多再提交一个 metadata action。`inflight_delete_count` 和 `inflight_delete_age_ms` 分别表示当前 GC 在途 action 数和最老任务年龄。
+窗口默认包含 64 个请求。一个慢或卡住的物理删除或 metadata action 只占用一个槽位，其他槽位仍可继续扫描和提交；只有全部槽位被占用时才暂停扫描。这为当前无容量上限的 Executor 队列提供 GC 调用方侧的硬反压，同时利用 #234 已提供的 worker 并发。基础 GC 每 tick 最多提交一个物理删除；EventReport 扩展开启时，同一批最多再提交一个 metadata action。`inflight_delete_count` 和 `inflight_delete_age_ms` 分别表示当前 GC 在途 action 数和最老任务年龄。
 
 cursor 在 SubmitAsync 前已经推进。rejected、抛异常或 accepted/Future 契约错误时不回滚 cursor，也不保存该批候选；对象仍保留在 metadata 中。若它后续仍可从 maintenance view 观察到，则由后续 round 重新发现；dual-backend 下已被内存淘汰的对象不承诺仅靠 GC 主动重载。这样避免为 V1 引入额外 retry queue。
 
@@ -239,7 +239,7 @@ V1 只要求重复处理安全；仍存在于 scan view 的对象可由后续 ro
 candidate eligibility delay + S + P
 ```
 
-WRITING 的 eligibility delay 是 grace；普通 SERVING storage-missing 一旦进入扫描即具备资格。默认 WRITING grace 为 24 小时，`P` 为 2 小时，因此该能力定位为 best-effort 后台收敛，不提供分钟级 SLA。cursor 并发遗漏、target 裁剪、backend/探测错误、全部在途槽位卡住，以及 dual-backend 下目标已从内存淘汰，都可能继续延长时间；最后一种情况不承诺有限时间内仅靠 GC 收敛。
+WRITING 的 eligibility delay 是 grace；普通 SERVING storage-missing 一旦进入扫描即具备资格。默认 WRITING grace 为 24 小时，`P` 为 5 分钟，因此该能力定位为 best-effort 后台收敛，不提供严格 SLA。cursor 并发遗漏、target 裁剪、backend/探测错误、全部在途槽位卡住，以及 dual-backend 下目标已从内存淘汰，都可能继续延长时间；最后一种情况不承诺有限时间内仅靠 GC 收敛。
 
 ## 4. 详细设计
 
@@ -564,13 +564,13 @@ V1 不修改 `write_location_manager.*`、`cache_reclaimer.*` 或 `migration_man
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
 | `kvcm.cache_gc.enabled` | `true` | 默认开启；可显式设为 `false` 回退 |
-| `kvcm.cache_gc.scan_interval_ms` | 1000 | 相邻 tick 的最小间隔 |
-| `kvcm.cache_gc.round_pause_ms` | 7200000 | 完成一个 full round 后的 cooldown；0 表示下一 tick 可开始新 round |
+| `kvcm.cache_gc.scan_interval_ms` | 100 | 相邻 tick 的最小间隔 |
+| `kvcm.cache_gc.round_pause_ms` | 300000 | 完成一个 full round 后的 cooldown；0 表示下一 tick 可开始新 round |
 | `kvcm.cache_gc.scan_batch_size` | 256 | backend key 数 hint，同时作为单请求 target 上限 |
 | `kvcm.cache_gc.orphan_writing_grace_period_ms` | 86400000 | WRITING 自动清理 grace，必须不小于 3600000 ms |
-| `kvcm.cache_gc.max_inflight_delete_requests` | 2 | 普通删除与 EventReport action 共用的 GC 在途硬上限，必须大于 0 |
+| `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通删除与 EventReport action 共用的 GC 在途硬上限，必须大于 0 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |
-| `kvcm.cache_gc.event_report_action_batch_size` | 32 | 单 tick EventReport metadata action 的唯一 Block key 上限；Location 总数仍受 `scan_batch_size` 限制 |
+| `kvcm.cache_gc.event_report_action_batch_size` | 256 | 单 tick EventReport metadata action 的唯一 Block key 上限；Location 总数仍受 `scan_batch_size` 限制 |
 
 配置通过一个内聚的 `CacheGarbageCollector::Config` 传入。`round_pause_ms` 可以为 0，其他 interval、batch 和在途请求上限必须为正；毫秒到内部 duration 的转换需要检查溢出。EventReport 扩展的收敛、优先级、recovery grace 和 metadata action 边界见其独立设计文档。1 小时 grace 下限基于当前 1800 秒 write session 上限；若后续修改该协议上限，必须同步重新评估 GC grace 下限。
 
