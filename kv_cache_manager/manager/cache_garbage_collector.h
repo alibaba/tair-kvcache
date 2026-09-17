@@ -63,9 +63,9 @@ public:
         int64_t round_pause_ms{5LL * 60 * 1000};
         size_t scan_batch_size{256};
         int64_t orphan_writing_grace_period_ms{24LL * 60 * 60 * 1000};
-        size_t max_inflight_delete_requests{2};
+        size_t max_inflight_delete_requests{64};
         bool event_report_cleanup_enabled{true};
-        size_t event_report_action_batch_size{32};
+        size_t event_report_action_batch_size{256};
     };
 
     CacheGarbageCollector() = delete;

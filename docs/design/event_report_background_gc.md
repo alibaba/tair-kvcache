@@ -179,7 +179,7 @@ V1 要求同一 InstanceGroup 内，每个 EventReport storage type 最多有一
 - `SchedulePlanExecutor` 的 worker；
 - Future 终态释放流程。
 
-这是 GC 调用方级的有界反压，不是 Executor 全局限流。即使 GC 只保留默认 2 个在途任务，Reclaimer、Migration 等其他调用方仍按现有 Executor 语义提交。V1 不修改公共队列容量、任务类别配额或全局 admission。
+这是 GC 调用方级的有界反压，不是 Executor 全局限流。即使 GC 只保留默认 64 个在途任务，Reclaimer、Migration 等其他调用方仍按现有 Executor 语义提交。V1 不修改公共队列容量、任务类别配额或全局 admission。
 
 ## 4. EventReport 判定契约
 
@@ -283,7 +283,7 @@ orphan WRITING
 预算规则：
 
 - 所有原因合计最多准入 `scan_batch_size` 个 Location；
-- EventReport action 最多包含 `event_report_action_batch_size` 个唯一 Block key，默认 32；
+- EventReport action 最多包含 `event_report_action_batch_size` 个唯一 Block key，默认 256；
 - 一个已准入 Block key 可以携带多个 EventReport Location，但 Location 总数仍受总预算限制；
 - pending target 不重复准入；
 - 超预算、Executor 拒绝或 inflight 已满的候选不进入 deferred queue，只记录指标并等待后续 round 重新发现。
@@ -458,9 +458,9 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | `kvcm.cache_gc.scan_interval_ms` | 100 | active round 相邻 tick 最小间隔 |
 | `kvcm.cache_gc.round_pause_ms` | 300000 | full round 完成后的 cooldown；0 表示下一 tick 可开始新 round |
 | `kvcm.cache_gc.scan_batch_size` | 256 | scan key hint，也是单 tick Location 总预算 |
-| `kvcm.cache_gc.max_inflight_delete_requests` | 2 | 普通与 EventReport action 共用的 GC 在途上限 |
+| `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通与 EventReport action 共用的 GC 在途上限 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |
-| `kvcm.cache_gc.event_report_action_batch_size` | 32 | 单 tick EventReport action 的唯一 Block key 上限 |
+| `kvcm.cache_gc.event_report_action_batch_size` | 256 | 单 tick EventReport action 的唯一 Block key 上限 |
 
 所有配置启动时读取；V1 不实现运行时热更新。`round_pause_ms` 可以为 0，其他 interval/budget/inflight 必须大于 0。EventReport key budget 与 Scan key hint 是独立上限：前者约束 metadata action 涉及的唯一 Block key 数，后者约束单 tick Location 总预算；key budget 大于 Scan hint 时只是当批通常无法用满，不构成非法配置。
 

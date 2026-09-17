@@ -36,7 +36,9 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(300000, config.GetCacheGcRoundPauseMs());
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
+        ASSERT_EQ(64, config.GetCacheGcMaxInflightDeleteRequests());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+        ASSERT_EQ(256, config.GetCacheGcEventReportActionBatchSize());
     }
     // config_file not exist
     {
