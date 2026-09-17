@@ -530,13 +530,13 @@ message GetHostCacheStateRequest {
     repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
     repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
     int32 global_kvs_host_count = 7; // 按 local 降序选前 N 个逻辑引擎计算远端命中；0 表示仅计算本地
-    bool enable_p2p = 8;         // 是否启用 P2P，每次最多选一个 V6D 节点；不影响 Tair/NFS 命中计算
+    bool enable_p2p = 8;         // 是否启用 P2P
 }
 
 message HostCacheMatch {
     string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
     int64 local = 2;           // 本地前缀匹配的 block 数
-    int64 global = 5; // 本地与选中远端来源联合后的前缀命中块数，包含 local
+    int64 global = 5; // 本地+p2p + tairmempool来源联合后的前缀命中块数，包含 local
 }
 
 message GetHostCacheStateResponse {
