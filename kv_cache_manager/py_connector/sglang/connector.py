@@ -104,6 +104,10 @@ class HiCacheKVCM(HiCacheStorage):
     # implemented; same process-wide, report-once reasoning.
     _warned_legacy_ops: set = set()
 
+    # Defaults for instances built without __init__ (tests build connectors by
+    # hand to drive one code path); a real backend sets these in __init__.
+    _client_ready: bool = False
+    _closed: bool = False
     # Immutable so hand-built instances (tests bypass __init__) can read it
     # without sharing one mutable object: late names are added by rebinding,
     # never by mutating a shared set.
