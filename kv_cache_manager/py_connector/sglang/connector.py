@@ -17,22 +17,19 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-StorageMetrics = None
 try:
     from sglang.srt.observability.metrics_collector import StorageMetrics
 except ImportError:
-    pass
-if StorageMetrics is None:
     try:
         # Older sglang versions kept StorageMetrics here.
         from sglang.srt.metrics.collector import StorageMetrics  # ty: ignore[unresolved-import]
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "Cannot import StorageMetrics from sglang. "
             "Tried sglang.srt.observability.metrics_collector and "
             "sglang.srt.metrics.collector. "
             "Please check your sglang version is compatible."
-        )
+        ) from e
 
 # get_attn_tp_group lives in sglang.srt.distributed since v0.5.9; the old
 # alias sglang.srt.layers.dp_attention.get_attention_tp_group was removed in
@@ -72,7 +69,7 @@ class HiCacheKVCM(HiCacheStorage):
         # --hicache-storage-backend-extra-config '{"k":"v"}'
         # HiCacheStorageConfig types extra_config as Optional; sglang always
         # provides it for a hicache storage backend.
-        self.extra_config: Dict[str, Any] = self.storage_config.extra_config  # ty: ignore[invalid-assignment]
+        self.extra_config: Dict[str, Any] = self.storage_config.extra_config or {}
 
         # deployment
         self.instance_group = self.extra_config["instance_group"]
@@ -1081,9 +1078,7 @@ class HiCacheKVCM(HiCacheStorage):
             return PoolTransferResult.empty()
 
     def get_stats(self) -> Any:
-        # StorageMetrics is a class by the time the module finishes its
-        # import fallback chain; ty cannot prove the None path unreachable.
-        storage_metrics = StorageMetrics()  # ty: ignore[call-non-callable]
+        storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
@@ -1115,10 +1110,8 @@ class HiCacheKVCM(HiCacheStorage):
         return str(uuid.uuid1())
 
     def _sha256_to_int64(self, data: str) -> int:
-        data = data.encode("utf-8")  # ty: ignore[invalid-assignment]
-        hash_digest = hashlib.sha256(data).digest()  # ty: ignore[invalid-argument-type]
-        hash_int64 = int.from_bytes(hash_digest[:8], "big", signed=True)
-        return hash_int64
+        hash_digest = hashlib.sha256(data.encode("utf-8")).digest()
+        return int.from_bytes(hash_digest[:8], "big", signed=True)
 
     def _prepare_block_keys(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
