@@ -52,8 +52,7 @@ public:
     struct HostCacheMatch {
         std::string host_ip_port;
         int64_t local;
-        int64_t p2p_1_fetch;
-        int64_t p2p_1_total_match;
+        int64_t global;
     };
 
     struct HostCacheLocationInfo {
@@ -109,7 +108,9 @@ public:
                                 const std::vector<std::string> &medium_filter,
                                 std::vector<HostCacheMatch> &out_matches,
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                size_t p2p_host_count = 0) const;
+                                size_t global_kvs_host_count = 0,
+                                bool enable_p2p = false,
+                                SelectLocationPolicy *policy = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
@@ -117,7 +118,9 @@ public:
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
                                          std::vector<HostCacheMatch> &out_matches,
                                          const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                         size_t p2p_host_count = 0) const;
+                                         size_t global_kvs_host_count = 0,
+                                         bool enable_p2p = false,
+                                         SelectLocationPolicy *policy = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,

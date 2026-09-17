@@ -278,6 +278,10 @@ BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheSta
     }
     writer.Key("medium_count");
     writer.Int(request->medium_size());
+    writer.Key("global_kvs_host_count");
+    writer.Int(request->global_kvs_host_count());
+    writer.Key("enable_p2p");
+    writer.Bool(request->enable_p2p());
     writer.EndObject();
     return {std::string(sb.GetString(), sb.GetSize()), true};
 }
@@ -986,8 +990,8 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    if (request->p2p_host_count() < 0) {
-        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "p2p_host_count (must be >= 0)", true);
+    if (request->global_kvs_host_count() < 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "global_kvs_host_count (must be >= 0)", true);
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
@@ -1006,7 +1010,8 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                           static_cast<CacheManager::QueryType>(request->query_type()),
                                           keys,
                                           mediums,
-                                          static_cast<size_t>(request->p2p_host_count()));
+                                          static_cast<size_t>(request->global_kvs_host_count()),
+                                          request->enable_p2p());
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());
@@ -1017,8 +1022,7 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
             auto *host_match = response->add_hosts();
             host_match->set_host_ip_port(match.host_ip_port);
             host_match->set_local(match.local);
-            host_match->set_p2p_1_fetch(match.p2p_1_fetch);
-            host_match->set_p2p_1_total_match(match.p2p_1_total_match);
+            host_match->set_global(match.global);
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());

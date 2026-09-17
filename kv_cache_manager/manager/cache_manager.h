@@ -80,8 +80,7 @@ public:
     struct HostCacheMatch {
         std::string host_ip_port;
         int64_t local;
-        int64_t p2p_1_fetch;
-        int64_t p2p_1_total_match;
+        int64_t global;
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -218,7 +217,8 @@ public:
                       QueryType query_type,
                       const KeyVector &block_cache_keys,
                       const std::vector<std::string> &medium_filter = {},
-                      size_t p2p_host_count = 0);
+                      size_t global_kvs_host_count = 0,
+                      bool enable_p2p = false);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
