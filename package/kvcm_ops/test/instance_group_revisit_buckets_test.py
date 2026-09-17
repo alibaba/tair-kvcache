@@ -12,6 +12,8 @@ from kvcm_ops.kvcm.instance_group.util import (
     InstanceGroup,
     InstanceGroupQuota,
     StorageQuota,
+    MetaStorageBackendConfig,
+    meta_storage_backend_config_value,
     parse_bucket_boundaries,
     parse_instance_group_args,
     revisit_interval_buckets_value,
@@ -189,6 +191,18 @@ class ParseInstanceGroupArgsTest(unittest.TestCase):
 
 
 class UpdateInstanceGroupTest(unittest.TestCase):
+    def test_update_preserves_memory_primary(self):
+        response = _get_response()
+        storage = response["instance_group"]["cache_config"]["meta_indexer_config"]["meta_storage_backend_config"]
+        storage.update(storage_type="cached", storage_uri="redis://backup:6379/?persistent_type=async_redis",
+                       memory_primary=True)
+        with patch("sys.argv", ["prog", "--name", "g1", "--user_data", "changed"]), \
+             patch.object(update_instance_group, "http_post") as post:
+            post.side_effect = [response, {"header": {"status": {"code": "OK"}}}]
+            update_instance_group.main()
+            updated = post.call_args_list[1].args[2]["instance_group"]
+            self.assertEqual(storage, updated["cache_config"]["meta_indexer_config"]["meta_storage_backend_config"])
+
     def _run_update(self, server_buckets, *extra_args):
         with patch("sys.argv", ["prog", "--name", "g1", *extra_args]), \
              patch.object(update_instance_group, "http_post") as mock_http_post:
@@ -211,6 +225,26 @@ class UpdateInstanceGroupTest(unittest.TestCase):
 
     def test_missing_server_field_stays_empty_when_omitted(self):
         self.assertEqual("", self._run_update(None, "--user_data", "changed"))
+
+
+class MemoryPrimaryConfigTest(unittest.TestCase):
+    def test_defaults_and_round_trip(self):
+        self.assertFalse(MetaStorageBackendConfig().to_json_data()["memory_primary"])
+        legacy = {"storage_type": "local", "storage_uri": ""}
+        self.assertFalse(MetaStorageBackendConfig.from_json_data(legacy).to_json_data()["memory_primary"])
+        data = {"storage_type": "cached", "storage_uri": "redis://backup:6379/?persistent_type=async_redis",
+                "memory_primary": True}
+        self.assertEqual(data, MetaStorageBackendConfig.from_json_data(data).to_json_data())
+
+    def test_cli(self):
+        for value in ("local", "cached,redis://backup:6379/?persistent_type=async_redis,false"):
+            self.assertFalse(meta_storage_backend_config_value(value).to_json_data()["memory_primary"])
+        self.assertTrue(meta_storage_backend_config_value(
+            "cached,redis://backup:6379/?persistent_type=async_redis,true").to_json_data()["memory_primary"])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            meta_storage_backend_config_value("cached,redis://backup:6379/,maybe")
+        with self.assertRaises(RuntimeError):
+            MetaStorageBackendConfig(memory_primary="false")
 
 
 if __name__ == "__main__":

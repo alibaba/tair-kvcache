@@ -9,6 +9,7 @@
 #include "google/protobuf/util/json_util.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
@@ -18,6 +19,27 @@
 #include "service/util/test/service_util_test.pb.h"
 
 namespace kv_cache_manager {
+
+TEST(ProtoConvertTest, MemoryPrimaryRoundTrip) {
+    for (bool enabled : {false, true}) {
+        proto::admin::CacheConfig proto_config;
+        auto *storage = proto_config.mutable_meta_indexer_config()->mutable_meta_storage_backend_config();
+        storage->set_storage_type("cached");
+        storage->set_storage_uri("redis://backup:6379/?persistent_type=async_redis");
+        storage->set_memory_primary(enabled);
+        CacheConfig config;
+        ProtoConvert::CacheConfigFromProto(&proto_config, config);
+        EXPECT_EQ(enabled, config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetMemoryPrimary());
+        proto::admin::CacheConfig round_trip;
+        ProtoConvert::CacheConfigToProto(config, &round_trip);
+        EXPECT_EQ(enabled, round_trip.meta_indexer_config().meta_storage_backend_config().memory_primary());
+        EXPECT_EQ(storage->storage_uri(), round_trip.meta_indexer_config().meta_storage_backend_config().storage_uri());
+    }
+    proto::admin::CacheConfig legacy;
+    CacheConfig config;
+    ProtoConvert::CacheConfigFromProto(&legacy, config);
+    EXPECT_FALSE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetMemoryPrimary());
+}
 
 namespace {
 

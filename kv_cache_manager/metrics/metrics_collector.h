@@ -498,6 +498,8 @@ class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, async_flush_key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_batch_flush_time_us)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_pipeline_error_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_metadata_count)
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;

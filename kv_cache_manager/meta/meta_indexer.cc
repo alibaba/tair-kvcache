@@ -190,6 +190,9 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     ec = RecoverMetaData();
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
+        // Failed initialization must not persist partial/default counters in
+        // the destructor over the Redis recovery baseline.
+        backend_manager_.reset();
         return ec;
     }
     KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
@@ -728,7 +731,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
-        if (maintenance_no_touch && !backend_manager_->Sync(batch_keys)) {
+        if (maintenance_no_touch && !backend_manager_->SyncBeforeMaintenanceRead(batch_keys)) {
             // A single async metadata backend may still have an accepted
             // same-key mutation queued. Reading before that mutation reaches
             // the persistent view could authorize a stale expected-value
@@ -748,7 +751,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> refresh_results;
-        if (refresh_cache_from_persistent) {
+        const bool refresh_cache = refresh_cache_from_persistent && !backend_manager_->IsMemoryPrimary();
+        if (refresh_cache) {
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
@@ -780,7 +784,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (refresh_cache_from_persistent && refresh_results.size() != batch_keys.size())) {
+            (refresh_cache && refresh_results.size() != batch_keys.size())) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -796,7 +800,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             continue;
         }
 
-        if (refresh_cache_from_persistent) {
+        if (refresh_cache) {
             for (size_t i = 0; i < batch_keys.size(); ++i) {
                 if (refresh_results[i] == EC_OK) {
                     continue;
@@ -1408,9 +1412,9 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
     return result;
 }
 
-MetaIndexer::Result MetaIndexer::GetLocationsFromPersistent(RequestContext *request_context,
-                                                            const KeyVector &keys,
-                                                            CacheLocationMapVector &out_location_maps) noexcept {
+MetaIndexer::Result MetaIndexer::GetLocationsFromPrimary(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         CacheLocationMapVector &out_location_maps) noexcept {
     if (keys.empty()) {
         out_location_maps.clear();
         return Result(EC_OK);
@@ -1420,7 +1424,7 @@ MetaIndexer::Result MetaIndexer::GetLocationsFromPersistent(RequestContext *requ
     const auto &trace_id = request_context->trace_id();
 
     const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = backend_manager_->GetLocationsFromPersistent(request_context, keys, out_location_maps);
+    auto error_codes = backend_manager_->GetLocationsFromPrimary(request_context, keys, out_location_maps);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 

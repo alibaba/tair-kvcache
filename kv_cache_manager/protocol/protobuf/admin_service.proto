@@ -288,6 +288,7 @@ enum CachePreferStrategy {
 message MetaStorageBackendConfig {
     string storage_type = 1;
     string storage_uri = 2;
+    bool memory_primary = 3;
 }
 
 message MetaCachePolicyConfig {

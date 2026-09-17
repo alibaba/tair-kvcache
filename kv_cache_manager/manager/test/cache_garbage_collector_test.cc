@@ -260,7 +260,7 @@ AsyncDeleteSubmitResult SubmitAsyncEventReportStub(void *, const EventReportMeta
 }
 
 MetaIndexer::Result
-GetLocationsFromPersistentErrorStub(void *, RequestContext *, const KeyVector &, CacheLocationMapVector &) noexcept {
+GetLocationsFromPrimaryErrorStub(void *, RequestContext *, const KeyVector &, CacheLocationMapVector &) noexcept {
     return MetaIndexer::Result(EC_ERROR);
 }
 
@@ -1898,7 +1898,7 @@ TEST_F(CacheGarbageCollectorTest, RealExecutorBacklogDoesNotBlockGcSubmitAndStop
     };
 
     stub_.reset(static_cast<SubmitAsyncLocation>(ADDR(SchedulePlanExecutor, SubmitAsync)));
-    stub_.set(ADDR(MetaIndexer, GetLocationsFromPersistent), GetLocationsFromPersistentErrorStub);
+    stub_.set(ADDR(MetaIndexer, GetLocationsFromPrimary), GetLocationsFromPrimaryErrorStub);
 
     std::promise<void> blocker_started;
     std::promise<void> release_blocker;

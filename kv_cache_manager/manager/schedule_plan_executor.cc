@@ -695,7 +695,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
     ErrorCode get_locations_ec = ErrorCode::EC_OK;
     if (authoritative_read) {
-        const auto get_result = indexer->GetLocationsFromPersistent(request_context.get(), block_keys, location_maps);
+        const auto get_result = indexer->GetLocationsFromPrimary(request_context.get(), block_keys, location_maps);
         if (get_result.error_codes.size() != block_keys.size()) {
             get_locations_ec = ErrorCode::EC_ERROR;
         } else {

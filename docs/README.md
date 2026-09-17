@@ -1,6 +1,7 @@
 # 项目文档
 
 ### 设计文档
+
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
 - [Client SDK I/O 契约](design/client_sdk_io_contract.md) - deadline 语义、buffer 生命周期、各后端取消能力矩阵
@@ -13,6 +14,7 @@
 - [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到
 - [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
+- [Meta 内存主存储与 Redis 异步备份](design/meta_memory_primary_async_backup.md) - Recover 保持持久化优先，Running 切换内存优先异步备份并复用原锁外 Sync
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置

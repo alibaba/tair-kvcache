@@ -5,9 +5,8 @@
 namespace kv_cache_manager {
 
 // Intermediate base class for cache-type backends (e.g. MetaLocalBackend).
-// Extends MetaStorageBackend with conditional write operations that accept
-// previous_error_codes, allowing callers to skip keys that already failed
-// in a prior write stage (e.g. persistent write) without copying key/value vectors.
+// Cache-only capabilities stay here; common conditional writes are declared
+// by MetaStorageBackend so either physical backend can be the second stage.
 class MetaCacheBaseBackend : public MetaStorageBackend {
 public:
     ~MetaCacheBaseBackend() override = default;
@@ -15,8 +14,13 @@ public:
     // Bring base-class write overloads into scope (without previous_error_codes).
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::DeleteLocations;
+    using MetaStorageBackend::GetLocationsForMaintenance;
     using MetaStorageBackend::Put;
     using MetaStorageBackend::Upsert;
+
+    virtual std::vector<ErrorCode> GetLocationsForMaintenance(RequestContext *request_context,
+                                                              const KeyTypeVec &keys,
+                                                              CacheLocationMapVector &out_locations) noexcept = 0;
 
     virtual size_t GetMemUsage() const noexcept = 0;
     virtual int64_t GetOldestAccessTime() const noexcept = 0;
@@ -43,48 +47,16 @@ public:
                                                const CacheLocationMapVector &locations,
                                                const PropertyMapVector &properties) noexcept = 0;
 
-    // =====================================================================
-    // Overloaded writes with previous_error_codes
-    // =====================================================================
+    // Conditional PutIfAbsent remains cache-specific.
     // For each key:
     //   - If previous_error_codes[i] != EC_OK → skip, return previous_error_codes[i]
     //   - Otherwise → perform the write normally
-
-    virtual std::vector<ErrorCode> Put(RequestContext *request_context,
-                                       const KeyTypeVec &keys,
-                                       const CacheLocationMapVector &locations,
-                                       const PropertyMapVector &properties,
-                                       const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 
     virtual std::vector<ErrorCode> PutIfAbsent(RequestContext *request_context,
                                                const KeyTypeVec &keys,
                                                const CacheLocationMapVector &locations,
                                                const PropertyMapVector &properties,
                                                const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
-    virtual std::vector<ErrorCode> Upsert(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          const CacheLocationMapVector &locations,
-                                          const PropertyMapVector &properties,
-                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
-    virtual std::vector<ErrorCode> Delete(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
-    virtual std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
-                                                   const KeyTypeVec &keys,
-                                                   const LocationIdsPerKey &location_ids,
-                                                   const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
-    // Conditional no-touch delete used by background metadata maintenance.
-    // EC_OK and EC_NOENT from the persistent layer both authorize the
-    // idempotent cache-side delete; hard failures must be preserved.
-    virtual std::vector<ErrorCode>
-    DeleteLocationsForMaintenance(RequestContext *request_context,
-                                  const KeyTypeVec &keys,
-                                  const LocationIdsPerKey &location_ids,
-                                  const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 };
 
 } // namespace kv_cache_manager
