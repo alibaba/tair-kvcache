@@ -1,7 +1,5 @@
 #include "kv_cache_manager/meta/mpsc_write_queue.h"
 
-#include <algorithm>
-
 namespace kv_cache_manager {
 
 MpscWriteQueue::~MpscWriteQueue() {
@@ -25,11 +23,64 @@ void MpscWriteQueue::Push(QueueItem item) {
         kc = static_cast<int64_t>(op->keys.size());
     }
     Node *new_node = new Node(std::move(item), kc);
+    key_size_.fetch_add(kc, std::memory_order_relaxed);
+    Publish(new_node);
+}
+
+bool MpscWriteQueue::TryReserve(int64_t key_count, int64_t capacity) noexcept {
+    return TryReserve(key_count, capacity, false);
+}
+
+bool MpscWriteQueue::TryReserve(int64_t key_count, int64_t capacity, bool allow_oversized_item) noexcept {
+    int64_t current = key_size_.load(std::memory_order_relaxed);
+    do {
+        if (key_count > capacity) {
+            if (!allow_oversized_item || current != 0) {
+                return false;
+            }
+        } else if (current > capacity - key_count) {
+            return false;
+        }
+    } while (!key_size_.compare_exchange_weak(current, current + key_count, std::memory_order_acq_rel));
+    return true;
+}
+
+bool MpscWriteQueue::HasCapacity(int64_t key_count, int64_t capacity, bool allow_oversized_item) const noexcept {
+    const int64_t current = key_size_.load(std::memory_order_acquire);
+    if (key_count > capacity) {
+        return allow_oversized_item && current == 0;
+    }
+    return current <= capacity - key_count;
+}
+
+bool MpscWriteQueue::WaitAndReserve(int64_t key_count, int64_t capacity, int64_t timeout_us) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
+    while (!TryReserve(key_count, capacity, true)) {
+        std::unique_lock<std::mutex> lock(capacity_mutex_);
+        if (HasCapacity(key_count, capacity, true)) {
+            continue;
+        }
+        const bool has_capacity =
+            capacity_cv_.wait_until(lock, deadline, [&] { return HasCapacity(key_count, capacity, true); });
+        if (!has_capacity) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MpscWriteQueue::PushReserved(QueueItem item, int64_t key_count) { Publish(new Node(std::move(item), key_count)); }
+
+void MpscWriteQueue::NotifyCapacityWaiters() noexcept {
+    std::lock_guard<std::mutex> lock(capacity_mutex_);
+    capacity_cv_.notify_all();
+}
+
+void MpscWriteQueue::Publish(Node *new_node) {
     Node *old_head = head_.load(std::memory_order_relaxed);
     do {
         new_node->next = old_head;
     } while (!head_.compare_exchange_weak(old_head, new_node, std::memory_order_acq_rel, std::memory_order_relaxed));
-    key_size_.fetch_add(kc, std::memory_order_relaxed);
     wait_cv_.notify_one();
 }
 
@@ -49,7 +100,7 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
     }
     if (leftover_consumed > 0) {
         key_size_.fetch_sub(leftover_consumed, std::memory_order_release);
-        capacity_cv_.notify_all();
+        NotifyCapacityWaiters();
     }
     if (out_taken_keys >= max_batch_size) {
         return result;
@@ -88,7 +139,7 @@ std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t 
 
     if (chain_consumed > 0) {
         key_size_.fetch_sub(chain_consumed, std::memory_order_release);
-        capacity_cv_.notify_all();
+        NotifyCapacityWaiters();
     }
 
     return result;
@@ -113,21 +164,5 @@ MpscWriteQueue::PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, in
 }
 
 void MpscWriteQueue::NotifyConsumer() { wait_cv_.notify_one(); }
-
-bool MpscWriteQueue::WaitForCapacity(int64_t capacity_threshold, int64_t incoming_key_count, int64_t timeout_us) {
-    auto has_capacity = [&] {
-        const int64_t current_key_count = key_size_.load(std::memory_order_acquire);
-        if (incoming_key_count >= capacity_threshold) {
-            return current_key_count == 0;
-        }
-        return current_key_count + incoming_key_count <= capacity_threshold;
-    };
-
-    if (has_capacity()) {
-        return true;
-    }
-    std::unique_lock<std::mutex> lock(capacity_mutex_);
-    return capacity_cv_.wait_for(lock, std::chrono::microseconds(timeout_us), has_capacity);
-}
 
 } // namespace kv_cache_manager

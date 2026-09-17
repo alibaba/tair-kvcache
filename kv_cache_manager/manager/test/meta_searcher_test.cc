@@ -3497,6 +3497,76 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
     EXPECT_TRUE(location_maps[1].empty());
 }
 
+TEST_F(MetaSearcherTest, TestMemoryPrimaryFailedAddFollowsPhaseWriteOrder) {
+    auto *backup = ReplaceWithRollbackFaultBackend();
+    auto local = std::make_unique<MetaLocalBackend>();
+    auto config = ConstructMetaStorageBackendConfig();
+    config->SetStorageUri("local://cache?capacity=1&num_shard_bits=0");
+    ASSERT_EQ(EC_OK, local->Init("test", config));
+    ASSERT_EQ(EC_OK, local->Open());
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.cache_backend_ = std::move(local);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    auto specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    specs[0].set_uri("file:///tmp/rollback?size=1&padding=" + std::string(2 * 1024 * 1024, 'x'));
+    auto location = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs);
+    std::vector<MetaSearcher::AddLocationResult> added;
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {42}, {location}, added));
+    ASSERT_EQ(1, added.size());
+    ASSERT_EQ(EC_NOSPC, added[0].ec);
+    ASSERT_FALSE(added[0].location_id.empty());
+    LocationsPerKey persistent;
+    // Recover retains the original persistent-first order. A local capacity
+    // failure here is a configuration error, not a supported degraded mode.
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              backup->GetLocations(nullptr, {42}, {{added[0].location_id}}, persistent));
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    std::vector<MetaSearcher::AddLocationResult> running_added;
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {43}, {location}, running_added));
+    ASSERT_EQ(EC_NOSPC, running_added[0].ec);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}),
+              backup->GetLocations(nullptr, {43}, {{running_added[0].location_id}}, persistent));
+    backup->SetFailSync(true);
+    MetaSearcher::AddLocationRollbackPlan plan;
+    running_added.push_back({EC_ERROR, ""});
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {43, 44}, running_added, plan));
+    // The Running failure never created a metadata reference, so the original
+    // Reconcile path can release both URIs without a persistence barrier.
+    EXPECT_THAT(plan.direct_delete_indices, testing::UnorderedElementsAre(0, 1));
+    EXPECT_EQ(0, meta_indexer_->GetKeyCount());
+}
+
+TEST_F(MetaSearcherTest, TestMemoryPrimaryDestructiveCasDoesNotSyncInsideRmw) {
+    auto *backup = ReplaceWithRollbackFaultBackend();
+    auto local = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, local->Init("test", ConstructMetaStorageBackendConfig()));
+    ASSERT_EQ(EC_OK, local->Open());
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.cache_backend_ = std::move(local);
+    manager.memory_primary_ = true;
+    auto location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    location->set_status(CLS_SERVING);
+    std::vector<MetaSearcher::AddLocationResult> added;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {42}, {location}, added));
+    const auto &id = added[0].location_id;
+    std::vector<std::vector<ErrorCode>> results;
+    backup->SetFailSync(true);
+    // Status CAS only commits metadata. SchedulePlanExecutor performs the
+    // Sync barrier after this RMW releases the shard lock.
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(
+                  request_context_.get(), {42}, {{{id, CLS_WRITING, CLS_SERVING}}}, results));
+    const std::vector<std::vector<MetaSearcher::LocationCASTask>> tasks{{{id, CLS_SERVING, CLS_DELETING}}};
+    EXPECT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {42}, tasks, results, true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    CacheLocationMapVector maps;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, maps));
+    EXPECT_EQ(CLS_DELETING, maps[0].at(id)->status());
+}
+
 TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
     MetaSearcher::AddLocationRollbackPlan plan;
     plan.pipeline_keys = {42};

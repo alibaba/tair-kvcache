@@ -22,10 +22,21 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 using namespace kv_cache_manager;
 namespace {
+class SyncResultBackend : public MetaLocalBackend {
+public:
+    bool Sync(const KeyTypeVec &) noexcept override {
+        ++sync_calls;
+        return sync_ok;
+    }
+    bool sync_ok = false;
+    size_t sync_calls = 0;
+};
+
 std::atomic<bool> sync_entered{false};
 std::atomic<bool> sync_completed{false};
 std::atomic<bool> release_sync{true};
@@ -377,6 +388,36 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     }
     // 等待任务完成 (即使DataStorageManager为nullptr，任务也会完成，只是存储删除会失败)
     future.get();
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryAdmissionSyncsAfterLocalDeleting) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+    auto &manager = *indexer->backend_manager_;
+    manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
+    auto backup = std::make_unique<SyncResultBackend>();
+    ASSERT_EQ(EC_OK, backup->Init(kTestInstanceName, std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backup->Open());
+    auto *backup_ptr = backup.get();
+    manager.persistent_backend_ = std::move(backup);
+    manager.memory_primary_ = true;
+    MetaSearcher searcher(indexer);
+    RequestContext context("memory_primary_admission");
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation();
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {42}, {location}, ids));
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {42}, {{{ids[0], CLS_SERVING}}}, results));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{kTestInstanceName, {42}, {{ids[0]}}, std::chrono::milliseconds(100)};
+    auto failed = executor.PrepareDeleteTask(request);
+    EXPECT_FALSE(failed.needs_physical_delete);
+    EXPECT_EQ(EC_ERROR, failed.result.status);
+    EXPECT_EQ(KeyVector{42}, failed.actual_task.block_keys);
+    EXPECT_EQ(1, backup_ptr->sync_calls);
+    CacheLocationMapVector local;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, local));
+    EXPECT_EQ(CLS_DELETING, local[0].at(ids[0])->status());
 }
 // 测试一个block_key对应多个location的情况
 TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
@@ -2186,7 +2227,7 @@ TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetada
 
     CacheLocationMapVector persistent_locations;
     const auto persistent_results =
-        indexer->backend_manager_->GetLocationsFromPersistent(request_context.get(), {block_key}, persistent_locations);
+        indexer->backend_manager_->GetLocationsFromPrimary(request_context.get(), {block_key}, persistent_locations);
     ASSERT_EQ(1u, persistent_results.size());
     ASSERT_EQ(1u, persistent_locations.size());
     EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());

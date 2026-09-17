@@ -391,6 +391,12 @@ DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
                                       async_pipeline_error_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_dropped_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_dropped_metadata_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
@@ -414,6 +420,8 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_flush_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_batch_flush_time_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_pipeline_error_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_metadata_count);
 
     return true;
 }

@@ -152,9 +152,9 @@ public:
                                                       const PrefixLocationVisitor &visitor) noexcept;
     // Source-of-truth read used by maintenance admission. It never backfills
     // or touches the optional hot-cache backend.
-    Result GetLocationsFromPersistent(RequestContext *request_context,
-                                      const KeyVector &keys,
-                                      CacheLocationMapVector &out_location_maps) noexcept;
+    Result GetLocationsFromPrimary(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   CacheLocationMapVector &out_location_maps) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,

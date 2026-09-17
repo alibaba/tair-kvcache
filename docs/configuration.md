@@ -291,12 +291,13 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
                 "max_key_count": 1000000, # 单个meta indexer的key数量上限，同样影响reclaimer的逐出水位计算
                 "mutex_shard_num": 16,
                 "batch_key_size": 16,
-                "meta_storage_backend_config": { # 控制meta indexer的storage backend，可选local本地文件或者redis
+                "meta_storage_backend_config": { # 元数据 backend，可选 local / redis / cached
                     # Redis示例：
                     # "storage_type": "redis",
                     # "storage_uri": "redis://your_auth_token@redis-host:6379/?db=3&client_max_pool_size=16"
                     "storage_type": "local",
-                    "storage_uri": ""
+                    "storage_uri": "",
+                    "memory_primary": false # 默认关闭；仅 cached + local + async_redis 可开启
                 },
                 "meta_cache_policy_config": { # 控制 meta indexer数据cache的配置
                     "type": "LRU",
@@ -311,6 +312,27 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
     }
 }
 ```
+
+`meta_storage_backend_config.memory_primary` 默认 `false`，保持原双写顺序。开启示例：
+
+```json
+{"storage_type":"cached","storage_uri":"redis://redis-backup:6379/?persistent_type=async_redis&cache_type=local&capacity=4096&async_max_size=102400","memory_primary":true}
+```
+
+启动保留 Redis Open 与辅助计数恢复；Init 完成后即可读写，全量回填异步进行。Recover 期间未回填 key 的读取及
+Upsert/部分删除的写前补齐仍可能依赖 Redis；Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时
+不会更新 local。全量回填完成并进入 Running 后，普通写切换为 local-first，Redis 只做有界异步备份，队列满不等待、
+丢弃新备份。
+`async_max_size` 按每队列 key 操作数计量，metadata 占一个容量单位；不额外估算 payload 字节或维护 in-flight
+字节额度。新模式不使用 `async_enqueue_timeout_ms` 等待 Running 阶段的备份容量；Recover 阶段的 Redis 主写
+仍沿用该超时。Running 阶段备份入队失败不回退 local，也不改变普通写结果。物理删除与回滚复用原有锁外
+`Sync` 和 RedisClient 有限重试，
+不新增队列级粘性失败状态；`Sync` 不占用 MetaIndexer shard mutex。
+观察 `async_dropped_key_count` 和 `async_dropped_metadata_count`；两者按采集周期清零。
+普通写成功不承诺 Redis 持久化，重启可能丢新增、回退逻辑删除。无自动补齐/在线热切换；所有可接管服务和运维工具升级后才可开启。
+开启或关闭前按 [设计文档](design/meta_memory_primary_async_backup.md) 执行停写、备份校准及重建。
+kvcm_ops 的 CLI 参数为 `--meta_storage_backend_config 'cached,redis://redis-backup:6379/?persistent_type=async_redis,true'`，
+旧的一段/两段参数仍可使用，GET→编辑→PUT 会保留该字段。
 
 `instance_reclaim_budget_policy` 选择同一 Group 内如何逐出，Admin API 和 `kvcm_ops` 使用枚举名，Registry JSON 持久化整数：
 

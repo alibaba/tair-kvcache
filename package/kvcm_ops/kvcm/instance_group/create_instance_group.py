@@ -51,7 +51,8 @@ curl -g -vvv -X POST http://localhost:56040/api/createInstanceGroup \
                 "mutex_shard_num": 1024,
                 "meta_storage_backend_config": {
                     "storage_type": "local",
-                    "storage_uri": ""
+                    "storage_uri": "",
+                    "memory_primary": False
                 },
                 "meta_cache_policy_config": {
                     "type": "LRU",

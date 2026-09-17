@@ -25,6 +25,7 @@ TEST_F(MetaIndexerConfigTest, TestSimple) {
     ASSERT_EQ(MetaIndexerConfig::kDefaultMutexShardNum, config_->GetMutexShardNum());
     ASSERT_EQ(MetaIndexerConfig::kDefaultPersistMetaDataIntervalTimeMs, config_->GetPersistMetaDataIntervalTimeMs());
     ASSERT_EQ("local", config_->GetMetaStorageBackendConfig()->GetStorageType());
+    ASSERT_FALSE(config_->GetMetaStorageBackendConfig()->GetMemoryPrimary());
 
     configStr = R"({
         "max_key_count": 1000,
@@ -57,4 +58,19 @@ TEST_F(MetaIndexerConfigTest, TestSimple) {
     ASSERT_EQ(64, config_->GetMutexShardNum());
     ASSERT_EQ(2000, config_->GetPersistMetaDataIntervalTimeMs());
     ASSERT_EQ("redis", config_->GetMetaStorageBackendConfig()->GetStorageType());
+}
+
+TEST_F(MetaIndexerConfigTest, TestMemoryPrimaryJsonRoundTripAndDefault) {
+    MetaStorageBackendConfig backend;
+    EXPECT_FALSE(backend.GetMemoryPrimary());
+    ASSERT_TRUE(backend.FromJsonString(
+        R"({"storage_type":"cached","storage_uri":"redis://backup:6379/?persistent_type=async_redis","memory_primary":true})"));
+    EXPECT_TRUE(backend.GetMemoryPrimary());
+    MetaStorageBackendConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(backend.ToJsonString()));
+    EXPECT_TRUE(restored.GetMemoryPrimary());
+    EXPECT_EQ(backend.GetStorageUri(), restored.GetStorageUri());
+    ASSERT_TRUE(restored.FromJsonString(R"({"storage_type":"local"})"));
+    EXPECT_FALSE(restored.GetMemoryPrimary());
+    EXPECT_FALSE(restored.FromJsonString(R"({"storage_type":"local","memory_primary":"true"})"));
 }

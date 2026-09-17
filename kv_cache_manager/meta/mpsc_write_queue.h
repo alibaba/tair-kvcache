@@ -17,6 +17,7 @@ enum class WriteOpType {
     kUpsert,
     kDelete,
     kDeleteLocations,
+    kPutMetaData,
 };
 
 struct WriteOp {
@@ -79,15 +80,14 @@ public:
     MpscWriteQueue &operator=(const MpscWriteQueue &) = delete;
 
     void Push(QueueItem item);
+    // Reserve bounded key capacity before the caller copies the payload.
+    bool TryReserve(int64_t key_count, int64_t capacity) noexcept;
+    bool WaitAndReserve(int64_t key_count, int64_t capacity, int64_t timeout_us);
+    void PushReserved(QueueItem item, int64_t key_count);
     std::vector<QueueItem> PopBatch(int64_t max_batch_size, int64_t &out_taken_keys);
     std::vector<QueueItem> PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, int64_t &out_taken_keys);
     int64_t GetKeySize() const { return key_size_.load(std::memory_order_relaxed); }
     void NotifyConsumer();
-
-    // Producer waits until the queue has capacity for the incoming keys, or timeout.
-    // A single oversized item is allowed when the queue is empty to avoid permanent blocking.
-    // Returns true if capacity is available, false on timeout.
-    bool WaitForCapacity(int64_t capacity_threshold, int64_t incoming_key_count, int64_t timeout_us);
 
 private:
     struct Node {
@@ -96,6 +96,11 @@ private:
         Node *next = nullptr;
         Node(QueueItem &&i, int64_t kc) : item(std::move(i)), key_count(kc) {}
     };
+
+    void Publish(Node *node);
+    bool HasCapacity(int64_t key_count, int64_t capacity, bool allow_oversized_item) const noexcept;
+    bool TryReserve(int64_t key_count, int64_t capacity, bool allow_oversized_item) noexcept;
+    void NotifyCapacityWaiters() noexcept;
 
     std::atomic<Node *> head_{nullptr};
     std::atomic<int64_t> key_size_{0};
