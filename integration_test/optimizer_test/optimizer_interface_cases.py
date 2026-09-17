@@ -386,7 +386,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
 
     def _create_group_and_register(self, group_name, instance_id,
                                    block_size=1024, capacity_gb=1.0,
-                                   linear_step=1):
+                                   linear_step=None):
         """Helper: create group then register instance."""
         self._client.create_instance_group({
             "trace_id": self._trace_id,
@@ -396,15 +396,26 @@ class OptimizerServiceTestCases(OptimizerTestBase):
                 "capacity_gb": [capacity_gb],
             }
         })
+        if linear_step is None:
+            linear_step = block_size
+
+        location_spec_infos = [{"name": "full", "size": block_size}]
+        location_spec_groups = [{"name": "full_group", "spec_names": ["full"]}]
+        optimizer_state_info = {"full_location_spec_group_name": "full_group"}
+        if linear_step > 0:
+            location_spec_infos.append({"name": "linear", "size": block_size})
+            location_spec_groups.append({"name": "linear_group", "spec_names": ["linear"]})
+            optimizer_state_info["linear_location_spec_group_name"] = "linear_group"
+
         reg_resp = self._client.register_instance({
             "trace_id": self._trace_id,
             "instance_group": group_name,
             "instance_id": instance_id,
             "block_size": block_size,
             "linear_step": linear_step,
-            "location_spec_infos": [{"name": "full", "size": block_size}],
-            "location_spec_groups": [{"name": "full_group", "spec_names": ["full"]}],
-            "optimizer_state_info": {"full_location_spec_group_name": "full_group"},
+            "location_spec_infos": location_spec_infos,
+            "location_spec_groups": location_spec_groups,
+            "optimizer_state_info": optimizer_state_info,
         })
         return reg_resp
 
@@ -472,7 +483,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         """Test GetInstance returns correct details."""
         group_name = f"test_getinst_grp_{self._trace_id}"
         inst_id = f"test_getinst_{self._trace_id}"
-        self._create_group_and_register(group_name, inst_id, block_size=2048, linear_step=3)
+        self._create_group_and_register(group_name, inst_id, block_size=2048, linear_step=6144)
 
         resp = self._client.get_instance({
             "trace_id": self._trace_id,
@@ -482,7 +493,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         self.assertEqual(resp["instance_id"], inst_id)
         self.assertEqual(resp["instance_group"], group_name)
         self.assertEqual(resp["block_size"], 2048)
-        self.assertEqual(resp["linear_step"], 3)
+        self.assertEqual(resp["linear_step"], 6144)
 
     def test_remove_instance(self):
         """Test removing an instance."""
@@ -782,7 +793,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         """Test instance with linear_step > 1."""
         group_name = f"test_ls_grp_{self._trace_id}"
         inst_id = f"test_ls_{self._trace_id}"
-        self._create_group_and_register(group_name, inst_id, linear_step=4)
+        self._create_group_and_register(group_name, inst_id, linear_step=4096)
 
         resp = self._client.list_instances({
             "trace_id": self._trace_id,
@@ -790,7 +801,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         })
         for inst in resp.get("instances", []):
             if inst["instance_id"] == inst_id:
-                self.assertEqual(int(inst["debug_info"]["linear_step"]), 4)
+                self.assertEqual(int(inst["debug_info"]["linear_step"]), 4096)
 
     # --- Duplicate Registration Tests ---
 

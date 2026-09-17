@@ -1,11 +1,84 @@
 #include "kv_cache_manager/optimizer/service/online_optimizer_server_config.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <unordered_set>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMaxCapacityGbForInt64 = static_cast<double>(std::numeric_limits<int64_t>::max()) / kBytesPerGb;
+
+} // namespace
+
+bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string());
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "consumer_id", consumer_id_, std::string("online-optimizer"));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
+    KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "fanout_all_instances", fanout_all_instances_, false);
+    KVCM_JSON_GET_MACRO(rapid_value, "linear_steps", linear_steps_);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "full_location_spec_group_name", full_location_spec_group_name_, std::string());
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "linear_location_spec_group_name", linear_location_spec_group_name_, std::string());
+    return Validate();
+}
+
+void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "service_discovery_url", service_discovery_url_);
+    Put(writer, "consumer_id", consumer_id_);
+    Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
+    Put(writer, "capacity_gb", capacity_gb_);
+    Put(writer, "fanout_all_instances", fanout_all_instances_);
+    Put(writer, "linear_steps", linear_steps_);
+    Put(writer, "full_location_spec_group_name", full_location_spec_group_name_);
+    Put(writer, "linear_location_spec_group_name", linear_location_spec_group_name_);
+}
+
+bool KvcmEventSubscriptionConfig::Validate() const {
+    if (service_discovery_url_.empty() || consumer_id_.empty() || discovery_refresh_interval_ms_ <= 0) {
+        return false;
+    }
+    if (!std::all_of(capacity_gb_.begin(), capacity_gb_.end(), [](double capacity) {
+            return std::isfinite(capacity) && capacity > 0.0 && capacity <= kMaxCapacityGbForInt64;
+        })) {
+        return false;
+    }
+    if (!fanout_all_instances_) {
+        return linear_steps_.empty() && full_location_spec_group_name_.empty() &&
+               linear_location_spec_group_name_.empty();
+    }
+    if (linear_steps_.empty()) {
+        return full_location_spec_group_name_.empty() && linear_location_spec_group_name_.empty();
+    }
+
+    std::unordered_set<int32_t> unique_steps;
+    bool has_full_only = false;
+    bool has_linear = false;
+    for (int32_t linear_step : linear_steps_) {
+        if (linear_step < 0 || !unique_steps.insert(linear_step).second) {
+            return false;
+        }
+        has_full_only = has_full_only || linear_step == 0;
+        has_linear = has_linear || linear_step > 0;
+    }
+    if (!has_full_only) {
+        return false;
+    }
+    if (!has_linear) {
+        return linear_location_spec_group_name_.empty();
+    }
+    return !full_location_spec_group_name_.empty() && !linear_location_spec_group_name_.empty() &&
+           full_location_spec_group_name_ != linear_location_spec_group_name_;
+}
 
 // clang-format off
 std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
@@ -50,6 +123,10 @@ std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
          config->io_thread_num_ = std::stoi(value);
          return true;
      }},
+    {"kvcm_optimizer.kvcm_event_subscriptions",
+     [](const std::string &value, OnlineOptimizerServerConfig *config) {
+         return Jsonizable::FromJsonString(value, config->kvcm_event_subscriptions_);
+     }},
 };
 // clang-format on
 
@@ -62,7 +139,8 @@ bool OnlineOptimizerServerConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_prometheus", enable_prometheus_, true);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "prometheus_prefix", prometheus_prefix_, std::string("kvcm_optimizer"));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "io_thread_num", io_thread_num_, int32_t(4));
-    return true;
+    KVCM_JSON_GET_MACRO(rapid_value, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
+    return ValidateKvcmEventSubscriptions();
 }
 
 void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -74,6 +152,7 @@ void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "enable_prometheus", enable_prometheus_);
     Put(writer, "prometheus_prefix", prometheus_prefix_);
     Put(writer, "io_thread_num", io_thread_num_);
+    Put(writer, "kvcm_event_subscriptions", kvcm_event_subscriptions_);
 }
 
 bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ) {
@@ -100,7 +179,17 @@ bool OnlineOptimizerServerConfig::OverrideFromEnviron(const EnvironMap &environ)
             success = false;
         }
     }
-    return success;
+    return success && ValidateKvcmEventSubscriptions();
+}
+
+bool OnlineOptimizerServerConfig::ValidateKvcmEventSubscriptions() const {
+    std::unordered_set<std::string> discovery_urls;
+    for (const auto &subscription : kvcm_event_subscriptions_) {
+        if (!subscription.Validate() || !discovery_urls.insert(subscription.service_discovery_url()).second) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void OnlineOptimizerServerConfig::UpdateEnviron(EnvironMap &environ) {
