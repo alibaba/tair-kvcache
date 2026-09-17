@@ -131,9 +131,9 @@ kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
 # MightExist 明确 missing 的普通 CLS_SERVING 以及 EventReport metadata 回收。
 kvcm.cache_gc.enabled=true
 # active round 的 tick 间隔；每个 tick 最多推进一个 backend batch。
-kvcm.cache_gc.scan_interval_ms=1000
-# 一个 full round 完成后的 cooldown，默认 2 小时；0 表示下一 tick 可开始新 round。
-kvcm.cache_gc.round_pause_ms=7200000
+kvcm.cache_gc.scan_interval_ms=100
+# 一个 full round 完成后的 cooldown，默认 5 分钟；0 表示下一 tick 可开始新 round。
+kvcm.cache_gc.round_pause_ms=300000
 # backend key 数 hint，同时限制单 tick 两类 action 合计的 Location target 数。
 kvcm.cache_gc.scan_batch_size=256
 # orphan WRITING grace，最小 1 小时（3600000ms），默认 24 小时。

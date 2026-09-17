@@ -32,8 +32,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(1024, config.GetCacheReclaimerPendingDeleteHandlerLimit());
         ASSERT_EQ(4ULL * 1024 * 1024 * 1024 * 1024, config.GetCacheReclaimerPendingBytesLimit());
         ASSERT_TRUE(config.IsCacheGcEnabled());
-        ASSERT_EQ(1000, config.GetCacheGcScanIntervalMs());
-        ASSERT_EQ(7200000, config.GetCacheGcRoundPauseMs());
+        ASSERT_EQ(100, config.GetCacheGcScanIntervalMs());
+        ASSERT_EQ(300000, config.GetCacheGcRoundPauseMs());
         ASSERT_EQ(256, config.GetCacheGcScanBatchSize());
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());

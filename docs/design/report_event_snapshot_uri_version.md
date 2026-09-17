@@ -440,7 +440,7 @@ sibling 暂存，后续完整 snapshot 会替换或回收。
 
 成功 snapshot 进入 strict 后，cleanup 只负责最终空间回收，不是查询正确性的前提。统一模式下多个 Snapshot/HOST_DOWN 事件天然折叠为扫描时的最新 Backend 状态，扫描 key 数不再随事件数线性增长。
 
-统一模式复用后台 GC 的 round/cursor，默认 2 小时 cooldown 下 best-effort 最终收敛；指标使用 shared `cache_gc.scan_key_count`、按 reason 的 candidate/drop、EventReport probe/delete 结果和共享 inflight count/age，不再上报 per-event `event_report.snapshot_cleanup_scan_latency_ms{instance_id,host,type}`。若后续需要明显更短的收敛 SLO，可增加独立 cadence 的状态驱动 Candidate Source 或 reporter -> location 索引，但不能恢复每事件一次全表扫描。
+统一模式复用后台 GC 的 round/cursor，默认 5 分钟 cooldown 下 best-effort 最终收敛；指标使用 shared `cache_gc.scan_key_count`、按 reason 的 candidate/drop、EventReport probe/delete 结果和共享 inflight count/age，不再上报 per-event `event_report.snapshot_cleanup_scan_latency_ms{instance_id,host,type}`。若后续需要明显更短的收敛 SLO，可增加独立 cadence 的状态驱动 Candidate Source 或 reporter -> location 索引，但不能恢复每事件一次全表扫描。
 
 ## 12. 测试要求
 

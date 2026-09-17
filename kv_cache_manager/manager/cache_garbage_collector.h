@@ -59,8 +59,8 @@ class CacheGarbageCollector {
 public:
     struct Config {
         bool enabled{false};
-        int64_t scan_interval_ms{1000};
-        int64_t round_pause_ms{2LL * 60 * 60 * 1000};
+        int64_t scan_interval_ms{100};
+        int64_t round_pause_ms{5LL * 60 * 1000};
         size_t scan_batch_size{256};
         int64_t orphan_writing_grace_period_ms{24LL * 60 * 60 * 1000};
         size_t max_inflight_delete_requests{2};
