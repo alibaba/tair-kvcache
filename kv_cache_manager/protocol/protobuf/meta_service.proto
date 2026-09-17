@@ -353,6 +353,7 @@ enum LocationSelectStrategy {
 message BackendLocationSelector {
     StorageType backend_type = 1;
     LocationSelectStrategy strategy = 2;
+    int32 max_peer_count = 3; // 小于等于0时默认为1
 }
 
 message GetCacheLocationsByBackendRequest {

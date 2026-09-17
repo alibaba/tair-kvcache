@@ -623,6 +623,15 @@ HTTP 接口为 `POST /api/getCacheLocation`：
 `ST_EVENT_REPORT_L1P5`、`ST_EVENT_REPORT_L2` 等 backend，适合验证两种 EventReport storage 的
 隔离状态。
 
+`backend_selectors[].max_peer_count` 仅适用于 `ST_EVENT_REPORT_L2` 的 `LSS_V6D_PREFIX` 和
+`LSS_V6D_COVERAGE` 策略。省略或小于等于 `0` 时按 `1` 处理；大于 `1` 时最多选择指定数量的
+peer。同一个 selector 内，每个 key 只返回第一个被选中且可用的 peer，避免返回重复的 V6D
+地址。
+
+KVCM 进程环境变量 `KVCM_V6D_MAX_PEER_COUNT` 可优先覆盖上述 V6D 策略的请求值；
+未设置时保持请求行为。例如请求传入 `4`，环境变量设为 `1` 后按单 peer 选择。
+部署时设置环境变量并重启 KVCM 生效，其他 backend 和策略不受影响。
+
 `location_spec_names` 不只是返回结果的投影条件，也是 backend/peer 选择前按 query key 生效的候选条件：
 
 - 为空时，location 中任意合法 spec 都可使该 location 成为候选；
