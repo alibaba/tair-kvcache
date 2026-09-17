@@ -203,6 +203,13 @@ class HiCacheKVCM(HiCacheStorage):
         Raises on failure: the ``batch_*`` callers turn that into a
         conservative result and retry on their next call.
         """
+        # Checked before the ready flag: close() tears the client down, so a
+        # late storage call must fail with a clear message instead of using it.
+        if self._closed:
+            raise RuntimeError(
+                "connector was closed; storage stays disabled until the "
+                "backend is re-attached"
+            )
         if self._client_ready:
             return
         with self._init_lock:
