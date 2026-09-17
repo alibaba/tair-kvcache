@@ -16,7 +16,7 @@ Covered:
   instead of being mapped page-by-page onto the wrong keys;
 * ``batch_exists_v2`` reports 0 hit pages for pools the connector does not
   manage, instead of implying the caller can fetch them (see
-  ``UNMANAGED_POOL`` for the enum member used; sglang < v0.5.15 has no
+  ``UNMANAGED_POOL`` for the enum member used; sglang < v0.5.12 has no
   ``PoolName.SWA``).
 
 Prerequisites: the connector needs a sglang runtime that can actually import
@@ -91,8 +91,8 @@ CONV_BYTES = 0x80
 INDEXER_PAGE_BYTES = 0x200
 
 # A pool the connector does not manage: PoolName.SWA is the realistic case
-# (sglang >= v0.5.15 only), MAMBA is the stand-in on older versions where the
-# enum member does not exist yet.  It has to stay an enum member -- enum
+# (sglang >= v0.5.12), MAMBA is the stand-in on older versions where the enum
+# member does not exist yet.  It has to stay an enum member -- enum
 # hashes differ from plain string hashes, so a bare "swa" would not find the
 # connector's per-pool result entries.
 UNMANAGED_POOL = getattr(PoolName, "SWA", PoolName.MAMBA)

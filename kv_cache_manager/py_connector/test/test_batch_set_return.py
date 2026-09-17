@@ -54,10 +54,9 @@ def _build_connector(
 ):
     """Build a HiCacheKVCM with attributes set manually (bypass __init__)."""
     obj = _make_obj(HiCacheKVCM)
-    # These tests drive _batch_set directly, i.e. after the connector has been
-    # attached and initialized; the deferred Manager handshake itself is
+    # NB: these tests call the private _batch_set directly, which never reads
+    # the initialization state; the deferred Manager handshake itself is
     # covered by sglang/test_pool_registration.py.
-    obj._client_ready = True
     obj.tp_rank = tp_rank
     obj.tp_world_size = tp_world_size
     obj.kv_factor = kv_factor
