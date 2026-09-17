@@ -921,6 +921,127 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsNormalizesLegacyDuplicateNam
     EXPECT_EQ("event_report://legacy:8080/mem?source=last", specs[2].uri());
 }
 
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostRequiresAllRegisteredNodeSpecs) {
+    const MetaSearcher::KeyVector keys = {11030, 11031, 11032, 11033};
+    const std::string host = "multinode:8080";
+    std::vector<std::string> names;
+    for (size_t node = 0; node < 70; ++node) {
+        names.push_back("F0_N" + std::to_string(node));
+    }
+    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0", names)};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        std::vector<LocationSpec> memory_specs;
+        std::vector<LocationSpec> disk_specs;
+        for (size_t node = 0; node < names.size(); ++node) {
+            // Missing a shard in the second bitmap word must stop the prefix.
+            if (key_index == 2 && node == 69) {
+                continue;
+            }
+            auto &specs = node % 2 == 0 ? memory_specs : disk_specs;
+            specs.emplace_back(names[node], "event_report://" + host + "/mem?node=" + std::to_string(node));
+        }
+        tasks[key_index].push_back({"kvs#event_report_l1p5#mem#" + host,
+                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                    CacheLocationStatus::CLS_SERVING,
+                                    std::move(memory_specs)});
+        tasks[key_index].push_back({"kvs#event_report_l2#disk#" + host,
+                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                    CacheLocationStatus::CLS_SERVING,
+                                    std::move(disk_specs)});
+        // Another host's fragments must not fill this host's missing shard.
+        tasks[key_index].push_back({"kvs#event_report_l1p5#mem#other:8080",
+                                    DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                    CacheLocationStatus::CLS_SERVING,
+                                    {LocationSpec(names.back(), "event_report://other:8080/mem")}});
+    }
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
+    for (const size_t global_count : {size_t{0}, size_t{1}}) {
+        for (const bool eagle_pop : {false, true}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                        keys,
+                                                        eagle_pop,
+                                                        {},
+                                                        matches,
+                                                        nullptr,
+                                                        global_count,
+                                                        true,
+                                                        &policy_,
+                                                        groups));
+            ASSERT_EQ(1u, matches.size());
+            EXPECT_EQ(host, matches[0].host_ip_port);
+            EXPECT_EQ(eagle_pop ? 1 : 2, matches[0].local);
+            EXPECT_EQ(matches[0].local, matches[0].global);
+        }
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(
+            EC_OK,
+            meta_searcher_->PrefixMatchByHost(
+                request_context_.get(), keys, false, {"mem"}, matches, nullptr, global_count, true, &policy_, groups));
+        EXPECT_TRUE(matches.empty()); // N1 lives on an excluded medium.
+    }
+    // Legacy callers without a completeness contract retain presence matching.
+    std::vector<MetaSearcher::HostCacheMatch> legacy;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatchByHost(request_context_.get(), keys, false, {}, legacy));
+    ASSERT_EQ(2u, legacy.size());
+    for (const auto &match : legacy) {
+        EXPECT_EQ(4, match.local);
+    }
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchByHostP2PFillsOnlyCompleteNodeSpecSets) {
+    const MetaSearcher::KeyVector keys = {11130, 11131, 11132, 11133};
+    const std::string host = "multinode:8080";
+    // Match the registration shape emitted by Vineyard: one group per node.
+    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0_N0", {"F0_N0"}),
+                                                   LocationSpecGroup("F0_N1", {"F0_N1"})};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks(keys.size());
+    auto add =
+        [&](size_t index, const std::string &reporter, DataStorageType type, const std::vector<std::string> &names) {
+            std::vector<LocationSpec> specs;
+            for (const auto &name : names) {
+                specs.emplace_back(name, "event_report://" + reporter + "/mem?name=" + name);
+            }
+            const std::string type_name =
+                type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ? "event_report_l2" : "event_report_l1p5";
+            tasks[index].push_back(
+                {"kvs#" + type_name + "#mem#" + reporter, type, CacheLocationStatus::CLS_SERVING, std::move(specs)});
+        };
+    for (size_t index = 0; index < keys.size(); ++index) {
+        add(index,
+            host,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+            index % 2 == 0 ? std::vector<std::string>{"F0_N0", "F0_N1"} : std::vector<std::string>{"F0_N0"});
+        // A lexicographically earlier peer has data but cannot fill N1.
+        add(index, "a-incomplete:8080", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"F0_N0"});
+        if (index == 1) {
+            add(index, "b-good:8080", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"F0_N1"});
+        }
+    }
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), per_key_ec);
+    auto check = [&](int64_t total) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys, false, {}, matches, nullptr, 1, true, &policy_, groups));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(host, matches[0].host_ip_port);
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(total, matches[0].global);
+    };
+    check(3); // B can be completed; the fourth block still lacks N1.
+    tasks.assign(keys.size(), {});
+    add(3, "b-good:8080", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {"F0_N1"});
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, per_key_ec));
+    check(4); // A single peer supplies both missing shards.
+}
+
 TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAndLocationUnion) {
     const MetaSearcher::KeyVector keys = {10030, 10031, 10032, 10033};
     const std::string host = "mamba-host:8080";
@@ -5139,6 +5260,63 @@ protected:
         return result;
     }
 };
+
+TEST_F(HostCacheRemoteTest, MultiNodeGlobalRequiresCompleteBaseAndPeerSpecUnion) {
+    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0_N0", {"F0_N0"}),
+                                                   LocationSpecGroup("F0_N1", {"F0_N1"})};
+    for (size_t i = 0; i < keys_.size(); ++i) {
+        Add(i,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+            "worker:80",
+            i == 0 || i == 3 || i == 5 ? std::vector<std::string>{"F0_N0", "F0_N1"}
+                                       : std::vector<std::string>{"F0_N0"});
+    }
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90", {"F0_N1"});
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs:90", {"F0_N0"});
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer:80", {"F0_N1"});
+    Store();
+    const auto check = [&](size_t count, bool p2p, int64_t global) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys_, false, {"mem"}, matches, nullptr, count, p2p, &policy_, groups));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ("worker:80", matches[0].host_ip_port);
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(global, matches[0].global);
+    };
+    check(0, true, 1);
+    check(1, false, 2); // A partial NFS block cannot extend the base-only prefix.
+    check(1, true, 4);  // P2P supplies N1, but block 4 still lacks N1.
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs:90", {"F0_N1"});
+    Store();
+    check(1, false, 2);
+    check(1, true, 6);
+}
+
+TEST_F(HostCacheRemoteTest, MultiNodePlainPrefixCannotCombineDifferentPeers) {
+    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0_N0", {"F0_N0"}),
+                                                   LocationSpecGroup("F0_N1", {"F0_N1"})};
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"F0_N0", "F0_N1"});
+    for (size_t i = 1; i < keys_.size(); ++i) {
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_a:80", {"F0_N0"});
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_b:80", {"F0_N1"});
+    }
+    Store();
+    const auto check = [&](int64_t global) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys_, false, {}, matches, nullptr, 1, true, &policy_, groups));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(global, matches[0].global);
+    };
+    check(1); // Each peer has only one node's shard; their union is not one fetch candidate.
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_a:80", {"F0_N0", "F0_N1"});
+    Store();
+    check(2);
+}
 
 TEST_F(HostCacheRemoteTest, BaseBackendsBridgeLocalHolesAndBudgetCountsLogicalHosts) {
     for (const auto &host : {"worker:80@0", "worker:80@1"}) {

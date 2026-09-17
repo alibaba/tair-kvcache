@@ -8417,6 +8417,113 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDo
     EXPECT_TRUE(hosts.empty());
 }
 
+TEST_F(CacheManagerTest, TestGetHostCacheStateMultiNodeSpecsAcrossSharedV6DAndDPRanks) {
+    const std::string instance_id = "multinode_dp_specs";
+    const std::string base = "10.0.8.4:8080";
+    const std::string rank0 = base + "@0";
+    const std::string rank1 = base + "@1";
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}) {
+        const std::string name =
+            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ? "multinode_l1p5" : "multinode_l2";
+        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+        StorageConfig config;
+        config.set_global_unique_name(name);
+        config.set_type(type);
+        config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        ASSERT_EQ(EC_OK, backend->Open(config, "multinode_test"));
+        backend->SetSnapshotMinIntervalMsForTest(0);
+        registry_manager_->data_storage_manager_->storage_map_[name] = backend;
+    }
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"multinode_l1p5", "multinode_l2"});
+    ASSERT_EQ(
+        std::make_pair(EC_OK, default_storage_configs),
+        cache_manager_->RegisterInstance(request_context_.get(),
+                                         "default",
+                                         instance_id,
+                                         64,
+                                         {LocationSpecInfo("F0_N0", 512), LocationSpecInfo("F0_N1", 512)},
+                                         createModelDeployment(),
+                                         {LocationSpecGroup("F0_N0", {"F0_N0"}), LocationSpecGroup("F0_N1", {"F0_N1"})},
+                                         CacheManager::QueryType::QT_PREFIX_MATCH));
+    InitializeEventReporter(instance_id, base, proto::meta::ST_EVENT_REPORT_L2);
+    InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+    auto add = [&](const std::string &reporter, proto::meta::StorageType type, int64_t key, const std::string &name) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance_id);
+        request.set_host_ip_port(reporter);
+        request.set_storage_type(type);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block = event->mutable_block_add();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        auto *spec = block->add_specs();
+        spec->set_name(name);
+        spec->set_uri("event_report://10.0.8.4:9600/mem?name=" + name);
+        proto::meta::ReportEventResponse response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+    };
+    for (int64_t key : {100, 200, 300}) {
+        add(base, proto::meta::ST_EVENT_REPORT_L2, key, "F0_N0");
+        add(rank0, proto::meta::ST_EVENT_REPORT_L1P5, key, "F0_N1");
+        if (key != 200) {
+            add(rank1, proto::meta::ST_EVENT_REPORT_L1P5, key, "F0_N1");
+        }
+    }
+    auto check = [&](int64_t rank0_local) {
+        for (size_t global_count : {size_t{0}, size_t{2}}) {
+            auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                                   instance_id,
+                                                                   CacheManager::QueryType::QT_UNSPECIFIED,
+                                                                   {100, 200, 300},
+                                                                   {},
+                                                                   global_count,
+                                                                   true);
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(2u, matches.size());
+            for (const auto &match : matches) {
+                ASSERT_TRUE(match.host_ip_port == rank0 || match.host_ip_port == rank1);
+                EXPECT_EQ(match.host_ip_port == rank0 ? rank0_local : 1, match.local);
+                EXPECT_EQ(match.local, match.global);
+            }
+        }
+    };
+    check(3);
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id(instance_id);
+    request.set_host_ip_port(rank0);
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+    auto *event = request.add_events();
+    event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+    auto *block = event->mutable_block_delete();
+    block->set_block_key("200");
+    block->set_medium("mem");
+    block->add_spec_names("F0_N1");
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+    check(1); // Shared N0 remains; losing N1 must immediately stop the prefix.
+    add(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, "F0_N1");
+    check(3);
+
+    request.clear_events();
+    event = request.add_events();
+    event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *item = event->mutable_block_snapshot()->add_blocks();
+    item->set_block_key("100");
+    item->set_medium("mem");
+    auto *spec = item->add_specs();
+    spec->set_name("F0_N1");
+    spec->set_uri("event_report://10.0.8.4:9600/mem?name=F0_N1");
+    response.Clear();
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+    check(1); // A successful snapshot must hide the old N1 generations.
+    registry_manager_->data_storage_manager_->storage_map_.erase("multinode_l1p5");
+    registry_manager_->data_storage_manager_->storage_map_.erase("multinode_l2");
+}
+
 TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes) {
     auto make_backend = [&](const std::string &name, DataStorageType type) {
         auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
@@ -8701,6 +8808,221 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
 
     registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l1p5");
     registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l2");
+}
+
+// Exercise multi-DP behavior through ReportEvent and GetHostCacheState. All
+// reporters deliberately use the same data endpoint: identity comes from the
+// instance, storage type and reporter address, never from the spec URI.
+class MultiDPHostCacheStateTest : public CacheManagerTest {
+public:
+    void SetUp() override {
+        CacheManagerTest::SetUp();
+        std::vector<std::string> names;
+        for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}) {
+            const std::string name = "multi_dp_" + ToString(type);
+            auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+            StorageConfig config;
+            config.set_global_unique_name(name);
+            config.set_type(type);
+            config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+            ASSERT_EQ(EC_OK, backend->Open(config, "multi_dp_test"));
+            backend->SetSnapshotMinIntervalMsForTest(0);
+            registry_manager_->data_storage_manager_->storage_map_[name] = backend;
+            names.push_back(name);
+        }
+        registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(names);
+        RegisterDPInstance("dp_a");
+        RegisterDPInstance("dp_b");
+    }
+
+    void RegisterDPInstance(const std::string &instance) {
+        auto deployment = createModelDeployment();
+        deployment.set_dp_size(3);
+        ASSERT_EQ(std::make_pair(EC_OK, default_storage_configs),
+                  cache_manager_->RegisterInstance(request_context_.get(),
+                                                   "default",
+                                                   instance,
+                                                   64,
+                                                   {LocationSpecInfo("F0", 512)},
+                                                   deployment,
+                                                   {LocationSpecGroup("F0", {"F0"})},
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH));
+    }
+
+    void Report(const std::string &instance,
+                proto::meta::StorageType type,
+                const std::string &host,
+                proto::meta::ReportEventType event_type,
+                const std::vector<int64_t> &keys = {}) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance);
+        request.set_storage_type(type);
+        request.set_host_ip_port(host);
+        const auto fill_block = [](auto *block, int64_t key) {
+            block->set_block_key(std::to_string(key));
+            block->set_medium("mem");
+            auto *spec = block->add_specs();
+            spec->set_name("F0");
+            spec->set_uri("event_report://10.0.9.1:9600/mem");
+        };
+        if (event_type == proto::meta::EVENT_BLOCK_ADD) {
+            for (const auto key : keys) {
+                auto *event = request.add_events();
+                event->set_event_type(event_type);
+                fill_block(event->mutable_block_add(), key);
+            }
+        } else {
+            auto *event = request.add_events();
+            event->set_event_type(event_type);
+            if (event_type == proto::meta::EVENT_BLOCK_SNAPSHOT) {
+                auto *snapshot = event->mutable_block_snapshot();
+                for (const auto key : keys) {
+                    fill_block(snapshot->add_blocks(), key);
+                }
+            } else if (event_type == proto::meta::EVENT_NODE_REGISTER) {
+                event->mutable_node_register()->add_mediums("mem");
+            } else {
+                ASSERT_EQ(proto::meta::EVENT_HOST_DOWN, event_type);
+                event->mutable_host_down();
+            }
+        }
+        proto::meta::ReportEventResponse response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        ASSERT_EQ(proto::meta::OK, response.header().status().code());
+    }
+
+    using Matches = std::map<std::string, std::pair<int64_t, int64_t>>;
+
+    void ExpectMatches(const std::string &instance,
+                       const std::vector<int64_t> &keys,
+                       const Matches &expected,
+                       size_t global_count = 0,
+                       bool p2p = false,
+                       const std::vector<std::string> &medium = {}) {
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance,
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                               keys,
+                                                               medium,
+                                                               global_count,
+                                                               p2p);
+        ASSERT_EQ(EC_OK, ec);
+        Matches actual;
+        for (const auto &match : matches) {
+            EXPECT_TRUE(actual.emplace(match.host_ip_port, std::make_pair(match.local, match.global)).second);
+        }
+        EXPECT_EQ(expected, actual);
+    }
+};
+
+TEST_F(MultiDPHostCacheStateTest, SnapshotAndHostDownAreIsolatedByRankTypeAndInstance) {
+    const std::string rank0 = "10.0.9.1:8080@0";
+    const std::string rank1 = "10.0.9.1:8080@1";
+    for (const auto &instance : {"dp_a", "dp_b"}) {
+        for (const auto &host : {rank0, rank1}) {
+            for (const auto type : {proto::meta::ST_EVENT_REPORT_L1P5, proto::meta::ST_EVENT_REPORT_L2}) {
+                Report(instance, type, host, proto::meta::EVENT_BLOCK_SNAPSHOT, {100, 200});
+            }
+        }
+        ExpectMatches(instance, {100, 200}, {{rank0, {2, 2}}, {rank1, {2, 2}}});
+    }
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_BLOCK_SNAPSHOT, {100});
+    // The same rank's independent L2 still contributes block 200.
+    ExpectMatches("dp_a", {100, 200}, {{rank0, {2, 2}}, {rank1, {2, 2}}});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, rank0, proto::meta::EVENT_BLOCK_SNAPSHOT);
+    ExpectMatches("dp_a", {100, 200}, {{rank0, {1, 1}}, {rank1, {2, 2}}});
+    ExpectMatches("dp_b", {100, 200}, {{rank0, {2, 2}}, {rank1, {2, 2}}});
+
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_HOST_DOWN);
+    ExpectMatches("dp_a", {100, 200}, {{rank1, {2, 2}}});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank1, proto::meta::EVENT_HOST_DOWN);
+    // L1P5 HOST_DOWN does not mark independent L2 on the same rank down.
+    ExpectMatches("dp_a", {100, 200}, {{rank1, {2, 2}}});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, rank1, proto::meta::EVENT_HOST_DOWN);
+    ExpectMatches("dp_a", {100, 200}, {});
+    ExpectMatches("dp_b", {100, 200}, {{rank0, {2, 2}}, {rank1, {2, 2}}});
+
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_NODE_REGISTER);
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_BLOCK_SNAPSHOT, {100});
+    ExpectMatches("dp_a", {100, 200}, {{rank0, {1, 1}}});
+}
+
+TEST_F(MultiDPHostCacheStateTest, SharedV6DProjectionUsesExactBaseAndCurrentInstance) {
+    const std::string base = "10.0.9.1:8080";
+    const std::string rank0 = base + "@0";
+    const std::string rank1 = base + "@1";
+    const std::string other_port = "10.0.9.1:8081@2";
+    const std::string other_instance_rank = base + "@2";
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, base, proto::meta::EVENT_BLOCK_ADD, {100});
+    // With no ranked L1P5 reporter, preserve the ordinary unranked result.
+    ExpectMatches("dp_a", {100}, {{base, {1, 1}}});
+    for (const auto &host : {rank0, rank1, other_port}) {
+        Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, host, proto::meta::EVENT_NODE_REGISTER);
+    }
+    Report("dp_b", proto::meta::ST_EVENT_REPORT_L1P5, other_instance_rank, proto::meta::EVENT_NODE_REGISTER);
+    ExpectMatches("dp_a", {100}, {{rank0, {1, 1}}, {rank1, {1, 1}}});
+    ExpectMatches("dp_b", {100}, {});
+    ExpectMatches("dp_a", {100}, {}, 2, true, {"gpu"});
+
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_HOST_DOWN);
+    ExpectMatches("dp_a", {100}, {{rank1, {1, 1}}});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank1, proto::meta::EVENT_HOST_DOWN);
+    ExpectMatches("dp_a", {100}, {{base, {1, 1}}});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_NODE_REGISTER);
+    ExpectMatches("dp_a", {100}, {{rank0, {1, 1}}});
+
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_BLOCK_ADD, {200});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, base, proto::meta::EVENT_BLOCK_SNAPSHOT);
+    ExpectMatches("dp_a", {100, 200}, {});
+    ExpectMatches("dp_a", {200}, {{rank0, {1, 1}}});
+}
+
+TEST_F(MultiDPHostCacheStateTest, GlobalTopNCountsLogicalRanksAndExcludesZeroLocalRanks) {
+    const std::string rank0 = "10.0.9.1:8080@0";
+    const std::string rank1 = "10.0.9.1:8080@1";
+    const std::string peer = "10.0.9.1:8080@2";
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_BLOCK_ADD, {100, 200});
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank1, proto::meta::EVENT_BLOCK_ADD, {100});
+    // Another rank on the same base is a remote peer, not shared local L2.
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, peer, proto::meta::EVENT_BLOCK_ADD, {200, 300});
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 2}}, {rank1, {1, 1}}}, 0, true);
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 2}}, {rank1, {1, 1}}}, 2, false);
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 3}}, {rank1, {1, 1}}}, 1, true);
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 3}}, {rank1, {1, 3}}}, 2, true);
+
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, rank1, proto::meta::EVENT_BLOCK_ADD, {200});
+    // Tied local prefixes select the lexicographically first full identity.
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 3}}, {rank1, {2, 2}}}, 1, true);
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L2, peer, proto::meta::EVENT_HOST_DOWN);
+    ExpectMatches("dp_a", {100, 200, 300}, {{rank0, {2, 2}}, {rank1, {2, 2}}}, 2, true);
+}
+
+TEST_F(MultiDPHostCacheStateTest, ReporterRankValidationRejectsMalformedAndOverflowingRanks) {
+    const std::string base = "10.0.9.1:8080";
+    for (const auto &rank : {"", "-1", "+1", " 1", "1 ", "01", "1x", "0@1", "18446744073709551616"}) {
+        SCOPED_TRACE(rank);
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id("dp_a");
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        request.set_host_ip_port(base + "@" + rank);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block = event->mutable_block_add();
+        block->set_block_key("100");
+        block->set_medium("mem");
+        auto *spec = block->add_specs();
+        spec->set_name("F0");
+        spec->set_uri("event_report://10.0.9.1:9600/mem");
+        proto::meta::ReportEventResponse response;
+        EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+    }
+    ExpectMatches("dp_a", {100}, {});
+    // Rank is an identity suffix, not an index validated against dp_size.
+    const std::string max_rank = base + "@18446744073709551615";
+    Report("dp_a", proto::meta::ST_EVENT_REPORT_L1P5, max_rank, proto::meta::EVENT_BLOCK_ADD, {100});
+    ExpectMatches("dp_a", {100}, {{max_rank, {1, 1}}});
 }
 
 TEST_F(CacheManagerTest, TestGetHostCacheState) {
@@ -9680,14 +10002,21 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     expect_mamba_matches(hosts);
 
     // An explicit request query type takes precedence over the registered default.
-    auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
-    ASSERT_EQ(EC_OK, explicit_ec);
-    EXPECT_EQ(3, find_prefix(explicit_hosts, host_a));
-    EXPECT_EQ(3, find_prefix(explicit_hosts, host_b));
-    EXPECT_EQ(1, find_prefix(explicit_hosts, host_c));
-    EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
-    EXPECT_EQ(2, find_prefix(explicit_hosts, host_e));
+    for (size_t global_count : {size_t{0}, size_t{2}}) {
+        auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                                               instance_id,
+                                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                               keys,
+                                                                               {},
+                                                                               global_count,
+                                                                               true);
+        ASSERT_EQ(EC_OK, explicit_ec);
+        EXPECT_EQ(3, find_prefix(explicit_hosts, host_a));
+        EXPECT_EQ(3, find_prefix(explicit_hosts, host_b));
+        EXPECT_EQ(1, find_prefix(explicit_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
+        EXPECT_EQ(2, find_prefix(explicit_hosts, host_e));
+    }
 
     auto [fallback_ec, fallback_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);

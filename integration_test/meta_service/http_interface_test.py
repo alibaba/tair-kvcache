@@ -81,6 +81,10 @@ class MetaServiceHttpClient(cases.MetaServiceClientBase):
         """Query locations with explicit backend selection."""
         return self._make_api_request('/api/getCacheLocationsByBackend', data, check_response)
 
+    def get_host_cache_state(self, data, check_response=True):
+        """Query prefix coverage for logical engine identities."""
+        return self._make_api_request('/api/getHostCacheState', data, check_response)
+
     def _make_admin_api_request(self, endpoint, data=None, check_response=True):
         return self._make_api_request(
             endpoint,
@@ -186,6 +190,69 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             },
         } for block_key in block_keys)
         return events
+
+    def test_multi_dp_host_cache_state_with_shared_v6d_and_node_specs(self):
+        """Keep ranked identities and complete node shards across the HTTP API."""
+        instance_id = "http_multi_dp_instance"
+        group_name = "http_multi_dp_group"
+        l1_name, l2_name = "http_multi_dp_l1p5", "http_multi_dp_l2"
+        base = "10.10.1.1:8080"
+        rank0, rank1 = base + "@0", base + "@1"
+        peer = "10.10.1.2:8080"
+        keys = [83000, 83001, 83002]
+        for name, storage_type in ((l1_name, "ST_EVENT_REPORT_L1P5"), (l2_name, "ST_EVENT_REPORT_L2")):
+            storage = self._event_report_storage(name)
+            storage["storage_type"] = storage_type
+            self._client.add_storage({"storage": storage})
+        group = self._event_report_instance_group(group_name, l2_name)
+        group["event_report_storage_candidates"] = [l1_name, l2_name]
+        self._client.create_instance_group({"instance_group": group})
+        deployment = self._get_test_model_deployment()
+        deployment["dp_size"] = 2
+        self._client.register_instance({
+            "instance_group": group_name,
+            "instance_id": instance_id,
+            "block_size": 128,
+            "model_deployment": deployment,
+            "default_query_type": "QT_PREFIX_MATCH",
+            "location_spec_infos": [{"name": name, "size": 1024} for name in ("F0_N0", "F0_N1")],
+            "location_spec_groups": [{"name": "F0", "spec_names": ["F0_N0", "F0_N1"]}],
+        })
+
+        def report(host, storage_type, events):
+            request = self._report_events(instance_id, host, events, "http_multi_dp_report")
+            request["storage_type"] = storage_type
+            return self._client.report_event(request)
+
+        for host, storage_type, spec, block_keys in (
+                (base, "ST_EVENT_REPORT_L2", "F0_N0", keys),
+                (rank0, "ST_EVENT_REPORT_L1P5", "F0_N1", keys),
+                (rank1, "ST_EVENT_REPORT_L1P5", "F0_N1", keys[::2]),
+                (peer, "ST_EVENT_REPORT_L2", "F0_N1", keys[1:])):
+            # Data endpoints do not encode the reporter's rank.
+            report(host, storage_type, self._node_and_block_events(base, spec, block_keys))
+
+        def check(global_count, enable_p2p, expected):
+            response = self._client.get_host_cache_state({
+                "instance_id": instance_id,
+                "block_cache_keys": keys,
+                "global_kvs_host_count": global_count,
+                "enable_p2p": enable_p2p,
+            })
+            hosts = response.get("hosts", [])
+            actual = {item["host_ip_port"]: (int(item["local"]), int(item["global"])) for item in hosts}
+            self.assertEqual(len(hosts), len(actual), response)
+            self.assertEqual(expected, actual, response)
+
+        check(0, True, {rank0: (3, 3), rank1: (1, 1)})
+        check(2, False, {rank0: (3, 3), rank1: (1, 1)})
+        check(1, True, {rank0: (3, 3), rank1: (1, 1)})
+        check(2, True, {rank0: (3, 3), rank1: (1, 3)})
+        down = [{"event_type": "EVENT_HOST_DOWN", "host_down": {}}]
+        report(peer, "ST_EVENT_REPORT_L2", down)
+        check(2, True, {rank0: (3, 3), rank1: (1, 1)})
+        report(rank0, "ST_EVENT_REPORT_L1P5", down)
+        check(2, True, {rank1: (1, 1)})
 
     def test_event_report_requested_spec_filters_before_peer_selection(self):
         """Exercise ReportEvent -> HTTP query with the adversarial peer layout.
