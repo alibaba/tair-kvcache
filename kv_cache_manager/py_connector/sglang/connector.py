@@ -469,8 +469,7 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
 
-                ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
-                components = self._get_extra_pool_components_per_page(transfer.name)
+                ptr_list, size_list, components = self._page_buffer_meta(pool, transfer)
                 ptr_list = [
                     p
                     for i, p in enumerate(ptr_list)
@@ -914,10 +913,9 @@ class HiCacheKVCM(HiCacheStorage):
                 # Wrapped in try-except so that every rank always reaches the
                 # all_reduce below, preventing cross-rank NCCL/gloo hangs.
                 try:
-                    ptr_list, size_list = pool.get_page_buffer_meta(
-                        transfer.host_indices
+                    ptr_list, size_list, components = self._page_buffer_meta(
+                        pool, transfer
                     )
-                    components = self._get_extra_pool_components_per_page(transfer.name)
                     save_set = set(save_indices)
                     ptr_list = [
                         p
@@ -1217,15 +1215,35 @@ class HiCacheKVCM(HiCacheStorage):
                 return spec["uri"]
         return None
 
-    def _get_extra_pool_components_per_page(self, pool_name: str) -> int:
-        """Number of IOV components per logical page for an extra pool."""
-        if pool_name == PoolName.MAMBA:
-            mamba_pool = self.registered_pools.get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", []) or [])
-            return 1 + conv_num  # temporal + N conv
-        if pool_name == PoolName.INDEXER:
-            return 1  # single indexer buffer per page
-        return 1
+    @staticmethod
+    def _page_buffer_meta(
+        pool: Any, transfer: PoolTransfer
+    ) -> tuple[List[int], List[int], int]:
+        """Per-page zero-copy meta of an extra pool plus its IOVs per page.
+
+        The component count is read back from the pool's own output instead of
+        being derived from pool internals: mamba pools emit a temporal IOV only
+        while the model has an SSM state, so conv-only models hand out one IOV
+        per conv buffer.  Each page must also match exactly one key: callers
+        slice the flat IOV list by page position and map it back to key
+        position, so both a wrong component count and a page/key mismatch would
+        silently shift every page's data.  Both are asserted here instead.
+        """
+        host_indices = transfer.host_indices
+        assert host_indices is not None, (
+            f"pool transfer {transfer.name} carries no host indices"
+        )
+        ptr_list, size_list = pool.get_page_buffer_meta(host_indices)
+        num_pages = len(host_indices) // pool.page_size
+        assert num_pages == len(transfer.keys or []), (
+            f"pool transfer {transfer.name} carries {num_pages} host pages "
+            f"(page size {pool.page_size}) for {len(transfer.keys or [])} keys"
+        )
+        assert num_pages > 0 and len(ptr_list) % num_pages == 0, (
+            f"get_page_buffer_meta returned {len(ptr_list)} IOVs for "
+            f"{len(host_indices)} host indices (page size {pool.page_size})"
+        )
+        return ptr_list, size_list, len(ptr_list) // num_pages
 
     def _get_kv_spec_group(self) -> str:
         """Spec group name used in start_write_cache for KV pool."""
