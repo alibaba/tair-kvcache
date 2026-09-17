@@ -25,11 +25,21 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MambaPool
 
-# MHATokenToKVPoolHost / MambaPoolHost moved in newer sglang versions.
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
-    MambaPoolHost,  # ty: ignore[unresolved-import]
-)
+# Host pool implementations moved from memory_pool_host to pool_host.* in
+# sglang v0.5.16+ (mamba only followed in v0.5.18), so fall back per class.
+try:  # sglang >= 0.5.16
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+except ImportError:  # sglang <= 0.5.15
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    )
+
+try:  # sglang >= 0.5.18
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+except ImportError:  # sglang <= 0.5.17
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MambaPoolHost,  # ty: ignore[unresolved-import]
+    )
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.distributed import (
     init_distributed_environment,

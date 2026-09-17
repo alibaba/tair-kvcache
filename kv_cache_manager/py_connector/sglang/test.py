@@ -18,10 +18,14 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-# MHATokenToKVPoolHost moved in newer sglang versions.
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
-)
+# Host pool implementations moved from memory_pool_host to pool_host.* in
+# sglang v0.5.16.
+try:  # sglang >= 0.5.16
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+except ImportError:  # sglang <= 0.5.15
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    )
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -167,12 +171,15 @@ def test():
         host_indices.extend(range(i, i + page_size))
 
     # Fill KV buffer with test data
+    # HostKVCache types kv_buffer as Optional; an MHA host pool always has it.
+    kv_buffer = mem_pool_host.kv_buffer
+    assert kv_buffer is not None
     for i in range(mem_pool_host.page_num * mem_pool_host.page_size):
         page_id = i // page_size
         token_id = i % page_size
         bf16_i = torch.tensor(i, dtype=torch.bfloat16)
         # (2, page_num, layer_num, page_size, head_num, head_dim)
-        mem_pool_host.kv_buffer[:, page_id, :, token_id] = bf16_i
+        kv_buffer[:, page_id, :, token_id] = bf16_i
 
     # Test 1: Basic set/get operations
     block_hashes_0 = block_hashes[:10]
@@ -199,7 +206,7 @@ def test():
         page_id = i // page_size
         token_id = i % page_size
         bf16_i = torch.tensor(i, dtype=torch.bfloat16)
-        tensor_i = mem_pool_host.kv_buffer[:, page_id, :, token_id]
+        tensor_i = kv_buffer[:, page_id, :, token_id]
         assert torch.mean(tensor_i).item() == bf16_i
         assert torch.std(tensor_i).item() == 0
 
@@ -240,7 +247,7 @@ def test():
         page_id = i // page_size
         token_id = i % page_size
         bf16_i = torch.tensor(i - index_shift, dtype=torch.bfloat16)
-        tensor_i = mem_pool_host.kv_buffer[:, page_id, :, token_id]
+        tensor_i = kv_buffer[:, page_id, :, token_id]
         assert torch.mean(tensor_i).item() == bf16_i, (
             f"{torch.mean(tensor_i).item()=} == {bf16_i=}"
         )
@@ -554,12 +561,12 @@ def _multi_rank_worker(rank, world_size, init_port):
     storage_backend.register_mem_pool_host(mem_pool_host)
 
     # Fill KV buffer with distinguishable data per rank
+    kv_buffer = mem_pool_host.kv_buffer
+    assert kv_buffer is not None
     for i in range(mem_pool_host.page_num * mem_pool_host.page_size):
         p = i // page_size
         t = i % page_size
-        mem_pool_host.kv_buffer[:, p, :, t] = torch.tensor(
-            i + rank * 100000, dtype=torch.bfloat16
-        )
+        kv_buffer[:, p, :, t] = torch.tensor(i + rank * 100000, dtype=torch.bfloat16)
 
     # Generate block hashes (different token_ids from single-rank tests)
     mr_token_ids = list(range(20000, 20000 + mr_max_total_num_tokens))
