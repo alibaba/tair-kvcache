@@ -224,9 +224,9 @@ Local 的 `SampleReclaimCandidates` 复用 `SampleReclaimKeys` 选择 key，再�
 
 对于本次请求的 `count > 0`，先计算 `R = min(sample_times, 分片总数, count)`，再选取最多 `K = min(R, 非空分片数)` 个冷分片。每个入选分片最多取 `ceil(count / R)` 个 key，且不超过剩余总预算；分片为空或 key 不足时不自动向其他分片补齐。因此 `sample_times` 控制单次采样的分片广度，增大它可能增加入选分片数、减少单分片份额，不代表轮转周期。`K=1` 时仍选最冷分片；同一批分片可以连续入选，不承诺跨轮覆盖全部分片，也不保证取到全局最冷的 `count` 个 key。
 
-采样本身不改变时间或 LRU 顺序，但旧前缀不能回收时，需要在后续过滤阶段让出位置：`FilterLocIDImpl` 完成维护性 Location 过滤后，将没有形成任何可删除 Location 的 key 交给 `TouchKeysForMaintenance`。该操作仅作用于完整的 Local 回收源，按名单更新时间和共享 LRU 位置，并通过尾部变化回调刷新分片冷度提示；不限于 EventReport-only key。仍有待删 Location 的 key 不 touch；读取失败或全局反压提前返回时也不触发。后续轮次因此有机会采到前缀之后的冷 key，但这不是游标续扫或同轮补采样的保证。
+采样本身不改变时间或 LRU 顺序，但旧前缀不能回收时，需要在后续过滤阶段让出位置：`FilterLocIDImpl` 完成维护性 Location 过滤后，将没有形成任何可删除 Location 的 key 交给 `TouchKeysForMaintenance`。该操作仅作用于完整的 Local 回收源，按名单更新时间和 LRU 位置，并通过尾部变化回调刷新分片冷度提示；不限于 EventReport-only key。仍有待删 Location 的 key 不 touch；读取失败或全局反压提前返回时也不触发。后续轮次因此有机会采到前缀之后的冷 key，但这不是游标续扫或同轮补采样的保证。
 
-维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本；它是显式维护副作用，不是严格的全链路 no-touch，也会延后被 touch 的 key 在 Local 元数据缓存中的容量淘汰。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
+维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本，是采样读取之外的显式维护操作。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
 
 ## 6. 候选表示、过滤与排序
 
@@ -261,6 +261,8 @@ Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaint
 
 1. **候选阶段**：按小批次读取 Location，判断 block 是否至少有一个符合本轮范围的 Location。排除 pending、EventReport、活跃 WRITING session、活跃 Migration Copy target，以及现有规则不允许删除的副本。此时不占 pending 配额，不建立 credit，也不为全部采样项预留待删除 bytes。Location map 用完即可释放，只保留紧凑候选。
 2. **提交阶段**：对已经选中的 block，按当前 Location 状态重新执行完整过滤、反压裁剪和计数。只把最终请求的 Location、bytes、Type count 和预计完全删除的 key 数交给 `SubmitDelReq`。
+
+两阶段均有意启用 `maintenance_read`，并遵循第 5.5 节的显式维护 touch 例外：过滤成功后，没有任何待删 Location 的 key 可在完整 Local 回收源上被 touch。`eligibility_only=true` 只表示不做删除准入和 pending 配额裁剪，不表示整个候选阶段完全无副作用；普通容量策略、固定策略和 Group LRU 共用此行为。真实 Local 后端测试覆盖 EventReport 和普通不可回收前缀跨轮让出位置，以及实际 touch 计数。
 
 多层存储 `keep_both` 的冷副本保护、热副本 spec 覆盖检查、Type 硬逐出等规则必须共用现有逻辑，不能在新路径复制出一套不一致的规则。普通容量策略和固定策略仍保留原来调用顺序，公共抽取不能顺带改变它们的选中集合。
 
@@ -350,7 +352,7 @@ B_request = min(B_cfg, kSizeLimit - 1)
 | 候选收集 / 排序 / 准入耗时 | 定位前置 I/O 和小请求交错带来的成本 |
 | `maintenance_touch_key_count` | 跨策略累计实际完成的维护 touch 次数，观察被过滤候选让出位置的频率 |
 
-`cache_reclaimer.maintenance_touch_key_count` 是不带 Instance 标签的进程级 counter，直接累加 `TouchKeysForMaintenance` 返回的实际 touch 数，不把名单中的缺失 key 或不支持该操作的后端算作成功。同一 key 多次成功 touch 会重复计数；它不是去重 key 数、删除量或业务命中数，也不能单独量化容量影响，需结合 Local 元数据占用和淘汰指标判断。
+`cache_reclaimer.maintenance_touch_key_count` 是不带 Instance 标签的进程级 counter，直接累加 `TouchKeysForMaintenance` 返回的实际 touch 数，不把名单中的缺失 key 或不支持该操作的后端算作成功。同一 key 多次成功 touch 会重复计数；它不是去重 key 数、删除量或业务命中数。
 
 复用现有删除 bytes、Location、Future、credit 和反压指标。Group LRU 的 DEBUG 汇总包含 Group、有效与预算覆盖的 Instance 数、是否 partial、计划与成功收集的采样预算、Top B 数量和请求尝试数；单请求沿用现有提交日志。暂停和停止由运行状态检查保护，未增加独立的暂停计数。上述信息不能被表述为全量 keyspace 的冷热分布。
 

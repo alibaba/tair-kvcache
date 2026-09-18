@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | V1 实现中；本文替代 cleanup intent / 双扫描 lane 方案 |
-| 更新时间 | 2026-09-01 |
+| 更新时间 | 2026-09-18 |
 | 依赖 | [后台扫描 GC](cache_garbage_collector.md)、[ReportEvent 增量上报与权威快照](report_event_snapshot_uri_version.md) |
 | 涉及模块 | `manager`、`data_storage`、`meta`、`metrics`、`service` |
 
@@ -256,15 +256,15 @@ Executor 执行 `RecoveryAbsentHost` action 时必须在 Backend availability le
 
 ### 5.1 per-Instance round-robin
 
-round 开始时取得一次 Group/Instance 快照，每个 `InstanceScanEntry` 保存独立 cursor 和 completed 标志。调度规则是：
+round 开始时取得一次 Group/Instance 快照，每个 `InstanceScanEntry` 保存独立 cursor、completed 标志和 `buffered_scan`。调度规则是：
 
-1. 当前 Instance 扫描一个 batch；
-2. 保存其 next cursor；
-3. 无论是否到 base，都轮转到下一个未完成 Instance；
-4. 所有 Instance 到 base 后结束 round并进入 cooldown；
+1. 当前 Instance 优先复用缓存，缓存为空才扫描一个 batch；
+2. 保存其 next cursor，对完整 batch 分类选优，再按预算构造请求；未选入的超预算 Location 快照保留在原缓存，后续 tick 重新 probe，不沿用旧判定或 token；
+3. 缓存未耗尽时继续当前 Instance，耗尽后才轮转到下一个未完成 Instance，不等待已提交 action 的 Future；
+4. 每个 Instance 都须 cursor 到 base 且缓存耗尽才正常完成；全部完成后结束 round 并进入 cooldown；
 5. 单 Instance scan 失败时保留原 cursor，但先让其他 Instance 推进；同一 round 连续 3 次失败后跳过该 Instance，下一 round 从 base cursor 重试，不能阻塞 round 完成和 Registry 新快照。
 
-该公平性只防止一个大 Instance 长期独占 GC tick，不改变 Reclaimer 的 victim fairness。
+轮转粒度是 backend batch，不是单个 tick。Local shard 返回量较大时会连续占用多个 tick，延后其他 Instance，但避免跨 Instance 同时堆积未消费的 shard 快照；单批缓存仍无严格字节上限。该调度不改变 Reclaimer 的 victim fairness，详细契约见 [后台扫描 GC](cache_garbage_collector.md#33-loopthread-回调)。
 
 dual-backend 扫描内存 cache backend；single-backend 扫描唯一 backend。内存视图中未加载或已淘汰的冷 key 可能不被发现，这是避免周期全扫 Redis 的显式 best-effort 取舍。
 
@@ -286,7 +286,9 @@ orphan WRITING
 - EventReport action 最多包含 `event_report_action_batch_size` 个唯一 Block key，默认 256；
 - 一个已准入 Block key 可以携带多个 EventReport Location，但 Location 总数仍受总预算限制；
 - pending target 不重复准入；
-- 超预算、Executor 拒绝或 inflight 已满的候选不进入 deferred queue，只记录指标并等待后续 round 重新发现。
+- 先对完整缓存分类、排序，再应用预算，不按原始扫描顺序截取前缀；
+- 超预算候选，以及因物理请求占用最后一个 action 槽位而未选入的 EventReport 候选，保留 Location 快照供后续 tick 重新判定；inflight 全满时不消费缓存、不扫描；
+- 已选入请求但被 Executor 拒绝的 target 不回填缓存，仍由后续 round 重发现；缓存不是失败请求的 deferred/retry queue。
 
 按 key 限制 EventReport action，是因为 metadata RMW、shard lock 和异步持久层写入的主要固定成本都按 Block key 发生；Location 总上限继续限制单请求序列化和遍历成本。
 
@@ -398,8 +400,8 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | 指标 | 说明 |
 |---|---|
 | `cache_gc.scan_round_count`、`scan_key_count`、`round_duration_ms` | shared round 进度与成本 |
-| `cache_gc.candidate_count{reason}` | 各原因候选数 |
-| `cache_gc.candidate_dropped_count{reason,cause}` | 总预算、key budget、inflight 等裁剪 |
+| `cache_gc.candidate_count{reason}` | 各原因候选判定次数；缓存重新 probe 可能重复累计 |
+| `cache_gc.candidate_dropped_count{reason,cause}` | 提交阶段因 `inflight_limit` 未发出的 EventReport target；预算不足而保留在缓存的候选不计入丢弃 |
 | `cache_gc.event_report_probe_count{result}` | keep/delete/unknown/error |
 | `cache_gc.event_report_probe_unknown_count{cause}` | malformed、owner、recovery grace 等 |
 | `cache_gc.event_report_delete_location_count{reason,status}` | worker 最终删除结果 |
@@ -422,9 +424,9 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 ### 8.2 GC 与 Executor 组件测试
 
 1. 一个 scan batch 同时产生普通物理删除和 EventReport metadata action，只扫描一次。
-2. Instance 每个 tick 只推进一个 batch并 round-robin；失败 Instance 不阻塞其他 Instance，重试耗尽后不阻塞下一 round 或新 Instance 快照。
+2. 每个 tick 最多扫描一个 batch；缓存未耗尽时不重新扫描、不轮转，耗尽后才 round-robin；失败 Instance 不阻塞其他 Instance，重试耗尽后不阻塞下一 round 或新 Instance 快照。
 3. 未注册或非 matching-type candidate 不遮蔽后续有效 owner；matching owner missing、ambiguous、unavailable 均不删除。
-4. 固定优先级、Location 总预算和 EventReport key budget正确；一个 key 的多个 Location 可共同提交。
+4. 完整 batch 先按固定优先级选优，再应用 Location 总预算和 EventReport key budget；同一 key 的部分 Location 可跨 tick 保留，后续重新 probe，旧删除结论不能复用。
 5. 普通物理删除和 EventReport action 共用 inflight/pending；窗口满时停止扫描。
 6. rejected/invalid/exception 不留下本地状态；Future 终态释放全部 pending。
 7. recovery grace 只跳过 EventReport，不阻塞同 batch 普通垃圾。
