@@ -7,7 +7,7 @@
 业务接入优先使用 `include/kv_meta_object_client.h` 中的 `KvMetaObjectClient`。它把 instance 注册、exact-key
 metadata 事务、exact-size 数据搬运和失败回滚组合成一个同步接口；普通固定 block `TransferClient` 不适用于
 KVMeta 对象。完整配置和状态机见
-[KVMeta 变长对象存储设计](../../docs/design/kv_meta_object_storage.md) 与
+[KVMeta EMB Cache 系统设计](../../docs/design/kv_meta_object_storage.md) 与
 [KVMeta 通用对象 API](../../docs/api/kv_meta_service.md)。
 
 ### Python client（RTP-LLM producer）

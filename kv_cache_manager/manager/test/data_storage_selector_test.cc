@@ -673,6 +673,42 @@ TEST_F(DataStorageSelectorTest, ExactVariableSizeRequirementFallsBackToATypeThat
     EXPECT_EQ("nfs_storage_00", selected.name);
 }
 
+TEST_F(DataStorageSelectorTest, ReclaimTargetUsesHardCapacityInsteadOfCurrentFreeSpace) {
+    instance_group_g->set_storage_candidates({"nfs_storage_00", "3fs_storage_01"});
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_UNSPECIFIED);
+    meta_indexer_g->storage_usage_data_.Reset();
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 20);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 90);
+
+    InstanceGroupQuota quota;
+    quota.set_capacity(1000);
+    quota.set_quota_config({QuotaConfig(30, DataStorageType::DATA_STORAGE_TYPE_NFS),
+                            QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_HF3FS)});
+    instance_group_g->set_quota(quota);
+
+    // Neither type has 40 free bytes now. NFS can never contain the request,
+    // while HF3FS can after reclaiming at least 30 bytes.
+    auto selected =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group", 40);
+    EXPECT_EQ(EC_NOENT, selected.ec);
+
+    selected = data_storage_selector_->SelectCacheWriteDataStorageBackendForReclaim(
+        request_context_.get(), "default_test_group", 40);
+    ASSERT_EQ(EC_OK, selected.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, selected.type);
+    EXPECT_EQ("3fs_storage_01", selected.name);
+
+    selected = data_storage_selector_->SelectCacheWriteDataStorageBackendForReclaim(
+        request_context_.get(), "default_test_group", 101);
+    EXPECT_EQ(EC_NOSPC, selected.ec);
+
+    quota.set_capacity(39);
+    instance_group_g->set_quota(quota);
+    selected = data_storage_selector_->SelectCacheWriteDataStorageBackendForReclaim(
+        request_context_.get(), "default_test_group", 40);
+    EXPECT_EQ(EC_NOSPC, selected.ec);
+}
+
 TEST_F(DataStorageSelectorTest, TestEventReportUsageDoesNotConsumeGroupQuota) {
     instance_group_g->set_storage_candidates({"3fs_storage_01"});
     instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);

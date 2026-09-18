@@ -2,14 +2,15 @@
 
 ## 1. API 定位
 
-KVMeta 是面向 embedding 等变长 opaque value 的 exact-key 元数据与写事务 API。协议定义在
+KVMeta 是面向 embedding 等变长 opaque value 的 Cache 元数据与写事务 API。协议定义在
 `kv_cache_manager/protocol/protobuf/kv_meta_service.proto`，完整 gRPC service 名为
 `kv_cache_manager.proto.kv_meta.MetaService`。
 
 KVMeta 只管理对象 key、真实字节数、storage location 和生命周期，不传输对象 bytes，也不保存 tensor shape、
-dtype 等业务信息。推荐调用方使用 `KvMetaObjectClient`，由它组合本文 RPC 和 exact-size 数据面。
+dtype、内容 checksum 等业务信息。它不是 source of truth；推荐调用方使用 `KvMetaObjectClient` 组合本文 RPC 和
+exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径。
 
-总体架构、隔离和 HA 设计见 [KVMeta 变长对象存储设计](../design/kv_meta_object_storage.md)。
+总体架构、隔离和 HA 设计见 [KVMeta EMB Cache 系统设计](../design/kv_meta_object_storage.md)。
 本文描述当前已实现的 V1 wire contract；设计文档第 13 节的 capability、generation、cleanup ledger 和 object-set
 均为后续演进方案，现有 client/server 不得假设这些字段或 RPC 已存在。
 
@@ -21,7 +22,11 @@ dtype 等业务信息。推荐调用方使用 `KvMetaObjectClient`，由它组�
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
 4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status；
 5. 公共 `instance_id` 只能通过本 service 使用。编码后的 `__kv_meta_v1__...` 前缀属于服务端保留 namespace；旧
-   Meta/Admin API 会返回 `INVALID_ARGUMENT`，Admin 列表也不会暴露这些内部实例。
+   Meta/Admin API 会返回 `INVALID_ARGUMENT`，Admin 列表也不会暴露这些内部实例；
+6. 同一 `(instance_id, key)` 必须永久表示相同内容。key 至少纳入 tenant、模型/预处理 revision、输入 digest、
+   tensor schema/version；服务端把“同 key、同 size”视为 hit，但不会比较 value bytes；
+7. miss、`RESOURCE_EXHAUSTED`、`WRITE_IN_PROGRESS`、服务不可用或数据面 Load 失败都必须允许调用方重算。Cache 写回失败
+   不应使本次推理失败。
 
 升级说明：遗留的 `kvcm.kv_meta.rpc_port=0` 仅作为无副作用的禁用配置兼容；任何非零旧端口都会使配置解析
 失败，避免服务端切换到主端口后客户端仍误连旧端口。启用时必须同时迁移为
@@ -49,7 +54,7 @@ RegisterInstance（每个 client 初始化时，幂等）
         v
 PutStart(keys, value_sizes, write_timeout_seconds)
         |
-        +-- key_mask=true  -> 同尺寸 committed 对象，不写数据
+        +-- key_mask=true  -> 同 key、同尺寸 committed 对象，不写数据（不校验内容）
         |
         +-- key_mask=false -> 按 compact locations 写入 exact bytes
                                   |
@@ -120,7 +125,8 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 - hit location 必须包含恰好一个名为 `value` 的 URI，并携带真实 `value_size`。
 
 V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理 allocation。调用方必须确保对应数据面 Load
-结束前没有其他 client 执行同对象的 Remove/Trim/GC；需要读删并发保护的后续设计见总体文档第 13 节。
+结束前没有其他 client 执行同对象的 Remove/Trim/GC；数据面读取失败应把整组当作 miss 并重算。需要读删并发保护
+的后续设计见总体文档第 13 节。
 
 ### 5.4 `PutStart`
 
@@ -128,12 +134,13 @@ V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理
 
 | 字段 | 对齐方式 |
 |---|---|
-| `key_mask.values` | 与请求 keys 等长；`true` 表示相同尺寸对象已 committed |
+| `key_mask.values` | 与请求 keys 等长；`true` 表示同 key、同尺寸对象已 committed，不表示服务端比较过内容 |
 | `locations` | 只包含 `key_mask=false` 的 miss，按请求中的相对顺序紧凑排列 |
 
 其他语义：
 
 - 全部命中时 `write_session_id` 和 `locations` 均为空；
+- 调用方必须保证同一 key 永远对应相同 bytes；否则同尺寸错误内容会成为无法检测的 false hit；
 - 有任一 miss 时返回非空 session，且每个 location 的 `value_size`、URI `size` 与请求值完全相等；
 - 同 key 的 committed 对象尺寸不同时，整批返回 `SIZE_MISMATCH`，不创建 allocation；
 - 任一 key 仍 active 时，整批返回 `WRITE_IN_PROGRESS`，不把它误报为命中；
@@ -166,6 +173,7 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 - 精确删除给定 committed keys；不存在的 key 幂等成功；
 - 任一 key 仍有 active write 时，整批返回 `WRITE_IN_PROGRESS`，不删除任何 key；
 - 服务端先条件删除 metadata 并 `Sync`，随后调用 backend Delete；
+- 显式 Remove 不等待自动 Reclaimer 的 `delay_before_delete_ms`，调用方必须先排空 consumer；
 - 若物理删除失败，接口返回错误，但已经删除的 metadata 不会重新暴露该 URI，也不会自动重放结果不确定的
   Delete；该 allocation 进入 backend orphan 清理范围。
 

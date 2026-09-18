@@ -362,6 +362,90 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     return result;
 }
 
+DataStorageSelectResult
+DataStorageSelector::SelectCacheWriteDataStorageBackendForReclaim(RequestContext *request_context,
+                                                                  const std::string &instance_group,
+                                                                  const std::uint64_t required_bytes) const noexcept {
+    SPAN_TRACER(request_context);
+    DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
+    if (!request_context || instance_group.empty() || required_bytes == 0) {
+        result.ec = ErrorCode::EC_BADARGS;
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    if (!meta_indexer_manager_ || !registry_manager_) {
+        result.ec = ErrorCode::EC_ERROR;
+        return result;
+    }
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager) {
+        result.ec = ErrorCode::EC_INSTANCE_NOT_EXIST;
+        return result;
+    }
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec != ErrorCode::EC_OK || !group) {
+        result.ec = group_ec == ErrorCode::EC_OK ? ErrorCode::EC_INSTANCE_NOT_EXIST : group_ec;
+        return result;
+    }
+    if (group->quota().capacity() < 0 || required_bytes > static_cast<std::uint64_t>(group->quota().capacity())) {
+        // No amount of eviction can make this request fit the hard group
+        // capacity. Do not pick a target that would cause a futile cache wipe.
+        result.ec = ErrorCode::EC_NOSPC;
+        return result;
+    }
+
+    const auto available_backends = data_storage_manager->GetAvailableStorages();
+    if (available_backends.empty()) {
+        result.ec = ErrorCode::EC_NOENT;
+        return result;
+    }
+    const auto &configured_candidates = group->storage_candidates();
+    if (configured_candidates.empty()) {
+        result.ec = ErrorCode::EC_CONFIG_ERROR;
+        return result;
+    }
+
+    auto preference = CachePreferStrategy::CPS_UNSPECIFIED;
+    if (group->cache_config()) {
+        preference = group->cache_config()->cache_prefer_strategy();
+    }
+    StorageQuotaAvail configured_types;
+    std::vector<std::shared_ptr<DataStorageBackend>> configured_available;
+    GetCandidates(request_context, available_backends, configured_candidates, configured_types, configured_available);
+    if (!Select(request_context, configured_available, preference)) {
+        // No backend satisfies the configured candidate/preference policy,
+        // independent of capacity. Reclaim cannot repair discovery/config.
+        result.ec = ErrorCode::EC_NOENT;
+        return result;
+    }
+
+    // Start with the same default type support as normal selection, then
+    // remove types whose hard quota can never contain this request. Current
+    // usage is intentionally ignored: that is precisely what reclaim will
+    // reduce.
+    StorageQuotaAvail reclaimable_types;
+    for (const auto &storage_quota : group->quota().quota_config()) {
+        if (storage_quota.capacity() < 0 || required_bytes > static_cast<std::uint64_t>(storage_quota.capacity())) {
+            reclaimable_types.SetStorageQuotaAvailByType(storage_quota.storage_spec(), false);
+        }
+    }
+    std::vector<std::shared_ptr<DataStorageBackend>> candidates;
+    GetCandidates(request_context, available_backends, configured_candidates, reclaimable_types, candidates);
+
+    const auto chosen_backend = Select(request_context, candidates, preference);
+    if (!chosen_backend) {
+        PREFIX_LOG(WARN,
+                   "no configured backend can fit exact bytes after reclaim, instance group: %s",
+                   instance_group.c_str());
+        result.ec = ErrorCode::EC_NOSPC;
+        return result;
+    }
+    result.ec = ErrorCode::EC_OK;
+    result.type = chosen_backend->GetType();
+    result.name = chosen_backend->GetStorageConfig().global_unique_name();
+    return result;
+}
+
 std::vector<StorageTargetAdmissionResult>
 DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
                                                const std::string &instance_group,
