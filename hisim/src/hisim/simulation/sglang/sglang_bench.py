@@ -35,7 +35,7 @@ hisim_hook.install_class_hooks(
     ]
 )
 
-HISIM_OUTPUT_DIR = "/tmp/hisim/simulation"
+HISIM_OUTPUT_DIR = "/tmp/hisim/output"
 HISIM_METRICS_PATH = f"{HISIM_OUTPUT_DIR}/metrics.json"
 os.environ["HISIM_OUTPUT_DIR"] = HISIM_OUTPUT_DIR
 
