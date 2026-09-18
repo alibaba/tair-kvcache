@@ -5,6 +5,9 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/cache_reclaim_strategy.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/kv_meta_instance.h"
@@ -468,6 +471,38 @@ TEST_F(KvMetaServiceImplTest, TrimReportsAnActiveWriterWithoutConsumingItsSessio
     RequestContext finish_context(finish_request.trace_id());
     service_->PutFinish(&finish_context, &finish_request, &finish_response);
     EXPECT_EQ(proto::kv_meta::OK, finish_response.header().status().code());
+}
+
+TEST_F(KvMetaServiceImplTest, InvalidReclaimConfigurationIsReportedAsServiceNotReady) {
+    const auto [group_ec, current_group] = registry_manager_->GetInstanceGroup(&setup_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(current_group);
+    ASSERT_TRUE(current_group->cache_config());
+    ASSERT_TRUE(current_group->cache_config()->reclaim_strategy());
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(cache_config->FromJsonString(current_group->cache_config()->ToJsonString()));
+    auto unsupported_strategy = std::make_shared<CacheReclaimStrategy>(*cache_config->reclaim_strategy());
+    unsupported_strategy->set_reclaim_policy(ReclaimPolicy::POLICY_TTL);
+    cache_config->set_reclaim_strategy(unsupported_strategy);
+    InstanceGroup updated_group(*current_group);
+    updated_group.set_cache_config(cache_config);
+    updated_group.set_version(current_group->version() + 1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&setup_context_, updated_group, current_group->version()));
+
+    proto::kv_meta::PutStartRequest request;
+    request.set_trace_id("invalid-reclaim-config");
+    request.set_instance_id(kInstanceId);
+    request.add_keys("new-object");
+    request.add_value_sizes(17);
+    request.set_write_timeout_seconds(30);
+    proto::kv_meta::PutStartResponse response;
+    RequestContext context(request.trace_id());
+    service_->PutStart(&context, &request, &response);
+
+    EXPECT_EQ(proto::kv_meta::SERVICE_NOT_READY, response.header().status().code());
+    EXPECT_TRUE(response.write_session_id().empty());
+    EXPECT_TRUE(response.locations().empty());
 }
 
 } // namespace

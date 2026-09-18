@@ -31,6 +31,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/kv_meta_instance.h"
@@ -422,7 +423,8 @@ protected:
                             std::int32_t delay_before_delete_ms,
                             std::size_t max_key_count = MetaIndexerConfig::kDefaultMaxKeyCount,
                             std::optional<std::int64_t> storage_type_capacity = std::nullopt,
-                            ReclaimPolicy reclaim_policy = ReclaimPolicy::POLICY_LRU) {
+                            ReclaimPolicy reclaim_policy = ReclaimPolicy::POLICY_LRU,
+                            ErrorCode expected_registration_ec = EC_OK) {
         const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
         ASSERT_EQ(EC_OK, group_ec);
         ASSERT_TRUE(default_group);
@@ -457,7 +459,8 @@ protected:
         object_group.set_quota(InstanceGroupQuota(
             capacity, {QuotaConfig(storage_type_capacity.value_or(capacity), DataStorageType::DATA_STORAGE_TYPE_NFS)}));
         ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
-        ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, group_name, instance_id, "reclaim-test").first);
+        ASSERT_EQ(expected_registration_ec,
+                  manager_->RegisterInstance(&request_context_, group_name, instance_id, "reclaim-test").first);
     }
 
     FailNextMaintenanceDeleteSyncBackend *InstallFailingSyncBackend(const std::string &instance_id) {
@@ -507,6 +510,34 @@ protected:
         ASSERT_EQ(EC_OK, start_ec);
         ASSERT_EQ(1, start.locations.size());
         ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, instance_id, start.write_session_id, {true}));
+    }
+
+    void MutateObject(const std::string &instance_id,
+                      const std::string &key,
+                      const std::function<void(CacheLocation &)> &mutation) {
+        auto indexer =
+            cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+        ASSERT_TRUE(indexer);
+        const auto internal_key = KvMetaManager::InternalKey(key);
+        const auto location_id = KvMetaManager::StableLocationId(key);
+        auto modifier = [&mutation](const std::vector<ErrorCode> &get_ecs,
+                                    const LocationIdVector &,
+                                    std::size_t,
+                                    CacheLocationVector &locations,
+                                    PropertyMap &) -> LocationModifierResult {
+            if (get_ecs.size() != 1 || get_ecs[0] != EC_OK || locations.size() != 1 || !locations[0]) {
+                return {MA_FAIL, {EC_CORRUPTION}};
+            }
+            auto replacement = std::make_shared<CacheLocation>(*locations[0]);
+            mutation(*replacement);
+            locations[0] = std::move(replacement);
+            return {MA_OK, {EC_OK}};
+        };
+        const auto result =
+            indexer->ReadModifyWriteTargetLocations(&request_context_, {internal_key}, {{location_id}}, modifier);
+        ASSERT_EQ(EC_OK, result.ec);
+        ASSERT_EQ(1, result.per_location_error_codes.size());
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), result.per_location_error_codes.front());
     }
 
     static bool WaitUntil(const std::function<bool()> &predicate, std::chrono::milliseconds timeout) {
@@ -1591,6 +1622,38 @@ TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
     EXPECT_EQ(EC_CORRUPTION, manager_->Remove(&request_context_, kInstanceId, {key}));
 }
 
+TEST_F(KvMetaManagerTest, PersistedObjectUriAndAccountingMustRemainUnambiguous) {
+    const std::vector<std::string> keys{
+        "duplicate-size", "fragment", "accounting-mismatch", "event-report", "oversized-uri"};
+    for (const auto &key : keys) {
+        CommitObject(kInstanceId, key, 31);
+    }
+
+    MutateObject(kInstanceId, "duplicate-size", [](CacheLocation &location) {
+        auto &spec = location.mutable_location_specs().front();
+        spec.set_uri(spec.uri() + "&size=31");
+    });
+    MutateObject(kInstanceId, "fragment", [](CacheLocation &location) {
+        auto &spec = location.mutable_location_specs().front();
+        spec.set_uri(spec.uri() + "#ignored-by-some-parsers");
+    });
+    MutateObject(
+        kInstanceId, "accounting-mismatch", [](CacheLocation &location) { location.set_validated_total_size(30); });
+    MutateObject(kInstanceId, "event-report", [](CacheLocation &location) {
+        location.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    });
+    MutateObject(kInstanceId, "oversized-uri", [](CacheLocation &location) {
+        location.mutable_location_specs().front().set_uri("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') +
+                                                          "?size=31");
+    });
+
+    for (const auto &key : keys) {
+        SCOPED_TRACE(key);
+        EXPECT_EQ(EC_CORRUPTION, manager_->Get(&request_context_, kInstanceId, {key}).first);
+        EXPECT_EQ(EC_CORRUPTION, manager_->Remove(&request_context_, kInstanceId, {key}));
+    }
+}
+
 TEST_F(KvMetaManagerTest, RejectsAmbiguousOrUnboundedRequestsBeforeAllocation) {
     auto [duplicate_ec, duplicate] = manager_->StartWrite(&request_context_, kInstanceId, {"dup", "dup"}, {1, 2}, 30);
     EXPECT_EQ(EC_DUPLICATE_ENTITY, duplicate_ec);
@@ -1628,6 +1691,17 @@ TEST_F(KvMetaManagerTest, RejectsWriteTimeoutLimitOutsideTheProtocolRange) {
     KvMetaManager invalid_manager(cache_manager_, registry_manager_, limits);
 
     EXPECT_FALSE(invalid_manager.Init());
+}
+
+TEST_F(KvMetaManagerTest, RejectsLocationUriLimitOutsideTheClientContract) {
+    KvMetaManager::Limits limits;
+    limits.max_location_uri_bytes = 0;
+    KvMetaManager zero_limit_manager(cache_manager_, registry_manager_, limits);
+    EXPECT_FALSE(zero_limit_manager.Init());
+
+    limits.max_location_uri_bytes = kMaxKvMetaLocationUriBytes + 1;
+    KvMetaManager oversized_limit_manager(cache_manager_, registry_manager_, limits);
+    EXPECT_FALSE(oversized_limit_manager.Init());
 }
 
 TEST_F(KvMetaManagerTest, RecoveryCanBeCancelledWithoutTouchingMetadata) {
@@ -2562,7 +2636,37 @@ TEST_F(KvMetaManagerTest, ReclaimerRejectsAnOverlongBackendSampleWithoutDeleting
     EXPECT_TRUE(values.front().found);
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerFailsClosedForAnUnsupportedPolicy) {
+TEST_F(KvMetaManagerTest, ReclaimerIsolatesACorruptCandidateAndStillMakesProgress) {
+    constexpr const char *kGroup = "reclaim-corrupt-candidate-group";
+    constexpr const char *kInstance = "reclaim-corrupt-candidate-instance";
+    constexpr const char *kCorruptKey = "corrupt-object";
+    constexpr const char *kValidKey = "valid-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.5, 0);
+    CommitObject(kInstance, kCorruptKey, 30);
+    CommitObject(kInstance, kValidKey, 30);
+    MutateObject(kInstance, kCorruptKey, [](CacheLocation &location) {
+        auto &spec = location.mutable_location_specs().front();
+        spec.set_uri(spec.uri() + "&size=30");
+    });
+
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 10));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 10));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kValidKey});
+            return get_ec == EC_OK && values.size() == 1 && !values.front().found;
+        },
+        std::chrono::seconds(2)));
+    cache_manager_->PauseReclaimer();
+
+    EXPECT_NE(0, metrics_registry_->GetCounter("kv_meta_reclaimer.error_count").Get());
+    EXPECT_NE(0, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_object_count").Get());
+    EXPECT_EQ(EC_CORRUPTION, manager_->Get(&request_context_, kInstance, {kCorruptKey}).first);
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsAnUnsupportedReclaimPolicy) {
     constexpr const char *kGroup = "reclaim-unsupported-policy-group";
     constexpr const char *kInstance = "reclaim-unsupported-policy-instance";
     CreateReclaimGroup(kGroup,
@@ -2572,15 +2676,223 @@ TEST_F(KvMetaManagerTest, ReclaimerFailsClosedForAnUnsupportedPolicy) {
                        0,
                        MetaIndexerConfig::kDefaultMaxKeyCount,
                        std::nullopt,
-                       ReclaimPolicy::POLICY_TTL);
-    CommitObject(kInstance, "must-stay", 90);
+                       ReclaimPolicy::POLICY_TTL,
+                       EC_CONFIG_ERROR);
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST, manager_->GetInstanceInfo(&request_context_, kInstance).first);
+}
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
-    ASSERT_TRUE(indexer);
-    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
-    ASSERT_TRUE(manager_->ResumeMaintenance());
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    EXPECT_EQ(90, indexer->GetStorageUsage());
+TEST_F(KvMetaManagerTest, RegistrationRejectsInvalidReclaimBounds) {
+    CreateReclaimGroup("reclaim-watermark-negative-group",
+                       "reclaim-watermark-negative-instance",
+                       100,
+                       -0.01,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+    CreateReclaimGroup("reclaim-watermark-high-group",
+                       "reclaim-watermark-high-instance",
+                       100,
+                       1.01,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+    CreateReclaimGroup("reclaim-watermark-infinity-group",
+                       "reclaim-watermark-infinity-instance",
+                       100,
+                       std::numeric_limits<double>::infinity(),
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+    CreateReclaimGroup("reclaim-watermark-nan-group",
+                       "reclaim-watermark-nan-instance",
+                       100,
+                       std::numeric_limits<double>::quiet_NaN(),
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+    CreateReclaimGroup("reclaim-negative-delay-group",
+                       "reclaim-negative-delay-instance",
+                       100,
+                       0.8,
+                       -1,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+    CreateReclaimGroup("reclaim-excessive-delay-group",
+                       "reclaim-excessive-delay-instance",
+                       100,
+                       0.8,
+                       1'800'001,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_CONFIG_ERROR);
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsStorageWithoutExactObjectOwnership) {
+    constexpr const char *kStorage = "external-event-report";
+    auto event_spec = std::make_shared<EventReportStorageSpec>();
+    StorageConfig event_config(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, kStorage, event_spec);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->data_storage_manager()->RegisterStorage(&request_context_, kStorage, event_config));
+
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    InstanceGroup object_group(*default_group);
+    object_group.set_name("event-report-object-group");
+    object_group.set_global_quota_group_name("event-report-object-quota");
+    object_group.set_storage_candidates({kStorage});
+    object_group.set_quota(
+        InstanceGroupQuota(100, {QuotaConfig(100, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5)}));
+    object_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
+
+    EXPECT_EQ(
+        EC_CONFIG_ERROR,
+        manager_
+            ->RegisterInstance(&request_context_, object_group.name(), "event-report-object-instance", "reclaim-test")
+            .first);
+
+    constexpr const char *kHotGroup = "hot-storage-object-group";
+    constexpr const char *kHotInstance = "hot-storage-object-instance";
+    CreateReclaimGroup(kHotGroup, kHotInstance, 100, 0.8, 0);
+    CommitObject(kHotInstance, "existing", 17);
+    const auto [hot_group_ec, hot_group] = registry_manager_->GetInstanceGroup(&request_context_, kHotGroup);
+    ASSERT_EQ(EC_OK, hot_group_ec);
+    ASSERT_TRUE(hot_group);
+    InstanceGroup updated_hot_group(*hot_group);
+    updated_hot_group.set_storage_candidates({kStorage});
+    updated_hot_group.set_version(hot_group->version() + 1);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->UpdateInstanceGroup(&request_context_, updated_hot_group, hot_group->version()));
+
+    auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kHotInstance, {"existing"}, {17}, 30);
+    ASSERT_EQ(EC_OK, hit_ec);
+    EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kHotInstance, {"new-object"}, {17}, 30).first);
+    EXPECT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage(kStorage));
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsDuplicateStorageCandidates) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    ASSERT_FALSE(default_group->storage_candidates().empty());
+    InstanceGroup duplicate_group(*default_group);
+    duplicate_group.set_name("duplicate-storage-object-group");
+    duplicate_group.set_global_quota_group_name("duplicate-storage-object-quota");
+    duplicate_group.set_storage_candidates(
+        {default_group->storage_candidates().front(), default_group->storage_candidates().front()});
+    duplicate_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, duplicate_group));
+    EXPECT_EQ(
+        EC_CONFIG_ERROR,
+        manager_->RegisterInstance(&request_context_, duplicate_group.name(), "duplicate-storage-object-instance", "")
+            .first);
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsMissingStorageCandidates) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+
+    const auto create_and_register = [&](const std::string &group_name,
+                                         const std::string &instance_id,
+                                         std::vector<std::string> storage_candidates) {
+        InstanceGroup group(*default_group);
+        group.set_name(group_name);
+        group.set_global_quota_group_name(group_name + "-quota");
+        group.set_storage_candidates(std::move(storage_candidates));
+        group.set_version(1);
+        ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, group));
+        EXPECT_EQ(EC_CONFIG_ERROR,
+                  manager_->RegisterInstance(&request_context_, group_name, instance_id, "reclaim-test").first);
+    };
+
+    create_and_register("empty-storage-object-group", "empty-storage-object-instance", {});
+    create_and_register(
+        "missing-storage-object-group", "missing-storage-object-instance", {"unregistered-kvmeta-storage"});
+}
+
+TEST_F(KvMetaManagerTest, ZeroReclaimerTuningBlocksOnlyNewAllocation) {
+    CommitObject(kInstanceId, "existing", 17);
+    const auto cache_reclaimer = cache_manager_->cache_reclaimer();
+    ASSERT_NE(nullptr, cache_reclaimer);
+    const auto original_sampling = cache_reclaimer->GetSamplingSize(&request_context_);
+    const auto original_batching = cache_reclaimer->GetBatchingSize(&request_context_);
+
+    ASSERT_EQ(EC_OK, cache_reclaimer->SetSamplingSize(&request_context_, 0));
+    auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kInstanceId, {"existing"}, {17}, 30);
+    ASSERT_EQ(EC_OK, hit_ec);
+    EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->StartWrite(&request_context_, kInstanceId, {"sampling-disabled"}, {17}, 30).first);
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->RegisterInstance(&request_context_, "default", "sampling-disabled-instance", "").first);
+
+    ASSERT_EQ(EC_OK, cache_reclaimer->SetSamplingSize(&request_context_, original_sampling));
+    ASSERT_EQ(EC_OK, cache_reclaimer->SetBatchingSize(&request_context_, 0));
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->StartWrite(&request_context_, kInstanceId, {"batching-disabled"}, {17}, 30).first);
+
+    // A broken GC knob closes admission, but never closes the operator's
+    // cleanup path for objects already present in the cache.
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {"existing"}));
+    ASSERT_EQ(EC_OK, cache_reclaimer->SetBatchingSize(&request_context_, original_batching));
+}
+
+TEST_F(KvMetaManagerTest, InvalidHotUpdatedReclaimPolicyBlocksOnlyNewAllocation) {
+    constexpr const char *kGroup = "reclaim-hot-update-group";
+    constexpr const char *kInstance = "reclaim-hot-update-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, "existing", 17);
+
+    const auto [group_ec, current_group] = registry_manager_->GetInstanceGroup(&request_context_, kGroup);
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(current_group);
+    ASSERT_TRUE(current_group->cache_config());
+    ASSERT_TRUE(current_group->cache_config()->reclaim_strategy());
+    auto updated_cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(updated_cache_config->FromJsonString(current_group->cache_config()->ToJsonString()));
+    auto unsupported_strategy = std::make_shared<CacheReclaimStrategy>(*updated_cache_config->reclaim_strategy());
+    unsupported_strategy->set_reclaim_policy(ReclaimPolicy::POLICY_TTL);
+    updated_cache_config->set_reclaim_strategy(unsupported_strategy);
+    InstanceGroup updated_group(*current_group);
+    updated_group.set_cache_config(updated_cache_config);
+    updated_group.set_version(current_group->version() + 1);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->UpdateInstanceGroup(&request_context_, updated_group, current_group->version()));
+
+    auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kInstance, {"existing"}, {17}, 30);
+    ASSERT_EQ(EC_OK, hit_ec);
+    EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
+    EXPECT_TRUE(hit.locations.empty());
+    EXPECT_TRUE(hit.write_session_id.empty());
+
+    auto [miss_ec, miss] = manager_->StartWrite(&request_context_, kInstance, {"new"}, {17}, 30);
+    EXPECT_EQ(EC_CONFIG_ERROR, miss_ec);
+    EXPECT_TRUE(miss.locations.empty());
+    EXPECT_TRUE(miss.write_session_id.empty());
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->RegisterInstance(&request_context_, kGroup, "another-instance", "reclaim-test").first);
+
+    // Configuration failure closes admission, not cleanup: operators must
+    // still be able to drain already committed cache objects safely.
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstance, {"existing"}));
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"existing"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
 }
 
 TEST_F(KvMetaManagerTest, RecoveryCompletesAReclaimerRetirementLeftByDemotion) {

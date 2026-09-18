@@ -281,15 +281,22 @@ namespace/key version，而不能依赖 Trim 恰好先完成。
 
 | 字段 | 约束 |
 |---|---|
-| `type` | 必须是已注册、可识别的 storage type |
+| `type` | 必须是已注册、可识别且具备对象所有权语义的 storage type |
 | `spec_size` | 固定为 `1` |
 | `location_specs` | 恰好一个元素，名字固定为 `value` |
 | `location_specs[0].uri` | scheme/hostname 必须对应所选 backend |
 | `value_size` | 对象有效字节数，必须大于 0 |
 | URI `size` 参数 | 必须与 `value_size` 完全相等 |
 
-服务端、metadata client、object client 和 transfer wrapper 都会独立验证这些不变量；任一层发现损坏都 fail closed，
-不会把不可信 URI 交给数据面。
+这里的对象 storage type 只包括 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy。
+EventReport location 是外部 block 的观测记录，不代表 KVMeta 对该物理对象具有独占创建/删除权；proto 与 C++ enum
+为 wire compatibility 保留其编号，但服务端和官方 exact-object client 都拒绝把它用于 EMB 对象。
+
+服务端、metadata client、object client 和 transfer wrapper 都会独立验证这些不变量；原始 URI 还必须不超过
+64 KiB、query 参数不超过 64 个，且没有控制字符、fragment、空 query key 或重复 query key，`size` 必须完整解析为
+正整数。进程内已有的 metadata size 校验缓存若存在，也必须与 URI `size` 相等；恢复后缓存不存在时重新解析 URI，
+而不是信任旧 hint。任一层发现损坏都 fail closed，不会把不可信 URI 交给数据面，也不会把“配额长度”和“对外读取
+长度”分叉。
 
 ### 5.4 对象状态
 
@@ -310,7 +317,9 @@ HA 节点必须保持时钟同步，并把可能的最大漂移计入写租约�
 
 `KvMetaObjectClient::Create` 首先通过 `KvMetaClient::RegisterInstance` 注册专用 instance，取得服务端权威
 `storage_configs`，再创建 exact-size transfer client。相同 instance/group/schema/user data 的注册幂等；身份或
-schema 不一致则失败。
+schema 不一致则失败。注册同时验证 group 已配置当前实现能够执行的 LRU 回收策略，并且每个
+`storage_candidates` 都唯一、已注册且具备 exact-object ownership；没有有效 Reclaimer、候选缺失/重复或混入
+EventReport 的 group 返回 `SERVICE_NOT_READY`，不会先创建一个只能靠人工删除维持的“对象库”。
 
 ### 6.2 写入
 
@@ -491,7 +500,15 @@ metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞�
 ### 8.2 Remove/新一代写入的 ABA 防护
 
 对 committed 对象，`Remove` 从条件删除 metadata、持久化到物理删除结束一直持有同一 group admission shard。
-下一代同 key `PutStart` 只能在旧物理对象删除完成后进入，避免可复用地址型 backend 的旧 Delete 误伤新对象。
+Reclaimer finalization 也在该 shard 下完成 metadata delete 和本次物理 Delete 调用。下一代同 key `PutStart` 只能在
+Delete 调用返回后进入；当 backend 保证“返回即终态（成功已删除，失败已取消且以后不会继续执行）”时，这能阻止旧
+Delete 与新 allocation 重叠。
+
+必须明确，这把进程内锁不能给 provider 内部仍在运行的超时请求加 fencing。如果 Delete 返回 timeout/抛异常后仍
+可能晚到完成，释放 shard 后的新对象又可能复用同一地址，第一次 Delete 本身仍会误伤后继 generation；“V1 不自动
+重放”只能避免第二次删除，不能撤销已经发出的晚到操作。因此 V1 生产 backend 还必须满足以下至少一项：Delete
+返回具有上述终态语义；物理 object key 在故障窗口内不可复用；或 backend 自身使用 generation/条件删除。立即复用
+地址、Delete 可能晚到且没有 generation/fencing 的 backend 是上线阻断项，不能以 group lock 代替证明。
 
 session timeout 和 `PutFinish` finalization 同样计为 in-flight。Trim 不能与它们同时删除相同 allocation。
 
@@ -525,6 +542,7 @@ sequence 防止较旧的 worker snapshot 清除并发产生的新需求；达到
 | 单 key | 512 bytes |
 | instance id / instance group / write session id | 各 512 bytes |
 | `user_data` | 64 KiB |
+| 单 location URI | 64 KiB |
 | 单 value | 1 GiB，且不能为 0 |
 | 单 batch value 总量 | 4 GiB |
 | 每 KVCM 进程 active write sessions | 4096 |
@@ -642,6 +660,12 @@ Instance Group quota 和 storage backend 配置。部署必须提前创建仅供
 - `PauseReclaimer` 会同时停止新的 KVMeta retirement；已进入 pending 的对象仍会完成 metadata-first
   finalization，避免长期停在半回收状态。
 
+`RegisterInstance` 会在写入 registry 前校验上述 group reclaim 配置、storage candidates 和进程级
+sampling/batching；运行中若 group/reclaim/storage 配置被热更新为不支持的值，或 sampling/batching 被关闭，已有
+committed hit 仍可读、Remove/Trim 仍可用于排空，但任何包含 miss 的新 `PutStart` 都在 storage allocation 前返回
+`SERVICE_NOT_READY`。Reclaimer 对非法 reclaim 配置停止选择新候选并告警。这样配置错误不会继续扩大占用，也不会
+影响普通 KVCache group；修复配置后无需重建已注册 instance。
+
 可观测指标位于 `kv_meta_reclaimer.*` namespace：
 
 - `round_count`、`retired_object_count`、`retry_count`、`error_count`；
@@ -702,8 +726,9 @@ metadata 前先把 committed 对象持久化为 retired，并等待配置的 rea
 
 若 metadata 已经持久化删除、随后物理 Delete 返回错误或抛异常，该 URI 已成为不可达 orphan：同步 API 返回错误，
 后台 worker 记录一次脱敏告警，recovery 则继续完成稳定扫描和 byte usage 重建。所有路径都不自动重放不确定
-Delete，因为现有 backend URI 没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。运维必须依赖
-backend 的条件/幂等删除能力或独立 orphan 清理策略。
+Delete，因为现有 backend URI 没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。这个规则只
+消除“由 KVCM 发起第二次 Delete”的风险；若第一次调用返回后仍可能在 provider 内部晚到执行，V1 同样无法 fence。
+运维必须证明 Delete 终态/地址不复用/条件删除契约，并依赖 backend 的独立 orphan 清理策略处理无法确认的 allocation。
 
 KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常、未知异常和 Delete 结果数量不匹配转换为
 明确错误码，防止异常越过可选侧路终止服务线程。批量 PutStart 的后续 singleton Create 抛异常时，已经取得 URI
@@ -728,7 +753,8 @@ Load 竞争。部署必须按第 6.3 节的尾延迟公式设置 `delay_before_d
 
 这类竞态的允许结果是 Load 失败并回退重算，而不是读出另一代对象。随机物理 object key、singleton allocation、
 exact-value metadata CAS 和“不重放不确定 Delete”共同降低 ABA 风险；对会立即复用地址且不能校验 generation 的
-backend，V1 仍依赖写租约、单 leader 和删除时序，强 fencing 需要 V2。
+backend，V1 仍依赖写租约、单 leader、删除时序以及 Delete 返回终态；provider 可在返回后晚到完成时，这些机制
+不足以保证安全，必须停用该 backend 或等待 V2 fencing。
 
 V1 只验证 URI identity、scheme、hostname 和逻辑 size，不计算 value checksum。backend 若静默返回同长度错误
 数据，KVCM 无法识别。因此生产部署必须至少满足以下之一：backend 自带端到端 checksum 并在读取错误时失败；或
@@ -745,6 +771,7 @@ embedding Cache 的 false-hit 正确性要求。
 | 推理 fallback | miss、`NOSPC`、`WRITE_IN_PROGRESS`、timeout、not-leader、Load/checksum 失败均可在延迟预算内重算 | Cache 不得进入核心推理强依赖 |
 | 回收闭环 | 专用 group 配置有效 `POLICY_LRU`、合法 watermark、非零 sampling/batch；Reclaimer 未长期暂停 | fail closed 并告警，不能靠手工 Remove 维持 |
 | 物理 GC | backend Delete 确实释放资源，或存在已验证的 TTL/sweeper/namespace 轮换和底层硬容量保护 | no-op Delete backend 禁止作为独立生产方案 |
+| 删除终态 | Delete 返回后不会再晚到修改该 allocation，或 URI 不复用/具备 generation 条件删除 | 可复用地址且异步晚到的 backend 禁止上线 |
 | consumer 生命周期 | grace 覆盖读尾延迟，显式 release 在最后消费后，Trim 前排空 consumer | Load 失败只能回退；不可把短 grace 当 read lease |
 | 时间与租约 | leader/backend 节点时钟同步，最大漂移计入 write lease、recovery 和 read grace；backend I/O 有可验证 deadline/drain | 扩大安全裕量或停用该 backend |
 | 故障与内容完整性 | provider 异常被隔离；backend checksum 或 receipt digest 可发现静默损坏 | 不允许把“长度正确”视为内容正确 |
@@ -982,9 +1009,10 @@ group 内所有 instance；恢复时再用 durable record 校准。cleanup 执�
   metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
   和零水位、低于水位的大请求按需回收、storage type 按需回收、per-instance key 准入、重叠压力不误伤无关
   Cache、不可能请求不清空有效对象、group LRU、active 排除、跨 instance 小样本轮转、pending credit 防过淘汰、
-  跨 group grace 隔离、Pause、非 LRU fail-closed、metadata Sync 重试/admission fail-closed、物理删除不重放，
-  以及降主后 retired recovery；
-- Client/SDK UT：响应对齐、URI/size/buffer 校验、CPU build 对 GPU buffer 的 fail-closed、failover、超时 drain、
+  跨 group grace 隔离、Pause、非 LRU 注册拒绝、非法热更新关闭新 allocation、metadata Sync
+  重试/admission fail-closed、物理删除不重放，以及降主后 retired recovery；
+- Client/SDK UT：响应对齐、重复参数/fragment/EventReport/URI size/buffer 校验、CPU build 对 GPU buffer 的
+  fail-closed、failover、超时 drain、
   普通 TransferClient 回归；
 - 内部 TairMempool UT：variable-size policy、严格 URI、禁 fallback、禁 gather/scatter；
 - v6d UT/真实服务测试：CPU/CUDA buffer 封装、不同长度读写和 remove；

@@ -22,6 +22,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client:kv_meta_client_impl",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
     ],
 )
@@ -32,6 +33,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client:kv_meta_object_client_impl",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
     ],
 )
 
@@ -41,6 +43,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
     ],
 )
 

@@ -11,6 +11,7 @@
 
 #include "kv_cache_manager/client/include/kv_meta_client.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/protocol/protobuf/kv_meta_service.grpc.pb.h"
 
 namespace kv_cache_manager {
@@ -25,6 +26,10 @@ public:
     void set_wrong_uri_size(bool value) { wrong_uri_size_.store(value); }
     void set_wrong_uri_scheme(bool value) { wrong_uri_scheme_.store(value); }
     void set_non_singleton_uri(bool value) { non_singleton_uri_.store(value); }
+    void set_duplicate_uri_size(bool value) { duplicate_uri_size_.store(value); }
+    void set_fragment_uri(bool value) { fragment_uri_.store(value); }
+    void set_event_report_location(bool value) { event_report_location_.store(value); }
+    void set_oversized_uri(bool value) { oversized_uri_.store(value); }
     void set_oversized_session_id(bool value) { oversized_session_id_.store(value); }
     void set_omit_last_start_location(bool value) { omit_last_start_location_.store(value); }
     void set_extra_start_mask_value(bool value) { extra_start_mask_value_.store(value); }
@@ -86,6 +91,7 @@ public:
             auto *location = response->add_locations();
             if (hit) {
                 FillLocation(key == "a" ? 17 : 33, location);
+                CorruptLocation(key == "a" ? 17 : 33, location);
             }
         }
         return grpc::Status::OK;
@@ -135,6 +141,7 @@ public:
                     location->mutable_location_specs(0)->set_uri("file://nfs/value?blkid=1&offset=0&size=" +
                                                                  std::to_string(size));
                 }
+                CorruptLocation(size, location);
             }
             ++write_count;
         }
@@ -221,12 +228,36 @@ private:
         spec->set_uri("file://nfs/value?offset=0&size=" + std::to_string(size));
     }
 
+    void CorruptLocation(std::uint64_t size, proto::kv_meta::ValueLocation *location) const {
+        if (duplicate_uri_size_.load()) {
+            auto *spec = location->mutable_location_specs(0);
+            spec->set_uri(spec->uri() + "&size=" + std::to_string(size));
+        }
+        if (fragment_uri_.load()) {
+            auto *spec = location->mutable_location_specs(0);
+            spec->set_uri(spec->uri() + "#fragment");
+        }
+        if (event_report_location_.load()) {
+            location->set_type(proto::kv_meta::ST_EVENT_REPORT_L1P5);
+            location->mutable_location_specs(0)->set_uri("event_report_l1p5://reporter/value?size=" +
+                                                         std::to_string(size));
+        }
+        if (oversized_uri_.load()) {
+            location->mutable_location_specs(0)->set_uri("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') +
+                                                         "?size=" + std::to_string(size));
+        }
+    }
+
     const bool standby_;
     std::atomic<bool> wrong_start_size_{false};
     std::atomic<bool> write_in_progress_{false};
     std::atomic<bool> wrong_uri_size_{false};
     std::atomic<bool> wrong_uri_scheme_{false};
     std::atomic<bool> non_singleton_uri_{false};
+    std::atomic<bool> duplicate_uri_size_{false};
+    std::atomic<bool> fragment_uri_{false};
+    std::atomic<bool> event_report_location_{false};
+    std::atomic<bool> oversized_uri_{false};
     std::atomic<bool> oversized_session_id_{false};
     std::atomic<bool> omit_last_start_location_{false};
     std::atomic<bool> extra_start_mask_value_{false};
@@ -547,6 +578,49 @@ TEST(KvMetaClientTest, MalformedAllocationUriIsRejectedAndAborted) {
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-non-singleton", {"a"}, {17}, 30).first);
     EXPECT_EQ(3, service.put_finish_calls.load());
     EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_non_singleton_uri(false);
+    service.set_duplicate_uri_size(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-duplicate-size", {"a"}, {17}, 30).first);
+    EXPECT_EQ(4, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_duplicate_uri_size(false);
+    service.set_fragment_uri(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-fragment", {"a"}, {17}, 30).first);
+    EXPECT_EQ(5, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_fragment_uri(false);
+    service.set_event_report_location(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-event-report", {"a"}, {17}, 30).first);
+    EXPECT_EQ(6, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_event_report_location(false);
+    service.set_oversized_uri(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-oversized-uri", {"a"}, {17}, 30).first);
+    EXPECT_EQ(7, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+}
+
+TEST(KvMetaClientTest, MalformedReadLocationIsRejectedBeforeExposure) {
+    FakeKvMetaService service;
+    service.set_duplicate_uri_size(true);
+    RunningServer server(&service);
+    ASSERT_TRUE(server.valid());
+
+    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    auto [duplicate_ec, duplicate] = client->Get("trace-duplicate", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, duplicate_ec);
+    EXPECT_TRUE(duplicate.locations.empty());
+
+    service.set_duplicate_uri_size(false);
+    service.set_event_report_location(true);
+    auto [event_ec, event] = client->Get("trace-event", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, event_ec);
+    EXPECT_TRUE(event.locations.empty());
 }
 
 TEST(KvMetaClientTest, OversizedSessionIdInStartResponseIsRejected) {

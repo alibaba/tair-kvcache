@@ -26,6 +26,21 @@ TEST_F(StorageConfigTest, TestNfsStorageSpecJsonize) {
     EXPECT_EQ(spec.key_count_per_file(), spec2.key_count_per_file());
 }
 
+TEST_F(StorageConfigTest, KvMetaObjectStorageTypesExcludeExternalObservationsAndSentinels) {
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::COUNT));
+}
+
 TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
     std::shared_ptr<NfsStorageSpec> nfs_spec_ptr(new NfsStorageSpec());
     auto &nfs_spec = *nfs_spec_ptr;
