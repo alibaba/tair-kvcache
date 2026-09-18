@@ -310,6 +310,10 @@ void CacheGarbageCollector::Join() noexcept {
     // Match CacheReclaimer's demotion policy: accepted actions continue best effort in the Executor, while GC never
     // waits for their end-to-end Futures. Clearing these observer handles does not cancel physical deletes or
     // EventReport metadata actions. Both paths revalidate their mutation preconditions in the Executor worker.
+    for (auto &entry : instances_) {
+        entry.buffered_scan = {};
+        entry.buffered_key_index = 0;
+    }
     inflight_deletes_.clear();
     pending_locations_.clear();
     METRICS_(cache_gc, inflight_delete_count) = 0;
@@ -338,6 +342,89 @@ void CacheGarbageCollector::ResetWorkerState() noexcept {
     METRICS_(cache_gc, inflight_delete_count) = 0;
     METRICS_(cache_gc, inflight_delete_age_ms) = 0;
     METRICS_(cache_gc, round_duration_ms) = 0;
+}
+
+ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
+                                                       InstanceScanEntry &entry,
+                                                       MaintenanceScanBatch &out) {
+    out.Clear();
+    auto &buffer = entry.buffered_scan;
+    if (buffer.keys.empty()) {
+        const ErrorCode ec = indexer.ScanLocationsForMaintenance(
+            round_context_.get(), entry.cursor, config_.scan_batch_size, buffer);
+        if (ec != EC_OK) {
+            buffer = {};
+            return ec;
+        }
+        if (buffer.keys.size() != buffer.locations.size() || buffer.keys.size() != buffer.location_results.size()) {
+            RecordOperationError("scan_shape");
+            buffer = {};
+            return EC_ERROR;
+        }
+        entry.buffered_key_index = 0;
+        entry.scanned_key_count += buffer.keys.size();
+        ++entry.scan_batch_count;
+        METRICS_(cache_gc, scan_key_count) += buffer.keys.size();
+    }
+
+    // Preserve the real backend cursor even while this scan has leftovers.
+    // RunOneTick must drain the buffer before treating a base cursor as EOF.
+    out.next_cursor = buffer.next_cursor;
+    size_t location_count = 0;
+    std::set<KeyType> event_report_keys;
+    // RunOneTick already checked the inflight limit. With only one free slot,
+    // don't consume a slice that could need both kinds of delete action.
+    const bool single_action = config_.max_inflight_delete_requests - inflight_deletes_.size() == 1;
+    std::optional<bool> event_report_action;
+    while (entry.buffered_key_index < buffer.keys.size() && out.keys.size() < config_.scan_batch_size &&
+           location_count < config_.scan_batch_size) {
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            break;
+        }
+        const size_t index = entry.buffered_key_index;
+        const KeyType key = buffer.keys[index];
+        auto &locations = buffer.locations[index];
+        CacheLocationMap slice;
+        if (buffer.location_results[index] != EC_OK) {
+            locations.clear();
+        }
+        while (!locations.empty() && location_count < config_.scan_batch_size) {
+            const auto &location = locations.begin()->second;
+            const bool is_event_report = config_.event_report_cleanup_enabled && location &&
+                                         location->status() == CLS_SERVING &&
+                                         IsEventReportStorageType(location->type());
+            if (single_action && event_report_action.has_value() && event_report_action.value() != is_event_report) {
+                break;
+            }
+            if (is_event_report) {
+                if (event_report_keys.count(key) == 0 &&
+                    event_report_keys.size() >= config_.event_report_action_batch_size) {
+                    break;
+                }
+                event_report_keys.insert(key);
+            }
+            event_report_action = is_event_report;
+            slice.insert(locations.extract(locations.begin()));
+            ++location_count;
+        }
+        if (slice.empty() && !locations.empty()) {
+            break;
+        }
+        out.keys.push_back(key);
+        out.locations.emplace_back(std::move(slice));
+        out.location_results.push_back(buffer.location_results[index]);
+        if (!locations.empty()) {
+            // One key may have more Locations than a tick can admit. Keep its
+            // remaining Locations, not just the following keys, for next time.
+            break;
+        }
+        ++entry.buffered_key_index;
+    }
+    if (entry.buffered_key_index == buffer.keys.size()) {
+        buffer = {};
+        entry.buffered_key_index = 0;
+    }
+    return EC_OK;
 }
 
 void CacheGarbageCollector::RunOneTick() noexcept {
@@ -388,8 +475,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
 
         MaintenanceScanBatch batch;
         const std::string scan_cursor = entry.cursor;
-        ErrorCode ec =
-            indexer->ScanLocationsForMaintenance(round_context_.get(), scan_cursor, config_.scan_batch_size, batch);
+        ErrorCode ec = GetNextMaintenanceBatch(*indexer, entry, batch);
         if (ec != EC_OK) {
             RecordOperationError("scan");
             ++entry.scan_failure_count;
@@ -415,16 +501,13 @@ void CacheGarbageCollector::RunOneTick() noexcept {
         }
 
         entry.scan_failure_count = 0;
-        entry.scanned_key_count += batch.keys.size();
-        ++entry.scan_batch_count;
-        METRICS_(cache_gc, scan_key_count) += batch.keys.size();
         entry.cursor = batch.next_cursor;
         if (stop_requested_.load(std::memory_order_acquire)) {
             return;
         }
         ScanDeleteActions actions = BuildDeleteActions(entry.instance_id, batch, TimestampUtil::GetCurrentTimeUs());
         const std::string instance_id = entry.instance_id;
-        const bool scan_completed = entry.cursor == SCAN_BASE_CURSOR;
+        const bool scan_completed = entry.cursor == SCAN_BASE_CURSOR && entry.buffered_scan.keys.empty();
 
         if (stop_requested_.load(std::memory_order_acquire)) {
             return;
@@ -784,6 +867,10 @@ void CacheGarbageCollector::AdvanceInstance(bool completed_current) noexcept {
         return;
     }
     instances_[instance_index_].completed = instances_[instance_index_].completed || completed_current;
+    if (instances_[instance_index_].completed) {
+        instances_[instance_index_].buffered_scan = {};
+        instances_[instance_index_].buffered_key_index = 0;
+    }
     if (std::all_of(instances_.begin(), instances_.end(), [](const InstanceScanEntry &entry) {
             return entry.completed;
         })) {

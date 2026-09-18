@@ -49,6 +49,7 @@ private:                                                                        
 
 class CacheLocation;
 class DataStorageManager;
+class MetaIndexer;
 class MetaIndexerManager;
 class MigrationManager;
 class RegistryManager;
@@ -108,6 +109,9 @@ private:
         size_t scan_batch_count{0};
         size_t inflight_throttled_tick_count{0};
         std::map<std::string, size_t> submitted_location_counts;
+        // Drain one backend scan result across ticks before scanning again.
+        MaintenanceScanBatch buffered_scan;
+        size_t buffered_key_index{0};
 
         bool operator<(const InstanceScanEntry &other) const {
             return std::tie(instance_group, instance_id) < std::tie(other.instance_group, other.instance_id);
@@ -159,6 +163,7 @@ private:
     };
 
     void RunOneTick() noexcept;
+    ErrorCode GetNextMaintenanceBatch(MetaIndexer &indexer, InstanceScanEntry &entry, MaintenanceScanBatch &out);
     EventReportBackendRoute LookupEventReportBackend(const std::string &instance_id,
                                                       DataStorageType storage_type) const;
     void PollInflightDeletes() noexcept;
