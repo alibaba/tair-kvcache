@@ -109,9 +109,8 @@ private:
         size_t scan_batch_count{0};
         size_t inflight_throttled_tick_count{0};
         std::map<std::string, size_t> submitted_location_counts;
-        // Drain one backend scan result across ticks before scanning again.
+        // Drain over-budget candidates from one scan before scanning again.
         MaintenanceScanBatch buffered_scan;
-        size_t buffered_key_index{0};
 
         bool operator<(const InstanceScanEntry &other) const {
             return std::tie(instance_group, instance_id) < std::tie(other.instance_group, other.instance_id);
@@ -160,6 +159,7 @@ private:
         EventReportMetadataDelRequest event_report_request;
         std::map<std::string, size_t> executor_reason_counts;
         std::map<std::string, size_t> event_report_reason_counts;
+        MaintenanceScanBatch deferred_batch;
     };
 
     void RunOneTick() noexcept;

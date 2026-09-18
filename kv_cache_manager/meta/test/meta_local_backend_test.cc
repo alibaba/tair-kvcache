@@ -773,7 +773,7 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouchingKeys) {
+TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingReselectsColdestWithoutTouchingKeys) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_no_touch", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -803,7 +803,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
                   meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, batch, locations));
         ASSERT_EQ(1, locations[0].size());
     }
-    EXPECT_EQ((KeyVector{1, 2, 3, 1, 2, 3}), sampled);
+    // Independent samples restart at the cold end; sampling is not a hit.
+    EXPECT_EQ((KeyVector{1, 1, 1, 1, 1, 1}), sampled);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
               GetLocalBackend()->GetLastAccessTimesForMaintenance(nullptr, keys, after));
     EXPECT_EQ(before, after);
@@ -820,9 +821,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
     EXPECT_EQ(0, after[1]);
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithoutTouchingLru) {
+TEST_F(MetaLocalBackendTest, TestGroupLruColdShardSamplingDoesNotSkipIneligiblePrefixes) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=3&sample_times=2");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_shard_rotation", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_cold_shards", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     auto *backend = GetLocalBackend();
     const auto shard_of = [backend](KeyType key) {
@@ -854,6 +855,17 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
         ASSERT_EQ(
             (std::vector<ErrorCode>{EC_OK, EC_OK}),
             backend->Put(nullptr, keys_by_shard[shard], CacheLocationMapVector(2, locations), PropertyMapVector(2)));
+        // Make shard coldness deterministic even if several Puts share a clock tick.
+        const int64_t access_time = (shard + 1) * 100;
+        for (const auto key : keys_by_shard[shard]) {
+            ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+                MetaLocalBackend::KeyToView(key),
+                [access_time](Cache::ObjectPtr obj, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                    static_cast<MetaMemCacheItem *>(obj)->last_access_time_.store(access_time);
+                    return 0;
+                }));
+        }
+        backend->shard_oldest_access_time_[shard].store(access_time);
         all_keys.insert(all_keys.end(), keys_by_shard[shard].begin(), keys_by_shard[shard].end());
     }
     std::vector<int64_t> before, after;
@@ -870,12 +882,14 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
             KeyVector sampled;
             ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(backend, count, sampled));
             ASSERT_EQ(count, sampled.size());
-            // The first slot rotates even when all physical LRU tails stay fixed.
-            EXPECT_EQ(round, shard_of(sampled.front()));
+            // Sampling always reselects cold shards; it does not rotate past
+            // ordinary ineligible prefixes or refill from warmer shards.
+            EXPECT_EQ(0, shard_of(sampled.front()));
             std::set<uint32_t> batch_shards;
             for (const auto key : sampled) {
                 covered.insert(shard_of(key));
                 batch_shards.insert(shard_of(key));
+                EXPECT_LT(shard_of(key), count);
             }
             EXPECT_EQ(sampled.size(), batch_shards.size());
             CacheLocationMapVector locations;
@@ -885,8 +899,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
                 found_reclaimable = found_reclaimable || !map.empty();
             }
         }
-        EXPECT_EQ(kShards, covered.size());
-        EXPECT_TRUE(found_reclaimable);
+        EXPECT_EQ(count, covered.size());
+        EXPECT_FALSE(found_reclaimable);
     }
     ASSERT_EQ(std::vector<ErrorCode>(all_keys.size(), EC_OK),
               backend->GetLastAccessTimesForMaintenance(nullptr, all_keys, after));
@@ -902,9 +916,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
     ASSERT_EQ(EC_OK, backend->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruSamplingCursorSurvivesRemovalAndPromotion) {
+TEST_F(MetaLocalBackendTest, TestGroupLruSamplingReflectsRemovalAndBusinessPromotion) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_cursor", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_coldest", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
               PutWithFieldMaps(meta_storage_backend_.get(),
@@ -915,8 +929,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruSamplingCursorSurvivesRemovalAndPromoti
     ASSERT_EQ((KeyVector{1}), sampled);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {2}));
     ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, sampled));
-    EXPECT_EQ((KeyVector{3}), sampled);
-    // A business read promotes the node at the cursor; maintenance must not retain a stale link.
+    EXPECT_EQ((KeyVector{1}), sampled);
+    // Removing key 2 leaves key 1 coldest; only a business read promotes it.
     PropertyMapVector props;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               meta_storage_backend_->GetProperties(nullptr, {1}, {PROPERTY_URI}, props));

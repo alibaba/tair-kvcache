@@ -135,6 +135,7 @@ const char *MaintenanceUnknownReasonName(EventReportBackend::MaintenanceProbeUnk
 }
 
 struct DeleteCandidate {
+    CacheLocationConstPtr location;
     std::string expected_location_value;
     CandidateReason reason{CandidateReason::kOrphanWriting};
     std::set<std::string> confirmed_missing_uris;
@@ -312,7 +313,6 @@ void CacheGarbageCollector::Join() noexcept {
     // EventReport metadata actions. Both paths revalidate their mutation preconditions in the Executor worker.
     for (auto &entry : instances_) {
         entry.buffered_scan = {};
-        entry.buffered_key_index = 0;
     }
     inflight_deletes_.clear();
     pending_locations_.clear();
@@ -361,69 +361,15 @@ ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
             buffer = {};
             return EC_ERROR;
         }
-        entry.buffered_key_index = 0;
         entry.scanned_key_count += buffer.keys.size();
         ++entry.scan_batch_count;
         METRICS_(cache_gc, scan_key_count) += buffer.keys.size();
     }
 
-    // Preserve the real backend cursor even while this scan has leftovers.
-    // RunOneTick must drain the buffer before treating a base cursor as EOF.
-    out.next_cursor = buffer.next_cursor;
-    size_t location_count = 0;
-    std::set<KeyType> event_report_keys;
-    // RunOneTick already checked the inflight limit. With only one free slot,
-    // don't consume a slice that could need both kinds of delete action.
-    const bool single_action = config_.max_inflight_delete_requests - inflight_deletes_.size() == 1;
-    std::optional<bool> event_report_action;
-    while (entry.buffered_key_index < buffer.keys.size() && out.keys.size() < config_.scan_batch_size &&
-           location_count < config_.scan_batch_size) {
-        if (stop_requested_.load(std::memory_order_acquire)) {
-            break;
-        }
-        const size_t index = entry.buffered_key_index;
-        const KeyType key = buffer.keys[index];
-        auto &locations = buffer.locations[index];
-        CacheLocationMap slice;
-        if (buffer.location_results[index] != EC_OK) {
-            locations.clear();
-        }
-        while (!locations.empty() && location_count < config_.scan_batch_size) {
-            const auto &location = locations.begin()->second;
-            const bool is_event_report = config_.event_report_cleanup_enabled && location &&
-                                         location->status() == CLS_SERVING &&
-                                         IsEventReportStorageType(location->type());
-            if (single_action && event_report_action.has_value() && event_report_action.value() != is_event_report) {
-                break;
-            }
-            if (is_event_report) {
-                if (event_report_keys.count(key) == 0 &&
-                    event_report_keys.size() >= config_.event_report_action_batch_size) {
-                    break;
-                }
-                event_report_keys.insert(key);
-            }
-            event_report_action = is_event_report;
-            slice.insert(locations.extract(locations.begin()));
-            ++location_count;
-        }
-        if (slice.empty() && !locations.empty()) {
-            break;
-        }
-        out.keys.push_back(key);
-        out.locations.emplace_back(std::move(slice));
-        out.location_results.push_back(buffer.location_results[index]);
-        if (!locations.empty()) {
-            // One key may have more Locations than a tick can admit. Keep its
-            // remaining Locations, not just the following keys, for next time.
-            break;
-        }
-        ++entry.buffered_key_index;
-    }
-    if (entry.buffered_key_index == buffer.keys.size()) {
-        buffer = {};
-        entry.buffered_key_index = 0;
-    }
+    // Let BuildDeleteActions see the complete batch before applying budgets,
+    // otherwise scan order can hide higher-priority garbage behind a slice.
+    out = std::move(buffer);
+    buffer = {};
     return EC_OK;
 }
 
@@ -506,6 +452,7 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             return;
         }
         ScanDeleteActions actions = BuildDeleteActions(entry.instance_id, batch, TimestampUtil::GetCurrentTimeUs());
+        entry.buffered_scan = std::move(actions.deferred_batch);
         const std::string instance_id = entry.instance_id;
         const bool scan_completed = entry.cursor == SCAN_BASE_CURSOR && entry.buffered_scan.keys.empty();
 
@@ -869,7 +816,9 @@ void CacheGarbageCollector::AdvanceInstance(bool completed_current) noexcept {
     instances_[instance_index_].completed = instances_[instance_index_].completed || completed_current;
     if (instances_[instance_index_].completed) {
         instances_[instance_index_].buffered_scan = {};
-        instances_[instance_index_].buffered_key_index = 0;
+    } else if (!instances_[instance_index_].buffered_scan.keys.empty()) {
+        // Finish this backend batch across ticks before rotating Instances.
+        return;
     }
     if (std::all_of(instances_.begin(), instances_.end(), [](const InstanceScanEntry &entry) {
             return entry.completed;
@@ -928,6 +877,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                 }
                 candidates.emplace(candidate_key,
                                    DeleteCandidate{
+                                       .location = location,
                                        .expected_location_value = location->ToJsonString(),
                                        .reason = CandidateReason::kOrphanWriting,
                                    });
@@ -1126,6 +1076,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                     }
                     candidates.emplace(entry.key,
                                        DeleteCandidate{
+                                           .location = entry.location,
                                            .expected_location_value = entry.location->ToJsonString(),
                                            .reason = reason,
                                            .event_report_backend = probe_batch.backend,
@@ -1154,6 +1105,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
         if (!probe.confirmed_missing_uris.empty()) {
             candidates.emplace(std::move(probe.key),
                                DeleteCandidate{
+                                   .location = probe.location,
                                    .expected_location_value = probe.location->ToJsonString(),
                                    .reason = CandidateReason::kStorageMissing,
                                    .confirmed_missing_uris = std::move(probe.confirmed_missing_uris),
@@ -1189,6 +1141,7 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
 
     size_t selected = 0;
     std::set<KeyType> event_report_selected_keys;
+    std::map<KeyType, CacheLocationMap> deferred_locations;
     for (const auto &[candidate_key, candidate_ptr] : ordered_candidates) {
         const auto &candidate = *candidate_ptr;
         const auto &[block_key, location_id] = candidate_key;
@@ -1196,16 +1149,19 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             pending_locations_.end()) {
             continue;
         }
-        if (selected >= config_.scan_batch_size) {
-            RecordCandidateDropped(CandidateReasonName(candidate.reason), "total_budget", 1);
+        const bool is_event_report = IsEventReportReason(candidate.reason);
+        const bool event_report_budget_full =
+            is_event_report && event_report_selected_keys.count(block_key) == 0 &&
+            event_report_selected_keys.size() >= config_.event_report_action_batch_size;
+        // Physical candidates have higher priority and share the same inflight
+        // window. Preserve EventReport candidates if only one action can fit.
+        const bool event_report_slot_unavailable = is_event_report && !executor_targets.empty() &&
+                                                   inflight_deletes_.size() + 1 >= config_.max_inflight_delete_requests;
+        if (selected >= config_.scan_batch_size || event_report_budget_full || event_report_slot_unavailable) {
+            deferred_locations[block_key].emplace(location_id, candidate.location);
             continue;
         }
-        if (IsEventReportReason(candidate.reason)) {
-            const bool new_key = event_report_selected_keys.find(block_key) == event_report_selected_keys.end();
-            if (new_key && event_report_selected_keys.size() >= config_.event_report_action_batch_size) {
-                RecordCandidateDropped(CandidateReasonName(candidate.reason), "event_report_budget", 1);
-                continue;
-            }
+        if (is_event_report) {
             if (!candidate.event_report_backend || !candidate.event_report_cleanup_token.has_value()) {
                 RecordOperationError("event_report_candidate_contract");
                 continue;
@@ -1229,6 +1185,14 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             ++actions.executor_reason_counts[CandidateReasonName(candidate.reason)];
         }
         ++selected;
+    }
+    // Retain raw snapshots, not cleanup decisions: probe deferred candidates
+    // again on the next tick, and keep the real backend cursor until drained.
+    actions.deferred_batch.next_cursor = batch.next_cursor;
+    for (auto &[block_key, locations] : deferred_locations) {
+        actions.deferred_batch.keys.push_back(block_key);
+        actions.deferred_batch.locations.emplace_back(std::move(locations));
+        actions.deferred_batch.location_results.push_back(EC_OK);
     }
     actions.executor_request.block_keys.reserve(executor_targets.size());
     actions.executor_request.location_ids.reserve(executor_targets.size());
