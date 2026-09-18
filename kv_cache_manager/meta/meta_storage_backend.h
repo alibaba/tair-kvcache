@@ -479,6 +479,11 @@ public:
                                               ReclaimCandidateVector &out_candidates,
                                               bool require_read_success = false) noexcept = 0;
 
+    // Yield rejected EventReport-only keys in a Local reclaim source. Recheck
+    // Location types atomically before refreshing timestamps and LRU positions,
+    // without recording business hits. Unsupported backends leave keys unchanged.
+    virtual size_t TouchEventReportOnlyKeys(const KeyTypeVec & /*keys*/) noexcept { return 0; }
+
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）
     // =====================================================================

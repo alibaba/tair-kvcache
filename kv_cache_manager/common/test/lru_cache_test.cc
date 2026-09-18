@@ -216,6 +216,35 @@ TEST_F(LRUCacheTest, OldestSamplingCursorAdvancesWhenNextEntryIsRemoved) {
     ValidateLRUList({"a", "c", "d", "e"}, 0, 4);
 }
 
+TEST_F(LRUCacheTest, ConditionalPromotionPreservesHitStateAndRejectsPinnedEntries) {
+    NewCache(3);
+    Insert("a");
+    Insert("b");
+    Insert("c");
+    const auto accept = [](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) { return true; };
+    EXPECT_FALSE(cache_->PromoteEntryIf(
+        "a", 0, [](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) { return false; }));
+    ValidateLRUList({"a", "b", "c"}, 0, 3);
+    EXPECT_TRUE(cache_->PromoteEntryIf("a", 0, accept));
+    ValidateLRUList({"b", "c", "a"}, 0, 3);
+    LRUHandle *lru, *low, *bottom;
+    cache_->TEST_GetLRUList(&lru, &low, &bottom);
+    EXPECT_FALSE(lru->prev->HasHit());
+    EXPECT_EQ((std::vector<std::string>{"b", "c", "a"}), ScanNextOldest(3));
+    EXPECT_FALSE(cache_->PromoteEntryIf("missing", 0, accept));
+
+    auto *pinned = cache_->Lookup("b", 0, nullptr, nullptr, Cache::Priority::LOW, nullptr);
+    ASSERT_NE(nullptr, pinned);
+    bool called = false;
+    EXPECT_FALSE(cache_->PromoteEntryIf(
+        "b", 0, [&called](Cache::ObjectPtr, size_t, const Cache::CacheItemHelper *) {
+            called = true;
+            return true;
+        }));
+    EXPECT_FALSE(called);
+    cache_->Release(pinned, false, false);
+}
+
 TEST_F(LRUCacheTest, BatchLookupAndReleasePreserveReferencesAndLruOrder) {
     NewCache(5);
     Insert("a");

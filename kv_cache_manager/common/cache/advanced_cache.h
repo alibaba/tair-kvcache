@@ -527,6 +527,17 @@ public: // functions
         return false;
     }
 
+    // Conditionally promote an unpinned entry to the hot end of its priority
+    // pool without marking a hit. The callback and promotion share the shard
+    // lock; the callback must not re-enter Cache or change the entry's charge.
+    // It may update fixed-size metadata only when returning true. Missing,
+    // pinned, rejected, and unsupported entries are left unchanged.
+    virtual bool PromoteEntryIf(
+        const std::string_view & /*key*/,
+        const std::function<bool(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+        return false;
+    }
+
     // Insert a mapping from key->object only if the key does not already exist.
     // Returns EC_OK on successful insertion, EC_EXIST if the key is already
     // present, or other error codes on failure (e.g. EC_NOSPC).
@@ -817,6 +828,12 @@ public:
         const std::string_view &key,
         const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
         return target_->ApplyToEntryNoTouch(key, callback);
+    }
+
+    bool PromoteEntryIf(
+        const std::string_view &key,
+        const std::function<bool(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
+        return target_->PromoteEntryIf(key, callback);
     }
 
     void StartAsyncLookup(AsyncLookupHandle &async_handle) override { target_->StartAsyncLookup(async_handle); }

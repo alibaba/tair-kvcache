@@ -1810,6 +1810,19 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
+    if (maintenance_read) {
+        KeyVector rejected_keys;
+        for (size_t i = 0; i < batch.size(); ++i) {
+            if (out_loc_ids[i].empty()) {
+                rejected_keys.push_back(batch[i]);
+            }
+        }
+        // Recheck under the Local cache lock: ordinary and mixed keys rejected
+        // for pending, writing, or storage-scope reasons must not be touched.
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
+            indexer->TouchEventReportOnlyKeys(rejected_keys);
+        }
+    }
     if (create_age_count == 0) {
         out_create_age_stats.Clear();
         return true;

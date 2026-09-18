@@ -1059,6 +1059,41 @@ public:
         return result;
     }
 
+    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
+                                                KeyType rejected_prefix = 0,
+                                                bool event_report_prefix = false) {
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
+        stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
+        auto &indexer = meta_indexers_by_instance.at(id);
+        indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+        auto backend = std::make_unique<MetaLocalBackend>();
+        auto *local = backend.get();
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+        EXPECT_EQ(EC_OK, local->Init(id, config));
+        EXPECT_EQ(EC_OK, local->Open());
+        for (KeyType key = 1; key <= 32; ++key) {
+            const bool rejected = key <= rejected_prefix;
+            auto location = MakeCacheLocation(
+                "loc",
+                rejected && !event_report_prefix ? CacheLocationStatus::CLS_DELETING : CacheLocationStatus::CLS_SERVING,
+                rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                                : DataStorageType::DATA_STORAGE_TYPE_NFS,
+                "nfs://store/key?size=1");
+            EXPECT_EQ(std::vector<ErrorCode>{EC_OK},
+                      local->Put(nullptr, {key}, {{{"loc", location}}}, PropertyMapVector(1)));
+            EXPECT_TRUE(local->cache_->ApplyToEntryNoTouch(
+                MetaLocalBackend::KeyToView(key),
+                [key](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                    static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(key * 100);
+                    return 0;
+                }));
+        }
+        local->shard_oldest_access_time_[0].store(100);
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        return local;
+    }
+
     std::array<double, 6> GroupLruAgeMetrics() {
         return {cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_min_us_metrics(),
                 cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_max_us_metrics(),
@@ -4412,6 +4447,35 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_TRUE(result.made_progress);
     EXPECT_EQ(1, SubmittedDelRequestCount());
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRounds) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *backend = UseRealLocalReclaimBackend("a", 5, true);
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(1);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{4, 5, 6}), order);
+
+    // The prefix exceeds the entire per-round budget. Only reporter-owned
+    // keys yield, so the next round reaches ordinary cold data without a
+    // persistent scan cursor or a larger scan cap.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, selected.size());
+    EXPECT_EQ(6, selected[0].second);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(7, EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3, 4, 5, 6, 7}, times));
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], (i + 1) * 100);
+    }
+    EXPECT_EQ(600, times[5]);
+    EXPECT_EQ(700, times[6]);
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruDefaultRatioExpandsSamplesWithoutChangingBatch) {

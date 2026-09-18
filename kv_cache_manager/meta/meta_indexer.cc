@@ -1968,6 +1968,10 @@ bool MetaIndexer::PreferSingleTaskReclaimSampling() const noexcept {
     return backend_manager_ && backend_manager_->PreferSingleTaskReclaimSampling();
 }
 
+size_t MetaIndexer::TouchEventReportOnlyKeys(const KeyVector &keys) const noexcept {
+    return backend_manager_ ? backend_manager_->TouchEventReportOnlyKeys(keys) : 0;
+}
+
 ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
                                                const int64_t count,
                                                ReclaimCandidateVector &out_candidates,

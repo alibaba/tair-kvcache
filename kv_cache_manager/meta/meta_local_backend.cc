@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
 
@@ -1544,6 +1545,38 @@ MetaLocalBackend::GetLastAccessTimesForMaintenance(RequestContext * /*request_co
         }
     }
     return results;
+}
+
+size_t MetaLocalBackend::TouchEventReportOnlyKeys(const KeyTypeVec &keys) noexcept {
+    if (!cache_) {
+        return 0;
+    }
+    size_t touched = 0;
+    for (const KeyType key : keys) {
+        touched += cache_->PromoteEntryIf(
+            KeyToView(key),
+            [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) {
+                if (!value) {
+                    return false;
+                }
+                auto *item = static_cast<MetaMemCacheItem *>(value);
+                std::shared_lock lock(item->GetMutex());
+                const auto &locations = item->GetLocations();
+                if (locations.empty() ||
+                    !std::all_of(locations.begin(), locations.end(), [](const auto &entry) {
+                        return entry.second && IsEventReportStorageType(entry.second->type());
+                    })) {
+                    return false;
+                }
+                // This is a maintenance yield, not a business access. Do
+                // not use Lookup/GetProperties or update revisit metrics.
+                // It intentionally also delays Local metadata eviction
+                // for these reporter-only keys in the shared LRU list.
+                item->TouchAccessTime(TimestampUtil::GetCurrentTimeUs());
+                return true;
+            });
+    }
+    return touched;
 }
 
 // return OK to avoid error in MetaIndexer::PersistMetaData()

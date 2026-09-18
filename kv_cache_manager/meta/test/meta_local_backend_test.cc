@@ -1037,6 +1037,82 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesDoesNotTouchLruState) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestReclaimTouchOnlyRefreshesEventReportOnlyKeysWithoutHits) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    auto *backend = GetLocalBackend();
+    ASSERT_EQ(EC_OK, backend->Init("reporter_yield", meta_storage_backend_config_));
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto histogram = std::make_shared<RevisitIntervalHistogram>();
+    ASSERT_TRUE(histogram->Init(registry, {1.0, 10.0}, "reporter_yield"));
+    backend->SetRevisitHistogram(histogram);
+    auto event = std::make_shared<CacheLocation>();
+    event->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    event->set_status(CLS_SERVING);
+    auto ordinary = std::make_shared<CacheLocation>();
+    ordinary->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ordinary->set_status(CLS_DELETING);
+    const KeyVector keys{1, 2, 3, 4, 5};
+    CacheLocationMapVector locations{
+        {{"event", event}}, {{"ordinary", ordinary}}, {{"event", event}, {"ordinary", ordinary}}, {}, {{"bad", nullptr}}};
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              backend->Put(nullptr, keys, locations, PropertyMapVector(keys.size())));
+    for (const KeyType key : keys) {
+        ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+            MetaLocalBackend::KeyToView(key),
+            [key](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(key * 100);
+                return 0;
+            }));
+    }
+    backend->shard_oldest_access_time_[0].store(100);
+    EXPECT_EQ(1, backend->TouchEventReportOnlyKeys({1, 2, 3, 4, 5, 6}));
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, keys, times));
+    EXPECT_GT(times[0], 100);
+    for (size_t i = 1; i < keys.size(); ++i) {
+        EXPECT_EQ(keys[i] * 100, times[i]);
+    }
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 5, order));
+    EXPECT_EQ((KeyVector{2, 3, 4, 5, 1}), order);
+    EXPECT_EQ(200, backend->GetOldestAccessTime());
+    EXPECT_EQ(0, histogram->GetCount());
+
+    // A stale rejection must not touch a key that has since become mixed.
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              backend->Upsert(nullptr, {1}, {{{"ordinary", ordinary}}}, PropertyMapVector(1)));
+    std::vector<int64_t> before, after;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, before));
+    EXPECT_EQ(0, backend->TouchEventReportOnlyKeys({1}));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, after));
+    EXPECT_EQ(before, after);
+    EXPECT_EQ(0, histogram->GetCount());
+    ASSERT_EQ(EC_OK, backend->Close());
+}
+
+TEST_F(MetaLocalBackendTest, TestReclaimTouchRefreshesSingletonShardColdness) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    auto *backend = GetLocalBackend();
+    ASSERT_EQ(EC_OK, backend->Init("singleton_reporter", meta_storage_backend_config_));
+    auto event = std::make_shared<CacheLocation>();
+    event->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->Put(nullptr, {1}, {{{"event", event}}}, PropertyMapVector(1)));
+    ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+        MetaLocalBackend::KeyToView(1),
+        [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+            static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(100);
+            return 0;
+        }));
+    backend->shard_oldest_access_time_[0].store(100);
+    EXPECT_EQ(1, backend->TouchEventReportOnlyKeys({1}));
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, times));
+    EXPECT_GT(times[0], 100);
+    EXPECT_EQ(times[0], backend->GetOldestAccessTime());
+    ASSERT_EQ(EC_OK, backend->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestReclaimSampleRestartsAtColdestAfterPartialDeletion) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("coldest_first", meta_storage_backend_config_));

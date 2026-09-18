@@ -184,6 +184,7 @@ public:
                                       bool require_read_success = false) const noexcept;
     // A complete local sampling source does not need parallel I/O fragments.
     bool PreferSingleTaskReclaimSampling() const noexcept;
+    size_t TouchEventReportOnlyKeys(const KeyVector &keys) const noexcept;
 
     // Reuses the same bounded executor for CPU-only query projection/reduction.
     // Directly constructed test/indexer instances without an executor retain
