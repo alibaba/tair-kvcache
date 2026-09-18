@@ -38,6 +38,7 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/event_report_cleanup_util.h"
 #include "kv_cache_manager/manager/hash_util.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
@@ -429,6 +430,17 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
     }
 }
 
+ErrorCode RejectLegacyKvMetaNamespace(RequestContext *request_context, const std::string &instance_id) {
+    if (!HasKvMetaReservedInstancePrefix(instance_id)) {
+        return EC_OK;
+    }
+    if (request_context && request_context->error_tracer()) {
+        request_context->error_tracer()->AddErrorMsg(
+            "reserved KVMeta instances are accessible only through KvMetaService");
+    }
+    return EC_BADARGS;
+}
+
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -640,6 +652,9 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                                        const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return ec;
+    }
 
     // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
     // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
@@ -730,6 +745,9 @@ std::pair<ErrorCode, InstanceInfoConstPtr> CacheManager::GetInstanceInfo(Request
                                                                          const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return {ec, nullptr};
+    }
     InstanceInfoConstPtr info_ptr = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (info_ptr == nullptr) {
         PREFIX_LOG(DEBUG, "get instance info failed");
@@ -1361,6 +1379,9 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return ec;
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     WriteLocationManager::WriteLocationInfo location_info;
     if (write_location_info_internal != nullptr) {
@@ -1498,6 +1519,9 @@ ErrorCode CacheManager::RemoveCache(RequestContext *request_context,
                                     const BlockMask &block_mask /*TODO*/) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return ec;
+    }
     assert(schedule_plan_executor_);
     if (keys.empty() && tokens.empty()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "remove cache failed: empty input");
@@ -1523,6 +1547,9 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
                                   std::int32_t end_ts) const noexcept {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return ec;
+    }
 
     if (trim_strategy != proto::meta::TS_REMOVE_ALL_CACHE) {
         PREFIX_LOG(WARN, "trim strategy not implemented");
@@ -1589,6 +1616,12 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     // 薄 facade：只做前置校验（依赖、instance、target storage 和 migration strategy），
     // 迁移编排（候选/meta/admission/dispatch/计数）下沉 MigrationManager::MigrateCache。
     MigrateCacheResult result;
+
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        result.ec = ec;
+        result.message = "reserved KVMeta instances are not valid legacy migration targets";
+        return result;
+    }
 
     if (migration_manager_ == nullptr || meta_indexer_manager_ == nullptr) {
         result.ec = EC_ERROR;
@@ -2676,6 +2709,12 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     const std::string &instance_id = request->instance_id();
     const std::string &host_ip_port = request->host_ip_port();
     auto *response_status = response->mutable_header()->mutable_status();
+
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("reserved KVMeta instances are accessible only through KvMetaService");
+        return ec;
+    }
 
     ReporterIdentityView reporter_identity;
     if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port) ||
@@ -4216,6 +4255,9 @@ std::pair<ErrorCode, MetaSearcher *> CacheManager::CheckInputAndGetMetaSearcher(
                                                                                 const TokenIdsVector &tokens) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return {ec, nullptr};
+    }
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         PREFIX_LOG(WARN, "meta searcher not found");
@@ -4234,6 +4276,9 @@ std::pair<ErrorCode, int64_t> CacheManager::GetBlockSize(RequestContext *request
                                                          const std::string &instance_id) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return {ec, 0};
+    }
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (!instance_info) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_INSTANCE_NOT_EXIST, int64_t, "instance not found");
@@ -4338,6 +4383,7 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
 }
 
 ErrorCode CacheManager::DoRecoverOnce() {
+    recover_complete_.store(false, std::memory_order_release);
     ActivateEventCleanupCallbacks();
     if (!registry_manager_) {
         KVCM_LOG_ERROR("CacheManager do recover failed, registry_manager is nullptr");
@@ -4391,7 +4437,11 @@ ErrorCode CacheManager::DoRecoverOnce() {
     }
 
     KVCM_LOG_INFO("CacheManager do recover once done, error_count[%lu]", error_count);
-    return error_count > 0 ? EC_ERROR : EC_OK;
+    if (error_count != 0) {
+        return EC_ERROR;
+    }
+    recover_complete_.store(true, std::memory_order_release);
+    return EC_OK;
 }
 
 ErrorCode CacheManager::DoRecover() {
@@ -4463,6 +4513,7 @@ void CacheManager::ActivateEventCleanupCallbacks() {
 }
 
 ErrorCode CacheManager::DoCleanup() {
+    recover_complete_.store(false, std::memory_order_release);
     if (cache_garbage_collector_) {
         cache_garbage_collector_->Stop();
     }
@@ -4755,6 +4806,9 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 size_t p2p_host_count) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
+        return {ec, {}};
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);

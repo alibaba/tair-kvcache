@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string_view>
 
 #include "kv_cache_manager/client/include/kv_meta_transfer_client.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
@@ -20,6 +21,10 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
                                                    const std::string *expected_instance_id = nullptr,
                                                    std::int32_t write_timeout_seconds = 0,
                                                    std::uint32_t metadata_call_timeout_ms = 0);
+
+// Rejects URI text whose meaning would change when StandardUri canonicalizes
+// its query map. Shared by both exact-object client layers before data I/O.
+bool HasUnambiguousKvMetaUriText(std::string_view uri_text);
 
 class KvMetaTransferClientImpl final : public KvMetaTransferClient {
 public:

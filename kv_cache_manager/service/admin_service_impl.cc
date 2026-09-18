@@ -22,6 +22,7 @@
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
@@ -82,6 +83,18 @@ kv_cache_manager::RequestContext::JsonFragment BuildProtoMessageDebugJson(const 
 namespace {
 kv_cache_manager::proto::admin::ErrorCode ToAdminPbError(kv_cache_manager::ErrorCode ec) {
     return kv_cache_manager::ToPbError<kv_cache_manager::proto::admin::ErrorCode>(ec);
+}
+
+bool RejectReservedKvMetaInstance(kv_cache_manager::RequestContext *request_context,
+                                  const std::string &instance_id,
+                                  kv_cache_manager::proto::admin::Status *status) {
+    if (!kv_cache_manager::HasKvMetaReservedInstancePrefix(instance_id)) {
+        return false;
+    }
+    status->set_code(kv_cache_manager::proto::admin::INVALID_ARGUMENT);
+    status->set_message("reserved KVMeta instances are accessible only through KvMetaService");
+    request_context->set_status_code(status->code());
+    return true;
 }
 
 bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::RegistryManager> &registry_manager,
@@ -482,6 +495,9 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
     API_CALL_GUARD("GetCacheMeta", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("GetCacheMeta", "instance_id", true);
@@ -534,6 +550,9 @@ void AdminServiceImpl::RemoveCache(RequestContext *request_context,
     API_CALL_GUARD("RemoveCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveCache", "instance_id", true);
@@ -570,6 +589,9 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
     API_CALL_GUARD("MigrateCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
 
     if (request->instance_id().empty()) {
@@ -627,6 +649,9 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
     API_CALL_GUARD("RegisterInstance", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_group().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RegisterInstance", "instance_group", true);
@@ -703,6 +728,9 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     API_CALL_GUARD("RemoveInstance", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstance", "instance_id", true);
@@ -738,6 +766,9 @@ void AdminServiceImpl::GetInstanceInfo(RequestContext *request_context,
     API_CALL_GUARD("GetInstanceInfo", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
+        return;
+    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("GetInstanceInfo", "instance_id", true);
@@ -780,6 +811,9 @@ void AdminServiceImpl::ListInstanceInfo(RequestContext *request_context,
         status->set_code(proto::admin::OK);
         request_context->set_status_code(status->code());
         for (const auto &instance_info : list_instance_info_res) {
+            if (!instance_info || HasKvMetaReservedInstancePrefix(instance_info->instance_id())) {
+                continue;
+            }
             auto *instance_info_config = response->add_instance_info();
             ProtoConvert::InstanceInfoToProto(*instance_info, instance_info_config);
         }

@@ -56,6 +56,8 @@ ClientErrorCode ToClientError(proto::kv_meta::ErrorCode error) {
         return ER_SERVICE_SIZE_MISMATCH;
     case proto::kv_meta::IO_ERROR:
         return ER_SERVICE_IO_ERROR;
+    case proto::kv_meta::OUTCOME_UNKNOWN:
+        return ER_SERVICE_OUTCOME_UNKNOWN;
     case proto::kv_meta::UNSPECIFIED:
     case proto::kv_meta::UNKNOWN_ERROR:
     case proto::kv_meta::ERROR_MAX:

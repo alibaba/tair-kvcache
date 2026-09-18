@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -97,6 +98,9 @@ private:
     std::unique_ptr<LockFreeThreadPool> wait_task_thread_pool_;
     // storage unique name -> storage_sdk
     std::map<std::string, std::shared_ptr<SdkInterface>> sdk_map_;
+    // Mirrors sdk_map_ so the KVMeta preflight can verify that an untrusted
+    // URI scheme cannot select a backend solely by reusing its hostname.
+    std::map<std::string, DataStorageType> sdk_storage_types_;
     int owned_shm_fd_{-1};
     bool variable_object_size_enabled_{false};
     std::uint64_t max_variable_object_bytes_{0};

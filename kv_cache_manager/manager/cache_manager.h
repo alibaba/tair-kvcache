@@ -104,6 +104,7 @@ public:
               CacheReclaimerGroupLruConfig group_lru_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
+    [[nodiscard]] bool IsRecoverComplete() const noexcept { return recover_complete_.load(std::memory_order_acquire); }
     void StartRecoverRetryLoop();
     void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
@@ -433,6 +434,11 @@ private:
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
+    // DoRecover historically returns EC_OK after handing a partial failure to
+    // its retry thread. Optional subsystems that depend on recreated indexers
+    // use this separate completion signal instead of changing that main-path
+    // contract.
+    std::atomic<bool> recover_complete_{false};
 };
 
 } // namespace kv_cache_manager

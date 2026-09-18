@@ -52,7 +52,7 @@ class KvMetaObjectClientWheelTest(unittest.TestCase):
         ).decode("utf-8")
 
         self.assertIn("KV_META_OBJECT_API_VERSION", package_source)
-        self.assertIn("KV_META_OBJECT_API_VERSION = 1", wrapper_source)
+        self.assertIn("KV_META_OBJECT_API_VERSION = 2", wrapper_source)
 
 
 if __name__ == "__main__":

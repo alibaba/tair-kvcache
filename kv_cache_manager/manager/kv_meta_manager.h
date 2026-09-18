@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -56,6 +57,10 @@ public:
 
     struct StartWriteResult {
         std::string write_session_id;
+        // Exact compact-session cardinality recorded only after the session
+        // is published. This is internal rollback metadata and is never sent
+        // on the wire.
+        std::size_t session_item_count = 0;
         // Request-aligned. true means the caller must not write this key.
         std::vector<bool> key_mask;
         // Only entries whose key_mask is false, in request-relative order.
@@ -174,9 +179,14 @@ private:
     std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
     mutable std::mutex registration_mutex_;
-    // Serializes exact-byte admission and bounded Trim within a KVMeta group.
-    // The existing cache path never takes these side-path-only locks.
+    // Serializes exact-byte admission and short metadata transitions within a
+    // KVMeta group. Long Trim scans publish a per-instance marker under this
+    // shard and then release it, so unrelated instances never wait behind
+    // unbounded scan or storage I/O. The existing cache path never takes
+    // these side-path-only locks.
     mutable std::array<std::mutex, 64> quota_admission_mutexes_;
+    // Each set is accessed only while holding the matching shard above.
+    std::array<std::unordered_set<std::string>, 64> trimming_instances_;
     std::atomic<bool> maintenance_cancelled_{false};
     std::atomic<bool> initialized_{false};
 };

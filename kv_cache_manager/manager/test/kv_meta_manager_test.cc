@@ -185,6 +185,54 @@ private:
     bool release_delete_{false};
 };
 
+class BlockingThenFailDeleteNfsBackend : public NfsBackend {
+public:
+    explicit BlockingThenFailDeleteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
+        bool fail = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ++delete_attempts_;
+            fail = delete_attempts_ > 1;
+            if (!fail) {
+                first_delete_entered_ = true;
+                condition_.notify_all();
+                condition_.wait(lock, [&]() { return release_first_delete_; });
+            }
+        }
+        if (cb) {
+            cb();
+        }
+        return std::vector<ErrorCode>(storage_uris.size(), fail ? EC_IO_ERROR : EC_OK);
+    }
+
+    bool WaitForFirstDelete(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [&]() { return first_delete_entered_; });
+    }
+
+    void ReleaseFirstDelete() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_first_delete_ = true;
+        condition_.notify_all();
+    }
+
+    std::size_t DeleteAttempts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return delete_attempts_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    bool first_delete_entered_{false};
+    bool release_first_delete_{false};
+    std::size_t delete_attempts_{0};
+};
+
 class FaultingDeleteNfsBackend : public NfsBackend {
 public:
     enum class Mode {
@@ -488,6 +536,7 @@ TEST_F(KvMetaManagerTest, DynamicSizesAreIndependentAndInvisibleUntilFinish) {
     ASSERT_EQ((std::vector<bool>{false, false}), start.key_mask);
     ASSERT_EQ(2, start.locations.size());
     ASSERT_FALSE(start.write_session_id.empty());
+    EXPECT_EQ(2, start.session_item_count);
     EXPECT_EQ(17, start.locations[0].value_size);
     EXPECT_EQ(33, start.locations[1].value_size);
     ASSERT_EQ(1, start.locations[0].specs.size());
@@ -914,6 +963,70 @@ TEST_F(KvMetaManagerTest, TrimWaitBarrierIncludesSessionFinalization) {
     EXPECT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
 }
 
+TEST_F(KvMetaManagerTest, TrimFenceDoesNotHoldTheGroupShardAcrossStorageIo) {
+    constexpr const char *kPeerInstance = "trim-peer-instance";
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, "default", kPeerInstance, "peer").first);
+    CommitObject(kInstanceId, "trim-slow-delete", 17);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto blocking = std::make_shared<BlockingDeleteNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, blocking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = blocking;
+    }
+
+    auto trim = std::async(std::launch::async, [&]() {
+        RequestContext context("slow-trim");
+        return manager_->TrimAll(&context, kInstanceId, false);
+    });
+    ASSERT_TRUE(blocking->WaitForDelete(std::chrono::seconds(2)));
+
+    auto same_instance_write = std::async(std::launch::async, [&]() {
+        RequestContext context("write-during-same-instance-trim");
+        return manager_->StartWrite(&context, kInstanceId, {"must-be-fenced"}, {19}, 30).first;
+    });
+    auto duplicate_trim = std::async(std::launch::async, [&]() {
+        RequestContext context("duplicate-trim");
+        return manager_->TrimAll(&context, kInstanceId, false);
+    });
+    auto same_instance_remove = std::async(std::launch::async, [&]() {
+        RequestContext context("remove-during-same-instance-trim");
+        return manager_->Remove(&context, kInstanceId, {"must-be-fenced"});
+    });
+    auto peer_write = std::async(std::launch::async, [&]() {
+        RequestContext context("peer-write-during-trim");
+        return manager_->StartWrite(&context, kPeerInstance, {"peer-value"}, {23}, 30);
+    });
+
+    const auto same_status = same_instance_write.wait_for(std::chrono::seconds(1));
+    const auto duplicate_status = duplicate_trim.wait_for(std::chrono::seconds(1));
+    const auto remove_status = same_instance_remove.wait_for(std::chrono::seconds(1));
+    const auto peer_status = peer_write.wait_for(std::chrono::seconds(1));
+    blocking->ReleaseDelete();
+
+    ASSERT_EQ(std::future_status::ready, same_status);
+    EXPECT_EQ(EC_EXIST, same_instance_write.get());
+    ASSERT_EQ(std::future_status::ready, duplicate_status);
+    EXPECT_EQ(EC_EXIST, duplicate_trim.get());
+    ASSERT_EQ(std::future_status::ready, remove_status);
+    EXPECT_EQ(EC_EXIST, same_instance_remove.get());
+    ASSERT_EQ(std::future_status::ready, peer_status);
+    auto [peer_ec, peer_start] = peer_write.get();
+    ASSERT_EQ(EC_OK, peer_ec);
+    ASSERT_FALSE(peer_start.write_session_id.empty());
+
+    EXPECT_EQ(EC_OK, trim.get());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kPeerInstance, peer_start.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
 TEST_F(KvMetaManagerTest, RemoveDoesNotInvalidateAnActiveWriteSession) {
     auto [committed_start_ec, committed_start] =
         manager_->StartWrite(&request_context_, kInstanceId, {"committed-remove-guard"}, {13}, 30);
@@ -1146,6 +1259,86 @@ TEST_F(KvMetaManagerTest, RollbackRejectsMalformedPhysicalDeleteResult) {
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, PartialCommitWithIncompleteRollbackReturnsUnknownOutcome) {
+    constexpr const char *kFirstKey = "partial-commit-first";
+    constexpr const char *kSecondKey = "partial-commit-second";
+    auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {kFirstKey, kSecondKey}, {17, 23}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    const auto second_key = KvMetaManager::InternalKey(kSecondKey);
+    const auto delete_result = indexer->Delete(&request_context_, {second_key});
+    ASSERT_EQ(EC_OK, delete_result.ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_result.error_codes);
+    ASSERT_TRUE(indexer->Sync({second_key}));
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto failing =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    ASSERT_EQ(EC_OK, failing->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = failing;
+    }
+
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN,
+              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
+    EXPECT_GE(failing->DeleteAttempts(), 1);
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kFirstKey, kSecondKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(2, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_FALSE(values[1].found);
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ExpiredFinishPreservesTimeoutWhenCleanupFails) {
+    auto [blocker_ec, blocker] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"expired-cleanup-blocker"}, {11}, 1);
+    ASSERT_EQ(EC_OK, blocker_ec);
+    auto [target_ec, target] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"expired-cleanup-failure"}, {19}, 2);
+    ASSERT_EQ(EC_OK, target_ec);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto blocking = std::make_shared<BlockingThenFailDeleteNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, blocking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = blocking;
+    }
+    ASSERT_TRUE(blocking->WaitForFirstDelete(std::chrono::seconds(3)));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    auto finish = std::async(std::launch::async, [&]() {
+        RequestContext context("expired-finish-with-cleanup-failure");
+        return manager_->FinishWrite(&context, kInstanceId, target.write_session_id, {true});
+    });
+    EXPECT_EQ(std::future_status::timeout, finish.wait_for(std::chrono::milliseconds(100)));
+    blocking->ReleaseFirstDelete();
+    EXPECT_EQ(EC_TIMEOUT, finish.get());
+    EXPECT_EQ(2, blocking->DeleteAttempts());
+    EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&request_context_, kInstanceId, blocker.write_session_id, {true}));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;

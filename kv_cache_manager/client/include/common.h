@@ -46,6 +46,7 @@ enum [[nodiscard]] ClientErrorCode : int32_t {
     ER_SERVICE_SESSION_NOT_FOUND = 62,
     ER_SERVICE_SIZE_MISMATCH = 63,
     ER_SERVICE_IO_ERROR = 64,
+    ER_SERVICE_OUTCOME_UNKNOWN = 65,
 
     // sdk
     ER_SDK_TIMEOUT = 100,

@@ -35,6 +35,7 @@ public:
     void set_remove_transport_error(bool value) { remove_transport_error_.store(value); }
     void set_trim_transport_error(bool value) { trim_transport_error_.store(value); }
     void set_get_delay(std::chrono::milliseconds value) { get_delay_ms_.store(value.count()); }
+    void set_put_finish_status(proto::kv_meta::ErrorCode value) { put_finish_status_.store(static_cast<int>(value)); }
 
     grpc::Status RegisterInstance(grpc::ServerContext *,
                                   const proto::kv_meta::RegisterInstanceRequest *request,
@@ -156,6 +157,8 @@ public:
         if (!SetReadyStatus(response)) {
             return grpc::Status::OK;
         }
+        response->mutable_header()->mutable_status()->set_code(
+            static_cast<proto::kv_meta::ErrorCode>(put_finish_status_.load()));
         std::lock_guard<std::mutex> lock(mutex_);
         last_finish_successes.assign(request->success_keys().values().begin(), request->success_keys().values().end());
         return grpc::Status::OK;
@@ -234,6 +237,7 @@ private:
     std::atomic<bool> remove_transport_error_{false};
     std::atomic<bool> trim_transport_error_{false};
     std::atomic<std::int64_t> get_delay_ms_{0};
+    std::atomic<int> put_finish_status_{static_cast<int>(proto::kv_meta::OK)};
     mutable std::mutex mutex_;
     std::vector<std::uint64_t> last_start_sizes;
     std::vector<bool> last_finish_successes;
@@ -436,6 +440,22 @@ TEST(KvMetaClientTest, AmbiguousWriteTransportErrorsAreNotRetried) {
     EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->TrimAll("trace-trim"));
     EXPECT_EQ(1, ambiguous.trim_calls.load());
     EXPECT_EQ(0, fallback.trim_calls.load());
+}
+
+TEST(KvMetaClientTest, ExplicitUnknownMutationOutcomeIsNotRetried) {
+    FakeKvMetaService uncertain;
+    uncertain.set_put_finish_status(proto::kv_meta::OUTCOME_UNKNOWN);
+    FakeKvMetaService fallback;
+    RunningServer uncertain_server(&uncertain);
+    RunningServer fallback_server(&fallback);
+    ASSERT_TRUE(uncertain_server.valid());
+    ASSERT_TRUE(fallback_server.valid());
+
+    auto client = KvMetaClient::Create({{uncertain_server.address(), fallback_server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->FinishWrite("trace-finish", "uncertain-session", {true}));
+    EXPECT_EQ(1, uncertain.put_finish_calls.load());
+    EXPECT_EQ(0, fallback.put_finish_calls.load());
 }
 
 TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {

@@ -169,6 +169,9 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 ### 4.2 元数据与容量隔离
 
 - 公共 `instance_id` 会编码为保留的 KVMeta 内部 instance id，并携带完整 schema marker；
+- 整个 `__kv_meta_v1__` 前缀都由 KVMeta 保留。旧 Meta/Admin handler 和 CacheManager 旧接口在读取、写入、删除、
+  Trim、Migration 或事件任务入队前拒绝该 namespace；Admin instance 列表过滤内部实例，避免绕过 KVMeta 的事务和
+  回收不变量；
 - KVMeta instance 必须放入专用 Instance Group。注册时若 group 已含普通 instance，服务端拒绝；
 - 如果之后通过普通接口向该 group 混入 KV cache instance，新的 KVMeta byte admission 会 fail closed；
 - 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
@@ -185,8 +188,9 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 
 ### 4.4 Leader 生命周期隔离
 
-升主时先完成 Registry/CacheManager 的既有恢复、启动 GC/Migration 并开放主服务，再在独立线程恢复 KVMeta。
-恢复成功且 session worker、KVMeta Reclaimer 启动后才开放 KVMeta 请求门。KVMeta 恢复失败不会阻止主服务可用。
+升主时先启动 Registry/CacheManager 的既有恢复、启动 GC/Migration 并开放主服务，再在独立线程等待
+CacheManager 的显式恢复完成信号后恢复 KVMeta（`DoRecover` 的返回只表示恢复已启动时也不会提前扫描）。恢复成功
+且 session worker、KVMeta Reclaimer 启动后才开放 KVMeta 请求门。KVMeta 恢复失败不会阻止主服务可用。
 
 降主或 Stop 时先关闭 KVMeta 请求门、session/Reclaimer 准入并取消 Trim，然后按既有顺序排空主服务请求、停止
 主 GC 和 Migration，最后 join KVMeta recovery/session/Reclaimer worker。内存 session 被丢弃而不是在主清理
@@ -297,7 +301,8 @@ sequenceDiagram
 - 任一 key 已 active 时整批返回 `WRITE_IN_PROGRESS`；已 committed 但尺寸不同则返回 `SIZE_MISMATCH`；
 - object client 会额外用 `Get` 确认 masked hit 已可读，以兼容已经具备 V1 字段、但仍保留早期 active-mask
   行为的滚动升级版本；这不表示缺少 V1 新字段的原始 proto 实现可以混用；
-- 数据写入返回的实际 URI 必须与服务端给出的 URI 完全一致，否则整批回滚；
+- 数据写入返回的实际 URI 必须与服务端给出的 URI 语义一致（允许 query 参数重排）；URI
+  无法解析、参数重复或任一 canonical component 改变都会整批回滚；
 - `PutFinish.success_keys` 与紧凑 `locations` 对齐。任一 `false` 会回滚本 session 的全部新对象；
 - commit/rollback 逐 key 执行并带失败补偿，不承诺多 key 同时可见。
 
@@ -318,7 +323,10 @@ Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另�
 - `Trim(TS_REMOVE_ALL_CACHE)` 删除 metadata 和可归属的物理对象；
 - `Trim(TS_REMOVE_ALL_META)` 只删 metadata，物理数据保留，仅用于明确的修复场景；
 - `TS_TIMESTAMP` 在 V1 中不支持；
-- 存在 active/finalizing session 或 pending automatic reclaim 时，Trim 整体返回 `WRITE_IN_PROGRESS`。
+- 存在 active/finalizing session 或 pending automatic reclaim 时，Trim 整体返回 `WRITE_IN_PROGRESS`；
+- Trim 在 group shard 下发布 per-instance fence 后立即释放 shard，长时间 metadata scan 和物理 Delete
+  不阻塞同 group 的其他 instance。同 instance 的新 `PutStart`/`Remove`/重复 Trim 会在 fence 活跃期间
+  fail closed，Reclaimer 也不会退休该 group 的新对象。
 
 ### 6.5 自动 LRU 回收
 
@@ -366,6 +374,8 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
 - `value_sizes[i] == URI.size == sum(buffer[i].iovs[*].size)`；
 - IOV 非空、非零、不 ignored，地址非空，memory type 只能是 CPU/GPU；
 - URI 合法、hostname 已注册、backend scheme 与 metadata type 一致；
+- 原始 URI 不含 fragment 或重复/空 query key，避免 parser 静默覆盖 `size`、`blkid` 等安全字段；
+- 可打包文件型 backend 的 `blkid` 缺失或严格解析为 `0`，不允许独立 transfer 调用方伪造共享 allocation 偏移；
 - 整个 batch 在任何数据 I/O 前完成校验。
 
 `MemoryType::GPU` 还要求实际 client/backend 以 CUDA 或 MUSA 能力构建。以开源 `LocalFileSdk` 为例，CPU-only
@@ -407,9 +417,10 @@ session timeout 和 `PutFinish` finalization 同样计为 in-flight。Trim 不�
 
 ### 8.3 Reclaimer 并发与配额语义
 
-Reclaimer 与 `PutStart`、`PutFinish`、`Remove`、`Trim` 共用 KVMeta 专用 group shard，因此重新检查水位、退休
-metadata 和建立 pending marker 之间没有 admission 窗口；普通 KVCache 不获取该锁。候选采样在锁外执行，进入
-锁后会重新读取实际 usage，并用 exact-value CAS 防止淘汰已变化的对象。
+Reclaimer 与 `PutStart`、`PutFinish`、`Remove`、`Trim` 的短 metadata transition 共用 KVMeta 专用 group
+shard，因此重新检查水位、退休 metadata 和建立 pending/Trim marker 之间没有 admission 窗口；
+普通 KVCache 不获取该锁。候选采样和 Trim 长扫描/物理 I/O 都在锁外执行，Reclaimer 进入锁后会
+重新读取实际 usage、检查 Trim marker，并用 exact-value CAS 防止淘汰已变化的对象。
 
 退休对象在物理删除前仍计入 MetaIndexer usage；Reclaimer 单独维护 pending credit，只用于判断下一轮还需淘汰多少，
 不会改变 `PutStart` 的硬容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
@@ -485,7 +496,8 @@ exact-object worker 使用非阻塞入队，因此 `sdk_config.queue_size` 必�
 - `Get`、`GetInstanceInfo` 和同配置的幂等 `RegisterInstance` 遇到 transport error 可以尝试下一地址；
 - 所有 RPC 收到服务端明确的 not-leader/not-ready 响应时可以 failover；
 - `PutStart`、`PutFinish`、`Remove`、`Trim` 遇到 transport error 时不自动重放，因为无法判断服务端是否执行；
-- C++ client 用 `ER_INVALID_GRPCSTATUS` 表示这类不确定结果。调用方必须查询或审计，不能盲目重试 mutation。
+- C++ client 用 `ER_INVALID_GRPCSTATUS` 表示 transport 不确定结果；服务端完成部分 mutation 但回滚/对账无法证明
+  唯一最终状态时返回 `ER_SERVICE_OUTCOME_UNKNOWN`。两者都要求调用方查询或审计，不能盲目重试 mutation。
 
 未提交 active allocation 最终由 session timeout 或下一任 leader 的 recovery 清理。
 

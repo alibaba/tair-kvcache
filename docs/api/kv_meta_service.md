@@ -19,7 +19,9 @@ dtype 等业务信息。推荐调用方使用 `KvMetaObjectClient`，由它组�
    `kvcm.service.rpc_port`，按不同的 protobuf service 全名路由；
 2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
-4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status。
+4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status；
+5. 公共 `instance_id` 只能通过本 service 使用。编码后的 `__kv_meta_v1__...` 前缀属于服务端保留 namespace；旧
+   Meta/Admin API 会返回 `INVALID_ARGUMENT`，Admin 列表也不会暴露这些内部实例。
 
 升级说明：遗留的 `kvcm.kv_meta.rpc_port=0` 仅作为无副作用的禁用配置兼容；任何非零旧端口都会使配置解析
 失败，避免服务端切换到主端口后客户端仍误连旧端口。启用时必须同时迁移为
@@ -197,6 +199,7 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 | `SIZE_MISMATCH` | 已有对象或 location 尺寸不一致 | 使用新 key，或先确认并删除旧对象 |
 | `NOT_FOUND` | 对象/instance 元数据不存在 | 按业务 miss 处理 |
 | `IO_ERROR` | metadata/storage 操作失败或超时 | 根据操作幂等性判断，避免盲目重放 mutation |
+| `OUTCOME_UNKNOWN` | mutation 后的回滚/对账无法证明唯一最终状态 | 查询最终状态；不得盲目重试 mutation |
 | `INTERNAL_ERROR` / `UNKNOWN_ERROR` | 服务端不变量或未知错误 | 记录 trace/request id 并排查 |
 
 ## 7. Failover 与 transport error
@@ -228,6 +231,10 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 数据面保护 caller-owned buffer，可能在名义 timeout 后等待不可取消 I/O 结束。调用方必须在同步方法返回前保持
 buffer 和其 owner 存活。
 
+C++ 调用方可显式调用幂等的 `KvMetaObjectClient::Close()`；它会拒绝新请求、等待本 client 已准入的同步操作结束，
+再释放 metadata/data-plane 资源。之后的合法操作返回 `ER_CLIENT_NOT_EXISTS`。Python `close()` 和 context manager
+会调用同一 native 清理入口。
+
 该 drain 只保护本地 buffer 生命周期，不会续约服务端 V1 write session。所选 backend 必须保证在 write lease
 到期前停止访问 remote allocation，或将 lease 配置为覆盖经过验证的最坏 I/O drain；否则 expiry 可能与越过
 provider timeout 的旧 Put 竞争。可续约/fenced I/O 是设计文档第 13 节的 V2 能力，不是现有保证。
@@ -256,7 +263,7 @@ client.close()
 可能具有不确定结果。异常 `KvMetaObjectClientError` 会给出 batch 位置、已确认完成数量及
 `unknown_outcome`，由拥有 key 生命周期的上层决定审计或清理策略。
 
-wheel 的 package 与 native extension 同时导出 `KV_META_OBJECT_API_VERSION=1`，extension 的值来自所链接 client
+wheel 的 package 与 native extension 同时导出 `KV_META_OBJECT_API_VERSION=2`，extension 的值来自所链接 client
 shared library 的版本查询。高层 client 在 native client 初始化前校验版本、必需类型、枚举成员和工厂方法；版本缺失
 或不匹配直接失败，避免 Python wrapper、extension 与 client library 混装。
 native mutation 若返回未知/畸形 code，也按 `unknown_outcome=True` 失败关闭，不能把它解释成可安全重试的明确拒绝。

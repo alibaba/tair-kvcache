@@ -1,6 +1,9 @@
 #pragma once
 
+#include <condition_variable>
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,8 +29,24 @@ public:
                                 const std::vector<std::uint64_t> &expected_value_sizes,
                                 const BlockBuffers &object_buffers) override;
     ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override;
+    void Close() noexcept override;
 
 private:
+    class OperationGuard {
+    public:
+        OperationGuard(KvMetaObjectClientImpl *owner, bool require_transfer);
+        ~OperationGuard() noexcept;
+
+        OperationGuard(const OperationGuard &) = delete;
+        OperationGuard &operator=(const OperationGuard &) = delete;
+
+        [[nodiscard]] bool admitted() const noexcept { return admitted_; }
+
+    private:
+        KvMetaObjectClientImpl *owner_{nullptr};
+        bool admitted_{false};
+    };
+
     static ClientErrorCode ValidateRequest(const std::vector<std::string> &keys,
                                            const std::vector<std::uint64_t> &value_sizes,
                                            const BlockBuffers &object_buffers,
@@ -39,11 +58,18 @@ private:
                                const std::string &write_session_id,
                                std::size_t location_count,
                                ClientErrorCode original_error);
+    [[nodiscard]] bool TryBeginOperation(bool require_transfer);
+    void EndOperation() noexcept;
 
     std::unique_ptr<KvMetaClient> metadata_client_;
     std::unique_ptr<KvMetaTransferClient> transfer_client_;
     std::uint64_t max_object_bytes_{0};
     std::int32_t write_timeout_seconds_{0};
+    std::mutex mutex_;
+    std::condition_variable lifecycle_condition_;
+    std::size_t active_operations_{0};
+    bool closing_{false};
+    bool closed_{false};
 };
 
 } // namespace kv_cache_manager
