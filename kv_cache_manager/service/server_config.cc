@@ -380,13 +380,13 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_group_lru_min_sampling_ratio_ = 10;
     cache_reclaimer_group_lru_max_delete_requests_per_round_ = 128;
     cache_gc_enabled_ = true;
-    cache_gc_scan_interval_ms_ = 1000;
-    cache_gc_round_pause_ms_ = 2LL * 60 * 60 * 1000;
+    cache_gc_scan_interval_ms_ = 100;
+    cache_gc_round_pause_ms_ = 5LL * 60 * 1000;
     cache_gc_scan_batch_size_ = 256;
     cache_gc_orphan_writing_grace_period_ms_ = 24LL * 60 * 60 * 1000;
-    cache_gc_max_inflight_delete_requests_ = 2;
+    cache_gc_max_inflight_delete_requests_ = 64;
     cache_gc_event_report_cleanup_enabled_ = true;
-    cache_gc_event_report_action_batch_size_ = 32;
+    cache_gc_event_report_action_batch_size_ = 256;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {

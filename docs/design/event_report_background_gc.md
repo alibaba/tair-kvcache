@@ -60,7 +60,7 @@ GC regular round
 6. EventReport action budget 按唯一 Block key 计数；一个已准入 key 可以批量携带多个 EventReport Location。
 7. 每个 active Instance 每次只推进一个 cursor batch，按 Instance round-robin，避免大 Instance 独占 active round。
 8. action 在 Executor worker 中重新校验 Backend/token 并执行 no-touch expected-value RMW；失败由后续周期扫描重新发现。
-9. 默认 full-round cooldown 为 2 小时；配置在启动时读取，不实现热更新。
+9. 默认 full-round cooldown 为 5 分钟；配置在启动时读取，不实现热更新。
 
 ### 2.2 V1 非目标
 
@@ -92,7 +92,7 @@ GC regular round
 当前 round 剩余时间 + round_pause_ms + 下一 round 扫描到目标的时间
 ```
 
-默认 `round_pause_ms=2h`。持续 Backend/metadata 错误、inflight 窗口长期占满，以及 dual-backend 中已从内存淘汰的冷 key 不在有限收敛保证内。若未来需要独立的小时级或分钟级 SLO，可增加无 intent 的独立 Candidate Source/cadence，但不恢复 per-event full scan。
+默认 `round_pause_ms=5min`。持续 Backend/metadata 错误、inflight 窗口长期占满，以及 dual-backend 中已从内存淘汰的冷 key 不在有限收敛保证内。若未来需要更严格的收敛 SLO，可增加无 intent 的独立 Candidate Source/cadence，但不恢复 per-event full scan。
 
 ## 3. 架构与职责
 
@@ -179,7 +179,7 @@ V1 要求同一 InstanceGroup 内，每个 EventReport storage type 最多有一
 - `SchedulePlanExecutor` 的 worker；
 - Future 终态释放流程。
 
-这是 GC 调用方级的有界反压，不是 Executor 全局限流。即使 GC 只保留默认 2 个在途任务，Reclaimer、Migration 等其他调用方仍按现有 Executor 语义提交。V1 不修改公共队列容量、任务类别配额或全局 admission。
+这是 GC 调用方级的有界反压，不是 Executor 全局限流。即使 GC 只保留默认 64 个在途任务，Reclaimer、Migration 等其他调用方仍按现有 Executor 语义提交。V1 不修改公共队列容量、任务类别配额或全局 admission。
 
 ## 4. EventReport 判定契约
 
@@ -283,7 +283,7 @@ orphan WRITING
 预算规则：
 
 - 所有原因合计最多准入 `scan_batch_size` 个 Location；
-- EventReport action 最多包含 `event_report_action_batch_size` 个唯一 Block key，默认 32；
+- EventReport action 最多包含 `event_report_action_batch_size` 个唯一 Block key，默认 256；
 - 一个已准入 Block key 可以携带多个 EventReport Location，但 Location 总数仍受总预算限制；
 - pending target 不重复准入；
 - 超预算、Executor 拒绝或 inflight 已满的候选不进入 deferred queue，只记录指标并等待后续 round 重新发现。
@@ -446,7 +446,7 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 4. EventReport 物理 Delete 调用数为 0，strict/soft 查询语义不退化。
 5. 多 Instance 与普通 GC 垃圾共存时，扫描按 batch 轮转且共享 inflight 生效。
 6. 对比 GC disabled、active scan、普通删除和 EventReport action 的 CPU/RSS、metadata QPS、在线请求 P50/P95/P99、round 时长和候选收敛时间。
-7. 统计 2 小时 cooldown 内 stale metadata 峰值，并验证默认节奏可接受。
+7. 统计 5 分钟 cooldown 内 stale metadata 峰值，并验证默认节奏可接受。
 
 编译、单测和 E2E 的具体执行环境由测试记录约束，不写入设计契约。
 
@@ -455,12 +455,12 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | 配置 | 默认值 | 说明 |
 |---|---:|---|
 | `kvcm.cache_gc.enabled` | `true` | GC 总开关；可显式设为 `false` 回退 |
-| `kvcm.cache_gc.scan_interval_ms` | 1000 | active round 相邻 tick 最小间隔 |
-| `kvcm.cache_gc.round_pause_ms` | 7200000 | full round 完成后的 cooldown；0 表示下一 tick 可开始新 round |
+| `kvcm.cache_gc.scan_interval_ms` | 100 | active round 相邻 tick 最小间隔 |
+| `kvcm.cache_gc.round_pause_ms` | 300000 | full round 完成后的 cooldown；0 表示下一 tick 可开始新 round |
 | `kvcm.cache_gc.scan_batch_size` | 256 | scan key hint，也是单 tick Location 总预算 |
-| `kvcm.cache_gc.max_inflight_delete_requests` | 2 | 普通与 EventReport action 共用的 GC 在途上限 |
+| `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通与 EventReport action 共用的 GC 在途上限 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |
-| `kvcm.cache_gc.event_report_action_batch_size` | 32 | 单 tick EventReport action 的唯一 Block key 上限 |
+| `kvcm.cache_gc.event_report_action_batch_size` | 256 | 单 tick EventReport action 的唯一 Block key 上限 |
 
 所有配置启动时读取；V1 不实现运行时热更新。`round_pause_ms` 可以为 0，其他 interval/budget/inflight 必须大于 0。EventReport key budget 与 Scan key hint 是独立上限：前者约束 metadata action 涉及的唯一 Block key 数，后者约束单 tick Location 总预算；key budget 大于 Scan hint 时只是当批通常无法用满，不构成非法配置。
 
@@ -481,7 +481,7 @@ V1 不新增线程、intent store、EventReport cursor、receipt、全局 Execut
 ## 11. 风险与后续演进
 
 1. **best-effort 内存 scan**：dual-backend 下冷 key 可能长期残留；如需完整覆盖，再评估 persistent scan、反向索引或增量 Candidate Source。
-2. **周期收敛而非事件即时收敛**：默认 cooldown 2 小时。若数据证明仍过慢，再增加独立但状态驱动的 cadence，不恢复 intent。
+2. **周期收敛而非事件即时收敛**：默认 cooldown 5 分钟。若数据证明仍过慢，再增加独立但状态驱动的 cadence，不恢复 intent。
 3. **共享 inflight 的优先级取舍**：物理垃圾优先，极端持续压力下 EventReport 可能多等一轮；通过 dropped 和 candidate 指标观察。
 4. **无跨层事务**：V1 通过双层 expected-value 复核和删除前整 key 判定避免误删，但不引入逐层 receipt 或分布式事务；persistent/hot 部分失败由保留下来的候选和后续 round best effort 收敛。
 5. **Backend retirement fail-closed**：owner 被永久移除时缺少 lifecycle 授权，metadata 可能残留；Storage retirement reconciliation 是独立需求。
