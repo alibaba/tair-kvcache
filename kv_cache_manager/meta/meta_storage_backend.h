@@ -66,6 +66,16 @@ public:
                                        const CacheLocationMapVector &locations,
                                        const PropertyMapVector &properties) noexcept = 0;
 
+    // Conditional second-stage write. Backends used as a secondary override
+    // this and skip entries rejected by the primary stage.
+    virtual std::vector<ErrorCode> Put(RequestContext * /*request_context*/,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector & /*locations*/,
+                                       const PropertyMapVector & /*properties*/,
+                                       const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
     // 若 key 存在则合并 不存在则创建 key 并写入。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys             待操作的 key 列表
@@ -80,6 +90,14 @@ public:
                                           const KeyTypeVec &keys,
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
+
+    virtual std::vector<ErrorCode> Upsert(RequestContext * /*request_context*/,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector & /*locations*/,
+                                          const PropertyMapVector & /*properties*/,
+                                          const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
 
     // Allocation-light one-location upsert used by pure-local targeted RMW.
     // The default adapter preserves backend semantics; local memory overrides
@@ -111,6 +129,12 @@ public:
     //   - EC_ERROR: 删除失败
     virtual std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept = 0;
 
+    virtual std::vector<ErrorCode> Delete(RequestContext * /*request_context*/,
+                                          const KeyTypeVec &keys,
+                                          const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
     // 删除指定 key 下的指定 location。幂等语义：删除不存在的 location 视为成功。
     // 不影响 key 中的 properties 和其他 location。
     // @param request_context  请求上下文；可为 nullptr
@@ -124,6 +148,13 @@ public:
     virtual std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
                                                    const KeyTypeVec &keys,
                                                    const LocationIdsPerKey &location_ids) noexcept = 0;
+
+    virtual std::vector<ErrorCode> DeleteLocations(RequestContext * /*request_context*/,
+                                                   const KeyTypeVec &keys,
+                                                   const LocationIdsPerKey & /*location_ids*/,
+                                                   const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
 
     // =====================================================================
     // Read APIs
@@ -445,6 +476,14 @@ public:
         return DeleteLocations(request_context, keys, location_ids);
     }
 
+    virtual std::vector<ErrorCode>
+    DeleteLocationsForMaintenance(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept {
+        return DeleteLocations(request_context, keys, location_ids, previous_error_codes);
+    }
+
     // 随机采样 key。
     // @param request_context 请求上下文；可为 nullptr
     // @param count    期望采样数量
@@ -504,6 +543,8 @@ public:
         int64_t flush_key_count = 0;
         int64_t batch_flush_time_us = 0;
         int64_t pipeline_error_count = 0;
+        int64_t dropped_key_count = 0;
+        int64_t dropped_metadata_count = 0;
     };
     virtual AsyncWriteStats GetAsyncWriteStats() noexcept { return {}; }
 

@@ -18,11 +18,13 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "storage_type", storage_type_);
         Put(writer, "storage_uri", storage_uri_);
+        Put(writer, "memory_primary", memory_primary_);
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "storage_type", storage_type_, std::string("local"));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "storage_uri", storage_uri_, std::string(""));
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "memory_primary", memory_primary_, false);
         return true;
     }
     bool ValidateRequiredFields(std::string &invalid_fields) const {
@@ -39,12 +41,15 @@ public:
     }
     const std::string &GetStorageType() const { return storage_type_; }
     const std::string &GetStorageUri() const { return storage_uri_; }
+    bool GetMemoryPrimary() const { return memory_primary_; }
 
     void SetStorageType(const std::string &storage_type) { storage_type_ = storage_type; }
     void SetStorageUri(const std::string &storage_uri) { storage_uri_ = storage_uri; }
+    void SetMemoryPrimary(bool memory_primary) { memory_primary_ = memory_primary; }
 
 private:
     std::string storage_type_ = "local";
     std::string storage_uri_ = "";
+    bool memory_primary_ = false;
 };
 } // namespace kv_cache_manager

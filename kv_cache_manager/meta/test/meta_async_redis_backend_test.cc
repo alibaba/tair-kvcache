@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -112,6 +113,18 @@ protected:
         if (ec != EC_OK)
             return ec;
         return backend_->Open();
+    }
+
+    void InitMemoryPrimaryWithoutConsumers(int64_t capacity = 2) {
+        config_->SetMemoryPrimary(true);
+        SetupMockRedisClients();
+        ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+        backend_->queue_max_size_ = capacity;
+        for (int i = 0; i < backend_->queue_count_; ++i) {
+            backend_->queues_.push_back(std::make_unique<MpscWriteQueue>());
+            backend_->consumer_clients_.push_back(backend_->CreateRedisClient());
+        }
+        backend_->is_running_.store(true);
     }
 
     std::unique_ptr<MockMetaAsyncRedisBackend> backend_;
@@ -943,7 +956,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
 
     auto barrier = std::make_shared<BarrierContext>();
     barrier->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
 
     can_proceed.store(true, std::memory_order_release);
 
@@ -1027,7 +1040,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
 
     auto barrier = std::make_shared<BarrierContext>();
     barrier->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
 
     can_proceed.store(true, std::memory_order_release);
 
@@ -1117,7 +1130,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
 
     auto barrier1 = std::make_shared<BarrierContext>();
     barrier1->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier1}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier1});
 
     CacheLocationMapVector locs2(1);
     PropertyMapVector props2 = {{{"f3", "v3"}}};
@@ -1125,7 +1138,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
 
     auto barrier2 = std::make_shared<BarrierContext>();
     barrier2->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier2}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier2});
 
     // Release consumer — first batch (seed) succeeds, second batch has partial failure
     can_proceed.store(true, std::memory_order_release);
@@ -1140,6 +1153,202 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
     EXPECT_EQ(1, stats.pipeline_error_count);
     // seed batch: 1 key (all_ok path) + segment 1: 2 keys (partial ok) = 3
     EXPECT_EQ(3, stats.flush_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryFullQueueDoesNotWait) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    backend_->enqueue_timeout_ms_ = 5000;
+    const KeyType key = 7;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Put(nullptr, {key}, {{}}, {{{"p", "v"}}}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Upsert(nullptr, {key}, {{}}, {{{"p", "v"}}}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->DeleteLocations(nullptr, {key}, {{"loc"}}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
+    EXPECT_FALSE(backend_->Sync({key}));
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(4, stats.dropped_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryPrimaryWriteKeepsOriginalBackpressure) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    backend_->enqueue_timeout_ms_ = 0;
+    const KeyType key = 7;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), backend_->Delete(nullptr, {key, key}));
+    EXPECT_EQ(2, backend_->queues_[backend_->GetQueueIndexForKey(key)]->GetKeySize());
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Delete(nullptr, {key}));
+    const auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(0, stats.dropped_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestConditionalSecondaryWritesFilterDuringQueueGrouping) {
+    InitMemoryPrimaryWithoutConsumers(10);
+    const KeyTypeVec keys{1, 2, 3};
+    CacheLocationMapVector locations(3);
+    PropertyMapVector properties{{{"p", "one"}}, {{"p", "two"}}, {{"p", "three"}}};
+    const std::vector<ErrorCode> put_gate{EC_OK, EC_NOSPC, EC_OK};
+    EXPECT_EQ(put_gate, backend_->Put(nullptr, keys, locations, properties, put_gate));
+
+    std::vector<std::pair<KeyType, std::string>> queued;
+    for (const auto &queue : backend_->queues_) {
+        int64_t taken = 0;
+        auto items = queue->PopBatch(10, taken);
+        for (auto &item : items) {
+            auto &op = std::get<WriteOp>(item);
+            ASSERT_EQ(op.keys.size(), op.field_maps.size());
+            for (size_t i = 0; i < op.keys.size(); ++i) {
+                queued.emplace_back(op.keys[i], op.field_maps[i].at("p"));
+            }
+        }
+    }
+    std::sort(queued.begin(), queued.end());
+    EXPECT_EQ((std::vector<std::pair<KeyType, std::string>>{{1, "one"}, {3, "three"}}), queued);
+
+    const std::vector<ErrorCode> delete_gate{EC_NOENT, EC_ERROR, EC_NOSPC};
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_ERROR, EC_NOSPC}), backend_->Delete(nullptr, keys, delete_gate));
+    KeyTypeVec delete_keys;
+    for (const auto &queue : backend_->queues_) {
+        int64_t taken = 0;
+        auto items = queue->PopBatch(10, taken);
+        for (auto &item : items) {
+            auto &op = std::get<WriteOp>(item);
+            delete_keys.insert(delete_keys.end(), op.keys.begin(), op.keys.end());
+        }
+    }
+    EXPECT_EQ(KeyTypeVec{1}, delete_keys);
+
+    const LocationIdsPerKey location_ids{{"a"}, {"b", "c"}, {"d"}};
+    const std::vector<ErrorCode> delete_locations_gate{EC_NOSPC, EC_NOENT, EC_OK};
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOSPC, EC_OK, EC_OK}),
+              backend_->DeleteLocations(nullptr, keys, location_ids, delete_locations_gate));
+    std::vector<std::pair<KeyType, std::vector<std::string>>> queued_location_deletes;
+    for (const auto &queue : backend_->queues_) {
+        int64_t taken = 0;
+        auto items = queue->PopBatch(10, taken);
+        for (auto &item : items) {
+            auto &op = std::get<WriteOp>(item);
+            ASSERT_EQ(op.keys.size(), op.field_names_vec.size());
+            for (size_t i = 0; i < op.keys.size(); ++i) {
+                queued_location_deletes.emplace_back(op.keys[i], std::move(op.field_names_vec[i]));
+            }
+        }
+    }
+    std::sort(queued_location_deletes.begin(), queued_location_deletes.end());
+    EXPECT_EQ((std::vector<std::pair<KeyType, std::vector<std::string>>>{
+                  {2, {PROPERTY_LOCATION_PREFIX + "b", PROPERTY_LOCATION_PREFIX + "c"}},
+                  {3, {PROPERTY_LOCATION_PREFIX + "d"}},
+              }),
+              queued_location_deletes);
+
+    const std::vector<ErrorCode> rejected(keys.size(), EC_NOSPC);
+    EXPECT_EQ(rejected, backend_->Upsert(nullptr, keys, locations, properties, rejected));
+    for (const auto &queue : backend_->queues_) {
+        EXPECT_EQ(0, queue->GetKeySize());
+    }
+    const auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(0, stats.dropped_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryOversizeAndSyncKeepsOriginalAdmission) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_TIMEOUT, EC_TIMEOUT}), backend_->Delete(nullptr, {5, 5}, {EC_OK, EC_OK}));
+    EXPECT_EQ(0, backend_->queues_[backend_->GetQueueIndexForKey(5)]->GetKeySize());
+    KeyType key = 6;
+    while (backend_->GetQueueIndexForKey(key) == backend_->GetQueueIndexForKey(5)) {
+        ++key;
+    }
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    EXPECT_FALSE(backend_->Sync({key})); // no consumer to complete the barrier
+    EXPECT_EQ(1, backend_->queues_[backend_->GetQueueIndexForKey(key)]->GetKeySize());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryMetadataUsesBoundedConsumerAndRealKey) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    EXPECT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "19"}}));
+    EXPECT_EQ(EC_TIMEOUT, backend_->PutMetaData({{"key_count", "20"}}));
+    EXPECT_EQ(1, backend_->queues_[0]->GetKeySize());
+    int64_t taken = 0;
+    auto items = backend_->queues_[0]->PopBatch(10, taken);
+    ASSERT_EQ(1, items.size());
+    auto &op = std::get<WriteOp>(items.front());
+    EXPECT_EQ(WriteOpType::kPutMetaData, op.type);
+    EXPECT_TRUE(op.keys.empty());
+    std::vector<CmdArgs> commands;
+    backend_->CompileWriteOp(op, commands);
+    ASSERT_FALSE(commands.empty());
+    for (const auto &command : commands) {
+        ASSERT_GE(command.size(), 2);
+        EXPECT_EQ(backend_->metadata_key_, command[1]);
+    }
+    EXPECT_EQ(1, backend_->GetAsyncWriteStats().dropped_metadata_count);
+    EXPECT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "21"}}));
+    items = backend_->queues_[0]->PopBatch(10, taken);
+    backend_->BatchFlush(0, items, taken);
+    EXPECT_EQ(0, backend_->GetAsyncWriteStats().flush_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryHealthySyncAndMetadata) {
+    config_->SetMemoryPrimary(true);
+    ASSERT_EQ(EC_OK, InitAndOpen());
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {7}, {{}}, {{{"p", "v"}}}));
+    ASSERT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "1"}}));
+    EXPECT_TRUE(backend_->Sync({7}));
+    ASSERT_EQ(EC_OK, backend_->Close());
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(1, stats.flush_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryPreservesFifoAndConsumerSerialization) {
+    InitMemoryPrimaryWithoutConsumers(10);
+    std::atomic<int> serialized{0};
+    auto location = std::make_shared<TrackingCacheLocation>(serialized, "location_json");
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {42}, {{{"loc", location}}}, {{}}));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Upsert(nullptr, {42}, {{{"loc", location}}}, {{}}));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->DeleteLocations(nullptr, {42}, {{"loc"}}));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {42}));
+    location.reset();
+    EXPECT_EQ(0, serialized.load());
+    int64_t taken = 0;
+    auto items = backend_->queues_[backend_->GetQueueIndexForKey(42)]->PopBatch(10, taken);
+    ASSERT_EQ(4, items.size());
+    const std::vector<WriteOpType> expected = {
+        WriteOpType::kPut, WriteOpType::kUpsert, WriteOpType::kDeleteLocations, WriteOpType::kDelete};
+    std::vector<CmdArgs> commands;
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto &op = std::get<WriteOp>(items[i]);
+        EXPECT_EQ(expected[i], op.type);
+        backend_->CompileWriteOp(op, commands);
+    }
+    EXPECT_EQ(2, serialized.load());
+    EXPECT_EQ(4, taken);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryDrainDropsAreVisibleAndFailBarriers) {
+    InitMemoryPrimaryWithoutConsumers(10);
+    backend_->drain_timeout_ms_ = 1;
+    backend_->max_batch_size_ = 1;
+    KeyType key = 1;
+    while (backend_->GetQueueIndexForKey(key) != 0) {
+        ++key;
+    }
+    auto *client = static_cast<MockRedisClient *>(backend_->consumer_clients_[0].get());
+    EXPECT_CALL(*client, TryExecPipeline(_)).WillOnce(Invoke([](const std::vector<CmdArgs> &) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::vector<ReplyUPtr> replies;
+        replies.push_back(MakeFakeReplyInteger(1));
+        return replies;
+    }));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {key}));
+    ASSERT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "1"}}));
+    auto barrier = std::make_shared<BarrierContext>();
+    barrier->remain.store(1);
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
+    backend_->DrainQueue(0);
+    EXPECT_FALSE(barrier->Wait(std::chrono::milliseconds(10)));
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(1, stats.flush_key_count);
+    EXPECT_EQ(1, stats.dropped_metadata_count);
 }
 
 } // namespace kv_cache_manager
