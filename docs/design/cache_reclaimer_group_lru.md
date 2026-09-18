@@ -218,13 +218,15 @@ B_group = E == 0 ? 0 : min(B_theory, max(1, floor(uint128(E) * B_cfg / S)))
 
 正常无故障且资源足够时，本轮为所有有效 Instance 收集候选；局部失败时只能保证成功候选范围内的 LRU。失败率持续较高、deadline 频繁截断时，应视为策略覆盖不足并告警，而不是把热点数据提前删除解释为理想 Group LRU。
 
-### 5.5 Local 后端的分片覆盖
+### 5.5 Local 后端的冷分片采样与覆盖边界
 
-no-touch 采样只推进分片内部的采样游标，不移动物理 LRU 尾部。若每次只按尾部时间选择最冷的几个分片，一个不可回收的旧尾部可能让同一批分片反复入选，其他分片一直没有采样机会。
+Local 的 `SampleReclaimCandidates` 复用 `SampleReclaimKeys` 选择 key，再通过 `GetLastAccessTimesForMaintenance` 无副作用读取访问时间。每次调用重新按各分片的最旧访问时间提示选择冷分片，并从入选分片的物理 LRU 最老端取 key；Reclaimer 不再使用跨调用的分片轮转或分片内采样游标。
 
-新路径每次选取 `K = min(sample_times, 非空分片数, 本次采样数)` 个分片：其中 `ceil(K / 2)` 个名额按分片 ID 跨调用轮转，剩余名额从尚未选中的分片里按尾部时间选最冷者。`K=1` 时该名额也轮转，不会一直固定在最冷分片。轮转部分先采样，分片内部仍沿独立游标继续读取。
+对于本次请求的 `count > 0`，先计算 `R = min(sample_times, 分片总数, count)`，再选取最多 `K = min(R, 非空分片数)` 个冷分片。每个入选分片最多取 `ceil(count / R)` 个 key，且不超过剩余总预算；分片为空或 key 不足时不自动向其他分片补齐。因此 `sample_times` 控制单次采样的分片广度，增大它可能增加入选分片数、减少单分片份额，不代表轮转周期。`K=1` 时仍选最冷分片；同一批分片可以连续入选，不承诺跨轮覆盖全部分片，也不保证取到全局最冷的 `count` 个 key。
 
-轮转复用公共候选采样接口中每个 Local backend 独立的 64 位原子计数，支持并发采样；非空分片集合稳定时会持续覆盖各分片。三种逐出策略共用该采样基础，不修改业务访问时间或物理 LRU 顺序。冷分片优先仍保留，但采样不是全量扫描，最终只对实际取得且可删除的候选按访问时间排序。
+采样本身不改变时间或 LRU 顺序，但旧前缀不能回收时，需要在后续过滤阶段让出位置：`FilterLocIDImpl` 完成维护性 Location 过滤后，将没有形成任何可删除 Location 的 key 交给 `TouchKeysForMaintenance`。该操作仅作用于完整的 Local 回收源，按名单更新时间和共享 LRU 位置，并通过尾部变化回调刷新分片冷度提示；不限于 EventReport-only key。仍有待删 Location 的 key 不 touch；读取失败或全局反压提前返回时也不触发。后续轮次因此有机会采到前缀之后的冷 key，但这不是游标续扫或同轮补采样的保证。
+
+维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本；它是显式维护副作用，不是严格的全链路 no-touch，也会延后被 touch 的 key 在 Local 元数据缓存中的容量淘汰。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
 
 ## 6. 候选表示、过滤与排序
 
@@ -249,7 +251,7 @@ struct GroupLruCandidate {
 
 Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 
-local 采样使用 shard 内独立游标推进下一段候选，不移动 LRU 节点；否则多个采样子任务可能反复拿到同一批最旧 key。节点因业务访问、删除或淘汰移出链表时同步维护游标，游标只影响后续采样覆盖，不把已采到的 key 标记为变热。
+完整 Local 回收源在同一轮内使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分，避免多个任务从相同冷前缀重复取样；完整预算是请求量，不保证一定采足。cached 恢复期间仍从持久层采样，允许按任务预算拆分。重复的纯采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除以及第 5.5 节的显式维护 touch。
 
 ### 6.2 Location 资格与删除准入分开
 
@@ -346,6 +348,9 @@ B_request = min(B_cfg, kSizeLimit - 1)
 | 采样失败 / LRU 属性缺失或非法计数 | 识别近似排序质量退化；批量 I/O 失败不能伪装成属性缺失 |
 | 提前停止原因计数 | 区分水位恢复、范围变化、request 上限、deadline 和全局反压 |
 | 候选收集 / 排序 / 准入耗时 | 定位前置 I/O 和小请求交错带来的成本 |
+| `maintenance_touch_key_count` | 跨策略累计实际完成的维护 touch 次数，观察被过滤候选让出位置的频率 |
+
+`cache_reclaimer.maintenance_touch_key_count` 是不带 Instance 标签的进程级 counter，直接累加 `TouchKeysForMaintenance` 返回的实际 touch 数，不把名单中的缺失 key 或不支持该操作的后端算作成功。同一 key 多次成功 touch 会重复计数；它不是去重 key 数、删除量或业务命中数，也不能单独量化容量影响，需结合 Local 元数据占用和淘汰指标判断。
 
 复用现有删除 bytes、Location、Future、credit 和反压指标。Group LRU 的 DEBUG 汇总包含 Group、有效与预算覆盖的 Instance 数、是否 partial、计划与成功收集的采样预算、Top B 数量和请求尝试数；单请求沿用现有提交日志。暂停和停止由运行状态检查保护，未增加独立的暂停计数。上述信息不能被表述为全量 keyspace 的冷热分布。
 
@@ -363,14 +368,14 @@ Group LRU 同时更新已有的 `reclaim_batch_lru_age_{min,max,avg}_us` 和 `re
 2. **低用量采样资格与采样权重**：旧容量算法 raw batch 为 0 的 Instance，在资源足够时仍有基础采样预算；额外预算按 key count 而非 bytes 分配，覆盖 bytes / key count 比例相反、极端倾斜、全零 key 统计和基础池取整。
 3. **身份隔离**：不同 Instance 的相同 key 分别参与比较、过滤和删除；重复采样在 Instance 内去重并采用最新有效时间。
 4. **排序确定性**：LRU 相同、属性缺失 / 非法、采样返回顺序变化，仍按既定规则输出；批量属性错误走失败路径。
-5. **no-touch**：重复采样、属性和 Location 查询不刷新业务 LRU 或 backend 候选次序；覆盖 local、cached / persistent 组合。
+5. **no-touch 与维护例外**：重复采样、维护性时间和 Location 查询不刷新 LRU 或 backend 候选次序；覆盖 local、cached / persistent 组合。过滤后的显式维护 touch 只作用于没有待删 Location 的 key，并核对实际成功计数；覆盖普通 / 混合 / EventReport key、缺失 key 和零成功返回。
 6. **先过滤再 Top B**：最旧项全部是不可删 Location 时，后续可删除候选仍能进入 Top B；EventReport、活跃写入、Copy target、 keep_both 与 spec 覆盖规则不变。
 7. **水位维度**：Group bytes、keys、单 / 多 Type、同时超限优先级、范围变化，均使用匹配的 Location 集合和停止逻辑。
 8. **保序拆批**：`A-oldest -> B-older -> A-newer` 不能被归并成 A 全部先提交；每个 accepted 后恢复水位都应停止于对应位置。
 9. **集中逐出**：同一 Instance 连续占据 Top B，能够按单请求上限提交多个请求，不被旧 per-instance 比例预算截断。
 10. **异步安全**：候选计划不建立 credit；accepted 才记账；过期 / 失败 Future、pending 去重、反压及 key 保留规则保持。
 11. **有界资源**：Group 乘法溢出、`N > S_plan` 时多轮覆盖全部有效 Instance 而非永久停回收、采样和 batch 为 0、联合裁剪取整、单请求 / 单轮请求上限、共享 deadline、超时 worker 不提前减 in-flight、局部失败不提交半个 Instance 的结果。
-12. **覆盖退化**：一个 Instance 故障不导致其他健康 Instance 永久无进展，包含健康 Instance 需要多次补充采样分片的场景；Location 检查耗尽 deadline 后，下一轮未检查项优先且不能被更快的采样项超越；优先项自身采样失败或超时后让出顺序，删除等待项和线程池饱和不破坏轮转；分片旧尾部长期保留时，其余分片仍获得采样机会；多轮 deadline 截断时未开始项优先获得下一轮机会， incomplete 计数和成功覆盖对应的 batch 收缩准确，暂停 / Stop 后不发起新删除。
+12. **覆盖退化**：一个 Instance 故障不导致其他健康 Instance 永久无进展，包含健康 Instance 需要多个远程采样子任务的场景；Location 检查耗尽 deadline 后，下一轮未检查项优先且不能被更快的采样项超越；优先项自身采样失败或超时后让出顺序，删除等待项和线程池饱和不破坏 Instance 轮转；Local 每轮重新选择冷分片，重复纯采样不会自行推进，不能回收的旧前缀经显式 touch 后后续冷 key 获得采样机会；多轮 deadline 截断时未开始项优先获得下一轮机会，incomplete 计数和成功覆盖对应的 batch 收缩准确，暂停 / Stop 后不发起新删除。不再验收跨调用 shard 轮转或全分片覆盖保证。
 13. **配置兼容**：新建和旧 Registry 缺字段时默认 Group LRU，显式旧值 0 / 1 保持原模式；覆盖协议字段缺省与显式 0 的区别、旧客户端省略零值、新枚举 round-trip、非法 LFU / TTL 组合、CLI 更新无关字段不丢策略，以及下一轮切换和在途状态不变。
 14. **单 Instance 回归**：合法完整候选下与原 LRU 选择基本一致。新路径过滤前移、确定性 tie-break 和显式 I/O 失败处理造成的差异单独断言，不承诺输出逐项完全相同。
 15. **迁移回归**：本轮 accepted Location 出现在 Migration pending 排除快照中；仅达到迁移水位时仍能迁移。

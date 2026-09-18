@@ -693,6 +693,8 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_limit_reject_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) = mr_->GetCounter(
             SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, duplicate_pending_location_filtered_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, maintenance_touch_key_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, maintenance_touch_key_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_no_progress_backoff_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_no_progress_backoff_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, delete_submit_count) =
@@ -4455,7 +4457,9 @@ TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRoun
     cache_reclaimer_->sampling_size_.store(3);
     cache_reclaimer_->batching_size_.store(1);
     cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
     KeyVector order;
     ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
@@ -4465,6 +4469,7 @@ TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRoun
     // so the next round reaches ordinary cold data without a
     // persistent scan cursor or a larger scan cap.
     ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     const auto selected = GroupLruSubmittedBlocks();
     ASSERT_EQ(1, selected.size());
     EXPECT_EQ(6, selected[0].second);
@@ -4488,6 +4493,7 @@ TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBounde
     // Ordinary locations in CLS_DELETING must yield too, not keep blocking
     // the same cold prefix merely because they are not EventReport-only.
     EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
     KeyVector order;
     ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
@@ -4504,8 +4510,46 @@ TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBounde
         EXPECT_GT(times[i], (i + 1) * 100);
     }
     // Neither a selected victim nor an unscanned key is a maintenance touch.
+    EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
     EXPECT_EQ(600, times[5]);
     EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejectedKeys) {
+    SetUpGroupLruScenario({"a"});
+    UseRealLocalReclaimBackend("a", 1);
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    const auto filter = [&](const KeyVector &keys) {
+        return cache_reclaimer_->FilterLocIDImpl(request_context_.get(),
+                                                 instance_infos.front(),
+                                                 keys,
+                                                 CacheReclaimer::WaterLevelExceed{},
+                                                 location_ids,
+                                                 bytes_by_type,
+                                                 counts_by_type,
+                                                 predicted_keys,
+                                                 create_age_stats,
+                                                 false,
+                                                 true);
+    };
+
+    // Key 1 is rejected, key 2 is deletable, and key 99 is missing. Only
+    // one of the two rejected keys actually exists and can be touched.
+    ASSERT_TRUE(filter({1, 2, 99}));
+    ASSERT_EQ(3, location_ids.size());
+    EXPECT_TRUE(location_ids[0].empty());
+    EXPECT_FALSE(location_ids[1].empty());
+    EXPECT_TRUE(location_ids[2].empty());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    ASSERT_TRUE(filter({2, 99}));
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    // Count successful touch operations, not distinct keys or deleted keys.
+    ASSERT_TRUE(filter({1}));
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
 }
 
 TEST_F(CacheReclaimerTest, TestGroupLruDefaultRatioExpandsSamplesWithoutChangingBatch) {

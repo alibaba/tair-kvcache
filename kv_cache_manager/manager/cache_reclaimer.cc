@@ -113,6 +113,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credit_timeout_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_complete_count);
@@ -660,6 +661,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count);
@@ -1820,7 +1822,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         // Yield keys with no deletable locations so later samples can reach
         // other cold candidates, regardless of the rejected location types.
         if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
-            indexer->TouchKeysForMaintenance(rejected_keys);
+            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
         }
     }
     if (create_age_count == 0) {
