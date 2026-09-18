@@ -1,5 +1,8 @@
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 
+#include <algorithm>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
@@ -16,7 +19,38 @@ constexpr const char *kKvMetaValueSpecName = "value";
 constexpr std::size_t kMaxKvMetaBatchItems = 64;
 constexpr std::uint64_t kMaxKvMetaObjectBytes = 1ULL * 1024 * 1024 * 1024;
 
+bool HasOnlyUnambiguousUriText(const UriStrVec &uris) {
+    return std::all_of(
+        uris.begin(), uris.end(), [](const std::string &uri) { return HasUnambiguousKvMetaUriText(uri); });
+}
+
 } // namespace
+
+bool HasUnambiguousKvMetaUriText(std::string_view uri_text) {
+    if (uri_text.find('#') != std::string_view::npos) {
+        return false;
+    }
+    const auto query_position = uri_text.find('?');
+    if (query_position == std::string_view::npos) {
+        return true;
+    }
+    std::unordered_set<std::string> keys;
+    std::size_t begin = query_position + 1;
+    while (begin < uri_text.size()) {
+        const auto end = uri_text.find('&', begin);
+        const auto item_end = end == std::string_view::npos ? uri_text.size() : end;
+        const auto equals = uri_text.find('=', begin);
+        const auto key_end = equals != std::string_view::npos && equals < item_end ? equals : item_end;
+        if (key_end == begin || !keys.emplace(uri_text.substr(begin, key_end - begin)).second) {
+            return false;
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return begin < uri_text.size();
+}
 
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
@@ -120,6 +154,9 @@ ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_v
     if (!sdk_wrapper_) {
         return ER_INVALID_SDKWRAPPER_CONFIG;
     }
+    if (!HasOnlyUnambiguousUriText(uri_str_vec)) {
+        return ER_INVALID_PARAMS;
+    }
     return sdk_wrapper_->GetKvMetaObjects(ParseLocations(uri_str_vec), value_sizes, object_buffers);
 }
 
@@ -127,6 +164,9 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     const UriStrVec &uri_str_vec, const std::vector<std::uint64_t> &value_sizes, const BlockBuffers &object_buffers) {
     if (!sdk_wrapper_) {
         return {ER_INVALID_SDKWRAPPER_CONFIG, {}};
+    }
+    if (!HasOnlyUnambiguousUriText(uri_str_vec)) {
+        return {ER_INVALID_PARAMS, {}};
     }
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
     const auto ec =

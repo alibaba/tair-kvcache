@@ -2,8 +2,8 @@
 
 The native :class:`KvMetaObjectClient` exposes caller-owned buffers.  This
 module adds a small, framework-independent Python layer that validates a whole
-operation, converts contiguous CPU/CUDA tensors to native IOVs, and splits a
-logical operation into service-sized requests.  Importing the module does not
+operation, converts contiguous CPU/CUDA/MUSA tensors to native IOVs, and splits
+a logical operation into service-sized requests.  Importing the module does not
 load the native extension; the extension is imported only when a client is
 constructed.
 """
@@ -32,7 +32,7 @@ KV_META_MAX_CALL_TIMEOUT_MS = 600_000
 KV_META_MAX_WRITE_TIMEOUT_SECONDS = 1800
 # Must match kKvMetaObjectClientApiVersion in the native public header.  This is
 # an API/ABI capability marker, not the wheel package version.
-KV_META_OBJECT_API_VERSION = 1
+KV_META_OBJECT_API_VERSION = 2
 
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_INT32 = (1 << 31) - 1
@@ -107,7 +107,7 @@ class KvMetaObjectBuffer:
 
     @classmethod
     def from_tensor(cls, key: str, tensor: Any) -> "KvMetaObjectBuffer":
-        """Describe a contiguous CPU/CUDA tensor without importing torch."""
+        """Describe a contiguous CPU/CUDA/MUSA tensor without importing torch."""
 
         is_contiguous = getattr(tensor, "is_contiguous", None)
         if not callable(is_contiguous) or not is_contiguous():
@@ -122,7 +122,7 @@ class KvMetaObjectBuffer:
         device_type = getattr(getattr(tensor, "device", None), "type", None)
         if device_type == "cpu":
             memory = KvMetaObjectMemory.CPU
-        elif device_type == "cuda":
+        elif device_type in ("cuda", "musa"):
             memory = KvMetaObjectMemory.GPU
         else:
             raise ValueError(f"KVMeta tensor device is unsupported: {device_type!r}")
@@ -333,7 +333,14 @@ def _validate_pybind_module(pybind: Any) -> None:
         )
     try:
         required_members = (
-            (pybind.ClientErrorCode, ("ER_OK", "ER_INVALID_GRPCSTATUS")),
+            (
+                pybind.ClientErrorCode,
+                (
+                    "ER_OK",
+                    "ER_INVALID_GRPCSTATUS",
+                    "ER_SERVICE_OUTCOME_UNKNOWN",
+                ),
+            ),
             (pybind.MemoryType, ("CPU", "GPU")),
             (pybind.RoleType, ("WORKER",)),
         )
@@ -342,11 +349,14 @@ def _validate_pybind_module(pybind: Any) -> None:
             for enum_type, names in required_members
         )
         has_factory = callable(getattr(pybind.KvMetaObjectClient, "Create", None))
+        has_explicit_close = callable(
+            getattr(pybind.KvMetaObjectClient, "Close", None)
+        )
     except Exception:
         raise ImportError(
             "installed kvcm_py_client cannot be inspected safely"
         ) from None
-    if not has_required_members or not has_factory:
+    if not has_required_members or not has_factory or not has_explicit_close:
         raise ImportError(
             "installed kvcm_py_client exports an incomplete KVMeta object API"
         )
@@ -374,7 +384,11 @@ def _is_ok_code(pybind: Any, code: Any) -> bool:
 
 
 def _is_ambiguous_code(pybind: Any, code: Any) -> bool:
-    return _matches_native_code(pybind, code, "ER_INVALID_GRPCSTATUS", 2)
+    return _matches_native_code(
+        pybind, code, "ER_INVALID_GRPCSTATUS", 2
+    ) or _matches_native_code(
+        pybind, code, "ER_SERVICE_OUTCOME_UNKNOWN", 65
+    )
 
 
 def _is_known_native_code(pybind: Any, code: Any) -> bool:
@@ -461,11 +475,11 @@ class KvMetaObjectClient:
                 self._client = self._create_client()
             if not all(
                 callable(getattr(self._client, method, None))
-                for method in ("SaveObjects", "LoadObjects", "Remove")
+                for method in ("SaveObjects", "LoadObjects", "Remove", "Close")
             ):
                 raise TypeError(
                     "native KVMeta object client is missing SaveObjects, "
-                    "LoadObjects, or Remove"
+                    "LoadObjects, Remove, or Close"
                 )
         except Exception:
             client, self._client = self._client, None
@@ -685,7 +699,7 @@ class KvMetaObjectClient:
         *,
         trace_id: Optional[str] = None,
     ) -> None:
-        """Save contiguous CPU/CUDA tensors under exact keys.
+        """Save contiguous CPU/CUDA/MUSA tensors under exact keys.
 
         This method intentionally matches RTP-LLM's multimodal writer protocol.
         Framework-specific stream synchronization remains the caller's job.
@@ -700,7 +714,7 @@ class KvMetaObjectClient:
         *,
         trace_id: Optional[str] = None,
     ) -> None:
-        """Load exact objects into preallocated contiguous CPU/CUDA tensors."""
+        """Load exact objects into preallocated contiguous CPU/CUDA/MUSA tensors."""
 
         self.load_buffers(self._buffers_from_tensors(keys, tensors), trace_id=trace_id)
 

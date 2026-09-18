@@ -69,7 +69,9 @@ cc_test(
         "//kv_cache_manager/manager:startup_config_loader",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service:admin_service_impl",
         "//kv_cache_manager/service:kv_meta_service_impl",
+        "//kv_cache_manager/service:meta_service_impl",
     ],
 )
 

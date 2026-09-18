@@ -7,8 +7,10 @@
 #include <thread>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/protocol/protobuf/kv_meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
+#include "kv_cache_manager/service/kv_meta_service_impl.h"
 #include "kv_cache_manager/service/server.h"
 
 using namespace kv_cache_manager;
@@ -182,4 +184,42 @@ TEST_F(ServerLifecycleTest, ConcurrentRecoveryCancellationWaitsForMovedWorker) {
     EXPECT_EQ(std::future_status::timeout, second_status_before_release)
         << "a concurrent cancellation returned while the moved recovery worker was still running";
     EXPECT_EQ(std::future_status::ready, second_returned.wait_for(0s));
+}
+
+TEST_F(ServerLifecycleTest, KvMetaRecoveryWaitsForDeferredCacheRecoveryCompletion) {
+    ASSERT_TRUE(StartRpcServer(true));
+    ASSERT_TRUE(server_.cache_manager_);
+    ASSERT_TRUE(server_.kv_meta_impl_);
+    server_.cache_manager_->recover_complete_.store(false, std::memory_order_release);
+
+    server_.StartKvMetaRecovery();
+    std::this_thread::sleep_for(100ms);
+    EXPECT_FALSE(server_.kv_meta_impl_->is_accepting_leader_only_requests_.load(std::memory_order_acquire));
+
+    server_.cache_manager_->recover_complete_.store(true, std::memory_order_release);
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return server_.kv_meta_impl_->is_accepting_leader_only_requests_.load(std::memory_order_acquire); },
+        2s));
+    server_.CancelAndJoinKvMetaRecovery();
+}
+
+TEST_F(ServerLifecycleTest, WaitJoinsKvMetaRecoveryWorker) {
+    ASSERT_TRUE(StartRpcServer(true));
+    std::promise<void> worker_started_promise;
+    auto worker_started = worker_started_promise.get_future();
+    std::promise<void> release_worker_promise;
+    auto release_worker = release_worker_promise.get_future().share();
+    server_.kv_meta_recovery_thread_ = std::thread([&]() {
+        worker_started_promise.set_value();
+        release_worker.wait();
+    });
+    ASSERT_EQ(std::future_status::ready, worker_started.wait_for(2s));
+
+    server_.rpc_server_->Shutdown();
+    auto wait_result = std::async(std::launch::async, [&]() { return server_.Wait(); });
+    EXPECT_EQ(std::future_status::timeout, wait_result.wait_for(50ms));
+    release_worker_promise.set_value();
+    ASSERT_EQ(std::future_status::ready, wait_result.wait_for(2s));
+    EXPECT_TRUE(wait_result.get());
+    EXPECT_FALSE(server_.kv_meta_recovery_thread_.joinable());
 }

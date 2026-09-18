@@ -1,8 +1,10 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <grpcpp/grpcpp.h>
+#include <thread>
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -250,7 +252,14 @@ void Server::StartKvMetaRecovery() {
             };
             ErrorCode ec = EC_ERROR;
             try {
-                ec = kv_meta_manager_->DoRecover(should_abort);
+                // CacheManager::DoRecover preserves its historical behavior
+                // of returning EC_OK after deferring a partial failure to a
+                // retry thread. KVMeta requires those indexers, so keep only
+                // this optional service gated until the retry really finishes.
+                while (!should_abort() && !cache_manager_->IsRecoverComplete()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                ec = should_abort() ? EC_SERVICE_NOT_LEADER : kv_meta_manager_->DoRecover(should_abort);
             } catch (const std::exception &) {
                 // KVMeta recovery is an isolated optional side path. A
                 // provider exception must leave its request gate closed, not
@@ -364,6 +373,10 @@ bool Server::Wait() {
     if (debug_http_thread_.joinable()) {
         debug_http_thread_.join();
     }
+    // Wait can be the final lifecycle call after an externally initiated gRPC
+    // shutdown. A finished std::thread remains joinable, and a still-running
+    // recovery must not outlive Server's members.
+    CancelAndJoinKvMetaRecovery();
     return true;
 }
 

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/client/src/kv_meta_object_client_impl.h"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <sys/stat.h>
 #include <unordered_set>
@@ -8,6 +9,7 @@
 
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -45,6 +47,84 @@ bool IsKnownStorageType(KvMetaStorageType type) {
     }
 }
 
+bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &uri) {
+    switch (type) {
+    case KvMetaStorageType::HF3FS:
+        return uri.GetProtocol() == "hf3fs";
+    case KvMetaStorageType::VCNS_HF3FS:
+        return uri.GetProtocol() == "hf3fs" || uri.GetProtocol() == "vcns_hf3fs";
+    case KvMetaStorageType::MOONCAKE:
+        return uri.GetProtocol() == "mooncake";
+    case KvMetaStorageType::TAIR_MEMPOOL:
+    case KvMetaStorageType::TAIR_MEMPOOL_SSD:
+        return uri.GetProtocol() == "pace";
+    case KvMetaStorageType::NFS:
+        return uri.GetProtocol() == "file";
+    case KvMetaStorageType::DUMMY:
+        return uri.GetProtocol() == "dummy";
+    case KvMetaStorageType::EVENT_REPORT_L1P5:
+        return uri.GetProtocol() == "event_report_l1p5";
+    case KvMetaStorageType::EVENT_REPORT_L2:
+        return uri.GetProtocol() == "event_report_l2";
+    case KvMetaStorageType::UNSPECIFIED:
+    default:
+        return false;
+    }
+}
+
+bool HasSingletonAllocationShape(KvMetaStorageType type, const DataStorageUri &uri) {
+    switch (type) {
+    case KvMetaStorageType::HF3FS:
+    case KvMetaStorageType::VCNS_HF3FS:
+    case KvMetaStorageType::NFS:
+    case KvMetaStorageType::DUMMY:
+        break;
+    default:
+        return true;
+    }
+    if (!uri.HasParam("blkid")) {
+        return true;
+    }
+    const std::string block_id_text = uri.GetParam("blkid");
+    std::uint64_t block_id = 0;
+    const auto parsed = std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
+    return !block_id_text.empty() && parsed.ec == std::errc{} &&
+           parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
+}
+
+bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
+    if (!HasUnambiguousKvMetaUriText(uri_text)) {
+        return false;
+    }
+    const DataStorageUri uri(uri_text);
+    if (!uri.Valid() || uri.GetHostName().empty() || !UriSchemeMatchesStorageType(type, uri) ||
+        !HasSingletonAllocationShape(type, uri) || !uri.HasParam("size")) {
+        return false;
+    }
+    const std::string size_text = uri.GetParam("size");
+    std::uint64_t size = 0;
+    const auto parsed = std::from_chars(size_text.data(), size_text.data() + size_text.size(), size);
+    return !size_text.empty() && parsed.ec == std::errc{} && parsed.ptr == size_text.data() + size_text.size() &&
+           size == expected_size;
+}
+
+bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
+    if (expected.size() != actual.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (!HasUnambiguousKvMetaUriText(expected[i]) || !HasUnambiguousKvMetaUriText(actual[i])) {
+            return false;
+        }
+        const DataStorageUri expected_uri(expected[i]);
+        const DataStorageUri actual_uri(actual[i]);
+        if (!expected_uri.Valid() || !actual_uri.Valid() || expected_uri.ToUriString() != actual_uri.ToUriString()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ClientErrorCode ValidateLocalRegistration(const InitParams &init_params,
                                           const SharedMemoryRegistration *shared_memory_registration) {
     if (init_params.regist_span != nullptr) {
@@ -68,7 +148,7 @@ ClientErrorCode ValidateLocalRegistration(const InitParams &init_params,
         KVCM_LOG_WARN("KVMeta shared-memory registration is incomplete or its address range overflows");
         return ER_INVALID_PARAMS;
     }
-    struct stat file_stat {};
+    struct stat file_stat{};
     if (fstat(registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<std::uintmax_t>(file_stat.st_size) < registration.size) {
         KVCM_LOG_WARN("KVMeta shared-memory fd is invalid or smaller than the registered range");
@@ -141,6 +221,31 @@ KvMetaObjectClientImpl::KvMetaObjectClientImpl(std::unique_ptr<KvMetaClient> met
     , max_object_bytes_(max_object_bytes)
     , write_timeout_seconds_(write_timeout_seconds) {}
 
+KvMetaObjectClientImpl::OperationGuard::OperationGuard(KvMetaObjectClientImpl *owner, bool require_transfer)
+    : owner_(owner), admitted_(owner_ != nullptr && owner_->TryBeginOperation(require_transfer)) {}
+
+KvMetaObjectClientImpl::OperationGuard::~OperationGuard() noexcept {
+    if (admitted_) {
+        owner_->EndOperation();
+    }
+}
+
+bool KvMetaObjectClientImpl::TryBeginOperation(bool require_transfer) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || closed_ || !metadata_client_ || (require_transfer && !transfer_client_)) {
+        return false;
+    }
+    ++active_operations_;
+    return true;
+}
+
+void KvMetaObjectClientImpl::EndOperation() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (--active_operations_ == 0) {
+        lifecycle_condition_.notify_all();
+    }
+}
+
 ClientErrorCode KvMetaObjectClientImpl::ValidateRequest(const std::vector<std::string> &keys,
                                                         const std::vector<std::uint64_t> &value_sizes,
                                                         const BlockBuffers &object_buffers,
@@ -196,6 +301,10 @@ ClientErrorCode KvMetaObjectClientImpl::ExtractUris(const std::vector<KvMetaValu
             uris.clear();
             return ER_SERVICE_SIZE_MISMATCH;
         }
+        if (!ValidateStorageUri(location.type, location.location_specs[0].uri, value_sizes[i])) {
+            uris.clear();
+            return ER_SERVICE_INTERNAL_ERROR;
+        }
         uris.push_back(location.location_specs[0].uri);
     }
     return ER_OK;
@@ -233,7 +342,8 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
     if (validation_ec != ER_OK) {
         return validation_ec;
     }
-    if (!metadata_client_ || !transfer_client_) {
+    OperationGuard operation(this, true);
+    if (!operation.admitted()) {
         return ER_CLIENT_NOT_EXISTS;
     }
 
@@ -334,7 +444,7 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
     if (save_ec != ER_OK) {
         return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), save_ec);
     }
-    if (actual_uris != requested_uris) {
+    if (!SameStorageUris(requested_uris, actual_uris)) {
         return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), ER_SDKWRITE_ERROR);
     }
     try {
@@ -354,7 +464,8 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjects(const std::string &trace_id,
     if (validation_ec != ER_OK) {
         return validation_ec;
     }
-    if (!metadata_client_ || !transfer_client_) {
+    OperationGuard operation(this, true);
+    if (!operation.admitted()) {
         return ER_CLIENT_NOT_EXISTS;
     }
     ClientErrorCode get_ec = ER_SERVICE_INTERNAL_ERROR;
@@ -402,7 +513,8 @@ ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, cons
             return ER_INVALID_PARAMS;
         }
     }
-    if (!metadata_client_) {
+    OperationGuard operation(this, false);
+    if (!operation.admitted()) {
         return ER_CLIENT_NOT_EXISTS;
     }
     try {
@@ -411,6 +523,31 @@ ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, cons
         KVCM_LOG_WARN("KVMeta object Remove threw; mutation outcome is unknown");
         return ER_INVALID_GRPCSTATUS;
     }
+}
+
+void KvMetaObjectClientImpl::Close() noexcept {
+    std::unique_ptr<KvMetaTransferClient> transfer_client;
+    std::unique_ptr<KvMetaClient> metadata_client;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (closed_) {
+        return;
+    }
+    if (closing_) {
+        lifecycle_condition_.wait(lock, [&]() { return closed_; });
+        return;
+    }
+    closing_ = true;
+    lifecycle_condition_.wait(lock, [&]() { return active_operations_ == 0; });
+    // Destroy the data plane first: it owns worker pools and may still refer
+    // to storage configuration returned by the metadata registration.
+    transfer_client = std::move(transfer_client_);
+    metadata_client = std::move(metadata_client_);
+    lock.unlock();
+    transfer_client.reset();
+    metadata_client.reset();
+    lock.lock();
+    closed_ = true;
+    lifecycle_condition_.notify_all();
 }
 
 std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>

@@ -108,6 +108,52 @@ TEST_F(KvMetaTransferClientTest, RejectsUriAndBufferSizeMismatchBeforeIo) {
     EXPECT_FALSE(std::filesystem::exists(path));
 }
 
+TEST_F(KvMetaTransferClientTest, RejectsSchemeMismatchAndNonSingletonBlockIdBeforeIo) {
+    auto client = KvMetaTransferClient::Create(client_config_, init_params_, 1024);
+    ASSERT_NE(nullptr, client);
+    std::vector<char> payload(5, 1);
+    auto buffer = MakeBuffer(payload.data(), payload.size());
+    const std::string path = root_path_ + "must_not_dispatch";
+
+    const UriStrVec wrong_scheme = {"mooncake://test_nfs/" + path + "?blkid=0&size=5"};
+    const auto [scheme_save_ec, scheme_actual_uris] = client->SaveObjects(wrong_scheme, {payload.size()}, {buffer});
+    EXPECT_EQ(ER_INVALID_PARAMS, scheme_save_ec);
+    EXPECT_TRUE(scheme_actual_uris.empty());
+    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(wrong_scheme, {payload.size()}, {buffer}));
+
+    for (const std::string &block_id : {"1", "-1", "not-a-number", "18446744073709551616"}) {
+        SCOPED_TRACE(block_id);
+        const UriStrVec non_singleton = {"file://test_nfs/" + path + "?blkid=" + block_id + "&size=5"};
+        const auto [save_ec, actual_uris] = client->SaveObjects(non_singleton, {payload.size()}, {buffer});
+        EXPECT_EQ(ER_INVALID_PARAMS, save_ec);
+        EXPECT_TRUE(actual_uris.empty());
+        EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(non_singleton, {payload.size()}, {buffer}));
+    }
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
+TEST_F(KvMetaTransferClientTest, RejectsAmbiguousRawUriSyntaxBeforeIo) {
+    auto client = KvMetaTransferClient::Create(client_config_, init_params_, 1024);
+    ASSERT_NE(nullptr, client);
+    std::vector<char> payload(5, 1);
+    const auto buffer = MakeBuffer(payload.data(), payload.size());
+    const std::string path = root_path_ + "ambiguous_must_not_dispatch";
+    const UriStrVec ambiguous_uris = {
+        "file://test_nfs/" + path + "?blkid=0&size=1&size=5",
+        "file://test_nfs/" + path + "?blkid=1&blkid=0&size=5",
+        "file://test_nfs/" + path + "?blkid=0&size=5&token=value#fragment",
+    };
+
+    for (const auto &uri : ambiguous_uris) {
+        SCOPED_TRACE(uri);
+        const auto [save_ec, actual_uris] = client->SaveObjects({uri}, {payload.size()}, {buffer});
+        EXPECT_EQ(ER_INVALID_PARAMS, save_ec);
+        EXPECT_TRUE(actual_uris.empty());
+        EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects({uri}, {payload.size()}, {buffer}));
+    }
+    EXPECT_FALSE(std::filesystem::exists(path));
+}
+
 TEST_F(KvMetaTransferClientTest, RejectsIgnoredOrOversizedObjects) {
     auto client = KvMetaTransferClient::Create(client_config_, init_params_, 8);
     ASSERT_NE(nullptr, client);

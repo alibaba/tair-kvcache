@@ -1,7 +1,11 @@
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -14,7 +18,7 @@
 namespace kv_cache_manager {
 namespace {
 
-static_assert(kKvMetaObjectClientApiVersion == 1);
+static_assert(kKvMetaObjectClientApiVersion == 2);
 
 TEST(KvMetaObjectClientVersionTest, SharedLibraryExportsHeaderCapabilityVersion) {
     EXPECT_EQ(GetKvMetaObjectClientApiVersion(), kKvMetaObjectClientApiVersion);
@@ -75,7 +79,7 @@ KvMetaObjectClientConfig MakeStaticallyValidCreateConfig() {
     return config;
 }
 
-class FakeKvMetaClient final : public KvMetaClient {
+class FakeKvMetaClient : public KvMetaClient {
 public:
     std::pair<ClientErrorCode, std::string>
     RegisterInstance(const std::string &, const std::string &, const std::string &) override {
@@ -152,6 +156,34 @@ public:
     std::string finished_session;
     std::vector<bool> finished_keys;
     std::vector<std::string> removed_keys;
+};
+
+struct BlockingStartControl {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered{false};
+    std::size_t entered_count{0};
+    bool released{false};
+};
+
+class BlockingStartKvMetaClient final : public FakeKvMetaClient {
+public:
+    explicit BlockingStartKvMetaClient(std::shared_ptr<BlockingStartControl> control) : control_(std::move(control)) {}
+
+    std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &,
+                                                                  const std::vector<std::string> &,
+                                                                  const std::vector<std::uint64_t> &,
+                                                                  std::int32_t) override {
+        std::unique_lock<std::mutex> lock(control_->mutex);
+        control_->entered = true;
+        ++control_->entered_count;
+        control_->condition.notify_all();
+        control_->condition.wait(lock, [&]() { return control_->released; });
+        return {ER_SERVICE_NOT_READY, {}};
+    }
+
+private:
+    std::shared_ptr<BlockingStartControl> control_;
 };
 
 class FakeKvMetaTransferClient final : public KvMetaTransferClient {
@@ -435,6 +467,26 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
     EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
 }
 
+TEST_F(KvMetaObjectClientTest, AcceptsSemanticallyIdenticalCanonicalizedUris) {
+    metadata_->start_result.write_session_id = "session";
+    metadata_->start_result.key_mask = {false, false};
+    metadata_->start_result.locations = {
+        MakeLocation("file://nfs/first?size=5&blkid=0", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9&blkid=0", sizeof(second_)),
+    };
+    // SDK results are serialized from StandardUri and therefore sort query
+    // keys. Parameter order is not an object-identity change.
+    transfer_->actual_uris = {
+        "file://nfs/first?blkid=0&size=5",
+        "file://nfs/second?blkid=0&size=9",
+    };
+
+    EXPECT_EQ(ER_OK, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, transfer_->save_calls);
+    EXPECT_EQ(1, metadata_->finish_calls);
+    EXPECT_EQ((std::vector<bool>{true, true}), metadata_->finished_keys);
+}
+
 TEST_F(KvMetaObjectClientTest, PropagatesCommitFailureWithoutRepeatingDataWrite) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
@@ -609,6 +661,17 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
 
     malformed = MakeLocation("", sizeof(first_));
     expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("mooncake://nfs/first?size=5", sizeof(first_));
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("file://nfs/first?blkid=1&size=5", sizeof(first_));
+    expect_internal(std::move(malformed));
+
+    // StandardUri keeps the last duplicate value. Reject duplicates before
+    // parsing so different components cannot disagree on object identity.
+    malformed = MakeLocation("file://nfs/first?size=999&size=5", sizeof(first_));
+    expect_internal(std::move(malformed));
 }
 
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMalformedMetadataAlignment) {
@@ -741,6 +804,86 @@ TEST(KvMetaObjectClientDependencyTest, MissingInternalDependenciesFailClosed) {
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("trace", keys, sizes, buffers));
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.LoadObjects("trace", keys, sizes, buffers));
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.Remove("trace", keys));
+}
+
+TEST(KvMetaObjectClientDependencyTest, ExplicitCloseIsIdempotentAndDisablesValidOperations) {
+    char payload = 0;
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 1024, 30);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<std::uint64_t> sizes{1};
+    const BlockBuffers buffers{MakeBuffer(&payload, 1)};
+
+    client.Close();
+    client.Close();
+
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("trace", keys, sizes, buffers));
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.LoadObjects("trace", keys, sizes, buffers));
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.Remove("trace", keys));
+}
+
+TEST(KvMetaObjectClientDependencyTest, ExplicitCloseWaitsForAnAdmittedOperation) {
+    using namespace std::chrono_literals;
+    char payload = 0;
+    auto control = std::make_shared<BlockingStartControl>();
+    auto metadata = std::make_unique<BlockingStartKvMetaClient>(control);
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 1024, 30);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<std::uint64_t> sizes{1};
+    const BlockBuffers buffers{MakeBuffer(&payload, 1)};
+
+    auto operation = std::async(std::launch::async,
+                                [&]() { return client.SaveObjects("blocking-operation", keys, sizes, buffers); });
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lock(control->mutex);
+        entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered; });
+        if (!entered) {
+            control->released = true;
+            control->condition.notify_all();
+        }
+    }
+    ASSERT_TRUE(entered);
+    auto close = std::async(std::launch::async, [&]() { client.Close(); });
+    EXPECT_EQ(std::future_status::timeout, close.wait_for(50ms));
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        control->released = true;
+        control->condition.notify_all();
+    }
+
+    EXPECT_EQ(ER_SERVICE_NOT_READY, operation.get());
+    EXPECT_EQ(std::future_status::ready, close.wait_for(2s));
+    close.get();
+    EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("after-close", keys, sizes, buffers));
+}
+
+TEST(KvMetaObjectClientDependencyTest, OperationsRemainConcurrentBeforeClose) {
+    using namespace std::chrono_literals;
+    char payload = 0;
+    auto control = std::make_shared<BlockingStartControl>();
+    auto metadata = std::make_unique<BlockingStartKvMetaClient>(control);
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 1024, 30);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<std::uint64_t> sizes{1};
+    const BlockBuffers buffers{MakeBuffer(&payload, 1)};
+
+    auto first = std::async(std::launch::async, [&]() { return client.SaveObjects("first", keys, sizes, buffers); });
+    auto second = std::async(std::launch::async, [&]() { return client.SaveObjects("second", keys, sizes, buffers); });
+    bool both_entered = false;
+    {
+        std::unique_lock<std::mutex> lock(control->mutex);
+        both_entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered_count == 2; });
+        control->released = true;
+        control->condition.notify_all();
+    }
+
+    EXPECT_TRUE(both_entered);
+    EXPECT_EQ(ER_SERVICE_NOT_READY, first.get());
+    EXPECT_EQ(ER_SERVICE_NOT_READY, second.get());
 }
 
 TEST(KvMetaObjectClientLimitTest, AcceptsExactBatchByteLimitAndRejectsTheNextObjectBeforeMetadata) {

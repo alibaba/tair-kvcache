@@ -1732,6 +1732,12 @@ private:
             if (ShouldStop()) {
                 return false;
             }
+            const auto &trimming = owner_->trimming_instances_[quota_shard];
+            if (std::any_of(instances.begin(), instances.end(), [&](const auto &instance) {
+                    return instance && trimming.count(instance->instance_id()) != 0;
+                })) {
+                return false;
+            }
             // Pressure and admission can change while sampling. Recheck under
             // the same group shard used by Put/Remove/Trim before changing any
             // metadata, so a completed concurrent delete cannot cause an
@@ -2606,6 +2612,10 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     const std::size_t quota_shard =
         std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
     std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
+    if (trimming_instances_[quota_shard].count(internal_instance_id) != 0) {
+        AddError(request_context, "KVMeta instance is being trimmed");
+        return {EC_EXIST, StartWriteResult{}};
+    }
 
     // A retired location normally remains visible as CLS_DELETING until its
     // final persistence barrier succeeds. If that barrier failed after the
@@ -2964,6 +2974,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         const ErrorCode direct_cleanup_ec = DeleteAllocatedLocations(request_context, direct_deletes);
         if (reload_ec != EC_OK || meta_cleanup_ec != EC_OK || direct_cleanup_ec != EC_OK) {
             AddError(request_context, "KVMeta start rollback was incomplete; uncertain allocations were retained");
+            return EC_OUTCOME_UNKNOWN;
         }
         return original_error;
     };
@@ -3092,6 +3103,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {EC_ERROR, StartWriteResult{}};
     }
     response.write_session_id = std::move(session_id);
+    response.session_item_count = session_items.size();
     for (const auto &location : response.locations) {
         data_storage_manager->RecordWriteBytes(selected.name, location.value_size);
     }
@@ -3175,7 +3187,12 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
             if (ec == EC_OK && modifier_committed[i]) {
                 committed[layer[i]] = true;
             } else {
-                commit_error = FirstHardError(commit_error, ec == EC_OK ? EC_MISMATCH : ec);
+                // A reservation disappearing before commit is a failed CAS,
+                // not an idempotent absence. FirstHardError intentionally
+                // ignores EC_NOENT for read/remove aggregation, so normalize
+                // it here or a partially committed batch could be reported
+                // as successful without running rollback.
+                commit_error = FirstHardError(commit_error, ec == EC_OK || ec == EC_NOENT ? EC_MISMATCH : ec);
             }
         }
         if (rmw.ec != EC_OK && rmw.ec != EC_PARTIAL_OK) {
@@ -3226,6 +3243,7 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
     if (reload_ec != EC_OK || exact_ec != EC_OK || direct_ec != EC_OK) {
         AddError(request_context,
                  "KVMeta commit rollback was incomplete; exact metadata guards prevented unsafe deletion");
+        return EC_OUTCOME_UNKNOWN;
     }
     return commit_error;
 }
@@ -3290,11 +3308,15 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
         // a successor allocation that reused the same backend address.
         KVCM_LOG_WARN("KVMeta active write cleanup did not complete; backend orphan cleanup may be required, "
                       "item_count[%zu], failure[%s], ec[%d]",
-                      success_keys.size(),
+                      session.items.size(),
                       failure_kind,
                       cleanup_ec);
         AddError(request_context, "KVMeta active write cleanup failed; backend orphan cleanup may be required");
-        return cleanup_ec;
+        // Preserve the lease-expired result: cleanup failure can create an
+        // orphan, but it must not hide the fact that the session was already
+        // ineligible to commit. Explicit caller aborts still surface their
+        // cleanup error because completed_result is EC_OK in that path.
+        return completed_result == EC_OK ? cleanup_ec : completed_result;
     };
 
     const bool expired = take_result == KvMetaWriteSessionManager::TakeResult::kExpired ||
@@ -3339,6 +3361,10 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
     std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
 
     const std::string internal_instance_id = InternalInstanceId(instance_id);
+    if (trimming_instances_[quota_shard].count(internal_instance_id) != 0) {
+        AddError(request_context, "KVMeta instance is being trimmed");
+        return EC_EXIST;
+    }
     std::vector<ExactLocation> exact;
     if (const ErrorCode ec = LoadExactLocations(request_context, internal_instance_id, keys, exact); ec != EC_OK) {
         return ec;
@@ -3400,9 +3426,10 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
         return EC_EXIST;
     }
 
-    // Block only new KVMeta allocations in this dedicated group. Existing
-    // KV-cache groups never take these locks, and each delete batch remains
-    // bounded even for a very large embedding namespace.
+    // Publish a per-instance fence under the same shard used by StartWrite,
+    // Remove and reclaim retirement. The fence closes the check-to-lock race,
+    // while releasing the shard below prevents an unbounded metadata scan or
+    // slow physical delete from stalling unrelated instances in this group.
     const std::size_t quota_shard =
         std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
     std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
@@ -3423,6 +3450,30 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
         AddError(request_context, "KVMeta cannot trim an instance while automatic reclaim is pending");
         return EC_EXIST;
     }
+    try {
+        if (!trimming_instances_[quota_shard].insert(internal_instance_id).second) {
+            AddError(request_context, "KVMeta instance is already being trimmed");
+            return EC_EXIST;
+        }
+    } catch (...) {
+        AddError(request_context, "KVMeta could not publish the trim admission fence");
+        return EC_ERROR;
+    }
+
+    struct TrimMarkerGuard {
+        std::mutex *mutex = nullptr;
+        std::unordered_set<std::string> *instances = nullptr;
+        const std::string *instance_id = nullptr;
+
+        ~TrimMarkerGuard() noexcept {
+            if (!mutex || !instances || !instance_id) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(*mutex);
+            instances->erase(*instance_id);
+        }
+    } trim_marker{&quota_admission_mutexes_[quota_shard], &trimming_instances_[quota_shard], &internal_instance_id};
+    quota_lock.unlock();
 
     for (;;) {
         if (maintenance_cancelled_.load(std::memory_order_acquire)) {

@@ -24,6 +24,9 @@ enum ErrorCode {
     SIZE_MISMATCH = 14;
 
     IO_ERROR = 20;
+    // The mutation may have taken effect. The caller must reconcile state and
+    // must not retry blindly.
+    OUTCOME_UNKNOWN = 21;
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }

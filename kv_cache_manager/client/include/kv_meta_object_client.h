@@ -14,7 +14,7 @@ namespace kv_cache_manager {
 // Increment when the Python-visible object API changes incompatibly.  The
 // packaged Python wrapper checks this value before constructing native state so
 // a stale extension cannot silently reinterpret exact-size object requests.
-inline constexpr std::uint32_t kKvMetaObjectClientApiVersion = 1;
+inline constexpr std::uint32_t kKvMetaObjectClientApiVersion = 2;
 
 // Returns the capability version compiled into kv_cache_manager_client.so.
 // Consumers should compare this with kKvMetaObjectClientApiVersion before
@@ -45,6 +45,8 @@ struct KvMetaObjectClientConfig {
 // complete value; ignored or zero-length IOVs are rejected before StartWrite.
 // GPU callers must make producer work visible before SaveObjects; this API
 // accepts raw pointers and does not inherit framework-specific stream order.
+// Calls on one object client may run concurrently. Close rejects new calls and
+// safely waits for already-admitted synchronous operations.
 class KvMetaObjectClient {
 public:
     virtual ~KvMetaObjectClient() = default;
@@ -74,6 +76,11 @@ public:
                                         const BlockBuffers &object_buffers) = 0;
 
     virtual ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
+
+    // Waits for operations already admitted by this client and releases its
+    // metadata/data-plane resources. Close is idempotent; subsequent valid
+    // operations return ER_CLIENT_NOT_EXISTS.
+    virtual void Close() noexcept = 0;
 
 protected:
     KvMetaObjectClient() = default;

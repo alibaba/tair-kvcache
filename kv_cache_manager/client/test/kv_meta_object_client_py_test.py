@@ -24,6 +24,7 @@ class _Code(IntEnum):
     ER_OK = 0
     ER_INVALID_GRPCSTATUS = 2
     ER_FAILED = 51
+    ER_SERVICE_OUTCOME_UNKNOWN = 65
 
 
 class _Memory(IntEnum):
@@ -78,6 +79,9 @@ class _FakeClient:
         self.close_calls += 1
         self.closed = True
 
+    def Close(self):
+        self.close()
+
 
 class _FakePybind:
     KV_META_OBJECT_API_VERSION = KV_META_OBJECT_API_VERSION
@@ -95,7 +99,7 @@ class _FakePybind:
         self.client = client or _FakeClient()
         self.create_code = create_code
         self.create_calls = []
-        self.KvMetaObjectClient = SimpleNamespace(Create=self._create)
+        self.KvMetaObjectClient = SimpleNamespace(Create=self._create, Close=_FakeClient.Close)
 
     def _create(self, trace_id, config):
         self.create_calls.append((trace_id, config))
@@ -232,9 +236,11 @@ class KvMetaObjectBufferTest(unittest.TestCase):
     def test_tensor_adapter_derives_exact_size_memory_and_owner(self):
         cpu = _Tensor(pointer=0x1000, count=3, width=4)
         cuda = _Tensor(pointer=0x2000, count=7, width=2, device="cuda")
+        musa = _Tensor(pointer=0x3000, count=11, width=2, device="musa")
 
         cpu_buffer = KvMetaObjectBuffer.from_tensor("cpu", cpu)
         cuda_buffer = KvMetaObjectBuffer.from_tensor("cuda", cuda)
+        musa_buffer = KvMetaObjectBuffer.from_tensor("musa", musa)
 
         self.assertEqual(
             (cpu_buffer.pointer, cpu_buffer.nbytes, cpu_buffer.memory),
@@ -242,8 +248,11 @@ class KvMetaObjectBufferTest(unittest.TestCase):
         )
         self.assertEqual(cuda_buffer.memory, KvMetaObjectMemory.GPU)
         self.assertEqual(cuda_buffer.nbytes, 14)
+        self.assertEqual(musa_buffer.memory, KvMetaObjectMemory.GPU)
+        self.assertEqual(musa_buffer.nbytes, 22)
         self.assertIs(cpu_buffer.owner, cpu)
         self.assertIs(cuda_buffer.owner, cuda)
+        self.assertIs(musa_buffer.owner, musa)
 
     def test_malformed_tensor_protocol_is_rejected(self):
         cases = [
@@ -358,7 +367,9 @@ class KvMetaObjectClientTest(unittest.TestCase):
         def fail_create(*_args):
             raise OSError("secret endpoint and credentials")
 
-        pybind.KvMetaObjectClient = SimpleNamespace(Create=fail_create)
+        pybind.KvMetaObjectClient = SimpleNamespace(
+            Create=fail_create, Close=_FakeClient.Close
+        )
         with self.assertRaises(KvMetaObjectClientError) as raised:
             KvMetaObjectClient(_config(), _pybind_module=pybind)
 
@@ -369,7 +380,9 @@ class KvMetaObjectClientTest(unittest.TestCase):
 
     def test_malformed_create_result_fails_closed(self):
         pybind = _FakePybind()
-        pybind.KvMetaObjectClient = SimpleNamespace(Create=lambda *_args: _Code.ER_OK)
+        pybind.KvMetaObjectClient = SimpleNamespace(
+            Create=lambda *_args: _Code.ER_OK, Close=_FakeClient.Close
+        )
 
         with self.assertRaises(KvMetaObjectClientError) as raised:
             KvMetaObjectClient(_config(), _pybind_module=pybind)
@@ -407,6 +420,27 @@ class KvMetaObjectClientTest(unittest.TestCase):
     def test_incomplete_versioned_binding_is_rejected_before_creation(self):
         pybind = _FakePybind()
         pybind.MemoryType = SimpleNamespace(CPU=_Memory.CPU)
+
+        with self.assertRaisesRegex(ImportError, "incomplete"):
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertEqual(pybind.create_calls, [])
+
+    def test_versioned_binding_without_explicit_close_is_rejected(self):
+        pybind = _FakePybind()
+        pybind.KvMetaObjectClient = SimpleNamespace(Create=pybind._create)
+
+        with self.assertRaisesRegex(ImportError, "incomplete"):
+            KvMetaObjectClient(_config(), _pybind_module=pybind)
+
+        self.assertEqual(pybind.create_calls, [])
+
+    def test_versioned_binding_without_unknown_outcome_code_is_rejected(self):
+        pybind = _FakePybind()
+        pybind.ClientErrorCode = SimpleNamespace(
+            ER_OK=_Code.ER_OK,
+            ER_INVALID_GRPCSTATUS=_Code.ER_INVALID_GRPCSTATUS,
+        )
 
         with self.assertRaisesRegex(ImportError, "incomplete"):
             KvMetaObjectClient(_config(), _pybind_module=pybind)
@@ -595,6 +629,12 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertTrue(remove_error.exception.unknown_outcome)
         self.assertIsInstance(remove_error.exception.__cause__, OSError)
         self.assertNotIn("endpoint", str(remove_error.exception))
+
+        native.Remove = _FakeClient.Remove.__get__(native, _FakeClient)
+        native.results["Remove"] = [_Code.ER_SERVICE_OUTCOME_UNKNOWN]
+        with self.assertRaises(KvMetaObjectClientError) as service_error:
+            client.remove(["key"])
+        self.assertTrue(service_error.exception.unknown_outcome)
 
     def test_load_failure_stops_before_later_batches_and_is_not_ambiguous(self):
         client, native, _ = _client()
@@ -924,6 +964,7 @@ class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
             kvcm_py_client.KV_META_OBJECT_API_VERSION,
             KV_META_OBJECT_API_VERSION,
         )
+        self.assertTrue(callable(getattr(kvcm_py_client.KvMetaObjectClient, "Close", None)))
 
         iov = kvcm_py_client.Iov()
         iov.type = kvcm_py_client.MemoryType.CPU

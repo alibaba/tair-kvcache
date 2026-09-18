@@ -49,6 +49,8 @@ PbError ToKvMetaPbError(ErrorCode ec, bool session_lookup = false) {
     case EC_IO_ERROR:
     case EC_TIMEOUT:
         return proto::kv_meta::IO_ERROR;
+    case EC_OUTCOME_UNKNOWN:
+        return proto::kv_meta::OUTCOME_UNKNOWN;
     case EC_UNKNOWN:
         return proto::kv_meta::UNKNOWN_ERROR;
     default:
@@ -318,12 +320,12 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
         if (result.write_session_id.empty()) {
             return;
         }
-        // The request-aligned mask is the authoritative compact-session
-        // cardinality. If even that shape is malformed, locations is the only
-        // remaining bounded hint; a wrong count fails without consuming the
-        // session and timeout recovery remains the final safety net.
-        const std::size_t abort_count = result.key_mask.size() == keys.size() ? write_count : result.locations.size();
-        if (abort_count == 0) {
+        // Never guess from a malformed public shape: an incorrect mask does
+        // not consume the session, leaving allocations active until timeout.
+        // StartWrite records this exact cardinality only after publishing the
+        // compact session.
+        const std::size_t abort_count = result.session_item_count;
+        if (abort_count == 0 || abort_count > kv_meta_manager_->limits().max_batch_items) {
             return;
         }
         const std::vector<bool> failed(abort_count, false);
@@ -336,7 +338,7 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
         }
     };
     if (result.key_mask.size() != keys.size() || result.locations.size() != write_count ||
-        (write_count == 0 && !result.write_session_id.empty()) ||
+        result.session_item_count != write_count || (write_count == 0 && !result.write_session_id.empty()) ||
         (write_count != 0 && result.write_session_id.empty())) {
         abort_session();
         SetDirectError(

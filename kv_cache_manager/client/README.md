@@ -14,7 +14,7 @@ KVMeta 对象。完整配置和状态机见
 
 `//kv_cache_manager/client/pybind:kvcm_py_client_lib_wheel` 同时发布 native binding 和
 `kv_cache_manager.client.KvMetaObjectClient`。高层 client 不依赖 torch；它按 tensor protocol 接受具有
-`is_contiguous()`、`data_ptr()`、`numel()`、`element_size()` 和 `device.type` 的连续 CPU/CUDA tensor：
+`is_contiguous()`、`data_ptr()`、`numel()`、`element_size()` 和 `device.type` 的连续 CPU/CUDA/MUSA tensor：
 
 ```python
 from kv_cache_manager.client import KvMetaObjectClient, KvMetaObjectClientConfig
@@ -35,9 +35,10 @@ with KvMetaObjectClient(config) as client:
 
 一次 Python 逻辑调用会先完整校验 keys、真实 byte size、buffer 和对象上限，再按服务端的 64 objects / 4 GiB
 上限分批；不会自动重试或回滚 mutation。RTP 使用每个 receipt 新生成的 UUID key，并由自身 pending/release/GC
-负责跨 batch 清理。CUDA producer 在调用 `save` 前仍须由框架侧同步对应 device stream。
+负责跨 batch 清理。CUDA/MUSA producer 在调用 `save` 前仍须由框架侧同步对应 device stream。Python context
+manager/`close()` 会调用 native `Close()`，等待该 client 已准入的同步调用并立即释放数据面线程池和注册资源。
 
-wheel 的 Python package 与 native extension 都导出 `KV_META_OBJECT_API_VERSION=1`；extension 的值来自所链接
+wheel 的 Python package 与 native extension 都导出 `KV_META_OBJECT_API_VERSION=2`；extension 的值来自所链接
 `kv_cache_manager_client.so` 导出的版本查询。高层 client 会在创建任何 native 状态前校验该 capability 及必需枚举/方法；
 部署必须使用同一次 KVCM 构建产出的 Python 源码、extension 与 client library，不能混装。
 mutation 返回 transport error、未知 error code 或畸形 code 时，Python 异常统一标记 `unknown_outcome=True`。

@@ -20,6 +20,34 @@ namespace {
 constexpr std::size_t kMaxKvMetaBatchItems = 64;
 constexpr std::uint64_t kMaxKvMetaBatchBytes = 4ULL * 1024 * 1024 * 1024;
 
+bool UriMatchesStorageType(const DataStorageUri &uri, DataStorageType storage_type) {
+    if (IsTairMempoolStorageType(storage_type)) {
+        return uri.GetProtocol() == kTairMempoolUriScheme;
+    }
+    const auto uri_type = ToDataStorageType(uri.GetProtocol());
+    return uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(storage_type);
+}
+
+bool HasSingletonAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
+    switch (storage_type) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        break;
+    default:
+        return true;
+    }
+    if (!uri.HasParam("blkid")) {
+        return true;
+    }
+    const std::string block_id_text = uri.GetParam("blkid");
+    std::uint64_t block_id = 0;
+    const auto parsed = std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
+    return !block_id_text.empty() && parsed.ec == std::errc{} &&
+           parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
+}
+
 } // namespace
 
 SdkWrapper::SdkWrapper() : sdk_factory_(SdkFactory::GetInstance()) {}
@@ -159,6 +187,7 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
             return ER_CREATESDK_ERROR;
         }
         sdk_map_.insert({storage_config->global_unique_name(), sdk});
+        sdk_storage_types_.insert({storage_config->global_unique_name(), type});
     }
     return ER_OK;
 }
@@ -378,6 +407,17 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         if (expected_size == 0 || expected_size > max_variable_object_bytes_ || !uri.Valid() ||
             expected_size > kMaxKvMetaBatchBytes || batch_bytes > kMaxKvMetaBatchBytes - expected_size ||
             uri.GetHostName().empty() || !uri.HasParam("size") || buffer.iovs.empty()) {
+            return ER_INVALID_PARAMS;
+        }
+        const auto storage_type = sdk_storage_types_.find(uri.GetHostName());
+        if (storage_type == sdk_storage_types_.end()) {
+            KVCM_LOG_WARN("KVMeta URI refers to an unknown storage backend: %s", uri.GetHostName().c_str());
+            return ER_GETSDK_ERROR;
+        }
+        if (!UriMatchesStorageType(uri, storage_type->second) ||
+            !HasSingletonAllocationShape(uri, storage_type->second)) {
+            KVCM_LOG_WARN("KVMeta URI scheme or singleton allocation shape does not match backend: %s",
+                          uri.GetHostName().c_str());
             return ER_INVALID_PARAMS;
         }
         batch_bytes += expected_size;

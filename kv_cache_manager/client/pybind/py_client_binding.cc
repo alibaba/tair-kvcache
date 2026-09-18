@@ -111,6 +111,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_SERVICE_SESSION_NOT_FOUND", kvcm::ClientErrorCode::ER_SERVICE_SESSION_NOT_FOUND)
         .value("ER_SERVICE_SIZE_MISMATCH", kvcm::ClientErrorCode::ER_SERVICE_SIZE_MISMATCH)
         .value("ER_SERVICE_IO_ERROR", kvcm::ClientErrorCode::ER_SERVICE_IO_ERROR)
+        .value("ER_SERVICE_OUTCOME_UNKNOWN", kvcm::ClientErrorCode::ER_SERVICE_OUTCOME_UNKNOWN)
         .value("ER_SDK_TIMEOUT", kvcm::ClientErrorCode::ER_SDK_TIMEOUT)
         .value("ER_GETSDK_ERROR", kvcm::ClientErrorCode::ER_GETSDK_ERROR)
         .value("ER_CREATESDK_ERROR", kvcm::ClientErrorCode::ER_CREATESDK_ERROR)
@@ -291,6 +292,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              &kvcm::KvMetaObjectClient::Remove,
              py::arg("trace_id"),
              py::arg("keys"),
-             py::call_guard<py::gil_scoped_release>());
+             py::call_guard<py::gil_scoped_release>())
+        .def("Close", &kvcm::KvMetaObjectClient::Close, py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager
