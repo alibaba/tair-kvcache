@@ -4519,6 +4519,10 @@ ErrorCode CacheManager::DoCleanup() {
     }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
+    // A retry already inside DoRecoverOnce may have published true after the
+    // store at cleanup entry. Joining it first and clearing again guarantees
+    // that observers never see cleaned-up indexers as recovery-complete.
+    recover_complete_.store(false, std::memory_order_release);
     DeactivateEventCleanupCallbacks();
     // aborting write session need meta indexer
     if (write_location_manager_) {
