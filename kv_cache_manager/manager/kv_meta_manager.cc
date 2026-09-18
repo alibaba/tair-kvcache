@@ -686,6 +686,7 @@ public:
         pending_instances_.clear();
         pending_locations_.clear();
         pending_credits_.clear();
+        admission_demands_.clear();
         pending_batches_.clear();
         sampling_rotation_by_group_.clear();
         pending_object_count_ = 0;
@@ -722,6 +723,71 @@ public:
         return it != pending_credits_.end() && it->second.blocked_batch_count != 0;
     }
 
+    // Record the largest request that was rejected only because existing
+    // cache entries consume its hard byte/key capacity. A wake-up alone is
+    // insufficient below the configured watermark: the worker must know how
+    // much headroom this concrete request needs. Max (rather than sum) avoids
+    // evicting the whole cache for a burst of equivalent retries.
+    void RequestAdmissionCapacity(const std::string &instance_group,
+                                  DataStorageType storage_type,
+                                  std::uint64_t requested_bytes,
+                                  const std::string &internal_instance_id = {},
+                                  std::uint64_t requested_keys = 0) noexcept {
+        if (instance_group.empty() || (requested_bytes == 0 && requested_keys == 0) ||
+            (requested_keys != 0 && internal_instance_id.empty())) {
+            return;
+        }
+        try {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stopping_) {
+                    return;
+                }
+                // Allocate every map node before changing the published
+                // demand. A failed allocation must not leave a sequence-zero
+                // entry that can neither be observed as new nor cleared.
+                const auto [demand_it, inserted_group] = admission_demands_.try_emplace(instance_group);
+                try {
+                    if (requested_keys != 0) {
+                        demand_it->second.requested_keys_by_instance.try_emplace(internal_instance_id, 0);
+                    }
+                } catch (...) {
+                    if (inserted_group) {
+                        admission_demands_.erase(demand_it);
+                    }
+                    throw;
+                }
+                auto &demand = demand_it->second;
+                demand.requested_group_bytes = std::max(demand.requested_group_bytes, requested_bytes);
+                if (requested_bytes != 0 && storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+                    const std::size_t type_index = ToIndex(ToBaseType(storage_type));
+                    if (type_index < demand.requested_bytes_by_type.size()) {
+                        demand.requested_bytes_by_type[type_index] =
+                            std::max(demand.requested_bytes_by_type[type_index], requested_bytes);
+                    }
+                }
+                if (requested_keys != 0) {
+                    auto &instance_keys = demand.requested_keys_by_instance.find(internal_instance_id)->second;
+                    instance_keys = std::max(instance_keys, requested_keys);
+                }
+                // Zero means "no demand" in pressure snapshots. Keep it
+                // reserved even after the practically unreachable uint64 wrap.
+                if (++next_admission_demand_sequence_ == 0) {
+                    ++next_admission_demand_sequence_;
+                }
+                demand.sequence = next_admission_demand_sequence_;
+                ++admission_demand_count_metrics_;
+                admission_demand_group_count_metrics_ = static_cast<double>(admission_demands_.size());
+                wake_requested_ = true;
+            }
+            condition_.notify_all();
+        } catch (const std::exception &e) {
+            KVCM_LOG_WARN("failed to publish KVMeta admission demand: %s", e.what());
+        } catch (...) {
+            KVCM_LOG_WARN("failed to publish KVMeta admission demand with unknown exception");
+        }
+    }
+
 private:
     void FailClosedMaintenance() noexcept {
         if (!owner_) {
@@ -750,6 +816,7 @@ private:
             retry_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.retry_count");
             error_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.error_count");
             pending_limit_reject_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.pending_limit_reject_count");
+            admission_demand_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.admission_demand_count");
             physical_delete_attempted_object_count_metrics_ =
                 registry->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count");
             physical_delete_uncertain_object_count_metrics_ =
@@ -759,6 +826,8 @@ private:
             pending_object_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_object_count");
             pending_bytes_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_bytes");
             blocked_group_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.blocked_group_count");
+            admission_demand_group_count_metrics_ =
+                registry->GetGauge("kv_meta_reclaimer.admission_demand_group_count");
             UpdatePendingMetricsLocked();
         } catch (const std::exception &e) {
             KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics: %s", e.what());
@@ -775,25 +844,24 @@ private:
                 return entry.second.blocked_batch_count != 0;
             });
         blocked_group_count_metrics_ = static_cast<double>(blocked_groups);
+        admission_demand_group_count_metrics_ = static_cast<double>(admission_demands_.size());
     }
 
     struct Pressure {
         std::uint64_t group_bytes = 0;
         std::uint64_t keys = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+        std::map<std::string, std::uint64_t> keys_by_instance;
 
         bool Any() const noexcept {
             if (group_bytes != 0 || keys != 0) {
                 return true;
             }
             return std::any_of(
-                bytes_by_type.begin(), bytes_by_type.end(), [](std::uint64_t value) { return value != 0; });
-        }
-
-        bool Relevant(DataStorageType type, bool removes_key) const noexcept {
-            const std::size_t type_index = ToIndex(ToBaseType(type));
-            return group_bytes != 0 || (keys != 0 && removes_key) ||
-                   (type_index < bytes_by_type.size() && bytes_by_type[type_index] != 0);
+                       bytes_by_type.begin(), bytes_by_type.end(), [](std::uint64_t value) { return value != 0; }) ||
+                   std::any_of(keys_by_instance.begin(), keys_by_instance.end(), [](const auto &entry) {
+                       return entry.second != 0;
+                   });
         }
 
         void Consume(DataStorageType type, std::uint64_t bytes) noexcept {
@@ -801,6 +869,16 @@ private:
             const std::size_t type_index = ToIndex(ToBaseType(type));
             if (type_index < bytes_by_type.size()) {
                 bytes_by_type[type_index] = bytes >= bytes_by_type[type_index] ? 0 : bytes_by_type[type_index] - bytes;
+            }
+        }
+
+        void ConsumeKey(const std::string &internal_instance_id) noexcept {
+            if (keys != 0) {
+                --keys;
+            }
+            const auto it = keys_by_instance.find(internal_instance_id);
+            if (it != keys_by_instance.end() && it->second != 0) {
+                --it->second;
             }
         }
     };
@@ -833,10 +911,18 @@ private:
         std::uint64_t bytes = 0;
         std::uint64_t keys = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+        std::map<std::string, std::uint64_t> keys_by_instance;
         // The entry is created when the batch is enqueued, before a metadata
         // cleanup can fail. Finalization can therefore close admission without
         // allocating memory on the error path.
         std::size_t blocked_batch_count = 0;
+    };
+
+    struct AdmissionDemand {
+        std::uint64_t requested_group_bytes = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> requested_bytes_by_type{};
+        std::map<std::string, std::uint64_t> requested_keys_by_instance;
+        std::uint64_t sequence = 0;
     };
 
     struct PendingBatch {
@@ -888,6 +974,19 @@ private:
         return used > allowed ? used - allowed : 0;
     }
 
+    static std::uint64_t
+    BytesToFit(std::int64_t capacity, std::uint64_t used, std::uint64_t requested, bool &possible) noexcept {
+        if (requested == 0) {
+            return 0;
+        }
+        if (capacity < 0 || requested > static_cast<std::uint64_t>(capacity)) {
+            possible = false;
+            return 0;
+        }
+        const std::uint64_t allowed_before_admission = static_cast<std::uint64_t>(capacity) - requested;
+        return used > allowed_before_admission ? used - allowed_before_admission : 0;
+    }
+
     bool ShouldStop() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return stopping_ || !owner_ || owner_->maintenance_cancelled_.load(std::memory_order_acquire);
@@ -925,6 +1024,29 @@ private:
         return it == pending_credits_.end() ? PendingCredit{} : it->second;
     }
 
+    AdmissionDemand GetAdmissionDemand(const std::string &instance_group) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = admission_demands_.find(instance_group);
+        return it == admission_demands_.end() ? AdmissionDemand{} : it->second;
+    }
+
+    void ClearAdmissionDemandIfCurrent(const std::string &instance_group, std::uint64_t sequence) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = admission_demands_.find(instance_group);
+            // A concurrent rejected request may have raised the high-water
+            // demand after this pressure snapshot. Never erase that newer
+            // request's signal.
+            if (it != admission_demands_.end() && it->second.sequence == sequence) {
+                admission_demands_.erase(it);
+                admission_demand_group_count_metrics_ = static_cast<double>(admission_demands_.size());
+            }
+        } catch (...) {
+            // Clearing a satisfied/impossible optimization signal must not
+            // terminate the worker. Keeping it is safe and will be retried.
+        }
+    }
+
     bool HasPendingCapacity(const std::vector<Candidate> &candidates) const {
         std::uint64_t candidate_bytes = 0;
         for (const auto &candidate : candidates) {
@@ -940,12 +1062,14 @@ private:
                       const InstanceGroup &group,
                       const std::vector<InstanceInfoConstPtr> &instances,
                       double threshold,
-                      Pressure &out) const {
+                      Pressure &out) {
         out = {};
         std::uint64_t group_usage = 0;
         std::uint64_t key_count = 0;
         std::uint64_t max_key_count = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> usage_by_type{};
+        std::map<std::string, std::uint64_t> key_count_by_instance;
+        std::map<std::string, std::uint64_t> max_key_count_by_instance;
         for (const auto &instance : instances) {
             if (!instance || !IsKvMetaInstance(*instance)) {
                 AddError(request_context, "KVMeta reclaimer requires a dedicated generic-object instance group");
@@ -960,6 +1084,8 @@ private:
             group_usage = SaturatingAdd(group_usage, indexer->GetStorageUsage());
             key_count = SaturatingAdd(key_count, static_cast<std::uint64_t>(indexer->GetKeyCount()));
             max_key_count = SaturatingAdd(max_key_count, static_cast<std::uint64_t>(indexer->GetMaxKeyCount()));
+            key_count_by_instance[instance->instance_id()] = static_cast<std::uint64_t>(indexer->GetKeyCount());
+            max_key_count_by_instance[instance->instance_id()] = static_cast<std::uint64_t>(indexer->GetMaxKeyCount());
             for (std::size_t i = 1; i < usage_by_type.size(); ++i) {
                 const auto type = static_cast<DataStorageType>(i);
                 if (ToBaseType(type) != type) {
@@ -972,6 +1098,12 @@ private:
         const PendingCredit credit = GetPendingCredit(group.name());
         group_usage = SaturatingSub(group_usage, credit.bytes);
         key_count = SaturatingSub(key_count, credit.keys);
+        for (auto &[instance_id, instance_key_count] : key_count_by_instance) {
+            const auto credit_it = credit.keys_by_instance.find(instance_id);
+            if (credit_it != credit.keys_by_instance.end()) {
+                instance_key_count = SaturatingSub(instance_key_count, credit_it->second);
+            }
+        }
         for (std::size_t i = 0; i < usage_by_type.size(); ++i) {
             usage_by_type[i] = SaturatingSub(usage_by_type[i], credit.bytes_by_type[i]);
         }
@@ -982,6 +1114,13 @@ private:
                                    : static_cast<std::int64_t>(max_key_count),
                                threshold,
                                key_count);
+        const AdmissionDemand demand = GetAdmissionDemand(group.name());
+        bool demand_possible = true;
+        bool demand_satisfied = demand.sequence != 0;
+        const std::uint64_t group_demand_pressure =
+            BytesToFit(group.quota().capacity(), group_usage, demand.requested_group_bytes, demand_possible);
+        out.group_bytes = std::max(out.group_bytes, group_demand_pressure);
+        demand_satisfied = demand_satisfied && group_demand_pressure == 0;
         for (const auto &quota : group.quota().quota_config()) {
             const auto base_type = ToBaseType(quota.storage_spec());
             const std::size_t type_index = ToIndex(base_type);
@@ -990,6 +1129,32 @@ private:
             }
             out.bytes_by_type[type_index] = std::max(
                 out.bytes_by_type[type_index], BytesToFree(quota.capacity(), threshold, usage_by_type[type_index]));
+            const std::uint64_t type_demand_pressure = BytesToFit(quota.capacity(),
+                                                                  usage_by_type[type_index],
+                                                                  demand.requested_bytes_by_type[type_index],
+                                                                  demand_possible);
+            out.bytes_by_type[type_index] = std::max(out.bytes_by_type[type_index], type_demand_pressure);
+            demand_satisfied = demand_satisfied && type_demand_pressure == 0;
+        }
+        for (const auto &[instance_id, requested_keys] : demand.requested_keys_by_instance) {
+            const auto used_it = key_count_by_instance.find(instance_id);
+            const auto capacity_it = max_key_count_by_instance.find(instance_id);
+            if (used_it == key_count_by_instance.end() || capacity_it == max_key_count_by_instance.end() ||
+                requested_keys > capacity_it->second) {
+                demand_possible = false;
+                continue;
+            }
+            const std::uint64_t allowed_before_admission = capacity_it->second - requested_keys;
+            if (used_it->second > allowed_before_admission) {
+                out.keys_by_instance[instance_id] = used_it->second - allowed_before_admission;
+                demand_satisfied = false;
+            }
+        }
+        if (!demand_possible || demand_satisfied) {
+            // An impossible demand must not remain armed and continuously scan
+            // or evict the cache after a quota/configuration change. A caller
+            // with a still-viable request will publish a fresh demand on retry.
+            ClearAdmissionDemandIfCurrent(group.name(), demand.sequence);
         }
         return true;
     }
@@ -997,6 +1162,7 @@ private:
     bool CollectCandidates(RequestContext *request_context,
                            const std::string &instance_group,
                            const std::vector<InstanceInfoConstPtr> &instances,
+                           const Pressure &pressure,
                            std::size_t sampling_size,
                            std::vector<CandidateKey> &out) {
         out.clear();
@@ -1027,9 +1193,28 @@ private:
         const std::size_t rotation = sampling_rotation_by_group_[instance_group] % eligible.size();
         std::vector<std::pair<InstanceInfoConstPtr, std::size_t>> selected_instances;
         selected_instances.reserve(instance_budget);
-        for (std::size_t offset = 0; offset < instance_budget; ++offset) {
-            selected_instances.push_back(eligible[(rotation + offset) % eligible.size()]);
-            total_key_count = SaturatingAdd(total_key_count, selected_instances.back().second);
+        std::set<std::string> selected_instance_ids;
+        // A rejected request at one full instance must not wait for a group
+        // round-robin over every peer. Reserve the bounded sampling slots for
+        // specifically pressured instances first, then retain rotation for the
+        // remaining periodic/group/type work.
+        for (const auto &entry : eligible) {
+            const auto pressure_it = pressure.keys_by_instance.find(entry.first->instance_id());
+            if (pressure_it != pressure.keys_by_instance.end() && pressure_it->second != 0 &&
+                selected_instances.size() < instance_budget) {
+                selected_instances.push_back(entry);
+                selected_instance_ids.insert(entry.first->instance_id());
+            }
+        }
+        for (std::size_t offset = 0; offset < eligible.size() && selected_instances.size() < instance_budget;
+             ++offset) {
+            const auto &entry = eligible[(rotation + offset) % eligible.size()];
+            if (selected_instance_ids.insert(entry.first->instance_id()).second) {
+                selected_instances.push_back(entry);
+            }
+        }
+        for (const auto &entry : selected_instances) {
+            total_key_count = SaturatingAdd(total_key_count, entry.second);
         }
         sampling_rotation_by_group_[instance_group] = (rotation + instance_budget) % eligible.size();
 
@@ -1136,34 +1321,102 @@ private:
                    std::tie(rhs.last_access_time_us, rhs.internal_instance_id, rhs.internal_key);
         });
         std::vector<Candidate> selected;
-        selected.reserve(std::min(batch_size, candidates.size()));
-        for (const auto &key_candidate : candidates) {
-            if (!pressure.Any() || selected.size() >= batch_size) {
-                break;
+        selected.reserve(std::min<std::size_t>(batch_size, kPendingObjectLimit));
+        std::vector<std::vector<bool>> object_selected;
+        object_selected.reserve(candidates.size());
+        std::vector<std::size_t> selected_per_key(candidates.size(), 0);
+        std::vector<bool> key_credit_applied(candidates.size(), false);
+        for (const auto &candidate : candidates) {
+            object_selected.emplace_back(candidate.objects.size(), false);
+        }
+
+        const auto has_type_pressure = [&pressure](const CandidateKey &key_candidate) {
+            return std::any_of(key_candidate.objects.begin(), key_candidate.objects.end(), [&](const Candidate &item) {
+                const std::size_t type_index = ToIndex(ToBaseType(item.location->type()));
+                return type_index < pressure.bytes_by_type.size() && pressure.bytes_by_type[type_index] != 0;
+            });
+        };
+        const auto select_object = [&](std::size_t key_index, std::size_t object_index) {
+            if (selected.size() >= batch_size || object_selected[key_index][object_index]) {
+                return false;
             }
-            const bool reclaim_whole_key = pressure.keys != 0 && key_candidate.all_locations_committed &&
-                                           key_candidate.objects.size() <= batch_size - selected.size();
-            std::size_t selected_for_key = 0;
-            for (const auto &candidate : key_candidate.objects) {
-                if (selected.size() >= batch_size) {
-                    break;
-                }
-                if (!reclaim_whole_key && !pressure.Relevant(candidate.location->type(), false)) {
-                    continue;
-                }
-                selected.push_back(candidate);
-                ++selected_for_key;
-                pressure.Consume(candidate.location->type(), candidate.value_size);
+            const Candidate &candidate = candidates[key_index].objects[object_index];
+            object_selected[key_index][object_index] = true;
+            ++selected_per_key[key_index];
+            selected.push_back(candidate);
+            pressure.Consume(candidate.location->type(), candidate.value_size);
+            if (!key_credit_applied[key_index] && candidates[key_index].all_locations_committed &&
+                selected_per_key[key_index] == candidates[key_index].objects.size()) {
+                // Whichever constraint selected the last location has removed
+                // the complete primary metadata key. Credit it exactly once so
+                // a simultaneous key-count pressure cannot over-evict.
+                selected.back().removes_metadata_key = true;
+                pressure.ConsumeKey(candidates[key_index].internal_instance_id);
+                key_credit_applied[key_index] = true;
             }
-            if (reclaim_whole_key && selected_for_key == key_candidate.objects.size() && pressure.keys != 0) {
-                selected.back().removes_metadata_key = true;
-                --pressure.keys;
-            } else if (key_candidate.all_locations_committed && selected_for_key == key_candidate.objects.size() &&
-                       selected_for_key != 0) {
-                // Byte pressure happened to select the complete metadata key;
-                // credit that key so a concurrent key-count watermark does
-                // not retire an unnecessary additional object.
-                selected.back().removes_metadata_key = true;
+            return true;
+        };
+        const auto select_whole_key = [&](std::size_t key_index) {
+            const auto &key_candidate = candidates[key_index];
+            if (!key_candidate.all_locations_committed || key_candidate.objects.empty() ||
+                key_credit_applied[key_index] ||
+                key_candidate.objects.size() - selected_per_key[key_index] > batch_size - selected.size()) {
+                return false;
+            }
+            for (std::size_t object_index = 0; object_index < key_candidate.objects.size(); ++object_index) {
+                select_object(key_index, object_index);
+            }
+            return static_cast<bool>(key_credit_applied[key_index]);
+        };
+
+        // Specific constraints are subsets of the group constraint. Satisfy
+        // them first so the same retired bytes also reduce group pressure. A
+        // single global-LRU pass can otherwise retire an unrelated old object
+        // for the group and then a second object for the constrained type or
+        // instance, even though one retirement was sufficient.
+        for (std::size_t key_index = 0; key_index < candidates.size() && selected.size() < batch_size; ++key_index) {
+            const auto pressure_it = pressure.keys_by_instance.find(candidates[key_index].internal_instance_id);
+            if (pressure_it != pressure.keys_by_instance.end() && pressure_it->second != 0) {
+                select_whole_key(key_index);
+            }
+        }
+
+        // For aggregate key pressure, prefer a whole key that also relieves an
+        // outstanding storage-type pressure, preserving LRU order within that
+        // more useful class. Then fall back to the oldest remaining whole key.
+        for (const bool require_type_overlap : {true, false}) {
+            for (std::size_t key_index = 0;
+                 pressure.keys != 0 && key_index < candidates.size() && selected.size() < batch_size;
+                 ++key_index) {
+                if ((!require_type_overlap || has_type_pressure(candidates[key_index])) &&
+                    !key_credit_applied[key_index]) {
+                    select_whole_key(key_index);
+                }
+            }
+        }
+
+        // Storage-type pressure is narrower than group pressure. Select the
+        // oldest matching locations before using arbitrary bytes for the group.
+        for (std::size_t key_index = 0; key_index < candidates.size() && selected.size() < batch_size; ++key_index) {
+            for (std::size_t object_index = 0;
+                 object_index < candidates[key_index].objects.size() && selected.size() < batch_size;
+                 ++object_index) {
+                const auto &candidate = candidates[key_index].objects[object_index];
+                const std::size_t type_index = ToIndex(ToBaseType(candidate.location->type()));
+                if (type_index < pressure.bytes_by_type.size() && pressure.bytes_by_type[type_index] != 0) {
+                    select_object(key_index, object_index);
+                }
+            }
+        }
+
+        for (std::size_t key_index = 0;
+             pressure.group_bytes != 0 && key_index < candidates.size() && selected.size() < batch_size;
+             ++key_index) {
+            for (std::size_t object_index = 0;
+                 pressure.group_bytes != 0 && object_index < candidates[key_index].objects.size() &&
+                 selected.size() < batch_size;
+                 ++object_index) {
+                select_object(key_index, object_index);
             }
         }
         return selected;
@@ -1335,6 +1588,12 @@ private:
                     pending_locations_.try_emplace(location, 0);
                 }
                 pending_credits_.try_emplace(instance_group, PendingCredit{});
+                auto &prepared_credit = pending_credits_.find(instance_group)->second;
+                for (const auto &item : batch->items) {
+                    if (item.removes_metadata_key) {
+                        prepared_credit.keys_by_instance.try_emplace(item.internal_instance_id, 0);
+                    }
+                }
                 const auto [_, inserted] =
                     pending_batches_.emplace(PendingDeadline{batch->deadline, batch->sequence}, batch);
                 if (!inserted) {
@@ -1354,8 +1613,19 @@ private:
                     }
                 }
                 const auto credit_it = pending_credits_.find(instance_group);
+                if (credit_it != pending_credits_.end()) {
+                    for (auto it = credit_it->second.keys_by_instance.begin();
+                         it != credit_it->second.keys_by_instance.end();) {
+                        if (it->second == 0) {
+                            it = credit_it->second.keys_by_instance.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
                 if (credit_it != pending_credits_.end() && credit_it->second.bytes == 0 &&
                     credit_it->second.keys == 0 && credit_it->second.blocked_batch_count == 0 &&
+                    credit_it->second.keys_by_instance.empty() &&
                     std::none_of(credit_it->second.bytes_by_type.begin(),
                                  credit_it->second.bytes_by_type.end(),
                                  [](std::uint64_t value) { return value != 0; })) {
@@ -1376,6 +1646,12 @@ private:
                 credit.bytes = SaturatingAdd(credit.bytes, item.item.value_size);
                 if (item.removes_metadata_key) {
                     credit.keys = SaturatingAdd(credit.keys, 1);
+                    const auto instance_it = credit.keys_by_instance.find(item.internal_instance_id);
+                    if (instance_it == credit.keys_by_instance.end()) {
+                        FailClosedMaintenance();
+                        throw std::logic_error("missing prepared KVMeta per-instance pending credit");
+                    }
+                    instance_it->second = SaturatingAdd(instance_it->second, 1);
                 }
                 if (item.item.data_location) {
                     const std::size_t type_index = ToIndex(ToBaseType(item.item.data_location->type()));
@@ -1429,6 +1705,13 @@ private:
                 credit.bytes = SaturatingSub(credit.bytes, item.item.value_size);
                 if (item.removes_metadata_key) {
                     credit.keys = SaturatingSub(credit.keys, 1);
+                    const auto instance_it = credit.keys_by_instance.find(item.internal_instance_id);
+                    if (instance_it != credit.keys_by_instance.end()) {
+                        instance_it->second = SaturatingSub(instance_it->second, 1);
+                        if (instance_it->second == 0) {
+                            credit.keys_by_instance.erase(instance_it);
+                        }
+                    }
                 }
                 if (item.item.data_location) {
                     const std::size_t type_index = ToIndex(ToBaseType(item.item.data_location->type()));
@@ -1441,7 +1724,8 @@ private:
             const bool has_type_credit = std::any_of(credit.bytes_by_type.begin(),
                                                      credit.bytes_by_type.end(),
                                                      [](std::uint64_t value) { return value != 0; });
-            if (credit.bytes == 0 && credit.keys == 0 && !has_type_credit && credit.blocked_batch_count == 0) {
+            if (credit.bytes == 0 && credit.keys == 0 && credit.keys_by_instance.empty() && !has_type_credit &&
+                credit.blocked_batch_count == 0) {
                 pending_credits_.erase(credit_it);
             }
         }
@@ -1718,7 +2002,7 @@ private:
             return false;
         }
         std::vector<CandidateKey> candidate_keys;
-        if (!CollectCandidates(request_context, group->name(), instances, sampling_size, candidate_keys)) {
+        if (!CollectCandidates(request_context, group->name(), instances, pressure, sampling_size, candidate_keys)) {
             KVCM_INTERVAL_LOG_WARN(
                 10, "KVMeta reclaimer failed to collect exact LRU candidates for group [%s]", group->name().c_str());
             return false;
@@ -1836,6 +2120,17 @@ private:
                 ++it;
             }
         }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = admission_demands_.begin(); it != admission_demands_.end();) {
+                if (active_group_names.count(it->first) == 0) {
+                    it = admission_demands_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            admission_demand_group_count_metrics_ = static_cast<double>(admission_demands_.size());
+        }
         bool made_progress = false;
         for (const auto &group : groups) {
             if (ShouldStop()) {
@@ -1940,9 +2235,11 @@ private:
     std::map<std::string, std::size_t> pending_instances_;
     std::map<std::pair<std::string, std::string>, std::size_t> pending_locations_;
     std::map<std::string, PendingCredit> pending_credits_;
+    std::map<std::string, AdmissionDemand> admission_demands_;
     std::map<PendingDeadline, std::shared_ptr<PendingBatch>> pending_batches_;
     std::map<std::string, std::size_t> sampling_rotation_by_group_;
     std::uint64_t next_pending_sequence_ = 0;
+    std::uint64_t next_admission_demand_sequence_ = 0;
     std::uint64_t pending_object_count_ = 0;
     std::uint64_t pending_bytes_ = 0;
     Counter round_count_metrics_;
@@ -1952,12 +2249,14 @@ private:
     Counter retry_count_metrics_;
     Counter error_count_metrics_;
     Counter pending_limit_reject_count_metrics_;
+    Counter admission_demand_count_metrics_;
     Counter physical_delete_attempted_object_count_metrics_;
     Counter physical_delete_uncertain_object_count_metrics_;
     Counter physical_delete_uncertain_bytes_metrics_;
     Gauge pending_object_count_metrics_;
     Gauge pending_bytes_metrics_;
     Gauge blocked_group_count_metrics_;
+    Gauge admission_demand_group_count_metrics_;
     std::thread thread_;
 };
 
@@ -2709,28 +3008,123 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     if (!data_storage_selector_) {
         return {EC_ERROR, StartWriteResult{}};
     }
+
+    // MetaIndexer enforces key capacity per instance, whereas the periodic
+    // watermark is aggregated for a group. A full hot instance can therefore
+    // need targeted reclaim even while peer instances keep the group ratio
+    // below its watermark. Avoid storage allocation when this request cannot
+    // create all of its new primary metadata keys.
+    std::uint64_t requested_new_metadata_keys = 0;
+    bool metadata_key_admission_blocked = false;
+    const std::uint64_t current_key_count = static_cast<std::uint64_t>(indexer->GetKeyCount());
+    const std::uint64_t max_key_count = static_cast<std::uint64_t>(indexer->GetMaxKeyCount());
+    if (current_key_count > max_key_count ||
+        missing_indices.size() > static_cast<std::size_t>(max_key_count - current_key_count)) {
+        KeyVector unique_missing_internal_keys;
+        unique_missing_internal_keys.reserve(missing_indices.size());
+        for (const std::size_t request_index : missing_indices) {
+            unique_missing_internal_keys.push_back(existing[request_index].internal_key);
+        }
+        std::sort(unique_missing_internal_keys.begin(), unique_missing_internal_keys.end());
+        unique_missing_internal_keys.erase(
+            std::unique(unique_missing_internal_keys.begin(), unique_missing_internal_keys.end()),
+            unique_missing_internal_keys.end());
+        CacheLocationMapVector existing_location_maps;
+        const auto key_result = indexer->GetLocationMapsForMaintenance(
+            request_context, unique_missing_internal_keys, existing_location_maps);
+        // Result::ec collapses an all-missing maintenance read to EC_ERROR in
+        // the legacy indexer aggregation. The aligned per-key codes remain the
+        // authoritative shape/identity signal for this read-only admission
+        // check, so validate and consume those directly.
+        if (key_result.error_codes.size() != unique_missing_internal_keys.size() ||
+            existing_location_maps.size() != unique_missing_internal_keys.size()) {
+            AddError(request_context,
+                     "KVMeta metadata-key admission returned a malformed result: ec=" +
+                         std::to_string(static_cast<int>(key_result.ec)) +
+                         ", errors=" + std::to_string(key_result.error_codes.size()) +
+                         ", maps=" + std::to_string(existing_location_maps.size()) +
+                         ", keys=" + std::to_string(unique_missing_internal_keys.size()));
+            return {EC_MISMATCH, StartWriteResult{}};
+        }
+        for (std::size_t i = 0; i < unique_missing_internal_keys.size(); ++i) {
+            if (key_result.error_codes[i] == EC_NOENT) {
+                ++requested_new_metadata_keys;
+            } else if (key_result.error_codes[i] != EC_OK || existing_location_maps[i].empty()) {
+                AddError(request_context, "KVMeta metadata-key admission could not verify an existing key");
+                return {key_result.error_codes[i] == EC_OK ? EC_CORRUPTION : key_result.error_codes[i],
+                        StartWriteResult{}};
+            }
+        }
+        if (current_key_count > max_key_count || requested_new_metadata_keys > max_key_count - current_key_count) {
+            AddError(request_context, "KVMeta requested keys exceed the remaining instance metadata capacity");
+            if (requested_new_metadata_keys > max_key_count) {
+                // The batch can never fit even in an empty instance. Do not
+                // evict useful cache entries for a futile admission request.
+                return {EC_NOSPC, StartWriteResult{}};
+            }
+            metadata_key_admission_blocked = true;
+        }
+    }
+
+    const auto publish_admission_demand = [&](DataStorageType storage_type) {
+        if (!reclaimer_) {
+            return false;
+        }
+        const std::uint64_t requested_key_headroom =
+            metadata_key_admission_blocked ? std::max<std::uint64_t>(1, requested_new_metadata_keys) : 0;
+        reclaimer_->RequestAdmissionCapacity(instance_info->instance_group_name(),
+                                             storage_type,
+                                             missing_bytes,
+                                             metadata_key_admission_blocked ? internal_instance_id : std::string{},
+                                             requested_key_headroom);
+        return true;
+    };
+    const auto request_reclaim_target = [&]() -> ErrorCode {
+        if (!reclaimer_) {
+            return EC_ERROR;
+        }
+        const auto target = data_storage_selector_->SelectCacheWriteDataStorageBackendForReclaim(
+            request_context, instance_info->instance_group_name(), missing_bytes);
+        if (target.ec != EC_OK || target.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || target.name.empty()) {
+            return target.ec == EC_OK ? EC_NOENT : target.ec;
+        }
+        return publish_admission_demand(target.type) ? EC_OK : EC_ERROR;
+    };
     if (const ErrorCode ec = CheckDynamicByteAdmission(request_context,
                                                        instance_info->instance_group_name(),
                                                        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
                                                        missing_bytes);
         ec != EC_OK) {
         if (ec == EC_NOSPC && reclaimer_) {
-            reclaimer_->Wake();
+            request_reclaim_target();
         }
         return {ec, StartWriteResult{}};
     }
     const auto selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(
         request_context, instance_info->instance_group_name(), missing_bytes);
     if (selected.ec != EC_OK || selected.name.empty() || selected.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+        const ErrorCode reclaim_ec = request_reclaim_target();
+        if (reclaim_ec == EC_OK) {
+            AddError(request_context, "KVMeta exact-size allocation requires cache reclamation");
+            return {EC_NOSPC, StartWriteResult{}};
+        }
+        if (reclaim_ec == EC_NOSPC) {
+            AddError(request_context, "KVMeta exact-size allocation exceeds every configured storage-type capacity");
+            return {EC_NOSPC, StartWriteResult{}};
+        }
         return {selected.ec == EC_OK ? EC_NOENT : selected.ec, StartWriteResult{}};
     }
     if (const ErrorCode ec = CheckDynamicByteAdmission(
             request_context, instance_info->instance_group_name(), selected.type, missing_bytes);
         ec != EC_OK) {
         if (ec == EC_NOSPC && reclaimer_) {
-            reclaimer_->Wake();
+            publish_admission_demand(selected.type);
         }
         return {ec, StartWriteResult{}};
+    }
+    if (metadata_key_admission_blocked) {
+        publish_admission_demand(selected.type);
+        return {EC_NOSPC, StartWriteResult{}};
     }
     const auto selected_backend = data_storage_manager->GetDataStorageBackend(selected.name);
     if (!selected_backend || selected_backend->GetType() != selected.type) {

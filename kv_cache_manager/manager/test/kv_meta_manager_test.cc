@@ -2269,6 +2269,216 @@ TEST_F(KvMetaManagerTest, ReclaimerHonorsTheStorageTypeByteWatermark) {
     ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
 }
 
+TEST_F(KvMetaManagerTest, ReclaimerCreatesHeadroomForARejectedRequestBelowTheWatermark) {
+    constexpr const char *kGroup = "reclaim-admission-demand-group";
+    constexpr const char *kInstance = "reclaim-admission-demand-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 1.0, 0);
+    CommitObject(kInstance, "old-object", 70);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(70, indexer->GetStorageUsage());
+
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"large-new-object"}, {40}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get());
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"large-new-object"}, {40}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_EQ(1, retry.locations.size());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerCreatesStorageTypeHeadroomBelowTheGroupWatermark) {
+    constexpr const char *kGroup = "reclaim-type-admission-demand-group";
+    constexpr const char *kInstance = "reclaim-type-admission-demand-instance";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0, MetaIndexerConfig::kDefaultMaxKeyCount, 100);
+    CommitObject(kInstance, "old-type-object", 70);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(70, indexer->GetStorageUsage());
+
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"new-type-object"}, {40}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"new-type-object"}, {40}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerTargetsKeyAdmissionPressureToTheFullInstance) {
+    constexpr const char *kGroup = "reclaim-key-admission-demand-group";
+    constexpr const char *kFullInstance = "z-reclaim-key-admission-full-instance";
+    constexpr const char *kPeerInstance = "a-reclaim-key-admission-peer-instance";
+    CreateReclaimGroup(kGroup, kFullInstance, 10'000, 1.0, 0, 2);
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, kGroup, kPeerInstance, "reclaim-test").first);
+
+    // Make the peer object globally oldest. Targeted pressure must still free
+    // a primary metadata key from the full instance, not evict the peer.
+    CommitObject(kPeerInstance, "peer-oldest", 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kFullInstance, "full-old", 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kFullInstance, "full-new", 10);
+
+    auto full_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kFullInstance));
+    auto peer_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kPeerInstance));
+    ASSERT_TRUE(full_indexer);
+    ASSERT_TRUE(peer_indexer);
+    ASSERT_EQ(2, full_indexer->GetKeyCount());
+    ASSERT_EQ(1, peer_indexer->GetKeyCount());
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 1));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 1));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 1000);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kFullInstance, {"third-key"}, {10}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    // The admission wake must sample the targeted (lexically last) instance
+    // immediately rather than waiting one full idle interval for rotation.
+    ASSERT_TRUE(WaitUntil([&]() { return full_indexer->GetKeyCount() == 1; }, std::chrono::milliseconds(500)));
+    EXPECT_EQ(1, peer_indexer->GetKeyCount());
+    auto [peer_get_ec, peer_values] = manager_->Get(&request_context_, kPeerInstance, {"peer-oldest"});
+    ASSERT_EQ(EC_OK, peer_get_ec);
+    ASSERT_EQ(1, peer_values.size());
+    EXPECT_TRUE(peer_values.front().found);
+
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kFullInstance, {"third-key"}, {10}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kFullInstance, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerUsesTargetedKeyEvictionToAlsoSatisfyGroupAndTypePressure) {
+    constexpr const char *kGroup = "reclaim-overlapping-pressure-group";
+    constexpr const char *kFullInstance = "reclaim-overlapping-pressure-full-instance";
+    constexpr const char *kPeerInstance = "reclaim-overlapping-pressure-peer-instance";
+    CreateReclaimGroup(kGroup, kFullInstance, 100, 0.9, 0, 2);
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, kGroup, kPeerInstance, "reclaim-test").first);
+
+    // The peer is globally oldest, but retiring it would satisfy only byte
+    // pressure. Retiring one object from the full instance satisfies the
+    // targeted key demand and the group/type byte pressure at the same time.
+    CommitObject(kPeerInstance, "peer-oldest", 35);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kFullInstance, "full-old", 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kFullInstance, "full-new", 30);
+
+    auto full_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kFullInstance));
+    auto peer_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kPeerInstance));
+    ASSERT_TRUE(full_indexer);
+    ASSERT_TRUE(peer_indexer);
+    cache_manager_->PauseReclaimer();
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kFullInstance, {"third-key"}, {1}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+
+    cache_manager_->ResumeReclaimer();
+    ASSERT_TRUE(WaitUntil([&]() { return full_indexer->GetKeyCount() == 1; }, std::chrono::seconds(2)));
+    EXPECT_EQ(1, peer_indexer->GetKeyCount());
+    EXPECT_EQ(35, peer_indexer->GetStorageUsage());
+    auto [peer_get_ec, peer_values] = manager_->Get(&request_context_, kPeerInstance, {"peer-oldest"});
+    ASSERT_EQ(EC_OK, peer_get_ec);
+    ASSERT_EQ(1, peer_values.size());
+    EXPECT_TRUE(peer_values.front().found);
+}
+
+TEST_F(KvMetaManagerTest, ImpossibleAdmissionDemandDoesNotEvictUsefulCacheEntries) {
+    constexpr const char *kGroup = "reclaim-impossible-admission-group";
+    constexpr const char *kInstance = "reclaim-impossible-admission-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 1.0, 0);
+    CommitObject(kInstance, "must-stay", 70);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"cannot-fit"}, {101}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(70, indexer->GetStorageUsage());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"must-stay"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+}
+
+TEST_F(KvMetaManagerTest, ImpossibleStorageTypeAdmissionDoesNotEvictUsefulCacheEntries) {
+    constexpr const char *kGroup = "reclaim-impossible-type-admission-group";
+    constexpr const char *kInstance = "reclaim-impossible-type-admission-instance";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0, MetaIndexerConfig::kDefaultMaxKeyCount, 100);
+    CommitObject(kInstance, "must-stay", 70);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"cannot-fit-type"}, {101}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(70, indexer->GetStorageUsage());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"must-stay"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+}
+
+TEST_F(KvMetaManagerTest, ImpossibleKeyAdmissionDemandDoesNotEvictUsefulCacheEntries) {
+    constexpr const char *kGroup = "reclaim-impossible-key-admission-group";
+    constexpr const char *kInstance = "reclaim-impossible-key-admission-instance";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0, 2);
+    CommitObject(kInstance, "must-stay", 10);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [blocked_ec, blocked] =
+        manager_->StartWrite(&request_context_, kInstance, {"new-a", "new-b", "new-c"}, {1, 1, 1}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(1, indexer->GetKeyCount());
+    EXPECT_EQ(10, indexer->GetStorageUsage());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"must-stay"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+}
+
 TEST_F(KvMetaManagerTest, ReclaimerSupportsAZeroWatermark) {
     constexpr const char *kGroup = "reclaim-zero-watermark-group";
     constexpr const char *kInstance = "reclaim-zero-watermark-instance";

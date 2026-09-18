@@ -165,6 +165,20 @@ public:
                                        std::uint64_t required_bytes) const noexcept;
 
     /**
+     * @brief Select the backend type that an exact-size allocation could use
+     * after reclaiming existing cache entries.
+     *
+     * This KVMeta-only helper applies the configured candidates and preference
+     * policy, but checks required_bytes against hard group/type capacities
+     * rather than their current free space. It lets a failed admission request
+     * reclaim from one viable type without changing the fixed-block selector.
+     */
+    [[nodiscard]] DataStorageSelectResult
+    SelectCacheWriteDataStorageBackendForReclaim(RequestContext *request_context,
+                                                 const std::string &instance_group,
+                                                 std::uint64_t required_bytes) const noexcept;
+
+    /**
      * @brief Check whether explicitly named write targets may accept new
      * allocations.
      *
