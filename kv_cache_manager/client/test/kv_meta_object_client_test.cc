@@ -14,6 +14,7 @@
 
 #include "kv_cache_manager/client/src/kv_meta_object_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -671,6 +672,15 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     // StandardUri keeps the last duplicate value. Reject duplicates before
     // parsing so different components cannot disagree on object identity.
     malformed = MakeLocation("file://nfs/first?size=999&size=5", sizeof(first_));
+    expect_internal(std::move(malformed));
+
+    // Event-report records describe externally observed blocks. They do not
+    // grant exact-object ownership and must never enter the EMB data plane.
+    malformed = MakeLocation("event_report_l1p5://reporter/first?size=5", sizeof(first_));
+    malformed.type = KvMetaStorageType::EVENT_REPORT_L1P5;
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') + "?size=5", sizeof(first_));
     expect_internal(std::move(malformed));
 }
 

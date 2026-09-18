@@ -30,6 +30,7 @@
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
@@ -180,17 +181,39 @@ bool ReadLogicalSize(const CacheLocation &location, std::uint64_t &out_size) {
         location.location_specs().front().name() != kKvMetaValueSpecName) {
         return false;
     }
-    const DataStorageUri uri(location.location_specs().front().uri());
-    if (!uri.Valid() || uri.GetHostName().empty()) {
+    const std::string &uri_text = location.location_specs().front().uri();
+    if (uri_text.size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(uri_text)) {
         return false;
     }
+
+    const DataStorageUri uri(uri_text);
+    if (!uri.Valid() || uri.GetHostName().empty() || !uri.HasParam("size")) {
+        return false;
+    }
+    const std::string size_text = uri.GetParam("size");
     std::uint64_t size = 0;
-    uri.GetParamAs<std::uint64_t>("size", size);
-    if (size == 0) {
+    const auto parsed = std::from_chars(size_text.data(), size_text.data() + size_text.size(), size);
+    if (size_text.empty() || parsed.ec != std::errc{} || parsed.ptr != size_text.data() + size_text.size() ||
+        size == 0) {
         return false;
     }
     out_size = size;
     return true;
+}
+
+bool HasSupportedKvMetaReclaimConfiguration(const InstanceGroup &group,
+                                            std::int64_t max_write_timeout_seconds) noexcept {
+    const auto cache_config = group.cache_config();
+    const auto strategy = cache_config ? cache_config->reclaim_strategy() : nullptr;
+    if (!strategy || strategy->reclaim_policy() != ReclaimPolicy::POLICY_LRU) {
+        return false;
+    }
+    const double threshold = strategy->trigger_strategy().used_percentage();
+    const std::int64_t max_delete_delay_ms = max_write_timeout_seconds > std::numeric_limits<std::int64_t>::max() / 1000
+                                                 ? std::numeric_limits<std::int64_t>::max()
+                                                 : max_write_timeout_seconds * 1000;
+    return std::isfinite(threshold) && threshold >= 0.0 && threshold <= 1.0 &&
+           strategy->delay_before_delete_ms() >= 0 && strategy->delay_before_delete_ms() <= max_delete_delay_ms;
 }
 
 bool UriMatchesStorageBackend(const DataStorageUri &uri,
@@ -233,10 +256,15 @@ bool HasSingletonAllocationShape(const DataStorageUri &uri, DataStorageType stor
 
 bool HasMatchingStorageBackend(const CacheLocation &location,
                                const std::shared_ptr<DataStorageManager> &data_storage_manager) {
-    if (!data_storage_manager || location.location_specs().size() != 1) {
+    if (!data_storage_manager || !IsKvMetaObjectStorageType(location.type()) || location.location_specs().size() != 1 ||
+        location.location_specs().front().uri().size() > kMaxKvMetaLocationUriBytes ||
+        !HasUnambiguousKvMetaUriText(location.location_specs().front().uri())) {
         return false;
     }
     const DataStorageUri uri(location.location_specs().front().uri());
+    if (!uri.Valid() || uri.GetHostName().empty()) {
+        return false;
+    }
     const auto backend = data_storage_manager->GetDataStorageBackend(uri.GetHostName());
     return backend && backend->GetType() == location.type() &&
            UriMatchesStorageBackend(uri, uri.GetHostName(), location.type()) &&
@@ -723,6 +751,11 @@ public:
         return it != pending_credits_.end() && it->second.blocked_batch_count != 0;
     }
 
+    bool HasExecutableTuning() const noexcept {
+        const auto [sampling_size, batch_size] = SamplingAndBatchSize();
+        return sampling_size != 0 && batch_size != 0;
+    }
+
     // Record the largest request that was rejected only because existing
     // cache entries consume its hard byte/key capacity. A wake-up alone is
     // insufficient below the configured watermark: the worker must know how
@@ -1008,13 +1041,13 @@ private:
     std::pair<std::size_t, std::size_t> SamplingAndBatchSize() const noexcept {
         try {
             if (!owner_ || !owner_->cache_manager_ || !owner_->cache_manager_->cache_reclaimer()) {
-                return {100, 100};
+                return {0, 0};
             }
             RequestContext request_context("kv_meta_reclaimer_config");
             return {owner_->cache_manager_->cache_reclaimer()->GetSamplingSize(&request_context),
                     owner_->cache_manager_->cache_reclaimer()->GetBatchingSize(&request_context)};
         } catch (...) {
-            return {100, 100};
+            return {0, 0};
         }
     }
 
@@ -1290,14 +1323,17 @@ private:
                     return false;
                 }
                 observed_location_count += location_maps[key_index].size();
+                bool valid_key = true;
                 for (const auto &[location_id, location] : location_maps[key_index]) {
                     if (!location) {
-                        return false;
+                        valid_key = false;
+                        break;
                     }
                     std::uint64_t value_size = 0;
                     if (owner_->ValidateOwnedLocation(
                             request_context, keys[key_index], location_id, *location, value_size) != EC_OK) {
-                        return false;
+                        valid_key = false;
+                        break;
                     }
                     if (!IsCommittedObject(*location)) {
                         key_candidate.all_locations_committed = false;
@@ -1305,6 +1341,13 @@ private:
                     }
                     key_candidate.objects.push_back(
                         Candidate{instance->instance_id(), keys[key_index], location_id, location, value_size});
+                }
+                if (!valid_key) {
+                    ++error_count_metrics_;
+                    KVCM_INTERVAL_LOG_WARN(10,
+                                           "KVMeta reclaimer skipped a corrupt candidate in instance [%s]",
+                                           instance->instance_id().c_str());
+                    continue;
                 }
                 if (!key_candidate.objects.empty()) {
                     out.push_back(std::move(key_candidate));
@@ -1368,6 +1411,28 @@ private:
             }
             return static_cast<bool>(key_credit_applied[key_index]);
         };
+        const auto select_key_for_key_pressure = [&](std::size_t key_index) {
+            if (select_whole_key(key_index)) {
+                return true;
+            }
+            const auto &key_candidate = candidates[key_index];
+            if (!key_candidate.all_locations_committed || key_candidate.objects.empty() ||
+                key_credit_applied[key_index]) {
+                return false;
+            }
+            // A hash bucket can contain more exact locations than one reclaim
+            // batch. Requiring the whole bucket to fit would make key-count
+            // pressure stall forever. Drain a committed oversized bucket in
+            // bounded chunks; only the batch containing its final location
+            // receives key credit.
+            bool made_progress = false;
+            for (std::size_t object_index = 0;
+                 object_index < key_candidate.objects.size() && selected.size() < batch_size;
+                 ++object_index) {
+                made_progress = select_object(key_index, object_index) || made_progress;
+            }
+            return made_progress;
+        };
 
         // Specific constraints are subsets of the group constraint. Satisfy
         // them first so the same retired bytes also reduce group pressure. A
@@ -1377,7 +1442,7 @@ private:
         for (std::size_t key_index = 0; key_index < candidates.size() && selected.size() < batch_size; ++key_index) {
             const auto pressure_it = pressure.keys_by_instance.find(candidates[key_index].internal_instance_id);
             if (pressure_it != pressure.keys_by_instance.end() && pressure_it->second != 0) {
-                select_whole_key(key_index);
+                select_key_for_key_pressure(key_index);
             }
         }
 
@@ -1390,7 +1455,7 @@ private:
                  ++key_index) {
                 if ((!require_type_overlap || has_type_pressure(candidates[key_index])) &&
                     !key_credit_applied[key_index]) {
-                    select_whole_key(key_index);
+                    select_key_for_key_pressure(key_index);
                 }
             }
         }
@@ -1948,29 +2013,15 @@ private:
     }
 
     bool ReclaimGroup(RequestContext *request_context, const std::shared_ptr<const InstanceGroup> &group) {
-        if (!group || !group->cache_config() || !group->cache_config()->reclaim_strategy()) {
+        if (!group || !HasSupportedKvMetaReclaimConfiguration(*group, owner_->limits_.max_write_timeout_seconds)) {
+            if (group) {
+                KVCM_INTERVAL_LOG_WARN(
+                    10, "KVMeta reclaimer skipped group [%s] with an unsupported configuration", group->name().c_str());
+            }
             return false;
         }
         const auto &strategy = group->cache_config()->reclaim_strategy();
         const double threshold = strategy->trigger_strategy().used_percentage();
-        const std::int64_t max_delete_delay_ms =
-            owner_->limits_.max_write_timeout_seconds > std::numeric_limits<std::int64_t>::max() / 1000
-                ? std::numeric_limits<std::int64_t>::max()
-                : owner_->limits_.max_write_timeout_seconds * 1000;
-        if (strategy->reclaim_policy() != ReclaimPolicy::POLICY_LRU) {
-            KVCM_INTERVAL_LOG_WARN(10,
-                                   "KVMeta reclaimer skipped group [%s]: only LRU is supported, policy[%d]",
-                                   group->name().c_str(),
-                                   static_cast<int>(strategy->reclaim_policy()));
-            return false;
-        }
-        if (!std::isfinite(threshold) || threshold < 0.0 || threshold > 1.0 || strategy->delay_before_delete_ms() < 0 ||
-            strategy->delay_before_delete_ms() > max_delete_delay_ms) {
-            KVCM_INTERVAL_LOG_WARN(10,
-                                   "KVMeta reclaimer skipped group [%s] with invalid watermark or delete delay",
-                                   group->name().c_str());
-            return false;
-        }
         const auto [instances_ec, all_instances] =
             owner_->registry_manager_->ListInstanceInfo(request_context, group->name());
         if (instances_ec != EC_OK || all_instances.empty()) {
@@ -1992,13 +2043,19 @@ private:
         if (!ReadPressure(request_context, *group, instances, threshold, pressure) || !pressure.Any()) {
             return false;
         }
-        const auto [sampling_size, batch_size] = SamplingAndBatchSize();
+        const auto [configured_sampling_size, configured_batch_size] = SamplingAndBatchSize();
+        // Candidate materialization and pending ownership use the same hard
+        // object bound. Clamp shared CacheReclaimer knobs locally so an
+        // otherwise valid large main-path setting cannot make every KVMeta
+        // reclaim round reject its own bounded candidate set.
+        const std::size_t sampling_size = std::min<std::size_t>(configured_sampling_size, kPendingObjectLimit);
+        const std::size_t batch_size = std::min<std::size_t>(configured_batch_size, kPendingObjectLimit);
         if (sampling_size == 0 || batch_size == 0) {
             KVCM_INTERVAL_LOG_WARN(10,
                                    "KVMeta reclaimer cannot make progress for group [%s]: sample[%zu], batch[%zu]",
                                    group->name().c_str(),
-                                   sampling_size,
-                                   batch_size);
+                                   configured_sampling_size,
+                                   configured_batch_size);
             return false;
         }
         std::vector<CandidateKey> candidate_keys;
@@ -2279,6 +2336,7 @@ bool KvMetaManager::Init() {
         !registry_manager_->data_storage_manager() || limits_.max_batch_items == 0 || limits_.max_key_bytes == 0 ||
         limits_.max_instance_id_bytes == 0 || limits_.max_instance_group_bytes == 0 ||
         limits_.max_write_session_id_bytes == 0 || limits_.max_user_data_bytes == 0 ||
+        limits_.max_location_uri_bytes == 0 || limits_.max_location_uri_bytes > kMaxKvMetaLocationUriBytes ||
         limits_.max_active_write_sessions == 0 || limits_.max_value_bytes == 0 || limits_.max_batch_bytes == 0 ||
         limits_.max_write_timeout_seconds <= 0 ||
         limits_.max_write_timeout_seconds > std::numeric_limits<std::int32_t>::max()) {
@@ -2390,8 +2448,14 @@ ErrorCode KvMetaManager::ValidateOwnedLocation(RequestContext *request_context,
                                                std::uint64_t &value_size) const {
     const auto data_storage_manager = registry_manager_->data_storage_manager();
     const bool known_state = (location.status() == CLS_NEW && location.create_time() != 0) || IsRetiredObject(location);
+    std::uint64_t validated_total_size = 0;
+    const bool has_validated_total_size = location.GetValidatedTotalSize(validated_total_size);
     if (!IsOwnedLocation(internal_key, location_id) || location.id() != location_id || !known_state ||
-        !HasMatchingStorageBackend(location, data_storage_manager) || !ReadLogicalSize(location, value_size)) {
+        location.location_specs().size() != 1 ||
+        location.location_specs().front().uri().size() > limits_.max_location_uri_bytes ||
+        !HasMatchingStorageBackend(location, data_storage_manager) || !ReadLogicalSize(location, value_size) ||
+        (has_validated_total_size && validated_total_size != value_size) || value_size > limits_.max_value_bytes ||
+        value_size > std::numeric_limits<std::size_t>::max()) {
         AddError(request_context, "KVMeta location does not match its exact key or registered storage backend");
         return EC_CORRUPTION;
     }
@@ -2438,6 +2502,42 @@ ErrorCode KvMetaManager::ValidateKeys(RequestContext *request_context, const std
             AddError(request_context, "KVMeta request contains duplicate keys");
             return EC_DUPLICATE_ENTITY;
         }
+    }
+    return EC_OK;
+}
+
+ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_context,
+                                                    const std::string &instance_group) const {
+    if (!request_context || instance_group.empty()) {
+        return EC_BADARGS;
+    }
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec != EC_OK || !group) {
+        return group_ec == EC_OK ? EC_INSTANCE_NOT_EXIST : group_ec;
+    }
+    if (!HasSupportedKvMetaReclaimConfiguration(*group, limits_.max_write_timeout_seconds)) {
+        AddError(request_context,
+                 "KVMeta requires an LRU reclaim strategy with a valid watermark and read-grace delay");
+        return EC_CONFIG_ERROR;
+    }
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager || group->storage_candidates().empty()) {
+        AddError(request_context, "KVMeta requires at least one exact-object storage candidate");
+        return EC_CONFIG_ERROR;
+    }
+    std::unordered_set<std::string_view> unique_storage_names;
+    unique_storage_names.reserve(group->storage_candidates().size());
+    for (const auto &storage_name : group->storage_candidates()) {
+        const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
+        if (!unique_storage_names.emplace(storage_name).second || !backend ||
+            !IsKvMetaObjectStorageType(backend->GetType())) {
+            AddError(request_context, "KVMeta storage candidates must be unique registered exact-object backends");
+            return EC_CONFIG_ERROR;
+        }
+    }
+    if (!reclaimer_ || !reclaimer_->HasExecutableTuning()) {
+        AddError(request_context, "KVMeta requires non-zero reclaim sampling and batching sizes");
+        return EC_CONFIG_ERROR;
     }
     return EC_OK;
 }
@@ -2515,6 +2615,9 @@ std::pair<ErrorCode, std::string> KvMetaManager::RegisterInstance(RequestContext
         instance_id.size() > limits_.max_instance_id_bytes || user_data.size() > limits_.max_user_data_bytes) {
         AddError(request_context, "KVMeta instance_group, instance_id, or user_data exceeds a configured limit");
         return {EC_BADARGS, {}};
+    }
+    if (const ErrorCode ec = ValidateCacheConfiguration(request_context, instance_group); ec != EC_OK) {
+        return {ec, {}};
     }
 
     ModelDeployment deployment;
@@ -2983,6 +3086,15 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     if (missing_indices.empty()) {
         return {EC_OK, std::move(response)};
     }
+    // A cache that can accept new objects but has no executable eviction
+    // policy eventually degrades into an unbounded/manual object store. Keep
+    // existing hits readable, but fail new allocation before touching the
+    // backend if the group was registered or hot-updated without the exact
+    // LRU, tuning, and storage-ownership contract implemented by KVMeta.
+    if (const ErrorCode ec = ValidateCacheConfiguration(request_context, instance_info->instance_group_name());
+        ec != EC_OK) {
+        return {ec, StartWriteResult{}};
+    }
     if (!write_session_manager_) {
         return {EC_SERVICE_NOT_LEADER, StartWriteResult{}};
     }
@@ -3127,8 +3239,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {EC_NOSPC, StartWriteResult{}};
     }
     const auto selected_backend = data_storage_manager->GetDataStorageBackend(selected.name);
-    if (!selected_backend || selected_backend->GetType() != selected.type) {
-        AddError(request_context, "KVMeta selected storage backend changed before allocation");
+    if (!selected_backend || selected_backend->GetType() != selected.type ||
+        !IsKvMetaObjectStorageType(selected_backend->GetType())) {
+        AddError(request_context, "KVMeta selected storage backend changed or is not an exact-object backend");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
 

@@ -10,6 +10,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -89,11 +90,8 @@ bool ToPublicStorageType(proto::kv_meta::StorageType source, KvMetaStorageType &
         target = KvMetaStorageType::DUMMY;
         return true;
     case proto::kv_meta::ST_EVENT_REPORT_L1P5:
-        target = KvMetaStorageType::EVENT_REPORT_L1P5;
-        return true;
     case proto::kv_meta::ST_EVENT_REPORT_L2:
-        target = KvMetaStorageType::EVENT_REPORT_L2;
-        return true;
+        return false;
     case proto::kv_meta::ST_TAIRMEMPOOL_SSD:
         target = KvMetaStorageType::TAIR_MEMPOOL_SSD;
         return true;
@@ -110,9 +108,19 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
         return false;
     }
     const auto &source_spec = source.location_specs(0);
+    if (source_spec.uri().size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(source_spec.uri())) {
+        return false;
+    }
     const DataStorageUri uri(source_spec.uri());
+    if (!uri.Valid() || uri.GetHostName().empty() || !uri.HasParam("size")) {
+        return false;
+    }
+    const std::string size_text = uri.GetParam("size");
     std::uint64_t uri_size = 0;
-    uri.GetParamAs<std::uint64_t>("size", uri_size);
+    const auto parsed = std::from_chars(size_text.data(), size_text.data() + size_text.size(), uri_size);
+    if (size_text.empty() || parsed.ec != std::errc{} || parsed.ptr != size_text.data() + size_text.size()) {
+        return false;
+    }
     const auto scheme_matches = [&]() {
         switch (target.type) {
         case KvMetaStorageType::HF3FS:
@@ -129,9 +137,7 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
         case KvMetaStorageType::DUMMY:
             return uri.GetProtocol() == "dummy";
         case KvMetaStorageType::EVENT_REPORT_L1P5:
-            return uri.GetProtocol() == "event_report_l1p5";
         case KvMetaStorageType::EVENT_REPORT_L2:
-            return uri.GetProtocol() == "event_report_l2";
         case KvMetaStorageType::UNSPECIFIED:
         default:
             return false;
@@ -155,8 +161,8 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
     default:
         break;
     }
-    if (source_spec.name() != "value" || !uri.Valid() || uri.GetHostName().empty() || uri_size != source.value_size() ||
-        !scheme_matches() || !singleton_allocation) {
+    if (source_spec.name() != "value" || uri_size != source.value_size() || !scheme_matches() ||
+        !singleton_allocation) {
         target = {};
         return false;
     }

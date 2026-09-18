@@ -20,6 +20,9 @@ enum class KvMetaStorageType : std::int32_t {
     NFS = 4,
     VCNS_HF3FS = 5,
     DUMMY = 6,
+    // Reserved for wire compatibility with the shared storage enum. Event
+    // report locations are external observations, not independently owned
+    // KVMeta objects, and official exact-object clients reject them.
     EVENT_REPORT_L1P5 = 7,
     EVENT_REPORT_L2 = 8,
     TAIR_MEMPOOL_SSD = 9,

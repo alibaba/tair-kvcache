@@ -18,7 +18,10 @@ exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径�
 
 1. 服务端必须配置 `kvcm.kv_meta.enabled=true`；KVMeta 与既有 MetaService 共用
    `kvcm.service.rpc_port`，按不同的 protobuf service 全名路由；
-2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；
+2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；group 必须配置 `POLICY_LRU`、
+   `used_percentage in [0,1]`、合法的 `delay_before_delete_ms`，且进程级 reclaim sampling/batching 均非零；
+   `storage_candidates` 还必须唯一、已注册并具有 exact-object ownership（EventReport 不满足）；否则注册或新对象
+   allocation 返回 `SERVICE_NOT_READY`；
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
 4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status；
 5. 公共 `instance_id` 只能通过本 service 使用。编码后的 `__kv_meta_v1__...` 前缀属于服务端保留 namespace；旧
@@ -83,6 +86,7 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 | key | 1..512 bytes |
 | instance id / group / session id | 1..512 bytes |
 | `user_data` | 0..64 KiB |
+| 单 location URI | 不超过 64 KiB，query 参数不超过 64 个 |
 | 单 value | 1 byte..1 GiB |
 | 单批 value 总量 | 不超过 4 GiB |
 | `write_timeout_seconds` | 1..1800 |
@@ -107,6 +111,10 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 输入 `instance_group`、`instance_id` 和可选 `user_data`：
 
 - group 必须已存在并且只包含 KVMeta instance；
+- group 必须有当前 KVMeta Reclaimer 可执行的 LRU 配置，且进程级 sampling/batching 非零；无配置、非 LRU、
+  非法 watermark/read grace 或关闭采样/批量回收均返回 `SERVICE_NOT_READY`，且不会创建 instance；
+- `storage_candidates` 必须唯一并全部指向已注册的 exact-object backend；EventReport 只表示外部 block 观测，不授予
+  KVCM 创建/删除所有权，因此不能作为 EMB value storage；
 - 相同 instance/group、KVMeta schema 和 `user_data` 的重复注册幂等；
 - group、schema 或既有 instance 配置不一致时失败；
 - 成功响应的 `storage_configs` 是后续 transfer client 的权威 backend 配置。
@@ -146,6 +154,8 @@ V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理
 - 任一 key 仍 active 时，整批返回 `WRITE_IN_PROGRESS`，不把它误报为命中；
 - 容量、storage type quota 或 active-session 数量不足时，不会返回可用 session；已产生的候选 allocation 或
   reservation 会在返回前进入补偿清理。
+- group reclaim 配置被热更新为非法值时，全部命中的请求仍可幂等返回；包含任一 miss 的请求在 backend allocation
+  前返回 `SERVICE_NOT_READY`。Remove/Trim 仍可用于安全排空已有对象。
 
 storage Create 抛出的标准或未知异常会转换为 `IO_ERROR`，不会穿透服务线程。服务端会对异常前已明确拿到的
 singleton allocation 做一次补偿删除；异常调用本身若在 provider 端已经分配但没有返回 URI，则只能由 backend
@@ -200,7 +210,7 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 | `UNSUPPORTED` | V1 不支持该模式 | 改用受支持模式 |
 | `DUPLICATE_ENTITY` | instance 已存在但注册配置不一致 | 对照既有 instance 配置，不覆盖重试 |
 | `INSTANCE_NOT_EXIST` | 未注册或内部 schema 不匹配 | 检查注册和部署配置 |
-| `SERVER_NOT_LEADER` / `SERVICE_NOT_READY` | endpoint 当前不能服务 | 官方 client 可切换下一地址 |
+| `SERVER_NOT_LEADER` / `SERVICE_NOT_READY` | endpoint 当前不能服务，或 KVMeta group 没有有效 LRU 回收配置 | endpoint 问题可切换地址；配置问题先修复 group，避免无界重试 |
 | `RESOURCE_EXHAUSTED` / `REACH_MAX_ENTITY_CAPACITY` | byte quota、session 或实体容量到限 | 释放对象或扩容后再试 |
 | `WRITE_IN_PROGRESS` | 相同 key 或 instance 正在写/finalize | 等原 session 收敛，不并发覆盖 |
 | `SESSION_NOT_FOUND` | session 过期、不存在或 instance 不匹配 | 查询最终状态，不把它当成功 |

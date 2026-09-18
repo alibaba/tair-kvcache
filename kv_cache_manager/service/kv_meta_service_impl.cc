@@ -1,9 +1,11 @@
 #include "kv_cache_manager/service/kv_meta_service_impl.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -12,6 +14,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
@@ -38,6 +41,8 @@ PbError ToKvMetaPbError(ErrorCode ec, bool session_lookup = false) {
         return proto::kv_meta::INSTANCE_NOT_EXIST;
     case EC_SERVICE_NOT_LEADER:
         return proto::kv_meta::SERVER_NOT_LEADER;
+    case EC_CONFIG_ERROR:
+        return proto::kv_meta::SERVICE_NOT_READY;
     case EC_NOSPC:
         return proto::kv_meta::RESOURCE_EXHAUSTED;
     case EC_OUT_OF_LIMIT:
@@ -85,19 +90,46 @@ proto::kv_meta::StorageType ToKvMetaStorageType(DataStorageType type) {
 }
 
 bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::ValueLocation *target) {
-    if (!target || source.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || source.value_size == 0 ||
-        source.specs.size() != 1 || source.specs.front().first != "value") {
+    if (!target || !IsKvMetaObjectStorageType(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
+        source.specs.front().first != "value" || source.specs.front().second.size() > kMaxKvMetaLocationUriBytes ||
+        !HasUnambiguousKvMetaUriText(source.specs.front().second)) {
         return false;
     }
     const DataStorageUri uri(source.specs.front().second);
+    if (!uri.Valid() || uri.GetHostName().empty() || !uri.HasParam("size")) {
+        return false;
+    }
+    const std::string uri_size_text = uri.GetParam("size");
     std::uint64_t uri_size = 0;
-    uri.GetParamAs<std::uint64_t>("size", uri_size);
+    const auto parsed = std::from_chars(uri_size_text.data(), uri_size_text.data() + uri_size_text.size(), uri_size);
+    if (uri_size_text.empty() || parsed.ec != std::errc{} ||
+        parsed.ptr != uri_size_text.data() + uri_size_text.size()) {
+        return false;
+    }
     const DataStorageType uri_type = ToDataStorageType(uri.GetProtocol());
     const bool scheme_matches =
         IsTairMempoolStorageType(source.type)
             ? uri.GetProtocol() == kTairMempoolUriScheme
             : uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(source.type);
-    if (!uri.Valid() || uri.GetHostName().empty() || uri_size != source.value_size || !scheme_matches) {
+    bool singleton_allocation = true;
+    switch (source.type) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        if (uri.HasParam("blkid")) {
+            const std::string block_id_text = uri.GetParam("blkid");
+            std::uint64_t block_id = 0;
+            const auto block_id_parsed =
+                std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
+            singleton_allocation = !block_id_text.empty() && block_id_parsed.ec == std::errc{} &&
+                                   block_id_parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
+        }
+        break;
+    default:
+        break;
+    }
+    if (uri_size != source.value_size || !scheme_matches || !singleton_allocation) {
         return false;
     }
     target->Clear();

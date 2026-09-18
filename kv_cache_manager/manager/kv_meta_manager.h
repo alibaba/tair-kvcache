@@ -13,6 +13,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
@@ -38,6 +39,7 @@ public:
         std::size_t max_instance_group_bytes = 512;
         std::size_t max_write_session_id_bytes = 512;
         std::size_t max_user_data_bytes = 64 * 1024;
+        std::size_t max_location_uri_bytes = kMaxKvMetaLocationUriBytes;
         std::size_t max_active_write_sessions = 4096;
         std::uint64_t max_value_bytes = 1ULL * 1024 * 1024 * 1024;
         std::uint64_t max_batch_bytes = 4ULL * 1024 * 1024 * 1024;
@@ -140,6 +142,7 @@ private:
     std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>>
     GetValidatedInstanceInfo(RequestContext *request_context, const std::string &instance_id) const;
     ErrorCode ValidateKeys(RequestContext *request_context, const std::vector<std::string> &keys) const;
+    ErrorCode ValidateCacheConfiguration(RequestContext *request_context, const std::string &instance_group) const;
     ErrorCode CheckDynamicByteAdmission(RequestContext *request_context,
                                         const std::string &instance_group,
                                         DataStorageType storage_type,

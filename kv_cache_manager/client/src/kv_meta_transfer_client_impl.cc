@@ -1,8 +1,6 @@
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 
 #include <algorithm>
-#include <string_view>
-#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
@@ -10,6 +8,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
 
@@ -20,37 +19,12 @@ constexpr std::size_t kMaxKvMetaBatchItems = 64;
 constexpr std::uint64_t kMaxKvMetaObjectBytes = 1ULL * 1024 * 1024 * 1024;
 
 bool HasOnlyUnambiguousUriText(const UriStrVec &uris) {
-    return std::all_of(
-        uris.begin(), uris.end(), [](const std::string &uri) { return HasUnambiguousKvMetaUriText(uri); });
+    return std::all_of(uris.begin(), uris.end(), [](const std::string &uri) {
+        return uri.size() <= kMaxKvMetaLocationUriBytes && HasUnambiguousKvMetaUriText(uri);
+    });
 }
 
 } // namespace
-
-bool HasUnambiguousKvMetaUriText(std::string_view uri_text) {
-    if (uri_text.find('#') != std::string_view::npos) {
-        return false;
-    }
-    const auto query_position = uri_text.find('?');
-    if (query_position == std::string_view::npos) {
-        return true;
-    }
-    std::unordered_set<std::string> keys;
-    std::size_t begin = query_position + 1;
-    while (begin < uri_text.size()) {
-        const auto end = uri_text.find('&', begin);
-        const auto item_end = end == std::string_view::npos ? uri_text.size() : end;
-        const auto equals = uri_text.find('=', begin);
-        const auto key_end = equals != std::string_view::npos && equals < item_end ? equals : item_end;
-        if (key_end == begin || !keys.emplace(uri_text.substr(begin, key_end - begin)).second) {
-            return false;
-        }
-        if (end == std::string_view::npos) {
-            break;
-        }
-        begin = end + 1;
-    }
-    return begin < uri_text.size();
-}
 
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
@@ -174,7 +148,17 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     if (ec != ER_OK) {
         return {ec, {}};
     }
-    return {ER_OK, ConstructLocations(*actual_remote_uris)};
+    UriStrVec actual_uris = ConstructLocations(*actual_remote_uris);
+    if (actual_uris.size() != uri_str_vec.size()) {
+        return {ER_SDKWRITE_ERROR, {}};
+    }
+    for (std::size_t i = 0; i < uri_str_vec.size(); ++i) {
+        if (!HasSameCanonicalKvMetaUri(uri_str_vec[i], actual_uris[i])) {
+            KVCM_LOG_WARN("KVMeta SDK rewrote an exact-object allocation URI");
+            return {ER_SDKWRITE_ERROR, {}};
+        }
+    }
+    return {ER_OK, std::move(actual_uris)};
 }
 
 std::vector<DataStorageUri> KvMetaTransferClientImpl::ParseLocations(const UriStrVec &uri_str_vec) {

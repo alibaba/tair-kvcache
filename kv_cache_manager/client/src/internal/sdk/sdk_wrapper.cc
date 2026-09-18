@@ -1,11 +1,13 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <algorithm>
 #include <charconv>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
@@ -121,6 +123,18 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
     if (storage_configs_.empty()) {
         KVCM_LOG_WARN("storage config is empty");
         return ER_INVALID_STORAGE_CONFIG;
+    }
+    if (variable_object_size_enabled) {
+        std::unordered_set<std::string> unique_storage_names;
+        unique_storage_names.reserve(storage_configs_.size());
+        for (const auto &storage_config : storage_configs_) {
+            if (!storage_config || !IsKvMetaObjectStorageType(storage_config->type()) ||
+                storage_config->global_unique_name().empty() ||
+                !unique_storage_names.insert(storage_config->global_unique_name()).second) {
+                KVCM_LOG_WARN("KVMeta storage configs must be unique named exact-object backends");
+                return ER_INVALID_STORAGE_CONFIG;
+            }
+        }
     }
 
     SharedMemoryRegistration prepared_registration;

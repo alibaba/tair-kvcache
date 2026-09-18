@@ -106,6 +106,7 @@ cc_library(
         ":kv_meta_client_impl",
         ":kv_meta_transfer_client_impl",
         "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/data_storage:common_define",
     ],
     alwayslink = True,
 )

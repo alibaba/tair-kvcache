@@ -10,6 +10,7 @@
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -37,10 +38,10 @@ bool IsKnownStorageType(KvMetaStorageType type) {
     case KvMetaStorageType::NFS:
     case KvMetaStorageType::VCNS_HF3FS:
     case KvMetaStorageType::DUMMY:
-    case KvMetaStorageType::EVENT_REPORT_L1P5:
-    case KvMetaStorageType::EVENT_REPORT_L2:
     case KvMetaStorageType::TAIR_MEMPOOL_SSD:
         return true;
+    case KvMetaStorageType::EVENT_REPORT_L1P5:
+    case KvMetaStorageType::EVENT_REPORT_L2:
     case KvMetaStorageType::UNSPECIFIED:
     default:
         return false;
@@ -63,9 +64,7 @@ bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &u
     case KvMetaStorageType::DUMMY:
         return uri.GetProtocol() == "dummy";
     case KvMetaStorageType::EVENT_REPORT_L1P5:
-        return uri.GetProtocol() == "event_report_l1p5";
     case KvMetaStorageType::EVENT_REPORT_L2:
-        return uri.GetProtocol() == "event_report_l2";
     case KvMetaStorageType::UNSPECIFIED:
     default:
         return false;
@@ -93,7 +92,7 @@ bool HasSingletonAllocationShape(KvMetaStorageType type, const DataStorageUri &u
 }
 
 bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
-    if (!HasUnambiguousKvMetaUriText(uri_text)) {
+    if (uri_text.size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(uri_text)) {
         return false;
     }
     const DataStorageUri uri(uri_text);
@@ -113,12 +112,7 @@ bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
         return false;
     }
     for (std::size_t i = 0; i < expected.size(); ++i) {
-        if (!HasUnambiguousKvMetaUriText(expected[i]) || !HasUnambiguousKvMetaUriText(actual[i])) {
-            return false;
-        }
-        const DataStorageUri expected_uri(expected[i]);
-        const DataStorageUri actual_uri(actual[i]);
-        if (!expected_uri.Valid() || !actual_uri.Valid() || expected_uri.ToUriString() != actual_uri.ToUriString()) {
+        if (!HasSameCanonicalKvMetaUri(expected[i], actual[i])) {
             return false;
         }
     }

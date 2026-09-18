@@ -39,6 +39,28 @@ constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
 }
 
+// KVMeta locations must describe objects allocated and exclusively owned by
+// KVCM. Event-report entries only observe externally managed blocks and must
+// never enter exact-object read/delete paths.
+constexpr bool IsKvMetaObjectStorageType(const DataStorageType &type) noexcept {
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
+    default:
+        return false;
+    }
+}
+
 constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
            type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
