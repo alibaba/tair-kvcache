@@ -2558,11 +2558,12 @@ TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEm
 
     constexpr KeyType residue_key = 42;
     CacheLocationMapVector locations(1);
-    locations[0].emplace("residue",
-                         std::make_shared<CacheLocation>(
-                             DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-                             1,
-                             std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_residue?size=1")}));
+    auto residue_location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_residue?size=1")});
+    residue_location->set_id("residue");
+    locations[0].emplace(residue_location->id(), std::move(residue_location));
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
               persistent->Put(request_context_.get(), {residue_key}, locations, PropertyMapVector(1)));
 

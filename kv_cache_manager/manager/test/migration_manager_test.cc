@@ -46,6 +46,29 @@ ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
 }
 } // namespace
 
+namespace destination_specs_capture_stub {
+std::vector<std::pair<size_t, size_t>> g_sizes_and_capacities;
+
+void Reset() { g_sizes_and_capacities.clear(); }
+
+ErrorCode BatchAddLocation_stub(void * /*obj*/,
+                                RequestContext * /*request_context*/,
+                                const KeyVector &keys,
+                                const CacheLocationVector &locations,
+                                std::vector<MetaSearcher::AddLocationResult> &out_results) {
+    g_sizes_and_capacities.reserve(g_sizes_and_capacities.size() + locations.size());
+    for (const auto &location : locations) {
+        g_sizes_and_capacities.emplace_back(location->location_specs().size(), location->location_specs().capacity());
+    }
+    out_results.assign(keys.size(), {});
+    for (size_t i = 0; i < out_results.size(); ++i) {
+        out_results[i].ec = EC_OK;
+        out_results[i].location_id = "captured_dst_" + std::to_string(i);
+    }
+    return EC_OK;
+}
+} // namespace destination_specs_capture_stub
+
 // ---- orphan cleanup 测试用 DataStorageManager::Create/Delete 存根 ----
 // 复现"异构 size spec 分散到多个 create_group、某 group 失败使 block ineligible、
 // 后处理 group 已成功分配的 URI 被跳过 → rollback 漏删 → orphan"的场景。
@@ -973,6 +996,43 @@ TEST_F(MigrationManagerTest, TestSubmitBadArgs) {
     ASSERT_EQ(ErrorCode::EC_BADARGS, mgr.Submit("t", req));
     ASSERT_FALSE(mgr.HasMigrationTask(req.instance_id, req.block_key));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
+}
+
+TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacity) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "spec_move_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "spec_move_cold/"));
+
+    auto make_request = [this](int64_t block_key) {
+        MigrationManager::MigrationRequest request;
+        request.instance_id = kInstance;
+        request.block_key = block_key;
+        request.src_location_id = "source_location";
+        request.src_storage_name = "hot_01";
+        request.dst_storage_name = "cold_01";
+        request.src_specs.reserve(3);
+        for (size_t i = 0; i < 3; ++i) {
+            request.src_specs.emplace_back("TP" + std::to_string(i),
+                                           "dummy://hot_01/source_" + std::to_string(i) + "?size=1");
+        }
+        return request;
+    };
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    destination_specs_capture_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(MetaSearcher, BatchAddLocation), destination_specs_capture_stub::BatchAddLocation_stub);
+
+    ASSERT_EQ(EC_OK, mgr.Submit("single", make_request(10)));
+    const auto batch_results = mgr.BatchSubmit("batch", {make_request(11)});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), batch_results);
+
+    std::vector<LocationSpec> reserved_specs;
+    reserved_specs.reserve(3);
+    const size_t reserved_capacity = reserved_specs.capacity();
+    EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{3, reserved_capacity}, {3, reserved_capacity}}),
+              destination_specs_capture_stub::g_sizes_and_capacities);
 }
 
 TEST_F(MigrationManagerTest, TestSubmitSourceNotFound) {
