@@ -381,11 +381,19 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                     is_new_key[global_index]) {
                     continue;
                 }
+                const bool requires_secondary_admission =
+                    std::binary_search(upsert_batch.batch_secondary_admission_indices.begin(),
+                                       upsert_batch.batch_secondary_admission_indices.end(),
+                                       i);
+                const size_t filtered_index = existing_update_batch.batch_keys.size();
                 existing_update_positions.push_back(i);
                 existing_update_batch.batch_keys.push_back(upsert_batch.batch_keys[i]);
                 existing_update_batch.batch_indexs.push_back(global_index);
                 existing_update_batch.batch_locations.push_back(upsert_batch.batch_locations[i]);
                 existing_update_batch.batch_properties.push_back(upsert_batch.batch_properties[i]);
+                if (requires_secondary_admission) {
+                    existing_update_batch.batch_secondary_admission_indices.push_back(filtered_index);
+                }
             }
             backend_batch = &existing_update_batch;
         }
@@ -889,6 +897,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             }
             if (action == MA_OK) {
                 CacheLocationMap upsert_loc_map;
+                bool requires_secondary_admission = false;
                 for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
                     if (modifier_ecs[loc_index] != EC_OK) {
                         location_result.per_location_error_codes[global_idx][loc_index] = modifier_ecs[loc_index];
@@ -901,13 +910,19 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                         key_level_failures[global_idx] = true;
                         continue;
                     }
+                    requires_secondary_admission =
+                        requires_secondary_admission || working_loc->status() == CacheLocationStatus::CLS_DELETING;
                     upsert_loc_map.emplace(loc_id, working_loc);
                 }
                 if (!upsert_loc_map.empty() || !upsert_property_map.empty()) {
+                    const size_t upsert_index = upsert_batch.batch_keys.size();
                     upsert_batch.batch_keys.emplace_back(key);
                     upsert_batch.batch_indexs.emplace_back(global_idx);
                     upsert_batch.batch_locations.emplace_back(std::move(upsert_loc_map));
                     upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
+                    if (requires_secondary_admission) {
+                        upsert_batch.batch_secondary_admission_indices.push_back(upsert_index);
+                    }
                     if (track_created_key_count && key_get_ec == EC_NOENT) {
                         put_global_indexs.emplace_back(global_idx);
                     }

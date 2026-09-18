@@ -547,7 +547,14 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        if (update_ec == ErrorCode::EC_OK) {
+            promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        } else {
+            HandleErrorPromise(promise,
+                               update_ec,
+                               "Failed to admit location delete metadata update, instance[%s]",
+                               task.instance_id.c_str());
+        }
         return future;
     }
 
@@ -790,6 +797,12 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         return admission_result;
     }
     if (admission_result.actual_task.block_keys.empty()) {
+        if (update_ec != ErrorCode::EC_OK) {
+            admission_result.result = MakeErrorResult(
+                update_ec,
+                StringUtil::FormatString("Failed to admit location delete metadata update, instance[%s]",
+                                         instance_id.c_str()));
+        }
         return admission_result;
     }
 

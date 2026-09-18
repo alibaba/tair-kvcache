@@ -137,6 +137,9 @@ struct BatchMetaData {
     CacheLocationMapVector batch_locations;  // optional per-key CacheLocations
     LocationIdsPerKey batch_location_ids;    // optional per-key location ids
     PropertyMapVector batch_properties;      // optional per-key properties
+    // Sorted positions in batch_keys that require strict Secondary admission.
+    // Ordinary batches keep this empty and perform no dynamic allocation.
+    std::vector<size_t> batch_secondary_admission_indices;
 
     // Ensure batch_locations and batch_properties are sized to match batch_keys.
     void EnsureLocationsAndPropertiesResized() {

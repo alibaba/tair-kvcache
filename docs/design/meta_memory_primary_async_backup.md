@@ -307,18 +307,19 @@ maintenance 的差异集中在 manager：
 
 ### 8.1 锁外 Sync
 
-物理删除恢复当前分支原有提交方式，不在通用 RMW、MetaStorageBackendManager 或 MetaSearcher 中增加 `confirm_persistence`、`CanSync` 和队列级粘性失败状态：
+物理删除沿用当前分支的锁外 Sync，不增加通用 `confirm_persistence`、`CanSync` 和队列级粘性失败状态；但 `DELETING` 写入必须满足一次非阻塞的 Secondary 准入：
 
 ```text
-shard lock 内读取/CAS local DELETING，并按普通 memory-primary 路径提交 Redis 备份
+shard lock 内读取/CAS local DELETING，并通过现有条件 Upsert 尝试 Redis 备份入队
+→ 队列未准入的项返回失败，不进入物理删除任务
 → 释放 shard lock
-→ SchedulePlanExecutor 调用真实 Sync(keys)
+→ SchedulePlanExecutor 仅对已准入项调用真实 Sync(keys)
 → Sync 成功才调度物理删除
 ```
 
-这样慢 Redis 与 `async_sync_timeout_ms` 不占用 MetaIndexer shard mutex，也不会因为同一 Redis 队列中其他 key 的历史失败永久阻断当前 key。Redis 请求失败继续依赖 RedisClient 的有限重试，Sync 超时或失败仍阻止本次物理删除。
+MetaIndexer 在构造 Upsert 批次的既有 location 遍历中标记 `DELETING` key，BackendManager 直接复用该稀疏标记和原返回码，不重复遍历 location，也不向 MetaSearcher/RMW 调用链新增布尔参数。准入仍使用现有 `TryReserve`，不在 MetaIndexer shard mutex 内等待容量；普通写继续以 local 结果为准。Redis 请求失败继续依赖 RedisClient 的有限重试，Sync 超时或失败仍阻止本次物理删除。
 
-该选择刻意对齐当前分支原始实现，而不是在本功能中扩展异步队列一致性协议。现有 barrier 只等待它之前已入队的消息被 consumer 处理，不提供逐 WriteOp 回执；如果某个写在 barrier 入队前已被单独消费并最终失败，后续 barrier 不能精确关联该失败。Running 队列满导致备份未入队时也没有历史 dirty-key 状态。V1 接受这一既有边界，后续若实际故障测试证明需要更强确认，再单独设计 per-write completion/sequence，不先引入队列级永久熔断。
+该选择不扩展异步队列一致性协议。现有 barrier 只等待它之前已入队的消息被 consumer 处理，不提供逐 WriteOp 回执；如果某个写在 barrier 入队前已被单独消费并最终失败，后续 barrier 不能精确关联该失败。V1 先关闭队列满导致 `DELETING` 备份根本未入队却被后续空 barrier 误判成功的确定性漏洞；后续若实际故障测试证明需要更强确认，再单独设计 per-write completion/sequence，不引入队列级永久熔断。
 
 同样对齐原实现：`Sync` 最终失败只阻止本次物理删除，不回滚已经提交的 local `DELETING`；相同删除请求会跳过该状态，本次不额外增加自动重试/补偿状态机。RedisClient 的有限重试用于降低该情况的发生概率，但不改变这个失败终态。上线故障压测若确认需要自动恢复，应在 executor 层单独设计可重试任务，而不是把网络等待重新放回 shard lock。
 
@@ -394,14 +395,14 @@ Redis 重新连通不会自动补齐丢写。需要恢复精确备份或关闭�
 |---|---|
 | config / service / kvcm_ops | 默认关闭、JSON/proto 双向透传、GET→PUT 不丢字段、合法/非法组合、persistent 子配置收到开关 |
 | 公共条件写接口 | 通过 MetaStorageBackend 指针调度到 local/async Redis；普通重载不被隐藏；未支持 backend 的默认条件写不产生写入；cache 专属能力不迁移 |
-| 普通写入 | Recover 覆盖 persistent-first 及 Redis 失败不提交 local；Running 覆盖四类 local-first 写及 property 更新、混合 EC_OK/EC_NOSPC、全失败和空批次；local 失败项不备份，备份失败不改 local 结果/计数 |
-| Secondary 筛选与返回 | 非连续成功索引跨多个队列、locations/properties/IDs 对齐；容量按入组项计量；删除 NOENT 授权与旧 local gate 不变；新模式返回 primary，旧模式返回 secondary，单 backend 不调用第二阶段；cache 指标仍只统计 local |
-| queue / async Redis | Recover 无条件主写使用 WaitAndReserve；Running 条件备份的 TryReserve 不超限、超大 item 拒绝、满队列立即失败；key 预留在 payload 构造前完成并在出队时释放；metadata 使用同一 key 容量准入，Sync barrier 保持原 `Push`；非预期异常 fail-fast |
+| 普通写入 | Recover 覆盖 persistent-first 及 Redis 失败不提交 local；Running 覆盖四类 local-first 写及 property 更新、混合 EC_OK/EC_NOSPC、全失败和空批次；local 失败项不备份，非 `DELETING` 备份失败不改 local 结果/计数 |
+| Secondary 筛选与返回 | 非连续成功索引跨多个队列、locations/properties/IDs 对齐；容量按入组项计量；删除 NOENT 授权与旧 local gate 不变；新模式普通项返回 primary、`DELETING` 项合并 Secondary 准入错误，旧模式返回 secondary，单 backend 不调用第二阶段；cache 指标仍只统计 local |
+| queue / async Redis | Recover 无条件主写使用 WaitAndReserve；Running 条件备份的 TryReserve 不超限、超大 item 拒绝、满队列立即失败；key 预留在 payload 构造前完成并在出队时释放；metadata 使用同一 key 容量准入，Sync barrier 使用零容量 `PushBarrier`；非预期异常 fail-fast |
 | 顺序与生命周期 | 同 key Put→Upsert→Delete→重建顺序；无额外全局锁；Close 不出现悬空引用/泄漏；drain 有界且丢弃可见 |
 | Open / Recover | Open/辅助计数失败保持 Init 失败；后台回填期间可读写；Recover Redis 主写失败时 local 不提交并保留原反压；切入 Running 后新调用改为 local-first；恢复失败不进入 Running；原 Manager 创建回归 |
 | Recover 并发 | 暂停 Redis 主写并在回调中切换 Running，验证在途调用仍完成 persistent-first；保留 PutIfAbsent、EnsureKeyInCache 和后台 tombstone；不增加前台读过滤 |
 | maintenance | local no-touch 权威读和精确 CAS、空 key 回收；旧 Redis 值不覆盖 local；metadata-only 操作不因 Redis 等待阻塞 |
-| 物理删除 Sync | CAS 在 shard lock 内完成，真实 Sync 在 executor 锁外执行；Sync 失败不调度物理删除；验证原 barrier 准入和超时行为，不把它声明为逐写入确认 |
+| 物理删除 Sync | CAS 在 shard lock 内完成；`DELETING` 备份队列准入失败的项不进入物理删除；真实 Sync 在 executor 锁外执行且失败时不调度物理删除；验证 barrier 准入和超时行为，不把它声明为逐写入确认 |
 | 回滚 | Recover 复用原 persistent-first 和 Reconcile；Running 的 local 失败新增不产生 Put 备份；Reconcile 不为缺失新 ID 增加专属 HDEL/Sync 分支；实际删到引用仍需锁外 Sync |
 | 辅助元数据与恢复 | 启动读 Redis 计数；运行时 PutMetaData 不同步访问 Redis；容量限制、序列化、失败可见；测试普通更新/逻辑删除回退和计数偏差的已声明边界 |
 | 隔离与发布 | 不同 Instance 数据与恢复互不串用；校准只改目标前缀；停止旧 writer 后再接管；旧程序/工具不能在开启状态下接管或改写配置 |
@@ -426,9 +427,9 @@ memory-primary 的主要收益来自消除普通备份入队在 shard lock 内�
 | meta_storage_backend.h / meta_cache_base_backend.h | 提升四个通用条件写与 maintenance 条件删除接口，保留 cache 专属接口；不让 Redis 继承 cache |
 | meta_async_redis_backend.h / .cc | 条件写重载及原入队分组筛选；构造 payload 前预留 key 容量；复用原 consumer/统计 |
 | meta_local_backend.h / .cc | 尽量只调整继承/重载可见性；原条件写、no-touch 和容量逻辑不变 |
-| meta_storage_backend_manager.h / .cc | 用唯一的 GetWriteRoute(bool) 统一主次 Backend 选择；普通写只在 Running 选择 local primary，maintenance 显式传入自身策略；删除 BackupSuccessful；保留原恢复链路及准确的 local 计时 |
+| meta_storage_backend_manager.h / .cc | 用唯一的 GetWriteRoute(bool) 统一主次 Backend 选择；普通写只在 Running 选择 local primary，maintenance 显式传入自身策略；删除 BackupSuccessful；仅 `DELETING` Upsert 返回 Secondary 准入结果；保留原恢复链路及准确的 local 计时 |
 | meta_indexer.cc / manager 相关调用点 | 恢复原 `MetaIndexer::Sync` 和 executor 锁外调用；保留原分片锁、计数和 Manager 生命周期 |
-| meta_searcher.cc / 相关测试 | 撤销 memory-primary 专属 Reconcile 补偿及持久化确认参数，复用原调用链；保留批次整体失败的回滚与物理删除 Sync |
+| meta_searcher.cc / 相关测试 | 撤销 memory-primary 专属 Reconcile 补偿及通用持久化确认参数，复用原调用链；保留批次整体失败的回滚与物理删除 Sync |
 
 顺序为“接口上移及 async 条件写测试 → Recover 保持原顺序、Running 启用 local-first → maintenance 数据源/刷新条件适配 → 撤销 Reconcile 专属补偿 → 全链路回归与故障压测”。全部闭环前不得启用生产开关。所有可能接管的服务及运维工具升级后再开启，模式切换必须结束旧 writer。
 

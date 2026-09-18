@@ -29,10 +29,28 @@ using namespace kv_cache_manager;
 namespace {
 class SyncResultBackend : public MetaLocalBackend {
 public:
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept override {
+        if (!admit_upserts) {
+            std::vector<ErrorCode> results = previous_error_codes;
+            for (auto &result : results) {
+                if (result == EC_OK) {
+                    result = EC_TIMEOUT;
+                }
+            }
+            return results;
+        }
+        return MetaLocalBackend::Upsert(request_context, keys, locations, properties, previous_error_codes);
+    }
+
     bool Sync(const KeyTypeVec &) noexcept override {
         ++sync_calls;
         return sync_ok;
     }
+    bool admit_upserts = true;
     bool sync_ok = false;
     size_t sync_calls = 0;
 };
@@ -390,7 +408,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     future.get();
 }
 
-TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryAdmissionSyncsAfterLocalDeleting) {
+TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionAndSync) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
     auto indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
     auto &manager = *indexer->backend_manager_;
@@ -418,7 +436,25 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryAdmissionSyncsAfterLocalDeleti
     CacheLocationMapVector local;
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, local));
     EXPECT_EQ(CLS_DELETING, local[0].at(ids[0])->status());
+
+    auto second_location = SchedulePlanExecutorTestHelper::CreateCacheLocation();
+    std::vector<std::string> second_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {43}, {second_location}, second_ids));
+    ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {43}, {{{second_ids[0], CLS_SERVING}}}, results));
+    backup_ptr->admit_upserts = false;
+
+    CacheLocationDelRequest unadmitted_request{
+        kTestInstanceName, {43}, {{second_ids[0]}}, std::chrono::milliseconds(100)};
+    auto unadmitted = executor.PrepareDeleteTask(unadmitted_request);
+    EXPECT_FALSE(unadmitted.needs_physical_delete);
+    EXPECT_EQ(EC_ERROR, unadmitted.result.status);
+    EXPECT_TRUE(unadmitted.actual_task.block_keys.empty());
+    EXPECT_EQ(1, backup_ptr->sync_calls);
+
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {43}, local));
+    EXPECT_EQ(CLS_DELETING, local[0].at(second_ids[0])->status());
 }
+
 // 测试一个block_key对应多个location的情况
 TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     // 创建 MetaIndexer

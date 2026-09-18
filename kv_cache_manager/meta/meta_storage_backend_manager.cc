@@ -621,6 +621,16 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
             mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
     }
     if (route.local_primary) {
+        // A DELETING value authorizes a later physical delete after Sync. Its
+        // backup must have entered the secondary queue before this Upsert can
+        // report success; ordinary memory-primary writes remain best-effort.
+        assert(secondary_results.size() == keys.size());
+        for (const size_t i : batch.batch_secondary_admission_indices) {
+            assert(i < keys.size());
+            if (primary_results[i] == EC_OK && secondary_results[i] != EC_OK) {
+                primary_results[i] = secondary_results[i];
+            }
+        }
         return primary_results;
     }
     if (secondary_results.size() != keys.size()) {
